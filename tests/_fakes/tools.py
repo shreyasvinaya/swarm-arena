@@ -1,14 +1,12 @@
-from typing import Any, ClassVar, cast
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate
-from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest
-from swarm_arena._model.tooling import Command, CompletedRun, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
@@ -53,6 +51,8 @@ def cand(*, data: dict[str, Any] | None = None, **fields: Any) -> Candidate:
         "output": ToolOutput(status=RunStatus.OK, data=data or {}),
     }
     return Candidate(**{**defaults, **fields})
+
+
 # --- Task 13 ---
 
 
