@@ -52,10 +52,10 @@ must be owned by you or root, and not writable by group or others unless sticky
 
 On a timeout or a cancel, the group gets SIGTERM, then `grace_s`, then `collect`
 for the partial output, then SIGKILL. The output gets the stop status, and
-`partial=True` whenever the collect returned a valid `ToolOutput`, even an empty
-one. Files dropped later (over `max_output_bytes`, or a failed upload) do not
-change it. When collect failed, timed out, or gave an invalid result, the data
-is empty, `partial=False`, and a note goes to the stderr log.
+`partial=True` if and only if that collect returned a valid `ToolOutput`, even
+an empty one. Files dropped later (over `max_output_bytes`, or a failed upload)
+do not change it. When collect failed, timed out, or gave an invalid result, the
+data is empty, `partial=False`, and a note goes to the stderr log.
 A `Tool.collect` must return a valid `ToolOutput`: anything else, or data that is
 not finite JSON, gives status `error` with a note in the stderr log (a stopped run
 keeps its stop status). A blocked `collect` delays the SIGKILL by at most

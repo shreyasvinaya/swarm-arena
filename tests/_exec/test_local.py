@@ -18,7 +18,7 @@ from typing import Any
 
 import anyio
 import pytest
-from _fakes.proc import pid_alive, reap, spawn_group, wait_until
+from _fakes.proc import pid_alive, reap, require_visible_proc, spawn_group, wait_until
 from _fakes.tools import (
     COLLECTING,
     RELEASE,
@@ -459,6 +459,7 @@ async def test_capacity_preflight_init(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 async def test_confirm_dead_and_kill_orphan(local_executor: LocalExecutor) -> None:
+    require_visible_proc()  # under hidepid, group_has_live_member answers "alive" to be safe
     me = await anyio.to_thread.run_sync(host_id)
     proc = await anyio.to_thread.run_sync(spawn_group, ["sleep", "30"])
     try:
