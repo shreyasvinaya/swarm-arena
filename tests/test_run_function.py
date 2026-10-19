@@ -80,6 +80,10 @@ def test_failures_exit_1(tmp_path: Path, fn: str, params: dict[str, Any], stderr
     done = run(tmp_path, fn, params)
     assert done.returncode == 1
     assert stderr in done.stderr
+    if fn == "_fakes.tools:exits":
+        assert "Traceback (most recent call last):" in done.stderr
+        assert "in exits" in done.stderr
+        assert "SystemExit: 0" in done.stderr
     assert not (tmp_path / "swarm/result.json").exists()
 
 
@@ -223,3 +227,28 @@ def test_runner_does_not_add_cwd_for_late_imports(tmp_path: Path) -> None:
     done = run(tmp_path, "task18_late:solve", {}, import_dir=root, pythonpath=root)
     assert done.returncode == 0, done.stderr
     assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"shadowed": False}
+
+
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [
+        (
+            "import task18_missing_dependency\n",
+            "ModuleNotFoundError: No module named 'task18_missing_dependency'",
+        ),
+        (f'raise RuntimeError("{SECRET}")\n', f"RuntimeError: {SECRET}"),
+        ("raise SystemExit(0)\n", "SystemExit: 0"),
+    ],
+)
+def test_import_failure_prints_user_traceback(tmp_path: Path, source: str, error: str) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "task18_import_failure.py").write_text(source)
+    done = run(tmp_path, "task18_import_failure:solve", {}, import_dir=root)
+    assert done.returncode == 1
+    assert "cannot import task18_import_failure:solve" in done.stderr
+    assert "Traceback (most recent call last):" in done.stderr
+    assert "task18_import_failure.py" in done.stderr
+    assert error in done.stderr
+    assert not done.stdout
+    assert not (tmp_path / "swarm/result.json").exists()

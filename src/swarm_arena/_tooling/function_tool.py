@@ -30,10 +30,17 @@ class _EmptyInputs(_ConfigInputModel):
 
 def _load_function(path: str) -> Callable[..., Any]:
     """Load through the shared cache without exposing import exception values."""
+    module_name = path.split(":", 1)[0]
     try:
         fn = load_object(path)
-    except Exception:
+        module = importlib.import_module(module_name)
+    except (Exception, SystemExit):
         raise ValueError(f"cannot import {path}") from None
+    if module.__spec__ is not None and module.__spec__.name != module_name:
+        raise TypeError(
+            f"FunctionTool {path}: {module_name} is an alias of {module.__spec__.name}; "
+            "use the defining module"
+        )
     if not callable(fn):
         raise TypeError(f"FunctionTool {path}: expected a callable function")
     return fn
@@ -101,7 +108,8 @@ def import_root(module_name: str) -> str:
     Returns
     -------
     str
-        Resolved directory containing the module's top-level package.
+        Resolved directory containing the loaded module's real top-level package.
+        FunctionTool rejects aliases of that module during preflight.
 
     Raises
     ------
@@ -115,10 +123,10 @@ def import_root(module_name: str) -> str:
     """
     try:
         module = importlib.import_module(module_name)
-        if module.__file__ is None:
+        if module.__file__ is None or module.__spec__ is None:
             raise ValueError
         file = Path(module.__file__).resolve()
-        levels = len(module_name.split(".")) + (file.name == "__init__.py")
+        levels = len(module.__spec__.name.split(".")) + (file.name == "__init__.py")
         return str(file.parents[levels - 1])
     except Exception:
         raise ValueError(f"cannot determine import root for {module_name}") from None
@@ -131,6 +139,8 @@ class FunctionTool(Tool):
     Construction stores the reference without importing it. Use
     ``get_input_model()`` to inspect parameters; ``input_model`` is only an
     empty frozen placeholder. The function must return a finite JSON object.
+    The configured module must use its real import name; ``sys.modules`` aliases
+    are rejected during preflight.
 
     Parameters
     ----------

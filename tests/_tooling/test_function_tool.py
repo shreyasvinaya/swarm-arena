@@ -1,3 +1,4 @@
+import os
 import sys
 import traceback
 from collections.abc import Callable
@@ -239,3 +240,56 @@ def test_command_uses_configured_module_for_reexport(
         assert command.argv[-3:] == ["--import-root", str(tmp_path), "task18_reexport:add"]
     finally:
         sys.modules.pop("task18_reexport", None)
+
+
+def test_preflight_rejects_stdlib_module_alias() -> None:
+    assert os.path.__spec__ is not None
+    real_name = os.path.__spec__.name
+    expected = (
+        f"FunctionTool os.path:basename: os.path is an alias of {real_name}; "
+        "use the defining module"
+    )
+    with pytest.raises(TypeError, match="is an alias of") as caught:
+        FunctionTool("os.path:basename").preflight()
+    assert str(caught.value) == expected
+    assert_secret_absent(caught.value)
+    assert import_root("os.path") == str(Path(os.path.__file__).resolve().parent)
+
+
+def test_preflight_rejects_package_module_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "task18_alias"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "import sys\nimport task18_defining\nsys.modules[__name__] = task18_defining\n"
+    )
+    (tmp_path / "task18_defining.py").write_text(
+        f'PRIVATE = "{SECRET}"\ndef solve() -> dict[str, int]:\n    return {{"answer": 42}}\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        with pytest.raises(TypeError, match="is an alias of") as caught:
+            FunctionTool("task18_alias:solve").preflight()
+        assert str(caught.value) == (
+            "FunctionTool task18_alias:solve: task18_alias is an alias of "
+            "task18_defining; use the defining module"
+        )
+        assert_secret_absent(caught.value)
+        assert import_root("task18_alias") == str(tmp_path)
+        FunctionTool("task18_defining:solve").preflight()
+    finally:
+        sys.modules.pop("task18_alias", None)
+        sys.modules.pop("task18_defining", None)
+
+
+@pytest.mark.parametrize("exception", ["RuntimeError", "SystemExit"])
+def test_preflight_import_failure_hides_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception: str
+) -> None:
+    (tmp_path / "task18_import_error.py").write_text(f'raise {exception}("{SECRET}")\n')
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ValueError, match="cannot import task18_import_error:solve") as caught:
+        FunctionTool("task18_import_error:solve").preflight()
+    assert str(caught.value) == "cannot import task18_import_error:solve"
+    assert_secret_absent(caught.value)

@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import importlib
 import json
 import os
 import sys
@@ -61,7 +62,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     -------
     int
         Zero after publishing the result, or one on failure. Runner diagnostics
-        omit values; user-function failures include their traceback in stderr.
+        omit values; failures importing or calling user code include their
+        traceback in stderr.
 
     Examples
     --------
@@ -84,6 +86,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.import_root is not None:
             sys.path.insert(0, args.import_root)
         reason = f"cannot import {args.function}"
+        try:
+            # Import here before the driver loader sanitizes exception values.
+            importlib.import_module(args.function.split(":", 1)[0])
+        except (Exception, SystemExit) as exc:
+            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            traceback.print_exception(exc, file=sys.stderr)
+            return 1
         fn = _load_function(args.function)
         reason = f"FunctionTool {args.function}: unsupported function signature"
         model = function_input_model(fn)
