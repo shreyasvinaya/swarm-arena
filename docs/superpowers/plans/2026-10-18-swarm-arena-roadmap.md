@@ -1845,12 +1845,22 @@ def note_in_log(path: Path, message: str) -> None: ...
 
 RESERVED: Final = frozenset({"swarm", "parents", "candidate"})
 def check_relpath(path: str) -> str: ...             # ValueError: absolute, "..", reserved top level, empty
+def check_key(path: str) -> str: ...                 # [plan] normal form for dict-key paths: check_relpath, and the input must already be normalized
 def matches(path: str, globs: Sequence[str]) -> bool: ...
 def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> FileSet: ...   # rejects symlinks
 def snapshot_plan(plan: Plan, artifacts: ArtifactStore) -> Plan: ...   # goal, parts, and every FileSet in component configs
 def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref: ...   # every FileSet and nested Ref in the
     # validated config; writes back only keys present in ref.config (an omitted default FileSet stays omitted); other keys
     # keep their raw form
+# _tooling/staging.py
+def parent_ref(candidate: Candidate) -> ParentRef: ...
+def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]: ...
+def validate_edits(edits: Mapping[str, str], *, editable: Sequence[str], protected: AbstractSet[str],
+                   max_edit_bytes: int) -> None: ...  # raises SoftError
+def edit_hashes(edits: Mapping[str, str]) -> dict[str, str]: ...  # refuse the reserved `sha256:<64 hex>` reference form
+def put_edits(edits: Mapping[str, str], artifacts: ArtifactStore) -> None: ...  # refuse the reserved `sha256:<64 hex>` reference form
+# callers run `validate_edits` with `protected = tool._protected(root) | private_paths`,
+# then `plan_tool_stage` with the same set
 def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]: ...   # config minus settable fields (no overrides)
 def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str: ...            # sha256(canonical({path, fixed_config}))
 def plan_tool_stage(*, goal_files: Mapping[str, str], tool_files: Mapping[str, str], editable: Sequence[str],

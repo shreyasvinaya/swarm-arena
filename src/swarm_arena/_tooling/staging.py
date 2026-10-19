@@ -1,0 +1,391 @@
+"""Plan workspace contents and preserve the receiving tool's edit boundary."""
+
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from typing import Any
+
+from swarm_arena._errors import SoftError
+from swarm_arena._exec.executor import Job
+from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.catalog import CatalogEntry
+from swarm_arena._model.goal import Goal
+from swarm_arena._model.ref import Configurable, Ref, _validate_config
+from swarm_arena._model.results import Candidate
+from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._tooling.paths import check_key, check_relpath, matches
+from swarm_arena._tooling.result_file import request_json as _request_json
+
+
+def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]:
+    """Validate tool settings, expand defaults, and remove settable fields.
+
+    Parameters
+    ----------
+    ref : Ref
+        Component reference carrying fixed settings, without round overrides.
+    entry : CatalogEntry or None
+        Catalog entry identifying fields excluded from the fixed identity.
+
+    Returns
+    -------
+    dict[str, Any]
+        JSON-compatible validated configuration without settable fields.
+
+    Examples
+    --------
+    >>> from swarm_arena import Ref
+    >>> fixed_config(Ref(path="swarm_arena._model.ref:Configurable"), None)
+    {}
+    """
+    try:
+        cls = ref.load()
+    except TypeError:
+        raise TypeError(f"{ref.path} is not a Configurable class") from None
+    except Exception:
+        raise ValueError(f"cannot import {ref.path}") from None
+    if not issubclass(cls, Configurable):
+        raise TypeError(f"{ref.path} is not a Configurable subclass")
+    config = _validate_config(cls.Config, ref.config, where=ref.path)
+    try:
+        result = config.model_dump(mode="json")
+    except Exception:
+        raise ValueError(f"{ref.path}: cannot serialize config") from None
+    return {
+        key: value for key, value in result.items() if entry is None or key not in entry.settable
+    }
+
+
+def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str:
+    """Hash the reference path and canonical fixed configuration.
+
+    Parameters
+    ----------
+    ref : Ref
+        Tool reference whose defaults are expanded before hashing.
+    entry : CatalogEntry or None
+        Optional catalog entry specifying settable fields to exclude.
+
+    Returns
+    -------
+    str
+        SHA-256 digest of the reference path and fixed configuration.
+
+    Examples
+    --------
+    >>> from swarm_arena import Ref
+    >>> len(tool_identity(Ref(path="swarm_arena._model.ref:Configurable"), None))
+    64
+    """
+    config = fixed_config(ref, entry)
+    try:
+        return sha256_hex(canonical_json({"path": ref.path, "fixed_config": config}))
+    except Exception:
+        raise ValueError(f"{ref.path}: cannot encode tool identity") from None
+
+
+def validate_edits(
+    edits: Mapping[str, str],
+    *,
+    editable: Sequence[str],
+    protected: AbstractSet[str],
+    max_edit_bytes: int,
+) -> None:
+    """Report the first refusal reason for every invalid live edit.
+
+    Parameters
+    ----------
+    edits : Mapping[str, str]
+        Normal-form workspace paths mapped to new text contents.
+    editable : Sequence[str]
+        Receiving tool's editable globs.
+    protected : AbstractSet[str]
+        Tool scripts, interpreters, and private paths, normalized before checks.
+    max_edit_bytes : int
+        Maximum UTF-8 byte count per edit.
+
+    Raises
+    ------
+    SoftError
+        If any path, protection, glob, size, or stored-reference rule fails.
+
+    Examples
+    --------
+    >>> validate_edits({"p/a.txt": "hi"}, editable=["p/*"], protected=set(), max_edit_bytes=10)
+    """
+    protected = {check_relpath(path) for path in protected}
+    errors: list[str] = []
+    for path, content in edits.items():
+        reason = ""
+        try:
+            check_key(path)
+        except ValueError as exc:
+            reason = str(exc).removeprefix(f"path {path!r}: ")
+        if not reason:
+            if path in protected:
+                reason = "protected"
+            elif not matches(path, editable):
+                reason = "not editable"
+            elif (size := len(content.encode())) > max_edit_bytes:
+                reason = f"{size} bytes > max_edit_bytes {max_edit_bytes}"
+            elif is_stored_edit_ref(content):
+                reason = "content is a stored-edit reference"
+        if reason:
+            errors.append(f"{path}: {reason}")
+    if errors:
+        raise SoftError("\n".join(errors))
+
+
+def _check_live_edits(edits: Mapping[str, str]) -> None:
+    """Refuse alias keys and stored references before hashing or storing anything."""
+    for path, content in edits.items():
+        check_key(path)
+        if is_stored_edit_ref(content):
+            raise ValueError(f"{path}: content is a stored-edit reference")
+
+
+def edit_hashes(edits: Mapping[str, str]) -> dict[str, str]:
+    """Hash live edit text, refusing reserved stored-reference contents.
+
+    Parameters
+    ----------
+    edits : Mapping[str, str]
+        Normal-form paths mapped to live text, never stored references.
+
+    Returns
+    -------
+    dict[str, str]
+        Paths mapped to SHA-256 digests of UTF-8 contents.
+
+    Examples
+    --------
+    >>> edit_hashes({"a.txt": "hello"}) == {"a.txt": sha256_hex(b"hello")}
+    True
+    """
+    _check_live_edits(edits)
+    return {path: sha256_hex(content.encode()) for path, content in edits.items()}
+
+
+def put_edits(edits: Mapping[str, str], artifacts: ArtifactStore) -> None:
+    """Validate all live edits before storing their UTF-8 contents.
+
+    Parameters
+    ----------
+    edits : Mapping[str, str]
+        Normal-form paths mapped to live text, never stored references.
+    artifacts : ArtifactStore
+        Store receiving each edit's contents.
+
+    Examples
+    --------
+    >>> put_edits({"a.txt": "hello"}, artifacts)  # doctest: +SKIP
+    """
+    _check_live_edits(edits)
+    for content in edits.values():
+        artifacts.put_bytes(content.encode())
+
+
+def parent_ref(candidate: Candidate) -> ParentRef:
+    """Extract a parent's identity, output data, overlay, and output files.
+
+    Parameters
+    ----------
+    candidate : Candidate
+        Candidate to expose read-only to a subsequent run.
+
+    Returns
+    -------
+    ParentRef
+        Parent staging reference.
+
+    Examples
+    --------
+    >>> parent = parent_ref(candidate)  # doctest: +SKIP
+    """
+    return ParentRef(
+        candidate_id=candidate.id,
+        run_id=candidate.run_id,
+        tool_identity=candidate.tool_identity,
+        data=candidate.output.data,
+        overlay=candidate.overlay,
+        files=candidate.output.files,
+    )
+
+
+def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]:
+    """Combine a goal's snapshot with the candidate's full effective overlay.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal holding the original file manifest.
+    candidate : Candidate
+        Candidate holding its cumulative overlay.
+
+    Returns
+    -------
+    dict[str, str]
+        Goal files replaced at matching paths by the candidate overlay.
+
+    Examples
+    --------
+    >>> files = effective_files(goal, candidate)  # doctest: +SKIP
+    """
+    _check_keys(goal.files.manifest)
+    _check_keys(candidate.overlay)
+    return {**goal.files.manifest, **candidate.overlay}
+
+
+def _check_keys(files: Mapping[str, str]) -> None:
+    """Validate all dictionary keys before any map merge can hide an alias."""
+    for path in files:
+        check_key(path)
+
+
+def plan_tool_stage(
+    *,
+    goal_files: Mapping[str, str],
+    tool_files: Mapping[str, str],
+    editable: Sequence[str],
+    protected: AbstractSet[str],
+    private_paths: AbstractSet[str],
+    parents: Sequence[ParentRef],
+    receiving_identity: str,
+    edits: Mapping[str, str],
+    request_json: dict[str, Any] | None,
+) -> tuple[Job.Stage, dict[str, str], list[str]]:
+    """Stage goal and tool files, an eligible base overlay, then live edits.
+
+    Callers first run ``validate_edits`` with the same protection set. Recheck
+    edit permissions here as an internal invariant. Only the first parent's
+    overlay can enter the root, and only as a whole with a nonempty matching
+    tool identity. Every parent also remains available in its read-only tree.
+
+    Parameters
+    ----------
+    goal_files : Mapping[str, str]
+        Original goal paths and artifact digests.
+    tool_files : Mapping[str, str]
+        Tool-owned paths and artifact digests.
+    editable : Sequence[str]
+        Receiving tool's editable globs.
+    protected : AbstractSet[str]
+        Protected script, interpreter, and private paths.
+    private_paths : AbstractSet[str]
+        Check and judge paths forbidden in the tool root.
+    parents : Sequence[ParentRef]
+        Ordered parents, first being the proposed base.
+    receiving_identity : str
+        Receiving tool's fixed identity.
+    edits : Mapping[str, str]
+        Validated new text contents.
+    request_json : dict[str, Any] or None
+        Request document for the tool workspace.
+
+    Returns
+    -------
+    tuple[Job.Stage, dict[str, str], list[str]]
+        Stage, cumulative effective overlay, and soft warnings.
+
+    Raises
+    ------
+    RuntimeError
+        If private files enter the root or edits violate receiving permissions.
+    ValueError
+        If a path is invalid, noncanonical, or an edit is a stored reference.
+
+    Examples
+    --------
+    >>> stage, overlay, warnings = plan_tool_stage(  # doctest: +SKIP
+    ...     goal_files={}, tool_files={}, editable=[], protected=set(),
+    ...     private_paths=set(), parents=[], receiving_identity="T", edits={}, request_json=None)
+    """
+    _check_keys(goal_files)
+    _check_keys(tool_files)
+    _check_keys(edits)
+    protected = {check_relpath(path) for path in protected}
+    private_paths = {check_relpath(path) for path in private_paths}
+    for parent in parents:
+        check_parent_id(parent.candidate_id)
+        _check_keys(parent.overlay)
+        for file in parent.files:
+            check_key(file.path)
+    root = {**goal_files, **tool_files}
+    for path in root:
+        if path in private_paths:
+            raise RuntimeError(f"private path in tool root: {path}")
+    for path in edits:
+        if path in protected or path in private_paths or not matches(path, editable):
+            raise RuntimeError(f"edit path not editable here: {path}")
+    overlay: dict[str, str] = {}
+    warnings: list[str] = []
+    if parents:
+        base = parents[0]
+        reason = ""
+        refused = sorted(base.overlay)
+        if not receiving_identity or base.tool_identity != receiving_identity:
+            reason = "made by another tool"
+        else:
+            refused = sorted(
+                path
+                for path in base.overlay
+                if path in protected or path in private_paths or not matches(path, editable)
+            )
+            if refused:
+                reason = "paths not editable here"
+        if reason:
+            warnings.append(
+                f"base parent {base.candidate_id} not overlaid: {reason}; "
+                f"paths: {', '.join(refused)}"
+            )
+        else:
+            overlay.update(base.overlay)
+    overlay.update(edit_hashes(edits))
+    root.update(overlay)
+    return Job.Stage(root=root, parents=list(parents), request_json=request_json), overlay, warnings
+
+
+def plan_script_stage(
+    *, own_files: Mapping[str, str], candidate: Candidate, effective_files: Mapping[str, str]
+) -> Job.Stage:
+    """Stage a check or judge's own files alongside read-only candidate files.
+
+    Parameters
+    ----------
+    own_files : Mapping[str, str]
+        Check or judge file manifest staged at the root.
+    candidate : Candidate
+        Candidate whose request, output, and files are evaluated.
+    effective_files : Mapping[str, str]
+        Candidate's goal files with its cumulative overlay applied.
+
+    Returns
+    -------
+    Job.Stage
+        Script workspace plan; output files replace matching effective paths.
+
+    Examples
+    --------
+    >>> stage = plan_script_stage(  # doctest: +SKIP
+    ...     own_files={}, candidate=candidate, effective_files={})
+    """
+    _check_keys(own_files)
+    _check_keys(effective_files)
+    for file in candidate.output.files:
+        check_key(file.path)
+    output = candidate.output
+    return Job.Stage(
+        root=dict(own_files),
+        candidate=Job.CandidateFiles(
+            request={**_request_json(candidate.request), "parents": candidate.parent_ids},
+            output={
+                "schema_version": 1,
+                "status": output.status.value,
+                "partial": output.partial,
+                "data": output.data,
+                "usage": output.usage.model_dump(mode="json"),
+                "files": [file.path for file in output.files],
+            },
+            files={**effective_files, **{file.path: file.sha256 for file in output.files}},
+        ),
+    )

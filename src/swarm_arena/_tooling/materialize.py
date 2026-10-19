@@ -1,0 +1,256 @@
+"""Materialize validated stages and collect regular output files safely."""
+
+import contextlib
+import json
+import os
+import secrets
+import stat
+from collections.abc import Generator, Sequence
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
+from typing import Any
+
+from swarm_arena._exec.executor import Job
+from swarm_arena._model.canonical import canonical_json
+from swarm_arena._model.tooling import FileRef, check_parent_id
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._tooling.paths import check_key, check_relpath
+from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
+
+
+def _json_bytes(value: dict[str, Any], rel: str, *, compact: bool = False) -> bytes:
+    """Serialize metadata without disclosing arbitrary values in an exception."""
+    try:
+        if compact:
+            return canonical_json(value)
+        return json.dumps(value, indent=2, sort_keys=True, allow_nan=False).encode()
+    except Exception:
+        raise ValueError(f"cannot serialize workspace path: {rel}") from None
+
+
+def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[str, bytes]]:
+    """Validate every input path before merging and prepare metadata before I/O."""
+    for path in stage.root:
+        check_key(path)
+    ids: set[str] = set()
+    for parent in stage.parents:
+        check_parent_id(parent.candidate_id)
+        if parent.candidate_id in ids:
+            raise ValueError(f"duplicate parent id: {parent.candidate_id}")
+        ids.add(parent.candidate_id)
+        for path in parent.overlay:
+            check_key(path)
+        for file in parent.files:
+            check_key(file.path)
+    if stage.candidate is not None:
+        for path in stage.candidate.files:
+            check_key(path)
+    files = {path: (digest, False) for path, digest in stage.root.items()}
+    metadata: dict[str, bytes] = {}
+    for parent in stage.parents:
+        prefix = f"parents/{parent.candidate_id}"
+        merged = {**parent.overlay, **{file.path: file.sha256 for file in parent.files}}
+        files.update(
+            {
+                f"{prefix}/{path}": (digest, True)
+                for path, digest in merged.items()
+                if path != "data.json"
+            }
+        )
+        metadata[f"{prefix}/data.json"] = _json_bytes(
+            parent.data, f"{prefix}/data.json", compact=True
+        )
+    if stage.candidate is not None:
+        candidate = stage.candidate
+        files.update(
+            {f"candidate/files/{path}": (digest, True) for path, digest in candidate.files.items()}
+        )
+        metadata["candidate/request.json"] = _json_bytes(
+            candidate.request, "candidate/request.json"
+        )
+        metadata["candidate/output.json"] = _json_bytes(candidate.output, "candidate/output.json")
+    if stage.request_json is not None:
+        metadata["swarm/request.json"] = _json_bytes(stage.request_json, "swarm/request.json")
+    return files, metadata
+
+
+def _check_layout(workspace: Path, files: set[str], directories: set[str]) -> None:
+    """Reject conflicting paths and existing symlinks before creating anything."""
+    if workspace.is_symlink():
+        raise ValueError("symlink not allowed: workspace path")
+    for rel in sorted(files | directories):
+        parts = PurePosixPath(rel)
+        for ancestor in parts.parents:
+            if ancestor.as_posix() in files:
+                raise ValueError(f"conflicting workspace path: {rel}")
+        if rel in files and rel in directories:
+            raise ValueError(f"conflicting workspace path: {rel}")
+        try:
+            if symlinked_component(workspace, rel) is not None:
+                raise ValueError(f"symlink not allowed: {rel}")
+            path = workspace / rel
+            if path.exists():
+                mode = path.lstat().st_mode
+                expected = stat.S_ISREG(mode) if rel in files else stat.S_ISDIR(mode)
+                if not expected:
+                    raise ValueError(f"invalid workspace path: {rel}")
+        except OSError:
+            raise ValueError(f"cannot inspect workspace path: {rel}") from None
+
+
+@contextlib.contextmanager
+def _directory(root: int, parts: tuple[str, ...]) -> Generator[int, None, None]:
+    """Create and pin descendant directories without following symlinks."""
+    with contextlib.ExitStack() as stack:
+        fd = root
+        for part in parts:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(part, dir_fd=fd)
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield fd
+
+
+def _write(root: int, rel: str, data: bytes, *, read_only: bool) -> None:
+    """Publish through pinned directories without following or truncating links."""
+    parts = PurePosixPath(rel).parts
+    try:
+        with _directory(root, parts[:-1]) as directory:
+            try:
+                mode = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(mode):
+                    raise ValueError(f"not a regular workspace path: {rel}")
+            temp = f".stage-{secrets.token_hex(16)}"
+            fd = os.open(
+                temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
+            )
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fchmod(stream.fileno(), 0o444 if read_only else 0o644)
+                os.replace(temp, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temp, dir_fd=directory)
+    except OSError:
+        raise ValueError(f"cannot write workspace path: {rel}") from None
+
+
+def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> None:
+    """Validate a stage again and write its workspace with explicit permissions.
+
+    All input paths and parent ids are checked before any writes, including
+    objects created through validator-bypassing model methods. Fetch artifacts
+    into a private scratch directory, then publish through pinned directory
+    descriptors, so existing or swapped symlinks cannot redirect writes.
+    Workspace ancestors are trusted executor-owned directories.
+
+    Parameters
+    ----------
+    stage : Job.Stage
+        Root, parent, candidate, and request contents to materialize.
+    workspace : Path
+        Executor-owned workspace root; the root itself cannot be a symlink.
+    artifacts : ArtifactStore
+        Store providing verified artifact bytes.
+
+    Raises
+    ------
+    ValueError
+        If paths, parent ids, metadata, or destination file types are invalid.
+
+    Examples
+    --------
+    >>> from swarm_arena.executor import Job
+    >>> materialize(Job.Stage(), Path("workspace"), artifacts)  # doctest: +SKIP
+    """
+    files, metadata = _stage_files(stage)
+    directories = {"swarm"}
+    if stage.candidate is not None:
+        directories.add("candidate/files")
+    _check_layout(workspace, set(files) | set(metadata), directories)
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        root = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ValueError("cannot open workspace path") from None
+    with contextlib.ExitStack() as stack:
+        stack.callback(os.close, root)
+        for rel in sorted(directories):
+            try:
+                with _directory(root, PurePosixPath(rel).parts):
+                    pass
+            except OSError:
+                raise ValueError(f"cannot create workspace path: {rel}") from None
+        scratch = Path(stack.enter_context(TemporaryDirectory(prefix="swarm-stage-"))) / "artifact"
+        for rel, (digest, read_only) in files.items():
+            # ArtifactStore.fetch uses path-based writes; keep those writes out
+            # of the destination tree, where only the pinned writer operates.
+            artifacts.fetch(digest, scratch, read_only=read_only)
+            data = scratch.read_bytes()
+            scratch.unlink()
+            _write(root, rel, data, read_only=read_only)
+        for rel, data in metadata.items():
+            _write(root, rel, data, read_only=rel.startswith("parents/"))
+
+
+def collect_output_files(
+    workspace: Path, declared: Sequence[str], artifacts: ArtifactStore
+) -> list[FileRef]:
+    """Upload declared regular outputs after checking paths and symlinks.
+
+    Parameters
+    ----------
+    workspace : Path
+        Trusted execution workspace root.
+    declared : Sequence[str]
+        Relative output paths; aliases normalize before collection.
+    artifacts : ArtifactStore
+        Store receiving output contents.
+
+    Returns
+    -------
+    list[FileRef]
+        References with normalized paths, basenames, hashes, and byte counts.
+
+    Raises
+    ------
+    ValueError
+        If a path is invalid, duplicated after normalization, missing,
+        symlinked, nonregular, or cannot be collected.
+
+    Examples
+    --------
+    >>> refs = collect_output_files(Path("ws"), ["out/a.txt"], artifacts)  # doctest: +SKIP
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    for path in declared:
+        rel = check_relpath(path)
+        if rel in seen:
+            raise ValueError(f"duplicate output path after normalization: {rel}")
+        seen.add(rel)
+        paths.append(rel)
+    output: list[FileRef] = []
+    for rel in paths:
+        try:
+            if symlinked_component(workspace, rel) is not None:
+                raise ValueError(f"symlink not allowed: {rel}")
+            (workspace / rel).lstat()
+        except FileNotFoundError:
+            raise ValueError(f"{rel} is missing") from None
+        except OSError:
+            raise ValueError(f"cannot inspect output path: {rel}") from None
+        data = read_regular_file(workspace, rel)
+        try:
+            digest = artifacts.put_bytes(data)
+        except Exception:
+            raise ValueError(f"cannot store output path: {rel}") from None
+        output.append(
+            FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=len(data))
+        )
+    return output

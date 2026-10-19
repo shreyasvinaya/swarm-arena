@@ -28,3 +28,37 @@ checks, judges, policy, and convergence team. Component configs are validated
 before traversing explicit `FileSet` and nested `Ref` fields, including lists of
 refs. Omitted defaults stay omitted, unrelated settings keep their original
 representation, and the returned plan retains its original base directory.
+
+## Workspace staging
+
+A tool workspace starts with goal and tool files. The first parent's full overlay
+is applied only when its nonempty tool identity matches the receiving tool and
+every overlay path is editable, unprotected, and outside check or judge private
+files. Otherwise the whole overlay is refused with a warning identifying the
+parent and the refused paths. Live edits are applied last. For example, an
+editable `problem/*.txt` file can inherit its base parent's contents and then be
+replaced by the current request's text. A protected `problem/run.py` remains
+protected even if its command path was spelled `./problem/run.py`.
+
+Identity hashes the import path and validated configuration with defaults
+expanded, excluding catalog-settable fields. Dictionary path keys must already
+be in normal form: aliases such as `./problem/a.txt` or `problem//a.txt` are
+refused, including normalization collisions. Edit values are literal UTF-8 text;
+the reserved `sha256:` followed by exactly 64 lowercase hex digits is a stored
+reference and cannot be submitted as a live edit.
+
+Every parent, including the base parent, has read-only overlay and output files
+under `parents/<id>/`. Output files win at a shared path; `data.json` always holds
+the parent's structured output. Parent ids must be single safe path components.
+Checks and judges instead receive their own root files and read-only candidate
+files under `candidate/files/`, with request and output metadata beside that
+directory. The directory exists even for a candidate with no files.
+
+Materialization revalidates every path before writing, even for model objects
+constructed without validation. It rejects symlinks and file/directory conflicts,
+fetches artifacts into private scratch space, and publishes through pinned
+directory descriptors. Root artifacts are writable; parent and candidate
+artifacts are read-only. The workspace's ancestors are trusted executor-owned
+directories. Output collection uses the shared regular-file reader, refuses
+symlink components and special files, and rejects duplicate normalized paths.
+These file-handling protections do not provide strong process isolation.
