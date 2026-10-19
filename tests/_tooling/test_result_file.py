@@ -212,7 +212,12 @@ async def test_result_must_be_a_regular_file(tmp_path: Path, kind: str) -> None:
     with anyio.fail_after(5):  # a FIFO opened without O_NONBLOCK would block forever
         out = await anyio.to_thread.run_sync(tool_output_from_result, ws, r, abandon_on_cancel=True)
     assert out.status is RunStatus.ERROR
-    assert "not a regular file" in await anyio.to_thread.run_sync(r.stderr_path.read_text)
+    logged = await anyio.to_thread.run_sync(r.stderr_path.read_text)
+    if kind == "symlinked_swarm_dir":
+        # The diagnostic must also refuse the replaced parent directory.
+        assert logged == ""
+    else:
+        assert "not a regular file" in logged
 
 
 @pytest.mark.parametrize("kind", ["regular", "missing", "fifo", "symlink"])
@@ -440,3 +445,127 @@ def test_read_refuses_parent_replaced_after_component_check(
     monkeypatch.setattr(result_file, "symlinked_component", swap)
     with pytest.raises(ValueError, match="not a regular file"):
         read_regular_file(workspace, "out/data")
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_log_refuses_symlinked_parent(tmp_path: Path, existing: bool) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "stderr.log"
+    if existing:
+        target.write_text("original\n")
+    (workspace / "swarm").symlink_to(outside, target_is_directory=True)
+
+    assert note_in_log(workspace / "swarm/stderr.log", "m") is None
+
+    if existing:
+        assert target.read_text() == "original\n"
+    else:
+        assert not target.exists()
+
+
+def test_log_refuses_hardlinked_file(tmp_path: Path) -> None:
+    target = tmp_path / "outside.log"
+    target.write_text("original\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "stderr.log"
+    path.hardlink_to(target)
+
+    assert note_in_log(path, "m") is None
+    assert target.read_text() == path.read_text() == "original\n"
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_log_parent_replacement_cannot_redirect_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pinned: bool
+) -> None:
+    workspace = tmp_path / "workspace"
+    parent = workspace / "swarm"
+    parent.mkdir(parents=True)
+    (parent / "stderr.log").write_text("original\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "stderr.log"
+    target.write_text("outside\n")
+    original_open = os.open
+    swapped = False
+
+    def swap_open(
+        path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal swapped
+        # Swap immediately before opening swarm, or after its fd was pinned.
+        if Path(path).name == ("stderr.log" if pinned else "swarm"):
+            parent.rename(workspace / "old-swarm")
+            parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_open)
+    assert note_in_log(parent / "stderr.log", "m") is None
+    assert swapped
+    assert target.read_text() == "outside\n"
+    expected = "original\nswarm-arena: m\n" if pinned else "original\n"
+    assert (workspace / "old-swarm/stderr.log").read_text() == expected
+
+
+def test_log_sanitizes_control_characters(tmp_path: Path) -> None:
+    path = tmp_path / "stderr.log"
+    message = "first\nforged\r\x1b[31m\t\0\x7f\x85\u2028\u2029last café"
+    assert note_in_log(path, message) is None
+    logged = path.read_text()
+    assert len(logged.splitlines()) == 1
+    assert logged.startswith("swarm-arena: first")
+    assert logged.endswith("last café\n")
+    assert not any(char in logged[:-1] for char in "\n\r\x1b\t\0\x7f\x85\u2028\u2029")
+
+
+@pytest.mark.parametrize("failure", [None, "open", "fstat", "write"])
+def test_log_closes_all_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    parent = tmp_path / "swarm"
+    parent.mkdir()
+    path = parent / "stderr.log"
+    opened: list[int] = []
+    original_open = os.open
+    original_fstat = os.fstat
+
+    def track_open(
+        path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if failure == "open" and Path(path).name == "stderr.log":
+            raise OSError("SENTINEL_SECRET")
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(fd)
+        return fd
+
+    def fail_fstat(fd: int) -> os.stat_result:
+        raise OSError("SENTINEL_SECRET")
+
+    def fail_write(fd: int, data: bytes) -> int:
+        raise OSError("SENTINEL_SECRET")
+
+    monkeypatch.setattr(os, "open", track_open)
+    if failure == "fstat":
+        monkeypatch.setattr(os, "fstat", fail_fstat)
+    if failure == "write":
+        monkeypatch.setattr(os, "write", fail_write)
+
+    assert note_in_log(path, "m") is None
+    assert opened
+    for fd in opened:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            original_fstat(fd)
+
+
+def test_log_supports_relative_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "swarm").mkdir()
+    note_in_log(Path("swarm/stderr.log"), "relative")
+    note_in_log(Path("stderr.log"), "leaf")
+    assert (tmp_path / "swarm/stderr.log").read_text() == "swarm-arena: relative\n"
+    assert (tmp_path / "stderr.log").read_text() == "swarm-arena: leaf\n"

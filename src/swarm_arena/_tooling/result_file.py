@@ -354,24 +354,42 @@ def note_in_log(path: Path, message: str) -> None:
     Parameters
     ----------
     path : Path
-        Log path. A missing leaf is created; a symlink or special file is refused.
+        Log path. A missing leaf is created. Symlinks in any component,
+        hardlinked files, and special files are refused. Directory descriptors
+        pin the parent walk so replacing a component cannot redirect the write.
     message : str
-        Sanitized diagnostic, without the prefix or trailing newline.
+        Diagnostic without the prefix or trailing newline. Nonprintable
+        characters, including controls and line separators, become spaces.
 
     Examples
     --------
     >>> note_in_log(Path("stderr.log"), "result is missing")  # doctest: +SKIP
     """
-    fd: int | None = None
+    fds: list[int] = []
     try:
+        parts = path.parts[1:] if path.anchor else path.parts
+        if not parts:
+            return
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory = os.open(path.anchor or ".", directory_flags)
+        fds.append(directory)
+        for part in parts[:-1]:
+            directory = os.open(part, directory_flags, dir_fd=directory)
+            fds.append(directory)
         fd = os.open(
-            path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
+            parts[-1],
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o644,
+            dir_fd=directory,
         )
-        if stat.S_ISREG(os.fstat(fd).st_mode):
-            os.write(fd, f"swarm-arena: {message}\n".encode())
+        fds.append(fd)
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            sanitized = "".join(char if char.isprintable() else " " for char in message)
+            os.write(fd, f"swarm-arena: {sanitized}\n".encode())
     except (OSError, ValueError):
         pass
     finally:
-        if fd is not None:
+        for fd in reversed(fds):
             with contextlib.suppress(OSError):
                 os.close(fd)

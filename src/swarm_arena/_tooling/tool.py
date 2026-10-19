@@ -82,9 +82,47 @@ class Tool(Configurable, ABC):
 
     Examples
     --------
-    >>> from swarm_arena.tool import Tool
+    >>> from pathlib import Path
+    >>> from pydantic import BaseModel
+    >>> from swarm_arena.tool import (
+    ...     Command, CompletedRun, RunStatus, Tool, ToolOutput, ToolRequest,
+    ... )
     >>> sorted(Tool.__abstractmethods__)
     ['collect', 'command']
+
+    A concrete tool can demonstrate the default hooks entirely in memory:
+
+    >>> class Inputs(BaseModel):
+    ...     n: int = 0
+    >>> class ExampleTool(Tool):
+    ...     name = "example"
+    ...     description = "An in-memory example."
+    ...     input_model = Inputs
+    ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+    ...         return Command(argv=["echo", "example"])
+    ...     def collect(
+    ...         self, request: ToolRequest, workspace: Path, run: CompletedRun,
+    ...     ) -> ToolOutput:
+    ...         return ToolOutput(status=run.status, data={})
+    >>> tool = ExampleTool()
+    >>> tool.preflight()
+    >>> tool.is_deterministic(ToolRequest())
+    True
+    >>> tool.editable()
+    ()
+    >>> tool.estimate(ToolRequest()) is None
+    True
+    >>> tool.providers()
+    frozenset()
+    >>> output = ToolOutput(status=RunStatus.OK, data={"a": 1})
+    >>> len(tool.fingerprint(output))
+    64
+    >>> tool.extra_actions()
+    ()
+    >>> tool.get_input_model().model_validate({}).model_dump()
+    {'n': 0}
+    >>> tool.get_description()
+    'An in-memory example.'
     """
 
     name: ClassVar[str]
@@ -99,7 +137,7 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.preflight()  # doctest: +SKIP
+        The :class:`Tool` example calls ``tool.preflight()`` without I/O.
         """
 
     def is_deterministic(self, request: ToolRequest) -> bool:
@@ -118,9 +156,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> from swarm_arena.tool import ToolRequest
-        >>> tool.is_deterministic(ToolRequest())  # doctest: +SKIP
-        True
+        The :class:`Tool` example calls ``tool.is_deterministic(ToolRequest())``
+        and returns True.
         """
         return True
 
@@ -135,8 +172,7 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.editable()  # doctest: +SKIP
-        ()
+        The :class:`Tool` example calls ``tool.editable()`` and returns ``()``.
         """
         return ()
 
@@ -156,9 +192,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> from swarm_arena.tool import ToolRequest
-        >>> tool.estimate(ToolRequest()) is None  # doctest: +SKIP
-        True
+        The :class:`Tool` example calls ``tool.estimate(ToolRequest())`` and
+        checks that the result is None.
         """
         return None
 
@@ -173,8 +208,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.providers()  # doctest: +SKIP
-        frozenset()
+        The :class:`Tool` example calls ``tool.providers()`` and returns an
+        empty frozenset.
         """
         return frozenset()
 
@@ -194,10 +229,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> from swarm_arena.tool import RunStatus, ToolOutput
-        >>> output = ToolOutput(status=RunStatus.OK, data={"a": 1})
-        >>> len(tool.fingerprint(output))  # doctest: +SKIP
-        64
+        The :class:`Tool` example calls ``tool.fingerprint(output)`` and checks
+        the digest length.
         """
         return sha256_hex(canonical_json(output.data))
 
@@ -212,8 +245,7 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.extra_actions()  # doctest: +SKIP
-        ()
+        The :class:`Tool` example calls ``tool.extra_actions()`` and returns ``()``.
         """
         return ()
 
@@ -228,7 +260,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.get_input_model().model_validate({})  # doctest: +SKIP
+        The :class:`Tool` example calls ``tool.get_input_model()`` and validates
+        an empty mapping with the returned model.
         """
         return type(self).input_model
 
@@ -243,8 +276,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> tool.get_description()  # doctest: +SKIP
-        'Runs Python code.'
+        The :class:`Tool` example calls ``tool.get_description()`` and returns
+        the concrete tool's description.
         """
         return type(self).description
 

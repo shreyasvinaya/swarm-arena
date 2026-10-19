@@ -1,3 +1,4 @@
+import doctest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any, cast
@@ -8,8 +9,37 @@ from pydantic import ValidationError
 
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.canonical import sha256_hex
+from swarm_arena._tooling import tool as tool_module
 from swarm_arena._tooling.tool import Action, Tool, cap_timeout, effective_tool_timeout, tool_grace
 from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+
+
+def test_tool_metadata_examples_execute() -> None:
+    examples = doctest.DocTestFinder().find(Tool, globs=vars(tool_module))
+    methods = (
+        "preflight",
+        "is_deterministic",
+        "editable",
+        "estimate",
+        "providers",
+        "fingerprint",
+        "extra_actions",
+        "get_input_model",
+        "get_description",
+    )
+    for method in methods:
+        calls = [
+            example
+            for test in examples
+            for example in test.examples
+            if f".{method}(" in example.source
+        ]
+        assert calls, f"No executable example for {method}"
+        assert all(not example.options.get(doctest.SKIP) for example in calls), method
+    runner = doctest.DocTestRunner()
+    for test in examples:
+        runner.run(test)
+    assert runner.summarize().failed == 0
 
 
 # tests/_tooling/test_tool.py
