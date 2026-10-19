@@ -159,11 +159,15 @@ async def _collect(
 
     The SIGKILL does not wait for ``before_kill`` to honour its cancellation, so
     a collector stuck in a thread cannot keep the tool alive. Return the note
-    to log (only the exception type on failure), or None on success.
+    to log (only the exception type on failure), or None on success. Any
+    other ``BaseException`` from ``before_kill``, cancellation included, is
+    re-raised as itself after the task group, never inside an exception group.
     """
     limit = BEFORE_KILL_TIMEOUT_S
+    cancelled = anyio.get_cancelled_exc_class()
     timed_out = False
     failed: str | None = None
+    raised: BaseException | None = None
     async with anyio.create_task_group() as tg:
 
         async def kill_at_deadline() -> None:
@@ -178,7 +182,13 @@ async def _collect(
             await before_kill(provisional)
         except Exception as exc:
             failed = type(exc).__name__  # the type only: a message can carry secret values
+        except BaseException as exc:
+            if isinstance(exc, cancelled) and tg.cancel_scope.cancel_called:
+                raise  # the deadline's own cancellation: the task group absorbs it
+            raised = exc
         tg.cancel_scope.cancel()
+    if raised is not None:
+        raise raised
     if timed_out:
         return f"before_kill timed out after {limit:g} s"
     if failed is not None:
@@ -273,10 +283,13 @@ class ProcessSupervisor:
         before_kill : Callable[[CompletedRun], Awaitable[None]] or None
             Collect partial output before SIGKILL. It receives a provisional
             result with ``returncode=None`` and status TIMEOUT or CANCELLED.
-            It must be cancellable: run blocking work with
-            ``anyio.to_thread.run_sync(..., abandon_on_cancel=True)``. A
-            collector that ignores cancellation does not delay the SIGKILL,
-            but ``run`` returns only when it returns.
+            It must be cancellable. Blocking work should run in a daemon
+            thread that the loop awaits (``LocalExecutor`` uses
+            ``swarm_arena._exec.threads.run_sync_daemon``), so cancelling it
+            returns at once. A collector that ignores cancellation does not
+            delay the SIGKILL, but ``run`` returns only when it returns. Its
+            ``Exception`` becomes a note in the stderr log (the type only);
+            any other ``BaseException`` leaves ``run`` as itself.
 
         Returns
         -------
@@ -349,8 +362,9 @@ class ProcessSupervisor:
                 _close(fds, fd)
             for proc in procs:
                 if proc.returncode is None:  # started, but the watch could not be made
-                    _signal_group(proc.pid, signal.SIGKILL)  # still unreaped, so still ours
-                    proc.wait()
+                    with anyio.CancelScope(shield=True):
+                        _signal_group(proc.pid, signal.SIGKILL)  # still unreaped, so still ours
+                        await anyio.to_thread.run_sync(proc.wait)  # never on the loop thread
 
     async def _supervise(
         self,

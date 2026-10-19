@@ -1,4 +1,6 @@
+import errno
 import gc
+import itertools
 import os
 import signal
 import sys
@@ -13,9 +15,21 @@ from _fakes.proc import pid_alive, wait_for_file, wait_until
 
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
-from swarm_arena._exec.procinfo import host_id
+from swarm_arena._exec.procinfo import ExitWatch, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._model.tooling import CompletedRun, RunStatus
+
+# The child of tests/_exec/test_procinfo.py: its main thread exits, a worker thread runs on.
+THREADED = (
+    "import ctypes, signal, threading, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "def work():\n"
+    "    time.sleep({work_s})\n"
+    "    open('worker.done', 'w').close()\n"
+    "threading.Thread(target=work).start()\n"
+    "open('child.ready', 'w').close()\n"
+    "ctypes.CDLL(None).pthread_exit(None)\n"
+)
 
 # A grandchild that ignores SIGTERM (so only the group SIGKILL ends it); the tool waits until the
 # grandchild has installed the ignore, writes its pid to gc.pid, and sleeps.
@@ -496,3 +510,107 @@ async def test_log_rerun_truncates(tmp_path: Path) -> None:
     await call(tmp_path, py("print('a much longer first line')"))
     done = await call(tmp_path, py("print('x')"))
     assert done.stdout_path.read_text() == "x\n"
+
+
+# --- Fix round 2 ---
+
+
+async def test_leader_that_exits_during_on_started_stays_anchored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = record_signals(monkeypatch)
+    pids: list[int] = []
+
+    async def crash_then_fail(s: Job.Started) -> None:
+        assert s.pid is not None
+        pids.append(s.pid)
+        os.kill(s.pid, signal.SIGKILL)  # the launcher dies while the start is being committed
+        await anyio.sleep(0.3)  # long enough for any eager reaper to collect it
+        raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await call(tmp_path, py("open('ran', 'w')"), on_started=crash_then_fail)
+    assert [(sig, unreaped) for sig, unreaped, _ in seen] == [(signal.SIGKILL, True)]
+    assert not pid_alive(pids[0])
+    assert not (tmp_path / "ran").exists()
+
+
+@pytest.mark.parametrize("kind", ["KeyboardInterrupt", "SystemExit", "cancelled"])
+async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, kind: str) -> None:
+    expected: type[BaseException] = {
+        "KeyboardInterrupt": KeyboardInterrupt,
+        "SystemExit": SystemExit,
+        "cancelled": anyio.get_cancelled_exc_class(),
+    }[kind]
+
+    async def broken(r: CompletedRun) -> None:
+        raise expected()
+
+    caught: BaseException | None = None
+    try:
+        await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=broken)
+    except BaseException as exc:
+        caught = exc
+    assert type(caught) is expected
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+
+
+async def test_safety_net_reap_does_not_block_the_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_watch(pid: int) -> ExitWatch:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    pids: list[int] = []
+    real_spawn = supervisor._spawn
+
+    def slow_spawn(*args: Any, **kwargs: Any) -> None:
+        real_spawn(*args, **kwargs)
+        proc = kwargs["procs"][-1]
+        pids.append(proc.pid)
+        real_wait = proc.wait
+
+        def slow_wait(timeout: float | None = None) -> int:
+            time.sleep(1.0)  # a leader that is slow to die after SIGKILL
+            return real_wait(timeout)
+
+        monkeypatch.setattr(proc, "wait", slow_wait)
+
+    monkeypatch.setattr(supervisor, "ExitWatch", no_watch)
+    monkeypatch.setattr(supervisor, "_spawn", slow_spawn)
+    ticks: list[float] = []
+
+    async def ticker() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await anyio.sleep(0.05)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(ticker)
+        await anyio.sleep(0.2)
+        with pytest.raises(OSError, match="Too many open files"):
+            await call(tmp_path, py("open('ran', 'w')"))
+        await anyio.sleep(0.2)
+        tg.cancel_scope.cancel()
+    assert max(b - a for a, b in itertools.pairwise(ticks)) < 0.5  # the loop kept running
+    assert not pid_alive(pids[0])  # killed and reaped
+    assert not (tmp_path / "ran").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
+async def test_grace_waits_for_live_threads_of_an_exited_main_thread(tmp_path: Path) -> None:
+    child = THREADED.format(work_s=1.5)
+    leader = (  # keeps the default SIGTERM action; the child ignores SIGTERM
+        "import os, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "while not os.path.exists('child.ready'): time.sleep(0.01)\n"
+        "time.sleep(60)\n"
+    )
+    seen: list[bool] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        seen.append((tmp_path / "worker.done").exists())
+
+    done = await call(tmp_path, py(leader), timeout_s=1.0, grace_s=5.0, before_kill=before_kill)
+    assert done.status is RunStatus.TIMEOUT
+    assert seen == [True]  # the grace covered the worker thread, not just the main thread

@@ -156,20 +156,123 @@ def test_group_has_live_member_sees_a_live_child_of_a_zombie_leader(tmp_path: Pa
         p.wait()
 
 
-def test_proc_scan_reads_state_and_pgrp_after_the_last_paren(tmp_path: Path) -> None:
-    def stat(pid: str, text: str) -> None:
-        (tmp_path / pid).mkdir()
-        (tmp_path / pid / "stat").write_text(text)
+def fake_proc(root: Path, options: str = "rw,nosuid,nodev,noexec") -> Path:
+    """Make an empty fake /proc whose mountinfo mounts it with ``options``."""
+    (root / "self").mkdir(parents=True)
+    (root / "self/mountinfo").write_text(
+        f"22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        f"25 22 0:23 / {root} rw,relatime shared:13 - proc proc {options}\n"
+    )
+    return root
 
-    stat("100", "100 (odd) name) S 1 4242 4242 0 -1\n")  # comm may hold spaces and parens
-    stat("101", "101 (zz) Z 1 777 777 0 -1\n")
-    stat("102", "102 (gone) X 1 888 888 0 -1\n")
-    (tmp_path / "self").mkdir()
-    (tmp_path / "103").mkdir()  # exited while scanning: no stat file
-    assert procinfo._live_in_proc(4242, tmp_path)
-    assert not procinfo._live_in_proc(777, tmp_path)
-    assert not procinfo._live_in_proc(888, tmp_path)
-    assert not procinfo._live_in_proc(5, tmp_path)
+
+def fake_task(proc: Path, pid: str, stat: str, tasks: dict[str, str] | None = None) -> None:
+    (proc / pid).mkdir()
+    (proc / pid / "stat").write_text(stat)
+    if tasks is not None:
+        (proc / pid / "task").mkdir()
+        for tid, task_stat in tasks.items():
+            (proc / pid / "task" / tid).mkdir()
+            (proc / pid / "task" / tid / "stat").write_text(task_stat)
+
+
+def test_proc_scan_reads_state_and_pgrp_after_the_last_paren(tmp_path: Path) -> None:
+    proc = fake_proc(tmp_path)
+    fake_task(proc, "100", "100 (odd) name) S 1 4242 4242 0 -1\n")  # comm may hold spaces, parens
+    fake_task(proc, "101", "101 (zz) Z 1 777 777 0 -1\n", {"101": "101 (zz) Z 1 777 777\n"})
+    fake_task(proc, "102", "102 (gone) X 1 888 888 0 -1\n", {})
+    (proc / "103").mkdir()  # exited while scanning: no stat file
+    assert procinfo._live_in_proc(4242, proc)
+    assert not procinfo._live_in_proc(777, proc)
+    assert not procinfo._live_in_proc(888, proc)
+    assert not procinfo._live_in_proc(5, proc)
+
+
+def test_proc_scan_counts_a_live_thread_of_an_exited_main_thread(tmp_path: Path) -> None:
+    proc = fake_proc(tmp_path)
+    tasks = {"200": "200 (py) Z 1 4242 4242\n", "201": "201 (py) S 1 4242 4242\n"}
+    fake_task(proc, "200", "200 (py) Z 1 4242 4242 0 -1\n", tasks)  # main thread did pthread_exit
+    fake_task(proc, "300", "300 (z) Z 1 777 777 0 -1\n")  # a zombie whose task dir is gone
+    assert procinfo._live_in_proc(4242, proc)
+    assert not procinfo._live_in_proc(777, proc)
+
+
+@pytest.mark.parametrize("options", ["rw,hidepid=2", "rw,hidepid=invisible", "rw,hidepid=1"])
+def test_proc_scan_cannot_rule_out_hidden_members(tmp_path: Path, options: str) -> None:
+    proc = fake_proc(tmp_path, options)
+    assert procinfo._live_in_proc(5, proc)  # another user's member may be unlisted
+
+
+@pytest.mark.parametrize("options", ["rw,hidepid=0", "rw,hidepid=off", "rw"])
+def test_proc_scan_trusts_a_proc_without_hidepid(tmp_path: Path, options: str) -> None:
+    assert not procinfo._live_in_proc(5, fake_proc(tmp_path, options))
+
+
+def test_proc_scan_without_mountinfo_cannot_tell(tmp_path: Path) -> None:
+    assert procinfo._live_in_proc(5, tmp_path)
+
+
+@pytest.mark.parametrize("unreadable", ["300/stat", "300/task", "300/task/301/stat"])
+def test_proc_scan_unreadable_entry_cannot_tell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> None:
+    proc = fake_proc(tmp_path)
+    tasks = {"300": "300 (z) Z 1 777 777\n", "301": "301 (z) Z 1 777 777\n"}
+    fake_task(proc, "300", "300 (z) Z 1 777 777 0 -1\n", tasks)
+    assert not procinfo._live_in_proc(777, proc)
+    real_read, real_list = procinfo._read_proc, procinfo._list_proc
+    denied = proc / unreadable
+
+    def read(path: Path) -> bytes:
+        if path == denied:
+            raise PermissionError(13, "Permission denied")
+        return real_read(path)
+
+    def listdir(path: Path) -> list[str]:
+        if path == denied:
+            raise PermissionError(13, "Permission denied")
+        return real_list(path)
+
+    monkeypatch.setattr(procinfo, "_read_proc", read)
+    monkeypatch.setattr(procinfo, "_list_proc", listdir)
+    assert procinfo._live_in_proc(777, proc)  # the pid still exists, but its state is unknown
+
+
+# A child whose main thread calls pthread_exit while a worker thread keeps running: Linux then
+# shows state Z in /proc/<pid>/stat although the process is alive.
+THREADED = (
+    "import ctypes, signal, threading, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "def work():\n"
+    "    time.sleep({work_s})\n"
+    "    open('worker.done', 'w').close()\n"
+    "threading.Thread(target=work).start()\n"
+    "open('child.ready', 'w').close()\n"
+    "ctypes.CDLL(None).pthread_exit(None)\n"
+)
+
+
+def _main_thread_state(pid: int) -> str:
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return ""
+    return data[data.rfind(b")") + 1 :].split()[0].decode()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
+def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
+    code = THREADED.format(work_s=1.0)
+    p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
+    try:
+        assert wait_until(lambda: _main_thread_state(p.pid) == "Z", 5)
+        assert not (tmp_path / "worker.done").exists()
+        assert group_has_live_member(p.pid)  # the worker thread still runs
+        assert wait_until(lambda: (tmp_path / "worker.done").exists(), 5)
+        assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+    finally:
+        p.kill()
+        p.wait()
 
 
 def _spawn(argv: list[str]) -> "subprocess.Popen[bytes]":

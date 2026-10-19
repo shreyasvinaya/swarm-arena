@@ -24,6 +24,7 @@ _PS_ENV = {"LC_ALL": "C", "TZ": "UTC"}
 _PS = "ps"
 _PROC = Path("/proc")
 _DEAD_STATES = frozenset({b"Z", b"X", b"x"})  # zombie, dead
+_GONE = (FileNotFoundError, ProcessLookupError)  # the process or thread exited
 _EXIT_POLL_S = 0.05
 
 
@@ -152,13 +153,17 @@ def group_has_live_member(pgid: int) -> bool:
     Returns
     -------
     bool
-        True when a live member exists, and also when liveness cannot be read
-        (``/proc`` or ``ps`` unavailable), so callers err toward waiting.
+        True when a live member exists, and also when liveness cannot be read,
+        so callers err toward waiting: ``/proc`` or ``ps`` unavailable, a
+        ``/proc`` entry that exists but cannot be read, or ``/proc`` mounted
+        with ``hidepid`` (another user's member may be unlisted).
         ``killpg(pgid, 0)`` decides when it can: ``ProcessLookupError`` is no
         member, and on macOS success is a live member (it refuses zombies).
-        Linux answers signal 0 for zombies too, so it scans ``/proc/*/stat``.
-        A ``PermissionError`` on macOS means only zombies or only another
-        user's members are left, so ``ps`` tells them apart.
+        Linux answers signal 0 for zombies too, so it scans ``/proc``; a
+        process is live while any thread in ``/proc/<pid>/task`` is not a
+        zombie, even when its main thread has exited. A ``PermissionError``
+        on macOS means only zombies or only another user's members are left,
+        so ``ps`` tells them apart.
 
     Examples
     --------
@@ -202,25 +207,87 @@ def _live_in_ps(pgid: int) -> bool:
     return False
 
 
-def _live_in_proc(pgid: int, proc: Path) -> bool:
-    """Scan ``<proc>/<pid>/stat`` for a process of group ``pgid`` that is not a zombie."""
+class _CannotTell(Exception):
+    """A ``/proc`` entry exists but cannot be read."""
+
+
+def _read_proc(path: Path) -> bytes:
+    """Read one ``/proc`` file."""
+    return path.read_bytes()
+
+
+def _list_proc(path: Path) -> list[str]:
+    """List one ``/proc`` directory."""
+    return os.listdir(path)
+
+
+def _stat_fields(path: Path) -> list[bytes] | None:
+    """Return the ``stat`` fields after the last ``)``, or None when the task is gone."""
     try:
-        entries = list(os.scandir(proc))
-    except OSError:
-        return True  # cannot tell, so the caller waits its full grace
-    group = str(pgid).encode()
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            with open(os.path.join(entry.path, "stat"), "rb") as stream:
-                data = stream.read()
-        except OSError:
-            continue  # exited while scanning
-        # "pid (comm) state ppid pgrp ...": comm may hold spaces and parentheses.
-        fields = data[data.rfind(b")") + 1 :].split()
-        if len(fields) >= 3 and fields[2] == group and fields[0] not in _DEAD_STATES:
+        data = _read_proc(path)
+    except _GONE:
+        return None
+    except OSError as exc:
+        raise _CannotTell from exc
+    return data[data.rfind(b")") + 1 :].split()  # comm may hold spaces and parentheses
+
+
+def _has_live_thread(pid_dir: Path) -> bool:
+    """Report whether any thread of a process is not a zombie (its main thread may be)."""
+    try:
+        tids = _list_proc(pid_dir / "task")
+    except _GONE:
+        return False
+    except OSError as exc:
+        raise _CannotTell from exc
+    for tid in tids:
+        fields = _stat_fields(pid_dir / "task" / tid / "stat")
+        if fields and fields[0] not in _DEAD_STATES:
             return True
+    return False
+
+
+def _proc_hides_pids(proc: Path) -> bool:
+    """Report whether ``proc`` may leave out other users' processes (``hidepid``)."""
+    try:
+        text = _read_proc(proc / "self" / "mountinfo").decode(errors="replace")
+    except OSError:
+        return True  # cannot tell
+    hides: bool | None = None
+    for line in text.splitlines():
+        head, sep, tail = line.partition(" - ")
+        fields, rest = head.split(), tail.split()
+        is_proc = sep and len(fields) >= 5 and len(rest) >= 3 and rest[0] == "proc"
+        if is_proc and fields[4] == str(proc):  # the last mount on that point is in use
+            options = dict(option.partition("=")[::2] for option in rest[2].split(","))
+            hides = options.get("hidepid", "0") not in {"0", "off"}
+    return True if hides is None else hides
+
+
+def _live_in_proc(pgid: int, proc: Path) -> bool:
+    """
+    Scan ``<proc>`` for a process of group ``pgid`` that has a live thread.
+
+    A process counts as live while any of its threads is not a zombie: when
+    its main thread exits early (``pthread_exit``), ``<pid>/stat`` reads Z but
+    other threads in ``<pid>/task`` still run. The answer is True when the
+    scan cannot tell: an entry that exists but cannot be read, or a ``proc``
+    mounted with ``hidepid``, where another user's member may be unlisted.
+    """
+    try:
+        if _proc_hides_pids(proc):
+            return True
+        group = str(pgid).encode()
+        for pid in _list_proc(proc):
+            if not pid.isdigit():
+                continue
+            fields = _stat_fields(proc / pid / "stat")
+            if fields is None or len(fields) < 3 or fields[2] != group:
+                continue
+            if fields[0] not in _DEAD_STATES or _has_live_thread(proc / pid):
+                return True
+    except (_CannotTell, OSError):
+        return True
     return False
 
 
