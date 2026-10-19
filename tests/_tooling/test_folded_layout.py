@@ -6,6 +6,7 @@ with the materialize sink, so a bad path fails the run that made it.
 
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from traceback import format_exception
@@ -13,13 +14,21 @@ from typing import Any, Never
 
 import pytest
 from _fakes.tools import cand
+from pydantic import ValidationError
 
 from swarm_arena import ScriptTool
 from swarm_arena._errors import ConfigError, NotFound, SoftError
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import FileSet, Goal
-from swarm_arena._model.tooling import CompletedRun, FileRef, ParentRef, RunStatus, ToolOutput
+from swarm_arena._model.tooling import (
+    CompletedRun,
+    FileRef,
+    ParentRef,
+    RunStatus,
+    ToolOutput,
+    ToolRequest,
+)
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
 from swarm_arena._tooling.materialize import collect_output_files, materialize
@@ -514,3 +523,101 @@ def test_collection_reuses_the_stage_layout_without_serializing(
     (tmp_path / "out.txt").write_text("x")
     [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage)
     assert ref.path == "out.txt"
+
+
+# --- Workspace paths are strict UTF-8 (integration fix 3, A0) ---
+
+# The surrogateescape spelling of SCRIPT: the same bytes on disk, another fold_key.
+SCRIPT_BYTES = SCRIPT.encode().decode("ascii", "surrogateescape")
+
+
+def _completed(workspace: Path, status: RunStatus = RunStatus.OK) -> CompletedRun:
+    (workspace / "swarm").mkdir(exist_ok=True)
+    for name in ("stdout.log", "stderr.log"):
+        (workspace / "swarm" / name).touch()
+    when = datetime(2026, 10, 20, tzinfo=UTC)
+    return CompletedRun(
+        returncode=0 if status == RunStatus.OK else None,
+        status=status,
+        stdout_path=workspace / "swarm/stdout.log",
+        stderr_path=workspace / "swarm/stderr.log",
+        started_at=when,
+        ended_at=when,
+    )
+
+
+def test_surrogate_spelling_cannot_overwrite_a_protected_script(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    assert SCRIPT_BYTES == "problem/\udcc5\udca1olver.py"
+    tool = ScriptTool(command=["python", SCRIPT], editable=["problem/*"])
+    goal = {SCRIPT: artifacts.put_bytes(b"HUMAN")}
+    protected = tool._protected(set(goal))
+    edits = {SCRIPT_BYTES: SECRET}
+    # Edit validation: a soft refusal whose text always encodes (the path is escaped).
+    with pytest.raises(SoftError) as soft:
+        validate_edits(
+            edits, root=set(goal), editable=tool.editable(), protected=protected, max_edit_bytes=100
+        )
+    assert str(soft.value) == f"{SCRIPT_BYTES!r}: not valid UTF-8"
+    str(soft.value).encode("utf-8")
+    assert SECRET not in "".join(format_exception(soft.value))
+    # Planning, edit storing, the tool root and every protected-set builder refuse it.
+    attempts: list[Callable[[], object]] = [
+        lambda: _tool_stage(
+            goal_files=goal, editable=tool.editable(), protected=protected, edits=edits
+        ),
+        lambda: put_edits(edits, artifacts),
+        lambda: tool_root(goal, {SCRIPT_BYTES: H}),
+        lambda: validate_edits({}, editable=["**"], protected={SCRIPT_BYTES}, max_edit_bytes=1),
+        lambda: _tool_stage(protected={SCRIPT_BYTES}),
+        lambda: _tool_stage(private_paths={SCRIPT_BYTES}),
+    ]
+    for attempt in attempts:
+        with pytest.raises(ValueError, match="not valid UTF-8") as exc:
+            attempt()
+        assert SECRET not in "".join(format_exception(exc.value))
+    # The sink refuses a bypassed model before it writes anything.
+    stage = Job.Stage.model_construct(root={**goal, SCRIPT_BYTES: artifacts.put_bytes(b"AGENT")})
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        materialize(stage, tmp_path / "ws", artifacts)
+    assert not (tmp_path / "ws").exists()
+
+
+def test_surrogate_output_spelling_fails_the_producing_run(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    stage = Job.Stage(root={SCRIPT: H})
+    (tmp_path / "problem").mkdir()
+    (tmp_path / SCRIPT).write_text(SECRET)  # the bytes a surrogate spelling would name
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        collect_output_files(tmp_path, [SCRIPT_BYTES], artifacts, stage=stage)
+    with pytest.raises(NotFound):
+        artifacts.get_bytes(sha256_hex(SECRET.encode()))
+    # json.loads keeps a \udcXX escape, so a result file can carry the same spelling.
+    result = json.dumps({"data": {"k": SECRET}, "files": [SCRIPT_BYTES]})
+    assert "\\udcc5" in result
+    completed = _completed(tmp_path)
+    (tmp_path / "swarm/result.json").write_text(result)
+    output = tool_output_from_result(tmp_path, completed)
+    assert (output.status, output.data, output.files) == (RunStatus.ERROR, {}, [])
+    log = completed.stderr_path.read_text()
+    assert "not valid UTF-8" in log
+    assert SECRET not in log
+
+
+def test_models_refuse_a_surrogate_path_in_python_mode() -> None:
+    file = {"name": "x", "path": SCRIPT_BYTES, "sha256": H, "size": 1}
+    parent = {"candidate_id": "c1", "run_id": "r", "tool_identity": "T"}
+    builds: list[Callable[[], object]] = [
+        lambda: FileRef.model_validate(file),
+        lambda: ParentRef.model_validate({**parent, "overlay": {SCRIPT_BYTES: H}}),
+        lambda: ParentRef.model_validate({**parent, "files": [file]}),
+        lambda: ToolRequest.model_validate({"parents": [{**parent, "overlay": {SCRIPT_BYTES: H}}]}),
+        lambda: ToolRequest.model_validate({"parents": [{**parent, "files": [file]}]}),
+        lambda: Job.Stage(root={SCRIPT_BYTES: H}),
+        lambda: FileSet(globs=["problem/*"], manifest={SCRIPT_BYTES: H}),
+    ]
+    for build in builds:
+        with pytest.raises(ValidationError, match="value_error"):  # check_relpath, sanitized
+            build()

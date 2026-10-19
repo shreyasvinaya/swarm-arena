@@ -323,3 +323,38 @@ def test_caseless_pairs_are_one_file_on_apfs(tmp_path: Path, first: str, second:
     (tmp_path / first).write_text("x")
     assert (tmp_path / second).exists()
     assert [entry.name for entry in tmp_path.iterdir()] == [first]
+
+
+# --- Workspace paths are strict UTF-8 (integration fix 3, A0) ---
+
+# The surrogateescape spelling of "problem/\N{LATIN SMALL LETTER S WITH CARON}olver.py":
+# os.fsencode gives both the same bytes on disk, but fold_key keeps them apart.
+SURROGATE_SCRIPT = "problem/\udcc5\udca1olver.py"
+
+
+@pytest.mark.parametrize(
+    "path", [SURROGATE_SCRIPT, "\ud800", "a/\udfff/b", "p/\udc80.txt", "p/x\udcff"]
+)
+def test_paths_that_are_not_strict_utf8_are_refused(path: str) -> None:
+    from swarm_arena._tooling.paths import output_paths
+
+    with pytest.raises(ValueError, match="path") as exc:
+        check_relpath(path)
+    assert str(exc.value) == f"path {path!r}: not valid UTF-8"
+    str(exc.value).encode("utf-8")  # the message itself always encodes
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        check_key(path)
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        output_paths([path], effective_files=())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX surrogateescape file names")
+def test_surrogate_spelling_names_the_same_file_but_folds_apart() -> None:
+    import os
+
+    from swarm_arena._tooling.paths import fold_key
+
+    script = "problem/\N{LATIN SMALL LETTER S WITH CARON}olver.py"
+    assert os.fsencode(SURROGATE_SCRIPT) == os.fsencode(script)  # one file on any filesystem
+    assert fold_key(SURROGATE_SCRIPT) != fold_key(script)  # so only check_relpath can stop it
+    assert check_relpath(script) == script

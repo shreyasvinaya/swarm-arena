@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data must be finite JSON` / `details must be finite JSON` validation messages;
   invalid connector output is reported as an execution error.
 
+### Fixed
+
+- Workspace paths must be strict UTF-8. A path with a lone surrogate, such as
+  the `surrogateescape` spelling of a non-ASCII name, is refused everywhere a
+  path is checked (`not valid UTF-8`): it names the same file on disk as the
+  real name but folds to another key, so an edit could replace a protected script.
+
 ### Added
 
 - End-to-end offline test of one tool run, checked and judged through the public API.

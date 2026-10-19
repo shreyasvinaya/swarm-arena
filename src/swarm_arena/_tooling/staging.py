@@ -15,6 +15,7 @@ from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edi
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import (
     PARENT_DATA,
+    _is_utf8,
     check_key,
     check_relpath,
     fold_conflicts,
@@ -93,13 +94,18 @@ def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str:
         raise ValueError(f"{ref.path}: cannot encode tool identity") from None
 
 
+def _shown(path: str) -> str:
+    """Return a path for a message: as written, or its repr when it is not valid UTF-8."""
+    return path if _is_utf8(path) else repr(path)
+
+
 def _layout_collisions(paths: Collection[str], root: AbstractSet[str]) -> dict[str, str]:
     """Report new paths the sink would refuse, in this root or a later parent tree."""
     errors: dict[str, str] = {}
     for first, second in fold_conflicts(dict.fromkeys([*sorted(root), *paths])):
         for path, other in ((first, second), (second, first)):
             if path in paths:
-                errors.setdefault(path, f"folded path collision with {other}")
+                errors.setdefault(path, f"folded path collision with {_shown(other)}")
     for path in parent_data_conflicts(paths):
         errors.setdefault(path, f"folded path collision with parent {PARENT_DATA}")
     return errors
@@ -136,7 +142,11 @@ def validate_edits(
         If any path, protection, collision, glob, size, or stored-reference rule fails.
         Collisions include folded aliases of each other or of ``root``, and a
         path below a top-level directory that folds to ``data.json``, which the
-        edit's later ``parents/<id>/`` tree reserves for the parent's data.
+        edit's later ``parents/<id>/`` tree reserves for the parent's data. A
+        path that is not valid UTF-8 is shown by its ``repr``, so the message
+        always encodes.
+    ValueError
+        If a protected path is invalid.
 
     Examples
     --------
@@ -167,7 +177,7 @@ def validate_edits(
             elif is_stored_edit_ref(content):
                 reason = "content is a stored-edit reference"
         if reason:
-            errors.append(f"{path}: {reason}")
+            errors.append(f"{_shown(path)}: {reason}")
     if errors:
         raise SoftError("\n".join(errors))
 

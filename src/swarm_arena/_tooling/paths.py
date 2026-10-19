@@ -276,8 +276,17 @@ def output_paths(
     return paths
 
 
+def _is_utf8(text: str) -> bool:
+    """Return whether text encodes as strict UTF-8, with no lone surrogate."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def check_relpath(path: str) -> str:
-    """Validate and normalize a relative POSIX workspace path.
+    r"""Validate and normalize a relative POSIX workspace path.
 
     Parameters
     ----------
@@ -293,12 +302,19 @@ def check_relpath(path: str) -> str:
     ------
     ValueError
         If the path is empty, absolute, contains a parent segment or NUL,
-        or uses a reserved top-level name.
+        is not valid UTF-8, or uses a reserved top-level name. A lone
+        surrogate (U+D800 to U+DFFF), such as the ``surrogateescape``
+        spelling of a non-ASCII name, is not valid UTF-8: it names the same
+        bytes on disk as the real name, but ``fold_key`` keeps the two apart.
 
     Examples
     --------
     >>> check_relpath("./problem//run.py")
     'problem/run.py'
+    >>> check_relpath("problem/\udcc5\udca1olver.py")
+    Traceback (most recent call last):
+    ...
+    ValueError: path 'problem/\udcc5\udca1olver.py': not valid UTF-8
     """
     parts = PurePosixPath(path).parts
     reason: str | None = None
@@ -310,6 +326,8 @@ def check_relpath(path: str) -> str:
         reason = "contains '..'"
     elif "\x00" in path:
         reason = "contains NUL"
+    elif not _is_utf8(path):
+        reason = "not valid UTF-8"
     elif fold_key(parts[0]) in RESERVED:
         reason = f"uses the reserved name {parts[0]!r}"
     if reason is not None:
