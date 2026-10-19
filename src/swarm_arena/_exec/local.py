@@ -421,12 +421,19 @@ class _JobRun:
             return None
 
     def _stopped_output(self, status: RunStatus) -> ToolOutput:
-        """Stamp the stop on the output: the stop status and ``partial=True``, always."""
+        """
+        Stamp the stop on the output: the stop status, and whether anything was kept.
+
+        ``partial`` is True only when the collect kept data or files (spec §5:
+        if no valid result exists, the data is empty). A failed, abandoned, or
+        invalid collect gives an empty output with ``partial=False``.
+        """
         if self._output is None:
             if self._provisional is not None:  # a collect was tried and gave nothing
                 note_in_log(self._stderr, "no partial output: collect failed or timed out")
-            return ToolOutput(status=status, partial=True)
-        return self._output.model_copy(update={"status": status, "partial": True})
+            return ToolOutput(status=status)
+        kept = bool(self._output.data or self._output.files)
+        return self._output.model_copy(update={"status": status, "partial": kept})
 
     def _read_log(self, rel: str) -> bytes:
         """Read the last ``max_log_bytes`` of a regular log; anything else is empty."""
@@ -673,9 +680,12 @@ class LocalExecutor(Executor):
         that raises, or returns anything but a ``ToolOutput`` that passes
         validation again (``model_copy`` and ``model_construct`` skip it), is a
         collect failure: status ERROR after a normal exit, with the reason in
-        the stderr log. A stopped run's output always has the stop status and
-        ``partial=True``, with empty data when collect gave nothing: after a
-        timeout it is the output collected before SIGKILL. On a cancel after
+        the stderr log. A stopped run's output has the stop status: after a
+        timeout it is the output collected before SIGKILL, with
+        ``partial=True`` only when that collect kept data or files. When
+        collect failed, timed out, or gave an invalid result, the output is
+        empty with ``partial=False``, and a note goes to the stderr log. On a
+        cancel after
         the start handshake, ``job.on_partial`` gets the best output there is
         (status CANCELLED), also when the tool had already exited and its
         collect was still running. A command

@@ -50,8 +50,12 @@ must be owned by you or root, and not writable by group or others unless sticky
 (like `/tmp`). The command starts only after `Job.on_started` returns.
 
 On a timeout or a cancel, the group gets SIGTERM, then `grace_s`, then `collect`
-for the partial output, then SIGKILL. The kept output gets the stop status and
-`partial=True`. A blocked `collect` delays the SIGKILL by at most
+for the partial output, then SIGKILL. The output gets the stop status, and
+`partial=True` only when the collect kept data or files. When collect failed,
+timed out, or gave an invalid result, the data is empty and `partial=False`.
+A `Tool.collect` must return a valid `ToolOutput`: anything else, or data that is
+not finite JSON, gives status `error` with a note in the stderr log (a stopped run
+keeps its stop status). A blocked `collect` delays the SIGKILL by at most
 `BEFORE_KILL_TIMEOUT_S` (30 s) after the grace period: at that deadline the
 supervisor kills the group, and the collect is abandoned and not tried again.
 Collect runs in a daemon thread, so an abandoned one never keeps the interpreter

@@ -362,8 +362,7 @@ async def test_blocked_collect_cannot_stop_kill(
             out = await local_executor.submit(
                 blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2)
             )
-        # Every stopped run is stamped partial=True, also when collect gave nothing (ruling K3).
-        assert (out.status, out.partial, out.data) == (RunStatus.TIMEOUT, True, {})
+        assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
         assert wait_until(lambda: not pid_alive(int((tmp_path / "pid").read_text())), 5)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
@@ -581,7 +580,7 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     await cancel_when(lambda: local_executor.submit(job), collecting)
     [out] = got
     assert out.status is RunStatus.CANCELLED
-    assert (out.partial, out.data) == (True, {"v": 7} if kept else {})
+    assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
     assert out.started_at is not None
     assert out.ended_at is not None
     assert out.started_at <= out.ended_at
@@ -1126,15 +1125,44 @@ async def test_collect_must_return_a_valid_tool_output(
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
         await cancel_when(lambda: local_executor.submit(job), ready_file(tmp_path / "ws"))
         [out] = got
-        expected = (RunStatus.CANCELLED, True)
+        status = RunStatus.CANCELLED
     elif path == "timeout":
         code = "import time; time.sleep(60)"
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=0.5, grace_s=0.2)
         out = await local_executor.submit(job)
-        expected = (RunStatus.TIMEOUT, True)
+        status = RunStatus.TIMEOUT
     else:
         out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=OkCollectTool))
-        expected = (RunStatus.ERROR, False)
-    assert (out.status, out.partial, out.data, out.files) == (*expected, {}, [])
+        status = RunStatus.ERROR
+    # Nothing valid was kept, so partial is False on every path (fix round 3 ruling).
+    assert (out.status, out.partial, out.data, out.files) == (status, False, {}, [])
     assert b"collect failed: Tool.collect() did not return a ToolOutput" in log(tmp_path, out, 2)
     assert out.started_at is not None
+
+
+@pytest.mark.parametrize(
+    ("result", "partial"),
+    [
+        (None, False),  # no result.json: the valid output keeps no data
+        ("{'data': {}, 'files': ['out/x.txt']}", True),  # a file is kept, so it is partial
+        ("{'data': {'step': 3}}", True),
+    ],
+)
+async def test_stopped_run_is_partial_only_when_something_is_kept(
+    local_executor: LocalExecutor, tmp_path: Path, result: str | None, partial: bool
+) -> None:  # fix round 3: partial=True only when the collect kept data or files
+    write = "" if result is None else WRITE.format(result) + "; "
+    code = (
+        "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x'); "
+        + write
+        + "import time; time.sleep(60)"
+    )
+    out = await local_executor.submit(tool_job(tmp_path, code, timeout_s=0.5, grace_s=0.2))
+    assert (out.status, out.partial) == (RunStatus.TIMEOUT, partial)
+    kept = (out.data, [ref.path for ref in out.files])
+    if result is None:
+        assert kept == ({}, [])
+    elif partial and not out.data:
+        assert kept == ({}, ["out/x.txt"])
+    else:
+        assert kept == ({"step": 3}, [])
