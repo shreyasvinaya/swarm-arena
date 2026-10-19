@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
-from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._exec.local import _NOT_AN_OUTPUT, LocalExecutor
 from swarm_arena._model.base import _sanitize_validation_error
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
@@ -273,10 +273,13 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     """Assert the executor's output and the Tool methods that read an output."""
     if not isinstance(out, ToolOutput):
         raise _fail("Executor.submit() must return a ToolOutput")
+    message = "Tool.collect() must return a valid ToolOutput (data must be finite JSON)"
+    # LocalExecutor turns an invalid collect result into status error with this note.
+    if out.status == RunStatus.ERROR and _NOT_AN_OUTPUT in _stderr_tail(out):
+        raise _fail(message)
     try:  # model_copy and model_construct skip validation, for example of finite data
         ToolOutput.model_validate(out.model_dump(warnings=False))
     except Exception:
-        message = "Tool.collect() must return a valid ToolOutput (data must be finite JSON)"
         raise _fail(message) from None
     store = open_store(_artifact_root())
     for file in out.files:
@@ -419,9 +422,11 @@ async def check_tool(
     )
     async with _executor(executor) as runner:
         out = await runner.submit(job)
+    # A contract failure raises first; a plain failed run is only reported.
+    checked = await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
     for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
-    return await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
+    return checked
 
 
 async def check_check(
