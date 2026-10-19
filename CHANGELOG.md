@@ -22,3 +22,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Executor` ABC and `Job` (`swarm_arena.executor`).
 - `LocalExecutor`: process-group supervision, launcher handshake, env allowlist, rlimits, and logs by hash.
 - `Check` and `Judge` ABCs with `CheckContext.execute` and score stamping.
+- `FunctionTool`: a module-level Python function run in a subprocess.

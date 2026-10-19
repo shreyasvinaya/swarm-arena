@@ -241,3 +241,69 @@ class RecordingExecutor(Executor):
 
     async def aclose(self) -> None:
         return None
+
+
+# --- Task 18 ---
+
+
+def gradient_descent(lr: float, steps: int, x0: float = -1.5, y0: float = 2.0) -> dict[str, float]:
+    """Minimize the Rosenbrock function with plain gradient descent."""
+    x, y = x0, y0
+    for _ in range(steps):
+        dx = 2 * (x - 1) - 400 * x * (y - x * x)
+        dy = 200 * (y - x * x)
+        x, y = x - lr * dx, y - lr * dy
+    return {"x": x, "y": y, "f": (1 - x) ** 2 + 100 * (y - x * x) ** 2}
+
+
+def add(a: int, b: int = 1) -> dict[str, int]:
+    """Add two numbers."""
+    return {"sum": a + b}
+
+
+def not_a_dict() -> list[int]:
+    return [1]
+
+
+def boom() -> dict[str, int]:
+    raise RuntimeError("boom")
+
+
+def nan_result() -> dict[str, float]:
+    return {"n": float("nan")}
+
+
+async def coro() -> dict[str, int]:
+    return {}
+
+
+def star(*xs: int) -> dict[str, int]:
+    return {"sum": sum(xs)}
+
+
+def unannotated(x) -> dict[str, int]:  # noqa: ANN001
+    return {"x": x}
+
+
+def keyword_only(*, value: int = 2) -> dict[str, int]:
+    return {"value": value}
+
+
+def positional_only(value: int, /) -> dict[str, int]:
+    return {"value": value}
+
+
+def star_keywords(**values: int) -> dict[str, int]:
+    return values
+
+
+def nested_input(values: dict[str, int]) -> dict[str, int]:
+    return values
+
+
+def secret_error(value: str) -> dict[str, int]:
+    raise RuntimeError(value)
+
+
+def non_json_result() -> dict[str, Any]:
+    return {"value": {1, 2}}

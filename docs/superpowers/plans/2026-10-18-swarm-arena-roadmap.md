@@ -739,9 +739,12 @@ class FunctionTool(Tool):
         timeout_s: float | None = None
         grace_s: float = 10.0
     def __init__(self, function: "str | Callable[..., Any] | FunctionTool.Config", /, **fields: Any) -> None: ...
-    # command(): [sys.executable, "-m", "swarm_arena.run_function", <function>], with PYTHONPATH in Job.env (non-secret)
-    # set to the import root of the function's module (the sys.path entry it was loaded from) [plan], so the subprocess
-    # imports what the driver imported. Inputs are validated by a model built from the function's annotated parameters,
+    # command(): `python -P -m swarm_arena.run_function --import-root <dir> <function>`
+    # (`-P` suppresses only the implicit cwd/script-directory `sys.path` entry; explicit `PYTHONPATH`
+    # entries still apply; the launcher bootstrap itself uses `-I`) [plan], with `<dir>` the `sys.path`
+    # entry the module was loaded from, computed by `command()` next to the tool, so the subprocess
+    # imports what the driver imported; no `Job.env` entry is needed.
+    # Inputs are validated by a model built from the function's annotated parameters,
     # so the driver imports the function (a recorded exception to §4.3, R5.4); the return value must be a JSON object → data.
 
 # _tooling/script_tool.py — M1a
@@ -1283,7 +1286,7 @@ class Job:
     timeout_s: float | None
     grace_s: float
     resources: Resources
-    env: Mapping[str, str]                      # non-secret values (SWARM_ARENA_*, gateway URLs, FunctionTool PYTHONPATH)
+    env: Mapping[str, str]                      # non-secret values (SWARM_ARENA_*, gateway URLs)
     secret_env: tuple[str, ...]                 # names resolved on the node
     secrets_file: str | None
     artifact_root: str
