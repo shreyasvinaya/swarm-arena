@@ -5,8 +5,8 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, Field, ModelWrapValidatorHandler, ValidationError, model_validator
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
-from swarm_arena._model.base import LLMRole
-from swarm_arena._model.limits import Limits, _safe_location, _SafeModel
+from swarm_arena._model.base import LLMRole, _SafeModel
+from swarm_arena._model.limits import Limits, _safe_location
 
 
 def _sanitize_config(

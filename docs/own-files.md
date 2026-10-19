@@ -105,7 +105,21 @@ inputs = script.get_input_model()(epochs=20)
 Use `get_input_model()` for the instance's parameter schema; the class-level
 `input_model` is an empty placeholder. Configuration accepts either a
 `ScriptTool.Config` positional argument or keyword fields, and rejects unknown
-fields. Snapshots are prepared separately before staging.
+fields. Invalid settings raise a sanitized `pydantic.ValidationError`; building
+through `Ref.build()` instead raises `ConfigError`. Unknown config keys appear as
+`<field>`, and nested error locations as `<…>`. Commands must have at least one
+argument, `env` contains variable names such as `API_KEY` (matching
+`[A-Za-z_][A-Za-z0-9_]*`), `timeout_s` is positive when set, and `grace_s` is
+nonnegative. These constraints are checked when the config is constructed.
+Snapshots are prepared separately before staging.
+
+Configuration, parameter, and file-action input errors hide rejected values,
+including malformed JSON in `model_validate_json()` and the resulting
+`ValidationError.errors()` / `.json()` details. For example,
+`ScriptTool(command=["x"], timeout_s=-1)` reports the `timeout_s` field and the
+`greater_than` error code without the rejected timeout. Invalid parameter
+schemas raise `ConfigError` retaining the property path and keyword identifiers,
+such as `script_params.lr` and `minimum`, while omitting configured values.
 
 The command runs in the staged workspace and reads its parameters from
 `swarm/request.json`. It writes a tool envelope such as

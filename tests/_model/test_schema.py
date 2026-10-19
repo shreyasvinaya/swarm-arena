@@ -54,7 +54,7 @@ def test_enum_default_and_array_items() -> None:
         ({"type": "integer", "default": "x"}, "default"),
         ({"type": "string", "minimum": 1}, "minimum"),
         ({"description": "no type"}, "type or enum"),
-        ({"type": "object"}, "type 'object'"),
+        ({"type": "object"}, "unsupported type"),
     ],
 )
 def test_rejected_schemas(prop: dict[str, Any], match: str) -> None:
@@ -316,3 +316,32 @@ def test_invalid_default_errors_hide_secret_values_and_exception_chain(
         assert sensitive not in rendered
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__suppress_context__
+
+
+@pytest.mark.parametrize("keyword", ["type", "pattern", "minimum", "default", "enum"])
+def test_compile_errors_hide_values_and_preserve_identifiers(keyword: str) -> None:
+    secret = "SECRET_SENTINEL_schema_compile"
+    schemas = {
+        "type": {"type": secret},
+        "pattern": {"type": "string", "pattern": "(" + secret},
+        "minimum": {"type": "number", "minimum": secret},
+        "default": {"type": "integer", "default": secret},
+        "enum": {"type": "integer", "enum": [secret]},
+    }
+    with pytest.raises(ValueError, match=r"P\.lr") as caught:
+        compile_object_schema("P", {"lr": schemas[keyword]})
+    error = caught.value
+    assert "P.lr" in str(error)
+    assert keyword in str(error)
+    for diagnostic in (
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(getattr(error, "__notes__", ())),
+        "".join(traceback.format_exception(error)),
+    ):
+        assert secret not in diagnostic
+    assert error.__cause__ is None
+    if isinstance(error, ValidationError):
+        assert secret not in repr(error.errors())
+        assert secret not in error.json()

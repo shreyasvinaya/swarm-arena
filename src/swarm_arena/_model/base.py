@@ -28,6 +28,12 @@ class FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+class _SafeModel(FrozenModel):
+    """Hide rejected values in validation and frozen-assignment messages."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+
 class StoredModel(FrozenModel):
     """
     Upgrade stored data before validating its fields.

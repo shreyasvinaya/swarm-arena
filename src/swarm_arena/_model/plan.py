@@ -13,10 +13,10 @@ from pydantic import (
 )
 
 from swarm_arena._errors import ConfigError
-from swarm_arena._model.base import JsonValue, Origin, StoredModel
+from swarm_arena._model.base import JsonValue, Origin, StoredModel, _SafeModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal, _Slug
-from swarm_arena._model.limits import Limits, _SafeModel, _sanitize_human_validation
+from swarm_arena._model.limits import Limits, _sanitize_human_validation
 from swarm_arena._model.ref import Ref, RefField, unique_names
 from swarm_arena._model.toml_io import dumps_toml, read_toml
 

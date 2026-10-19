@@ -28,6 +28,10 @@ _KEYWORDS = {"type", "enum", "items", "default", "description", *_BOUNDS, *_STRI
 _TYPES = {"string": str, "integer": int, "number": float, "boolean": bool}
 
 
+class _SchemaError(ValueError):
+    """Identify compiler diagnostics containing only schema identifiers and fixed reasons."""
+
+
 def _validate_enum(
     value: Any,
     handler: ValidatorFunctionWrapHandler,
@@ -44,14 +48,14 @@ def _validate_enum(
     return validated
 
 
-def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo]:
+def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo]:
     """Compile a property or array item and validate its declared default."""
     for keyword in schema:
         if keyword not in _KEYWORDS:
-            raise ValueError(f"{path}: unsupported JSON-schema keyword {keyword!r}")
+            raise _SchemaError(f"{path}: unsupported JSON-schema keyword {keyword!r}")
     kind = schema.get("type")
     if kind is None and "enum" not in schema:
-        raise ValueError(f"{path}: expected type or enum")
+        raise _SchemaError(f"{path}: expected type or enum")
     annotation: Any
     if kind == "array":
         item_type = (
@@ -60,22 +64,24 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
         annotation = list[item_type]
     elif kind is None:
         annotation = Any
-    elif kind in _TYPES:
+    elif isinstance(kind, str) and kind in _TYPES:
         annotation = _TYPES[kind]
     else:
-        raise ValueError(f"{path}: unsupported type {kind!r}")
+        raise _SchemaError(f"{path}: unsupported type")
     if "items" in schema and kind != "array":
-        raise ValueError(f"{path}: items requires type 'array'")
+        raise _SchemaError(f"{path}: items requires type 'array'")
     if "enum" in schema:
         choices = schema["enum"]
         if not isinstance(choices, list) or not choices:
-            raise ValueError(f"{path}: enum must be a non-empty list")
+            raise _SchemaError(f"{path}: enum must be a non-empty list")
         adapter = TypeAdapter(annotation, config=ConfigDict(strict=True)) if kind else None
         if adapter is not None:
             try:
                 choices = [adapter.validate_python(choice, strict=True) for choice in choices]
             except ValidationError:
-                raise ValueError(f"{path}: enum member does not match the declared type") from None
+                raise _SchemaError(
+                    f"{path}: enum member does not match the declared type"
+                ) from None
         # Enum values are runtime schema data rather than static type arguments.
         literal = cast(Any, Literal)[tuple(choices)]
         annotation = Annotated[
@@ -86,20 +92,19 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
     for keyword, constraint in _BOUNDS.items():
         if keyword in schema:
             if kind not in ("integer", "number"):
-                raise ValueError(f"{path}: {keyword} requires type 'integer' or 'number'")
+                raise _SchemaError(f"{path}: {keyword} requires type 'integer' or 'number'")
             constraints[constraint] = schema[keyword]
     for keyword, constraint in _STRINGS.items():
         if keyword in schema:
             if kind != "string":
-                raise ValueError(f"{path}: {keyword} requires type 'string'")
+                raise _SchemaError(f"{path}: {keyword} requires type 'string'")
             constraints[constraint] = schema[keyword]
     annotation = Annotated[annotation, Field(description=schema.get("description"), **constraints)]
+    adapter = TypeAdapter(annotation, config=ConfigDict(strict=True))
     default = schema.get("default", ...)
     if "default" in schema:
         try:
-            default = TypeAdapter(annotation, config=ConfigDict(strict=True)).validate_python(
-                default
-            )
+            default = adapter.validate_python(default)
         except ValidationError as err:
             reasons = ", ".join(
                 error["type"]
@@ -107,9 +112,25 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
                     include_input=False, include_url=False, include_context=False
                 )
             )
-            raise ValueError(f"{path}: default does not match the schema ({reasons})") from None
+            raise _SchemaError(f"{path}: default does not match the schema ({reasons})") from None
     field = cast(FieldInfo, Field(default=default))
     return annotation, field
+
+
+def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo]:
+    """Preserve safe diagnostics and replace native schema errors with keyword identifiers."""
+    try:
+        return _compile_field_impl(path, schema)
+    except _SchemaError:
+        raise
+    except Exception:
+        keywords = (
+            ", ".join(key for key in schema if isinstance(key, str))
+            if isinstance(schema, Mapping)
+            else ""
+        )
+        suffix = f" (keywords: {keywords})" if keywords else ""
+        raise _SchemaError(f"{path}: invalid schema{suffix}") from None
 
 
 def compile_object_schema(
@@ -151,7 +172,7 @@ def compile_object_schema(
     fields: dict[str, Any] = {}
     for prop, schema in properties.items():
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", prop):
-            raise ValueError(f"{name}.{prop}: invalid property name")
+            raise _SchemaError(f"{name}.{prop}: invalid property name")
         fields[prop] = _compile_field(f"{name}.{prop}", schema)
     return create_model(
         name, __config__=ConfigDict(extra="forbid", strict=True, frozen=True), **fields

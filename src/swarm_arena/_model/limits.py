@@ -5,7 +5,6 @@ from typing import Annotated, Any, LiteralString, Union, get_args, get_origin
 
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
     ModelWrapValidatorHandler,
     ValidationError,
@@ -13,14 +12,8 @@ from pydantic import (
 )
 from pydantic_core import ErrorType, InitErrorDetails, PydanticCustomError
 
-from swarm_arena._model.base import FrozenModel
+from swarm_arena._model.base import _SafeModel
 from swarm_arena._model.tooling import Estimate
-
-
-class _SafeModel(FrozenModel):
-    """Hide rejected values in validation and frozen-assignment messages."""
-
-    model_config = ConfigDict(hide_input_in_errors=True)
 
 
 def _safe_location(
