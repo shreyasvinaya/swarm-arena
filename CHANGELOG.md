@@ -15,3 +15,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Result types (`Candidate`, `Score`, `CheckResult`, `Learning`, `LLMCall`, `AgentStatus`) and the A2A v1.0.1 types of `swarm_arena.protocol`.
 - Internal write-once local storage and SHA-256-addressed artifacts with verified retrieval.
 - `Tool` ABC and `Action`; the `swarm/result.json` contract.
+- `Plan` and its specs with TOML load and dump, and `Limits` with the §8.1 defaults.

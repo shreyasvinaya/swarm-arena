@@ -29,6 +29,17 @@ PUBLIC: dict[str, list[str]] = {
 }
 PUBLIC["swarm_arena"] += ["Ref"]
 PUBLIC["swarm_arena"] += ["Goal"]
+PUBLIC["swarm_arena"] += [
+    "Plan",
+    "PartSpec",
+    "TeamSpec",
+    "AgentSpec",
+    "RoundSpec",
+    "ConvergeSpec",
+    "Limits",
+    "Resources",
+]
+PUBLIC["swarm_arena.planning"] += ["FlowSpec"]
 PUBLIC["swarm_arena.board"] += ["GoalKey"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",

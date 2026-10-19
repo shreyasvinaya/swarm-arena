@@ -7,11 +7,33 @@ on answers you can prove.
 
 from swarm_arena._facade import publish as _publish
 from swarm_arena._model.goal import Goal
+from swarm_arena._model.limits import Limits
+from swarm_arena._model.plan import (
+    AgentSpec,
+    ConvergeSpec,
+    PartSpec,
+    Plan,
+    Resources,
+    RoundSpec,
+    TeamSpec,
+)
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Score
 from swarm_arena._version import __version__ as __version__
 
 __all__: list[str] = ["Goal", "Ref", "Score"]
+__all__: list[str] = [
+    "AgentSpec",
+    "ConvergeSpec",
+    "Goal",
+    "Limits",
+    "PartSpec",
+    "Plan",
+    "Ref",
+    "Resources",
+    "RoundSpec",
+    "TeamSpec",
+]
 
 _publish(__name__, __all__)
 
