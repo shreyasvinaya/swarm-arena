@@ -374,6 +374,8 @@ class PanelJudge(Judge):
 
     def models(self) -> tuple[str, ...]:
         return tuple(self.config.models)
+
+
 def raises_error() -> dict[str, int]:
     raise RuntimeError("boom")
 
