@@ -12,3 +12,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project scaffold: package, `swarm-arena --version`, CI, and docs skeleton.
 - `Ref`: components referenced by import path, with validated `Config`.
 - `Goal`, `GoalKey`, and the tool-run data types of `swarm_arena.tool`.
+- Result types (`Candidate`, `Score`, `CheckResult`, `Learning`, `LLMCall`, `AgentStatus`) and the A2A v1.0.1 types of `swarm_arena.protocol`.

@@ -8,9 +8,10 @@ on answers you can prove.
 from swarm_arena._facade import publish as _publish
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref
+from swarm_arena._model.results import Score
 from swarm_arena._version import __version__ as __version__
 
-__all__: list[str] = ["Goal", "Ref"]
+__all__: list[str] = ["Goal", "Ref", "Score"]
 
 _publish(__name__, __all__)
 

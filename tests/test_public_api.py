@@ -43,6 +43,20 @@ PUBLIC["swarm_arena.tool"] += [
     "RunStatus",
 ]
 
+PUBLIC["swarm_arena"] += ["Score"]
+PUBLIC["swarm_arena.scoring"] += ["CheckResult"]
+PUBLIC["swarm_arena.board"] += ["Candidate", "Learning", "LLMCall"]
+PUBLIC["swarm_arena.manager"] += ["AgentStatus"]
+PUBLIC["swarm_arena.protocol"] += [
+    "Message",
+    "Part",
+    "Artifact",
+    "Task",
+    "TaskStatus",
+    "TaskState",
+    "Role",
+]
+
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_all_snapshot(module: str) -> None:

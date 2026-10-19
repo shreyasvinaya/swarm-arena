@@ -1,9 +1,11 @@
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
 from swarm_arena._model.ref import Configurable
+from swarm_arena._model.results import Candidate
+from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest
 
 # --- Task 5 ---
 
@@ -29,3 +31,20 @@ class NoNameWidget(Configurable):
 # --- Task 6 ---
 
 GOAL = Goal(id="g", namespace="n")
+
+
+# --- Task 7 ---
+
+
+def cand(*, data: dict[str, Any] | None = None, **fields: Any) -> Candidate:
+    defaults: dict[str, Any] = {
+        "id": "c1",
+        "run_id": "r",
+        "goal_id": "g",
+        "team": "t",
+        "agent": "a",
+        "round": 1,
+        "request": ToolRequest(),
+        "output": ToolOutput(status=RunStatus.OK, data=data or {}),
+    }
+    return Candidate(**{**defaults, **fields})
