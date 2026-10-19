@@ -1,3 +1,4 @@
+import contextvars
 import threading
 
 import anyio
@@ -63,3 +64,27 @@ def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPa
     thread.join(5)
     assert not thread.is_alive()
     assert errors == []
+
+
+_VALUE: contextvars.ContextVar[str] = contextvars.ContextVar("value", default="unset")
+
+
+async def test_runs_in_a_copy_of_the_callers_context() -> None:  # IF3 A3
+    def work() -> str:
+        seen = _VALUE.get()
+        _VALUE.set("changed in the thread")
+        return seen
+
+    token = _VALUE.set("from the caller")
+    try:
+        assert await run_sync_daemon(work) == "from the caller"
+        assert _VALUE.get() == "from the caller"  # a copy: the thread's change stays there
+    finally:
+        _VALUE.reset(token)
+
+
+async def test_from_thread_is_not_available_in_the_daemon_thread() -> None:  # the docstring says so
+    import anyio.from_thread
+
+    with pytest.raises(anyio.NoEventLoopError):
+        await run_sync_daemon(anyio.from_thread.run_sync, lambda: 1)

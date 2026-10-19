@@ -64,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LocalExecutor` removes a workspace whose tool locked the workspace root, and
   its fallback remover changes a directory's mode only when an open, unlink or
   rmdir in it is refused.
+- `FunctionTool` refuses a `sys.modules` entry without an import spec with the
+  same identifier-only `TypeError` as an alias, and finds the import root of a
+  package whose `__init__` is a sourceless `.pyc` or a compiled extension.
+- `ProgramJudge` reports a returned Score that fails validation again as
+  `invalid Score returned` (a raise stays `<Type>: scoring function raised`),
+  makes each candidate's deep copy in the daemon thread, off the event loop, and
+  runs the function in a copy of the caller's context, so context variables
+  carry over. A `Lexicographic` member config error names the member path once.
 
 ### Added
 

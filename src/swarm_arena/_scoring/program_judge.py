@@ -1,7 +1,7 @@
 """Score candidates using trusted synchronous Python functions."""
 
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 from typing import ClassVar, cast
 
@@ -21,14 +21,39 @@ def _is_async_callable(fn: object) -> bool:
     )
 
 
+def _score_copy(fn: Callable[[Goal, Candidate], Score], goal: Goal, candidate: Candidate) -> Score:
+    """Score a deep copy of the candidate; this runs in the daemon thread, off the loop."""
+    return fn(goal, candidate.model_copy(deep=True))
+
+
+def _discard_awaitable(result: object) -> None:
+    """Close or cancel an awaitable a sync scoring function returned, so it never warns."""
+    close = getattr(result, "close", None)
+    if callable(close):
+        close()
+        return
+    cancel = getattr(result, "cancel", None)
+    if callable(cancel):
+        cancel()
+        return
+    iterator = cast(Awaitable[object], result).__await__()
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 class ProgramJudge(Judge):
     """
     Score candidates with an importable synchronous Python function.
 
     Functions run in daemon threads in the driver process with no time limit.
     Cancellation stops waiting promptly; the abandoned function keeps running.
-    Each call receives a deep copy of its candidate. Exceptions, incorrect
-    return types, and invalid keys become per-candidate judge errors. Exception
+    Each call receives a deep copy of its candidate, made in that thread, so a
+    large output never stalls the event loop. The function sees the caller's
+    context variables (a copy), but ``anyio.from_thread`` is not available to
+    it. Exceptions (``<Type>: scoring function raised``), incorrect return
+    types, invalid keys, and a returned Score that fails validation again
+    (``invalid Score returned``) become per-candidate judge errors. Exception
     messages are omitted because they can contain candidate or configuration data.
     Construction stores the import path; preflight or first judging loads it.
 
@@ -112,8 +137,21 @@ class ProgramJudge(Judge):
 
         Examples
         --------
-        >>> from swarm_arena import ProgramJudge
-        >>> ProgramJudge('my_judges:quality').preflight()  # doctest: +SKIP
+        An in-memory module stands in for your own ``my_judges.py``:
+
+        >>> import sys, types
+        >>> from swarm_arena import ProgramJudge, Score
+        >>> def quality(goal, candidate):
+        ...     return Score.maximize(1.0)
+        >>> module = types.ModuleType('preflight_demo')
+        >>> module.quality = quality
+        >>> sys.modules['preflight_demo'] = module
+        >>> ProgramJudge('preflight_demo:quality').preflight()
+        >>> ProgramJudge('preflight_demo:missing').preflight()
+        Traceback (most recent call last):
+        ...
+        ValueError: cannot import preflight_demo:missing
+        >>> del sys.modules['preflight_demo']
         """
         self._load_function()
 
@@ -160,49 +198,54 @@ class ProgramJudge(Judge):
 
         Examples
         --------
+        An in-memory module stands in for your own ``my_judges.py``:
+
+        >>> import sys, types
         >>> import anyio
-        >>> from swarm_arena import Goal, ProgramJudge
+        >>> from swarm_arena import Goal, ProgramJudge, Score
+        >>> from swarm_arena.board import Candidate
         >>> from swarm_arena.executor import LocalExecutor
         >>> from swarm_arena.scoring import JudgeContext
+        >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+        >>> def quality(goal, candidate):
+        ...     return Score.maximize(candidate.output.data['accuracy'])
+        >>> module = types.ModuleType('judge_demo')
+        >>> module.quality = quality
+        >>> sys.modules['judge_demo'] = module
         >>> goal = Goal(id='g', namespace='demo')
+        >>> candidate = Candidate(
+        ...     id='c1', run_id='r', goal_id='g', team='t', agent='a', round=1,
+        ...     request=ToolRequest(),
+        ...     output=ToolOutput(status=RunStatus.OK, data={'accuracy': 0.9}))
         >>> ctx = JudgeContext(goal=goal, executor=LocalExecutor(), artifact_root='unused')
-        >>> from my_judges import candidate, quality  # doctest: +SKIP
-        >>> judge = ProgramJudge(quality)  # doctest: +SKIP
-        >>> scores = anyio.run(judge.judge, goal, [candidate], ctx)  # doctest: +SKIP
-        >>> scores[0].candidate_id == candidate.id  # doctest: +SKIP
-        True
+        >>> judge = ProgramJudge('judge_demo:quality')
+        >>> [(s.candidate_id, s.key) for s in anyio.run(judge.judge, goal, [candidate], ctx)]
+        [('c1', (0.9,))]
+        >>> del sys.modules['judge_demo']
         """
         fn = self._load_function()
         scores: list[Score] = []
         for candidate in candidates:
             try:
-                result = await run_sync_daemon(fn, goal, candidate.model_copy(deep=True))
+                result = await run_sync_daemon(_score_copy, fn, goal, candidate)
                 if inspect.isawaitable(result):
-                    close = getattr(result, "close", None)
-                    if callable(close):
-                        close()
-                    else:
-                        cancel = getattr(result, "cancel", None)
-                        if callable(cancel):
-                            cancel()
-                        else:
-                            iterator = result.__await__()
-                            close = getattr(iterator, "close", None)
-                            if callable(close):
-                                close()
+                    _discard_awaitable(result)
                     ctx.judge_error(candidate.id, "ProgramJudge needs a sync function")
-                elif not isinstance(result, Score):
-                    ctx.judge_error(
-                        candidate.id, f"returned {type(result).__name__}, expected Score"
-                    )
-                elif not is_finite_score(result):
-                    ctx.judge_error(candidate.id, "score key must be nonempty and finite")
-                else:
-                    scores.append(
-                        Score.model_validate(
-                            {**result.model_dump(warnings=False), "candidate_id": candidate.id}
-                        )
-                    )
+                    continue
             except Exception as error:
                 ctx.judge_error(candidate.id, f"{type(error).__name__}: scoring function raised")
+                continue
+            if not isinstance(result, Score):
+                ctx.judge_error(candidate.id, f"returned {type(result).__name__}, expected Score")
+            elif not is_finite_score(result):
+                ctx.judge_error(candidate.id, "score key must be nonempty and finite")
+            else:
+                try:  # the function returned normally: a refusal here is about its Score
+                    score = Score.model_validate(
+                        {**result.model_dump(warnings=False), "candidate_id": candidate.id}
+                    )
+                except Exception:
+                    ctx.judge_error(candidate.id, "invalid Score returned")
+                else:
+                    scores.append(score)
         return scores

@@ -5,7 +5,6 @@ from typing import ClassVar, cast
 
 from pydantic import Field, JsonValue
 
-from swarm_arena._errors import ConfigError
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel, _validate_config
@@ -103,10 +102,10 @@ class Lexicographic(Judge):
                     raise ValueError(f"cannot import {ref.path}") from None
                 if not issubclass(cls, Judge):
                     raise TypeError(f"cannot build judge {ref.path}: expected Judge subclass")
-                try:
-                    validated = _validate_config(cls.Config, ref.config, where=ref.path)
-                except ConfigError as error:
-                    raise ConfigError(f"cannot build judge {ref.path}: {error}") from None
+                # The sanitized ConfigError names the member path once, as its prefix.
+                validated = _validate_config(
+                    cls.Config, ref.config, where=f"cannot build judge {ref.path}"
+                )
                 try:
                     members.append(cls(validated))
                 except TypeError:
@@ -131,9 +130,22 @@ class Lexicographic(Judge):
 
         Examples
         --------
-        >>> from swarm_arena import ProgramJudge
+        An in-memory module stands in for your own ``my_judges.py``:
+
+        >>> import sys, types
+        >>> from swarm_arena import ProgramJudge, Score
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([ProgramJudge('my_judges:quality')]).preflight()  # doctest: +SKIP
+        >>> def quality(goal, candidate):
+        ...     return Score.maximize(1.0)
+        >>> module = types.ModuleType('lex_preflight_demo')
+        >>> module.quality = quality
+        >>> sys.modules['lex_preflight_demo'] = module
+        >>> Lexicographic([ProgramJudge('lex_preflight_demo:quality')]).preflight()
+        >>> Lexicographic([ProgramJudge('lex_preflight_demo:missing')]).preflight()
+        Traceback (most recent call last):
+        ...
+        ValueError: cannot import lex_preflight_demo:missing
+        >>> del sys.modules['lex_preflight_demo']
         """
         for member in self._get_members():
             member.preflight()
@@ -310,17 +322,34 @@ class Lexicographic(Judge):
 
         Examples
         --------
+        An in-memory module stands in for your own ``my_judges.py``: quality
+        decides first, and lower cost breaks ties.
+
+        >>> import sys, types
         >>> import anyio
-        >>> from swarm_arena import Goal, ProgramJudge
+        >>> from swarm_arena import Goal, ProgramJudge, Score
+        >>> from swarm_arena.board import Candidate
         >>> from swarm_arena.executor import LocalExecutor
         >>> from swarm_arena.scoring import JudgeContext, Lexicographic
+        >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+        >>> def quality(goal, candidate):
+        ...     return Score.maximize(candidate.output.data['accuracy'])
+        >>> def cost(goal, candidate):
+        ...     return Score.minimize(candidate.output.data['usd'])
+        >>> module = types.ModuleType('lex_judge_demo')
+        >>> module.quality, module.cost = quality, cost
+        >>> sys.modules['lex_judge_demo'] = module
         >>> goal = Goal(id='g', namespace='demo')
+        >>> candidate = Candidate(
+        ...     id='c1', run_id='r', goal_id='g', team='t', agent='a', round=1,
+        ...     request=ToolRequest(),
+        ...     output=ToolOutput(status=RunStatus.OK, data={'accuracy': 0.9, 'usd': 2.0}))
         >>> ctx = JudgeContext(goal=goal, executor=LocalExecutor(), artifact_root='unused')
-        >>> from my_judges import candidate  # doctest: +SKIP
-        >>> lex = Lexicographic([ProgramJudge('my_judges:quality'), ProgramJudge('my_judges:cost')])
-        >>> scores = anyio.run(lex.judge, goal, [candidate], ctx)  # doctest: +SKIP
-        >>> scores[0].key  # doctest: +SKIP
+        >>> lex = Lexicographic([ProgramJudge('lex_judge_demo:quality'),
+        ...                      ProgramJudge('lex_judge_demo:cost')])
+        >>> anyio.run(lex.judge, goal, [candidate], ctx)[0].key
         (0.9, -2.0)
+        >>> del sys.modules['lex_judge_demo']
         """
         members = self._get_members()
         by_member: list[dict[str, Score]] = []

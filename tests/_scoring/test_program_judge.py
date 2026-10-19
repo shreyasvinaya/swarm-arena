@@ -1,3 +1,4 @@
+import contextvars
 import inspect
 import threading
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from swarm_arena._scoring.judge import JudgeContext
 from swarm_arena._scoring.program_judge import ProgramJudge
 
 SECRET = "SENTINEL_TASK21_SECRET"
+_REQUEST: contextvars.ContextVar[str] = contextvars.ContextVar("request", default="unset")
 
 
 async def test_scores_each_candidate(judge_ctx: JudgeContext) -> None:
@@ -192,8 +194,59 @@ async def test_invalid_non_key_fields_are_candidate_errors(
         GOAL, [cand(id="bad"), cand(id="good")], judge_ctx
     )
     assert [s.candidate_id for s in scores] == ["good"]
-    assert judge_ctx.errors == {"bad": "ValidationError: scoring function raised"}
+    assert judge_ctx.errors == {"bad": "invalid Score returned"}  # the function did not raise
     assert SECRET not in repr(judge_ctx.errors)
+
+
+async def test_score_subclass_with_an_extra_field_is_an_invalid_score(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:  # IF3 A3: Score forbids extra fields, so re-validation refuses it
+    class TaggedScore(Score):
+        tag: str = SECRET
+
+    tagged = TaggedScore.maximize(1)
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: tagged)
+    assert await ProgramJudge("example:score").judge(GOAL, [cand(id="c")], judge_ctx) == []
+    assert judge_ctx.errors == {"c": "invalid Score returned"}
+    assert SECRET not in repr(judge_ctx.errors)
+
+
+async def test_candidate_copy_is_made_in_the_daemon_thread(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:  # IF3 A3: a deep copy of a large output must not stall the event loop
+    copied_on: list[threading.Thread] = []
+    real_copy = Candidate.model_copy
+
+    def model_copy(self: Candidate, *args: Any, **kwargs: Any) -> Candidate:
+        copied_on.append(threading.current_thread())
+        return real_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(Candidate, "model_copy", model_copy)
+    loop_thread = threading.current_thread()
+    scores = await ProgramJudge(rosen_score).judge(
+        GOAL, [cand(id="c1", data={"f": 1.0}), cand(id="c2", data={"f": 2.0})], judge_ctx
+    )
+    assert [s.candidate_id for s in scores] == ["c1", "c2"]
+    assert len(copied_on) == 2
+    assert all(t is not loop_thread and t.daemon for t in copied_on)
+
+
+async def test_scoring_function_sees_the_callers_context_variables(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:  # IF3 A3: later plans read driver state through ContextVars
+    seen: list[str] = []
+
+    def score(goal: Goal, candidate: Candidate) -> Score:
+        seen.append(_REQUEST.get())
+        return Score.maximize(1)
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: score)
+    token = _REQUEST.set("driver-value")
+    try:
+        await ProgramJudge("example:score").judge(GOAL, [cand(id="c")], judge_ctx)
+    finally:
+        _REQUEST.reset(token)
+    assert seen == ["driver-value"]
 
 
 async def test_scoring_can_be_cancelled_while_daemon_is_blocked(

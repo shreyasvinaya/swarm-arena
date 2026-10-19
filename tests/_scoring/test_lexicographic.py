@@ -279,8 +279,8 @@ def test_member_config_diagnostics_keep_safe_detail(method: str) -> None:
     lex = Lexicographic([Ref(path="_fakes.tools:FixedJudge", config={"value": SECRET})])
     with pytest.raises(ConfigError, match=r"cannot build judge _fakes\.tools:FixedJudge") as caught:
         getattr(lex, method)()
-    assert "value: float_parsing" in str(caught.value)
-    assert "cannot import" not in str(caught.value)
+    assert str(caught.value) == "cannot build judge _fakes.tools:FixedJudge: value: float_parsing"
+    assert str(caught.value).count("_fakes.tools:FixedJudge") == 1  # the path once (IF3 A3)
     assert_secret_absent(caught.value, SECRET)
 
 
