@@ -1318,9 +1318,11 @@ class Executor(ABC):
 class LocalExecutor(Executor):
     class Config(BaseModel):
         max_concurrent: int | None = None       # None → os.cpu_count()
-        workspace_root: str | None = None       # None → tempfile.gettempdir()/swarm-arena
+        workspace_root: str | None = None       # None → tempfile.gettempdir()/swarm-arena-<uid> [plan, per user]
         keep_workspaces: bool = False
         rlimits: bool = True
+        max_log_bytes: int = 8 * 2**20          # [plan] per log; the last max_log_bytes are uploaded, with a note
+        max_output_bytes: int = 256 * 2**20     # [plan] all declared outputs of one run (the §11 Ray cap); over → error
     def __init__(self, config: "LocalExecutor.Config | None" = None, /, **fields: Any) -> None: ...
     # preflight() refuses a non-POSIX platform [plan].
     # [plan, M1a] The executor runs with `Job.timeout_s` and `Job.grace_s` and writes them into `Command.timeout_s` and `Command.grace_s`; the driver computes them with `effective_tool_timeout` and `tool_grace` (`_tooling/tool.py`).
