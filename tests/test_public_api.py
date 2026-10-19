@@ -28,6 +28,20 @@ PUBLIC: dict[str, list[str]] = {
     )
 }
 PUBLIC["swarm_arena"] += ["Ref"]
+PUBLIC["swarm_arena"] += ["Goal"]
+PUBLIC["swarm_arena.board"] += ["GoalKey"]
+PUBLIC["swarm_arena.tool"] += [
+    "Command",
+    "CompletedRun",
+    "ToolRequest",
+    "ParentRef",
+    "ToolOutput",
+    "FileRef",
+    "FileSet",
+    "Usage",
+    "Estimate",
+    "RunStatus",
+]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))

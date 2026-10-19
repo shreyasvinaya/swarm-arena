@@ -2,6 +2,7 @@ from typing import ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from swarm_arena import Goal
 from swarm_arena._model.ref import Configurable
 
 # --- Task 5 ---
@@ -23,3 +24,8 @@ class Widget(Configurable):
 
 class NoNameWidget(Configurable):
     pass
+
+
+# --- Task 6 ---
+
+GOAL = Goal(id="g", namespace="n")
