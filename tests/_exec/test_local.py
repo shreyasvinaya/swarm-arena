@@ -842,6 +842,24 @@ async def test_outputs_over_the_cap_are_an_error(tmp_path: Path) -> None:  # L3
     assert b"out/b.txt crosses max_output_bytes" in log(tmp_path, out, 2)
 
 
+async def test_upload_reads_are_bounded_by_the_cap_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # integration fix 3, A1: collect_output_files gets max_output_bytes
+    monkeypatch.setattr(local._JobRun, "_check_output_sizes", lambda self, files: None)
+    code = (
+        "import os; os.makedirs('out'); open('out/a.txt', 'w').write('a' * 600); "
+        "open('out/b.txt', 'w').close(); os.truncate('out/b.txt', 2**30); "  # sparse 1 GiB
+        + WRITE.format("{'data': {}}")
+    )
+    ex = LocalExecutor(workspace_root=str(tmp_path / "ws"), max_output_bytes=1024)
+    read: list[int] = []
+    with anyio.fail_after(20), count_reads(monkeypatch, read):
+        out = await ex.submit(tool_job(tmp_path, code, tool_cls=UnreadFilesTool))
+    assert (out.status, out.files) == (RunStatus.ERROR, [])
+    assert b"output files not uploaded: out/b.txt crosses the size cap" in log(tmp_path, out, 2)
+    assert sum(read) < 64 * 1024  # out/a.txt and the logs, never the sparse 1 GiB file
+
+
 def remove_tree_flat(top: Path) -> None:
     """
     Remove any tree one level at a time, independent of the code under test.

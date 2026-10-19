@@ -2,17 +2,19 @@
 
 import contextlib
 import errno
+import hashlib
 import json
 import math
 import os
 import stat
+import sys
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, NoReturn
+from typing import Any, ClassVar, Final, NoReturn
 
 from pydantic import Field, ValidationError
 
 from swarm_arena._model.base import StoredModel
-from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.tooling import (
     CompletedRun,
@@ -25,6 +27,12 @@ from swarm_arena._model.tooling import (
 from swarm_arena._tooling.paths import output_paths
 
 _RESULT = "swarm/result.json"
+_CHUNK: Final = 1 << 20
+_MAX_READ: Final = 1 << 30  # one read(2) call; macOS refuses more than INT_MAX
+MAX_RESULT_JSON_BYTES: Final = 16 * 2**20
+"""Most bytes ``read_result_json`` reads from ``swarm/result.json``."""
+MAX_DECLARED_FILES_BYTES: Final = 256 * 2**20
+"""Most bytes of all files one result declares (the ``LocalExecutor`` default cap)."""
 
 
 class ToolResultFile(StoredModel):
@@ -102,9 +110,13 @@ def symlinked_component(base: Path, rel: str) -> str | None:
     return None
 
 
-def read_regular_file(workspace: Path, rel: str) -> bytes:
+def open_regular_file(workspace: Path, rel: str) -> int:
     """
-    Read a regular workspace file without following any symlink component.
+    Open a regular workspace file read-only without following any symlink component.
+
+    Each directory is pinned by its descriptor while the next component is
+    opened with ``O_NOFOLLOW | O_NONBLOCK``, so a parent swapped for a symlink
+    cannot redirect the open, and a FIFO never blocks it.
 
     Parameters
     ----------
@@ -115,18 +127,24 @@ def read_regular_file(workspace: Path, rel: str) -> bytes:
 
     Returns
     -------
-    bytes
-        File contents.
+    int
+        A read-only descriptor of a regular file; the caller closes it.
 
     Raises
     ------
     ValueError
-        If the path escapes the workspace, is missing, contains a symlink,
-        cannot be read, or is not a regular file.
+        ``<rel> is not a regular file`` if the path escapes the workspace, is
+        missing, contains a symlink, cannot be opened, or is not a regular file.
 
     Examples
     --------
-    >>> data = read_regular_file(Path("workspace"), "out.txt")  # doctest: +SKIP
+    >>> import os, tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     size = (Path(tmp) / "out.txt").write_text("hi")
+    ...     fd = open_regular_file(Path(tmp), "out.txt")
+    ...     os.read(fd, 10)
+    ...     os.close(fd)
+    b'hi'
     """
     try:
         parts = PurePosixPath(rel).parts
@@ -144,12 +162,122 @@ def read_regular_file(workspace: Path, rel: str) -> bytes:
                 directory = os.open(part, flags | os.O_DIRECTORY, dir_fd=directory)
                 stack.callback(os.close, directory)
             fd = os.open(parts[-1], flags, dir_fd=directory)
-            with os.fdopen(fd, "rb") as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise ValueError
-                return stream.read()
     except (OSError, ValueError):
         raise ValueError(f"{rel} is not a regular file") from None
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        regular = False
+    if not regular:
+        os.close(fd)
+        raise ValueError(f"{rel} is not a regular file")
+    return fd
+
+
+def _chunks(fd: int, rel: str, max_bytes: int | None, *, step: int | None) -> Iterator[bytes]:
+    """
+    Yield a file's bytes, refusing it unread when ``fstat`` shows it is over the cap.
+
+    Reads go through ``os.read`` and never past ``max_bytes``. Each read asks
+    for ``step`` bytes, or with no step for the size ``fstat`` reported, so a
+    whole file usually arrives in one buffer. A file that grows past the cap
+    after the first check is refused when the cap is reached.
+    """
+    limit = sys.maxsize if max_bytes is None else max_bytes
+    size = os.fstat(fd).st_size
+    if size > limit:
+        raise ValueError(f"{rel} crosses the size cap")
+    total = 0
+    while total < limit:
+        want = step if step is not None else max(size - total, _CHUNK)
+        chunk = os.read(fd, min(want, limit - total, _MAX_READ))
+        if not chunk:
+            return
+        total += len(chunk)
+        yield chunk
+    if os.fstat(fd).st_size > limit:
+        raise ValueError(f"{rel} crosses the size cap")
+
+
+def read_regular_file(workspace: Path, rel: str, *, max_bytes: int | None = None) -> bytes:
+    """
+    Read a regular workspace file without following any symlink component.
+
+    The file is opened through ``open_regular_file``. Its ``fstat`` size is
+    checked before any read: a file over ``max_bytes`` is refused unread, so a
+    sparse file is never read whole, and no read goes past the cap even if
+    the file grows meanwhile.
+
+    Parameters
+    ----------
+    workspace : Path
+        Trusted workspace root.
+    rel : str
+        Relative path, including internal paths such as ``swarm/result.json``.
+    max_bytes : int or None, optional
+        Most bytes to read. Every read of a tool-written file passes a cap;
+        None reads the whole file, for human-authored sources only.
+
+    Returns
+    -------
+    bytes
+        File contents.
+
+    Raises
+    ------
+    ValueError
+        ``<rel> is not a regular file`` if the path escapes the workspace, is
+        missing, contains a symlink, cannot be read, or is not a regular file;
+        ``<rel> crosses the size cap`` if it is larger than ``max_bytes``.
+
+    Examples
+    --------
+    >>> import tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     size = (Path(tmp) / "out.txt").write_text("hello")
+    ...     read_regular_file(Path(tmp), "out.txt", max_bytes=5)
+    b'hello'
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     size = (Path(tmp) / "out.txt").write_text("hello")
+    ...     read_regular_file(Path(tmp), "out.txt", max_bytes=4)
+    Traceback (most recent call last):
+    ...
+    ValueError: out.txt crosses the size cap
+    """
+    fd = open_regular_file(workspace, rel)
+    try:
+        return b"".join(_chunks(fd, rel, max_bytes, step=None))
+    except OSError:
+        raise ValueError(f"{rel} is not a regular file") from None
+    finally:
+        os.close(fd)
+
+
+def _hash_regular_file(workspace: Path, rel: str, *, max_bytes: int) -> tuple[str, int]:
+    """Hash a regular workspace file in chunks; return its SHA-256 digest and size."""
+    fd = open_regular_file(workspace, rel)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        for chunk in _chunks(fd, rel, max_bytes, step=_CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    except OSError:
+        raise ValueError(f"{rel} is not a regular file") from None
+    finally:
+        os.close(fd)
+    return digest.hexdigest(), size
+
+
+def _regular_file_size(workspace: Path, rel: str) -> int:
+    """Return a regular workspace file's ``fstat`` size without reading it."""
+    fd = open_regular_file(workspace, rel)
+    try:
+        return os.fstat(fd).st_size
+    except OSError:
+        raise ValueError(f"{rel} is not a regular file") from None
+    finally:
+        os.close(fd)
 
 
 def _reject(value: str) -> NoReturn:
@@ -182,8 +310,9 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
     Raises
     ------
     ValueError
-        If the file is missing, unsafe, unreadable, invalid JSON, not an object,
-        or contains a non-finite number.
+        If the file is missing, unsafe, unreadable, larger than
+        ``MAX_RESULT_JSON_BYTES`` (16 MiB), invalid JSON, not an object, or
+        contains a non-finite number.
 
     Examples
     --------
@@ -198,7 +327,7 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
         raise ValueError(f"{_RESULT} is missing") from None
     except OSError:
         raise ValueError(f"{_RESULT} is not a regular file") from None
-    raw = read_regular_file(workspace, _RESULT)
+    raw = read_regular_file(workspace, _RESULT, max_bytes=MAX_RESULT_JSON_BYTES)
     try:
         text = raw.decode("utf-8")
         result = json.loads(text, parse_constant=_reject, parse_float=_finite_float)
@@ -247,18 +376,31 @@ def _load_result(workspace: Path) -> tuple[ToolResultFile, list[FileRef]]:
     # The result parser has no original stage. The executor's upload collector
     # performs the full staged-layout check with its required stage argument.
     paths = output_paths(result.files, effective_files=())
+    total = 0
+    for rel in paths:  # every size before any read, so an oversized set is never read
+        total += _regular_file_size(workspace, rel)
+        if total > MAX_DECLARED_FILES_BYTES:
+            raise ValueError(
+                f"declared files are too large: {rel} crosses MAX_DECLARED_FILES_BYTES"
+            )
     files: list[FileRef] = []
-    for rel in paths:
-        data = read_regular_file(workspace, rel)
-        files.append(
-            FileRef(name=PurePosixPath(rel).name, path=rel, sha256=sha256_hex(data), size=len(data))
-        )
+    left = MAX_DECLARED_FILES_BYTES
+    for rel in paths:  # one file at a time, each bounded by what is left of the cap
+        digest, size = _hash_regular_file(workspace, rel, max_bytes=left)
+        left -= size
+        files.append(FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=size))
     return result, files
 
 
 def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
     """
     Collect a tool envelope according to process status and artifact validity.
+
+    Every read is bounded: ``swarm/result.json`` by ``MAX_RESULT_JSON_BYTES``
+    (16 MiB), and the declared files together by ``MAX_DECLARED_FILES_BYTES``
+    (256 MiB). Their sizes are summed before any of them is read, so a result
+    whose files cross the cap is invalid unread; the files are hashed one at a
+    time.
 
     Parameters
     ----------

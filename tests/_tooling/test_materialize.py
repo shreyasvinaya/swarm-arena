@@ -2,7 +2,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 
 import pytest
 
@@ -12,6 +12,8 @@ from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.tooling import FileRef, ParentRef
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files, materialize
+
+CAP = 2**20  # the output cap every collect_output_files call passes
 
 
 # tests/_tooling/test_materialize.py
@@ -190,15 +192,38 @@ def test_collect_output_files_rejects(
     (tmp_path / "target").write_text("t")
     os.mkfifo(tmp_path / "fifo.txt")
     with pytest.raises(ValueError, match=match):
-        collect_output_files(tmp_path, [declared], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, [declared], artifacts, stage=Job.Stage(), max_bytes=CAP)
 
 
 def test_collect_output_files_uploads(tmp_path: Path, artifacts: ArtifactStore) -> None:
     (tmp_path / "out").mkdir()
     (tmp_path / "out/p.txt").write_bytes(b"p")
-    [ref] = collect_output_files(tmp_path, ["out/p.txt"], artifacts, stage=Job.Stage())
+    [ref] = collect_output_files(
+        tmp_path, ["out/p.txt"], artifacts, stage=Job.Stage(), max_bytes=CAP
+    )
     assert (ref.name, ref.path, ref.size) == ("p.txt", "out/p.txt", 1)
     assert artifacts.get_bytes(ref.sha256) == b"p"
+
+
+def test_collect_output_files_checks_each_size_before_reading_it(
+    tmp_path: Path, artifacts: ArtifactStore, bytes_read: list[int], sparse: Any
+) -> None:  # integration fix 3, A1
+    declared = ["out/a.txt", "out/b.txt"]
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/a.txt").write_bytes(b"a" * 600)
+    sparse(tmp_path / "out/b.txt", 2 * 1024)
+    bytes_read.clear()
+    with pytest.raises(ValueError, match=r"^out/b\.txt crosses the size cap$"):
+        collect_output_files(tmp_path, declared, artifacts, stage=Job.Stage(), max_bytes=1024)
+    assert sum(bytes_read) == 600  # out/b.txt is refused by its size alone
+    # The cap holds for all files together: 600 + 600 bytes cross 1024 as well.
+    (tmp_path / "out/b.txt").write_bytes(b"b" * 600)
+    bytes_read.clear()
+    with pytest.raises(ValueError, match=r"^out/b\.txt crosses the size cap$"):
+        collect_output_files(tmp_path, declared, artifacts, stage=Job.Stage(), max_bytes=1024)
+    assert sum(bytes_read) == 600
+    refs = collect_output_files(tmp_path, declared, artifacts, stage=Job.Stage(), max_bytes=1200)
+    assert [(ref.path, ref.size) for ref in refs] == [("out/a.txt", 600), ("out/b.txt", 600)]
 
 
 @pytest.mark.parametrize(
@@ -346,7 +371,7 @@ def test_collection_rejects_symlinked_parent(tmp_path: Path, artifacts: Artifact
     (tmp_path / "target/a").write_text("secret-content")
     (tmp_path / "p").symlink_to(tmp_path / "target")
     with pytest.raises(ValueError, match="symlink not allowed: p/a"):
-        collect_output_files(tmp_path, ["p/a"], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, ["p/a"], artifacts, stage=Job.Stage(), max_bytes=CAP)
 
 
 def test_collection_normalizes_and_refuses_collisions(
@@ -354,8 +379,10 @@ def test_collection_normalizes_and_refuses_collisions(
 ) -> None:
     (tmp_path / "a.txt").write_bytes(b"A")
     with pytest.raises(ValueError, match="duplicate output path"):
-        collect_output_files(tmp_path, ["a.txt", "./a.txt"], artifacts, stage=Job.Stage())
-    [ref] = collect_output_files(tmp_path, ["./a.txt"], artifacts, stage=Job.Stage())
+        collect_output_files(
+            tmp_path, ["a.txt", "./a.txt"], artifacts, stage=Job.Stage(), max_bytes=CAP
+        )
+    [ref] = collect_output_files(tmp_path, ["./a.txt"], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert ref.path == "a.txt"
 
 
@@ -388,7 +415,7 @@ def test_collection_storage_errors_suppress_secret_exception_chains(
 
     monkeypatch.setattr(artifacts, "put_bytes", fail)
     with pytest.raises(ValueError, match=r"cannot store output path: a\.txt") as exc:
-        collect_output_files(tmp_path, ["a.txt"], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, ["a.txt"], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert secret not in "".join(format_exception(exc.value))
 
 
@@ -422,7 +449,7 @@ def test_collection_refuses_folded_output_duplicates_before_upload(
     (tmp_path / first).write_bytes(content)
     (tmp_path / second).write_bytes(content)
     with pytest.raises(ValueError, match="duplicate output path") as exc:
-        collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert first in str(exc.value)
     assert second in str(exc.value)
     assert content.decode() not in str(exc.value)

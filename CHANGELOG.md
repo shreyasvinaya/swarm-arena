@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `surrogateescape` spelling of a non-ASCII name, is refused everywhere a
   path is checked (`not valid UTF-8`): it names the same file on disk as the
   real name but folds to another key, so an edit could replace a protected script.
+- Every read of a tool-written file is bounded, and a file's size is checked
+  before it is read, so a sparse file is never read whole: `swarm/result.json`
+  is at most 16 MiB, the files one result declares at most 256 MiB together
+  (summed before any is hashed; hashed one at a time), and the executor's
+  upload reads stay within `max_output_bytes`.
 
 ### Added
 

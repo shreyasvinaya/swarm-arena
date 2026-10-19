@@ -221,12 +221,20 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
 
 
 def collect_output_files(
-    workspace: Path, declared: Sequence[str], artifacts: ArtifactStore, *, stage: Job.Stage
+    workspace: Path,
+    declared: Sequence[str],
+    artifacts: ArtifactStore,
+    *,
+    stage: Job.Stage,
+    max_bytes: int,
 ) -> list[FileRef]:
     """Upload declared regular outputs after checking paths and symlinks.
 
     Declarations are checked, before any read, against the same planned layout
     that ``materialize`` wrote, and against the later parent tree they join.
+    Files are read and uploaded one at a time. Each file's size is checked
+    before it is read, against what is left of ``max_bytes``, so a file over
+    the cap (a sparse one too) is never read.
 
     Parameters
     ----------
@@ -239,6 +247,9 @@ def collect_output_files(
     stage : Job.Stage
         Original materialized stage, including the effective root, parents,
         candidate files, and generated metadata. Required even for an empty stage.
+    max_bytes : int
+        Most bytes of all declared files together, such as
+        ``LocalExecutor.Config.max_output_bytes``.
 
     Returns
     -------
@@ -250,7 +261,7 @@ def collect_output_files(
     ValueError
         If a path is invalid, duplicated after normalization and folding, conflicts
         with the staged layout or with a parent tree's ``data.json``, missing,
-        symlinked, nonregular, or cannot be collected.
+        symlinked, nonregular, crosses ``max_bytes``, or cannot be collected.
 
     Examples
     --------
@@ -261,10 +272,11 @@ def collect_output_files(
     >>> with tempfile.TemporaryDirectory() as tmp:
     ...     artifacts = ArtifactStore(open_store(f"{tmp}/artifacts"))
     ...     size = (Path(tmp) / "out.txt").write_text("x")
-    ...     [ref] = collect_output_files(Path(tmp), ["./out.txt"], artifacts, stage=stage)
+    ...     [ref] = collect_output_files(
+    ...         Path(tmp), ["./out.txt"], artifacts, stage=stage, max_bytes=2**20)
     ...     (ref.path, ref.size)
     ('out.txt', 1)
-    >>> collect_output_files(Path("ws"), ["P/out.txt"], artifacts, stage=stage)
+    >>> collect_output_files(Path("ws"), ["P/out.txt"], artifacts, stage=stage, max_bytes=1)
     Traceback (most recent call last):
     ...
     ValueError: conflicting output path with staged layout: p/run.py and P/out.txt
@@ -276,6 +288,7 @@ def collect_output_files(
         directories=sorted(layout.directories),
     )
     output: list[FileRef] = []
+    left = max_bytes
     for rel in paths:
         try:
             if symlinked_component(workspace, rel) is not None:
@@ -285,7 +298,8 @@ def collect_output_files(
             raise ValueError(f"{rel} is missing") from None
         except OSError:
             raise ValueError(f"cannot inspect output path: {rel}") from None
-        data = read_regular_file(workspace, rel)
+        data = read_regular_file(workspace, rel, max_bytes=left)
+        left -= len(data)
         try:
             digest = artifacts.put_bytes(data)
         except Exception:

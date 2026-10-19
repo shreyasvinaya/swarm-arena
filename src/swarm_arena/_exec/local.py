@@ -31,7 +31,12 @@ from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOut
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.materialize import collect_output_files, materialize
-from swarm_arena._tooling.result_file import command_output_from_result, note_in_log, open_log
+from swarm_arena._tooling.result_file import (
+    command_output_from_result,
+    note_in_log,
+    open_log,
+    open_regular_file,
+)
 from swarm_arena._tooling.tool import Tool
 
 _LOG: Final = logging.getLogger(__name__)
@@ -41,7 +46,6 @@ _STOPPED: Final = frozenset({RunStatus.TIMEOUT, RunStatus.CANCELLED})
 _PREFIX_UNSAFE: Final = re.compile(r"[^A-Za-z0-9._-]")
 _PREFIX_MAX: Final = 64
 _DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 _CHUNK: Final = 1 << 20
 _PROC_FD = "/proc/self/fd"  # Linux: a descriptor's own path, used to chmod an O_PATH open
 _NOT_AN_OUTPUT: Final = "collect failed: Tool.collect() did not return a ToolOutput"
@@ -207,31 +211,6 @@ def _remove_workspace(workspace: Path) -> None:
         if not os.path.lexists(workspace):
             return
     _LOG.warning("could not remove workspace %s", workspace)
-
-
-def _open_regular(workspace: Path, rel: str) -> int:
-    """Open a regular workspace file read-only through pinned directories, never via a link."""
-    parts = PurePosixPath(rel).parts
-    if not parts or rel.startswith("/") or ".." in parts:
-        raise ValueError(f"{rel} is not a regular file")
-    directories: list[int] = []
-    try:
-        try:
-            directories.append(os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK))
-            for part in parts[:-1]:
-                directories.append(
-                    os.open(part, _READ_FLAGS | os.O_DIRECTORY, dir_fd=directories[-1])
-                )
-            fd = os.open(parts[-1], _READ_FLAGS, dir_fd=directories[-1])
-        finally:
-            for directory in directories:
-                os.close(directory)
-    except OSError:
-        raise ValueError(f"{rel} is not a regular file") from None
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
-        raise ValueError(f"{rel} is not a regular file")
-    return fd
 
 
 def _read_tail(fd: int, size: int, limit: int) -> bytes:
@@ -438,7 +417,7 @@ class _JobRun:
     def _read_log(self, rel: str) -> bytes:
         """Read the last ``max_log_bytes`` of a regular log; anything else is empty."""
         try:
-            fd = _open_regular(self._workspace, rel)
+            fd = open_regular_file(self._workspace, rel)
         except ValueError:
             note_in_log(self._stderr, f"{rel} is not a regular file; its log is uploaded empty")
             return b""
@@ -461,7 +440,7 @@ class _JobRun:
         total = 0
         for ref in files:
             try:
-                fd = _open_regular(self._workspace, ref.path)
+                fd = open_regular_file(self._workspace, ref.path)
             except ValueError:
                 continue  # collect_output_files names what is wrong with it
             try:
@@ -481,6 +460,7 @@ class _JobRun:
                 [ref.path for ref in output.files],
                 self._artifacts,
                 stage=self._job.stage,
+                max_bytes=self._max_output,
             )
         except ValueError as exc:
             note_in_log(self._stderr, f"output files not uploaded: {exc}")

@@ -680,3 +680,94 @@ def test_output_directory_alias_fails_producing_run(
     assert first in diagnostic
     assert second in diagnostic
     assert secret not in diagnostic
+
+
+# --- Every read of a tool-written file is bounded (integration fix 3, A1) ---
+
+CAP = 1 << 20
+
+
+def test_read_regular_file_refuses_a_file_over_its_cap_unread(
+    tmp_path: Path, bytes_read: list[int], sparse: Any
+) -> None:
+    sparse(tmp_path / "out/big", 2 * CAP)
+    with pytest.raises(ValueError, match=r"^out/big crosses the size cap$"):
+        read_regular_file(tmp_path, "out/big", max_bytes=CAP)
+    assert sum(bytes_read) == 0  # fstat first: a sparse file is never read
+    sparse(tmp_path / "out/fits", CAP)
+    assert read_regular_file(tmp_path, "out/fits", max_bytes=CAP) == bytes(CAP)
+    assert sum(bytes_read) == CAP
+
+
+def test_read_regular_file_never_reads_past_its_cap_while_a_file_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bytes_read: list[int], sparse: Any
+) -> None:
+    path = tmp_path / "out/grows"
+    sparse(path, 10)  # small when its size is checked
+    counted_read = os.read
+
+    def grow_then_read(fd: int, n: int) -> bytes:  # a stray process extends it meanwhile
+        os.truncate(path, 2 * CAP)
+        return counted_read(fd, n)
+
+    monkeypatch.setattr(os, "read", grow_then_read)
+    with pytest.raises(ValueError, match=r"^out/grows crosses the size cap$"):
+        read_regular_file(tmp_path, "out/grows", max_bytes=3000)
+    assert sum(bytes_read) == 3000  # up to the cap, never one byte past it
+
+
+def test_result_json_read_is_bounded(tmp_path: Path, bytes_read: list[int], sparse: Any) -> None:
+    from swarm_arena._tooling.result_file import MAX_RESULT_JSON_BYTES
+
+    assert MAX_RESULT_JSON_BYTES == 16 * 2**20
+    r = run(tmp_path, RunStatus.OK, 0)
+    sparse(tmp_path / "swarm/result.json", 2 * MAX_RESULT_JSON_BYTES)
+    with pytest.raises(ValueError, match=r"^swarm/result\.json crosses the size cap$"):
+        read_result_json(tmp_path)
+    assert tool_output_from_result(tmp_path, r).status == RunStatus.ERROR
+    assert command_output_from_result(tmp_path, r).status == RunStatus.ERROR
+    assert "swarm-arena: swarm/result.json crosses the size cap" in r.stderr_path.read_text()
+    assert sum(bytes_read) < 4096  # the log reads only, never the sparse result
+
+
+@pytest.mark.parametrize("status", [RunStatus.OK, RunStatus.TIMEOUT])
+def test_declared_files_over_the_cap_fail_before_any_is_hashed(
+    tmp_path: Path, bytes_read: list[int], sparse: Any, status: RunStatus
+) -> None:
+    from swarm_arena._tooling.result_file import MAX_DECLARED_FILES_BYTES
+
+    assert MAX_DECLARED_FILES_BYTES == 256 * 2**20  # the LocalExecutor default
+    sparse(tmp_path / "out/a", MAX_DECLARED_FILES_BYTES)
+    sparse(tmp_path / "out/b", MAX_DECLARED_FILES_BYTES)
+    write_result(tmp_path, {"data": {"k": "SENTINEL_SECRET"}, "files": ["out/a", "out/b"]})
+    r = run(tmp_path, status, 0 if status == RunStatus.OK else None)
+    out = tool_output_from_result(tmp_path, r)
+    expected = RunStatus.ERROR if status == RunStatus.OK else status
+    assert (out.status, out.partial, out.data, out.files) == (expected, False, {}, [])
+    assert sum(bytes_read) < 4096  # result.json only: the 512 MiB of outputs are never read
+    log = r.stderr_path.read_text()
+    if status == RunStatus.OK:
+        assert "out/b crosses MAX_DECLARED_FILES_BYTES" in log
+    assert "SENTINEL_SECRET" not in log
+
+
+def test_declared_files_are_hashed_one_at_a_time_within_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._tooling import result_file
+
+    monkeypatch.setattr(result_file, "MAX_DECLARED_FILES_BYTES", 10)
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/a").write_bytes(b"aaaa")
+    (tmp_path / "out/b").write_bytes(b"bbbbbb")  # 4 + 6: exactly the cap
+    write_result(tmp_path, {"data": {}, "files": ["out/a", "out/b"]})
+    out = tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0))
+    assert out.status == RunStatus.OK
+    assert [(f.path, f.size, f.sha256) for f in out.files] == [
+        ("out/a", 4, sha256_hex(b"aaaa")),
+        ("out/b", 6, sha256_hex(b"bbbbbb")),
+    ]
+    (tmp_path / "out/b").write_bytes(b"bbbbbbb")  # one byte over
+    r = run(tmp_path, RunStatus.OK, 0)
+    assert tool_output_from_result(tmp_path, r).status == RunStatus.ERROR
+    assert "out/b crosses MAX_DECLARED_FILES_BYTES" in r.stderr_path.read_text()

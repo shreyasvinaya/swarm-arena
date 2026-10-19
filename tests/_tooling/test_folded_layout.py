@@ -44,6 +44,7 @@ from swarm_arena._tooling.staging import (
 )
 
 H = "1" * 64
+CAP = 2**20  # the output cap every collect_output_files call passes
 SECRET = "round-three-secret-contents"
 EDIT_CASES = [
     ({"p/sub/a.txt"}, {"p/SUB/b.txt": SECRET}),
@@ -188,7 +189,7 @@ def test_output_ancestor_conflict_before_upload(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(SECRET)
     with pytest.raises(ValueError, match="output path") as exc:
-        collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert first in str(exc.value)
     assert second in str(exc.value)
     assert SECRET not in "".join(format_exception(exc.value))
@@ -229,7 +230,7 @@ def test_collection_checks_original_stage_before_reading_outputs(
     # No output exists: collision validation must precede reads and uploads.
     stage = Job.Stage(root={root: H})
     with pytest.raises(ValueError, match="conflicting output path") as exc:
-        collect_output_files(tmp_path, [declared], artifacts, stage=stage)
+        collect_output_files(tmp_path, [declared], artifacts, stage=stage, max_bytes=CAP)
     assert root in str(exc.value)
     assert declared in str(exc.value)
 
@@ -239,7 +240,7 @@ def test_collection_allows_exact_staged_replacement(
 ) -> None:
     stage = Job.Stage(root={"out.txt": H})
     (tmp_path / "out.txt").write_text(SECRET)
-    [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage)
+    [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage, max_bytes=CAP)
     assert ref.path == "out.txt"
     assert artifacts.get_bytes(ref.sha256) == SECRET.encode()
 
@@ -260,7 +261,7 @@ def test_collection_checks_full_stage_layout(
         else None,
     )
     with pytest.raises(ValueError, match=r"conflicting.*path") as exc:
-        collect_output_files(tmp_path, [], artifacts, stage=stage)
+        collect_output_files(tmp_path, [], artifacts, stage=stage, max_bytes=CAP)
     assert "p/a.txt" in str(exc.value)
     assert "P/b.txt" in str(exc.value)
 
@@ -351,7 +352,9 @@ def test_each_producer_refuses_a_respelling_with_its_own_error(
     with pytest.raises(
         ValueError, match=exactly("conflicting output path with staged layout: p/a.txt and P/A.txt")
     ):
-        collect_output_files(tmp_path, ["P/A.txt"], artifacts, stage=Job.Stage(root=root))
+        collect_output_files(
+            tmp_path, ["P/A.txt"], artifacts, stage=Job.Stage(root=root), max_bytes=CAP
+        )
     # Base parent overlay: the soft "not overlaid" warning.
     parent = ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={"P/A.txt": H})
     stage, overlay, warnings = _tool_stage(goal_files=root, parents=[parent])
@@ -383,7 +386,7 @@ def test_exact_spellings_pass_every_producer_and_later_stage(
     ws = tmp_path / "producing"
     materialize(stage, ws, artifacts)
     (ws / "p/out.txt").write_bytes(b"OUT")
-    files = collect_output_files(ws, ["p/out.txt"], artifacts, stage=stage)
+    files = collect_output_files(ws, ["p/out.txt"], artifacts, stage=stage, max_bytes=CAP)
     candidate = cand(
         tool_identity="T", overlay=overlay, output=ToolOutput(status=RunStatus.OK, files=files)
     )
@@ -432,7 +435,7 @@ def test_parent_data_directory_output_fails_producing_run(
     (tmp_path / path).parent.mkdir(parents=True)
     (tmp_path / path).write_text(SECRET)
     with pytest.raises(ValueError, match=r"with parent data\.json") as exc:
-        collect_output_files(tmp_path, [path], artifacts, stage=Job.Stage())
+        collect_output_files(tmp_path, [path], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert str(exc.value) == f"conflicting output path with parent data.json: {path}"
     with pytest.raises(NotFound):
         artifacts.get_bytes(sha256_hex(SECRET.encode()))
@@ -488,7 +491,9 @@ def test_merge_errors_name_the_parent_or_tree(tmp_path: Path, artifacts: Artifac
     with pytest.raises(ValueError, match=parents):
         materialize(Job.Stage(parents=[good, bad]), tmp_path / "ws", artifacts)
     with pytest.raises(ValueError, match=parents):
-        collect_output_files(tmp_path, [], artifacts, stage=Job.Stage(parents=[good, bad]))
+        collect_output_files(
+            tmp_path, [], artifacts, stage=Job.Stage(parents=[good, bad]), max_bytes=CAP
+        )
 
     files = exactly(
         "conflicting workspace path: candidate/files/p/a.txt and candidate/files/P/b.txt"
@@ -521,7 +526,7 @@ def test_collection_reuses_the_stage_layout_without_serializing(
     materialize(stage, tmp_path, artifacts)
     monkeypatch.setattr(materialize_module, "_json_bytes", fail)
     (tmp_path / "out.txt").write_text("x")
-    [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage)
+    [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage, max_bytes=CAP)
     assert ref.path == "out.txt"
 
 
@@ -591,7 +596,7 @@ def test_surrogate_output_spelling_fails_the_producing_run(
     (tmp_path / "problem").mkdir()
     (tmp_path / SCRIPT).write_text(SECRET)  # the bytes a surrogate spelling would name
     with pytest.raises(ValueError, match="not valid UTF-8"):
-        collect_output_files(tmp_path, [SCRIPT_BYTES], artifacts, stage=stage)
+        collect_output_files(tmp_path, [SCRIPT_BYTES], artifacts, stage=stage, max_bytes=CAP)
     with pytest.raises(NotFound):
         artifacts.get_bytes(sha256_hex(SECRET.encode()))
     # json.loads keeps a \udcXX escape, so a result file can carry the same spelling.
