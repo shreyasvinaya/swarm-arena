@@ -4,9 +4,10 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from swarm_arena._model.base import _sanitize_validation_error
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
-from swarm_arena._model.ref import _config_error_details, _ConfigInputModel, config_or_fields
+from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus
 from swarm_arena._scoring.check import Check, CheckContext
@@ -31,7 +32,7 @@ def _preflight_files(name: str, files: FileSet) -> None:
 
 def _result_error(kind: str, model: type[BaseModel], error: Exception) -> str:
     """Render the first validation code with only safe schema locations."""
-    first = _config_error_details(model, error)[0]
+    first = _sanitize_validation_error(model, error).errors()[0]
     location = ".".join(str(part) for part in first.get("loc", ()))
     return f"invalid {kind} result: {location}: {first['type']}"
 

@@ -79,9 +79,6 @@ def test_ref_build_text_snapshot() -> None:
 # Parallel agents own these direct BaseModel users; editing their files is forbidden.
 EXTERNAL_MODELS = {
     ("_exec.local", "LocalExecutor.Config"),
-    ("_tooling.function_tool", "_FunctionModel"),
-    ("_tooling.function_tool", "_EmptyInputs"),
-    ("_tooling.function_tool", "FunctionTool.Config"),
 }
 
 
@@ -165,6 +162,10 @@ def test_source_inventory_has_explicit_ownership() -> None:
     assert all(issubclass(model, _SafeModel) for model in MODELS)
 
 
+def _forbids_unknown(model: type[BaseModel]) -> bool:
+    return model.model_config.get("extra") == "forbid" or bool(model.__pydantic_root_model__)
+
+
 def _validate_bad_input(model: type[BaseModel], surface: str, secret: str) -> object:
     if surface == "json-invalid":
         return model.model_validate_json('{"value":"' + secret)
@@ -202,6 +203,15 @@ def _assert_secret_absent(error: Exception, secret: str) -> None:
 )
 def test_every_model_rejects_secret_safely(model: type[BaseModel], surface: str) -> None:
     secret = "sentinel_" + model.__qualname__.replace(".", "_") + "_" + surface
+    if surface in {"extra-value", "strings"} and not _forbids_unknown(model):
+        # A model that ignores unknown keys may accept them; it must not keep their values.
+        try:
+            accepted = _validate_bad_input(model, surface, secret)
+        except ValidationError as error:
+            _assert_secret_absent(error, secret)
+        else:
+            assert secret not in repr(accepted)
+        return
     with pytest.raises(ValidationError) as caught:
         _validate_bad_input(model, surface, secret)
     _assert_secret_absent(caught.value, secret)
@@ -212,7 +222,7 @@ def test_unknown_key_policy(model: type[BaseModel]) -> None:
     # Root mappings have data keys, never model-field typo identifiers.
     expected_policy = "show" if model.__qualname__ in SHOW_MODELS else "hide"
     assert getattr(model, "_unknown_fields", None) == expected_policy
-    if model.__pydantic_root_model__:
+    if model.__pydantic_root_model__ or not _forbids_unknown(model):
         return
     secret = "sentinel_" + model.__qualname__ + "_unknown_value"
     with pytest.raises(ValidationError) as caught:
