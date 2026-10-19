@@ -1,6 +1,10 @@
+import importlib
+import importlib.machinery
 import os
+import py_compile
 import sys
 import traceback
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -293,3 +297,77 @@ def test_preflight_import_failure_hides_values(
         FunctionTool("task18_import_error:solve").preflight()
     assert str(caught.value) == "cannot import task18_import_error:solve"
     assert_secret_absent(caught.value)
+
+
+# --- Aliases and import roots (integration fix 3, A2) ---
+
+
+def _solve(x: int) -> dict[str, int]:
+    """Return the input as data."""
+    return {"x": x}
+
+
+class _NotAModule:  # sys.modules may hold any object; the stdlib does (typing.io on 3.11)
+    solve = staticmethod(_solve)
+
+
+def _specless_module() -> types.ModuleType:
+    module = types.ModuleType("task18_specless")  # a real module, but made without a spec
+    setattr(module, "solve", _solve)  # noqa: B010 (a module attribute the checker cannot see)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("name", "entry"), [("task18_not_a_module", _NotAModule), ("task18_specless", None)]
+)
+def test_sys_modules_entry_without_a_spec_is_refused(
+    monkeypatch: pytest.MonkeyPatch, name: str, entry: object
+) -> None:
+    monkeypatch.setitem(sys.modules, name, _specless_module() if entry is None else entry)
+    tool = FunctionTool(f"{name}:solve")
+    expected = f"FunctionTool {name}:solve: {name} has no import spec; use the defining module"
+    for call in (tool.preflight, tool.get_description, lambda: tool.command(ToolRequest(), Path())):
+        with pytest.raises(TypeError) as caught:
+            call()
+        assert str(caught.value) == expected
+        assert_secret_absent(caught.value)
+
+
+def test_import_root_finds_a_sourceless_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "task18_sourceless"
+    package.mkdir()
+    source = package / "__init__.py"
+    source.write_text("def solve(x: int) -> dict[str, int]:\n    return {'x': x}\n")
+    py_compile.compile(str(source), cfile=str(package / "__init__.pyc"), doraise=True)
+    source.unlink()  # only __init__.pyc is left, as in a sourceless install
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        module = importlib.import_module("task18_sourceless")
+        assert Path(module.__file__ or "").name == "__init__.pyc"
+        assert import_root("task18_sourceless") == str(tmp_path.resolve())
+        command = FunctionTool("task18_sourceless:solve").command(ToolRequest(), tmp_path)
+        assert command.argv[-3:] == [
+            "--import-root",
+            str(tmp_path.resolve()),
+            "task18_sourceless:solve",
+        ]
+    finally:
+        sys.modules.pop("task18_sourceless", None)
+
+
+def test_import_root_finds_an_extension_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # a compiled __init__ (mypyc builds) is a package by its spec, not its file name
+    package = tmp_path / "task18_ext"
+    package.mkdir()
+    init = package / "__init__.cpython-311-darwin.so"
+    init.touch()
+    module = types.ModuleType("task18_ext")
+    module.__spec__ = importlib.machinery.ModuleSpec(
+        "task18_ext", None, origin=str(init), is_package=True
+    )
+    module.__file__ = str(init)
+    monkeypatch.setitem(sys.modules, "task18_ext", module)
+    assert import_root("task18_ext") == str(tmp_path.resolve())

@@ -36,11 +36,12 @@ def _load_function(path: str) -> Callable[..., Any]:
         module = importlib.import_module(module_name)
     except (Exception, SystemExit):
         raise ValueError(f"cannot import {path}") from None
-    if module.__spec__ is not None and module.__spec__.name != module_name:
-        raise TypeError(
-            f"FunctionTool {path}: {module_name} is an alias of {module.__spec__.name}; "
-            "use the defining module"
-        )
+    # sys.modules can hold any object, so the spec is read defensively.
+    spec = getattr(module, "__spec__", None)
+    real = getattr(spec, "name", None)
+    if spec is None or real != module_name:
+        alias = f"is an alias of {real}" if isinstance(real, str) else "has no import spec"
+        raise TypeError(f"FunctionTool {path}: {module_name} {alias}; use the defining module")
     if not callable(fn):
         raise TypeError(f"FunctionTool {path}: expected a callable function")
     return fn
@@ -109,6 +110,8 @@ def import_root(module_name: str) -> str:
     -------
     str
         Resolved directory containing the loaded module's real top-level package.
+        A package is known by its spec's submodule search locations, so an
+        ``__init__`` that is a sourceless ``.pyc`` or a compiled extension works.
         FunctionTool rejects aliases of that module during preflight.
 
     Raises
@@ -123,11 +126,14 @@ def import_root(module_name: str) -> str:
     """
     try:
         module = importlib.import_module(module_name)
-        if module.__file__ is None or module.__spec__ is None:
+        spec = getattr(module, "__spec__", None)
+        file = getattr(module, "__file__", None)
+        if file is None or spec is None:
             raise ValueError
-        file = Path(module.__file__).resolve()
-        levels = len(module.__spec__.name.split(".")) + (file.name == "__init__.py")
-        return str(file.parents[levels - 1])
+        # A package has submodule search locations, whatever its __init__ file is
+        # (.py, a sourceless .pyc, or a compiled extension).
+        levels = len(spec.name.split(".")) + (spec.submodule_search_locations is not None)
+        return str(Path(file).resolve().parents[levels - 1])
     except Exception:
         raise ValueError(f"cannot determine import root for {module_name}") from None
 
@@ -139,8 +145,9 @@ class FunctionTool(Tool):
     Construction stores the reference without importing it. Use
     ``get_input_model()`` to inspect parameters; ``input_model`` is only an
     empty frozen placeholder. The function must return a finite JSON object.
-    The configured module must use its real import name; ``sys.modules`` aliases
-    are rejected during preflight.
+    The configured module must use its real import name; ``sys.modules`` aliases,
+    and entries without an import spec (such as a class put there), are
+    rejected during preflight with an identifier-only TypeError.
 
     Parameters
     ----------
