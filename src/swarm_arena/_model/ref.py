@@ -3,9 +3,18 @@
 import importlib
 from collections.abc import Mapping, Sequence
 from functools import cache
-from typing import Annotated, Any, TypeVar
+from types import UnionType
+from typing import Annotated, Any, TypeVar, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+)
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import FrozenModel
@@ -172,6 +181,51 @@ def load_object(path: str) -> object:
     return obj
 
 
+def _safe_config_location(
+    annotation: Any, location: tuple[str | int, ...]
+) -> tuple[str | int, ...]:
+    """Retain only location segments attributable to the schema at that level."""
+    if not location:
+        return ()
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Annotated:
+        return _safe_config_location(args[0], location)
+    if origin in (Union, UnionType):
+        branches = [arg for arg in args if arg is not type(None)]
+        if len(branches) == 1:
+            return _safe_config_location(branches[0], location)
+        # Branch labels may be data-derived discriminator values. Without an
+        # unambiguous schema, redact the entire remaining location.
+        return ("<key>",) * len(location)
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if annotation.__pydantic_root_model__:
+            return _safe_config_location(annotation.model_fields["root"].annotation, location)
+        for name, field in annotation.model_fields.items():
+            paths: list[tuple[str | int, ...]] = [(name,)]
+            if field.alias is not None:
+                paths.append((field.alias,))
+            alias = field.validation_alias
+            choices = alias.choices if isinstance(alias, AliasChoices) else [alias]
+            for choice in choices:
+                if isinstance(choice, str):
+                    paths.append((choice,))
+                elif isinstance(choice, AliasPath):
+                    paths.append(tuple(choice.path))
+            for path in paths:
+                if location[: len(path)] == path:
+                    return path + _safe_config_location(field.annotation, location[len(path) :])
+    if origin in (dict, Mapping):
+        # Even integer keys and keys spelled like model fields are input data.
+        value_type = args[1] if len(args) == 2 else None
+        return ("<key>", *_safe_config_location(value_type, location[1:]))
+    if origin in (list, Sequence) and isinstance(location[0], int):
+        item_type = args[0] if args else None
+        return (location[0], *_safe_config_location(item_type, location[1:]))
+    # Unknown fields, scalar suffixes, and opaque/custom schemas fail closed.
+    return ("<key>",) * len(location)
+
+
 class Ref(FrozenModel):
     """
     Reference a component by its import path and configuration.
@@ -280,6 +334,8 @@ class Ref(FrozenModel):
             If importing fails or configuration validation raises ConfigError.
             ConfigError reports the component path, field locations, and error
             types, omitting input values and validator messages or context.
+            Locations retain schema field names/aliases and list indices;
+            mapping keys and unrecognized location segments become ``<key>``.
 
         Examples
         --------
@@ -296,7 +352,10 @@ class Ref(FrozenModel):
         except ValidationError as err:
             # Validator messages and context may repeat secret input values.
             errors = err.errors(include_input=False, include_url=False, include_context=False)
-            summary = "; ".join(f"{error['loc']}: {error['type']}" for error in errors)
+            summary = "; ".join(
+                f"{_safe_config_location(cls.Config, error['loc'])}: {error['type']}"
+                for error in errors
+            )
             raise ConfigError(f"{self.path}: {summary}") from None
         return cls(validated)
 
