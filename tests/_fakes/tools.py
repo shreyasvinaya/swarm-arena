@@ -1,7 +1,7 @@
-import os
-import sys
 import math
+import os
 import secrets
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -423,6 +423,8 @@ def exits() -> dict[str, int]:
 def changes_directory(directory: str) -> dict[str, bool]:
     os.chdir(directory)
     return {"changed": True}
+
+
 # Conformance-kit fakes: each one breaks one component contract.
 
 
