@@ -5,9 +5,8 @@ from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
 from swarm_arena._exec.executor import Job
-from swarm_arena._model.plan import Resources
-from swarm_arena._model.ref import Configurable
 from swarm_arena._model.goal import FileSet
+from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
@@ -141,11 +140,15 @@ def make_job(**fields: Any) -> Job:
         "artifact_root": "/tmp/a",
     }
     return Job(**{**defaults, **fields})
+
+
 # --- Task 11 ---
 
 
 class FilesWidget(Configurable):
     name: ClassVar[str] = "files-widget"
+
+
 # --- Task 9 ---
 
 
