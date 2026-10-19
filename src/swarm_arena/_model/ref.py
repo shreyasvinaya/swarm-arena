@@ -10,10 +10,12 @@ from pydantic import (
     BeforeValidator,
     Field,
 )
+from pydantic.errors import PydanticErrorMixin
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import (
     FrozenModel,
+    _minimal_validation_error,
     _SafeModel,
     _sanitize_validation_error,
 )
@@ -202,8 +204,9 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     Raises
     ------
     ConfigError
-        If validation raises an exception. Custom error types become ``invalid``;
+        If input validation fails. Custom error types become ``invalid``;
         input, messages, context, and original exception chains are suppressed.
+        Pydantic developer errors propagate unchanged with their fix-it hints.
 
     Examples
     --------
@@ -213,13 +216,18 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         return model_cls.model_validate(data)
     except Exception as error:
-        safe = _sanitize_validation_error(model_cls, error)
+        if isinstance(error, PydanticErrorMixin):
+            raise
+        try:
+            safe = _sanitize_validation_error(model_cls, error)
+        except Exception:
+            safe = _minimal_validation_error(model_cls)
         summary = "; ".join(
             (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "")
             + item["type"]
             for item in safe.errors(include_input=False, include_url=False, include_context=False)
         )
-        raise ConfigError(f"{where}: {summary}") from None
+    raise ConfigError(f"{where}: {summary}") from None
 
 
 class Ref(FrozenModel):

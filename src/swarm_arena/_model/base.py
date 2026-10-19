@@ -3,6 +3,8 @@
 import re
 from collections.abc import Callable
 from contextvars import ContextVar
+from dataclasses import dataclass, field
+from threading import get_ident
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, Self, cast, get_args
 
 from pydantic import (
@@ -14,6 +16,7 @@ from pydantic import (
 )
 from pydantic import JsonValue as JsonValue
 from pydantic.config import ExtraValues
+from pydantic.errors import PydanticErrorMixin
 from pydantic_core import CoreSchema, ErrorType, InitErrorDetails, PydanticCustomError, core_schema
 
 from swarm_arena._model.migrate import upgrade
@@ -38,7 +41,20 @@ _NEWER_VERSION_REASON = re.compile(
 _VALIDATION_BY_ALIAS: ContextVar[bool | None] = ContextVar(
     "swarm_arena_validation_by_alias", default=None
 )
-_VALIDATION_ACTIVE: ContextVar[bool] = ContextVar("swarm_arena_validation_active", default=False)
+
+
+@dataclass
+class _ValidationOwner:
+    """Own nested field validation only while active in the originating thread."""
+
+    thread_id: int
+    active: bool = True
+    sanitized: set[tuple[tuple[str | int, ...], str, str]] = field(default_factory=set)
+
+
+_VALIDATION_ACTIVE: ContextVar[_ValidationOwner | None] = ContextVar(
+    "swarm_arena_validation_active", default=None
+)
 _SAFE_MESSAGES = frozenset(
     {
         "Value error, Plan.flows is reserved for v2 messaging and must be empty",
@@ -87,6 +103,33 @@ def _schema_definitions(schema: dict[str, Any]) -> dict[str, Any]:
     return refs
 
 
+@dataclass
+class _SchemaIndex:
+    """Retain schema-only routes and references, never rejected input data."""
+
+    schema: dict[str, Any]
+    refs: dict[str, Any]
+    sequence_paths: dict[bool | None, frozenset[tuple[str | int, ...]]]
+
+
+def _schema_index(model: type[BaseModel]) -> _SchemaIndex:
+    """Cache references on each class, invalidating on core-schema identity changes."""
+    schema = cast(Any, model.__pydantic_core_schema__)
+    cached = model.__dict__.get("__swarm_arena_location_index__")
+    if cached is None or cached.schema is not schema:
+        cached = _SchemaIndex(schema, _schema_definitions(schema), {})
+        cast(Any, model).__swarm_arena_location_index__ = cached
+    return cached
+
+
+def _common_location(paths: list[tuple[str | int, ...]]) -> tuple[str | int, ...]:
+    """Keep only segments all matching schema paths establish as identifiers."""
+    return tuple(
+        parts[0] if all(part == parts[0] for part in parts) else "<…>"
+        for parts in zip(*paths, strict=True)
+    )
+
+
 def _location_parts(
     schema: dict[str, Any],
     location: tuple[str | int, ...],
@@ -132,16 +175,21 @@ def _location_parts(
             if paths and not isinstance(paths[0], list):
                 paths = [paths]
             aliases.extend((tuple(path), field) for path in paths)
-        # Pydantic reports the validation alias on collisions, even when it is
-        # another field's name. Resolve all aliases before looking at names.
+        # Alias/name collisions can describe different schema nodes. Retain a
+        # segment only when all matching paths establish it as an identifier.
         by_alias = _VALIDATION_BY_ALIAS.get()
         use_alias = validate_by_alias if by_alias is None else by_alias
         paths = [*aliases, *names] if loc_by_alias and use_alias else names
-        for path, field in paths:
-            if location[: len(path)] == path:
-                return path + _location_parts(
-                    field["schema"], location[len(path) :], refs, show_unknown=show_unknown
-                )
+        matches = [
+            path
+            + _location_parts(
+                field["schema"], location[len(path) :], refs, show_unknown=show_unknown
+            )
+            for path, field in paths
+            if location[: len(path)] == path
+        ]
+        if matches:
+            return _common_location(matches)
         return ((first if show_unknown else "<field>"),) + ("<…>",) * len(rest)
     if kind in {"list", "set", "frozenset", "generator", "tuple"} and isinstance(first, int):
         items = schema.get("items_schema", {})
@@ -170,16 +218,25 @@ def _location_parts(
             ),
         )
     if kind == "union":
+        matches = []
         for choice in schema["choices"]:
             branch, label = choice if isinstance(choice, tuple) else (choice, None)
             node = branch
             while "schema" in node and node.get("type") != "model":
                 node = node["schema"]
             if branch.get("type") == "function-wrap":
-                label = label or f"function-wrap[{branch['function']['function'].__name__}()]"
+                fn = branch["function"]["function"]
+                label = (
+                    label
+                    or f"function-wrap[{getattr(fn, '__name__', None) or type(fn).__name__}()]"
+                )
             label = label or getattr(node.get("cls"), "__name__", node.get("type"))
             if first == label:
-                return ("<…>", *_location_parts(branch, rest, refs, show_unknown=show_unknown))
+                matches.append(
+                    ("<…>", *_location_parts(branch, rest, refs, show_unknown=show_unknown))
+                )
+        if matches:
+            return _common_location(matches)
     return ("<…>",) * len(location)
 
 
@@ -187,8 +244,58 @@ def _safe_location(
     model: type[BaseModel], location: tuple[str | int, ...], *, show_unknown: bool = False
 ) -> tuple[str | int, ...]:
     """Retain schema fields, aliases and indices, with data keys always redacted."""
-    schema = cast(Any, model.__pydantic_core_schema__)
-    return _location_parts(schema, location, _schema_definitions(schema), show_unknown=show_unknown)
+    try:
+        index = _schema_index(model)
+        return _location_parts(index.schema, location, index.refs, show_unknown=show_unknown)
+    except Exception:
+        return ("<…>",) * len(location)
+
+
+def _sequence_paths(index: _SchemaIndex) -> frozenset[tuple[str | int, ...]]:
+    """Prove and cache direct sequence routes for large repeated item errors."""
+    mode = _VALIDATION_BY_ALIAS.get()
+    if mode in index.sequence_paths:
+        return index.sequence_paths[mode]
+    node = index.schema
+    seen: set[int] = set()
+    while id(node) not in seen:
+        seen.add(id(node))
+        if node.get("type") == "definition-ref":
+            node = index.refs.get(node["schema_ref"], {})
+        elif "schema" in node:
+            node = node["schema"]
+        else:
+            break
+    paths: set[tuple[str | int, ...]] = set()
+    if node.get("type") in {"model-fields", "typed-dict"}:
+        for name, field in node["fields"].items():
+            candidates = [(name,)]
+            alias = field.get("validation_alias")
+            aliases = [[alias]] if isinstance(alias, str) else alias or []
+            if aliases and not isinstance(aliases[0], list):
+                aliases = [aliases]
+            candidates.extend(tuple(path) for path in aliases)
+            for path in candidates:
+                probe = (*path, 0)
+                if _location_parts(index.schema, probe, index.refs, show_unknown=False) == probe:
+                    paths.add(path)
+    result = frozenset(paths)
+    index.sequence_paths[mode] = result
+    return result
+
+
+def _explicit_location(
+    model: type[BaseModel],
+    location: tuple[str | int, ...],
+    code: str,
+    message: str,
+    known: set[tuple[tuple[str | int, ...], str, str]],
+) -> tuple[str | int, ...] | None:
+    """Preserve a sanitized explicit-call suffix after Pydantic adds field prefixes."""
+    for offset in range(len(location) + 1):
+        if (location[offset:], code, message) in known:
+            return _safe_location(model, location[:offset]) + location[offset:]
+    return None
 
 
 def _sanitize_validation_error(
@@ -223,66 +330,138 @@ def _sanitize_validation_error(
     >>> safe.errors()[0]
     {'type': 'int_parsing', 'loc': ('count',), 'msg': 'int_parsing', 'input': None}
     """
-    details: list[InitErrorDetails] = []
-    if isinstance(error, ValidationError):
-        for item in error.errors(include_input=False, include_url=False, include_context=False):
-            code = item["type"] if item["type"] in _VALIDATION_ERROR_TYPES else "invalid"
-            message = item["msg"]
-            # Only complete fixed messages survive; never forward validator text.
-            if message.removeprefix("Value error, ") in _SAFE_MESSAGES:
-                message = message.removeprefix("Value error, ")
-            elif _CATALOG_HUMAN_ONLY_REASON.fullmatch(message):
-                pass
-            elif _NEWER_VERSION_REASON.fullmatch(message):
-                message = "schema_version is newer than this swarm-arena supports"
-            elif message not in _SAFE_MESSAGES:
-                message = code
+    try:
+        details: list[InitErrorDetails] = []
+        if isinstance(error, ValidationError):
+            sequence_paths = _sequence_paths(_schema_index(model))
+            owner = _VALIDATION_ACTIVE.get()
+            known = (
+                owner.sanitized
+                if owner is not None and owner.active and owner.thread_id == get_ident()
+                else set()
+            )
+            types: dict[tuple[str, str], PydanticCustomError] = {}
+            items = cast(
+                list[dict[str, Any]],
+                error.errors(include_input=False, include_url=False, include_context=False),
+            )
+            previous: tuple[str, str] | None = None
+            safe_type: PydanticCustomError | None = None
+            for item in items:
+                raw_code: str = item["type"]
+                message: str = item["msg"]
+                key = (raw_code, message)
+                if key != previous:
+                    safe_type = types.get(key)
+                if safe_type is None:
+                    code = raw_code if raw_code in _VALIDATION_ERROR_TYPES else "invalid"
+                    # Only complete fixed messages survive; never forward validator text.
+                    if message.removeprefix("Value error, ") in _SAFE_MESSAGES:
+                        message = message.removeprefix("Value error, ")
+                    elif _CATALOG_HUMAN_ONLY_REASON.fullmatch(message):
+                        pass
+                    elif _NEWER_VERSION_REASON.fullmatch(message):
+                        message = "schema_version is newer than this swarm-arena supports"
+                    elif message not in _SAFE_MESSAGES:
+                        message = code
+                    safe_type = PydanticCustomError(
+                        cast(LiteralString, code), cast(LiteralString, message)
+                    )
+                    types[key] = safe_type
+                previous = key
+                item["type"] = safe_type
+                location: tuple[str | int, ...] = item["loc"]
+                if (
+                    not known
+                    and location
+                    and isinstance(location[-1], int)
+                    and location[:-1] in sequence_paths
+                ):
+                    continue
+                explicit_location = (
+                    _explicit_location(model, location, raw_code, key[1], known) if known else None
+                )
+                # A cached schema proof allows sequence-item errors to reuse the
+                # original location tuple; integer mapping keys never qualify.
+                if explicit_location is not None:
+                    location = explicit_location
+                elif not (
+                    location and isinstance(location[-1], int) and location[:-1] in sequence_paths
+                ):
+                    location = _safe_location(
+                        model,
+                        location,
+                        show_unknown=unknown_fields == "show" and raw_code == "extra_forbidden",
+                    )
+                item["loc"] = location
+            details = cast(list[InitErrorDetails], items)
+        else:
             details.append(
                 InitErrorDetails(
                     type=PydanticCustomError(
-                        cast(LiteralString, code), cast(LiteralString, message)
+                        "invalid", cast(LiteralString, f"invalid: {type(error).__name__}")
                     ),
-                    loc=_safe_location(
-                        model,
-                        item["loc"],
-                        show_unknown=unknown_fields == "show" and code == "extra_forbidden",
-                    ),
+                    loc=(),
                     input=None,
                 )
             )
-    else:
-        details.append(
-            InitErrorDetails(
-                type=PydanticCustomError(
-                    "invalid", cast(LiteralString, f"invalid: {type(error).__name__}")
-                ),
-                loc=(),
-                input=None,
-            )
-        )
-    return ValidationError.from_exception_data(model.__name__, details, hide_input=True)
+        return ValidationError.from_exception_data(model.__name__, details, hide_input=True)
+    except Exception:
+        return _minimal_validation_error(model)
+
+
+def _minimal_validation_error(model: type[BaseModel]) -> ValidationError:
+    """Build the value-free fallback without schema walking or error inspection."""
+    return ValidationError.from_exception_data(
+        model.__name__,
+        [{"type": PydanticCustomError("invalid", "invalid"), "loc": (), "input": None}],
+        hide_input=True,
+    )
 
 
 def _validation_wrapper(
-    model: type[BaseModel], *, by_alias: bool | None = None
+    model: type[BaseModel], *, by_alias: bool | None = None, explicit: bool = False
 ) -> Callable[[Any, Callable[[Any], Any]], Any]:
     """Build the one outer validation boundary, including subclass after validators."""
 
     def validate(data: Any, handler: Callable[[Any], Any]) -> Any:
         """Suppress input-bearing exception chains and rebuild safe error details."""
-        if _VALIDATION_ACTIVE.get():
+        current = _VALIDATION_ACTIVE.get()
+        if (
+            not explicit
+            and current is not None
+            and current.active
+            and current.thread_id == get_ident()
+        ):
             return handler(data)
-        token = _VALIDATION_ACTIVE.set(True)
+        owner = _ValidationOwner(get_ident())
+        token = _VALIDATION_ACTIVE.set(owner)
         alias_token = _VALIDATION_BY_ALIAS.set(by_alias)
         try:
             return handler(data)
         except Exception as error:
-            raise _sanitize_validation_error(
-                model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
-            ) from None
+            if isinstance(error, PydanticErrorMixin):
+                raise
+            try:
+                safe = _sanitize_validation_error(
+                    model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
+                )
+            except Exception:
+                safe = _minimal_validation_error(model)
+            else:
+                if current is not None and current.active and current.thread_id == get_ident():
+                    current.sanitized.update(
+                        (item["loc"], item["type"], item["msg"])
+                        for item in safe.errors(
+                            include_input=False, include_url=False, include_context=False
+                        )
+                    )
+                raise safe from None
         finally:
+            owner.active = False
             _VALIDATION_BY_ALIAS.reset(alias_token)
             _VALIDATION_ACTIVE.reset(token)
+        raise safe from None
 
     validate.__name__ = model.__name__
     return validate
@@ -297,9 +476,12 @@ class _SafeModel(BaseModel):
     _unknown_fields : ClassVar[Literal['show', 'hide']]
         Unknown-key policy. Human plan/settings classes select ``show``; component,
         job, catalog and result classes inherit ``hide``. The outermost model owns
-        this policy throughout the tree. Fields, aliases and indices remain;
-        segments under free-form mappings or Any become ``<…>``. JSON parse
-        errors and frozen assignments use the same core.
+        this policy for nested fields in its originating thread. Explicit
+        constructor and ``model_validate*`` calls inside validators establish
+        their own boundary. Fields, aliases and indices remain; segments under
+        free-form mappings or Any become ``<…>``. JSON parse errors and frozen
+        assignments use the same core. Sanitizer failures yield a minimal
+        ``invalid`` error, and Pydantic developer errors propagate unchanged.
 
     Examples
     --------
@@ -318,6 +500,27 @@ class _SafeModel(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
     _unknown_fields: ClassVar[Literal["show", "hide"]] = "hide"
+
+    def __init__(self, /, **data: Any) -> None:
+        """
+        Validate an explicit constructor call with this model's own policy.
+
+        Parameters
+        ----------
+        **data : Any
+            Field inputs to validate.
+
+        Examples
+        --------
+        >>> _SafeModel().model_dump()
+        {}
+        """
+        initialize = super().__init__
+        _validation_wrapper(type(self), explicit=True)(data, lambda values: initialize(**values))
+
+    # Pydantic must construct nested fields through their core schema rather
+    # than this explicit-entry wrapper, just as it does with BaseModel.__init__.
+    cast(Any, __init__).__pydantic_base_init__ = True
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -388,7 +591,7 @@ class _SafeModel(BaseModel):
         {}
         """
         validate = super().model_validate
-        return _validation_wrapper(cls, by_alias=by_alias)(
+        return _validation_wrapper(cls, by_alias=by_alias, explicit=True)(
             obj,
             lambda data: validate(
                 data,
@@ -446,7 +649,7 @@ class _SafeModel(BaseModel):
         {}
         """
         validate = super().model_validate_json
-        return _validation_wrapper(cls, by_alias=by_alias)(
+        return _validation_wrapper(cls, by_alias=by_alias, explicit=True)(
             json_data,
             lambda data: validate(
                 data,
@@ -498,7 +701,7 @@ class _SafeModel(BaseModel):
         {}
         """
         validate = super().model_validate_strings
-        return _validation_wrapper(cls, by_alias=by_alias)(
+        return _validation_wrapper(cls, by_alias=by_alias, explicit=True)(
             obj,
             lambda data: validate(
                 data,

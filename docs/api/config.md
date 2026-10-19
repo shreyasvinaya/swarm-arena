@@ -47,6 +47,8 @@ class's `_human_only` attribute. Entries without settable fields need no import.
 `match()` compares the component kind, import path, and raw fixed configuration;
 full component validation belongs to the later planning validation layer.
 
-Load errors report the configuration path and safe field locations. Rejected
+Load errors report the configuration path and schema field names, aliases and
+list/tuple indices; human settings show unknown model keys as typo identifiers,
+component configs use `<field>`, and free-form mapping or `Any` segments use `<…>`. Rejected
 values, schema defaults, import exception contents, and data-derived mapping keys
 are omitted from diagnostics.

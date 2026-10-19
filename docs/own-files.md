@@ -123,7 +123,8 @@ Use `get_input_model()` for the instance's parameter schema; the class-level
 `ScriptTool.Config` positional argument or keyword fields, and rejects unknown
 fields. Invalid settings raise a sanitized `pydantic.ValidationError`; building
 through `Ref.build()` instead raises `ConfigError`. Unknown config keys appear as
-`<field>`, and nested error locations as `<…>`. Commands must have at least one
+`<field>`; nested locations retain schema field names, aliases and list/tuple
+indices, while each free-form mapping or `Any` segment becomes `<…>`. Commands must have at least one
 argument, `env` contains variable names such as `API_KEY` (matching
 `[A-Za-z_][A-Za-z0-9_]*`), `timeout_s` is positive when set, and `grace_s` is
 nonnegative. These constraints are checked when the config is constructed.

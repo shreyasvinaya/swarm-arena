@@ -16,16 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed from `errors()` and `json()` as well as text and tracebacks.
   Schema fields, aliases and list/tuple indices remain visible at every depth;
   free-form mapping and `Any` segments use `<…>`. The outermost validated model
-  owns the unknown-key policy: human plan/settings models show nested typo names,
+  owns the unknown-key policy for nested fields; explicit constructor and
+  `model_validate*` calls inside validators use the called model's own policy,
+  and contexts copied to another thread establish their own boundary. For
+  ambiguous alias or union paths, integer mapping keys remain redacted. The
+  policy is: human plan/settings models show nested typo names,
   while runtime records and component configs use `<field>` for unknown keys.
   Empty locations stay empty, restoring `plan`/`run_config` loader fallbacks and
-  removing false nested locations. Custom codes become `invalid`; non-validation
+  removing false nested locations. Custom codes become `invalid`; wrapped built-in
+  causes previously labelled `arena_config` now use the built-in code (such as
+  `float_parsing`, `bool_parsing`, or `string_type`). Non-validation
   exceptions report `invalid: <TypeName>`. Result errors expose structured locations
   and built-in codes, and result-file reasons use those same locations and markers.
   Fixed safe reasons remain, including the value-free newer-schema reason; catalog
   human-only violations identify both the entry and the field. Compiled parameter
   models also sanitize all validation entry points and retain JSON-schema `$defs`
-  and recursive references.
+  and recursive references. Previously unsanitized standalone `Ref`, `Goal`,
+  `FileSet`, and other frozen models now use fixed messages and built-in codes,
+  redact data keys and hide unknown model keys as `<field>`. Pydantic developer
+  errors retain their original type and fix-it hint at every entry point. If
+  sanitization itself fails, diagnostics fall back to an empty location with
+  type and message `invalid`, without exposing the original failure.
 - `ToolOutput.data` and script-check `details` must be finite JSON, with fixed
   `data must be finite JSON` / `details must be finite JSON` validation messages;
   invalid connector output is reported as an execution error.

@@ -36,8 +36,9 @@ list/tuple indices, hide unknown model keys as `<field>`, and replace each
 free-form mapping or `Any` segment with `<…>`. For example, an unknown field in
 a staged candidate is reported at `candidate.<field>`, and in a parent at
 `parents.0.<field>`. The outermost validated model owns the unknown-key policy
-for its whole tree; human-authored Plan, RunConfig and Limits settings show
-nested typo identifiers. Rejected values and validator context never appear.
+for nested field validation; an explicit constructor or `model_validate*` call
+inside a validator uses the called model's own policy. Human-authored Plan,
+RunConfig and Limits settings show nested typo identifiers. Rejected values and validator context never appear.
 
 ## LocalExecutor
 
