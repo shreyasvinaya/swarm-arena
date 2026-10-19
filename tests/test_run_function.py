@@ -14,7 +14,14 @@ from swarm_arena._tooling.result_file import request_json
 SECRET = "SECRET_SENTINEL_TASK18"
 
 
-def run(tmp_path: Path, fn: str, params: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+def run(
+    tmp_path: Path,
+    fn: str,
+    params: dict[str, Any],
+    *,
+    import_dir: Path | None = None,
+    pythonpath: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     (tmp_path / "swarm").mkdir(exist_ok=True)
     (tmp_path / "swarm/request.json").write_text(
         json.dumps(request_json(ToolRequest(inputs=params)))
@@ -26,10 +33,11 @@ def run(tmp_path: Path, fn: str, params: dict[str, Any]) -> subprocess.Completed
             "-m",
             "swarm_arena.run_function",
             "--import-root",
-            str(Path(fake_tools.__file__).resolve().parents[1]),
+            str(import_dir or Path(fake_tools.__file__).resolve().parents[1]),
             fn,
         ],
         cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(pythonpath)} if pythonpath is not None else None,
         capture_output=True,
         text=True,
         check=False,
@@ -62,7 +70,8 @@ def test_cwd_files_do_not_shadow_imports(tmp_path: Path) -> None:
     [
         ("_fakes.tools:add", {"a": "x"}, "validation error for add_inputs"),
         ("_fakes.tools:not_a_dict", {}, "JSON object"),
-        ("_fakes.tools:boom", {}, "boom"),
+        ("_fakes.tools:raises_error", {}, "RuntimeError: boom"),
+        ("_fakes.tools:exits", {}, "function failed (SystemExit)"),
         ("_fakes.tools:nan_result", {}, "finite"),
         ("_fakes.tools:non_json_result", {}, "finite"),
     ],
@@ -80,7 +89,6 @@ def test_failures_exit_1(tmp_path: Path, fn: str, params: dict[str, Any], stderr
         ("_fakes.tools:add", {"a": SECRET}),
         ("_fakes.tools:add", {"a": 1, SECRET: SECRET}),
         ("_fakes.tools:nested_input", {"values": {SECRET: SECRET}}),
-        ("_fakes.tools:secret_error", {"value": SECRET}),
     ],
 )
 def test_stderr_hides_secret_values(tmp_path: Path, fn: str, params: dict[str, Any]) -> None:
@@ -153,3 +161,65 @@ def test_bad_arguments_hide_values(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert run_function.main(["_fakes.tools:add", "--unexpected", SECRET]) == 1
     assert SECRET not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("params", "expected"), [({"a": "2", "b": "3"}, 5), ({"a": "2"}, 3)])
+def test_calls_function_with_validated_values(
+    tmp_path: Path, params: dict[str, Any], expected: int
+) -> None:
+    done = run(tmp_path, "_fakes.tools:add", params)
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"sum": expected}
+
+
+@pytest.mark.parametrize("has_swarm_dir", [False, True])
+def test_result_stays_in_workspace_after_chdir(tmp_path: Path, has_swarm_dir: bool) -> None:
+    destination = tmp_path / "elsewhere"
+    destination.mkdir()
+    if has_swarm_dir:
+        (destination / "swarm").mkdir()
+    done = run(tmp_path, "_fakes.tools:changes_directory", {"directory": str(destination)})
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"changed": True}
+    assert not (destination / "swarm/result.json").exists()
+    assert sorted(p.name for p in (tmp_path / "swarm").iterdir()) == ["request.json", "result.json"]
+
+
+def test_user_traceback_is_written_to_own_stderr(tmp_path: Path) -> None:
+    done = run(tmp_path, "_fakes.tools:secret_error", {"value": SECRET})
+    assert done.returncode == 1
+    assert "FunctionTool _fakes.tools:secret_error: function failed (RuntimeError)" in done.stderr
+    assert "Traceback (most recent call last):" in done.stderr
+    assert "in secret_error" in done.stderr
+    assert f"RuntimeError: {SECRET}" in done.stderr
+    assert not done.stdout
+    assert not (tmp_path / "swarm/result.json").exists()
+
+
+def test_import_root_precedes_pythonpath(tmp_path: Path) -> None:
+    decoy = tmp_path / "decoy"
+    (decoy / "_fakes").mkdir(parents=True)
+    # Match the real _fakes namespace package so only sys.path order decides.
+    (decoy / "_fakes/tools.py").write_text(
+        'def add(a: int, b: int = 1) -> dict[str, int]:\n    return {"sum": -1}\n'
+    )
+    done = run(tmp_path, "_fakes.tools:add", {"a": 2, "b": 3}, pythonpath=decoy)
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"sum": 5}
+
+
+def test_runner_does_not_add_cwd_for_late_imports(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "task18_late.py").write_text(
+        "def solve() -> dict[str, bool]:\n"
+        "    try:\n"
+        "        import task18_workspace_only\n"
+        "    except ModuleNotFoundError:\n"
+        "        return {'shadowed': False}\n"
+        "    return {'shadowed': True}\n"
+    )
+    (tmp_path / "task18_workspace_only.py").write_text("")
+    done = run(tmp_path, "task18_late:solve", {}, import_dir=root, pythonpath=root)
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"shadowed": False}

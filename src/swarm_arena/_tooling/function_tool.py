@@ -4,20 +4,16 @@ import importlib
 import inspect
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar, LiteralString, cast, get_type_hints
+from typing import Any, ClassVar, cast, get_type_hints
 
 from pydantic import (
     BaseModel,
     ConfigDict,
-    ModelWrapValidatorHandler,
-    ValidationError,
     create_model,
-    model_validator,
 )
-from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from swarm_arena._model.ref import (
-    _CONFIG_ERROR_TYPES,
+    _ConfigInputModel,
     _validate_config,
     config_or_fields,
     import_path,
@@ -28,48 +24,8 @@ from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
 
-def _sanitize_validation(
-    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
-) -> Any:
-    """Expose only top-level schema fields and built-in validation error codes."""
-    try:
-        return handler(data)
-    except ValidationError as exc:
-        errors: list[InitErrorDetails] = []
-        for error in exc.errors(include_input=False, include_url=False, include_context=False):
-            loc = error["loc"]
-            first = loc[0] if loc else None
-            field = first if isinstance(first, str) and first in cls.model_fields else "<field>"
-            code = cast(
-                LiteralString, error["type"] if error["type"] in _CONFIG_ERROR_TYPES else "invalid"
-            )
-            errors.append(
-                InitErrorDetails(
-                    type=PydanticCustomError(code, code),
-                    loc=(field, "<…>") if len(loc) > 1 else (field,),
-                    input=None,
-                )
-            )
-        raise ValidationError.from_exception_data(cls.__name__, errors, hide_input=True) from None
-    except Exception:
-        raise ValidationError.from_exception_data(
-            cls.__name__,
-            [InitErrorDetails(type=PydanticCustomError("invalid", "invalid"), loc=(), input=None)],
-            hide_input=True,
-        ) from None
-
-
-class _FunctionModel(BaseModel):
-    """Hide values in configuration and generated-input validation failures."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
-
-
-class _EmptyInputs(_FunctionModel):
+class _EmptyInputs(_ConfigInputModel):
     """Provide a frozen placeholder; use FunctionTool.get_input_model for inputs."""
-
-    model_config = ConfigDict(frozen=True)
 
 
 def _load_function(path: str) -> Callable[..., Any]:
@@ -128,7 +84,7 @@ def function_input_model(fn: Callable[..., Any]) -> type[BaseModel]:
         default = ... if parameter.default is inspect.Parameter.empty else parameter.default
         fields[name] = (hints[name], default)
     try:
-        return create_model(f"{fn.__name__}_inputs", __base__=_FunctionModel, **fields)
+        return create_model(f"{fn.__name__}_inputs", __base__=_ConfigInputModel, **fields)
     except Exception:
         raise TypeError(f"FunctionTool {path}: cannot build input model") from None
 
@@ -140,7 +96,7 @@ def import_root(module_name: str) -> str:
     Parameters
     ----------
     module_name : str
-        Dotted module name, as recorded on the function.
+        Dotted module name from the configured function import path.
 
     Returns
     -------
@@ -181,7 +137,8 @@ class FunctionTool(Tool):
     function : str or Callable[..., Any] or FunctionTool.Config
         Module-level function, its ``module:qualname`` path, or full configuration.
     **fields : Any
-        Configuration fields when passing a function or path.
+        Configuration fields when passing a function or path. Pass ``function``
+        positionally only; a duplicate keyword raises TypeError.
 
     Examples
     --------
@@ -195,7 +152,7 @@ class FunctionTool(Tool):
     description: ClassVar[str] = "Runs a Python function in a subprocess."
     input_model: ClassVar[type[BaseModel]] = _EmptyInputs
 
-    class Config(_FunctionModel):
+    class Config(_ConfigInputModel):
         """
         Configure a function tool without importing the function.
 
@@ -230,6 +187,8 @@ class FunctionTool(Tool):
         self, function: "str | Callable[..., Any] | FunctionTool.Config", /, **fields: Any
     ) -> None:
         """Validate settings while retaining only the function's import path."""
+        if "function" in fields:
+            raise TypeError("pass function positionally only")
         if isinstance(function, self.Config):
             data = config_or_fields(function, fields)
         else:
@@ -267,7 +226,10 @@ class FunctionTool(Tool):
         Examples
         --------
         >>> from swarm_arena import FunctionTool
-        >>> model = FunctionTool("my_package.tools:solve").get_input_model()  # doctest: +SKIP
+        >>> FunctionTool("textwrap:dedent").get_input_model()
+        Traceback (most recent call last):
+        ...
+        TypeError: FunctionTool textwrap:dedent: parameter text needs an annotation
         """
         return function_input_model(_load_function(self.config.function))
 
@@ -278,7 +240,10 @@ class FunctionTool(Tool):
         Examples
         --------
         >>> from swarm_arena import FunctionTool
-        >>> FunctionTool("my_package.tools:solve").preflight()  # doctest: +SKIP
+        >>> FunctionTool("textwrap:dedent").preflight()
+        Traceback (most recent call last):
+        ...
+        TypeError: FunctionTool textwrap:dedent: parameter text needs an annotation
         """
         self.get_input_model()
 
@@ -365,7 +330,7 @@ class FunctionTool(Tool):
         >>> cmd.argv[:4]
         ['python', '-P', '-m', 'swarm_arena.run_function']
         """
-        fn = _load_function(self.config.function)
+        _load_function(self.config.function)
         return Command(
             argv=[
                 "python",
@@ -373,7 +338,7 @@ class FunctionTool(Tool):
                 "-m",
                 "swarm_arena.run_function",
                 "--import-root",
-                import_root(fn.__module__),
+                import_root(self.config.function.split(":", 1)[0]),
                 self.config.function,
             ],
             timeout_s=self.config.timeout_s,
@@ -400,6 +365,23 @@ class FunctionTool(Tool):
 
         Examples
         --------
-        >>> output = tool.collect(request, workspace, run)  # doctest: +SKIP
+        >>> from datetime import UTC, datetime
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> from swarm_arena import FunctionTool
+        >>> from swarm_arena.tool import CompletedRun, RunStatus, ToolRequest
+        >>> tool = FunctionTool("my_tools:add")
+        >>> now = datetime(2026, 10, 18, tzinfo=UTC)
+        >>> with TemporaryDirectory() as directory:
+        ...     workspace = Path(directory)
+        ...     (workspace / "swarm").mkdir()
+        ...     _ = (workspace / "swarm/result.json").write_text(
+        ...         '{"schema_version": 1, "data": {"sum": 5}}')
+        ...     run = CompletedRun(returncode=0, status=RunStatus.OK,
+        ...         stdout_path=workspace / "stdout", stderr_path=workspace / "stderr",
+        ...         started_at=now, ended_at=now)
+        ...     output = tool.collect(ToolRequest(), workspace, run)
+        >>> output.data
+        {'sum': 5}
         """
         return tool_output_from_result(workspace, run)

@@ -27,6 +27,7 @@ tool.preflight()
 inputs = tool.get_input_model().model_validate({"a": 2})
 assert inputs.model_dump() == {"a": 2, "b": 1}
 assert FunctionTool("my_tools:add").config.function == "my_tools:add"
+assert FunctionTool(FunctionTool.Config(function="my_tools:add")).config == FunctionTool(add).config
 ```
 
 Construction does not import the referenced module. Preflight validates the
@@ -40,10 +41,15 @@ must be a dictionary accepted by the finite JSON encoder.
 `python -P -m swarm_arena.run_function --import-root <dir> <function>`.
 The runner validates `params` from `swarm/request.json` and atomically publishes
 `{"schema_version": 1, "data": ...}` to `swarm/result.json`. Failures exit with
-status 1 and sanitized diagnostics. The executor collects the standard result
-envelope and supervises cancellation and timeouts as for other tools.
+status 1. Runner diagnostics contain identifiers and error codes; exceptions
+raised by the user function include their own traceback in the tool's stderr
+log. The result stays in the original workspace even if the function changes
+directory. The executor collects the standard result envelope and supervises
+cancellation and timeouts as for other tools.
 
 Install `swarm-arena` in the interpreter's own environment: the launcher uses
 `python -I`. The function command uses `-P`, which suppresses only the implicit
-cwd/script-directory import entry; explicit `PYTHONPATH` entries still apply.
-The function's import root travels in argv, so no `Job.env` entry is required.
+cwd/script-directory import entry. `LocalExecutor` uses an environment allowlist
+and does not forward `PYTHONPATH`. The configured function module's import root
+travels in argv, so no `Job.env` entry is required. Other dependencies must be
+installed in the interpreter's environment or available under that import root.

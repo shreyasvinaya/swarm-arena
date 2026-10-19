@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
@@ -24,14 +25,16 @@ class _Parser(argparse.ArgumentParser):
         raise ValueError("invalid function runner arguments")
 
 
-def _write_result(payload: bytes) -> None:
+def _write_result(payload: bytes, result_path: Path) -> None:
     """Publish a complete envelope atomically and clean up unpublished files."""
     temporary: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(dir="swarm", prefix=".result-", delete=False) as stream:
+        with tempfile.NamedTemporaryFile(
+            dir=result_path.parent, prefix=".result-", delete=False
+        ) as stream:
             temporary = stream.name
             stream.write(payload)
-        os.replace(temporary, "swarm/result.json")
+        os.replace(temporary, result_path)
     finally:
         if temporary is not None:
             with contextlib.suppress(FileNotFoundError):
@@ -44,7 +47,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Run with ``python -P -m swarm_arena.run_function``. The explicit import root
     is inserted before loading user code. ``-P`` removes only the implicit
-    working-directory entry; explicit ``PYTHONPATH`` entries remain effective.
+    working-directory entry. LocalExecutor does not forward ``PYTHONPATH``;
+    dependencies must be installed in the interpreter's environment or available
+    under the explicit import root.
 
     Parameters
     ----------
@@ -55,15 +60,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns
     -------
     int
-        Zero after publishing the result, or one after a sanitized diagnostic.
+        Zero after publishing the result, or one on failure. Runner diagnostics
+        omit values; user-function failures include their traceback in stderr.
 
     Examples
     --------
-    >>> main(["--import-root", "/project", "my_package.tools:solve"])  # doctest: +SKIP
+    >>> from swarm_arena.run_function import main
+    >>> main(["--help"])
+    usage: ...
     0
     """
     reason = "invalid function runner arguments"
     try:
+        swarm_dir = Path.cwd() / "swarm"
+        result_path = swarm_dir / "result.json"
         parser = _Parser(prog="python -P -m swarm_arena.run_function")
         parser.add_argument("--import-root")
         parser.add_argument("function")
@@ -78,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reason = f"FunctionTool {args.function}: unsupported function signature"
         model = function_input_model(fn)
         reason = "cannot read swarm/request.json"
-        request = json.loads(Path("swarm/request.json").read_bytes())
+        request = json.loads((swarm_dir / "request.json").read_bytes())
         reason = f"FunctionTool {args.function}: invalid request params"
         try:
             inputs = model.model_validate(request["params"])
@@ -86,14 +96,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         reason = f"FunctionTool {args.function}: function failed"
-        result = fn(**{name: getattr(inputs, name) for name in type(inputs).model_fields})
+        try:
+            result = fn(**{name: getattr(inputs, name) for name in type(inputs).model_fields})
+        except (Exception, SystemExit) as exc:
+            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            traceback.print_exception(exc, file=sys.stderr)
+            return 1
         if not isinstance(result, dict):
             print(f"FunctionTool {args.function}: must return a JSON object", file=sys.stderr)
             return 1
         reason = f"FunctionTool {args.function}: values must be finite JSON"
         payload = canonical_json({"schema_version": 1, "data": result})
         reason = "cannot write swarm/result.json"
-        _write_result(payload)
+        _write_result(payload, result_path)
         return 0
     except (Exception, SystemExit) as exc:
         print(f"{reason} ({type(exc).__name__})", file=sys.stderr)

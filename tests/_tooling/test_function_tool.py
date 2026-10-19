@@ -1,11 +1,13 @@
+import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import pytest
 from _fakes import tools as fake_tools
 from _fakes.tools import add, gradient_descent, make_job
-from pydantic import BeforeValidator, ValidationError
+from pydantic import BaseModel, BeforeValidator, ValidationError
 from pydantic_core import PydanticCustomError
 
 import swarm_arena
@@ -96,6 +98,7 @@ def test_input_model_and_description() -> None:
         "_fakes.tools:positional_only",
         "_fakes.tools:star_keywords",
         "_fakes.tools:GOAL",
+        "_fakes.tools:RecordingExecutor",
     ],
 )
 def test_unsupported_signatures(fn: str) -> None:
@@ -199,10 +202,40 @@ def test_import_root_rejects_modules_without_a_file() -> None:
         import_root("sys")
 
 
-def test_direct_model_json_errors_hide_input_text() -> None:
-    model = FunctionTool(add).get_input_model()
-    for model_cls in (model, FunctionTool.Config):
-        with pytest.raises(ValidationError) as caught:
-            model_cls.model_validate_json(f"{{{SECRET}")
-        assert SECRET not in str(caught.value)
-        assert SECRET not in "".join(traceback.format_exception(caught.value))
+@pytest.mark.parametrize(
+    "model_cls",
+    [FunctionTool(add).get_input_model(), FunctionTool.Config, FunctionTool.input_model],
+)
+def test_direct_model_json_errors_hide_input_text(model_cls: type[BaseModel]) -> None:
+    with pytest.raises(ValidationError) as caught:
+        model_cls.model_validate_json(f"{{{SECRET}")
+    assert caught.value.errors()[0]["type"] == "json_invalid"
+    assert model_cls.model_config["hide_input_in_errors"]
+    assert_secret_absent(caught.value)
+
+
+@pytest.mark.parametrize(
+    "function", ["_fakes.tools:add", add, FunctionTool.Config(function="_fakes.tools:add")]
+)
+def test_duplicate_function_keyword_is_rejected(
+    function: str | Callable[..., Any] | FunctionTool.Config,
+) -> None:
+    with pytest.raises(TypeError, match="function") as caught:
+        FunctionTool(function, function=SECRET)
+    assert_secret_absent(caught.value)
+
+
+def test_command_uses_configured_module_for_reexport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "task18_reexport.py").write_text("from _fakes.tools import add\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    tool = FunctionTool("task18_reexport:add")
+    try:
+        tool.preflight()
+        assert sys.modules["task18_reexport"].add.__module__ == "_fakes.tools"
+        assert import_root("_fakes.tools") != str(tmp_path)
+        command = tool.command(ToolRequest(), tmp_path)
+        assert command.argv[-3:] == ["--import-root", str(tmp_path), "task18_reexport:add"]
+    finally:
+        sys.modules.pop("task18_reexport", None)

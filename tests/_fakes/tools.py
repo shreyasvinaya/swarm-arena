@@ -1,3 +1,5 @@
+import os
+import sys
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -372,3 +374,14 @@ class PanelJudge(Judge):
 
     def models(self) -> tuple[str, ...]:
         return tuple(self.config.models)
+def raises_error() -> dict[str, int]:
+    raise RuntimeError("boom")
+
+
+def exits() -> dict[str, int]:
+    sys.exit(0)
+
+
+def changes_directory(directory: str) -> dict[str, bool]:
+    os.chdir(directory)
+    return {"changed": True}
