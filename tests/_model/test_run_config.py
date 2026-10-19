@@ -12,6 +12,7 @@ from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.settings import SecretsPolicy
+from swarm_arena._model.toml_io import dumps_toml
 
 MODELS_TOML = """[models.opus]
 model = "anthropic/claude-opus-5-5"     # LiteLLM "provider/model" name
@@ -101,6 +102,52 @@ def test_run_config_rejects_invalid_fields(data: dict[str, Any]) -> None:
         RunConfig.model_validate(data)
 
 
+@pytest.mark.parametrize(
+    ("table", "key", "defaults", "location"),
+    [
+        ("", "settle_timout_s", {}, "settle_timout_s"),
+        ("limits", "max_teamz", {}, "limits.max_teamz"),
+        ("secrets", "alow", {}, "secrets.alow"),
+        ("tracing", "store_paylods", {}, "tracing.store_paylods"),
+        (
+            "llm_gateway",
+            "request_timout_s",
+            {"url": "https://gateway.example"},
+            "llm_gateway.request_timout_s",
+        ),
+        ("cache", "ttl_sec", {"backend": "disk"}, "cache.ttl_sec"),
+        ("cache.roles.judge", "reed", {"read": True, "write": True}, "cache.roles.<key>.reed"),
+    ],
+)
+def test_unknown_run_config_fields_show_identifiers_without_values(
+    tmp_path: Path, table: str, key: str, defaults: dict[str, Any], location: str
+) -> None:
+    data: dict[str, Any] = {"cache": {"backend": "disk"}} if table.startswith("cache") else {}
+    target = data
+    for segment in table.split(".") if table else []:
+        target = target.setdefault(segment, {})
+    target.update(defaults)
+    target[key] = "SECRET_SENTINEL"
+    with pytest.raises(ValidationError) as caught:
+        RunConfig.model_validate(data)
+    assert location in str(caught.value)
+    assert "extra_forbidden" in str(caught.value)
+    assert "SECRET_SENTINEL" not in str(caught.value)
+    assert "SECRET_SENTINEL" not in repr(caught.value.args)
+    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert "SECRET_SENTINEL" not in caught.value.json()
+
+    path = tmp_path / "typo.toml"
+    path.write_text(dumps_toml(data))
+    with pytest.raises(ConfigError, match=r"typo\.toml") as loaded:
+        RunConfig.load(path)
+    assert location in str(loaded.value)
+    assert "extra_forbidden" in str(loaded.value)
+    assert "SECRET_SENTINEL" not in str(loaded.value)
+    assert "SECRET_SENTINEL" not in repr(loaded.value.args)
+    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(loaded.value))
+
+
 def test_run_config_refs_roots_and_defaults_are_independent(tmp_path: Path) -> None:
     from _fakes.tools import Widget
 
@@ -131,7 +178,7 @@ def test_run_config_refs_roots_and_defaults_are_independent(tmp_path: Path) -> N
     "text",
     [
         'reserve_fraction="SECRET_SENTINEL"',
-        "SECRET_SENTINEL=1",
+        'settle_timout_s="SECRET_SENTINEL"',
         '[goal_weights]\nSECRET_SENTINEL="bad"',
         '[models.SECRET_SENTINEL]\nmodel="a/b"\nroles=["SECRET_SENTINEL"]',
         '[executor]\npath="SECRET_SENTINEL"',
@@ -147,6 +194,8 @@ def test_load_errors_hide_values_and_data_keys(tmp_path: Path, text: str) -> Non
     path.write_text(text)
     with pytest.raises(ConfigError, match=r"secret\.toml") as caught:
         RunConfig.load(path)
+    assert "SECRET_SENTINEL" not in str(caught.value)
+    assert "SECRET_SENTINEL" not in repr(caught.value.args)
     assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
     assert caught.value.__cause__ is None
     assert caught.value.__suppress_context__

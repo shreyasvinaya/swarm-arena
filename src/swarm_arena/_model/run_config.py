@@ -15,7 +15,7 @@ from swarm_arena._model.settings import (
     GatewayConfig,
     SecretsPolicy,
     TracingConfig,
-    _sanitize_config,
+    _sanitize_human_config,
 )
 from swarm_arena._model.toml_io import dumps_toml, read_toml
 
@@ -115,7 +115,8 @@ class RunConfig(StoredModel):
         ------
         ConfigError
             If reading, parsing, or validation fails. Diagnostics identify the
-            path and safe field locations without rejected input values.
+            path and safe field locations, including misspelled setting names,
+            without rejected input values or arbitrary mapping keys.
 
         Examples
         --------
@@ -157,4 +158,4 @@ class RunConfig(StoredModel):
         """
         return dumps_toml(self.model_dump(mode="json", exclude_none=True))
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_config)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_config)

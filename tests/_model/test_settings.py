@@ -87,7 +87,7 @@ def test_settings_boundaries_and_defaults() -> None:
     ("model", "data"),
     [
         (SecretsPolicy, {"allow": ["SECRET_SENTINEL-INVALID"]}),
-        (TracingConfig, {"SECRET_SENTINEL": True}),
+        (TracingConfig, {"store_paylods": "SECRET_SENTINEL"}),
         (GatewayConfig, {"url": "SECRET_SENTINEL"}),
         (CachePolicy, {"backend": "s3", "namespace": "SECRET_SENTINEL"}),
         (CachePolicy, {"backend": "redis", "namespace": "SECRET_SENTINEL"}),
@@ -101,5 +101,31 @@ def test_settings_errors_hide_secret_values(
 ) -> None:
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
+    assert "SECRET_SENTINEL" not in str(caught.value)
+    assert "SECRET_SENTINEL" not in repr(caught.value.args)
+    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert "SECRET_SENTINEL" not in caught.value.json()
+
+
+@pytest.mark.parametrize(
+    ("model", "data", "key"),
+    [
+        (SecretsPolicy, {}, "alow"),
+        (TracingConfig, {}, "store_paylods"),
+        (GatewayConfig, {"url": "https://gateway.example"}, "request_timout_s"),
+        (CachePolicy, {"backend": "disk"}, "ttl_sec"),
+        (CachePolicy.RoleSwitch, {"read": True, "write": True}, "reed"),
+    ],
+)
+def test_unknown_settings_fields_show_identifiers_without_values(
+    model: type[BaseModel], data: dict[str, Any], key: str
+) -> None:
+    data = data | {key: "SECRET_SENTINEL"}
+    with pytest.raises(ValidationError) as caught:
+        model.model_validate(data)
+    assert key in str(caught.value)
+    assert "extra_forbidden" in str(caught.value)
+    assert "SECRET_SENTINEL" not in str(caught.value)
+    assert "SECRET_SENTINEL" not in repr(caught.value.args)
     assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
     assert "SECRET_SENTINEL" not in caught.value.json()

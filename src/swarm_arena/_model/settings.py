@@ -10,7 +10,11 @@ from swarm_arena._model.limits import Limits, _safe_location, _SafeModel
 
 
 def _sanitize_config(
-    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
+    cls: type[BaseModel],
+    data: Any,
+    handler: ModelWrapValidatorHandler[Any],
+    *,
+    show_unknown_fields: bool = False,
 ) -> Any:
     """Strip rejected values, dynamic locations, and untrusted validator messages."""
     try:
@@ -23,11 +27,22 @@ def _sanitize_config(
             errors.append(
                 InitErrorDetails(
                     type=PydanticCustomError("arena_config", "{reason}", {"reason": reason}),
-                    loc=_safe_location(cls, item["loc"]),
+                    loc=_safe_location(
+                        cls,
+                        item["loc"],
+                        extra_field=show_unknown_fields and reason == "extra_forbidden",
+                    ),
                     input=None,
                 )
             )
         raise ValidationError.from_exception_data(cls.__name__, errors, hide_input=True) from None
+
+
+def _sanitize_human_config(
+    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
+) -> Any:
+    """Retain setting typo identifiers through nested wrappers, hiding values and mapping keys."""
+    return _sanitize_config(cls, data, handler, show_unknown_fields=True)
 
 
 class _ConfigModel(_SafeModel):
@@ -36,7 +51,13 @@ class _ConfigModel(_SafeModel):
     _sanitize_errors = model_validator(mode="wrap")(_sanitize_config)
 
 
-class SecretsPolicy(_ConfigModel):
+class _HumanConfigModel(_ConfigModel):
+    """Show unknown human-authored setting names without exposing rejected values."""
+
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_config)
+
+
+class SecretsPolicy(_HumanConfigModel):
     """
     Declare the secrets file and permitted environment variable names.
 
@@ -58,7 +79,7 @@ class SecretsPolicy(_ConfigModel):
     allow: list[Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]] = []
 
 
-class TracingConfig(_ConfigModel):
+class TracingConfig(_HumanConfigModel):
     """
     Select payload storage and optional Langfuse tracing.
 
@@ -80,7 +101,7 @@ class TracingConfig(_ConfigModel):
     langfuse: bool = False
 
 
-class GatewayConfig(_ConfigModel):
+class GatewayConfig(_HumanConfigModel):
     """
     Configure an optional LiteLLM gateway and its budget policy.
 
@@ -142,7 +163,7 @@ class GatewayConfig(_ConfigModel):
         )
 
 
-class CachePolicy(_ConfigModel):
+class CachePolicy(_HumanConfigModel):
     """
     Configure optional response caching with separate permissions per role.
 
@@ -171,7 +192,7 @@ class CachePolicy(_ConfigModel):
     False
     """
 
-    class RoleSwitch(_ConfigModel):
+    class RoleSwitch(_HumanConfigModel):
         """
         Select cache read and write permissions for a role.
 
@@ -214,4 +235,4 @@ class CachePolicy(_ConfigModel):
             raise PydanticCustomError("arena_config", "redis backend requires redis_url_env")
         return self
 
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_config)
+    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_human_config)
