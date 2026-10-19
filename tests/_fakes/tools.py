@@ -10,7 +10,7 @@ from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
-from swarm_arena._model.results import Candidate
+from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._model.tooling import (
     Command,
     CompletedRun,
@@ -19,8 +19,6 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
-from swarm_arena._model.results import Candidate, CheckResult, Score
-from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._tooling.result_file import tool_output_from_result
@@ -197,6 +195,8 @@ class GhostFileTool(PyTool):
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
         ghost = FileRef(name="ghost.txt", path="out/ghost.txt", sha256="0" * 64, size=0)
         return ToolOutput(status=run.status, data={"x": 1}, files=[ghost])
+
+
 # --- Task 20 ---
 
 
