@@ -16,7 +16,7 @@ from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import JsonValue, Origin, StoredModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal, _Slug
-from swarm_arena._model.limits import Limits, _SafeModel, _sanitize_validation
+from swarm_arena._model.limits import Limits, _SafeModel, _sanitize_human_validation
 from swarm_arena._model.ref import Ref, RefField, unique_names
 from swarm_arena._model.toml_io import dumps_toml, read_toml
 
@@ -50,7 +50,7 @@ class Resources(_SafeModel):
     memory_gib: float | None = Field(default=None, gt=0)
     custom: dict[str, Annotated[float, Field(ge=0)]] = {}
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class PartSpec(_SafeModel):
@@ -83,7 +83,7 @@ class PartSpec(_SafeModel):
     judges: list[RefField] | None = None
     ranking: str | None = None
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class AgentSpec(_SafeModel):
@@ -120,7 +120,7 @@ class AgentSpec(_SafeModel):
     replicates: int = Field(default=1, ge=1)
     resources: Resources = Resources()
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class TeamSpec(_SafeModel):
@@ -150,7 +150,7 @@ class TeamSpec(_SafeModel):
     part: str | None = None
     agents: list[AgentSpec]
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class RoundSpec(_SafeModel):
@@ -205,7 +205,7 @@ class RoundSpec(_SafeModel):
             raise ValueError("tool_overrides: expected finite JSON values") from None
         return sha256_hex(encoded)[:12]
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class ConvergeSpec(_SafeModel):
@@ -250,7 +250,7 @@ class ConvergeSpec(_SafeModel):
     parents_per_part: int = Field(default=1, ge=1)
     max_join_attempts: int = Field(default=1, ge=0)
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class FlowSpec(_SafeModel):
@@ -277,7 +277,7 @@ class FlowSpec(_SafeModel):
     recipient: str
     rationale: str
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class Plan(StoredModel, _SafeModel):
@@ -559,4 +559,4 @@ class Plan(StoredModel, _SafeModel):
         """
         return len(self.rounds) or limits.max_rounds
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)

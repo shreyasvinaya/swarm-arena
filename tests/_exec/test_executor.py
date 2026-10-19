@@ -190,3 +190,56 @@ def test_validation_errors_hide_values_and_dynamic_keys(
 def test_executor_requires_all_abstract_operations() -> None:
     with pytest.raises(TypeError, match=r"abstract.*aclose.*capacity.*submit"):
         Executor()  # ty: ignore[call-non-callable]
+
+
+@pytest.mark.parametrize(
+    ("model", "data", "location"),
+    [
+        (Job.Stage, {"sentinel-secret": "sentinel-value"}, ("<key>",)),
+        (
+            Job.CandidateFiles,
+            {"request": {}, "output": {}, "files": {}, "sentinel-secret": "sentinel-value"},
+            ("<key>",),
+        ),
+        (
+            Job.Started,
+            {"kind": "process", "job_id": "x-1", "sentinel-secret": "sentinel-value"},
+            ("<key>",),
+        ),
+        (
+            Job.Stage,
+            {"candidate": {"request": {}, "output": {}, "files": {}, "sentinel-secret": 1}},
+            ("candidate", "<key>"),
+        ),
+        (
+            Job.Stage,
+            {
+                "parents": [
+                    {"candidate_id": "c", "run_id": "r", "tool_identity": "t", "sentinel-secret": 1}
+                ]
+            },
+            ("parents", 0, "<key>"),
+        ),
+    ],
+)
+def test_runtime_unknown_fields_are_hidden(
+    model: type[Job.Stage] | type[Job.CandidateFiles] | type[Job.Started],
+    data: dict[str, object],
+    location: tuple[str | int, ...],
+) -> None:
+    import traceback
+
+    with pytest.raises(ValidationError) as caught:
+        model.model_validate(data)
+    errors = caught.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["loc"] == location
+    assert errors[0]["type"] == "extra_forbidden"
+    for rendered in (
+        str(caught.value),
+        repr(caught.value.args),
+        repr(errors),
+        "".join(traceback.format_exception(caught.value)),
+    ):
+        assert "sentinel-secret" not in rendered
+        assert "sentinel-value" not in rendered

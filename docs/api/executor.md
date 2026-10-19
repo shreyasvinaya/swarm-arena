@@ -30,6 +30,14 @@ Callbacks are local control hooks and must be omitted from serialized payloads.
 `secret_values` overrides other environment sources and is excluded from repr,
 as are both callbacks. Secret values must never be journaled or logged.
 
+Validation errors from `Job.Stage`, `Job.CandidateFiles`, and `Job.Started`
+hide rejected values and unknown or dynamic keys, including nested locations.
+Declared field names and list indices remain visible. For example, an unknown
+field in a staged candidate is reported at `candidate.<key>`. The typo diagnostics
+used for human-authored Plan and Limits settings do not apply to these runtime
+records. Component configuration validation retains its separate rule: only
+declared top-level field names or aliases are shown, with deeper locations redacted.
+
 ```{eval-rst}
 .. automodule:: swarm_arena.executor
    :members:

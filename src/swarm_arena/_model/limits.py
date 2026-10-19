@@ -77,9 +77,13 @@ _STRUCTURAL_REASONS: frozenset[LiteralString] = frozenset(
 
 
 def _sanitize_validation(
-    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
+    cls: type[BaseModel],
+    data: Any,
+    handler: ModelWrapValidatorHandler[Any],
+    *,
+    show_unknown_fields: bool = False,
 ) -> Any:
-    """Rebuild errors with field identifiers and no input or context values."""
+    """Redact values and dynamic keys; human configuration may opt into typo locations."""
     try:
         return handler(data)
     except ValidationError as err:
@@ -90,11 +94,22 @@ def _sanitize_validation(
             errors.append(
                 InitErrorDetails(
                     type=PydanticCustomError(code, reason),
-                    loc=_safe_location(cls, item["loc"], extra_field=code == "extra_forbidden"),
+                    loc=_safe_location(
+                        cls,
+                        item["loc"],
+                        extra_field=show_unknown_fields and code == "extra_forbidden",
+                    ),
                     input=None,
                 )
             )
         raise ValidationError.from_exception_data(cls.__name__, errors, hide_input=True) from None
+
+
+def _sanitize_human_validation(
+    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
+) -> Any:
+    """Keep Plan/Limits typo identifiers without exposing rejected values or mapping keys."""
+    return _sanitize_validation(cls, data, handler, show_unknown_fields=True)
 
 
 class Limits(_SafeModel):
@@ -204,4 +219,4 @@ class Limits(_SafeModel):
         """
         return self.round_timeout_s if self.round_timeout_s is not None else 4 * self.tool_timeout_s
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
