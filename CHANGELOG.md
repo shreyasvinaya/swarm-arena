@@ -24,3 +24,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Check` and `Judge` ABCs with `CheckContext.execute` and score stamping.
 - `FunctionTool`: a module-level Python function run in a subprocess.
 - `ProgramJudge` and `Lexicographic` judges.
+
+- `ScriptCheck` and `ScriptJudge`, and the "Use your own files and script" docs page.

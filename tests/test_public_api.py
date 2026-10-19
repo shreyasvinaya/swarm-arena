@@ -185,3 +185,7 @@ def test_root_import_publishes_core_facades() -> None:  # __module__ never depen
     code = f"import sys, swarm_arena; print(sorted(set({CORE!r}) - set(sys.modules)))"
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert done.stdout.strip() == "[]"
+
+
+# --- Task 22 ---
+PUBLIC["swarm_arena"] += ["ScriptCheck", "ScriptJudge"]
