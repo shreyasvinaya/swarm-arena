@@ -7,7 +7,7 @@ from swarm_arena import FunctionTool, Goal, ProgramJudge, ScriptCheck, ScriptJud
 from swarm_arena.executor import LocalExecutor
 from swarm_arena.scoring import Lexicographic
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
-from swarm_arena.tool import FileSet, RunStatus, ToolRequest
+from swarm_arena.tool import FileSet, RunStatus, ToolOutput, ToolRequest
 
 DATA = Path(__file__).parent / "data" / "single_run"
 CHECK = {"command": ["python", "checks/check.py"], "files": ["checks/check.py"]}
@@ -52,6 +52,8 @@ async def test_script_tool_edit_overlay_check_and_lexicographic_judge(
         tool, {}, goal=goal, edits={"problem/model_a.txt": "2.0"}, executor=executor
     )
     assert (first.status, first.data["a"], first.data["b"]) == (RunStatus.OK, 2.0, 0.0)
+    assert [file.path for file in first.files] == ["fit.txt"]
+    assert first.data["parent_files_present"] == {}
     parent = make_candidate(
         first,
         request=ToolRequest(edits={"problem/model_a.txt": "2.0"}),
@@ -68,12 +70,22 @@ async def test_script_tool_edit_overlay_check_and_lexicographic_judge(
     )
     # The base overlay supplies a, and this run's edit supplies b.
     assert (out.status, out.data["a"], out.data["b"]) == (RunStatus.OK, 2.0, 1.0)
+    assert [file.path for file in out.files] == ["fit.txt"]
+    assert out.data["parent_files_present"] == {parent.id: True}
     # Guard against judge data leaking into tool workspaces.
     assert "judge/hidden/points.csv" not in out.data["files_seen"]
     assert "judge/score.py" not in out.data["files_seen"]
     assert "problem/run.py" in out.data["files_seen"]
-    child = make_candidate(out, tool=tool, goal_id="fit", parent_ids=[parent.id])
-    baseline = make_candidate(first, tool=tool, goal_id="fit")
+    child = make_candidate(
+        out,
+        request=ToolRequest(edits={"problem/model_b.txt": "1.0"}),
+        tool=tool,
+        goal_id="fit",
+        parent_ids=[parent.id],
+    )
+    # The conformance helper hashes this request's edits; retain the base overlay too.
+    child = child.model_copy(update={"overlay": {**parent.overlay, **child.overlay}})
+    baseline = make_candidate(first, request=parent.request, tool=tool, goal_id="fit")
     for c in (child, baseline):
         assert (await check_check(ScriptCheck(**CHECK), c, goal=goal, executor=executor)).passed
     judge = Lexicographic(
@@ -95,3 +107,18 @@ async def test_script_tool_edit_overlay_check_and_lexicographic_judge(
     assert scores[baseline.id].key == (-1.0, -0.0)
     assert max(scores.values(), key=lambda s: s.key).candidate_id == child.id
     assert {s.judge for s in scores.values()} == {"lexicographic"}
+
+
+async def test_script_check_rejects_missing_numbers_and_crashed_script(
+    executor: LocalExecutor,
+) -> None:
+    goal = Goal(id="invalid", namespace="e2e")
+    candidate = make_candidate(
+        ToolOutput(status=RunStatus.OK, data={"files_seen": []}), goal_id=goal.id
+    )
+    result = await check_check(ScriptCheck(**CHECK), candidate, goal=goal, executor=executor)
+    assert (result.passed, result.reasons) == (False, ["non-finite or missing numbers"])
+
+    crashed = ScriptCheck(command=["python", "-c", "raise SystemExit(1)"])
+    result = await check_check(crashed, candidate, goal=goal, executor=executor)
+    assert (result.passed, result.reasons) == (False, ["check script failed: error"])

@@ -20,6 +20,13 @@
 
 M1a (foundations): tools, checks, judges, `LocalExecutor`, and the `swarm_arena.testing` conformance kit work; plans, managers, and full runs arrive in M1b.
 
+Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,
+replace `/path/to/agent-swarm` with the clone's absolute path and run:
+
+```sh
+uv venv --python 3.11 && uv pip install -e /path/to/agent-swarm
+```
+
 Run one function offline with `check_tool`. Save the function in an importable
 module, `rosenbrock.py`, so `FunctionTool` can run it in a subprocess:
 
@@ -56,7 +63,7 @@ def gradient_descent(lr: float, steps: int, x0: float = -1.5, y0: float = 2.0) -
 ```
 
 Save this driver beside it as `run_example.py` and run `uv run python run_example.py`
-in an environment with swarm-arena installed (Python 3.11+, POSIX):
+in the same directory:
 
 ```python
 import anyio

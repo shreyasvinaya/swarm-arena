@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - End-to-end offline test of one tool run, checked and judged through the public API.
+- Extend the offline exit test to reject invalid candidates and crashed checks,
+  upload output files, and verify candidate overlays and parent file staging.
+  Document installation from a clone before running the README example.
 - `ScriptTool`: bring your own files and script, with `list_files` and `read_file` actions.
 - `RunConfig` and the `swarm_arena.config` models, with load-time catalog rules.
 
