@@ -1,9 +1,13 @@
+import inspect
 import threading
-import traceback
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
+import anyio
+import anyio.lowlevel
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, cand, rosen_score
 from pydantic import ValidationError
 
@@ -29,17 +33,18 @@ async def test_scores_each_candidate(judge_ctx: JudgeContext) -> None:
 @pytest.mark.parametrize(
     ("fn", "reason"),
     [
-        ("_fakes.tools:raising_score", "RuntimeError"),
-        ("_fakes.tools:nan_score", "finite"),
+        ("_fakes.tools:raising_score", "RuntimeError: scoring function raised"),
+        ("_fakes.tools:nan_score", "ValidationError: scoring function raised"),
         ("_fakes.tools:list_score", "returned list, expected Score"),
     ],
 )
 async def test_failures_are_judge_errors(judge_ctx: JudgeContext, fn: str, reason: str) -> None:
     assert await ProgramJudge(fn).judge(GOAL, [cand(id="c1", data={"f": 1.0})], judge_ctx) == []
-    assert reason in judge_ctx.errors["c1"]
+    assert reason == judge_ctx.errors["c1"]
 
 
 def test_forms_and_preflight() -> None:
+    assert ProgramJudge.name == "program"
     assert ProgramJudge(rosen_score).config == ProgramJudge("_fakes.tools:rosen_score").config
     assert ProgramJudge(ProgramJudge.Config(function="_fakes.tools:rosen_score")).config == (
         ProgramJudge(rosen_score).config
@@ -103,21 +108,7 @@ def test_lazy_import_and_sanitized_import_error(monkeypatch: pytest.MonkeyPatch)
     judge = ProgramJudge("example:score")
     with pytest.raises(ValueError, match="cannot import example:score") as caught:
         judge.preflight()
-    assert_safe_error(caught.value)
-
-
-def assert_safe_error(error: Exception) -> None:
-    surfaces = [
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(error.__notes__) if hasattr(error, "__notes__") else "",
-        repr(error.__cause__),
-        "".join(traceback.format_exception(error)),
-    ]
-    if isinstance(error, ValidationError):
-        surfaces += [repr(error.errors()), error.json()]
-    assert all(SECRET not in surface for surface in surfaces)
+    assert_secret_absent(caught.value, SECRET)
 
 
 @pytest.mark.parametrize(
@@ -131,4 +122,191 @@ def assert_safe_error(error: Exception) -> None:
 def test_config_errors_are_sanitized(make: Callable[[], object]) -> None:
     with pytest.raises(ValidationError) as caught:
         make()
-    assert_safe_error(caught.value)
+    assert_secret_absent(caught.value, SECRET)
+
+
+class AsyncScorer:
+    async def __call__(self, goal: Goal, candidate: Candidate) -> Score:
+        return Score.maximize(1)
+
+    async def method(self, goal: Goal, candidate: Candidate) -> Score:
+        return Score.maximize(1)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [AsyncScorer(), AsyncScorer().method, partial(AsyncScorer().method), partial(AsyncScorer())],
+)
+@pytest.mark.parametrize("direct", [False, True])
+def test_async_callable_forms_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, fn: Any, direct: bool
+) -> None:
+    monkeypatch.setattr(program_judge, "load_object", lambda path: fn)
+    with pytest.raises(TypeError, match="sync"):
+        ProgramJudge(fn if direct else "example:score").preflight()
+
+
+async def test_returned_coroutine_is_closed(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = AsyncScorer()(GOAL, cand())
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: result)
+    try:
+        assert await ProgramJudge("example:score").judge(GOAL, [cand(id="bad")], judge_ctx) == []
+        assert inspect.getcoroutinestate(result) == inspect.CORO_CLOSED
+        assert judge_ctx.errors == {"bad": "ProgramJudge needs a sync function"}
+    finally:
+        result.close()
+
+
+async def test_returned_custom_awaitable_is_closed(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AwaitableScore:
+        closed = False
+
+        def __await__(self) -> Any:
+            yield
+
+        def close(self) -> None:
+            self.closed = True
+
+    result = AwaitableScore()
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: result)
+    assert await ProgramJudge("example:score").judge(GOAL, [cand(id="bad")], judge_ctx) == []
+    assert result.closed
+    assert judge_ctx.errors == {"bad": "ProgramJudge needs a sync function"}
+
+
+@pytest.mark.parametrize(
+    "update", [{"notes": object()}, {"value": SECRET}, {"llm_call_ids": SECRET}]
+)
+async def test_invalid_non_key_fields_are_candidate_errors(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch, update: dict[str, Any]
+) -> None:
+    def score(goal: Goal, candidate: Candidate) -> Score:
+        return Score.maximize(1).model_copy(update=update if candidate.id == "bad" else {})
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: score)
+    scores = await ProgramJudge("example:score").judge(
+        GOAL, [cand(id="bad"), cand(id="good")], judge_ctx
+    )
+    assert [s.candidate_id for s in scores] == ["good"]
+    assert judge_ctx.errors == {"bad": "ValidationError: scoring function raised"}
+    assert SECRET not in repr(judge_ctx.errors)
+
+
+async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    daemon: list[bool] = []
+    completed: list[bool] = []
+
+    def score(goal: Goal, candidate: Candidate) -> Score:
+        daemon.append(threading.current_thread().daemon)
+        started.set()
+        try:
+            release.wait(2)
+            return Score.maximize(1)
+        finally:
+            finished.set()
+
+    async def run() -> None:
+        await ProgramJudge("example:score").judge(GOAL, [cand()], judge_ctx)
+        completed.append(True)
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: score)
+    try:
+        with anyio.fail_after(1):
+            async with anyio.create_task_group() as group:
+                group.start_soon(run)
+                while not started.is_set():
+                    await anyio.lowlevel.checkpoint()
+                group.cancel_scope.cancel()
+        assert not release.is_set()
+        assert not finished.is_set()
+        assert daemon == [True]
+        assert completed == []
+        assert judge_ctx.errors == {}
+    finally:
+        release.set()
+        await anyio.to_thread.run_sync(finished.wait, 3)
+
+
+async def test_candidate_mutation_does_not_leak_to_later_members(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._scoring.lexicographic import Lexicographic
+
+    original = cand(id="c", data={"nested": {"f": 2}})
+
+    def mutate(goal: Goal, candidate: Candidate) -> Score:
+        candidate.output.data["nested"]["f"] = 99
+        return Score.maximize(1)
+
+    def read(goal: Goal, candidate: Candidate) -> Score:
+        return Score.maximize(candidate.output.data["nested"]["f"])
+
+    monkeypatch.setattr(
+        program_judge, "load_object", lambda path: mutate if path == "example:mutate" else read
+    )
+    lex = Lexicographic([ProgramJudge("example:mutate"), ProgramJudge("example:read")])
+    [score] = await lex.judge(GOAL, [original], judge_ctx)
+    assert score.key == (1, 2)
+    assert original.output.data == {"nested": {"f": 2}}
+
+
+async def test_returned_future_is_cancelled(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    result = asyncio.get_running_loop().create_future()
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: result)
+    assert await ProgramJudge("example:score").judge(GOAL, [cand(id="bad")], judge_ctx) == []
+    assert result.cancelled()
+    assert judge_ctx.errors == {"bad": "ProgramJudge needs a sync function"}
+
+
+async def test_returned_awaitable_iterator_is_closed(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = AsyncScorer()(GOAL, cand())
+
+    class WrappedAwaitable:
+        def __await__(self) -> Any:
+            return result.__await__()
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: WrappedAwaitable())
+    try:
+        assert await ProgramJudge("example:score").judge(GOAL, [cand(id="bad")], judge_ctx) == []
+        assert inspect.getcoroutinestate(result) == inspect.CORO_CLOSED
+        assert judge_ctx.errors == {"bad": "ProgramJudge needs a sync function"}
+    finally:
+        result.close()
+
+
+async def test_score_subclass_is_revalidated_as_plain_score(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CustomScore(Score):
+        pass
+
+    result = CustomScore.maximize(2)
+    monkeypatch.setattr(program_judge, "load_object", lambda path: lambda g, c: result)
+    [score] = await ProgramJudge("example:score").judge(GOAL, [cand(id="c")], judge_ctx)
+    assert type(score) is Score
+    assert score.candidate_id == "c"
+    assert result.candidate_id == ""
+
+
+def test_bound_instance_method_is_rejected_without_losing_binding() -> None:
+    class Scorer:
+        def score(self, goal: Goal, candidate: Candidate) -> Score:
+            return Score.maximize(1)
+
+    with pytest.raises(TypeError, match="bound instance method"):
+        ProgramJudge(Scorer().score)

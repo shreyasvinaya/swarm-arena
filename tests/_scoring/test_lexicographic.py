@@ -2,6 +2,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, FixedJudge, PanelJudge, cand, rosen_score, small_b
 from pydantic import ValidationError
 
@@ -14,7 +15,8 @@ from swarm_arena._model.results import Candidate, Score
 from swarm_arena._scoring.judge import JudgeContext, stamp_scores
 from swarm_arena._scoring.lexicographic import Lexicographic
 from swarm_arena._scoring.program_judge import ProgramJudge
-from tests._scoring.test_program_judge import SECRET, assert_safe_error
+
+SECRET = "SENTINEL_TASK21_SECRET"
 
 
 async def test_key_is_member_keys_in_order(judge_ctx: JudgeContext) -> None:
@@ -40,6 +42,7 @@ async def test_member_error_leaves_candidate_unjudged(judge_ctx: JudgeContext) -
 
 
 def test_hashes_and_forms() -> None:
+    assert Lexicographic.name == "lexicographic"
     one = Lexicographic([FixedJudge(FixedJudge.Config(value=1.0))])
     assert (
         one.rubric_hash() != Lexicographic([FixedJudge(FixedJudge.Config(value=2.0))]).rubric_hash()
@@ -134,10 +137,13 @@ async def test_bad_member_score_is_candidate_error(
         ]
 
     monkeypatch.setattr(FixedJudge, "judge", score)
-    lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1))])
+    lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1)), PanelJudge(PanelJudge.Config())])
     scores = await lex.judge(GOAL, [cand(id="bad"), cand(id="good")], judge_ctx)
     assert [s.candidate_id for s in scores] == ["good"]
-    assert "bad" in judge_ctx.errors
+    if "key" in update:
+        assert judge_ctx.errors["bad"] == "member fixed gave a non-finite key"
+    else:
+        assert "cannot combine member scores" in judge_ctx.errors["bad"]
     assert SECRET not in repr(judge_ctx.errors)
 
 
@@ -156,11 +162,11 @@ async def test_metadata_and_missing_member(
                 key=(self.config.value, 3),
                 value=self.config.value,
                 verdict=None if self.config.value == 1 else "ok",
-                notes="first" if self.config.value == 1 else "second",
+                notes="" if self.config.value == 1 else "second",
                 llm_call_ids=[str(self.config.value)],
             )
             for c in reversed(candidates)
-            if c.id != "missing" or self.config.value == 1
+            if c.id != "missing" or self.config.value == 2
         ]
 
     monkeypatch.setattr(FixedJudge, "judge", score)
@@ -171,7 +177,7 @@ async def test_metadata_and_missing_member(
     assert s.key == (1, 3, 2, 3)
     assert s.value == 1
     assert s.verdict == "ok"
-    assert s.notes == "first; second"
+    assert s.notes == "second"
     assert s.llm_call_ids == ["1.0", "2.0"]
     assert s.panel_hash == ""
     assert judge_ctx.errors == {"missing": "member fixed gave no score"}
@@ -204,7 +210,7 @@ def test_members_built_once_and_preflight_called(monkeypatch: pytest.MonkeyPatch
 def test_config_errors_are_sanitized(make: Callable[[], object]) -> None:
     with pytest.raises(ValidationError) as caught:
         make()
-    assert_safe_error(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, TypeError, ConfigError])
@@ -218,7 +224,7 @@ def test_member_build_errors_are_sanitized(
     lex = Lexicographic([Ref(path="_fakes.tools:FixedJudge", config={"value": 1})])
     with pytest.raises((ValueError, TypeError), match="judge") as caught:
         lex.preflight()
-    assert_safe_error(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_rubric_errors_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,4 +235,86 @@ def test_rubric_errors_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
     lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1))])
     with pytest.raises(ValueError, match="cannot encode lexicographic rubric") as caught:
         lex.rubric_hash()
-    assert_safe_error(caught.value)
+    assert_secret_absent(caught.value, SECRET)
+
+
+async def test_mixed_member_key_lengths_fail_closed_for_whole_batch(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def score(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [
+            Score(candidate_id=c.id, key=(1,) if c.id == "short" else (1, 2))
+            for c in candidates
+            if c.id != "missing"
+        ]
+
+    monkeypatch.setattr(FixedJudge, "judge", score)
+    lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1)), PanelJudge(PanelJudge.Config())])
+    candidates = [cand(id="short"), cand(id="long"), cand(id="missing")]
+    assert await lex.judge(GOAL, candidates, judge_ctx) == []
+    assert judge_ctx.errors == {
+        c.id: "member fixed gave keys of different lengths" for c in candidates
+    }
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_empty_members_rejected_at_config_time(direct: bool) -> None:
+    make = (lambda: Lexicographic.Config(judges=[])) if direct else (lambda: Lexicographic([]))
+    with pytest.raises((ConfigError, ValidationError), match="judges") as caught:
+        make()
+    assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("method", ["preflight", "rubric_hash"])
+def test_member_import_diagnostics_keep_path(method: str) -> None:
+    lex = Lexicographic([Ref(path="no_such_mod:J")])
+    with pytest.raises(ValueError, match="cannot import no_such_mod:J"):
+        getattr(lex, method)()
+
+
+@pytest.mark.parametrize("method", ["preflight", "rubric_hash"])
+def test_member_config_diagnostics_keep_safe_detail(method: str) -> None:
+    lex = Lexicographic([Ref(path="_fakes.tools:FixedJudge", config={"value": SECRET})])
+    with pytest.raises(ConfigError, match=r"cannot build judge _fakes\.tools:FixedJudge") as caught:
+        getattr(lex, method)()
+    assert "value: float_parsing" in str(caught.value)
+    assert "cannot import" not in str(caught.value)
+    assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [None, {"candidate_id": "bad"}, Score.maximize(1).model_copy(update={"candidate_id": []})],
+)
+async def test_non_score_member_item_is_candidate_error(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch, item: Any
+) -> None:
+    async def score(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [item, Score(candidate_id="good", key=(1,))]
+
+    monkeypatch.setattr(FixedJudge, "judge", score)
+    lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1)), PanelJudge(PanelJudge.Config())])
+    scores = await lex.judge(GOAL, [cand(id="bad"), cand(id="good")], judge_ctx)
+    assert [s.candidate_id for s in scores] == ["good"]
+    assert judge_ctx.errors == {"bad": "member fixed gave an invalid score"}
+
+
+async def test_member_exception_propagates(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = RuntimeError("provider unavailable")
+
+    async def fail(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise error
+
+    monkeypatch.setattr(FixedJudge, "judge", fail)
+    lex = Lexicographic([FixedJudge(FixedJudge.Config(value=1))])
+    with pytest.raises(RuntimeError, match="provider unavailable") as caught:
+        await lex.judge(GOAL, [cand()], judge_ctx)
+    assert caught.value is error

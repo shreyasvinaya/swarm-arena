@@ -3,6 +3,9 @@
 from collections.abc import Sequence
 from typing import ClassVar, cast
 
+from pydantic import Field, JsonValue
+
+from swarm_arena._errors import ConfigError
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel, _validate_config
@@ -12,7 +15,7 @@ from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 def _panel_hash(hashes: list[str]) -> str:
     """Hash ordered panel identities, preserving the all-empty identity."""
-    return sha256_hex(canonical_json([value for value in hashes])) if any(hashes) else ""
+    return sha256_hex(canonical_json(cast(JsonValue, hashes))) if any(hashes) else ""
 
 
 class Lexicographic(Judge):
@@ -22,6 +25,10 @@ class Lexicographic(Judge):
     Every member judges the full candidate batch. Only candidates with valid
     scores from every member receive a composite score. Members are referenced
     without imports at construction, then built and cached on first use.
+    Each member must return keys of one fixed length within a batch; differing
+    lengths fail the entire batch closed, preserving member-first ordering.
+    Invalid member items become per-candidate errors. Exceptions raised by a
+    member propagate to the runner, including provider failures.
 
     Parameters
     ----------
@@ -46,16 +53,17 @@ class Lexicographic(Judge):
         Parameters
         ----------
         judges : list[Ref]
-            Member references, accepting judge instances through coercion.
+            One or more member references, accepting judge instances through coercion.
 
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic.Config(judges=[]).judges
-        []
+        >>> Lexicographic.Config(judges=[ProgramJudge('my_judges:quality')]).judges[0].path
+        'swarm_arena:ProgramJudge'
         """
 
-        judges: list[RefField]
+        judges: list[RefField] = Field(min_length=1)
 
     def __init__(self, judges: Sequence[Judge | Ref] | Config, /) -> None:
         """Validate references without importing or constructing their members."""
@@ -75,9 +83,10 @@ class Lexicographic(Judge):
 
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).config.judges
-        []
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).config.judges[0].path
+        'swarm_arena:ProgramJudge'
         """
         return cast(Lexicographic.Config, self._config)
 
@@ -87,11 +96,23 @@ class Lexicographic(Judge):
             members: list[Judge] = []
             for ref in self.config.judges:
                 try:
-                    members.append(ref.build(Judge))
+                    cls = ref.load()
                 except TypeError:
                     raise TypeError(f"cannot build judge {ref.path}") from None
                 except Exception:
-                    raise ValueError(f"cannot import {ref.path} or build judge") from None
+                    raise ValueError(f"cannot import {ref.path}") from None
+                if not issubclass(cls, Judge):
+                    raise TypeError(f"cannot build judge {ref.path}: expected Judge subclass")
+                try:
+                    validated = _validate_config(cls.Config, ref.config, where=ref.path)
+                except ConfigError as error:
+                    raise ConfigError(f"cannot build judge {ref.path}: {error}") from None
+                try:
+                    members.append(cls(validated))
+                except TypeError:
+                    raise TypeError(f"cannot build judge {ref.path}") from None
+                except Exception:
+                    raise ValueError(f"cannot build judge {ref.path}") from None
             self._members = members
         return self._members
 
@@ -99,10 +120,20 @@ class Lexicographic(Judge):
         """
         Build the member judges and check each member's readiness.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
+        Exception
+            If a member raises; provider failures must reach the runner.
+
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).preflight()
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).preflight()  # doctest: +SKIP
         """
         for member in self._get_members():
             member.preflight()
@@ -116,18 +147,28 @@ class Lexicographic(Judge):
         str
             SHA-256 digest of ordered name and rubric pairs.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed,
+            or its rubric cannot be encoded.
+        TypeError
+            If a reference does not identify a valid judge class.
+
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> len(Lexicographic([]).rubric_hash())
+        >>> len(Lexicographic([ProgramJudge('my_judges:quality')]).rubric_hash())
         64
         """
+        members = self._get_members()
         try:
             return sha256_hex(
                 canonical_json(
                     [
                         [ref.name if ref.name is not None else member.name, member.rubric_hash()]
-                        for ref, member in zip(self.config.judges, self._get_members(), strict=True)
+                        for ref, member in zip(self.config.judges, members, strict=True)
                     ]
                 )
             )
@@ -143,10 +184,18 @@ class Lexicographic(Judge):
         str
             Empty when all member panels are empty, otherwise their ordered hash.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
+
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).panel_hash()
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).panel_hash()
         ''
         """
         return _panel_hash([member.panel_hash() for member in self._get_members()])
@@ -158,12 +207,20 @@ class Lexicographic(Judge):
         Returns
         -------
         int
-            Maximum anchor count, or zero for an empty composite.
+            Maximum anchor count required by any member.
+
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
 
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).anchor_count()
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).anchor_count()
         0
         """
         return max((member.anchor_count() for member in self._get_members()), default=0)
@@ -177,10 +234,18 @@ class Lexicographic(Judge):
         frozenset[str]
             All providers used by any member.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
+
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).providers()
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).providers()
         frozenset()
         """
         return frozenset(
@@ -196,10 +261,18 @@ class Lexicographic(Judge):
         tuple[str, ...]
             Ordered unique model aliases.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
+
         Examples
         --------
+        >>> from swarm_arena import ProgramJudge
         >>> from swarm_arena.scoring import Lexicographic
-        >>> Lexicographic([]).models()
+        >>> Lexicographic([ProgramJudge('my_judges:quality')]).models()
         ()
         """
         return tuple(
@@ -226,36 +299,56 @@ class Lexicographic(Judge):
         list[Score]
             Composite scores in candidate order, with effective panel identities.
 
+        Raises
+        ------
+        ValueError
+            If a member cannot be imported, configured, or constructed.
+        TypeError
+            If a reference does not identify a valid judge class.
+        Exception
+            If a member raises; provider failures must reach the runner.
+
         Examples
         --------
         >>> import anyio
-        >>> from swarm_arena import Goal
+        >>> from swarm_arena import Goal, ProgramJudge
         >>> from swarm_arena.executor import LocalExecutor
         >>> from swarm_arena.scoring import JudgeContext, Lexicographic
         >>> goal = Goal(id='g', namespace='demo')
         >>> ctx = JudgeContext(goal=goal, executor=LocalExecutor(), artifact_root='unused')
-        >>> anyio.run(Lexicographic([]).judge, goal, [], ctx)
-        []
+        >>> from my_judges import candidate  # doctest: +SKIP
+        >>> lex = Lexicographic([ProgramJudge('my_judges:quality'), ProgramJudge('my_judges:cost')])
+        >>> scores = anyio.run(lex.judge, goal, [candidate], ctx)  # doctest: +SKIP
+        >>> scores[0].key  # doctest: +SKIP
+        (0.9, -2.0)
         """
         members = self._get_members()
         by_member: list[dict[str, Score]] = []
         for ref, member in zip(self.config.judges, members, strict=True):
             name = ref.name if ref.name is not None else member.name
-            raw = {score.candidate_id: score for score in await member.judge(goal, candidates, ctx)}
+            raw: dict[str, Score] = {}
+            invalid_item = False
+            for score in await member.judge(goal, candidates, ctx):
+                if not isinstance(score, Score) or not isinstance(score.candidate_id, str):
+                    invalid_item = True
+                    continue
+                raw[score.candidate_id] = score
             valid: dict[str, Score] = {}
+            errors: dict[str, str] = {}
             for candidate in candidates:
                 score = raw.get(candidate.id)
                 if score is None:
-                    ctx.judge_error(candidate.id, f"member {name} gave no score")
-                    continue
-                try:
-                    finite = is_finite_score(score)
-                except Exception:
-                    finite = False
-                if finite:
+                    reason = "an invalid score" if invalid_item else "no score"
+                    errors[candidate.id] = f"member {name} gave {reason}"
+                elif is_finite_score(score):
                     valid[candidate.id] = score
                 else:
-                    ctx.judge_error(candidate.id, f"member {name} gave a non-finite key")
+                    errors[candidate.id] = f"member {name} gave a non-finite key"
+            if len({len(score.key) for score in valid.values()}) > 1:
+                valid.clear()
+                errors = {c.id: f"member {name} gave keys of different lengths" for c in candidates}
+            for candidate_id, reason in errors.items():
+                ctx.judge_error(candidate_id, reason)
             by_member.append(valid)
         scores: list[Score] = []
         for candidate in candidates:
