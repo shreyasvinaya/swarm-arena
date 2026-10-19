@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ScriptTool` parameter schemas allow non-clashing names such as `model_name`,
+  refuse reserved model names and malformed sub-schemas or keyword values,
+  and bound default-mismatch diagnostics without exposing configured values.
 - Consolidate model validation diagnostics: rejected inputs and validator context
   are removed from `errors()` and `json()` as well as text and tracebacks. Human
   plan/settings models show top-level typo names; other models use `<field>`.

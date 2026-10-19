@@ -15,6 +15,7 @@ from pydantic import (
     WrapValidator,
     create_model,
 )
+from pydantic._internal._config import ConfigWrapper
 from pydantic.fields import FieldInfo
 
 _BOUNDS = {
@@ -30,6 +31,24 @@ _TYPES = {"string": str, "integer": int, "number": float, "boolean": bool}
 
 class _SchemaError(ValueError):
     """Identify compiler diagnostics containing only schema identifiers and fixed reasons."""
+
+
+def _check_keyword_types(path: str, schema: Mapping[str, Any]) -> None:
+    """Refuse malformed keyword values before pydantic can coerce them."""
+    for keyword, value in schema.items():
+        if keyword in _BOUNDS:
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif keyword in ("minLength", "maxLength"):
+            valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        elif keyword in ("type", "description", "pattern"):
+            valid = isinstance(value, str)
+        elif keyword == "enum":
+            valid = isinstance(value, list) and bool(value)
+        else:
+            # items is compiled recursively; default is checked against its annotation.
+            continue
+        if not valid:
+            raise _SchemaError(f"{path}: invalid {keyword}")
 
 
 def _validate_enum(
@@ -55,6 +74,7 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
     for keyword in schema:
         if keyword not in _KEYWORDS:
             raise _SchemaError(f"{path}: unsupported JSON-schema keyword {keyword!r}")
+    _check_keyword_types(path, schema)
     kind = schema.get("type")
     if kind is None and "enum" not in schema:
         raise _SchemaError(f"{path}: expected type or enum")
@@ -74,8 +94,6 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
         raise _SchemaError(f"{path}: items requires type 'array'")
     if "enum" in schema:
         choices = schema["enum"]
-        if not isinstance(choices, list) or not choices:
-            raise _SchemaError(f"{path}: enum must be a non-empty list")
         adapter = TypeAdapter(annotation, config=ConfigDict(strict=True)) if kind else None
         if adapter is not None:
             try:
@@ -108,12 +126,15 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
         try:
             default = adapter.validate_python(default)
         except ValidationError as err:
-            reasons = ", ".join(
-                error["type"]
-                for error in err.errors(
-                    include_input=False, include_url=False, include_context=False
-                )
+            error_types = sorted(
+                {
+                    error["type"]
+                    for error in err.errors(
+                        include_input=False, include_url=False, include_context=False
+                    )
+                }
             )
+            reasons = ", ".join(error_types[:5] + (["…"] if len(error_types) > 5 else []))
             raise _SchemaError(f"{path}: default does not match the schema ({reasons})") from None
     field = cast(FieldInfo, Field(default=default))
     return annotation, field
@@ -156,8 +177,11 @@ def compile_object_schema(
         floats, so dumped values can be validated again.
         Every property and items schema must be a mapping. Property names must
         start with an ASCII letter and contain only ASCII letters, digits, or
-        underscores; BaseModel member names, the model_ prefix, and Config are
-        reserved.
+        underscores; BaseModel member names, names matching the generated model's
+        configured protected namespaces, and Config are reserved. Other model_
+        names, such as model_name, are allowed. Numeric bounds must be integers
+        or floats, length bounds must be non-negative integers, and neither
+        accepts booleans. Descriptions and patterns must be strings.
 
     Returns
     -------
@@ -174,17 +198,27 @@ def compile_object_schema(
     >>> Params = compile_object_schema("Params", {"epochs": {"type": "integer", "maximum": 400}})
     >>> Params(epochs=400).model_dump()
     {'epochs': 400}
+    >>> Named = compile_object_schema("Named", {"model_name": {"type": "string"}})
+    >>> Named(model_name="small").model_dump()
+    {'model_name': 'small'}
     """
+    config = ConfigDict(**BaseModel.model_config)
+    config.update(extra="forbid", strict=True, frozen=True)
+    # model_config omits unset defaults; use pydantic's own effective config.
+    protected_namespaces = ConfigWrapper(config).protected_namespaces
     fields: dict[str, Any] = {}
     for prop, schema in properties.items():
         if (
             not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", prop)
-            or prop.startswith("model_")
+            or any(
+                prop.startswith(namespace)
+                if isinstance(namespace, str)
+                else namespace.match(prop) is not None
+                for namespace in protected_namespaces
+            )
             or prop == "Config"
             or hasattr(BaseModel, prop)
         ):
             raise _SchemaError(f"{name}.{prop}: invalid property name")
         fields[prop] = _compile_field(f"{name}.{prop}", schema)
-    return create_model(
-        name, __config__=ConfigDict(extra="forbid", strict=True, frozen=True), **fields
-    )
+    return create_model(name, __config__=config, **fields)

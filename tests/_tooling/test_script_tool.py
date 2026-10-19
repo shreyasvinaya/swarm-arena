@@ -636,7 +636,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         "model_config",
         "model_fields",
         "model_post_init",
-        "model_custom",
+        "model_validate_custom",
+        "model_dump_custom",
         "schema",
         "schema_json",
         "dict",
@@ -645,6 +646,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         "parse_obj",
         "construct",
         "validate",
+        "mro",
+        "register",
         "Config",
     ],
 )
@@ -658,6 +661,17 @@ def test_reserved_property_names_raise_config_error(prop: str) -> None:
 
 
 def test_nonreserved_parameter_names_remain_usable() -> None:
-    values = {"modelvalue": 1, "schema_version": 2, "dictionary": 3, "copy_count": 4, "config": 5}
+    values = {
+        "modelvalue": 1,
+        "schema_version": 2,
+        "dictionary": 3,
+        "copy_count": 4,
+        "config": 5,
+        "model_name": 6,
+        "model_id": 7,
+        "model_type": 8,
+        "model_path": 9,
+        "model_custom": 10,
+    }
     tool = ScriptTool(command=["x"], params={key: {"type": "integer"} for key in values})
     assert tool.get_input_model().model_validate(values).model_dump() == values

@@ -1,8 +1,10 @@
+import re
 import traceback
 from typing import Any, cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic_core import InitErrorDetails
 
 from swarm_arena._model.schema import _SchemaError, compile_object_schema
 
@@ -392,7 +394,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         "model_config",
         "model_fields",
         "model_post_init",
-        "model_custom",
+        "model_validate_custom",
+        "model_dump_custom",
         "schema",
         "schema_json",
         "dict",
@@ -401,6 +404,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         "parse_obj",
         "construct",
         "validate",
+        "mro",
+        "register",
         "Config",
     ],
 )
@@ -412,6 +417,161 @@ def test_reserved_property_names_are_rejected_at_compile_time(prop: str) -> None
 
 
 def test_nonreserved_property_names_remain_usable() -> None:
-    values = {"modelvalue": 1, "schema_version": 2, "dictionary": 3, "copy_count": 4, "config": 5}
+    values = {
+        "modelvalue": 1,
+        "schema_version": 2,
+        "dictionary": 3,
+        "copy_count": 4,
+        "config": 5,
+        "model_name": 6,
+        "model_id": 7,
+        "model_type": 8,
+        "model_path": 9,
+        "model_custom": 10,
+    }
     model = compile_object_schema("P", {key: {"type": "integer"} for key in values})
     assert model.model_validate(values).model_dump() == values
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("namespace", ["custom_", re.compile("^custom_name$")])
+def test_reserved_names_follow_generated_model_config(
+    monkeypatch: pytest.MonkeyPatch, namespace: str | re.Pattern[str]
+) -> None:
+    monkeypatch.setattr(
+        BaseModel, "model_config", {**BaseModel.model_config, "protected_namespaces": (namespace,)}
+    )
+    with pytest.raises(_SchemaError, match=r"^P\.custom_name: invalid property name$"):
+        compile_object_schema("P", {"custom_name": {"type": "string"}})
+    model = compile_object_schema("P", {"model_dump_custom": {"type": "integer"}})
+    assert model.model_validate({"model_dump_custom": 1}).model_dump() == {"model_dump_custom": 1}
+    assert model.model_config["protected_namespaces"] == (namespace,)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "keyword", "bad"),
+    [
+        (kind, keyword, bad)
+        for kind in ("integer", "number")
+        for keyword in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+        for bad in (
+            True,
+            False,
+            None,
+            "SECRET_keyword",
+            ["SECRET_keyword"],
+            {"v": "SECRET_keyword"},
+        )
+    ]
+    + [
+        ("string", keyword, bad)
+        for keyword in ("minLength", "maxLength")
+        for bad in (True, False, -1, 1.5, None, "SECRET_keyword", [], {})
+    ]
+    + [
+        ("string", keyword, bad)
+        for keyword in ("description", "pattern")
+        for bad in (True, 5, 1.5, None, ["SECRET_keyword"], {"v": "SECRET_keyword"})
+    ]
+    + [("string", "pattern", re.compile("SECRET_keyword"))]
+    + [("string", "enum", bad) for bad in (True, 5, None, "SECRET_keyword", (), {}, [])]
+    + [(None, "type", bad) for bad in (True, 5, None, ["SECRET_keyword"], {})],
+)
+def test_wrong_typed_keywords_have_exact_value_free_errors(
+    kind: str | None, keyword: str, bad: Any, *, nested: bool
+) -> None:
+    prop = {"type": kind, keyword: bad}
+    schema = {"type": "array", "items": prop} if nested else prop
+    with pytest.raises(_SchemaError, match="invalid") as caught:
+        compile_object_schema("P", {"p": schema})
+    assert str(caught.value) == "P.p" + (".items" if nested else "") + f": invalid {keyword}"
+    error = caught.value
+    for diagnostic in (
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(getattr(error, "__notes__", ())),
+        "".join(traceback.format_exception(error)),
+    ):
+        assert "SECRET_keyword" not in diagnostic
+    assert error.__cause__ is None
+
+
+def test_keyword_boundary_values_produce_valid_schema() -> None:
+    model = compile_object_schema(
+        "P",
+        {
+            "text": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 0,
+                "description": "",
+                "pattern": "",
+            },
+            "n": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2.0,
+                "exclusiveMinimum": -1.0,
+                "exclusiveMaximum": 3,
+            },
+            "flag": {"enum": [True, False], "default": False},
+        },
+    )
+    assert model.model_validate({"text": "", "n": 1}).model_dump() == {
+        "text": "",
+        "n": 1.0,
+        "flag": False,
+    }
+    properties = model.model_json_schema()["properties"]
+    assert properties["text"]["description"] == ""
+    assert properties["text"]["minLength"] == properties["text"]["maxLength"] == 0
+    assert type(properties["n"]["minimum"]) is int
+    assert type(properties["n"]["maximum"]) is float
+
+
+def test_large_bad_default_has_sorted_unique_bounded_reasons() -> None:
+    with pytest.raises(_SchemaError, match="default") as caught:
+        compile_object_schema(
+            "P",
+            {
+                "xs": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 2},
+                    "default": ["SECRET_default"] * 199_998 + [0, 3],
+                }
+            },
+        )
+    assert str(caught.value) == (
+        "P.xs: default does not match the schema (greater_than_equal, int_type, less_than_equal)"
+    )
+    assert "SECRET_default" not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize("count", [5, 6, 7])
+def test_default_reasons_show_at_most_five_types(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    secret = "SECRET_default"
+    codes = [
+        "tuple_type",
+        "string_type",
+        "list_type",
+        "int_type",
+        "float_type",
+        "dict_type",
+        "bool_type",
+    ][:count]
+
+    def reject_default(self: TypeAdapter[Any], value: Any, **kwargs: Any) -> Any:
+        errors: list[InitErrorDetails] = [{"type": code, "input": value} for code in codes * 2]
+        raise ValidationError.from_exception_data("default", errors)
+
+    monkeypatch.setattr(TypeAdapter, "validate_python", reject_default)
+    with pytest.raises(_SchemaError, match="default") as caught:
+        compile_object_schema("P", {"p": {"type": "integer", "default": secret}})
+    expected = sorted(set(codes))[:5] + (["…"] if count > 5 else [])
+    assert str(caught.value) == f"P.p: default does not match the schema ({', '.join(expected)})"
+    assert "SECRET_default" not in "".join(traceback.format_exception(caught.value))
