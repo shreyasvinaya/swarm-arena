@@ -263,7 +263,7 @@ async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
     done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=broken)
     assert done.status is RunStatus.TIMEOUT
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
-    assert "before_kill failed: RuntimeError: collector broke" in done.stderr_path.read_text()
+    assert done.stderr_path.read_text().endswith("swarm-arena: before_kill failed: RuntimeError\n")
 
 
 async def test_blocked_before_kill_is_bounded(
@@ -337,9 +337,7 @@ async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None
             tg.cancel_scope.cancel()
     assert not scope.cancelled_caught
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
-    assert (
-        "before_kill failed: RuntimeError: collector broke" in (tmp_path / "stderr.log").read_text()
-    )
+    assert "before_kill failed: RuntimeError" in (tmp_path / "stderr.log").read_text()
 
 
 async def test_background_child_killed_after_normal_exit(tmp_path: Path) -> None:
@@ -391,3 +389,110 @@ async def test_no_descriptor_or_transport_leak(tmp_path: Path) -> None:  # api-a
         gc.collect()
     assert len(os.listdir("/dev/fd")) == n0
     assert not [w for w in caught if issubclass(w.category, ResourceWarning)]
+
+
+# --- Fix round 1 ---
+
+
+def record_signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, bool, float]]:
+    """Record (signal, leader still unreaped, time) for every group signal the supervisor sends."""
+    seen: list[tuple[int, bool, float]] = []
+    real = supervisor._signal_group
+
+    def spy(pgid: int, sig: int) -> None:
+        # The leader is the group id; a zombie still answers kill(pid, 0), a reaped pid does not.
+        seen.append((sig, pid_alive(pgid), time.monotonic()))
+        real(pgid, sig)
+
+    monkeypatch.setattr(supervisor, "_signal_group", spy)
+    return seen
+
+
+@pytest.mark.parametrize("case", ["exit", "timeout", "cancel", "on_started_fails"])
+async def test_leader_unreaped_until_last_group_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    seen = record_signals(monkeypatch)
+    pids: list[int] = []
+
+    async def record(s: Job.Started) -> None:
+        assert s.pid is not None
+        pids.append(s.pid)
+        if case == "on_started_fails":
+            raise RuntimeError("commit failed")
+
+    code = "pass" if case == "exit" else "import time; time.sleep(60)"
+    timeout_s = 1.0 if case == "timeout" else None
+    if case == "on_started_fails":
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await call(tmp_path, py(code), on_started=record)
+    else:
+        with anyio.move_on_after(1.0 if case == "cancel" else 30):
+            await call(tmp_path, py(code), timeout_s=timeout_s, grace_s=0.5, on_started=record)
+    assert seen
+    assert seen[-1][0] == signal.SIGKILL
+    assert [unreaped for _, unreaped, _ in seen] == [True] * len(seen)  # the pgid stayed anchored
+    assert not pid_alive(pids[0])  # reaped once run() is done: no zombie is left
+
+
+async def test_kill_at_deadline_when_before_kill_ignores_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
+    seen = record_signals(monkeypatch)
+    entered: list[float] = []
+
+    async def stuck(r: CompletedRun) -> None:
+        entered.append(time.monotonic())
+        await anyio.to_thread.run_sync(time.sleep, 2.0)  # not abandonable: ignores cancellation
+
+    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=stuck)
+    kills = [at for sig, _, at in seen if sig == signal.SIGKILL]
+    assert done.status is RunStatus.TIMEOUT
+    assert 0.4 <= kills[0] - entered[0] < 1.5  # at the 0.5 s deadline, not after the 2 s thread
+    assert "before_kill timed out after 0.5 s" in done.stderr_path.read_text()
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+
+
+async def test_before_kill_failure_note_names_only_the_type(tmp_path: Path) -> None:
+    async def leaky(r: CompletedRun) -> None:
+        raise ValueError("sentinel-secret")
+
+    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=leaky)
+    log = done.stderr_path.read_text()
+    assert "before_kill failed: ValueError" in log
+    assert "sentinel-secret" not in log
+
+
+async def test_log_open_refuses_symlinked_parent(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(OSError, match="link"):
+        await call(tmp_path, py("open('ran', 'w')"), stdout=tmp_path / "link/stdout.log")
+    assert not (real / "stdout.log").exists()
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_log_open_refuses_hardlinked_leaf(tmp_path: Path) -> None:
+    (tmp_path / "other.txt").write_text("keep")
+    os.link(tmp_path / "other.txt", tmp_path / "stdout.log")
+    with pytest.raises(OSError, match=r"stdout\.log"):
+        await call(tmp_path, py("open('ran', 'w')"))
+    assert (tmp_path / "other.txt").read_text() == "keep"
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_log_open_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "stderr.log")  # nobody reads it
+    started = time.monotonic()
+    with pytest.raises(OSError, match=r"stderr\.log"):
+        await call(tmp_path, py("open('ran', 'w')"))
+    assert time.monotonic() - started < 5
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_log_rerun_truncates(tmp_path: Path) -> None:
+    await call(tmp_path, py("print('a much longer first line')"))
+    done = await call(tmp_path, py("print('x')"))
+    assert done.stdout_path.read_text() == "x\n"

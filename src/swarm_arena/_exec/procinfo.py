@@ -1,11 +1,17 @@
 """Identify the host and check or kill process groups recorded in a start event."""
 
+import contextlib
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
+
+import anyio
 
 from swarm_arena._exec.executor import Job
 
@@ -15,6 +21,10 @@ _UNKNOWN = "unknown"
 # ps prints lstart in the local time of its locale; pin both so a resume on the
 # same host reads the same string as the run that recorded it.
 _PS_ENV = {"LC_ALL": "C", "TZ": "UTC"}
+_PS = "ps"
+_PROC = Path("/proc")
+_DEAD_STATES = frozenset({b"Z", b"X", b"x"})  # zombie, dead
+_EXIT_POLL_S = 0.05
 
 
 def _boot_id() -> str:
@@ -81,7 +91,7 @@ def process_start_time(pid: int) -> str | None:
     """
     try:
         done = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            [_PS, "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             check=False,
@@ -122,6 +132,193 @@ def group_alive(pgid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def group_has_live_member(pgid: int) -> bool:
+    """
+    Report whether a process group has a member that is not a zombie.
+
+    Unlike ``group_alive``, zombie members do not count, so a group whose
+    processes have all exited but are not yet reaped reads as empty. Members
+    of any user count. When the caller holds the group's leader unreaped (see
+    ``ExitWatch``), the zombie keeps the group id reserved, so the answer is
+    about that group only; otherwise the id may name a newer group.
+
+    Parameters
+    ----------
+    pgid : int
+        Process group id to inspect.
+
+    Returns
+    -------
+    bool
+        True when a live member exists, and also when liveness cannot be read
+        (``/proc`` or ``ps`` unavailable), so callers err toward waiting.
+        ``killpg(pgid, 0)`` decides when it can: ``ProcessLookupError`` is no
+        member, and on macOS success is a live member (it refuses zombies).
+        Linux answers signal 0 for zombies too, so it scans ``/proc/*/stat``.
+        A ``PermissionError`` on macOS means only zombies or only another
+        user's members are left, so ``ps`` tells them apart.
+
+    Examples
+    --------
+    >>> import os
+    >>> group_has_live_member(os.getpgrp())
+    True
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        if sys.platform != "linux":
+            return _live_in_ps(pgid)
+    else:
+        if sys.platform != "linux":
+            return True
+    return _live_in_proc(pgid, _PROC)
+
+
+def _live_in_ps(pgid: int) -> bool:
+    """Read ``ps`` for a process of group ``pgid`` that is not a zombie."""
+    try:
+        done = subprocess.run(
+            [_PS, "-A", "-o", "pgid=", "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+            env={**os.environ, **_PS_ENV},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if done.returncode != 0:
+        return True
+    group = str(pgid)
+    for line in done.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == group and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def _live_in_proc(pgid: int, proc: Path) -> bool:
+    """Scan ``<proc>/<pid>/stat`` for a process of group ``pgid`` that is not a zombie."""
+    try:
+        entries = list(os.scandir(proc))
+    except OSError:
+        return True  # cannot tell, so the caller waits its full grace
+    group = str(pgid).encode()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(os.path.join(entry.path, "stat"), "rb") as stream:
+                data = stream.read()
+        except OSError:
+            continue  # exited while scanning
+        # "pid (comm) state ppid pgrp ...": comm may hold spaces and parentheses.
+        fields = data[data.rfind(b")") + 1 :].split()
+        if len(fields) >= 3 and fields[2] == group and fields[0] not in _DEAD_STATES:
+            return True
+    return False
+
+
+def _has_exited(pid: int) -> bool:
+    """Report, without blocking or reaping, whether the child ``pid`` has exited (Linux)."""
+    if sys.platform != "linux":
+        raise NotImplementedError
+    return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
+class ExitWatch:
+    """
+    Wait for a child process to exit without reaping it.
+
+    An unreaped child stays a zombie, so its pid, and the process group it
+    leads, cannot be reused until its parent reaps it. The watch lets the
+    owner learn of the exit and still decide when to reap. Linux uses a pidfd
+    and falls back to polling ``waitid(WNOWAIT)`` when pidfds are not
+    available; macOS and the BSDs use a kqueue ``NOTE_EXIT`` event.
+
+    Parameters
+    ----------
+    pid : int
+        Unreaped child of this process.
+
+    Examples
+    --------
+    >>> import subprocess, anyio
+    >>> child = subprocess.Popen(["true"])
+    >>> watch = ExitWatch(child.pid)
+    >>> anyio.run(watch.wait)
+    >>> child.returncode is None  # exited, but not reaped
+    True
+    >>> watch.close()
+    >>> child.wait()
+    0
+    """
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+        self._exited = False
+        self._fd: int | None = None
+        self._kqueue: Any = None
+        if sys.platform == "linux":
+            with contextlib.suppress(OSError):  # an old kernel or a seccomp filter: poll waitid
+                self._fd = os.pidfd_open(pid)
+        else:
+            kqueue = select.kqueue()
+            event = select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            try:
+                kqueue.control([event], 0)
+            except ProcessLookupError:
+                self._exited = True  # already a zombie, since it was never reaped
+            except BaseException:
+                kqueue.close()
+                raise
+            self._kqueue = kqueue
+            self._fd = kqueue.fileno()
+
+    async def wait(self) -> None:
+        """
+        Return once the child has exited; never reap it.
+
+        The wait is cancellable and uses no thread. Later calls return at once.
+
+        Examples
+        --------
+        >>> await watch.wait()  # doctest: +SKIP
+        """
+        if self._exited:
+            return
+        if self._fd is not None:
+            await anyio.wait_readable(self._fd)
+        elif sys.platform == "linux":
+            # The fallback has no descriptor to wait on, so it polls.
+            while not _has_exited(self._pid):  # noqa: ASYNC110
+                await anyio.sleep(_EXIT_POLL_S)
+        self._exited = True
+
+    def close(self) -> None:
+        """
+        Release the watch descriptor; calling it again does nothing.
+
+        Examples
+        --------
+        >>> watch.close()  # doctest: +SKIP
+        """
+        if self._kqueue is not None:
+            self._kqueue.close()
+        elif self._fd is not None:
+            os.close(self._fd)
+        self._kqueue = None
+        self._fd = None
 
 
 def kill_orphan(started: Job.Started) -> bool:

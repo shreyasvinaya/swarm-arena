@@ -13,6 +13,7 @@ from swarm_arena._tooling.result_file import (
     ToolResultFile,
     command_output_from_result,
     note_in_log,
+    open_log,
     read_regular_file,
     read_result_json,
     request_json,
@@ -595,3 +596,64 @@ def test_folded_output_duplicates_fail_producing_run(
     assert first in diagnostic
     assert second in diagnostic
     assert secret not in diagnostic
+
+
+# --- Task 15 fix round 1: the shared log opener ---
+
+
+def test_open_log_truncates_or_appends_and_returns_a_blocking_fd(tmp_path: Path) -> None:
+    p = tmp_path / "log"
+    p.write_text("old content")
+    fd = open_log(p, truncate=True)
+    try:
+        assert os.get_blocking(fd)
+        os.write(fd, b"new")
+    finally:
+        os.close(fd)
+    assert p.read_text() == "new"
+    fd = open_log(p, truncate=False)
+    try:
+        os.write(fd, b"+more")
+    finally:
+        os.close(fd)
+    assert p.read_text() == "new+more"
+    os.close(open_log(tmp_path / "created", truncate=True))
+    assert (tmp_path / "created").read_text() == ""
+
+
+@pytest.mark.parametrize(
+    "kind", ["symlink_leaf", "symlink_parent", "hardlink", "fifo", "directory"]
+)
+def test_open_log_refuses_unsafe_paths_untouched(tmp_path: Path, kind: str) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "log").write_text("keep")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "log"
+    if kind == "symlink_leaf":
+        path.symlink_to(outside / "log")
+    elif kind == "symlink_parent":
+        (workspace / "sub").symlink_to(outside, target_is_directory=True)
+        path = workspace / "sub/log"
+    elif kind == "hardlink":
+        path.hardlink_to(outside / "log")
+    elif kind == "fifo":
+        os.mkfifo(path)  # no reader: must fail at once, never block
+    else:
+        path.mkdir()
+    with pytest.raises(OSError, match="cannot open log file safely") as exc:
+        open_log(path, truncate=True)
+    assert exc.value.filename == str(path)
+    assert (outside / "log").read_text() == "keep"
+
+
+def test_open_log_refuses_fifo_with_reader(tmp_path: Path) -> None:
+    p = tmp_path / "fifo"
+    os.mkfifo(p)
+    reader = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError, match="not a regular file with one link"):
+            open_log(p, truncate=False)
+    finally:
+        os.close(reader)

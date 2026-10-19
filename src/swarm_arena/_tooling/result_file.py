@@ -1,6 +1,7 @@
 """Read result envelopes and workspace artifacts without following file links."""
 
 import contextlib
+import errno
 import json
 import math
 import os
@@ -357,6 +358,84 @@ def command_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput
     return ToolOutput(status=status, data=data, started_at=run.started_at, ended_at=run.ended_at)
 
 
+_NOT_SINGLE_REGULAR = "not a regular file with one link"
+
+
+def open_log(path: Path, *, truncate: bool) -> int:
+    """
+    Open a log file for writing without following links or blocking.
+
+    Every component is opened from its parent's descriptor with
+    ``O_NOFOLLOW | O_NONBLOCK`` (directories also ``O_DIRECTORY``), so a
+    symlinked component, or one replaced during the walk, cannot redirect the
+    open. The leaf is created if missing and is never truncated before it
+    passes the checks. A FIFO without a reader fails at once instead of
+    blocking.
+
+    Parameters
+    ----------
+    path : Path
+        Log path. Every component must be a real directory, not a symlink.
+    truncate : bool
+        True empties the file after the checks; False opens it in append mode.
+
+    Returns
+    -------
+    int
+        A blocking, non-inheritable write descriptor that the caller closes.
+
+    Raises
+    ------
+    OSError
+        ``cannot open log file safely: <reason>`` with ``filename`` set to
+        ``path``, when a component is a symlink or missing, or the leaf is not
+        a regular file with exactly one link (a hardlink, FIFO, or directory).
+
+    Examples
+    --------
+    >>> import os, tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     log = Path(tmp).resolve() / "stderr.log"
+    ...     fd = open_log(log, truncate=True)
+    ...     written = os.write(fd, b"hi")
+    ...     os.close(fd)
+    ...     log.read_text()
+    'hi'
+    """
+    fds: list[int] = []
+    try:
+        parts = path.parts[1:] if path.anchor else path.parts
+        if not parts:
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR))
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory = os.open(path.anchor or ".", directory_flags)
+        fds.append(directory)
+        for part in parts[:-1]:
+            directory = os.open(part, directory_flags, dir_fd=directory)
+            fds.append(directory)
+        leaf_flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(
+            parts[-1], leaf_flags if truncate else leaf_flags | os.O_APPEND, 0o644, dir_fd=directory
+        )
+        fds.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(errno.EINVAL, _NOT_SINGLE_REGULAR)
+        if truncate:
+            os.ftruncate(fd, 0)
+        os.set_blocking(fd, True)
+        fds.remove(fd)
+        return fd
+    except (OSError, ValueError) as exc:
+        code = exc.errno if isinstance(exc, OSError) and exc.errno else errno.EINVAL
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else "invalid path"
+        raise OSError(code, f"cannot open log file safely: {reason}", os.fspath(path)) from None
+    finally:
+        for fd in reversed(fds):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
 def note_in_log(path: Path, message: str) -> None:
     """
     Append a diagnostic to a regular log file, dropping unsafe or failed writes.
@@ -364,9 +443,9 @@ def note_in_log(path: Path, message: str) -> None:
     Parameters
     ----------
     path : Path
-        Log path. A missing leaf is created. Symlinks in any component,
-        hardlinked files, and special files are refused. Directory descriptors
-        pin the parent walk so replacing a component cannot redirect the write.
+        Log path, opened through ``open_log``: a missing leaf is created;
+        symlinks in any component, hardlinked files, and special files are
+        refused, and the note is dropped.
     message : str
         Diagnostic without the prefix or trailing newline. Nonprintable
         characters, including controls and line separators, become spaces.
@@ -375,31 +454,14 @@ def note_in_log(path: Path, message: str) -> None:
     --------
     >>> note_in_log(Path("stderr.log"), "result is missing")  # doctest: +SKIP
     """
-    fds: list[int] = []
     try:
-        parts = path.parts[1:] if path.anchor else path.parts
-        if not parts:
-            return
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-        directory = os.open(path.anchor or ".", directory_flags)
-        fds.append(directory)
-        for part in parts[:-1]:
-            directory = os.open(part, directory_flags, dir_fd=directory)
-            fds.append(directory)
-        fd = os.open(
-            parts[-1],
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o644,
-            dir_fd=directory,
-        )
-        fds.append(fd)
-        info = os.fstat(fd)
-        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-            sanitized = "".join(char if char.isprintable() else " " for char in message)
-            os.write(fd, f"swarm-arena: {sanitized}\n".encode())
-    except (OSError, ValueError):
+        fd = open_log(path, truncate=False)
+    except OSError:
+        return
+    try:
+        sanitized = "".join(char if char.isprintable() else " " for char in message)
+        os.write(fd, f"swarm-arena: {sanitized}\n".encode())
+    except OSError:
         pass
     finally:
-        for fd in reversed(fds):
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        os.close(fd)
