@@ -20,6 +20,7 @@ from swarm_arena._model.plan import (
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._tooling.script_tool import ScriptTool
 from swarm_arena._version import __version__ as __version__
 
 __all__: list[str] = [
@@ -34,6 +35,7 @@ __all__: list[str] = [
     "RoundSpec",
     "RunConfig",
     "Score",
+    "ScriptTool",
     "TeamSpec",
 ]
 

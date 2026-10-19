@@ -62,3 +62,50 @@ artifacts are read-only. The workspace's ancestors are trusted executor-owned
 directories. Output collection uses the shared regular-file reader, refuses
 symlink components and special files, and rejects duplicate normalized paths.
 These file-handling protections do not provide strong process isolation.
+
+## ScriptTool
+
+`ScriptTool` configures an external command without importing the script or
+reading its files during construction:
+
+```python
+from swarm_arena import ScriptTool
+
+script = ScriptTool(
+    command=["python", "problem/run.py"],
+    files=["tool/helper.py"],
+    editable=["problem/*.txt"],
+    params={"epochs": {"type": "integer", "maximum": 400}},
+    timeout_s=120,
+)
+inputs = script.get_input_model()(epochs=20)
+```
+
+Use `get_input_model()` for the instance's parameter schema; the class-level
+`input_model` is an empty placeholder. Configuration accepts either a
+`ScriptTool.Config` positional argument or keyword fields, and rejects unknown
+fields. Snapshots are prepared separately before staging.
+
+The command runs in the staged workspace and reads its parameters from
+`swarm/request.json`. It writes a tool envelope such as
+`{"data": {"loss": 0.25}}` to `swarm/result.json`. The shared result rules validate
+the envelope, keep valid partial data after timeout or cancellation, and mark a
+successful process with a missing or invalid result as an error. `python`, `env`,
+`timeout_s`, and `grace_s` are passed through to the command settings.
+
+Every command argument or configured interpreter that names a root file is
+protected using its canonical relative path: `problem/run.py`,
+`./problem/run.py`, and `problem//run.py` protect the same file. All tool-owned
+manifest paths are protected too. These restrictions apply even under a broad
+editable glob, both to live edits and to a base parent's overlay.
+
+The tool provides two read-only actions, each counted as a board read:
+
+- `list_files(candidate=None)` returns sorted goal-file paths. Supplying a
+  candidate selects its goal files plus effective overlay.
+- `read_file(path, candidate=None)` returns that path and its UTF-8 contents from
+  the same view. Missing paths and non-UTF-8 contents produce soft errors.
+
+Candidate lookup uses the agent context, so candidates outside its view cannot
+be read. Artifact reads run on a worker thread. Neither action exposes arbitrary
+filesystem paths or artifact hashes as a way to select additional files.
