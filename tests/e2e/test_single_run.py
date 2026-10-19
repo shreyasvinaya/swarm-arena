@@ -120,5 +120,6 @@ async def test_script_check_rejects_missing_numbers_and_crashed_script(
     assert (result.passed, result.reasons) == (False, ["non-finite or missing numbers"])
 
     crashed = ScriptCheck(command=["python", "-c", "raise SystemExit(1)"])
-    result = await check_check(crashed, candidate, goal=goal, executor=executor)
+    with pytest.warns(UserWarning, match="ended with status error"):
+        result = await check_check(crashed, candidate, goal=goal, executor=executor)
     assert (result.passed, result.reasons) == (False, ["check script failed: error"])
