@@ -67,7 +67,8 @@ def upgrade(kind: str, raw: dict[str, Any]) -> dict[str, Any]:
     kind : str
         Stored-format registry kind.
     raw : dict[str, Any]
-        Stored fields; an absent ``schema_version`` means version one.
+        Stored fields; ``schema_version`` must be a positive integer, excluding
+        booleans. An absent version means version one.
 
     Returns
     -------
@@ -77,7 +78,8 @@ def upgrade(kind: str, raw: dict[str, Any]) -> dict[str, Any]:
     Raises
     ------
     ValueError
-        If the kind is unknown or the stored version is newer than supported.
+        If the kind is unknown, the stored version is invalid, or the stored
+        version is newer than supported.
     RuntimeError
         If a required migration step is missing.
 
@@ -91,6 +93,8 @@ def upgrade(kind: str, raw: dict[str, Any]) -> dict[str, Any]:
     current = CURRENT[kind]
     data = raw.copy()
     version = data.get("schema_version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ValueError("schema_version must be a positive integer")
     if version > current:
         raise ValueError(
             f"{kind} schema_version {version} is newer than this swarm-arena supports ({current})"

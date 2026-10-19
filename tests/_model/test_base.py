@@ -1,3 +1,4 @@
+import json
 from typing import Any, ClassVar, get_args
 
 import pytest
@@ -67,6 +68,35 @@ def test_stored_model_current_version_and_instance() -> None:
     assert m.schema_version == 1
     assert Demo.model_validate(m) is m
     assert m.model_dump() == {"schema_version": 1, "x": 1}
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["dict", "json"])
+@pytest.mark.parametrize(
+    "version",
+    [None, "1", [], {}, float("nan"), True, False, 1.0, 0, -1],
+    ids=["null", "string", "list", "dict", "nan", "true", "false", "float", "zero", "negative"],
+)
+def test_stored_model_invalid_version_is_validation_error(version: object, as_json: bool) -> None:
+    class Demo(StoredModel):
+        schema_kind: ClassVar[str] = "plan"
+
+    data = {"schema_version": version}
+    if as_json:
+        payload = json.dumps(data)
+        with pytest.raises(ValidationError, match="schema_version must be a positive integer"):
+            Demo.model_validate_json(payload)
+    else:
+        with pytest.raises(ValidationError, match="schema_version must be a positive integer"):
+            Demo.model_validate(data)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["dict", "json"])
+def test_stored_model_missing_version_means_one(as_json: bool) -> None:
+    class Demo(StoredModel):
+        schema_kind: ClassVar[str] = "plan"
+
+    model = Demo.model_validate_json("{}") if as_json else Demo.model_validate({})
+    assert model.schema_version == 1
 
 
 def test_type_aliases() -> None:

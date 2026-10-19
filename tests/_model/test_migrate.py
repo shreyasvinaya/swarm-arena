@@ -19,6 +19,25 @@ def test_missing_version_means_one() -> None:
     assert upgrade("plan", {"x": 1}) == {"schema_version": 1, "x": 1}
 
 
+@pytest.mark.parametrize("current", [1, 2])
+@pytest.mark.parametrize(
+    "version",
+    [None, "1", [], {}, float("nan"), True, False, 1.0, 0, -1],
+    ids=["null", "string", "list", "dict", "nan", "true", "false", "float", "zero", "negative"],
+)
+def test_invalid_version_refused_before_migration(
+    monkeypatch: pytest.MonkeyPatch, current: int, version: object
+) -> None:
+    monkeypatch.setitem(migrate.CURRENT, "plan", current)
+
+    @migration("plan", 1)
+    def step(raw: dict[str, Any]) -> dict[str, Any]:
+        pytest.fail("invalid schema_version reached migration dispatch")
+
+    with pytest.raises(ValueError, match="schema_version must be a positive integer"):
+        upgrade("plan", {"schema_version": version})
+
+
 def test_newer_version_refused() -> None:
     with pytest.raises(
         ValueError,
