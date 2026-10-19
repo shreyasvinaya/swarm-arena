@@ -27,6 +27,7 @@ PUBLIC: dict[str, list[str]] = {
         "swarm_arena.testing",
     )
 }
+PUBLIC["swarm_arena"] += ["Ref"]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))
@@ -50,6 +51,10 @@ def test_names_report_public_module(module: str) -> None:
 def test_version_is_package_metadata() -> None:
     assert swarm_arena.__version__ == importlib.metadata.version("swarm-arena")
     assert "__version__" not in swarm_arena.__all__
+
+
+def test_doctest_finder_collects_method_examples() -> None:
+    assert "swarm_arena.Ref.of" in {t.name for t in doctest.DocTestFinder().find(swarm_arena)}
 
 
 def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -10,3 +10,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Project scaffold: package, `swarm-arena --version`, CI, and docs skeleton.
+- `Ref`: components referenced by import path, with validated `Config`.
