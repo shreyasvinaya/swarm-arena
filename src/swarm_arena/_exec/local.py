@@ -12,8 +12,9 @@ import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Final, cast
+from typing import Annotated, Any, Final, TypeVar, cast
 
 import anyio
 from pydantic import ConfigDict, Field
@@ -40,6 +41,7 @@ from swarm_arena._tooling.result_file import (
 from swarm_arena._tooling.tool import Tool
 
 _LOG: Final = logging.getLogger(__name__)
+_T = TypeVar("_T")
 _STDOUT: Final = "swarm/stdout.log"
 _STDERR: Final = "swarm/stderr.log"
 _STOPPED: Final = frozenset({RunStatus.TIMEOUT, RunStatus.CANCELLED})
@@ -132,16 +134,46 @@ def _open_subdirectory(parent: int, name: str) -> int | None:
         return None
 
 
+def _unlocked_retry(directory: int, operation: Callable[[], _T]) -> _T:
+    """
+    Run an operation on a directory's entries; if it is refused, unlock the directory and retry.
+
+    Only a refusal (EACCES or EPERM) unlocks the directory: deep in a tree a
+    chmod is slow (about 8 ms per level on APFS past PATH_MAX), even when it
+    changes nothing.
+    """
+    try:
+        return operation()
+    except PermissionError:
+        os.fchmod(directory, 0o700)
+        return operation()
+
+
 def _clear_files(directory: int) -> list[str]:
     """List a directory once: unlink every entry that is not a directory, return the rest."""
-    os.fchmod(directory, 0o700)  # a read-only directory refuses unlink
     subdirectories: list[str] = []
     for name in os.listdir(directory):
-        if stat.S_ISDIR(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+        info = _unlocked_retry(
+            directory, partial(os.stat, name, dir_fd=directory, follow_symlinks=False)
+        )
+        if stat.S_ISDIR(info.st_mode):
             subdirectories.append(name)
-        else:
-            os.unlink(name, dir_fd=directory)  # a symlink is removed, never followed
+        else:  # a symlink is removed, never followed
+            _unlocked_retry(directory, partial(os.unlink, name, dir_fd=directory))
     return subdirectories
+
+
+def _open_top(top: Path) -> int:
+    """Open the tree's top directory, unlocking it first when a tool locked it."""
+    try:
+        return os.open(top, _DIR_FLAGS)
+    except PermissionError:
+        parent = os.open(top.parent, _DIR_FLAGS)
+        try:
+            _unlock_directory(parent, top.name)
+        finally:
+            os.close(parent)
+        return os.open(top, _DIR_FLAGS)
 
 
 @dataclass
@@ -161,13 +193,16 @@ def _remove_tree(top: Path) -> None:
     subdirectories are kept in its stack frame. Every child is opened from its
     parent's descriptor, so neither the recursion limit nor PATH_MAX applies,
     and a symlink is unlinked, never followed. Going back up opens ``..`` and
-    checks that it is the directory the walk came from. A locked directory
-    that cannot be unlocked safely is left in place.
+    checks that it is the directory the walk came from. A directory is
+    unlocked only when opening it, or a stat, unlink, or rmdir in it, is
+    refused; that includes the top itself, so a tool that locks its own
+    workspace root does not keep it. A locked directory that cannot be
+    unlocked safely is left in place.
     """
     if not stat.S_ISDIR(os.lstat(top).st_mode):
         os.unlink(top)
         return
-    fd = os.open(top, _DIR_FLAGS)
+    fd = _open_top(top)
     try:
         info = os.fstat(fd)
         stack = [_Frame("", (info.st_dev, info.st_ino), _clear_files(fd))]
@@ -193,7 +228,7 @@ def _remove_tree(top: Path) -> None:
             if (info.st_dev, info.st_ino) != stack[-1].inode:
                 raise OSError("workspace tree changed during removal")
             with contextlib.suppress(OSError):  # not empty: something in it was left
-                os.rmdir(frame.name, dir_fd=fd)
+                _unlocked_retry(fd, partial(os.rmdir, frame.name, dir_fd=fd))
     finally:
         os.close(fd)
     os.rmdir(top)
@@ -401,18 +436,19 @@ class _JobRun:
 
     def _stopped_output(self, status: RunStatus) -> ToolOutput:
         """
-        Stamp the stop on the output: the stop status, and whether anything was kept.
+        Stamp the stop on the output: the stop status, and ``partial``.
 
-        ``partial`` is True only when the collect kept data or files (spec §5:
-        if no valid result exists, the data is empty). A failed, abandoned, or
-        invalid collect gives an empty output with ``partial=False``.
+        ``partial`` is True when the stop-path collect returned a valid
+        ``ToolOutput``, even an empty one (spec §5), whatever the collect said
+        itself; files that ``_finish`` drops later do not change it. A failed,
+        abandoned, or invalid collect gives an empty output with
+        ``partial=False`` and a note.
         """
         if self._output is None:
             if self._provisional is not None:  # a collect was tried and gave nothing
                 note_in_log(self._stderr, "no partial output: collect failed or timed out")
             return ToolOutput(status=status)
-        kept = bool(self._output.data or self._output.files)
-        return self._output.model_copy(update={"status": status, "partial": kept})
+        return self._output.model_copy(update={"status": status, "partial": True})
 
     def _read_log(self, rel: str) -> bytes:
         """Read the last ``max_log_bytes`` of a regular log; anything else is empty."""
@@ -662,13 +698,14 @@ class LocalExecutor(Executor):
         collect failure: status ERROR after a normal exit, with the reason in
         the stderr log. A stopped run's output has the stop status: after a
         timeout it is the output collected before SIGKILL, with
-        ``partial=True`` only when that collect kept data or files. When
+        ``partial=True`` whenever that collect returned a valid
+        ``ToolOutput``, even an empty one, and also when its files are
+        dropped later (over ``max_output_bytes``, or a failed upload). When
         collect failed, timed out, or gave an invalid result, the output is
         empty with ``partial=False``, and a note goes to the stderr log. On a
-        cancel after
-        the start handshake, ``job.on_partial`` gets the best output there is
-        (status CANCELLED), also when the tool had already exited and its
-        collect was still running. A command
+        cancel after the start handshake, ``job.on_partial`` gets the best
+        output there is (status CANCELLED), also when the tool had already
+        exited and its collect was still running. A command
         ``cwd`` that is not a directory in the workspace gives status ERROR
         and the command never starts. A declared output file that is missing,
         unsafe, or over ``max_output_bytes`` gives status ERROR with no files.

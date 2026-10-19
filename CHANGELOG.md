@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is at most 16 MiB, the files one result declares at most 256 MiB together
   (summed before any is hashed; hashed one at a time), and the executor's
   upload reads stay within `max_output_bytes`.
+- A stopped run's output has `partial=True` whenever its collect returned a
+  valid `ToolOutput`, even an empty one, also when its files are dropped later
+  by `max_output_bytes` or a failed upload; a failed, timed-out or invalid
+  collect gives `partial=False` and a note. `tool_output_from_result` notes why
+  a stopped run kept no result.
+- `LocalExecutor` removes a workspace whose tool locked the workspace root, and
+  its fallback remover changes a directory's mode only when an open, unlink or
+  rmdir in it is refused.
 
 ### Added
 

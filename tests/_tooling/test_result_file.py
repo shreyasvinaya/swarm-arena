@@ -148,6 +148,25 @@ def test_killed_run_with_result_is_partial(tmp_path: Path, status: RunStatus) ->
     assert (empty.partial, empty.data) == (False, {})
 
 
+@pytest.mark.parametrize("status", [RunStatus.TIMEOUT, RunStatus.CANCELLED])
+def test_stopped_run_partial_rule(tmp_path: Path, status: RunStatus) -> None:  # IF3 A8
+    write_result(tmp_path / "empty", {"data": {}})  # valid but empty: still partial
+    r = run(tmp_path / "empty", status, None)
+    out = tool_output_from_result(tmp_path / "empty", r)
+    assert (out.status, out.partial, out.data) == (status, True, {})
+    assert r.stderr_path.read_text() == ""
+    # Missing or invalid: empty, not partial, and the reason is in the stderr log.
+    for name, result in (("missing", None), ("invalid", {"data": {}, "files": ["out/none"]})):
+        ws = tmp_path / name
+        if result is not None:
+            write_result(ws, result)
+        r = run(ws, status, None)
+        out = tool_output_from_result(ws, r)
+        assert (out.status, out.partial, out.data, out.files) == (status, False, {}, [])
+        reason = "swarm/result.json is missing" if result is None else "out/none is not a regular"
+        assert f"swarm-arena: {reason}" in r.stderr_path.read_text()
+
+
 def test_error_keeps_usage_only(tmp_path: Path) -> None:
     write_result(tmp_path, {"data": {"x": 1}, "usage": {"output_tokens": 7}})
     out = tool_output_from_result(tmp_path, run(tmp_path, RunStatus.ERROR, 1))
@@ -746,8 +765,7 @@ def test_declared_files_over_the_cap_fail_before_any_is_hashed(
     assert (out.status, out.partial, out.data, out.files) == (expected, False, {}, [])
     assert sum(bytes_read) < 4096  # result.json only: the 512 MiB of outputs are never read
     log = r.stderr_path.read_text()
-    if status == RunStatus.OK:
-        assert "out/b crosses MAX_DECLARED_FILES_BYTES" in log
+    assert "out/b crosses MAX_DECLARED_FILES_BYTES" in log
     assert "SENTINEL_SECRET" not in log
 
 

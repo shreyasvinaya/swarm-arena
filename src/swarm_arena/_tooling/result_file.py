@@ -413,7 +413,10 @@ def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
     -------
     ToolOutput
         Valid data for successful or partial runs; usage only for errors and
-        provider failures. An invalid successful result becomes an error.
+        provider failures. An invalid successful result becomes an error. A
+        timeout or cancel keeps a valid result, even an empty one, with
+        ``partial=True``; without one the output is empty with
+        ``partial=False``, and the reason goes to the stderr log.
 
     Examples
     --------
@@ -423,9 +426,10 @@ def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
     try:
         result, files = _load_result(workspace)
     except ValueError as exc:
+        if status in (RunStatus.OK, RunStatus.TIMEOUT, RunStatus.CANCELLED):
+            note_in_log(run.stderr_path, str(exc))  # why nothing was kept
         if status == RunStatus.OK:
             status = RunStatus.ERROR
-            note_in_log(run.stderr_path, str(exc))
         return ToolOutput(status=status, started_at=run.started_at, ended_at=run.ended_at)
 
     failed_provider = None
