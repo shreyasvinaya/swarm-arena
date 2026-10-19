@@ -1,3 +1,4 @@
+import json
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
@@ -6,10 +7,10 @@ from typing import Any
 
 import pytest
 from _fakes.tools import cand
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from swarm_arena import Goal
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import materialize
 from swarm_arena._tooling.script_tool import (
@@ -26,6 +27,100 @@ from swarm_arena.tool import Command, CompletedRun, FileSet, ParentRef, RunStatu
 
 HA, HA2, HR, HN = (digit * 64 for digit in ("a", "b", "c", "d"))
 SECRET = "SECRET_SENTINEL_script_tool"
+
+
+def _assert_secret_safe(error: BaseException, secret: str) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for diagnostic in (
+            str(current),
+            repr(current),
+            repr(current.args),
+            "".join(traceback.format_exception(current)),
+        ):
+            assert secret not in diagnostic
+        pending.extend(
+            chained for chained in (current.__cause__, current.__context__) if chained is not None
+        )
+
+
+def test_constructor_timeout_error_is_secret_safe() -> None:
+    secret = "SECRET_SENTINEL_constructor_timeout"
+    with pytest.raises(ValueError, match="timeout_s") as caught:
+        ScriptTool(command=["x"], timeout_s=secret)
+    _assert_secret_safe(caught.value, secret)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
+def test_config_env_error_is_secret_safe(entrypoint: str) -> None:
+    secret = "SECRET_SENTINEL_config_env"
+    _check_model_error(
+        ScriptTool.Config, {"command": ["x"], "env": [{"token": secret}]}, entrypoint, "env", secret
+    )
+
+
+def _check_model_error(
+    model: type[BaseModel], data: dict[str, Any], entrypoint: str, field: str, secret: str
+) -> None:
+    def validate() -> BaseModel:
+        if entrypoint == "constructor":
+            return model(**data)
+        if entrypoint == "model_validate_json":
+            return model.model_validate_json(json.dumps(data))
+        return model.model_validate(data)
+
+    with pytest.raises(ValidationError, match=field) as caught:
+        validate()
+    _assert_secret_safe(caught.value, secret)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
+@pytest.mark.parametrize("kind", ["integer", "array", "enum", "extra"])
+def test_parameter_input_error_is_secret_safe(entrypoint: str, kind: str) -> None:
+    secret = "SECRET_SENTINEL_parameter_input"
+    schemas: dict[str, dict[str, Any]] = {
+        "integer": {"type": "integer"},
+        "array": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
+        "enum": {"enum": [secret]},
+        "extra": {"type": "integer"},
+    }
+    values: dict[str, Any] = {"integer": secret, "array": [[secret]], "enum": "wrong", "extra": 1}
+    model = ScriptTool(command=["x"], params={"count": schemas[kind]}).get_input_model()
+    data = {"count": values[kind]}
+    if kind == "extra":
+        data[secret] = secret
+    _check_model_error(model, data, entrypoint, "<field>" if kind == "extra" else "count", secret)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_schema_type_error_is_secret_safe(nested: bool) -> None:
+    secret = "SECRET_SENTINEL_schema_type"
+    schema: dict[str, Any] = {"type": secret}
+    if nested:
+        schema = {"type": "array", "items": schema}
+    tool = ScriptTool(command=["x"], params={"count": schema})
+    with pytest.raises(ValueError, match=r"script_params\.count.*unsupported type") as caught:
+        tool.get_input_model()
+    _assert_secret_safe(caught.value, secret)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_config_nested_location_is_secret_safe() -> None:
+    secret = "SECRET_SENTINEL_config_location"
+    with pytest.raises(ValidationError, match="params") as caught:
+        ScriptTool.Config(command=["x"], params={secret: secret})  # ty: ignore[invalid-argument-type]
+    _assert_secret_safe(caught.value, secret)
+    assert caught.value.errors()[0]["loc"] == ("params", "<…>")
 
 
 class FakeView:
@@ -62,7 +157,7 @@ def test_config_forms() -> None:
     assert a.config == ScriptTool(ScriptTool.Config(command=["python", "run.py"])).config
     with pytest.raises(TypeError, match="config or fields"):
         ScriptTool(ScriptTool.Config(command=["x"]), timeout_s=1)
-    with pytest.raises(ValidationError, match="timeout"):
+    with pytest.raises(ConfigError, match="<field>: extra_forbidden"):
         ScriptTool(command=["x"], timeout=10)
     with pytest.raises(ValidationError, match="frozen"):
         a.config.timeout_s = 1  # ty: ignore[invalid-assignment]

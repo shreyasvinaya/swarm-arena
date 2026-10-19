@@ -1,24 +1,81 @@
 """Run user scripts and expose read-only views of goal and candidate files."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, ClassVar, LiteralString, Protocol, cast
 
 import anyio
-from pydantic import BaseModel, ConfigDict
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ModelWrapValidatorHandler,
+    ValidationError,
+    create_model,
+    model_validator,
+)
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.goal import FileSet, Goal
-from swarm_arena._model.ref import config_or_fields
+from swarm_arena._model.ref import _CONFIG_ERROR_TYPES, _validate_config, config_or_fields
 from swarm_arena._model.results import Candidate
-from swarm_arena._model.schema import compile_object_schema
+from swarm_arena._model.schema import _TYPES, compile_object_schema
 from swarm_arena._model.tooling import Command, CompletedRun, ToolOutput, ToolRequest
 from swarm_arena._tooling.paths import check_relpath
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.staging import effective_files
 from swarm_arena._tooling.tool import Action, Tool
+
+
+def _sanitize_validation(
+    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
+) -> Any:
+    """Retain field identifiers and built-in error codes, discarding values and chains."""
+    try:
+        return handler(data)
+    except ValidationError as error:
+        errors: list[InitErrorDetails] = []
+        for item in error.errors(include_input=False, include_url=False, include_context=False):
+            location = item["loc"]
+            first = location[0] if location else None
+            field = first if isinstance(first, str) and first in cls.model_fields else "<field>"
+            # Membership restricts the dynamic string to pydantic's built-in literals.
+            code = cast(
+                LiteralString, item["type"] if item["type"] in _CONFIG_ERROR_TYPES else "invalid"
+            )
+            errors.append(
+                InitErrorDetails(
+                    type=PydanticCustomError(code, code),
+                    loc=(field, "<…>") if len(location) > 1 else (field,),
+                    input=None,
+                )
+            )
+    except Exception:
+        errors = [
+            InitErrorDetails(type=PydanticCustomError("invalid", "invalid"), loc=(), input=None)
+        ]
+    # Raising outside the handler also removes the value-bearing __context__.
+    raise ValidationError.from_exception_data(cls.__name__, errors, hide_input=True) from None
+
+
+class _ScriptModel(BaseModel):
+    """Sanitize configuration and generated parameter validation errors."""
+
+    _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
+
+
+def _check_schema_types(path: str, schema: Mapping[str, Any]) -> None:
+    """Reject unsupported types using only the property path, including array items."""
+    kind = schema.get("type")
+    if kind is not None and kind not in (*_TYPES, "array"):
+        raise ConfigError(f"{path}: unsupported type") from None
+    if kind == "array" and "items" in schema:
+        items = schema["items"]
+        if not isinstance(items, Mapping):
+            raise ConfigError(f"{path}.items: invalid schema") from None
+        _check_schema_types(f"{path}.items", items)
 
 
 class _EmptyInputs(FrozenModel):
@@ -191,9 +248,12 @@ class ScriptTool(Tool):
         {"command", "python", "files", "env", "editable"}
     )
 
-    class Config(BaseModel):
+    class Config(_ScriptModel):
         """
         Configure a script command, file permissions, and input parameters.
+
+        Validation errors expose field names and error codes only; nested
+        locations and rejected values are hidden.
 
         Parameters
         ----------
@@ -243,8 +303,16 @@ class ScriptTool(Tool):
 
     def __init__(self, config: Config | None = None, /, **fields: Any) -> None:
         """Validate configuration without inspecting or importing the script."""
-        super().__init__(config_or_fields(config, fields))
-        self._input_model: type[BaseModel] | None = None
+        data = config_or_fields(config, fields)
+        try:
+            validated = _validate_config(self.Config, data, where="ScriptTool.Config")
+        except ConfigError as error:
+            message = str(error)
+        else:
+            super().__init__(validated)
+            self._input_model: type[BaseModel] | None = None
+            return
+        raise ConfigError(message) from None
 
     @property
     def config(self) -> Config:
@@ -268,6 +336,9 @@ class ScriptTool(Tool):
         """
         Compile and cache this instance's script parameter model.
 
+        Input errors retain only top-level field names and built-in error codes.
+        Schema errors omit configured values and original exception chains.
+
         Returns
         -------
         type[BaseModel]
@@ -280,7 +351,16 @@ class ScriptTool(Tool):
         {}
         """
         if self._input_model is None:
-            self._input_model = compile_object_schema(f"{self.name}_params", self.config.params)
+            name = f"{self.name}_params"
+            for prop, schema in self.config.params.items():
+                _check_schema_types(f"{name}.{prop}", schema)
+            try:
+                compiled = compile_object_schema(name, self.config.params)
+                self._input_model = create_model(name, __base__=(compiled, _ScriptModel))
+            except Exception:
+                pass
+            if self._input_model is None:
+                raise ConfigError(f"{name}: invalid schema") from None
         return self._input_model
 
     def get_description(self) -> str:
