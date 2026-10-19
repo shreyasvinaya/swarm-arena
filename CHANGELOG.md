@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- End-to-end offline test of one tool run, checked and judged through the public API.
 - `ScriptTool`: bring your own files and script, with `list_files` and `read_file` actions.
 - `RunConfig` and the `swarm_arena.config` models, with load-time catalog rules.
 
