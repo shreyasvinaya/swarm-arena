@@ -1,11 +1,12 @@
 import importlib
 from collections.abc import Mapping
+from traceback import format_exception
 from types import MappingProxyType, ModuleType
 from typing import Any
 
 import pytest
 from _fakes.tools import NoNameWidget, Widget
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import FrozenModel
@@ -59,6 +60,39 @@ def test_build_validates_config() -> None:
 def test_build_rejects_misspelled_key() -> None:
     with pytest.raises(ConfigError, match=r"(?s)_fakes\.tools:Widget.*sise"):
         Ref(path="_fakes.tools:Widget", config={"sise": 2}).build(Configurable)
+
+
+def test_build_config_error_omits_input_values() -> None:
+    secret = "review-only-secret-sentinel"
+    with pytest.raises(ConfigError) as exc:
+        Ref(path="_fakes.tools:Widget", config={"size": secret, "sise": secret}).build(Configurable)
+
+    assert secret not in str(exc.value)
+    assert secret not in repr(exc.value.args)
+    assert secret not in "".join(format_exception(exc.value))
+    for detail in ("_fakes.tools:Widget", "size", "sise", "int_parsing", "extra_forbidden"):
+        assert detail in str(exc.value)
+
+
+def test_build_config_error_omits_validator_message_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Config(Widget.Config):
+        @field_validator("size", mode="before")
+        @classmethod
+        def reject_size(cls, value: object) -> object:
+            raise ValueError(f"invalid size: {value}")
+
+    monkeypatch.setattr(Widget, "Config", Config)
+    secret = "validator-only-secret-sentinel"
+    with pytest.raises(ConfigError) as exc:
+        Ref(path="_fakes.tools:Widget", config={"size": secret}).build(Configurable)
+
+    assert secret not in str(exc.value)
+    assert secret not in repr(exc.value.args)
+    assert secret not in "".join(format_exception(exc.value))
+    for detail in ("_fakes.tools:Widget", "size", "value_error"):
+        assert detail in str(exc.value)
 
 
 def test_build_wrong_base_and_load_errors() -> None:

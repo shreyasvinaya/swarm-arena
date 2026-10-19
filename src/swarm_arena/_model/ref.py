@@ -278,6 +278,8 @@ class Ref(FrozenModel):
             If the referenced class does not inherit from the required base.
         ValueError
             If importing fails or configuration validation raises ConfigError.
+            ConfigError reports the component path, field locations, and error
+            types, omitting input values and validator messages or context.
 
         Examples
         --------
@@ -292,7 +294,10 @@ class Ref(FrozenModel):
         try:
             validated = cls.Config.model_validate(self.config)
         except ValidationError as err:
-            raise ConfigError(f"{self.path}: {err}") from err
+            # Validator messages and context may repeat secret input values.
+            errors = err.errors(include_input=False, include_url=False, include_context=False)
+            summary = "; ".join(f"{error['loc']}: {error['type']}" for error in errors)
+            raise ConfigError(f"{self.path}: {summary}") from None
         return cls(validated)
 
     def component_name(self) -> str:
