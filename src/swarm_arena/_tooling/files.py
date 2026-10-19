@@ -2,12 +2,9 @@
 
 from pathlib import Path
 
-from pydantic import ValidationError
-
-from swarm_arena._errors import ConfigError
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
-from swarm_arena._model.ref import Configurable, Ref, _safe_config_location
+from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import check_relpath, matches
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
@@ -100,6 +97,8 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     ValueError
         If importing, validating configuration, or snapshotting files fails.
         ConfigError diagnostics omit values, validator messages, and data keys.
+        Only built-in Pydantic error types are shown; custom types and other
+        validation exceptions become ``invalid`` with their chains suppressed.
 
     Examples
     --------
@@ -116,15 +115,7 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
         raise ValueError(f"cannot import {ref.path}") from None
     if not issubclass(cls, Configurable):
         raise TypeError(f"{ref.path} is not a Configurable subclass")
-    try:
-        config = cls.Config.model_validate(ref.config)
-    except ValidationError as err:
-        errors = err.errors(include_input=False, include_url=False, include_context=False)
-        summary = "; ".join(
-            f"{_safe_config_location(cls.Config, error['loc'])}: {error['type']}"
-            for error in errors
-        )
-        raise ConfigError(f"{ref.path}: {summary}") from None
+    config = _validate_config(cls.Config, ref.config, where=ref.path)
     updated = dict(ref.config)
     for key in type(config).model_fields:
         if key not in ref.config:

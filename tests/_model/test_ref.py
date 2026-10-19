@@ -17,6 +17,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import FrozenModel
@@ -433,3 +434,52 @@ def test_config_or_fields() -> None:
         config_or_fields(config, fields)
     with pytest.raises(TypeError, match="pass a config or fields, not both"):
         config_or_fields({}, fields)
+
+
+class _ValidatorFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (TypeError("validator_secret_sentinel"), "invalid"),
+        (ValueError("validator_secret_sentinel"), "size: value_error"),
+        (AssertionError("validator_secret_sentinel"), "size: assertion_error"),
+        (_ValidatorFailure("validator_secret_sentinel"), "invalid"),
+        (
+            PydanticCustomError(
+                "validator_secret_sentinel",
+                "bad input: {value}",
+                {"value": "validator_secret_sentinel"},
+            ),
+            "size: invalid",
+        ),
+        (PydanticCustomError("unregistered_type", "validator_secret_sentinel"), "size: invalid"),
+        (None, "size: int_parsing"),
+    ],
+)
+def test_build_config_validation_failures_are_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception | None,
+    expected: str,
+) -> None:
+    class Config(Widget.Config):
+        @field_validator("size", mode="before")
+        @classmethod
+        def reject_size(cls, value: object) -> object:
+            if error is not None:
+                raise error
+            return value
+
+    monkeypatch.setattr(Widget, "Config", Config)
+    secret = "validator_secret_sentinel"
+    ref = Ref(path="_fakes.tools:Widget", config={"size": secret})
+    with pytest.raises(ConfigError) as exc:
+        ref.build(Configurable)
+
+    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
+        assert secret not in diagnostic
+    assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
+    assert exc.value.__suppress_context__
+    assert exc.value.__cause__ is None

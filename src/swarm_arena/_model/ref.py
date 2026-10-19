@@ -3,7 +3,7 @@
 import importlib
 from collections.abc import Mapping, Sequence
 from functools import cache
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, TypeVar, get_args
 
 from pydantic import (
     AliasChoices,
@@ -14,9 +14,12 @@ from pydantic import (
     Field,
     ValidationError,
 )
+from pydantic_core import ErrorType
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import FrozenModel
+
+_CONFIG_ERROR_TYPES = frozenset(get_args(ErrorType))
 
 
 class EmptyConfig(BaseModel):
@@ -198,6 +201,48 @@ def _safe_config_location(config_model: type[BaseModel], location: tuple[str | i
     return f"{name}.<…>" if len(location) > 1 else name
 
 
+def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) -> BaseModel:
+    """Validate config while exposing only schema locations and built-in error types.
+
+    Parameters
+    ----------
+    model_cls : type[BaseModel]
+        Component configuration schema.
+    data : object
+        Untrusted settings to validate.
+    where : str
+        Safe component identifier for diagnostics, never a configuration value.
+
+    Returns
+    -------
+    BaseModel
+        Validated configuration.
+
+    Raises
+    ------
+    ConfigError
+        If validation raises an exception. Custom error types become ``invalid``;
+        input, messages, context, and original exception chains are suppressed.
+
+    Examples
+    --------
+    >>> _validate_config(EmptyConfig, {}, where="example:Component").model_dump()
+    {}
+    """
+    try:
+        return model_cls.model_validate(data)
+    except ValidationError as err:
+        errors = err.errors(include_input=False, include_url=False, include_context=False)
+        summary = "; ".join(
+            f"{_safe_config_location(model_cls, error['loc'])}: "
+            f"{error['type'] if error['type'] in _CONFIG_ERROR_TYPES else 'invalid'}"
+            for error in errors
+        )
+        raise ConfigError(f"{where}: {summary}") from None
+    except Exception:
+        raise ConfigError(f"{where}: invalid") from None
+
+
 class Ref(FrozenModel):
     """
     Reference a component by its import path and configuration.
@@ -308,7 +353,8 @@ class Ref(FrozenModel):
             types, omitting input values and validator messages or context.
             Locations show only a declared top-level field name or alias,
             or ``<field>`` when unrecognized. All deeper segments are replaced
-            together by a single ``<…>`` marker.
+            together by a single ``<…>`` marker. Only built-in Pydantic error
+            types are shown; custom types and other exceptions become ``invalid``.
 
         Examples
         --------
@@ -320,16 +366,7 @@ class Ref(FrozenModel):
         cls = self.load()
         if not issubclass(cls, base):
             raise TypeError(f"{self.path} is not a subclass of {base.__name__}")
-        try:
-            validated = cls.Config.model_validate(self.config)
-        except ValidationError as err:
-            # Validator messages and context may repeat secret input values.
-            errors = err.errors(include_input=False, include_url=False, include_context=False)
-            summary = "; ".join(
-                f"{_safe_config_location(cls.Config, error['loc'])}: {error['type']}"
-                for error in errors
-            )
-            raise ConfigError(f"{self.path}: {summary}") from None
+        validated = _validate_config(cls.Config, self.config, where=self.path)
         return cls(validated)
 
     def component_name(self) -> str:

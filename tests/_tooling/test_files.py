@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from _fakes.tools import FilesWidget, Widget
 from pydantic import create_model, field_validator
+from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.goal import FileSet
@@ -379,3 +380,54 @@ def test_snapshot_plan_unimportable_ref(tmp_path: Path, artifacts: ArtifactStore
     )
     with pytest.raises(ValueError, match="cannot import no_such_mod:J"):
         snapshot_plan(plan, artifacts)
+
+
+class _ValidatorFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (TypeError("validator_secret_sentinel"), "invalid"),
+        (ValueError("validator_secret_sentinel"), "size: value_error"),
+        (AssertionError("validator_secret_sentinel"), "size: assertion_error"),
+        (_ValidatorFailure("validator_secret_sentinel"), "invalid"),
+        (
+            PydanticCustomError(
+                "validator_secret_sentinel",
+                "bad input: {value}",
+                {"value": "validator_secret_sentinel"},
+            ),
+            "size: invalid",
+        ),
+        (PydanticCustomError("unregistered_type", "validator_secret_sentinel"), "size: invalid"),
+        (None, "size: int_parsing"),
+    ],
+)
+def test_snapshot_ref_config_validation_failures_are_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    error: Exception | None,
+    expected: str,
+) -> None:
+    class Config(Widget.Config):
+        @field_validator("size", mode="before")
+        @classmethod
+        def reject_size(cls, value: object) -> object:
+            if error is not None:
+                raise error
+            return value
+
+    monkeypatch.setattr(Widget, "Config", Config)
+    secret = "validator_secret_sentinel"
+    ref = Ref(path="_fakes.tools:Widget", config={"size": secret})
+    with pytest.raises(ConfigError) as exc:
+        snapshot_ref(ref, tmp_path, artifacts)
+
+    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
+        assert secret not in diagnostic
+    assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
+    assert exc.value.__suppress_context__
+    assert exc.value.__cause__ is None
