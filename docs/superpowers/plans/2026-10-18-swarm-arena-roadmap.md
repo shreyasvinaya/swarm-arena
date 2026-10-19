@@ -1278,6 +1278,7 @@ class Job:
     on_started: Callable[["Job.Started"], Awaitable[None]] | None = None   # never serialized; None -> the executor starts
         # the job with no callback (LocalExecutor and RayExecutor). In a run, the core sets it for every job:
         # tool_start / tool_dispatch for tools, command_start for command jobs
+    on_partial: Callable[[ToolOutput], Awaitable[None]] | None = None   # never serialized; the only channel by which an executor hands a cancel-path partial output to the caller (M1b's `execute_tool_run` sets it)
 
 class Executor(ABC):
     Config: ClassVar[type[BaseModel]]
@@ -1300,6 +1301,7 @@ class LocalExecutor(Executor):
         rlimits: bool = True
     def __init__(self, config: "LocalExecutor.Config | None" = None, /, **fields: Any) -> None: ...
     # preflight() refuses a non-POSIX platform [plan].
+    # [plan, M1a] The executor runs with `Job.timeout_s` and `Job.grace_s` and writes them into `Command.timeout_s` and `Command.grace_s`; the driver computes them with `effective_tool_timeout` and `tool_grace` (`_tooling/tool.py`).
     # [plan, M4] confirm_dead(kind "process") on this host: True if not group_alive(pgid), or if process_start_time(pid)
     # differs from started.start_time. False if the group is alive with the recorded start time or an unknown one. None on
     # another host or for kind "dispatch".

@@ -16,3 +16,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal write-once local storage and SHA-256-addressed artifacts with verified retrieval.
 - `Tool` ABC and `Action`; the `swarm/result.json` contract.
 - `Plan` and its specs with TOML load and dump, and `Limits` with the §8.1 defaults.
+- `Executor` ABC and `Job` (`swarm_arena.executor`).

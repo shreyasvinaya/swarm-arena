@@ -4,6 +4,8 @@ from typing import Any, ClassVar, cast
 from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
+from swarm_arena._exec.executor import Job
+from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
@@ -117,3 +119,23 @@ class EchoTool(Tool):
 
 
 WRITE = "import json, os; json.dump({0}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
+
+
+# --- Task 12 ---
+
+
+def make_job(**fields: Any) -> Job:
+    defaults: dict[str, Any] = {
+        "id": "x-1",
+        "kind": "command",
+        "command": Command(argv=["true"]),
+        "stage": Job.Stage(),
+        "timeout_s": 5.0,
+        "grace_s": 1.0,
+        "resources": Resources(),
+        "env": {},
+        "secret_env": (),
+        "secrets_file": None,
+        "artifact_root": "/tmp/a",
+    }
+    return Job(**{**defaults, **fields})
