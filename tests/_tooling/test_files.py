@@ -1,0 +1,381 @@
+import os
+from collections.abc import Iterator
+from copy import deepcopy
+from pathlib import Path
+from traceback import format_exception
+from typing import Any
+
+import pytest
+from _fakes.tools import FilesWidget, Widget
+from pydantic import create_model, field_validator
+
+from swarm_arena._errors import ConfigError
+from swarm_arena._model.goal import FileSet
+from swarm_arena._model.plan import Plan
+from swarm_arena._model.ref import Ref, RefField
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
+
+
+def _write(base: Path, rel: str, data: bytes = b"contents") -> Path:
+    path = base / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def test_snapshot_fileset(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    for rel in ["problem/a.phyk", "problem/b.phyk", "problem/run.py", "problem/sub/c.phyk"]:
+        _write(tmp_path, rel, rel.encode())
+    fs = snapshot_fileset(FileSet(globs=["problem/*.phyk", "problem/run.py"]), tmp_path, artifacts)
+    assert list(fs.manifest) == ["problem/a.phyk", "problem/b.phyk", "problem/run.py"]
+    assert fs.globs == ["problem/*.phyk", "problem/run.py"]
+    assert (
+        artifacts.get_bytes(fs.manifest["problem/run.py"])
+        == (tmp_path / "problem/run.py").read_bytes()
+    )
+
+
+def test_glob_matching_nothing_raises(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    _write(tmp_path, "problem/a.phyk")
+    with pytest.raises(ValueError, match=r"glob 'problem/\*\.phky' matched no file"):
+        snapshot_fileset(FileSet(globs=["problem/*.phky"]), tmp_path, artifacts)
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "dangling"])
+def test_symlinks_rejected(tmp_path: Path, artifacts: ArtifactStore, kind: str) -> None:
+    base = tmp_path / "source"
+    (base / "problem").mkdir(parents=True)
+    target = _write(tmp_path, "outside/file.txt", b"secret-file-contents")
+    if kind == "directory":
+        (base / "problem/linkdir").symlink_to(target.parent, target_is_directory=True)
+        glob, match = "problem/linkdir/*", "symlink.*problem/linkdir"
+    else:
+        if kind == "dangling":
+            target.unlink()
+        (base / "problem/link.txt").symlink_to(target)
+        glob, match = "problem/*", "symlink.*problem/link.txt"
+    with pytest.raises(ValueError, match=match):
+        snapshot_fileset(FileSet(globs=[glob]), base, artifacts)
+
+
+@pytest.mark.parametrize("reserved", ["swarm", "parents", "candidate"])
+def test_reserved_names_rejected(tmp_path: Path, artifacts: ArtifactStore, reserved: str) -> None:
+    _write(tmp_path, f"{reserved}/x.txt")
+    with pytest.raises(ValueError, match="reserved"):
+        snapshot_fileset(FileSet(globs=[f"{reserved}/*"]), tmp_path, artifacts)
+
+
+def test_reserved_basenames_allowed(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    for name in ["swarm", "parents", "candidate"]:
+        _write(tmp_path, f"problem/{name}", name.encode())
+    fs = snapshot_fileset(FileSet(globs=["problem/*"]), tmp_path, artifacts)
+    assert list(fs.manifest) == ["problem/candidate", "problem/parents", "problem/swarm"]
+    assert artifacts.get_bytes(fs.manifest["problem/candidate"]) == b"candidate"
+
+
+def test_already_snapshotted_reads_no_disk(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path, "problem/a.txt")
+    fs = snapshot_fileset(FileSet(globs=["problem/*"]), tmp_path, artifacts)
+    path.unlink()
+
+    def forbid_glob(self: Path, pattern: str) -> Iterator[Path]:
+        raise AssertionError("snapshotted sets must not expand globs")
+
+    monkeypatch.setattr(Path, "glob", forbid_glob)
+    assert snapshot_fileset(fs, tmp_path, artifacts) is fs
+    empty = FileSet()
+    assert snapshot_fileset(empty, tmp_path, artifacts) is empty
+
+
+def test_snapshot_glob_order_overlap_and_regular_files(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    for rel in ["data/z.txt", "data/a.txt", "data/.hidden.txt", "data/sub/b.txt"]:
+        _write(tmp_path, rel)
+    os.mkfifo(tmp_path / "data/pipe.txt")
+    fs = snapshot_fileset(
+        FileSet(globs=["data/z.txt", "data/**/*.txt", "data/*"]), tmp_path, artifacts
+    )
+    assert list(fs.manifest) == ["data/.hidden.txt", "data/a.txt", "data/sub/b.txt", "data/z.txt"]
+
+
+def test_each_glob_must_match_a_regular_file(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    _write(tmp_path, "data/ok.txt")
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(ValueError, match="matched no file"):
+        snapshot_fileset(FileSet(globs=["data/*", "empty"]), tmp_path, artifacts)
+
+
+def test_reserved_directory_is_not_a_selected_file(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    _write(tmp_path, "input.txt")
+    _write(tmp_path, "swarm/internal.txt")
+    fs = snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
+    assert list(fs.manifest) == ["input.txt"]
+
+
+def test_path_glob_hits_use_shared_dialect(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = [_write(tmp_path, rel) for rel in ["data/a.txt", "data/sub/b.txt"]]
+
+    def broad_glob(self: Path, pattern: str) -> Iterator[Path]:
+        return iter(paths)
+
+    monkeypatch.setattr(Path, "glob", broad_glob)
+    fs = snapshot_fileset(FileSet(globs=["data/*.txt"]), tmp_path, artifacts)
+    assert list(fs.manifest) == ["data/a.txt"]
+
+
+def test_snapshot_fileset_sanitizes_io_errors(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_glob(self: Path, pattern: str) -> Iterator[Path]:
+        raise OSError("snapshot-secret-sentinel")
+
+    monkeypatch.setattr(Path, "glob", fail_glob)
+    with pytest.raises(ValueError, match="cannot snapshot glob") as exc:
+        snapshot_fileset(FileSet(globs=["data/*"]), tmp_path, artifacts)
+    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+    assert exc.value.__suppress_context__
+
+
+def test_snapshot_ref_nested(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    _write(tmp_path, "data/a.csv")
+    _write(tmp_path, "more/b.txt")
+    ref = Ref(
+        path="_fakes.tools:FilesWidget",
+        config={
+            "files": ["data/*.csv"],
+            "label": "x",
+            "members": [{"path": "_fakes.tools:FilesWidget", "config": {"files": ["more/*.txt"]}}],
+        },
+    )
+    before = deepcopy(ref)
+    out = snapshot_ref(ref, tmp_path, artifacts)
+    assert list(out.config["files"]["manifest"]) == ["data/a.csv"]
+    assert out.config["label"] == "x"
+    assert list(out.config["members"][0]["config"]["files"]["manifest"]) == ["more/b.txt"]
+    assert snapshot_ref(
+        Ref(path="_fakes.tools:Widget", config={"size": 2}), tmp_path, artifacts
+    ) == Ref(path="_fakes.tools:Widget", config={"size": 2})
+    assert ref == before
+    assert snapshot_ref(out, tmp_path, artifacts) == out
+
+
+def test_snapshot_ref_keeps_omitted_fileset_omitted(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    out = snapshot_ref(
+        Ref(path="_fakes.tools:FilesWidget", config={"label": "x"}), tmp_path, artifacts
+    )
+    assert out == Ref(path="_fakes.tools:FilesWidget", config={"label": "x"})
+    assert "files" not in out.config
+
+
+def test_snapshot_ref_preserves_raw_scalars(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    ref = Ref(path="_fakes.tools:Widget", config={"size": "2"}, name="custom")
+    assert snapshot_ref(ref, tmp_path, artifacts) == ref
+
+
+def test_snapshot_ref_single_ref_and_omitted_defaults(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path, "data/a.csv")
+    config = create_model(
+        "Config",
+        __base__=FilesWidget.Config,
+        member=(RefField, Ref(path="no_such_mod:OmittedDefault")),
+        files=(FileSet, FileSet(globs=["missing-default/*"])),
+    )
+    monkeypatch.setattr(FilesWidget, "Config", config)
+    empty = Ref(path="_fakes.tools:FilesWidget")
+    assert snapshot_ref(empty, tmp_path, artifacts) == empty
+    ref = Ref(
+        path=empty.path, config={"member": {"path": empty.path, "config": {"files": ["data/*"]}}}
+    )
+    out = snapshot_ref(ref, tmp_path, artifacts)
+    assert list(out.config["member"]["config"]["files"]["manifest"]) == ["data/a.csv"]
+    assert "files" not in out.config
+
+
+@pytest.mark.parametrize("path", ["builtins:str", "json:dumps"])
+def test_snapshot_ref_requires_configurable_class(
+    tmp_path: Path, artifacts: ArtifactStore, path: str
+) -> None:
+    with pytest.raises(TypeError, match="Configurable"):
+        snapshot_ref(Ref(path=path), tmp_path, artifacts)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"label": {"snapshot-secret-sentinel": "snapshot-secret-sentinel"}},
+        {"snapshot-secret-sentinel": "snapshot-secret-sentinel"},
+        {"files": {"manifest": {"snapshot-secret-sentinel": "invalid"}}},
+        {
+            "members": [
+                {"path": "_fakes.tools:Widget", "config": {"size": "snapshot-secret-sentinel"}}
+            ]
+        },
+    ],
+)
+def test_snapshot_ref_sanitizes_validation_errors(
+    tmp_path: Path, artifacts: ArtifactStore, config: dict[str, Any]
+) -> None:
+    with pytest.raises(ConfigError) as exc:
+        snapshot_ref(Ref(path="_fakes.tools:FilesWidget", config=config), tmp_path, artifacts)
+    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+    assert exc.value.__suppress_context__
+
+
+def test_snapshot_ref_sanitizes_validator_message(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Config(Widget.Config):
+        @field_validator("size", mode="before")
+        @classmethod
+        def reject(cls, value: object) -> object:
+            raise ValueError(f"invalid secret: {value}")
+
+    monkeypatch.setattr(Widget, "Config", Config)
+    with pytest.raises(ConfigError) as exc:
+        snapshot_ref(
+            Ref(path="_fakes.tools:Widget", config={"size": "snapshot-secret-sentinel"}),
+            tmp_path,
+            artifacts,
+        )
+    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+
+
+def test_snapshot_ref_sanitizes_import_errors(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_load(self: Ref) -> type:
+        raise ValueError("snapshot-secret-sentinel")
+
+    monkeypatch.setattr(Ref, "load", fail_load)
+    with pytest.raises(ValueError, match=r"cannot import _fakes\.tools:Widget") as exc:
+        snapshot_ref(Ref(path="_fakes.tools:Widget"), tmp_path, artifacts)
+    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+
+
+PLAN_TOML = """
+policy = { path = "_fakes.tools:Widget" }
+checks = [{ path = "_fakes.tools:FilesWidget", config = { files = ["check/*"] } }]
+judges = [{ path = "_fakes.tools:FilesWidget", config = { files = ["judge/*"] } }]
+[goal]
+id = "g"
+namespace = "n"
+files = ["problem/*"]
+[[parts]]
+name = "part"
+checks = [{ path = "_fakes.tools:FilesWidget", config = { files = ["part-check/*"] } }]
+judges = [{ path = "_fakes.tools:FilesWidget", config = { files = ["part-judge/*"] } }]
+[parts.goal]
+id = "p"
+namespace = "n"
+files = ["part/*"]
+[[parts]]
+name = "inherit"
+[parts.goal]
+id = "inherit"
+namespace = "n"
+[[parts]]
+name = "empty"
+checks = []
+judges = []
+[parts.goal]
+id = "empty"
+namespace = "n"
+[[teams]]
+name = "t"
+rationale = "Explore"
+[[teams.agents]]
+name = "a"
+rationale = "Search"
+tool = { path = "_fakes.tools:FilesWidget", config = { files = ["tool/*"] } }
+manager = { path = "_fakes.tools:FilesWidget", config = { files = ["manager/*"] } }
+[converge]
+mode = "team"
+[converge.team]
+name = "join"
+rationale = "Combine"
+[[converge.team.agents]]
+name = "join"
+rationale = "Combine"
+tool = { path = "_fakes.tools:FilesWidget", config = { files = ["join-tool/*"] } }
+manager = { path = "_fakes.tools:FilesWidget", config = { files = ["join-manager/*"] } }
+"""
+
+
+def test_snapshot_plan(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    for directory in [
+        "problem",
+        "part",
+        "tool",
+        "manager",
+        "check",
+        "judge",
+        "part-check",
+        "part-judge",
+        "join-tool",
+        "join-manager",
+        "policy",
+    ]:
+        _write(tmp_path, f"{directory}/file.txt", directory.encode())
+    (tmp_path / "plan.toml").write_text(PLAN_TOML)
+    original = Plan.load(tmp_path / "plan.toml")
+    before = deepcopy(original)
+    plan = snapshot_plan(original, artifacts)
+    assert plan.goal.key().files_sha256
+    assert plan.parts[0].goal.files.snapshotted
+    assert plan.teams[0].agents[0].tool.config["files"]["manifest"]
+    assert plan.judges[0].config["files"]["manifest"]
+    assert plan.base_dir == tmp_path
+    assert snapshot_plan(plan, artifacts) == plan
+    assert original == before
+    assert plan.parts[1].checks is None
+    assert plan.parts[1].judges is None
+    assert plan.parts[2].checks == []
+    assert plan.parts[2].judges == []
+    assert plan.converge.team is not None
+    assert plan.parts[0].checks is not None
+    assert plan.parts[0].judges is not None
+    refs = [
+        (plan.teams[0].agents[0].tool, "tool"),
+        (plan.teams[0].agents[0].manager, "manager"),
+        (plan.checks[0], "check"),
+        (plan.judges[0], "judge"),
+        (plan.parts[0].checks[0], "part-check"),
+        (plan.parts[0].judges[0], "part-judge"),
+        (plan.converge.team.agents[0].tool, "join-tool"),
+        (plan.converge.team.agents[0].manager, "join-manager"),
+    ]
+    for ref, directory in refs:
+        manifest = ref.config["files"]["manifest"]
+        assert list(manifest) == [f"{directory}/file.txt"]
+        assert artifacts.get_bytes(manifest[f"{directory}/file.txt"]) == directory.encode()
+    policy_plan = original.model_copy(
+        update={"policy": Ref(path="_fakes.tools:FilesWidget", config={"files": ["policy/*"]})}
+    )
+    assert list(snapshot_plan(policy_plan, artifacts).policy.config["files"]["manifest"]) == [
+        "policy/file.txt"
+    ]
+    for path in tmp_path.glob("*/file.txt"):
+        path.unlink()
+    assert snapshot_plan(plan, artifacts) == plan
+
+
+def test_snapshot_plan_unimportable_ref(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    plan = Plan.loads(
+        'teams = []\njudges = [{path = "no_such_mod:J"}]\n'
+        'policy = {path = "_fakes.tools:Widget"}\n[goal]\nid = "g"\nnamespace = "n"',
+        base_dir=tmp_path,
+    )
+    with pytest.raises(ValueError, match="cannot import no_such_mod:J"):
+        snapshot_plan(plan, artifacts)

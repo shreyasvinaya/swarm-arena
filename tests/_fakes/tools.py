@@ -7,6 +7,8 @@ from swarm_arena import Goal
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable
+from swarm_arena._model.goal import FileSet
+from swarm_arena._model.ref import Configurable, RefField
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
 from swarm_arena._tooling.result_file import tool_output_from_result
@@ -139,3 +141,15 @@ def make_job(**fields: Any) -> Job:
         "artifact_root": "/tmp/a",
     }
     return Job(**{**defaults, **fields})
+# --- Task 11 ---
+
+
+class FilesWidget(Configurable):
+    name: ClassVar[str] = "files-widget"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        files: FileSet = FileSet()
+        members: list[RefField] = []
+        label: str = ""
