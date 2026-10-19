@@ -43,6 +43,8 @@ _PREFIX_MAX: Final = 64
 _DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 _CHUNK: Final = 1 << 20
+_PROC_FD = "/proc/self/fd"  # Linux: a descriptor's own path, used to chmod an O_PATH open
+_NOT_AN_OUTPUT: Final = "collect failed: Tool.collect() did not return a ToolOutput"
 _UNSAFE_ROOT: Final = (
     "workspace root is not safe: it and every parent directory must be owned by this user "
     "or root, and not writable by group or others unless sticky (like /tmp)"
@@ -84,35 +86,79 @@ def _open_workspace(configured: str | None, job: Job) -> tuple[Path, ArtifactSto
     return Path(tempfile.mkdtemp(prefix=prefix, dir=root)), artifacts
 
 
-def _open_subdirectory(parent: int, name: str) -> int:
-    """Open a real subdirectory, first giving it back to the owner if the tool locked it."""
+def _unlock_directory(parent: int, name: str) -> bool:
+    """
+    Give a locked subdirectory back to its owner without ever following a symlink.
+
+    macOS and the BSDs have ``fchmodat(AT_SYMLINK_NOFOLLOW)``. Linux has no
+    such call for directories, so the entry is opened with ``O_PATH |
+    O_NOFOLLOW | O_DIRECTORY`` (which refuses a symlink and needs no read
+    permission) and changed through its ``/proc/self/fd`` link. Where neither
+    exists, or the entry is not a real directory any more, nothing is changed
+    and a warning is logged.
+    """
+    with contextlib.suppress(OSError):
+        if os.chmod in os.supports_follow_symlinks and os.chmod in os.supports_dir_fd:
+            os.chmod(name, 0o700, dir_fd=parent, follow_symlinks=False)
+            return True
+        o_path = getattr(os, "O_PATH", None)
+        if o_path is not None and os.path.isdir(_PROC_FD):
+            fd = os.open(name, o_path | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parent)
+            try:
+                os.chmod(f"{_PROC_FD}/{fd}", 0o700)
+            finally:
+                os.close(fd)
+            return True
+    _LOG.warning("cannot unlock a locked directory without following symlinks: %s", name)
+    return False
+
+
+def _open_subdirectory(parent: int, name: str) -> int | None:
+    """Open a real subdirectory, unlocking it first if needed; None leaves it in place."""
     try:
         return os.open(name, _DIR_FLAGS, dir_fd=parent)
     except PermissionError:
-        os.chmod(name, 0o700, dir_fd=parent)  # the caller's lstat saw a directory, not a link
+        if not _unlock_directory(parent, name):
+            return None
+    except OSError:  # no longer a real directory (for example a symlink swapped in)
+        return None
+    try:
         return os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return None
 
 
-def _clear_files(directory: int) -> str | None:
-    """Unlink every entry that is not a directory, and return one subdirectory or None."""
+def _clear_files(directory: int) -> list[str]:
+    """List a directory once: unlink every entry that is not a directory, return the rest."""
     os.fchmod(directory, 0o700)  # a read-only directory refuses unlink
-    subdirectory: str | None = None
+    subdirectories: list[str] = []
     for name in os.listdir(directory):
         if stat.S_ISDIR(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
-            subdirectory = subdirectory or name
+            subdirectories.append(name)
         else:
-            os.unlink(name, dir_fd=directory)
-    return subdirectory
+            os.unlink(name, dir_fd=directory)  # a symlink is removed, never followed
+    return subdirectories
+
+
+@dataclass
+class _Frame:
+    """One open level of the removal walk: its name, its inode, and the names left to do."""
+
+    name: str
+    inode: tuple[int, int]
+    pending: list[str]
 
 
 def _remove_tree(top: Path) -> None:
     """
-    Remove a tree without recursion, holding at most two descriptors at a time.
+    Remove a tree in linear time without recursion, holding at most two descriptors.
 
-    The walk keeps an explicit stack of names and inodes and opens every child
-    from its parent's descriptor, so neither the recursion limit nor PATH_MAX
-    applies, and a symlink is unlinked, never followed. Going back up opens
-    ``..`` and checks that it is the directory the walk came from.
+    Each directory is listed once: its files are unlinked and the names of its
+    subdirectories are kept in its stack frame. Every child is opened from its
+    parent's descriptor, so neither the recursion limit nor PATH_MAX applies,
+    and a symlink is unlinked, never followed. Going back up opens ``..`` and
+    checks that it is the directory the walk came from. A locked directory
+    that cannot be unlocked safely is left in place.
     """
     if not stat.S_ISDIR(os.lstat(top).st_mode):
         os.unlink(top)
@@ -120,26 +166,30 @@ def _remove_tree(top: Path) -> None:
     fd = os.open(top, _DIR_FLAGS)
     try:
         info = os.fstat(fd)
-        stack: list[tuple[str, tuple[int, int]]] = [("", (info.st_dev, info.st_ino))]
+        stack = [_Frame("", (info.st_dev, info.st_ino), _clear_files(fd))]
         while True:
-            child = _clear_files(fd)
-            if child is not None:
+            frame = stack[-1]
+            if frame.pending:
+                child = frame.pending.pop()
                 opened = _open_subdirectory(fd, child)
+                if opened is None:
+                    continue  # left in place, so this directory's rmdir fails later
                 os.close(fd)
                 fd = opened
                 info = os.fstat(fd)
-                stack.append((child, (info.st_dev, info.st_ino)))
+                stack.append(_Frame(child, (info.st_dev, info.st_ino), _clear_files(fd)))
                 continue
             if len(stack) == 1:
                 break
-            name, _ = stack.pop()
+            stack.pop()
             parent = os.open("..", _DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = parent
             info = os.fstat(fd)
-            if (info.st_dev, info.st_ino) != stack[-1][1]:
+            if (info.st_dev, info.st_ino) != stack[-1].inode:
                 raise OSError("workspace tree changed during removal")
-            os.rmdir(name, dir_fd=fd)
+            with contextlib.suppress(OSError):  # not empty: something in it was left
+                os.rmdir(frame.name, dir_fd=fd)
     finally:
         os.close(fd)
     os.rmdir(top)
@@ -351,21 +401,31 @@ class _JobRun:
             await self._job.on_partial(output)
 
     def _collect(self, run: CompletedRun) -> ToolOutput | None:
-        """Collect the output; on an exception note the traceback and return None."""
+        """Collect and validate the output; on any failure, note it and return None."""
         try:
+            output: object
             if self._staged.tool is not None and self._staged.request is not None:
-                return self._staged.tool.collect(self._staged.request, self._workspace, run)
-            return command_output_from_result(self._workspace, run)
+                output = self._staged.tool.collect(self._staged.request, self._workspace, run)
+            else:
+                output = command_output_from_result(self._workspace, run)
         except Exception:
             note_in_log(run.stderr_path, "collect failed: " + traceback.format_exc())
             return None
+        try:
+            if not isinstance(output, ToolOutput):
+                raise TypeError(_NOT_AN_OUTPUT)
+            # model_copy and model_construct skip validation (the finite-JSON rule too).
+            return ToolOutput.model_validate(output.model_dump(warnings=False))
+        except Exception:
+            note_in_log(run.stderr_path, _NOT_AN_OUTPUT)  # the reason only: no values
+            return None
 
     def _stopped_output(self, status: RunStatus) -> ToolOutput:
-        """Stamp the stop on the kept output: the stop status and ``partial=True``."""
+        """Stamp the stop on the output: the stop status and ``partial=True``, always."""
         if self._output is None:
             if self._provisional is not None:  # a collect was tried and gave nothing
                 note_in_log(self._stderr, "no partial output: collect failed or timed out")
-            return ToolOutput(status=status)
+            return ToolOutput(status=status, partial=True)
         return self._output.model_copy(update={"status": status, "partial": True})
 
     def _read_log(self, rel: str) -> bytes:
@@ -609,13 +669,16 @@ class LocalExecutor(Executor):
         Stage and run a job, and return its output with uploaded files and logs.
 
         A job that exits on its own is collected with ``Tool.collect`` (tool
-        jobs) or from its raw ``swarm/result.json`` (command jobs); an exception
-        in collect gives status ERROR, with the traceback in the stderr log.
-        After a timeout, the output collected before SIGKILL is returned with
-        status TIMEOUT and ``partial=True``. On a cancel after the start
-        handshake, ``job.on_partial`` gets the best output there is (status
-        CANCELLED, ``partial=True`` when a collect gave one), also when the tool
-        had already exited and its collect was still running. A command
+        jobs) or from its raw ``swarm/result.json`` (command jobs). A collect
+        that raises, or returns anything but a ``ToolOutput`` that passes
+        validation again (``model_copy`` and ``model_construct`` skip it), is a
+        collect failure: status ERROR after a normal exit, with the reason in
+        the stderr log. A stopped run's output always has the stop status and
+        ``partial=True``, with empty data when collect gave nothing: after a
+        timeout it is the output collected before SIGKILL. On a cancel after
+        the start handshake, ``job.on_partial`` gets the best output there is
+        (status CANCELLED), also when the tool had already exited and its
+        collect was still running. A command
         ``cwd`` that is not a directory in the workspace gives status ERROR
         and the command never starts. A declared output file that is missing,
         unsafe, or over ``max_output_bytes`` gives status ERROR with no files.

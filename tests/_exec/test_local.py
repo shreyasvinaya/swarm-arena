@@ -1,11 +1,16 @@
+import contextlib
+import io
 import json
+import logging
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Sequence
 from itertools import pairwise
 from pathlib import Path
 from traceback import format_exception
@@ -357,7 +362,8 @@ async def test_blocked_collect_cannot_stop_kill(
             out = await local_executor.submit(
                 blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2)
             )
-        assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
+        # Every stopped run is stamped partial=True, also when collect gave nothing (ruling K3).
+        assert (out.status, out.partial, out.data) == (RunStatus.TIMEOUT, True, {})
         assert wait_until(lambda: not pid_alive(int((tmp_path / "pid").read_text())), 5)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
@@ -575,7 +581,7 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     await cancel_when(lambda: local_executor.submit(job), collecting)
     [out] = got
     assert out.status is RunStatus.CANCELLED
-    assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
+    assert (out.partial, out.data) == (True, {"v": 7} if kept else {})
     assert out.started_at is not None
     assert out.ended_at is not None
     assert out.started_at <= out.ended_at
@@ -736,29 +742,75 @@ async def test_memory_gib_sets_the_address_space_limit(tmp_path: Path) -> None: 
 async def test_sparse_log_upload_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cap = 1 << 20  # L3
+    cap = 1 << 20  # L3, K4: every driver read path is counted while submit runs
     read: list[int] = []
-    pread = os.pread
-
-    def counting(fd: int, n: int, offset: int) -> bytes:
-        data = pread(fd, n, offset)
-        read.append(len(data))
-        return data
-
-    monkeypatch.setattr(os, "pread", counting)
     code = (
         WRITE.format("{'data': {}}") + "; import os; os.truncate('swarm/stdout.log', "
         f"{2 * cap}); f = open('swarm/stdout.log', 'r+b'); f.seek({2 * cap - 9}); "
         "f.write(b'TAIL-MARK'); f.close()"
     )
     ex = LocalExecutor(workspace_root=str(tmp_path / "ws"), max_log_bytes=cap)
-    out = await ex.submit(tool_job(tmp_path, code))
+    with count_reads(monkeypatch, read):
+        out = await ex.submit(tool_job(tmp_path, code))
+    total = sum(read)
     stdout = log(tmp_path, out, 1)
     assert len(stdout) == cap
     assert stdout.endswith(b"TAIL-MARK")
     note = f"log truncated: swarm/stdout.log: dropped the first {cap} bytes".encode()
     assert note in log(tmp_path, out, 2)
-    assert sum(read) < 2 * cap  # the driver never read the whole sparse file
+    assert cap <= total <= cap + 64 * 1024  # the tail and small files, never the whole 2x log
+
+
+class _CountingStream:
+    """Wrap a file object and record the size of everything read through it."""
+
+    def __init__(self, stream: Any, sink: list[int]) -> None:
+        self._stream = stream
+        self._sink = sink
+
+    def read(self, *args: Any) -> Any:
+        data = self._stream.read(*args)
+        self._sink.append(len(data))
+        return data
+
+    def __enter__(self) -> "_CountingStream":
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stream.__exit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+@contextlib.contextmanager
+def count_reads(monkeypatch: pytest.MonkeyPatch, sink: list[int]) -> Generator[None]:
+    """Count bytes read through os.read, os.pread, os.fdopen streams, and io.open streams."""
+    with monkeypatch.context() as patch:
+        real_read, real_pread, real_fdopen, real_open = os.read, os.pread, os.fdopen, io.open
+
+        def read(fd: int, n: int) -> bytes:
+            data = real_read(fd, n)
+            sink.append(len(data))
+            return data
+
+        def pread(fd: int, n: int, offset: int) -> bytes:
+            data = real_pread(fd, n, offset)
+            sink.append(len(data))
+            return data
+
+        def fdopen(*args: Any, **kw: Any) -> Any:
+            return _CountingStream(real_fdopen(*args, **kw), sink)
+
+        def open_(*args: Any, **kw: Any) -> Any:
+            return _CountingStream(real_open(*args, **kw), sink)
+
+        patch.setattr(os, "read", read)
+        patch.setattr(os, "pread", pread)
+        patch.setattr(os, "fdopen", fdopen)
+        patch.setattr(io, "open", open_)
+        yield
 
 
 async def test_stderr_tail_keeps_its_own_truncation_note(tmp_path: Path) -> None:  # L3
@@ -914,3 +966,175 @@ def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> 
     )
     assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
     assert time.monotonic() - started < 15  # the blocked collect thread would hold it for 30 s
+
+
+# --- Fix round 2 ---
+
+
+@pytest.fixture
+def wide_tree(tmp_path: Path) -> Iterator[Path]:
+    """Give a tree root that is removed in teardown, even when the test fails."""
+    top = tmp_path / "tree"
+    top.mkdir()
+    try:
+        yield top
+    finally:
+        if os.path.lexists(top):
+            remove_tree_flat(top)
+
+
+def test_fallback_remover_is_linear(
+    wide_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # K1, K2
+    n = 20_000
+    for i in range(n):
+        os.mkdir(wide_tree / f"d{i}")
+    (wide_tree / "d0" / "f").write_text("x")
+    (wide_tree / "d0").chmod(0o500)  # makes shutil.rmtree fail into this fallback
+    (wide_tree / "d1" / "g").write_text("y")
+    (wide_tree / "d1").chmod(0o000)  # can only be opened after an unlock
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("k")
+    outside.chmod(0o500)
+    (wide_tree / "d2" / "link").symlink_to(outside)  # must be unlinked, never followed
+    calls = {"listdir": 0, "stat": 0}
+    real_listdir, real_stat = os.listdir, os.stat
+    limit = 4 * (n + 10)  # a quadratic walk crosses this at once and fails fast
+
+    def listdir(path: Any) -> list[str]:
+        calls["listdir"] += 1
+        if calls["listdir"] > limit:
+            raise RuntimeError("listdir called too often")
+        return real_listdir(path)
+
+    def stat_(*args: Any, **kw: Any) -> os.stat_result:
+        calls["stat"] += 1
+        if calls["stat"] > limit:
+            raise RuntimeError("stat called too often")
+        return real_stat(*args, **kw)
+
+    try:
+        with pytest.raises(PermissionError):
+            shutil.rmtree(wide_tree / "d0")  # the reason the fallback runs at all
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "listdir", listdir)
+            patch.setattr(os, "stat", stat_)
+            started = time.monotonic()
+            local._remove_tree(wide_tree)
+            elapsed = time.monotonic() - started
+        assert not os.path.lexists(wide_tree)
+        assert calls["listdir"] <= n + 2  # each directory listed exactly once
+        assert calls["stat"] <= 2 * (n + 10)
+        assert elapsed < 20
+        assert (outside / "keep").read_text() == "k"
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o500
+    finally:
+        outside.chmod(0o700)
+
+
+def test_unlock_uses_a_no_follow_chmod_where_the_os_has_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # K2: macOS and the BSDs
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def chmod(*args: Any, **kw: Any) -> None:
+        calls.append((args, kw))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "chmod", chmod)
+        patch.setattr(os, "supports_follow_symlinks", {chmod})
+        patch.setattr(os, "supports_dir_fd", {chmod})
+        unlocked = local._unlock_directory(7, "d")
+    assert unlocked is True
+    assert calls == [(("d", 0o700), {"dir_fd": 7, "follow_symlinks": False})]
+
+
+def test_unlock_uses_o_path_and_proc_on_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:  # K2: Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) for directories
+    o_path = 0o10000000
+    opened: list[tuple[str, int, int | None]] = []
+    chmods: list[tuple[Any, ...]] = []
+    closed: list[int] = []
+
+    def open_(name: str, flags: int, dir_fd: int | None = None) -> int:
+        opened.append((name, flags, dir_fd))
+        return 99
+
+    def chmod(*args: Any, **kw: Any) -> None:
+        chmods.append(args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "supports_follow_symlinks", set())
+        patch.setattr(os, "O_PATH", o_path, raising=False)
+        patch.setattr(local, "_PROC_FD", str(tmp_path))  # stands in for /proc/self/fd
+        patch.setattr(os, "open", open_)
+        patch.setattr(os, "chmod", chmod)
+        patch.setattr(os, "close", closed.append)
+        unlocked = local._unlock_directory(7, "d")
+    assert unlocked is True
+    assert opened == [("d", o_path | os.O_NOFOLLOW | os.O_DIRECTORY, 7)]
+    assert chmods == [(f"{tmp_path}/99", 0o700)]
+    assert closed == [99]
+
+
+def test_unlock_without_a_safe_method_skips_and_logs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:  # K2: never fall back to a chmod that follows links
+    chmods: list[tuple[Any, ...]] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "supports_follow_symlinks", set())
+        patch.delattr(os, "O_PATH", raising=False)
+        patch.setattr(os, "chmod", lambda *args, **kw: chmods.append(args))
+        with caplog.at_level(logging.WARNING):
+            unlocked = local._unlock_directory(7, "d")
+    assert unlocked is False
+    assert chmods == []
+    assert "cannot unlock a locked directory without following symlinks: d" in caplog.text
+
+
+def _not_a_tool_output(kind: str) -> Any:
+    if kind == "dict":
+        return {"status": "ok"}
+    if kind == "none":
+        return None
+    if kind == "construct":  # skips validation, so a NaN gets past the finite-JSON rule
+        return ToolOutput.model_construct(status=RunStatus.OK, data={"x": float("nan")})
+    return ToolOutput(status=RunStatus.OK).model_copy(update={"data": {"x": float("inf")}})
+
+
+@pytest.mark.parametrize("kind", ["dict", "none", "construct", "copy"])
+@pytest.mark.parametrize("path", ["exit", "timeout", "cancel"])
+async def test_collect_must_return_a_valid_tool_output(
+    local_executor: LocalExecutor,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    path: str,
+) -> None:  # K3
+    monkeypatch.setattr(
+        OkCollectTool, "collect", lambda self, request, workspace, run: _not_a_tool_output(kind)
+    )
+    if path == "cancel":
+        got: list[ToolOutput] = []
+
+        async def on_partial(o: ToolOutput) -> None:
+            got.append(o)
+
+        code = "open('ready', 'w'); import time; time.sleep(60)"
+        job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
+        await cancel_when(lambda: local_executor.submit(job), ready_file(tmp_path / "ws"))
+        [out] = got
+        expected = (RunStatus.CANCELLED, True)
+    elif path == "timeout":
+        code = "import time; time.sleep(60)"
+        job = tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=0.5, grace_s=0.2)
+        out = await local_executor.submit(job)
+        expected = (RunStatus.TIMEOUT, True)
+    else:
+        out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=OkCollectTool))
+        expected = (RunStatus.ERROR, False)
+    assert (out.status, out.partial, out.data, out.files) == (*expected, {}, [])
+    assert b"collect failed: Tool.collect() did not return a ToolOutput" in log(tmp_path, out, 2)
+    assert out.started_at is not None
