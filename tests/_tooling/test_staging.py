@@ -317,3 +317,28 @@ def test_script_stage_output_wins_and_keeps_effective_and_own_files_separate() -
     assert st.candidate is not None
     assert st.candidate.files == {"p/a.txt": H3}
     assert st.root == {"judge/score.py": H1}
+
+
+@pytest.mark.parametrize("operation", ["import", "serialize", "canonical"])
+def test_identity_errors_suppress_secret_exception_chains(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from traceback import format_exception
+    from typing import Never
+
+    import swarm_arena._tooling.staging as staging
+
+    secret = "identity-secret-sentinel"
+
+    def fail(*args: Any, **kwargs: Any) -> Never:
+        raise ValueError(secret)
+
+    if operation == "import":
+        monkeypatch.setattr(Ref, "load", fail)
+    elif operation == "serialize":
+        monkeypatch.setattr(PyTool.Config, "model_dump", fail)
+    else:
+        monkeypatch.setattr(staging, "canonical_json", fail)
+    with pytest.raises(ValueError, match="cannot") as exc:
+        tool_identity(Ref(path="_fakes.tools:PyTool", config={"code": secret}), None)
+    assert secret not in "".join(format_exception(exc.value))

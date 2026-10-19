@@ -288,3 +288,39 @@ def test_metadata_errors_do_not_disclose_values(tmp_path: Path, artifacts: Artif
         materialize(Job.Stage(parents=[parent]), tmp_path / "ws", artifacts)
     assert secret not in "".join(traceback.format_exception(exc.value))
     assert not (tmp_path / "ws").exists()
+
+
+def test_collection_storage_errors_suppress_secret_exception_chains(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traceback import format_exception
+
+    secret = "storage-secret-sentinel"
+    (tmp_path / "a.txt").write_text(secret)
+
+    def fail(data: bytes) -> Never:
+        raise ValueError(secret)
+
+    monkeypatch.setattr(artifacts, "put_bytes", fail)
+    with pytest.raises(ValueError, match=r"cannot store output path: a\.txt") as exc:
+        collect_output_files(tmp_path, ["a.txt"], artifacts)
+    assert secret not in "".join(format_exception(exc.value))
+
+
+def test_materialize_write_errors_suppress_secret_exception_chains(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traceback import format_exception
+    from typing import Any
+
+    secret = "write-secret-sentinel"
+    digest = artifacts.put_bytes(secret.encode())
+
+    def fail(*args: Any, **kwargs: Any) -> Never:
+        raise OSError(secret)
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(ValueError, match=r"cannot write workspace path: a\.txt") as exc:
+        materialize(Job.Stage(root={"a.txt": digest}), tmp_path / "ws", artifacts)
+    assert secret not in "".join(format_exception(exc.value))
+    assert list((tmp_path / "ws").iterdir()) == [tmp_path / "ws/swarm"]
