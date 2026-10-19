@@ -86,30 +86,34 @@ def test_build_config_error_omits_input_values() -> None:
 
 
 @pytest.mark.parametrize(
-    ("annotation", "credentials"),
+    ("annotation", "credentials", "location"),
     [
-        (dict[str, int], {"review-only-secret-sentinel": "invalid"}),
+        (dict[str, int], {"review-only-secret-sentinel": "invalid"}, "credentials.<…>"),
         (
             dict[str, dict[str, int]],
             {"outer": {"review-only-secret-sentinel": "invalid"}},
+            "credentials.<…>.<…>",
         ),
-        (list[int], ["review-only-secret-sentinel"]),
-        (dict[int, int], {739201: "review-only-secret-sentinel"}),
+        (list[int], ["review-only-secret-sentinel"], "credentials.0"),
+        (dict[int, int], {739201: "review-only-secret-sentinel"}, "credentials.<…>"),
         (
             list[dict[str, int]],
             [{"review-only-secret-sentinel": "invalid"}],
+            "credentials.0.<…>",
         ),
         (
             dict[str, list[int]],
             {"review-only-secret-sentinel": ["invalid"]},
+            "credentials.<…>.0",
         ),
-        (dict[str, int], {"size": "review-only-secret-sentinel"}),
+        (dict[str, int], {"size": "review-only-secret-sentinel"}, "credentials.<…>"),
     ],
 )
 def test_build_config_error_redacts_data_locations(
     monkeypatch: pytest.MonkeyPatch,
     annotation: Any,
     credentials: object,
+    location: str,
 ) -> None:
     config_model = create_model("Config", __base__=Widget.Config, credentials=(annotation, ...))
     monkeypatch.setattr(Widget, "Config", config_model)
@@ -121,7 +125,7 @@ def test_build_config_error_redacts_data_locations(
         assert secret not in diagnostic
         assert "739201" not in diagnostic
         assert "credentials" in diagnostic
-    assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>: int_parsing"
+    assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
     assert exc.value.__suppress_context__
 
 
@@ -141,7 +145,7 @@ def test_build_config_error_redacts_unknown_field_names() -> None:
         "count",
         AliasChoices("total", "count"),
         AliasPath("counts", 0),
-        "review-only-secret-sentinel",
+        "declared_count",
     ],
 )
 def test_build_config_error_redacts_nested_schema_locations(
@@ -166,7 +170,12 @@ def test_build_config_error_redacts_nested_schema_locations(
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
         assert secret not in diagnostic
         assert "credentials" in diagnostic
-    assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>: int_parsing"
+    location = (
+        "counts.0"
+        if isinstance(alias, AliasPath)
+        else (alias if isinstance(alias, str) else "count")
+    )
+    assert str(exc.value) == f"_fakes.tools:Widget: credentials.0.{location}: int_parsing"
 
 
 @pytest.mark.parametrize("container", ["model", "mapping", "root", "annotated"])
@@ -196,7 +205,13 @@ def test_build_config_error_redacts_nested_models(
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
         assert secret not in diagnostic
         assert "credentials" in diagnostic
-    assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>: int_parsing"
+    location = {
+        "model": "count",
+        "mapping": "<…>.count",
+        "root": "0.count",
+        "annotated": "0.count",
+    }[container]
+    assert str(exc.value) == f"_fakes.tools:Widget: credentials.{location}: int_parsing"
 
 
 def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -222,7 +237,7 @@ def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) 
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
         assert secret not in diagnostic
         assert "credentials" in diagnostic
-    assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>: int_parsing"
+    assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>.amount: int_parsing"
 
 
 @pytest.mark.parametrize("value", ["invalid", "review-only-secret-sentinel"])
@@ -264,7 +279,7 @@ def test_build_config_error_preserves_top_level_alias(
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
         assert secret not in diagnostic
         assert "items" in diagnostic
-    location = "items.<…>" if isinstance(alias, AliasPath) else "items"
+    location = "items.0" if isinstance(alias, AliasPath) else "items"
     assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
 
 
@@ -295,7 +310,7 @@ def test_build_config_error_redacts_model_level_error(monkeypatch: pytest.Monkey
 
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
         assert secret not in diagnostic
-    assert str(exc.value) == "_fakes.tools:Widget: <field>: value_error"
+    assert str(exc.value) == "_fakes.tools:Widget: value_error"
     assert exc.value.__suppress_context__
 
 

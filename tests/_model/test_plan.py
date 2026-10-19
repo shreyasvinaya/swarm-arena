@@ -202,9 +202,12 @@ def test_structure_rules() -> None:
         ({"agents": [AGENT, AGENT]}, "duplicate agent"),
         ({"name": "t"}, "duplicate team"),
         ({"part": "missing"}, "unknown part"),
-        ({"rationale": "  "}, "converge"),
-        ({"agents": [AGENT.model_dump() | {"rationale": "  "}]}, "converge"),
-        ({"name": "a/b"}, "converge"),
+        ({"rationale": "  "}, r"converge\.team\.rationale"),
+        (
+            {"agents": [AGENT.model_dump() | {"rationale": "  "}]},
+            r"converge\.team\.agents\.0\.rationale",
+        ),
+        ({"name": "a/b"}, r"converge\.team\.name"),
     ],
 )
 def test_converge_team_structure(mode: str, updates: dict[str, Any], message: str) -> None:
@@ -328,7 +331,7 @@ def test_validation_locations_keep_only_schema_fields(tmp_path: Path) -> None:
     text = SPEC_TOML.replace(
         "[teams.agents.tool]", "[teams.agents.resources.custom]\ncpus = -1\n[teams.agents.tool]"
     )
-    with pytest.raises(ConfigError, match=r"teams\.<…>"):
+    with pytest.raises(ConfigError, match=r"teams\.0\.agents\.0\.resources\.custom\.<…>"):
         Plan.loads(text, base_dir=tmp_path)
 
 
@@ -356,9 +359,9 @@ def test_ranking_resolution_errors_do_not_leak_values(monkeypatch: pytest.Monkey
     ("table", "key", "location"),
     [
         ("", "teamz", "teamz"),
-        ("teams", "agentz", "teams.<…>"),
-        ("teams.agents", "replicatez", "teams.<…>"),
-        ("teams.agents.resources", "cpuz", "teams.<…>"),
+        ("teams", "agentz", "teams.0.agentz"),
+        ("teams.agents", "replicatez", "teams.0.agents.0.replicatez"),
+        ("teams.agents.resources", "cpuz", "teams.0.agents.0.resources.cpuz"),
     ],
 )
 def test_unknown_plan_fields_show_identifiers_without_values(

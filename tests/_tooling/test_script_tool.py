@@ -532,7 +532,7 @@ def test_config_sanitizer_preserves_aliases(alias: str | AliasChoices | AliasPat
     data = {"command": ["x"], "count": [SECRET] if isinstance(alias, AliasPath) else SECRET}
     with pytest.raises(ValidationError) as caught:
         AliasedConfig.model_validate(data)
-    expected = ("count", "<…>") if isinstance(alias, AliasPath) else ("count",)
+    expected = ("count", 0) if isinstance(alias, AliasPath) else ("count",)
     assert caught.value.errors()[0]["loc"] == expected
     _assert_secret_safe(caught.value, SECRET)
 

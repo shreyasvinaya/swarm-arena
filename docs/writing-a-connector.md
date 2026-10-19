@@ -28,6 +28,7 @@ tests/
 ## A tool
 
 A tool says **what** to run. The executor decides **where** it runs.
+The data returned by `collect` must be finite JSON; `LocalExecutor` reports a violation as status `ERROR`.
 
 ```python
 # my_connector/tools.py

@@ -113,7 +113,7 @@ def test_ok_with_valid_result(tmp_path: Path) -> None:
         (None, "swarm/result.json is missing"),
         ("{nope", "not valid JSON"),
         ('{"data": [1]}', "data"),
-        ('{"data": {}, "usgae": {}}', "<key>"),
+        ('{"data": {}, "usgae": {}}', "<field>"),
         ('{"schema_version": 2, "data": {}}', "newer"),
         ('{"data": {}, "files": ["swarm/x"]}', "reserved"),
         ('{"data": {}, "files": ["out/none.txt"]}', "out/none.txt"),

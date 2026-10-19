@@ -106,17 +106,17 @@ def test_run_config_rejects_invalid_fields(data: dict[str, Any]) -> None:
     ("table", "key", "defaults", "location"),
     [
         ("", "settle_timout_s", {}, "settle_timout_s"),
-        ("limits", "max_teamz", {}, "limits.<…>"),
-        ("secrets", "alow", {}, "secrets.<…>"),
-        ("tracing", "store_paylods", {}, "tracing.<…>"),
+        ("limits", "max_teamz", {}, "limits.max_teamz"),
+        ("secrets", "alow", {}, "secrets.alow"),
+        ("tracing", "store_paylods", {}, "tracing.store_paylods"),
         (
             "llm_gateway",
             "request_timout_s",
             {"url": "https://gateway.example"},
-            "llm_gateway.<…>",
+            "llm_gateway.request_timout_s",
         ),
-        ("cache", "ttl_sec", {"backend": "disk"}, "cache.<…>"),
-        ("cache.roles.judge", "reed", {"read": True, "write": True}, "cache.<…>"),
+        ("cache", "ttl_sec", {"backend": "disk"}, "cache.ttl_sec"),
+        ("cache.roles.judge", "reed", {"read": True, "write": True}, "cache.roles.<…>.reed"),
     ],
 )
 def test_unknown_run_config_fields_show_identifiers_without_values(

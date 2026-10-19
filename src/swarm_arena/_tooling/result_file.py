@@ -218,21 +218,12 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
 
 
 def _validation_reason(exc: ValidationError) -> str:
-    """Keep schema field names and list indices; redact dynamic locations."""
-    reasons: list[str] = []
-    for error in exc.errors(include_input=False, include_url=False, include_context=False):
-        loc = error["loc"]
-        safe: list[str] = []
-        for index, segment in enumerate(loc):
-            if isinstance(segment, int):
-                safe.append(str(segment))
-            elif (index == 0 and segment in ToolResultFile.model_fields) or (
-                index == 1 and loc[0] == "usage" and segment in Usage.model_fields
-            ):
-                safe.append(segment)
-            else:
-                safe.append("<key>")
-        reasons.append(f"{'.'.join(safe) or 'schema_version'}: {error['type']}")
+    """Format locations already sanitized by the shared model boundary."""
+    reasons = [
+        (".".join(str(part) for part in error["loc"]) + ": " if error["loc"] else "")
+        + error["type"]
+        for error in exc.errors(include_input=False, include_url=False, include_context=False)
+    ]
     return f"{_RESULT}: " + "; ".join(reasons)
 
 

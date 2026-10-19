@@ -335,7 +335,8 @@ class ToolOutput(FrozenModel):
     partial : bool, default=False
         Whether the output is an incomplete result.
     data : dict[str, Any], default={}
-        Structured result data.
+        Structured result data containing only finite JSON; NaN, infinity,
+        circular structures and non-serializable objects are rejected.
     files : list[FileRef], default=[]
         Collected output artifacts.
     usage : Usage, default=Usage()
@@ -349,11 +350,18 @@ class ToolOutput(FrozenModel):
     failed_provider : str or None, default=None
         Failed provider name; None leaves the provider unspecified.
 
+    Raises
+    ------
+    ValidationError
+        If ``data`` cannot be encoded as finite JSON, or another field is invalid.
+
     Examples
     --------
     >>> from swarm_arena.tool import RunStatus, ToolOutput
     >>> ToolOutput(status=RunStatus.OK).partial
     False
+    >>> ToolOutput(status=RunStatus.OK, data={"count": 2}).data
+    {'count': 2}
     """
 
     status: RunStatus

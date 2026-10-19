@@ -76,6 +76,10 @@ class Job:
         """
         Describe workspace contents computed in the driver.
 
+        Validation keeps schema field names, aliases and list/tuple indices;
+        unknown model keys become ``<field>`` and dynamic data segments ``<…>``.
+        Stage owns this hidden-key policy throughout its validated tree.
+
         Parameters
         ----------
         root : dict[str, str], optional

@@ -31,12 +31,13 @@ Callbacks are local control hooks and must be omitted from serialized payloads.
 as are both callbacks. Secret values must never be journaled or logged.
 
 Validation errors from `Job.Stage`, `Job.CandidateFiles`, and `Job.Started`
-hide rejected values and unknown or dynamic keys, including nested locations.
-Declared field names and list indices remain visible. For example, an unknown
-field in a staged candidate is reported at `candidate.<key>`. The typo diagnostics
-used for human-authored Plan and Limits settings do not apply to these runtime
-records. Component configuration validation retains its separate rule: only
-declared top-level field names or aliases are shown, with deeper locations redacted.
+share the component-configuration rule: keep schema field names, aliases and
+list/tuple indices, hide unknown model keys as `<field>`, and replace each
+free-form mapping or `Any` segment with `<…>`. For example, an unknown field in
+a staged candidate is reported at `candidate.<field>`, and in a parent at
+`parents.0.<field>`. The outermost validated model owns the unknown-key policy
+for its whole tree; human-authored Plan, RunConfig and Limits settings show
+nested typo identifiers. Rejected values and validator context never appear.
 
 ## LocalExecutor
 

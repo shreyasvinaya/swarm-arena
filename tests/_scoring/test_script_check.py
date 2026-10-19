@@ -202,3 +202,19 @@ async def test_resources_pass_through() -> None:
 @pytest.mark.parametrize("model", [_CheckResultFile, _JudgeResultFile])
 def test_result_models_disallow_nonfinite_numbers(model: Any) -> None:
     assert model.model_config.get("allow_inf_nan") is False
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), object()])
+async def test_construct_bypass_still_rejects_non_json_details(bad: Any) -> None:
+    class BypassedExecutor(RecordingExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            return ToolOutput.model_construct(
+                status=RunStatus.OK, data={"passed": True, "details": {SECRET: [bad]}}
+            )
+
+    context = CheckContext(goal=GOAL, executor=BypassedExecutor(), artifact_root="/unused")
+    result = await ScriptCheck(command=["example"]).check(cand(), context)
+    assert result.passed is False
+    assert result.details == {}
+    assert result.reasons == ["invalid check result: details: value_error"]
+    assert SECRET not in result.model_dump_json()

@@ -209,7 +209,7 @@ def test_executor_requires_all_abstract_operations() -> None:
         (
             Job.Stage,
             {"candidate": {"request": {}, "output": {}, "files": {}, "sentinel-secret": 1}},
-            ("candidate", "<…>"),
+            ("candidate", "<field>"),
         ),
         (
             Job.Stage,
@@ -218,7 +218,7 @@ def test_executor_requires_all_abstract_operations() -> None:
                     {"candidate_id": "c", "run_id": "r", "tool_identity": "t", "sentinel-secret": 1}
                 ]
             },
-            ("parents", "<…>"),
+            ("parents", 0, "<field>"),
         ),
     ],
 )

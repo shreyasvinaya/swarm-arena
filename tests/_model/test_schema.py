@@ -441,11 +441,17 @@ def test_reserved_names_follow_generated_model_config(
     monkeypatch.setattr(
         BaseModel, "model_config", {**BaseModel.model_config, "protected_namespaces": (namespace,)}
     )
-    with pytest.raises(_SchemaError, match=r"^P\.custom_name: invalid property name$"):
-        compile_object_schema("P", {"custom_name": {"type": "string"}})
-    model = compile_object_schema("P", {"model_dump_custom": {"type": "integer"}})
-    assert model.model_validate({"model_dump_custom": 1}).model_dump() == {"model_dump_custom": 1}
-    assert model.model_config["protected_namespaces"] == (namespace,)
+    model = compile_object_schema(
+        "P", {"custom_name": {"type": "integer"}, "model_name": {"type": "integer"}}
+    )
+    assert model.model_validate({"custom_name": 1, "model_name": 2}).model_dump() == {
+        "custom_name": 1,
+        "model_name": 2,
+    }
+    assert model.model_config["protected_namespaces"] == ("model_validate", "model_dump")
+    for prop in ("model_validate_custom", "model_dump_custom"):
+        with pytest.raises(_SchemaError, match=rf"^P\.{prop}: invalid property name$"):
+            compile_object_schema("P", {prop: {"type": "integer"}})
 
 
 @pytest.mark.parametrize("nested", [False, True])

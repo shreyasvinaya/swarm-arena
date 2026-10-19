@@ -13,7 +13,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from swarm_arena._model.base import _HUMAN_ONLY_REASONS, CatalogKind, LLMRole, _SafeModel
+from swarm_arena._model.base import CatalogKind, LLMRole, _SafeModel
 from swarm_arena._model.goal import _Slug
 from swarm_arena._model.ref import Ref, load_object
 from swarm_arena._model.schema import compile_object_schema
@@ -307,12 +307,10 @@ class PlannerCatalog(_ConfigModel):
                 ) from None
             for key in entry.settable:
                 if key in human_only:
-                    # Keep built-in field identifiers as fixed diagnostics. Arbitrary
-                    # component field names need no interpolation into an error.
-                    reason = _HUMAN_ONLY_REASONS.get(key, "human-only field cannot be settable")
                     raise PydanticCustomError(
                         "arena_config",
-                        reason,
+                        "catalog entry '{entry}': human-only field '{field}' cannot be settable",
+                        {"entry": entry.name, "field": key},
                     )
         return self
 

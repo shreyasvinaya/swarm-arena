@@ -15,8 +15,9 @@ from pydantic import (
     WrapValidator,
     create_model,
 )
-from pydantic._internal._config import ConfigWrapper
 from pydantic.fields import FieldInfo
+
+from swarm_arena._model.base import _SafeModel
 
 _BOUNDS = {
     "minimum": "ge",
@@ -202,10 +203,11 @@ def compile_object_schema(
     >>> Named(model_name="small").model_dump()
     {'model_name': 'small'}
     """
-    config = ConfigDict(**BaseModel.model_config)
-    config.update(extra="forbid", strict=True, frozen=True)
-    # model_config omits unset defaults; use pydantic's own effective config.
-    protected_namespaces = ConfigWrapper(config).protected_namespaces
+    config = ConfigDict(
+        strict=True,
+        protected_namespaces=("model_validate", "model_dump"),
+    )
+    protected_namespaces = config["protected_namespaces"]
     fields: dict[str, Any] = {}
     for prop, schema in properties.items():
         if (
@@ -221,4 +223,4 @@ def compile_object_schema(
         ):
             raise _SchemaError(f"{name}.{prop}: invalid property name")
         fields[prop] = _compile_field(f"{name}.{prop}", schema)
-    return create_model(name, __config__=config, **fields)
+    return create_model(name, __base__=_SafeModel, __config__=config, **fields)

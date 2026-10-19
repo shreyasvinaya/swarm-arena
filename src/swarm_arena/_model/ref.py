@@ -13,14 +13,10 @@ from pydantic import (
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import (
-    _VALIDATION_ERROR_TYPES,
     FrozenModel,
     _SafeModel,
     _sanitize_validation_error,
 )
-
-# Compatibility for the parallel FunctionTool fix; the allowlist lives only in base.py.
-_CONFIG_ERROR_TYPES = _VALIDATION_ERROR_TYPES
 
 
 class EmptyConfig(_SafeModel):
@@ -334,10 +330,10 @@ class Ref(FrozenModel):
             If importing fails or configuration validation raises ConfigError.
             ConfigError reports the component path, field locations, and error
             types, omitting input values and validator messages or context.
-            Locations show only a declared top-level field name or alias,
-            or ``<field>`` when unrecognized. All deeper segments are replaced
-            together by a single ``<…>`` marker. Only built-in Pydantic error
-            types are shown; custom types and other exceptions become ``invalid``.
+            Locations keep schema field names, aliases and list/tuple indices.
+            Unknown model keys become ``<field>`` and free-form mapping or Any
+            segments become ``<…>``. Only built-in Pydantic error types are shown;
+            custom types and other exceptions become ``invalid`` in this summary.
 
         Examples
         --------

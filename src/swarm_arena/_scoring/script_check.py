@@ -2,9 +2,10 @@
 
 from typing import Annotated, Any, ClassVar, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from swarm_arena._model.base import _sanitize_validation_error
+from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
@@ -15,13 +16,44 @@ from swarm_arena._tooling.script_tool import script_command
 
 
 class _CheckResultFile(_ConfigInputModel):
-    """Validate check output strictly without exposing rejected values."""
+    """
+    Validate check output strictly without exposing rejected values.
+
+    Parameters
+    ----------
+    passed : bool
+        Whether the check passed.
+    reasons : list[str], default=[]
+        Feedback explaining the result.
+    details : dict[str, Any], default={}
+        Finite JSON details; non-finite or non-serializable values are rejected.
+
+    Raises
+    ------
+    ValidationError
+        If fields have invalid types or details are not finite JSON.
+
+    Examples
+    --------
+    >>> _CheckResultFile(passed=True, details={"count": 2}).details
+    {'count': 2}
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True, allow_inf_nan=False)
 
     passed: bool
     reasons: list[str] = []
     details: dict[str, Any] = {}
+
+    @field_validator("details")
+    @classmethod
+    def _finite_details(cls, details: dict[str, Any]) -> dict[str, Any]:
+        """Require finite JSON details without echoing values or dynamic keys."""
+        try:
+            canonical_json(details)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise ValueError("details must be finite JSON") from None
+        return details
 
 
 def _preflight_files(name: str, files: FileSet) -> None:

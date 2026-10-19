@@ -3,6 +3,7 @@
 import ast
 import importlib
 import json
+import pkgutil
 import traceback
 from pathlib import Path
 from typing import Any, LiteralString, Self, cast
@@ -12,6 +13,7 @@ from _fakes.tools import GOAL
 from pydantic import AliasChoices, AliasPath, BaseModel, Field, ValidationError, model_validator
 from pydantic_core import PydanticCustomError
 
+import swarm_arena
 from swarm_arena._errors import ConfigError
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.base import _SafeModel, _sanitize_validation_error
@@ -21,7 +23,10 @@ from swarm_arena._model.plan import Plan
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.results import CheckResult
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._model.schema import compile_object_schema
 from swarm_arena._model.settings import TracingConfig
+from swarm_arena._tooling.function_tool import function_input_model
+from swarm_arena._tooling.script_tool import ScriptTool
 
 # Captured at b4ed078 before any source changes. Keep historical text reviewable.
 BASELINE_TEXT = {
@@ -75,11 +80,8 @@ def test_ref_build_text_snapshot() -> None:
     assert str(caught.value) == BASELINE_TEXT["Ref.build"]
 
 
-# Static inventory found by grep, checked by AST to avoid silently missing future classes.
-# Parallel agents own these direct BaseModel users; editing their files is forbidden.
-EXTERNAL_MODELS = {
-    ("_exec.local", "LocalExecutor.Config"),
-}
+# Cross-check source declarations with imported runtime classes and dynamic factories.
+EXTERNAL_MODELS: set[tuple[str, str]] = set()
 
 
 def _source_models() -> list[tuple[str, str]]:
@@ -123,7 +125,7 @@ def _model_classes() -> list[type[BaseModel]]:
         for part in name.split("."):
             value = getattr(value, part)
         found.append(value)
-    # The catalog factory is in scope. The bare schema compiler is externally owned.
+    # Exercise each dynamic factory as well as source declarations.
     found.append(
         CatalogEntry(
             name="x",
@@ -133,6 +135,35 @@ def _model_classes() -> list[type[BaseModel]]:
             settable={"count": {"type": "integer"}},
         ).settable_model()
     )
+    found.extend(
+        [
+            compile_object_schema("InventoryParams", {"count": {"type": "integer"}}),
+            ScriptTool(command=["x"], params={"count": {"type": "integer"}}).get_input_model(),
+            function_input_model(_inventory_function),
+        ]
+    )
+    for module in pkgutil.walk_packages(swarm_arena.__path__, "swarm_arena."):
+        importlib.import_module(module.name)
+    found.extend(_runtime_models())
+    return list(dict.fromkeys(found))
+
+
+def _inventory_function(count: int) -> int:
+    return count
+
+
+def _runtime_models() -> set[type[BaseModel]]:
+    found: set[type[BaseModel]] = set()
+    pending = list(BaseModel.__subclasses__())
+    seen: set[type[BaseModel]] = set()
+    while pending:
+        model = pending.pop()
+        if model in seen:
+            continue
+        seen.add(model)
+        pending.extend(model.__subclasses__())
+        if model.__module__ == "swarm_arena" or model.__module__.startswith("swarm_arena."):
+            found.add(model)
     return found
 
 
@@ -158,7 +189,9 @@ SHOW_MODELS = {
 
 
 def test_source_inventory_has_explicit_ownership() -> None:
-    assert set(_source_models()) >= EXTERNAL_MODELS
+    assert not EXTERNAL_MODELS
+    assert all(model in MODELS or issubclass(model, _SafeModel) for model in _runtime_models())
+    assert len(MODELS) >= len(_source_models())
     assert all(issubclass(model, _SafeModel) for model in MODELS)
 
 
@@ -210,7 +243,12 @@ def test_every_model_rejects_secret_safely(model: type[BaseModel], surface: str)
         except ValidationError as error:
             _assert_secret_absent(error, secret)
         else:
+            assert isinstance(accepted, BaseModel)
             assert secret not in repr(accepted)
+            assert secret not in repr(accepted.model_dump())
+            assert secret not in repr(accepted.__dict__)
+            assert secret not in repr(accepted.__pydantic_extra__)
+            assert secret not in repr(accepted.__pydantic_private__)
         return
     with pytest.raises(ValidationError) as caught:
         _validate_bad_input(model, surface, secret)
@@ -273,6 +311,8 @@ def test_subclass_after_validator_is_inside_shared_boundary(kind: str, entry: st
         "type-error": "invalid",
     }[kind]
     assert caught.value.errors()[0]["type"] == expected_code
+    if kind == "type-error":
+        assert caught.value.errors()[0]["msg"] == "invalid: TypeError"
 
 
 @pytest.mark.parametrize(
@@ -287,7 +327,7 @@ def test_shared_location_handles_aliases(alias: str | AliasChoices | AliasPath) 
     with pytest.raises(ValidationError) as caught:
         Aliased.model_validate(data)
     _assert_secret_absent(caught.value, secret)
-    expected = ("items", "<…>") if isinstance(alias, AliasPath) else ("amount",)
+    expected = ("items", 0) if isinstance(alias, AliasPath) else ("amount",)
     assert caught.value.errors()[0]["loc"] == expected
 
 
@@ -320,4 +360,4 @@ def test_root_catalog_redacts_data_keys_colliding_with_schema_names() -> None:
         ModelCatalog.model_validate({secret: {"model": secret}, "root": {"model": secret}})
     _assert_secret_absent(caught.value, secret)
     # RootModel.root is a serialization field, not an input mapping key identifier.
-    assert all(item["loc"][0] == "<field>" for item in caught.value.errors())
+    assert all(item["loc"][0] == "<…>" for item in caught.value.errors())

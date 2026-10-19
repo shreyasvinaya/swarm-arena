@@ -241,10 +241,23 @@ def test_result_errors_never_expose_values(
 def test_result_error_locations_keep_schema_fields_only() -> None:
     from swarm_arena._model.base import _safe_location
 
-    assert _safe_location(Candidate, ("output", "usage", "input_tokens")) == ("output", "<…>")
-    assert _safe_location(Candidate, ("checks", 0, "details", "passed")) == ("checks", "<…>")
-    assert _safe_location(Candidate, ("overlay", 123456789, "[key]")) == ("overlay", "<…>")
-    assert _safe_location(Candidate, ("request", "inputs", "SENTINEL_SECRET")) == ("request", "<…>")
+    assert _safe_location(Candidate, ("output", "usage", "input_tokens")) == (
+        "output",
+        "usage",
+        "input_tokens",
+    )
+    assert _safe_location(Candidate, ("checks", 0, "details", "passed")) == (
+        "checks",
+        0,
+        "details",
+        "<…>",
+    )
+    assert _safe_location(Candidate, ("overlay", 123456789, "[key]")) == ("overlay", "<…>", "<…>")
+    assert _safe_location(Candidate, ("request", "inputs", "SENTINEL_SECRET")) == (
+        "request",
+        "inputs",
+        "<…>",
+    )
 
 
 def test_stored_results_reject_newer_schema_and_unknown_fields() -> None:
