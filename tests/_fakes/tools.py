@@ -439,6 +439,7 @@ async def _no_action(context: Any, inputs: PyInputs) -> int:
 
 
 _ACTION = Action(name="same", description="An action.", input_model=PyInputs, handler=_no_action)
+FAILING_COMMAND = "import sys; sys.stderr.write('COMMAND-DIAG'); sys.exit(2)"
 
 
 class BrokenTool(Tool):
@@ -478,7 +479,11 @@ class BrokenTool(Tool):
         return output
 
     def get_input_model(self) -> type[BaseModel]:
-        return cast(Any, dict) if self._breaks("get_input_model") else super().get_input_model()
+        if self._breaks("get_input_model"):
+            return cast(Any, dict)
+        if self._breaks("get_input_model_instance"):  # a model, not a model class
+            return cast(Any, PyInputs())
+        return super().get_input_model()
 
     def get_description(self) -> str:
         return cast(Any, None) if self._breaks("get_description") else super().get_description()
@@ -493,7 +498,11 @@ class BrokenTool(Tool):
         return super().editable()
 
     def providers(self) -> frozenset[str]:
-        return cast(Any, {"openai"}) if self._breaks("providers") else super().providers()
+        if self._breaks("providers"):
+            return cast(Any, {"openai"})
+        if self._breaks("providers_items"):
+            return cast(Any, frozenset({1}))
+        return super().providers()
 
     def extra_actions(self) -> Sequence[Action[Any]]:
         if self._breaks("extra_actions"):
@@ -507,6 +516,8 @@ class BrokenTool(Tool):
             return secrets.token_hex(8)
         if self._breaks("fingerprint_run"):  # includes logs_ref and the run times
             return hashlib.sha256(output.model_dump_json().encode()).hexdigest()
+        if self._breaks("fingerprint_type"):
+            return cast(Any, 123)
         return super().fingerprint(output)
 
     def is_deterministic(self, request: ToolRequest) -> bool:
@@ -550,6 +561,10 @@ class BrokenJudge(Judge):
             return secrets.token_hex(32)
         if mode == "rubric_per_instance":  # stable for one object, new for a second build
             return f"{id(self):x}"
+        if mode == "rubric_drifts":  # the first call of each object agrees, later calls drift
+            calls = vars(self).setdefault("calls", [])
+            calls.append(None)
+            return f"rubric-{len(calls)}"
         if mode == "rubric_type":
             return cast(Any, 123)
         if mode == "rubric_empty":
@@ -557,16 +572,30 @@ class BrokenJudge(Judge):
         return super().rubric_hash()
 
     def panel_hash(self) -> str:
-        return cast(Any, None) if self.config.mode == "panel_type" else super().panel_hash()
+        if self.config.mode == "panel_type":
+            return cast(Any, None)
+        if self.config.mode == "panel_unstable":
+            return secrets.token_hex(8)
+        return super().panel_hash()
 
     def anchor_count(self) -> int:
-        return cast(Any, True) if self.config.mode == "anchor_count" else super().anchor_count()
+        if self.config.mode == "anchor_count":
+            return cast(Any, True)
+        return -1 if self.config.mode == "anchor_negative" else super().anchor_count()
 
     def providers(self) -> frozenset[str]:
-        return cast(Any, ["openai"]) if self.config.mode == "providers" else super().providers()
+        if self.config.mode == "providers":
+            return cast(Any, ["openai"])
+        if self.config.mode == "providers_items":
+            return cast(Any, frozenset({1}))
+        return super().providers()
 
     def models(self) -> tuple[str, ...]:
-        return cast(Any, "gpt") if self.config.mode == "models" else super().models()
+        if self.config.mode == "models":
+            return cast(Any, "gpt")
+        if self.config.mode == "models_list":
+            return cast(Any, ["gpt"])
+        return super().models()
 
     async def judge(
         self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
@@ -581,8 +610,17 @@ class BrokenJudge(Judge):
                 Score.model_construct(key=(1.0,), candidate_id=c.id, notes=cast(Any, 5))
                 for c in candidates
             ]
+        if mode in ("repairable_score", "command_then_invalid"):
+            if mode == "command_then_invalid":
+                await ctx.execute(Command(argv=["python", "-c", FAILING_COMMAND]))
+            return [  # lax validation would quietly turn "1.0" into 1.0
+                Score.model_construct(key=(1.0,), candidate_id=c.id, value=cast(Any, "1.0"))
+                for c in candidates
+            ]
         if mode == "drop":  # neither a score nor a judge error
             return []
+        if mode == "command_fails":
+            await ctx.execute(Command(argv=["python", "-c", FAILING_COMMAND]))
         one = Score.maximize(1.0)
         copies = "ab" if mode == "duplicate" else "a"
         return [one.model_copy(update={"candidate_id": c.id}) for c in candidates for _ in copies]
@@ -597,11 +635,30 @@ class NotACheckResult(AlwaysPass):
         return cast(Any, {"passed": True})
 
 
-class InvalidCheckResult(AlwaysPass):
+class InvalidCheckResult(AlwaysPass):  # a truthy "no": lax validation would make it False
     async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
-        return CheckResult.model_construct(
-            check=self.name, passed=cast(Any, "no"), reasons=cast(Any, "oops")
-        )
+        return CheckResult.model_construct(check=self.name, passed=cast(Any, "no"))
+
+
+class CommandCheck(Check):
+    """Run ``code`` through ``ctx.execute``; ``valid=False`` then breaks the result."""
+
+    name = "command-check"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        code: str
+        valid: bool = True
+
+    @property
+    def config(self) -> Config:
+        return cast(CommandCheck.Config, super().config)
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        out = await ctx.execute(Command(argv=["python", "-c", self.config.code]))
+        if not self.config.valid:
+            return CheckResult.model_construct(check=self.name, passed=cast(Any, "no"))
+        return CheckResult(check=self.name, passed=out.status == RunStatus.OK)
 
 
 class PreflightFailsCheck(AlwaysPass):

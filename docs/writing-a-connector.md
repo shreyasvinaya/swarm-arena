@@ -28,7 +28,6 @@ tests/
 ## A tool
 
 A tool says **what** to run. The executor decides **where** it runs.
-The data returned by `collect` must be finite JSON; `LocalExecutor` reports a violation as status `ERROR`.
 
 ```python
 # my_connector/tools.py
@@ -137,10 +136,13 @@ writes its result to the path in `SWARM_ARENA_RESULT`
 {"data": {"target": "CCO", "steps": ["step 1", "step 2"]}}
 ```
 
-`data` is required. `usage`, `files`, `failed_provider`, and `schema_version`
-are optional in the file format that the built-in `ScriptTool` reader uses. The
-full contract (request shape, parents, edits, exit codes, partial results, the
-environment) is in [Use your own files and script](own-files.md).
+`data` is required. The data returned by `collect()` must be finite JSON (no
+NaN and no infinity): `LocalExecutor` reports a violation as status `error`, and
+under `check_tool` it is an `AssertionError`. `usage`, `files`,
+`failed_provider`, and `schema_version` are optional in the file format that
+the built-in `ScriptTool` reader uses. The full contract (request shape,
+parents, edits, exit codes, partial results, the environment) is in
+[Use your own files and script](own-files.md).
 
 For your own `Tool`, `collect()` decides what is kept: the core sees only the
 `ToolOutput` that it returns. The executor uploads only the files in
@@ -173,9 +175,9 @@ selects what managers see: `"pass_fail"` shows only passed or failed, and
 `ctx.execute(command, candidate=...)` runs a command through the executor, for
 example a validator that needs RDKit in the tool's interpreter. The command's
 workspace has the candidate's request, output, and files under `candidate/`,
-which is read-only, and the command writes a raw JSON object (no `data` envelope) to
-`swarm/result.json`. A check must **fail closed**: a crash or a missing result
-is a failed check, never a pass.
+which is read-only, and the command writes a raw JSON object (no `data`
+envelope) to `swarm/result.json`. A check must **fail closed**: a crash or a
+missing result is a failed check, never a pass.
 
 ## A judge
 
@@ -283,10 +285,12 @@ breaks its contract:
   refused edit raises a `ValueError` that names the path and the reason; a
   refused base-parent overlay gives a `UserWarning`.
 - `check_check(check, candidate, *, goal, executor)` runs one check and returns
-  its `CheckResult`, validated again. `feedback` must be `"pass_fail"` or
-  `"reasons"`.
+  its `CheckResult`. `feedback` must be `"pass_fail"` or `"reasons"`. The
+  result is validated again in strict mode, so a value that only lax
+  validation would repair, such as `passed="no"`, is an `AssertionError`.
 - `check_judge(judge, goal, candidates, *, executor)` judges one batch and
-  returns the stamped scores, validated again. The judge identity must be
+  returns the stamped scores. Each score is validated again in strict mode, as
+  for a check result. The judge identity must be
   stable: `rubric_hash()` gives the same nonempty `str` on two calls and on a
   second build, and `panel_hash()` the same `str`. `anchor_count()` must return
   an `int` of 0 or more, `providers()` a frozenset of `str`, and `models()` a
@@ -355,8 +359,10 @@ how a plan names it.
 ### When a run ends with status `error`
 
 The kit gives a `UserWarning` that holds the last 2 KB of the run's stderr log,
-for a tool run and for each command that a check or judge runs. To keep the
-whole workspace, with its logs, pass your own executor:
+for a tool run and for each command that a check or judge runs. If the same
+call also fails a contract, the kit adds that text to the `AssertionError` as a
+note instead, so the log is never lost. To keep the whole workspace, with its
+logs, pass your own executor:
 
 ```python
 # tests/test_logs.py

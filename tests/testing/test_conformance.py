@@ -1,22 +1,32 @@
+import math
 import subprocess
 import sys
+import traceback
+import warnings
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
+    FAILING_COMMAND,
     GOAL,
     WRITE,
+    AlwaysPass,
     BadCollectTool,
     BadFeedbackCheck,
     BrokenJudge,
     BrokenTool,
+    CommandCheck,
+    EchoTool,
     EmptyFingerprintTool,
+    FixedJudge,
     GoalCheck,
     InvalidCheckResult,
     NotACheckResult,
     OkCollectTool,
+    PanelJudge,
     PreflightFailsCheck,
     PyTool,
     RecordingExecutor,
@@ -24,15 +34,16 @@ from _fakes.tools import (
     add,
     manifest_size,
     nan_score,
+    raising_score,
     rosen_score,
 )
 from pydantic import ValidationError
 
 from swarm_arena import FunctionTool, Goal, Limits, ProgramJudge, Ref, ScriptCheck, ScriptTool
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._model.ids import run_tag
 from swarm_arena.executor import Job, LocalExecutor
-from swarm_arena.scoring import Check
+from swarm_arena.scoring import Check, Judge, Lexicographic
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
 from swarm_arena.testing._conformance import _artifact_root
 from swarm_arena.tool import FileRef, FileSet, RunStatus, ToolOutput, ToolRequest
@@ -45,6 +56,7 @@ json.dump({"data": data}, open(os.environ["SWARM_ARENA_RESULT"], "w"))
 """
 EMPTY_RESULT = WRITE.format("{'data': {}}")
 PROBLEM = FileSet(globs=["problem/*"])
+VALID_OUTPUT = r"Tool\.collect\(\) must return a valid ToolOutput \(data must be finite JSON\)"
 
 
 @pytest.fixture
@@ -158,6 +170,19 @@ async def test_edit_rules_are_the_core_rules(ws: Path, edit: dict[str, str], mat
     assert executor.jobs == []
 
 
+async def test_respelled_tool_file_is_a_config_error() -> None:
+    goal = Goal(id="g", namespace="ns", files=FileSet(manifest={"p/run.py": "1" * 64}))
+    files = FileSet(manifest={"P/RUN.py": "2" * 64})  # snapshotted already: no file is read
+    tool = ScriptTool(command=["python", "p/run.py"], files=files)
+    executor = RecordingExecutor()
+    with pytest.raises(ConfigError, match=r"tool files do not fit the goal files: .*P/RUN\.py"):
+        await check_tool(tool, {}, goal=goal, executor=executor)
+    # The human's config error comes before any refusal of the agent's edits.
+    with pytest.raises(ConfigError, match="tool files do not fit the goal files"):
+        await check_tool(tool, {}, goal=goal, edits={"p/x.txt": "x"}, executor=executor)
+    assert executor.jobs == []
+
+
 async def test_input_and_edit_errors_hide_values(ws: Path, local_executor: LocalExecutor) -> None:
     with pytest.raises(ValidationError) as invalid:
         await check_tool(FunctionTool(add), {"a": SECRET}, executor=local_executor)
@@ -193,14 +218,17 @@ async def test_conformance_violation(local_executor: LocalExecutor) -> None:
     ("mode", "match"),
     [
         ("get_input_model", r"Tool\.get_input_model\(\) must return"),
+        ("get_input_model_instance", r"Tool\.get_input_model\(\) must return"),
         ("get_description", r"Tool\.get_description\(\) must return"),
         ("editable", r"Tool\.editable\(\) must return"),
         ("editable_str", r"Tool\.editable\(\) must return"),
         ("editable_dict", r"Tool\.editable\(\) must return"),
         ("providers", r"Tool\.providers\(\) must return"),
+        ("providers_items", r"Tool\.providers\(\) must return"),
         ("extra_actions", r"Tool\.extra_actions\(\) must return"),
         ("extra_actions_names", r"Tool\.extra_actions\(\) must return .* unique names"),
         ("fingerprint", r"Tool\.fingerprint\(\) must return the same"),
+        ("fingerprint_type", r"Tool\.fingerprint\(\) must return a nonempty str"),
         ("fingerprint_run", r"Tool\.fingerprint\(\) must not depend on"),
         ("is_deterministic", r"Tool\.is_deterministic\(\) must return"),
         ("estimate", r"Tool\.estimate\(\) must return"),
@@ -230,6 +258,9 @@ async def test_collect_probe_accepts_error_status_and_raising(
     assert out.status == RunStatus.ERROR
     out = await check_tool(PyTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor)
     assert out.status == RunStatus.OK
+    # EchoTool reports run.status as it is: the probe's failed run must stay failed.
+    out = await check_tool(EchoTool(EchoTool.Config(text="hi")), {}, executor=local_executor)
+    assert (out.status, out.data) == (RunStatus.OK, {"text": "hi"})
 
 
 async def test_failed_run_shows_the_end_of_its_stderr_log(local_executor: LocalExecutor) -> None:
@@ -252,6 +283,65 @@ async def test_failed_check_command_shows_its_stderr_log(
     with pytest.warns(UserWarning, match=r"(?s)ended with status error.*CHECK-DIAG"):
         result = await check_check(check, make_candidate(ok()), executor=local_executor)
     assert not result.passed
+
+
+async def test_failed_judge_command_shows_its_stderr_log(local_executor: LocalExecutor) -> None:
+    c = make_candidate(ok())
+    judge = BrokenJudge({"mode": "command_fails"})
+    with pytest.warns(UserWarning, match=r"(?s)ended with status error.*COMMAND-DIAG"):
+        [score] = await check_judge(judge, GOAL, [c], executor=local_executor)
+    assert score.candidate_id == c.id
+
+
+async def test_log_tail_that_is_not_utf8_is_decoded_safely(local_executor: LocalExecutor) -> None:
+    # 2-byte characters then one invalid byte: the 2 KB tail starts in a character, too.
+    code = "import sys; sys.stderr.buffer.write('é'.encode() * 1100 + b'\\xff'); sys.exit(1)"
+    with pytest.warns(UserWarning, match="ended with status error") as record:
+        await check_tool(PyTool(PyTool.Config(code=code)), {}, executor=local_executor)
+    [message] = [str(w.message) for w in record]
+    assert message.endswith(chr(0xFFFD))
+    assert ":\n" + chr(0xFFFD) + "é" * 1023 + chr(0xFFFD) in message
+
+
+@pytest.mark.parametrize("status", [s for s in RunStatus if s != RunStatus.ERROR])
+async def test_only_status_error_gives_the_failed_run_warning(status: RunStatus) -> None:
+    executor = FixedExecutor(ToolOutput(status=status))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = await check_tool(PyTool(PyTool.Config(code="pass")), {}, executor=executor)
+    assert out.status == status
+
+
+def notes_of(error: BaseException) -> str:
+    return "".join(traceback.format_exception(error))
+
+
+async def test_contract_failure_keeps_the_failed_run_tail(local_executor: LocalExecutor) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the tail goes on the AssertionError, not a warning
+        with pytest.raises(AssertionError, match=r"Tool\.estimate\(\)") as tool:
+            await check_tool(broken("estimate", FAILING_COMMAND), {}, executor=local_executor)
+        check = CommandCheck({"code": FAILING_COMMAND, "valid": False})
+        with pytest.raises(AssertionError, match="valid CheckResult") as checked:
+            await check_check(check, make_candidate(ok()), executor=local_executor)
+        judge = BrokenJudge({"mode": "command_then_invalid"})
+        with pytest.raises(AssertionError, match="valid Scores") as judged:
+            await check_judge(judge, GOAL, [make_candidate(ok())], executor=local_executor)
+    for caught in (tool, checked, judged):
+        text = notes_of(caught.value)
+        assert "ended with status error" in text
+        assert "COMMAND-DIAG" in text
+
+
+async def test_note_check_matches_the_exact_note_line(local_executor: LocalExecutor) -> None:
+    # The tool prints the executor's note text inside its own line: that is not the note.
+    code = (
+        "import sys; sys.stderr.write('echo: swarm-arena: collect failed: Tool.collect() "
+        "did not return a ToolOutput\\n'); sys.exit(1)"
+    )
+    with pytest.warns(UserWarning, match="ended with status error"):
+        out = await check_tool(PyTool(PyTool.Config(code=code)), {}, executor=local_executor)
+    assert out.status == RunStatus.ERROR
 
 
 async def test_output_files_in_the_store_pass(ws: Path, local_executor: LocalExecutor) -> None:
@@ -297,6 +387,19 @@ async def test_job_is_staged_like_the_core() -> None:
                 files=[FileRef(name="ghost.txt", path="out/ghost.txt", sha256="0" * 64, size=0)],
             ),
             "out/ghost.txt is not in the artifact store",
+        ),
+        (  # the kit's own re-validation: an executor other than LocalExecutor
+            ToolOutput(status=RunStatus.OK).model_copy(update={"data": {"x": math.nan}}),
+            VALID_OUTPUT,
+        ),
+        (ToolOutput.model_construct(data={}), VALID_OUTPUT),  # no status at all
+        (ToolOutput.model_construct(status=RunStatus.ERROR, logs_ref=5), VALID_OUTPUT),
+        (ToolOutput.model_construct(status="ok"), VALID_OUTPUT),  # lax would make it an enum
+        (  # strict accepts it, but validation would repair it (milliseconds only)
+            ToolOutput(status=RunStatus.OK).model_copy(
+                update={"started_at": datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)}
+            ),
+            VALID_OUTPUT,
         ),
     ],
 )
@@ -360,6 +463,12 @@ async def test_check_contract_is_asserted(check: Check, match: str) -> None:
         await check_check(check, make_candidate(ok()))
 
 
+@pytest.mark.parametrize("check", [AlwaysPass(), GoalCheck()])
+async def test_good_checks_pass_strict_validation(check: Check) -> None:
+    result = await check_check(check, make_candidate(ok()))
+    assert result.passed is True
+
+
 async def test_check_judge_stamps_and_warns(local_executor: LocalExecutor) -> None:
     c1 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 2.0}))
     c2 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 1.0}))
@@ -394,15 +503,21 @@ async def test_check_judge_rejects_unknown_candidate(local_executor: LocalExecut
     [
         ("duplicate", "more than one score for candidate"),
         ("not_score", "list of Score"),
-        ("invalid_score", r"Judge\.judge\(\) must return valid Score objects"),
+        ("invalid_score", r"Judge\.judge\(\) must return valid Scores"),
+        ("repairable_score", r"Judge\.judge\(\) must return valid Scores"),
         ("rubric_unstable", r"Judge\.rubric_hash\(\) must return the same nonempty str"),
         ("rubric_per_instance", r"Judge\.rubric_hash\(\) must return the same nonempty str"),
+        ("rubric_drifts", r"Judge\.rubric_hash\(\) must return the same nonempty str"),
         ("rubric_type", r"Judge\.rubric_hash\(\) must return the same nonempty str"),
         ("rubric_empty", r"Judge\.rubric_hash\(\) must return the same nonempty str"),
         ("panel_type", r"Judge\.panel_hash\(\) must return the same str"),
+        ("panel_unstable", r"Judge\.panel_hash\(\) must return the same str"),
         ("anchor_count", r"Judge\.anchor_count\(\) must return an int >= 0"),
+        ("anchor_negative", r"Judge\.anchor_count\(\) must return an int >= 0"),
         ("providers", r"Judge\.providers\(\) must return a frozenset of str"),
+        ("providers_items", r"Judge\.providers\(\) must return a frozenset of str"),
         ("models", r"Judge\.models\(\) must return a tuple of str"),
+        ("models_list", r"Judge\.models\(\) must return a tuple of str"),
     ],
 )
 async def test_judge_contract_is_asserted(mode: str, match: str) -> None:
@@ -410,10 +525,37 @@ async def test_judge_contract_is_asserted(mode: str, match: str) -> None:
         await check_judge(BrokenJudge({"mode": mode}), GOAL, [make_candidate(ok())])
 
 
+@pytest.mark.parametrize(
+    "judge",
+    [
+        ProgramJudge(rosen_score),
+        FixedJudge({"value": 2.0}),
+        PanelJudge({"panel": "p", "anchors": 1, "providers": ["openai"], "models": ["m"]}),
+        Lexicographic([ProgramJudge(rosen_score), FixedJudge({"value": 1.0})]),
+    ],
+)
+async def test_good_judges_pass_strict_validation(judge: Judge) -> None:
+    c = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 0.5}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        [score] = await check_judge(judge, GOAL, [c])
+    assert score.candidate_id == c.id
+
+
 async def test_non_finite_score_is_a_judge_error() -> None:
     c = make_candidate(ok())
-    with pytest.warns(UserWarning, match=f"judge error for {c.id}: score key must be"):
+    with pytest.warns(UserWarning, match=f"judge error for {c.id}: score key must be") as record:
         assert await check_judge(BrokenJudge({"mode": "nan"}), GOAL, [c]) == []
+    assert [str(w.message) for w in record] == [
+        f"judge error for {c.id}: score key must be nonempty and finite"
+    ]
+
+
+async def test_judge_error_without_a_score_gives_one_warning() -> None:
+    c = make_candidate(ok())
+    with pytest.warns(UserWarning, match=f"judge error for {c.id}") as record:
+        assert await check_judge(ProgramJudge(raising_score), GOAL, [c]) == []
+    assert [str(w.message).split(":")[0] for w in record] == [f"judge error for {c.id}"]
 
 
 async def test_candidate_without_score_or_error_warns() -> None:
@@ -423,12 +565,14 @@ async def test_candidate_without_score_or_error_warns() -> None:
 
 
 def test_artifact_root_is_one_per_process_and_removed_at_exit() -> None:
-    code = (
+    code = (  # the root holds a store tree before exit, so an empty-only cleanup fails
         "import os\n"
-        "from swarm_arena.testing._conformance import _artifact_root\n"
+        "from swarm_arena.testing._conformance import _artifact_root, _artifacts\n"
         "root = _artifact_root()\n"
         "assert root == _artifact_root() and os.path.isdir(root)\n"
         "assert os.path.basename(root).startswith('swarm-arena-testing-')\n"
+        "_artifacts().put_bytes(b'kept until exit')\n"
+        "assert os.listdir(root)\n"
         "print(root)\n"
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
