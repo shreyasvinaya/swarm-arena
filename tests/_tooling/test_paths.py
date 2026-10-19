@@ -179,20 +179,33 @@ def test_shared_folded_layout(
     assert conflicts == ([] if conflict is None else [conflict])
 
 
-def test_fold_merge_keeps_the_first_spelling_without_mutation() -> None:
-    # One spelling rule for every stage: a later layer replaces the content, never the name.
+def test_fold_merge_replaces_exact_spelling_without_mutation() -> None:
     from swarm_arena._tooling.paths import fold_merge
 
-    base = {"p/a": "base", "p/b": "keep", "caf\u00e9/a": "base"}
-    overlay = {"p/A": "winner", "cafe\u0301/a": "unicode", "p/c": "new"}
-    assert fold_merge(base, overlay) == {
-        "p/a": "winner",
-        "p/b": "keep",
-        "caf\u00e9/a": "unicode",
-        "p/c": "new",
-    }
-    assert base == {"p/a": "base", "p/b": "keep", "caf\u00e9/a": "base"}
-    assert overlay == {"p/A": "winner", "cafe\u0301/a": "unicode", "p/c": "new"}
+    base = {"p/a": "base", "p/b": "keep"}
+    overlay = {"p/a": "winner", "p/c": "new"}
+    assert fold_merge(base, overlay) == {"p/a": "winner", "p/b": "keep", "p/c": "new"}
+    assert base == {"p/a": "base", "p/b": "keep"}
+    assert overlay == {"p/a": "winner", "p/c": "new"}
+
+
+CAFE_NFC = "caf\N{LATIN SMALL LETTER E WITH ACUTE}/a"
+CAFE_NFD = "cafe\N{COMBINING ACUTE ACCENT}/a"
+
+
+@pytest.mark.parametrize(
+    ("base", "respelled"),
+    [("p/a", "p/A"), ("p/a", "P/a"), ("p/run.py", "P/RUN.py"), (CAFE_NFC, CAFE_NFD)],
+)
+def test_fold_merge_refuses_a_respelling(base: str, respelled: str) -> None:
+    # A respelling (same fold_key, other spelling) is never merged silently.
+    from swarm_arena._tooling.paths import fold_merge
+
+    with pytest.raises(ValueError, match="conflicting workspace path") as exc:
+        fold_merge({base: "old"}, {respelled: "new"}, prefix="parents/c1/")
+    assert str(exc.value) == (
+        f"conflicting workspace path: parents/c1/{base} and parents/c1/{respelled}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -218,10 +231,12 @@ def test_parent_data_name_is_reserved_for_files_and_directories() -> None:
 
     paths = ["data.json/x", "Data.json/y", "DATA.JSON", "p/data.json/x", "data.jsonl/x"]
     assert parent_data_conflicts(paths) == ["data.json/x", "Data.json/y"]
-    # The sink skips a whole-path alias of the generated file instead.
-    assert parent_tree({"DATA.JSON": "o", "p/a": "o"}, {"Data.json": "f", "p/A": "f"}) == {
+    # The sink skips a whole-path alias of the generated file instead, before merging.
+    assert parent_tree({"DATA.JSON": "o", "p/a": "o"}, {"Data.json": "f", "p/a": "f"}) == {
         "p/a": "f"
     }
+    with pytest.raises(ValueError, match="parents/c1/p/a and parents/c1/p/A"):
+        parent_tree({"p/a": "o"}, {"p/A": "f"}, prefix="parents/c1/")
 
 
 # Canonical caseless classes (Unicode D145) that NFC-then-casefold split. APFS

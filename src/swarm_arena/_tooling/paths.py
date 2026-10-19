@@ -100,19 +100,19 @@ def fold_conflicts(
 def fold_merge(
     base: Mapping[str, _T], overlay: Mapping[str, _T], *, prefix: str = ""
 ) -> dict[str, _T]:
-    """Merge file maps by folded key; a replacement keeps the base spelling.
+    """Merge file maps by exact path and refuse any folded conflict.
 
-    This is the one spelling rule for every stage: a later layer replaces a
-    file's content, never its name. Every later stage starts from the same
-    goal manifest, so the goal's spelling is the one all stages agree on.
+    An overlay entry replaces a base entry only at the exact same spelling. A
+    respelling (the same ``fold_key``, another spelling) is never merged: one
+    workspace must work on case-sensitive and case-insensitive filesystems.
+    Each caller turns the error into its own kind of refusal.
 
     Parameters
     ----------
     base : Mapping[str, _T]
-        Lower-priority file entries. Their spellings are kept.
+        Lower-priority file entries.
     overlay : Mapping[str, _T]
-        Higher-priority entries. Each replaces the value of the ``base`` entry
-        with the same folded key; other entries keep their own spelling.
+        Higher-priority entries; each replaces the base entry at its exact path.
     prefix : str, optional
         Workspace prefix of the tree, such as ``"parents/c1/"``. Errors name
         paths with it, so they show which parent or tree failed.
@@ -125,32 +125,23 @@ def fold_merge(
     Raises
     ------
     ValueError
-        If either input or the merged layout has conflicting paths.
+        If the merged layout has conflicting paths, such as a respelling, an
+        ancestor directory spelled two ways, or a file/directory conflict. The
+        message names both paths.
 
     Examples
     --------
-    >>> fold_merge({"p/a": "old"}, {"p/A": "new", "p/b": "add"})
-    {'p/a': 'new', 'p/b': 'add'}
-    >>> fold_merge({"p/a": "x"}, {"P/b": "y"}, prefix="parents/c1/")
+    >>> fold_merge({"p/a": "old", "p/b": "keep"}, {"p/a": "new"})
+    {'p/a': 'new', 'p/b': 'keep'}
+    >>> fold_merge({"p/a": "x"}, {"p/A": "y"}, prefix="parents/c1/")
     Traceback (most recent call last):
     ...
-    ValueError: conflicting workspace path: parents/c1/p/a and parents/c1/P/b
+    ValueError: conflicting workspace path: parents/c1/p/a and parents/c1/p/A
     """
-
-    def check(files: Iterable[str]) -> None:
-        conflicts = fold_conflicts(files)
-        if conflicts:
-            first, second = conflicts[0]
-            raise ValueError(f"conflicting workspace path: {prefix}{first} and {prefix}{second}")
-
-    check(base)
-    check(overlay)
-    entries = {fold_key(path): (path, value) for path, value in base.items()}
-    for path, value in overlay.items():
-        key = fold_key(path)
-        entries[key] = (entries[key][0] if key in entries else path, value)
-    merged = dict(entries.values())
-    check(merged)
+    merged = {**base, **overlay}
+    if conflicts := fold_conflicts(merged):
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting workspace path: {prefix}{first} and {prefix}{second}")
     return merged
 
 
@@ -161,16 +152,17 @@ def parent_tree(
 
     The core writes the parent's structured output to ``data.json`` at the top
     of the tree, so an entry whose whole path folds to ``data.json`` is
-    skipped. Producers refuse paths below a folded ``data.json`` directory
-    with ``parent_data_conflicts``, the same rule the sink applies.
+    skipped before the merge. Producers refuse paths below a folded
+    ``data.json`` directory with ``parent_data_conflicts``, the same rule the
+    sink applies.
 
     Parameters
     ----------
     overlay : Mapping[str, _T]
         The parent's effective overlay.
     outputs : Mapping[str, _T]
-        The parent's output files. At a shared folded key an output replaces
-        the overlay's content, and the overlay's spelling is kept.
+        The parent's output files. An output replaces an overlay entry only at
+        the exact same spelling; a respelling is refused.
     prefix : str, optional
         Workspace prefix for errors, such as ``"parents/c1/"``.
 
@@ -189,8 +181,11 @@ def parent_tree(
     >>> parent_tree({"p/a": "old", "Data.json": "x"}, {"p/a": "out"})
     {'p/a': 'out'}
     """
-    merged = fold_merge(overlay, outputs, prefix=prefix)
-    return {path: value for path, value in merged.items() if fold_key(path) != PARENT_DATA}
+
+    def kept(files: Mapping[str, _T]) -> dict[str, _T]:
+        return {path: value for path, value in files.items() if fold_key(path) != PARENT_DATA}
+
+    return fold_merge(kept(overlay), kept(outputs), prefix=prefix)
 
 
 def parent_data_conflicts(paths: Iterable[str]) -> list[str]:

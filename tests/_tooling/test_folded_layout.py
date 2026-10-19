@@ -15,7 +15,7 @@ import pytest
 from _fakes.tools import cand
 
 from swarm_arena import ScriptTool
-from swarm_arena._errors import NotFound, SoftError
+from swarm_arena._errors import ConfigError, NotFound, SoftError
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import FileSet, Goal
@@ -30,6 +30,7 @@ from swarm_arena._tooling.staging import (
     plan_script_stage,
     plan_tool_stage,
     put_edits,
+    tool_root,
     validate_edits,
 )
 
@@ -79,64 +80,70 @@ def test_edit_layout_soft_refusal(root: set[str], edits: dict[str, str], operati
     assert SECRET not in "".join(format_exception(exc.value))
 
 
-@pytest.mark.parametrize("variant", ["p/RUN.py", "P/RUN.py", "p/cafe\u0301.py"])
-def test_tool_content_wins_at_the_goal_spelling(
-    tmp_path: Path, artifacts: ArtifactStore, variant: str
+CAFE_PY = "p/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py"
+CAFE_PY_NFD = "p/cafe\N{COMBINING ACUTE ACCENT}.py"
+CAFE_TXT = "p/caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt"
+CAFE_TXT_NFD = "p/cafe\N{COMBINING ACUTE ACCENT}.txt"
+
+
+@pytest.mark.parametrize(
+    ("goal_path", "tool_path"),
+    [("p/run.py", "p/RUN.py"), ("p/run.py", "P/RUN.py"), (CAFE_PY, CAFE_PY_NFD)],
+)
+def test_tool_file_respelling_a_goal_file_is_refused_before_any_run(
+    artifacts: ArtifactStore, goal_path: str, tool_path: str
 ) -> None:
-    original = "p/caf\u00e9.py" if "cafe" in variant else "p/run.py"
-    goal, tool = artifacts.put_bytes(b"GOAL"), artifacts.put_bytes(b"TOOL")
-    stage, _, _ = plan_tool_stage(
-        goal_files={original: goal},
-        tool_files={variant: tool},
-        editable=[],
-        protected=set(),
-        private_paths=set(),
-        parents=[],
-        receiving_identity="T",
-        edits={},
-        request_json=None,
+    # One workspace must work on both filesystems: `python P/RUN.py` must name a real file.
+    goal_files = {goal_path: artifacts.put_bytes(b"GOAL")}
+    tool_files = {tool_path: artifacts.put_bytes(b"TOOL")}
+    expected = exactly(
+        f"tool files do not fit the goal files: conflicting workspace path: "
+        f"{goal_path} and {tool_path}; spell a replaced goal file exactly as the goal does"
     )
-    # One spelling rule: the tool's content at the goal's spelling, as later stages see it.
-    assert stage.root == {original: tool}
+    with pytest.raises(ConfigError, match=expected):
+        tool_root(goal_files, tool_files)
+    with pytest.raises(ConfigError, match=expected):
+        _tool_stage(goal_files=goal_files, tool_files=tool_files)
+
+
+def test_exact_tool_file_replaces_goal_file(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    goal, tool = artifacts.put_bytes(b"GOAL"), artifacts.put_bytes(b"TOOL")
+    assert tool_root({"p/run.py": goal, "p/a.txt": goal}, {"p/run.py": tool}) == {
+        "p/run.py": tool,
+        "p/a.txt": goal,
+    }
+    stage, _, _ = _tool_stage(goal_files={"p/run.py": goal}, tool_files={"p/run.py": tool})
+    assert stage.root == {"p/run.py": tool}
     materialize(stage, tmp_path / "ws", artifacts)
-    assert [path.name for path in (tmp_path / "ws/p").iterdir()] == [original.split("/")[1]]
-    assert (tmp_path / "ws" / original).read_bytes() == b"TOOL"
+    assert (tmp_path / "ws/p/run.py").read_bytes() == b"TOOL"
 
 
-@pytest.mark.parametrize("variant", ["P/A.txt", "p/A.txt", "p/cafe\u0301.txt"])
+@pytest.mark.parametrize(
+    ("original", "variant"),
+    [("p/a.txt", "P/A.txt"), ("p/a.txt", "p/A.txt"), (CAFE_TXT, CAFE_TXT_NFD)],
+)
 @pytest.mark.parametrize("target", ["parent", "candidate"])
-def test_output_content_wins_at_the_overlay_spelling(
-    tmp_path: Path, artifacts: ArtifactStore, variant: str, target: str
+def test_output_respelling_is_never_merged(
+    tmp_path: Path, artifacts: ArtifactStore, original: str, variant: str, target: str
 ) -> None:
-    original = "p/caf\u00e9.txt" if "cafe" in variant else "p/a.txt"
+    # Collection refuses these in the producing run; a bypassed model fails closed here.
     base, output = artifacts.put_bytes(b"BASE"), artifacts.put_bytes(b"OUTPUT")
     file = FileRef(name="a", path=variant, sha256=output, size=6)
     if target == "parent":
-        stage = Job.Stage(
-            parents=[
-                ParentRef(
-                    candidate_id="c1",
-                    run_id="r",
-                    tool_identity="T",
-                    overlay={original: base},
-                    files=[file],
-                )
-            ]
+        parent = ParentRef(
+            candidate_id="c1", run_id="r", tool_identity="T", overlay={original: base}, files=[file]
         )
-        dest = f"parents/c1/{original}"
+        with pytest.raises(ValueError, match="conflicting workspace path") as exc:
+            materialize(Job.Stage(parents=[parent]), tmp_path / "ws", artifacts)
+        assert not (tmp_path / "ws").exists()
+        prefix = "parents/c1/"
     else:
-        stage = plan_script_stage(
-            own_files={},
-            effective_files={original: base},
-            candidate=cand(output=ToolOutput(status=RunStatus.OK, files=[file])),
-        )
-        assert stage.candidate is not None
-        assert stage.candidate.files == {original: output}
-        dest = f"candidate/files/{original}"
-    materialize(stage, tmp_path / "ws", artifacts)
-    assert (tmp_path / "ws" / dest).read_bytes() == b"OUTPUT"
-    names = [path.name for path in (tmp_path / "ws" / dest).parent.iterdir()]
-    assert names == [dest.rsplit("/", 1)[1]]
+        candidate = cand(output=ToolOutput(status=RunStatus.OK, files=[file]))
+        with pytest.raises(ValueError, match="conflicting workspace path") as exc:
+            plan_script_stage(own_files={}, effective_files={original: base}, candidate=candidate)
+        prefix = "candidate/files/"
+    assert f"{prefix}{original}" in str(exc.value)
+    assert f"{prefix}{variant}" in str(exc.value)
 
 
 @pytest.mark.parametrize("variant", ["DATA.json", "Data.json"])
@@ -307,35 +314,57 @@ def test_canonical_caseless_edits_collide() -> None:
         _tool_stage(edits=edits)
 
 
-# --- One spelling rule from the producing root to later stages (G2) ---
+# --- A respelling is refused wherever two layers merge (G9) ---
 
 
-def test_tool_spelling_cannot_pass_the_producing_run(
+def test_each_producer_refuses_a_respelling_with_its_own_error(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    root = {"p/a.txt": H, "p/run.py": H}
+    # Tool file over goal file: a config error before any run (see the tool tests above).
+    with pytest.raises(ConfigError, match=r"p/run\.py and P/RUN\.py"):
+        tool_root(root, {"P/RUN.py": H})
+    # Edit: a soft refusal the agent can act on.
+    expected = exactly("P/A.txt: folded path collision with p/a.txt")
+    with pytest.raises(SoftError, match=expected):
+        validate_edits(
+            {"P/A.txt": SECRET},
+            root=set(root),
+            editable=["**/*"],
+            protected=set(),
+            max_edit_bytes=100,
+        )
+    with pytest.raises(SoftError, match=expected):
+        _tool_stage(goal_files=root, edits={"P/A.txt": SECRET})
+    # Output: ValueError at collection, which the executor turns into ERROR for the
+    # producing run (see test_folded_output_vs_staged_path_fails_producing_run in
+    # tests/_exec/test_local.py).
+    with pytest.raises(
+        ValueError, match=exactly("conflicting output path with staged layout: p/a.txt and P/A.txt")
+    ):
+        collect_output_files(tmp_path, ["P/A.txt"], artifacts, stage=Job.Stage(root=root))
+    # Base parent overlay: the soft "not overlaid" warning.
+    parent = ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={"P/A.txt": H})
+    stage, overlay, warnings = _tool_stage(goal_files=root, parents=[parent])
+    assert (stage.root, overlay) == (root, {})
+    assert warnings == [
+        "base parent c1 not overlaid: paths conflict with the workspace layout; paths: P/A.txt"
+    ]
+
+
+def test_exact_spellings_pass_every_producer_and_later_stage(
     tmp_path: Path, artifacts: ArtifactStore
 ) -> None:
     goal_files = {"p/run.py": artifacts.put_bytes(b"GOAL")}
-    tool_files = {"P/RUN.py": artifacts.put_bytes(b"TOOL")}
+    tool_files = {"p/run.py": artifacts.put_bytes(b"TOOL")}
     goal = Goal(id="g", namespace="n", files=FileSet(globs=["p/*"], manifest=goal_files))
     common: dict[str, Any] = {
         "goal_files": goal_files,
         "tool_files": tool_files,
-        "protected": {"P/RUN.py"},
+        "protected": {"p/run.py"},
     }
     produced, _, _ = _tool_stage(**common)
-    assert produced.root == {"p/run.py": tool_files["P/RUN.py"]}
-
-    alias = {"P/notes.txt": SECRET}
-    with pytest.raises(SoftError, match=r"^P/notes\.txt: folded path collision with p/run\.py$"):
-        validate_edits(
-            alias, root=set(produced.root), editable=["**/*"], protected=set(), max_edit_bytes=100
-        )
-    with pytest.raises(SoftError, match=r"^P/notes\.txt: folded path collision with p/run\.py$"):
-        _tool_stage(**common, edits=alias)
-    with pytest.raises(ValueError, match="conflicting output path") as exc:
-        collect_output_files(tmp_path, ["P/out.txt"], artifacts, stage=produced)
-    assert "p/run.py" in str(exc.value)
-
-    # The shared spelling passes the producing run, and every later stage accepts it.
+    assert produced.root == tool_files
     edits = {"p/notes.txt": "agent text"}
     validate_edits(
         edits, root=set(produced.root), editable=["**/*"], protected=set(), max_edit_bytes=100

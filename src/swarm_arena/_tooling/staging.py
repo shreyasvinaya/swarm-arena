@@ -4,7 +4,7 @@ from collections.abc import Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any
 
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry
@@ -261,13 +261,13 @@ def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]:
     Returns
     -------
     dict[str, str]
-        Goal files replaced at matching folded paths by the candidate overlay,
-        keeping the goal's spelling, as in the producing run's root.
+        Goal files, replaced at exact paths by the candidate overlay.
 
     Raises
     ------
     ValueError
-        If the paths conflict; the error names them under ``candidate/files/``.
+        If the paths conflict, including a respelling; the error names both
+        paths under ``candidate/files/``.
 
     Examples
     --------
@@ -293,6 +293,53 @@ def _check_keys(files: Mapping[str, str]) -> None:
         check_key(path)
 
 
+def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> dict[str, str]:
+    """Build a tool's workspace root: the goal files, then the tool's own files.
+
+    A tool file replaces a goal file only at the exact same spelling. A
+    respelling (the same ``fold_key``, another spelling) or any other folded
+    conflict is a configuration error, raised here before any run, so one
+    workspace works on case-sensitive and case-insensitive filesystems.
+
+    Parameters
+    ----------
+    goal_files : Mapping[str, str]
+        Goal paths and artifact digests.
+    tool_files : Mapping[str, str]
+        Tool-owned paths and artifact digests.
+
+    Returns
+    -------
+    dict[str, str]
+        Root paths and artifact digests.
+
+    Raises
+    ------
+    ConfigError
+        If the tool files do not fit the goal files; the message names both paths.
+    ValueError
+        If a path is not in normal form.
+
+    Examples
+    --------
+    >>> tool_root({"p/run.py": "1" * 64}, {"p/run.py": "2" * 64}) == {"p/run.py": "2" * 64}
+    True
+    >>> tool_root({"p/run.py": "1" * 64}, {"P/RUN.py": "2" * 64})
+    Traceback (most recent call last):
+    ...
+    swarm_arena._errors.ConfigError: tool files do not fit the goal files: ...P/RUN.py; ...
+    """
+    _check_keys(goal_files)
+    _check_keys(tool_files)
+    try:
+        return fold_merge(goal_files, tool_files)
+    except ValueError as exc:
+        raise ConfigError(
+            f"tool files do not fit the goal files: {exc}; "
+            "spell a replaced goal file exactly as the goal does"
+        ) from None
+
+
 def plan_tool_stage(
     *,
     goal_files: Mapping[str, str],
@@ -313,8 +360,8 @@ def plan_tool_stage(
     tool identity, when every path is editable here and fits the root layout
     as an exact-spelling replacement or a new path. Otherwise the overlay is
     refused with a soft warning. Every parent also remains available in its
-    read-only tree. Tool files replace goal files at a shared folded key and
-    keep the goal's spelling, the spelling every later stage uses.
+    read-only tree. The root starts from ``tool_root``: a tool file replaces a
+    goal file only at the exact same spelling.
 
     Parameters
     ----------
@@ -346,6 +393,8 @@ def plan_tool_stage(
     ------
     RuntimeError
         If private files enter the root or edits violate receiving permissions.
+    ConfigError
+        If the tool files do not fit the goal files, as in ``tool_root``.
     ValueError
         If a path is invalid, noncanonical, or an edit is a stored reference.
     SoftError
@@ -358,7 +407,7 @@ def plan_tool_stage(
     >>> base = ParentRef(candidate_id="c1", run_id="r", tool_identity="T",
     ...                  overlay={"P/notes.txt": "2" * 64})
     >>> stage, overlay, warnings = plan_tool_stage(
-    ...     goal_files={"p/run.py": "1" * 64}, tool_files={"P/RUN.py": "3" * 64},
+    ...     goal_files={"p/run.py": "1" * 64}, tool_files={"p/run.py": "3" * 64},
     ...     editable=["**/*"], protected={"p/run.py"}, private_paths=set(), parents=[base],
     ...     receiving_identity="T", edits={}, request_json=None)
     >>> stage.root == {"p/run.py": "3" * 64}, overlay
@@ -366,8 +415,6 @@ def plan_tool_stage(
     >>> warnings
     ['base parent c1 not overlaid: paths conflict with the workspace layout; paths: P/notes.txt']
     """
-    _check_keys(goal_files)
-    _check_keys(tool_files)
     _check_keys(edits)
     protected = {fold_key(check_relpath(path)) for path in protected}
     private_paths = {fold_key(check_relpath(path)) for path in private_paths}
@@ -382,7 +429,7 @@ def plan_tool_stage(
         _check_keys(parent.overlay)
         for file in parent.files:
             check_key(file.path)
-    root = fold_merge(goal_files, tool_files)
+    root = tool_root(goal_files, tool_files)
     for path in root:
         if fold_key(path) in private_paths:
             raise RuntimeError(f"private path in tool root: {path}")
@@ -436,14 +483,15 @@ def plan_script_stage(
     Returns
     -------
     Job.Stage
-        Script workspace plan; output files replace the content at matching
-        folded effective paths and keep the effective spelling.
+        Script workspace plan; an output file replaces an effective file only
+        at the exact same path.
 
     Raises
     ------
     ValueError
-        If a path is not in normal form, or the candidate files conflict; the
-        error names them under ``candidate/files/``.
+        If a path is not in normal form, or the candidate files conflict,
+        including an output that respells an effective file; the error names
+        both paths under ``candidate/files/``.
 
     Examples
     --------
