@@ -7,11 +7,12 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
     TypeAdapter,
     ValidationError,
+    ValidatorFunctionWrapHandler,
+    WrapValidator,
     create_model,
 )
 from pydantic.fields import FieldInfo
@@ -25,6 +26,22 @@ _BOUNDS = {
 _STRINGS = {"minLength": "min_length", "maxLength": "max_length", "pattern": "pattern"}
 _KEYWORDS = {"type", "enum", "items", "default", "description", *_BOUNDS, *_STRINGS}
 _TYPES = {"string": str, "integer": int, "number": float, "boolean": bool}
+
+
+def _validate_enum(
+    value: Any,
+    handler: ValidatorFunctionWrapHandler,
+    *,
+    choices: tuple[Any, ...],
+    adapter: TypeAdapter[Any] | None,
+) -> Any:
+    """Check membership by type and value, preserving the declared output type."""
+    validated = adapter.validate_python(value, strict=True) if adapter is not None else value
+    if not any(type(value) is type(choice) and value == choice for choice in choices):
+        raise ValueError("value does not match an enum member")
+    handler(value)
+    # Literal can substitute an equal member of another type; keep our validated value.
+    return validated
 
 
 def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo]:
@@ -53,15 +70,21 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
         choices = schema["enum"]
         if not isinstance(choices, list) or not choices:
             raise ValueError(f"{path}: enum must be a non-empty list")
+        adapter = TypeAdapter(annotation, config=ConfigDict(strict=True)) if kind else None
+        if adapter is not None:
+            for choice in choices:
+                try:
+                    adapter.validate_python(choice, strict=True)
+                except ValidationError:
+                    raise ValueError(
+                        f"{path}: enum member does not match the declared type"
+                    ) from None
         # Enum values are runtime schema data rather than static type arguments.
         literal = cast(Any, Literal)[tuple(choices)]
-        if kind is None:
-            annotation = literal
-        else:
-            adapter = TypeAdapter(annotation, config=ConfigDict(strict=True))
-            annotation = Annotated[
-                literal, BeforeValidator(partial(adapter.validate_python, strict=True))
-            ]
+        annotation = Annotated[
+            literal,
+            WrapValidator(partial(_validate_enum, choices=tuple(choices), adapter=adapter)),
+        ]
     constraints: dict[str, Any] = {}
     for keyword, constraint in _BOUNDS.items():
         if keyword in schema:
@@ -74,13 +97,21 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
                 raise ValueError(f"{path}: {keyword} requires type 'string'")
             constraints[constraint] = schema[keyword]
     annotation = Annotated[annotation, Field(description=schema.get("description"), **constraints)]
+    default = schema.get("default", ...)
     if "default" in schema:
-        value = schema["default"]
         try:
-            TypeAdapter(annotation, config=ConfigDict(strict=True)).validate_python(value)
+            default = TypeAdapter(annotation, config=ConfigDict(strict=True)).validate_python(
+                default
+            )
         except ValidationError as err:
-            raise ValueError(f"{path}: default {value!r} does not match the schema: {err}") from err
-    field = Field(default=schema.get("default", ...))
+            reasons = ", ".join(
+                error["type"]
+                for error in err.errors(
+                    include_input=False, include_url=False, include_context=False
+                )
+            )
+            raise ValueError(f"{path}: default does not match the schema ({reasons})") from None
+    field = cast(FieldInfo, Field(default=default))
     return annotation, field
 
 
@@ -99,6 +130,9 @@ def compile_object_schema(
         number, boolean, and array, with recursive items, enum, numeric bounds,
         string length and pattern constraints, default, and description.
         Properties without a default are required; extra fields are forbidden.
+        Enum membership compares both type and value; explicitly typed members
+        must satisfy the declared strict type. Number outputs, including
+        defaults, are floats even when an integer enum member is used.
 
     Returns
     -------
