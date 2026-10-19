@@ -38,6 +38,29 @@ used for human-authored Plan and Limits settings do not apply to these runtime
 records. Component configuration validation retains its separate rule: only
 declared top-level field names or aliases are shown, with deeper locations redacted.
 
+## LocalExecutor
+
+`LocalExecutor` runs each job on this POSIX host in a fresh workspace,
+`<workspace_root>/<job id>-<random>`, and in its own process group. The command
+starts only after `Job.on_started` returns. On a timeout or a cancel, the group
+gets SIGTERM, then `grace_s`, then `collect` for the partial output, then SIGKILL.
+A blocked `collect` cannot delay the kill. The cancel-path output goes to
+`Job.on_partial`. Logs live at `swarm/stdout.log` and `swarm/stderr.log` and are
+uploaded to `artifact_root`, with `logs_ref = "sha256:<stdout>:<stderr>"`.
+
+```python
+from swarm_arena.executor import LocalExecutor
+
+executor = LocalExecutor(max_concurrent=2, workspace_root="/tmp/my-workspaces")
+executor.preflight()  # RuntimeError on a non-POSIX system
+# output = await executor.submit(job)
+```
+
+Install swarm-arena in the interpreter's own environment (a venv or its
+site-packages). The launcher runs as `python -I`, which reads neither
+`PYTHONPATH` nor the user site. This is not strong isolation: the tool runs as
+the same user, with resource limits but no sandbox.
+
 ```{eval-rst}
 .. automodule:: swarm_arena.executor
    :members:

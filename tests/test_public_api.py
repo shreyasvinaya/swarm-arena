@@ -69,6 +69,7 @@ PUBLIC["swarm_arena.protocol"] += [
 ]
 PUBLIC["swarm_arena.tool"] += ["Tool", "Action"]
 PUBLIC["swarm_arena.executor"] += ["Executor", "Job"]
+PUBLIC["swarm_arena.executor"] += ["LocalExecutor"]
 PUBLIC["swarm_arena"] += ["RunConfig"]
 PUBLIC["swarm_arena"] += ["ScriptTool"]
 PUBLIC["swarm_arena.config"] += [

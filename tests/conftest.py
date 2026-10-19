@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 
@@ -57,3 +58,8 @@ def artifact_root(tmp_path: Path) -> str:
 @pytest.fixture
 def artifacts(artifact_root: str) -> ArtifactStore:
     return ArtifactStore(open_store(artifact_root))
+
+
+@pytest.fixture
+def local_executor(tmp_path: Path) -> LocalExecutor:
+    return LocalExecutor(workspace_root=str(tmp_path / "ws"))

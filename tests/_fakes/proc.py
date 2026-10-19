@@ -1,6 +1,7 @@
 """Process helpers shared by the supervisor, procinfo, and executor tests."""
 
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -37,3 +38,15 @@ async def wait_for_file(path: Path, timeout_s: float) -> None:
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{path.name} did not appear")
         await anyio.sleep(0.05)
+
+
+def spawn_group(argv: list[str]) -> subprocess.Popen[bytes]:
+    """Start ``argv`` as the leader of a new process group (call through a thread in async code)."""
+    return subprocess.Popen(argv, start_new_session=True)
+
+
+def reap(proc: subprocess.Popen[bytes]) -> None:
+    """Kill ``proc`` if it still runs, then reap it, so it is not left as a zombie."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()

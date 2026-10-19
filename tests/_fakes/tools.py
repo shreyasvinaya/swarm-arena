@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -9,7 +10,14 @@ from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
 from swarm_arena._model.results import Candidate
-from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    Command,
+    CompletedRun,
+    FileRef,
+    RunStatus,
+    ToolOutput,
+    ToolRequest,
+)
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
@@ -167,3 +175,20 @@ class HumanOnlyWidget(Configurable):
 
         command: list[str] = []
         timeout_s: float | None = None
+
+
+# --- Task 17 ---
+
+RELEASE = threading.Event()
+
+
+class BlockingCollectTool(PyTool):
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        RELEASE.wait(30)
+        return super().collect(request, workspace, run)
+
+
+class GhostFileTool(PyTool):
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        ghost = FileRef(name="ghost.txt", path="out/ghost.txt", sha256="0" * 64, size=0)
+        return ToolOutput(status=run.status, data={"x": 1}, files=[ghost])
