@@ -52,7 +52,7 @@ _INVALID_COLLECT_NOTE: Final = f"swarm-arena: {_NOT_AN_OUTPUT}"  # as note_in_lo
 _root: str | None = None
 
 _C = TypeVar("_C", Tool, Check, Judge)
-_M = TypeVar("_M", ToolOutput, CheckResult, Score)
+_M = TypeVar("_M", CheckResult, Score)
 
 
 def _artifact_root() -> str:
@@ -303,8 +303,10 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
         _stderr_tail(out).splitlines()
     ):
         raise _fail(message)
-    if _strict_copy(ToolOutput, out) is None:  # another executor may pass it on unvalidated
-        raise _fail(message)
+    try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
+        ToolOutput.model_validate(out.model_dump(warnings=False))
+    except Exception:
+        raise _fail(message) from None
     store = open_store(_artifact_root())
     for file in out.files:
         if not store.exists(file.sha256):
@@ -406,9 +408,9 @@ async def check_tool(
     with the last 2 KB of its stderr log; if a contract assert fails too, that
     text is a note on the ``AssertionError`` instead.
 
-    After the run, the output must be a ``ToolOutput`` that is valid in strict
-    mode as it is (finite JSON data, nothing that a lax validation would
-    repair), and its files must be in the artifact store. ``fingerprint()`` must
+    After the run, the output must be a valid ``ToolOutput`` (finite JSON data;
+    it is validated again in lax mode, as the core does), and its files must
+    be in the artifact store. ``fingerprint()`` must
     give the same nonempty str twice and must not depend on ``logs_ref`` or
     the run times. ``collect()`` is also called once on an empty workspace with
     a failed run: it may raise, but it must not report ``ok``.

@@ -5,7 +5,7 @@ import traceback
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -42,8 +42,9 @@ from pydantic import ValidationError
 from swarm_arena import FunctionTool, Goal, Limits, ProgramJudge, Ref, ScriptCheck, ScriptTool
 from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._model.ids import run_tag
+from swarm_arena.board import Candidate
 from swarm_arena.executor import Job, LocalExecutor
-from swarm_arena.scoring import Check, Judge, Lexicographic
+from swarm_arena.scoring import Check, CheckContext, CheckResult, Judge, Lexicographic
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
 from swarm_arena.testing._conformance import _artifact_root
 from swarm_arena.tool import FileRef, FileSet, RunStatus, ToolOutput, ToolRequest
@@ -394,18 +395,24 @@ async def test_job_is_staged_like_the_core() -> None:
         ),
         (ToolOutput.model_construct(data={}), VALID_OUTPUT),  # no status at all
         (ToolOutput.model_construct(status=RunStatus.ERROR, logs_ref=5), VALID_OUTPUT),
-        (ToolOutput.model_construct(status="ok"), VALID_OUTPUT),  # lax would make it an enum
-        (  # strict accepts it, but validation would repair it (milliseconds only)
-            ToolOutput(status=RunStatus.OK).model_copy(
-                update={"started_at": datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)}
-            ),
-            VALID_OUTPUT,
-        ),
     ],
 )
 async def test_executor_contract_is_asserted(output: object, match: str) -> None:
     with pytest.raises(AssertionError, match=match):
         await check_tool(PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(output))
+
+
+async def test_custom_executor_with_microsecond_times_passes() -> None:
+    # The core re-validates a ToolOutput in lax mode; timestamp precision is not a contract.
+    when = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
+    out = ToolOutput(status=RunStatus.OK, data={"x": 1})
+    out = out.model_copy(update={"started_at": when, "ended_at": when})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        checked = await check_tool(
+            PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(out)
+        )
+    assert (checked.data, checked.started_at, checked.ended_at) == ({"x": 1}, when, when)
 
 
 async def test_preflight_runs_before_any_job() -> None:
@@ -461,6 +468,16 @@ async def test_default_executor_is_closed_and_ref_name_wins(
 async def test_check_contract_is_asserted(check: Check, match: str) -> None:
     with pytest.raises(AssertionError, match=match):
         await check_check(check, make_candidate(ok()))
+
+
+async def test_check_result_is_validated_in_strict_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def one(self: Check, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        # Lax mode makes 1 into True, and 1 == True, so only strict mode refuses it.
+        return CheckResult.model_construct(check="always-pass", passed=cast(Any, 1))
+
+    monkeypatch.setattr(AlwaysPass, "check", one)
+    with pytest.raises(AssertionError, match=r"Check\.check\(\) must return a valid CheckResult"):
+        await check_check(AlwaysPass(), make_candidate(ok()))
 
 
 @pytest.mark.parametrize("check", [AlwaysPass(), GoalCheck()])
