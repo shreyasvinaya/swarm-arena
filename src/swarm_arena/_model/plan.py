@@ -16,7 +16,7 @@ from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import JsonValue, Origin, StoredModel, _SafeModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal, _Slug
-from swarm_arena._model.limits import Limits, _sanitize_human_validation
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref, RefField, unique_names
 from swarm_arena._model.toml_io import dumps_toml, read_toml
 
@@ -45,12 +45,12 @@ class Resources(_SafeModel):
     0.0
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     cpus: float = Field(default=1.0, gt=0)
     gpus: float = Field(default=0.0, ge=0)
     memory_gib: float | None = Field(default=None, gt=0)
     custom: dict[str, Annotated[float, Field(ge=0)]] = {}
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class PartSpec(_SafeModel):
@@ -77,13 +77,13 @@ class PartSpec(_SafeModel):
     True
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     name: _Slug
     goal: Goal
     checks: list[RefField] | None = None
     judges: list[RefField] | None = None
     ranking: str | None = None
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class AgentSpec(_SafeModel):
@@ -113,14 +113,14 @@ class AgentSpec(_SafeModel):
     1
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     name: _Slug
     rationale: _Rationale
     tool: RefField
     manager: RefField
     replicates: int = Field(default=1, ge=1)
     resources: Resources = Resources()
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class TeamSpec(_SafeModel):
@@ -145,12 +145,12 @@ class TeamSpec(_SafeModel):
     True
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     name: _Slug
     rationale: _Rationale
     part: str | None = None
     agents: list[AgentSpec]
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class RoundSpec(_SafeModel):
@@ -172,6 +172,8 @@ class RoundSpec(_SafeModel):
     >>> RoundSpec(fidelity="full").effective_fidelity()
     'full'
     """
+
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
 
     tool_overrides: dict[str, Any] = {}
     tool_timeout_s: float | None = Field(default=None, gt=0)
@@ -204,8 +206,6 @@ class RoundSpec(_SafeModel):
         except (TypeError, ValueError):
             raise ValueError("tool_overrides: expected finite JSON values") from None
         return sha256_hex(encoded)[:12]
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class ConvergeSpec(_SafeModel):
@@ -240,6 +240,8 @@ class ConvergeSpec(_SafeModel):
     'select'
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     mode: Literal["select", "team"] = "select"
     top_n: int = Field(default=2, ge=1)
     distinct: bool = True
@@ -249,8 +251,6 @@ class ConvergeSpec(_SafeModel):
     round: RoundSpec | None = None
     parents_per_part: int = Field(default=1, ge=1)
     max_join_attempts: int = Field(default=1, ge=0)
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
 
 class FlowSpec(_SafeModel):
@@ -273,14 +273,14 @@ class FlowSpec(_SafeModel):
     '*'
     """
 
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
+
     sender: str
     recipient: str
     rationale: str
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)
 
-
-class Plan(StoredModel, _SafeModel):
+class Plan(StoredModel):
     """
     Describe a versioned goal-solving plan without importing its components.
 
@@ -328,6 +328,8 @@ class Plan(StoredModel, _SafeModel):
     >>> plan.ranking_name()
     'score'
     """
+
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
 
     schema_kind: ClassVar[str] = "plan"
     goal: Goal
@@ -558,5 +560,3 @@ class Plan(StoredModel, _SafeModel):
         3
         """
         return len(self.rounds) or limits.max_rounds
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_validation)

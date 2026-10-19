@@ -5,10 +5,9 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
-from pydantic import ConfigDict, field_validator, model_validator
+from pydantic import field_validator
 
 from swarm_arena._model.base import FrozenModel, StoredModel
-from swarm_arena._model.limits import _sanitize_validation
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.tooling import Command, ParentRef, ToolOutput, ToolRequest
@@ -95,8 +94,6 @@ class Job:
         []
         """
 
-        model_config = ConfigDict(hide_input_in_errors=True)
-
         root: dict[str, str] = {}
         parents: list[ParentRef] = []
         candidate: "Job.CandidateFiles | None" = None
@@ -109,8 +106,6 @@ class Job:
             for path in root:
                 check_key(path)
             return root
-
-        _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
 
     class CandidateFiles(FrozenModel):
         """
@@ -132,8 +127,6 @@ class Job:
         {}
         """
 
-        model_config = ConfigDict(hide_input_in_errors=True)
-
         request: dict[str, Any]
         output: dict[str, Any]
         files: dict[str, str]
@@ -145,8 +138,6 @@ class Job:
             for path in files:
                 check_key(path)
             return files
-
-        _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
 
     class Started(StoredModel):
         """
@@ -179,7 +170,6 @@ class Job:
         True
         """
 
-        model_config = ConfigDict(hide_input_in_errors=True)
         schema_kind: ClassVar[str] = "job_started"
 
         kind: Literal["process", "dispatch"]
@@ -189,8 +179,6 @@ class Job:
         pgid: int | None = None
         start_time: str | None = None
         task_name: str | None = None
-
-        _sanitize_errors = model_validator(mode="wrap")(_sanitize_validation)
 
     id: str
     kind: Literal["tool", "command"]

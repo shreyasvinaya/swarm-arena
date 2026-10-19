@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidate model validation diagnostics: rejected inputs and validator context
+  are removed from `errors()` and `json()` as well as text and tracebacks. Human
+  plan/settings models show top-level typo names; other models use `<field>`.
+  All deeper locations collapse to `<…>`, custom error codes become `invalid`,
+  and result errors expose structured locations and built-in codes. Fixed safe
+  validation reasons remain; catalog human-only violations use a fixed message.
+
 ### Added
 
 - `ScriptTool`: bring your own files and script, with `list_files` and `read_file` actions.

@@ -195,21 +195,21 @@ def test_executor_requires_all_abstract_operations() -> None:
 @pytest.mark.parametrize(
     ("model", "data", "location"),
     [
-        (Job.Stage, {"sentinel-secret": "sentinel-value"}, ("<key>",)),
+        (Job.Stage, {"sentinel-secret": "sentinel-value"}, ("<field>",)),
         (
             Job.CandidateFiles,
             {"request": {}, "output": {}, "files": {}, "sentinel-secret": "sentinel-value"},
-            ("<key>",),
+            ("<field>",),
         ),
         (
             Job.Started,
             {"kind": "process", "job_id": "x-1", "sentinel-secret": "sentinel-value"},
-            ("<key>",),
+            ("<field>",),
         ),
         (
             Job.Stage,
             {"candidate": {"request": {}, "output": {}, "files": {}, "sentinel-secret": 1}},
-            ("candidate", "<key>"),
+            ("candidate", "<…>"),
         ),
         (
             Job.Stage,
@@ -218,7 +218,7 @@ def test_executor_requires_all_abstract_operations() -> None:
                     {"candidate_id": "c", "run_id": "r", "tool_identity": "t", "sentinel-secret": 1}
                 ]
             },
-            ("parents", 0, "<key>"),
+            ("parents", "<…>"),
         ),
     ],
 )

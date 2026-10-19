@@ -115,7 +115,7 @@ def test_limits_errors_do_not_leak_values() -> None:
         ({"max_roundz": "sentinel-secret-92845"}, "max_roundz"),
         (
             {"default_run_reservation": {"tokenz": "sentinel-secret-92845"}},
-            "default_run_reservation.tokenz",
+            "default_run_reservation.<…>",
         ),
     ],
 )

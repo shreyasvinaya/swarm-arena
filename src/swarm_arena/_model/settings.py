@@ -1,60 +1,22 @@
 """Define human-controlled secrets, tracing, gateway, and cache settings."""
 
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, Field, ModelWrapValidatorHandler, ValidationError, model_validator
-from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic import Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from swarm_arena._model.base import LLMRole, _SafeModel
-from swarm_arena._model.limits import Limits, _safe_location
-
-
-def _sanitize_config(
-    cls: type[BaseModel],
-    data: Any,
-    handler: ModelWrapValidatorHandler[Any],
-    *,
-    show_unknown_fields: bool = False,
-) -> Any:
-    """Strip rejected values, dynamic locations, and untrusted validator messages."""
-    try:
-        return handler(data)
-    except ValidationError as err:
-        errors: list[InitErrorDetails] = []
-        for item in err.errors(include_input=False, include_url=False, include_context=False):
-            # Only our tagged errors contain reviewed messages with identifiers, not values.
-            reason = item["msg"] if item["type"] == "arena_config" else item["type"]
-            errors.append(
-                InitErrorDetails(
-                    type=PydanticCustomError("arena_config", "{reason}", {"reason": reason}),
-                    loc=_safe_location(
-                        cls,
-                        item["loc"],
-                        extra_field=show_unknown_fields and reason == "extra_forbidden",
-                    ),
-                    input=None,
-                )
-            )
-        raise ValidationError.from_exception_data(cls.__name__, errors, hide_input=True) from None
-
-
-def _sanitize_human_config(
-    cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
-) -> Any:
-    """Retain setting typo identifiers through nested wrappers, hiding values and mapping keys."""
-    return _sanitize_config(cls, data, handler, show_unknown_fields=True)
+from swarm_arena._model.limits import Limits
 
 
 class _ConfigModel(_SafeModel):
-    """Apply secret-safe validation to configuration models."""
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_config)
+    """Inherit the shared hidden-key configuration validation policy."""
 
 
 class _HumanConfigModel(_ConfigModel):
-    """Show unknown human-authored setting names without exposing rejected values."""
+    """Show human-authored setting typo identifiers without rejected values."""
 
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_config)
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
 
 
 class SecretsPolicy(_HumanConfigModel):
@@ -234,5 +196,3 @@ class CachePolicy(_HumanConfigModel):
         if self.backend == "redis" and not self.redis_url_env:
             raise PydanticCustomError("arena_config", "redis backend requires redis_url_env")
         return self
-
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_human_config)

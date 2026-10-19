@@ -13,11 +13,11 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from swarm_arena._model.base import CatalogKind, LLMRole
+from swarm_arena._model.base import _HUMAN_ONLY_REASONS, CatalogKind, LLMRole, _SafeModel
 from swarm_arena._model.goal import _Slug
 from swarm_arena._model.ref import Ref, load_object
 from swarm_arena._model.schema import compile_object_schema
-from swarm_arena._model.settings import _ConfigModel, _sanitize_config
+from swarm_arena._model.settings import _ConfigModel
 
 
 class ModelSpec(_ConfigModel):
@@ -124,11 +124,10 @@ class ModelSpec(_ConfigModel):
         """
         return self.model.split("/", 1)[0]
 
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_config)
-
 
 class ModelCatalog(
-    RootModel[dict[Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")], ModelSpec]]
+    RootModel[dict[Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")], ModelSpec]],
+    _SafeModel,
 ):
     """
     Map human-approved aliases to model specifications.
@@ -147,8 +146,7 @@ class ModelCatalog(
     4096
     """
 
-    model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_config)
+    model_config = ConfigDict(frozen=True, extra=None, hide_input_in_errors=True)
 
     def resolve(self, alias: str, role: LLMRole) -> ModelSpec:
         """
@@ -270,8 +268,6 @@ class CatalogEntry(_ConfigModel):
             **fields,
         )
 
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_config)
-
 
 class PlannerCatalog(_ConfigModel):
     """
@@ -311,10 +307,12 @@ class PlannerCatalog(_ConfigModel):
                 ) from None
             for key in entry.settable:
                 if key in human_only:
+                    # Keep built-in field identifiers as fixed diagnostics. Arbitrary
+                    # component field names need no interpolation into an error.
+                    reason = _HUMAN_ONLY_REASONS.get(key, "human-only field cannot be settable")
                     raise PydanticCustomError(
                         "arena_config",
-                        "catalog entry {name}: human-only field {field} cannot be settable",
-                        {"name": repr(entry.name), "field": repr(key)},
+                        reason,
                     )
         return self
 
@@ -382,5 +380,3 @@ class PlannerCatalog(_ConfigModel):
             ):
                 return entry
         return None
-
-    _sanitize_final_errors = model_validator(mode="wrap")(_sanitize_config)

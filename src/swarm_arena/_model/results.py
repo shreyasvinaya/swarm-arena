@@ -3,13 +3,9 @@
 import math
 import re
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, Self, get_args, get_origin
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import (
-    BaseModel,
-    ConfigDict,
-    ModelWrapValidatorHandler,
-    ValidationError,
     field_validator,
     model_validator,
 )
@@ -24,71 +20,7 @@ def _finite_key(key: tuple[float, ...]) -> bool:
     return bool(key) and all(math.isfinite(value) for value in key)
 
 
-_SAFE_REASONS = frozenset(
-    {
-        "key needs at least one value",
-        "score key values must be finite",
-        "overlay keys must be normalized workspace paths",
-        "overlay values must be 64 lowercase hex characters",
-        "title must be nonempty, single-line, and at most 120 characters",
-        "text must be at most 1500 characters",
-        "evidence needs at least one id unless the author is human",
-        "schema_version must be a positive integer",
-    }
-)
-
-
-def _safe_location(
-    model: type[BaseModel], location: tuple[str | int, ...]
-) -> tuple[str | int, ...]:
-    """Retain schema fields and list indices, replacing data-derived key segments."""
-    annotation: Any = model
-    safe: list[str | int] = []
-    for segment in location:
-        origin = get_origin(annotation)
-        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            info = annotation.model_fields.get(segment) if isinstance(segment, str) else None
-            safe.append(segment if info is not None else "<key>")
-            annotation = info.annotation if info is not None else Any
-        elif origin in (list, tuple) and isinstance(segment, int):
-            safe.append(segment)
-            annotation = get_args(annotation)[0]
-        else:
-            safe.append("<key>")
-            annotation = get_args(annotation)[1] if origin is dict else Any
-    return tuple(safe)
-
-
-class _ResultModel(FrozenModel):
-    """Keep validation diagnostics free of supplied values and mapping keys."""
-
-    model_config = ConfigDict(hide_input_in_errors=True)
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def _safe_errors(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
-        """Expose schema field locations and fixed reasons without exception chains."""
-        try:
-            return handler(data)
-        except ValidationError as exc:
-            summaries: list[str] = []
-            for error in exc.errors(include_input=False, include_url=False, include_context=False):
-                location = _safe_location(cls, error["loc"])
-                message = error["msg"].removeprefix("Value error, ")
-                if message in _SAFE_REASONS:
-                    reason = message
-                elif (
-                    error["type"] == "value_error"
-                    and "is newer than this swarm-arena supports" in message
-                ):
-                    reason = "schema_version is newer than this swarm-arena supports"
-                else:
-                    reason = error["type"]
-                summaries.append(f"{location}: {reason}")
-            raise ValueError("; ".join(summaries)) from None
-
-
-class CheckResult(_ResultModel):
+class CheckResult(FrozenModel):
     """
     Record whether a candidate passes a named check.
 
@@ -116,7 +48,7 @@ class CheckResult(_ResultModel):
     details: dict[str, Any] = {}
 
 
-class Score(_ResultModel):
+class Score(FrozenModel):
     """
     Rank a candidate using a nonempty finite lexicographic key.
 
@@ -268,7 +200,7 @@ class AgentStatus(StrEnum):
     WATCHDOG_STOPPED = "watchdog_stopped"
 
 
-class Candidate(StoredModel, _ResultModel):
+class Candidate(StoredModel):
     """
     Store a tool result and its provenance, checks, and effective file overlay.
 
@@ -386,7 +318,7 @@ class Candidate(StoredModel, _ResultModel):
         return any(not check.passed for check in self.checks)
 
 
-class Learning(StoredModel, _ResultModel):
+class Learning(StoredModel):
     """
     Store a short, evidence-backed learning for a problem namespace.
 
@@ -498,7 +430,7 @@ class Learning(StoredModel, _ResultModel):
         return self.author.startswith("human:")
 
 
-class LLMCall(StoredModel, _ResultModel):
+class LLMCall(StoredModel):
     """
     Store model-call usage, cost, provenance, and optional payload references.
 

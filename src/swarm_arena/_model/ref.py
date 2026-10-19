@@ -1,30 +1,29 @@
 """Reference components by import path and validate their configuration."""
 
 import importlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import cache
-from typing import Annotated, Any, LiteralString, Self, TypeVar, cast, get_args
+from typing import Annotated, Any, TypeVar
 
 from pydantic import (
-    AliasChoices,
-    AliasPath,
     BaseModel,
     BeforeValidator,
-    ConfigDict,
     Field,
-    ValidationError,
-    model_validator,
 )
-from pydantic.config import ExtraValues
-from pydantic_core import ErrorType, InitErrorDetails, PydanticCustomError
 
 from swarm_arena._errors import ConfigError
-from swarm_arena._model.base import FrozenModel, _SafeModel
+from swarm_arena._model.base import (
+    _VALIDATION_ERROR_TYPES,
+    FrozenModel,
+    _SafeModel,
+    _sanitize_validation_error,
+)
 
-_CONFIG_ERROR_TYPES = frozenset(get_args(ErrorType))
+# Compatibility for the parallel FunctionTool fix; the allowlist lives only in base.py.
+_CONFIG_ERROR_TYPES = _VALIDATION_ERROR_TYPES
 
 
-class EmptyConfig(BaseModel):
+class EmptyConfig(_SafeModel):
     """
     Reject settings for a component with no configurable fields.
 
@@ -33,8 +32,6 @@ class EmptyConfig(BaseModel):
     >>> EmptyConfig().model_dump()
     {}
     """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class Configurable:
@@ -185,122 +182,8 @@ def load_object(path: str) -> object:
     return obj
 
 
-def _safe_config_location(
-    config_model: type[BaseModel], location: tuple[str | int, ...]
-) -> tuple[str | int, ...]:
-    """Show only a declared top-level field or alias, redacting all deeper segments."""
-    names = set(config_model.model_fields)
-    for field in config_model.model_fields.values():
-        if field.alias is not None:
-            names.add(field.alias)
-        alias = field.validation_alias
-        choices = alias.choices if isinstance(alias, AliasChoices) else [alias]
-        for choice in choices:
-            if isinstance(choice, str):
-                names.add(choice)
-            elif isinstance(choice, AliasPath) and isinstance(choice.path[0], str):
-                names.add(choice.path[0])
-    first = location[0] if location else None
-    name = first if isinstance(first, str) and first in names else "<field>"
-    return (name, "<…>") if len(location) > 1 else (name,)
-
-
-def _config_error_details(model_cls: type[BaseModel], error: Exception) -> list[InitErrorDetails]:
-    """Share the component location and built-in error-type rule across entry points."""
-    if not isinstance(error, ValidationError):
-        return [
-            InitErrorDetails(type=PydanticCustomError("invalid", "invalid"), loc=(), input=None)
-        ]
-    details: list[InitErrorDetails] = []
-    for item in error.errors(include_input=False, include_url=False, include_context=False):
-        code = cast(
-            LiteralString, item["type"] if item["type"] in _CONFIG_ERROR_TYPES else "invalid"
-        )
-        details.append(
-            InitErrorDetails(
-                type=PydanticCustomError(code, code),
-                loc=_safe_config_location(model_cls, item["loc"]),
-                input=None,
-            )
-        )
-    return details
-
-
-def _sanitize_config_validation(
-    cls: type[BaseModel], data: Any, handler: Callable[[Any], Any]
-) -> Any:
-    """Rebuild validation errors without input, custom messages, or dynamic locations."""
-    try:
-        return handler(data)
-    except Exception as error:
-        raise ValidationError.from_exception_data(
-            cls.__name__, _config_error_details(cls, error), hide_input=True
-        ) from None
-
-
 class _ConfigInputModel(_SafeModel):
-    """Sanitize component and tool-input validation, including JSON parse failures."""
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_config_validation)
-
-    @classmethod
-    def model_validate_json(
-        cls,
-        json_data: str | bytes | bytearray,
-        *,
-        strict: bool | None = None,
-        extra: ExtraValues | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """
-        Validate JSON without exposing rejected input in error details.
-
-        Parameters
-        ----------
-        json_data : str or bytes or bytearray
-            JSON document to validate.
-        strict : bool or None, optional
-            Override strict validation.
-        extra : {'allow', 'ignore', 'forbid'} or None, optional
-            Override handling of extra fields.
-        context : Any, optional
-            Context passed to validators.
-        by_alias : bool or None, optional
-            Accept validation aliases.
-        by_name : bool or None, optional
-            Accept model field names.
-
-        Returns
-        -------
-        Self
-            Validated model.
-
-        Raises
-        ------
-        ValidationError
-            If parsing or validation fails; diagnostics omit rejected values.
-
-        Examples
-        --------
-        >>> from swarm_arena import ScriptTool
-        >>> ScriptTool.Config.model_validate_json('{"command": ["x"]}').command
-        ['x']
-        """
-        validate = super().model_validate_json
-        return _sanitize_config_validation(
-            cls,
-            json_data,
-            lambda data: validate(
-                data,
-                strict=strict,
-                extra=extra,
-                context=context,
-                by_alias=by_alias,
-                by_name=by_name,
-            ),
-        )
+    """Inherit shared component/input validation with hidden unknown keys."""
 
 
 def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) -> BaseModel:
@@ -334,11 +217,11 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         return model_cls.model_validate(data)
     except Exception as error:
-        details = _config_error_details(model_cls, error)
+        safe = _sanitize_validation_error(model_cls, error)
         summary = "; ".join(
-            (".".join(str(part) for part in item.get("loc", ())) + ": " if item.get("loc") else "")
-            + str(item["type"])
-            for item in details
+            (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "")
+            + item["type"]
+            for item in safe.errors(include_input=False, include_url=False, include_context=False)
         )
         raise ConfigError(f"{where}: {summary}") from None
 

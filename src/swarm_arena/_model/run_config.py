@@ -1,9 +1,9 @@
 """Define versioned human-only run configuration and TOML persistence."""
 
 from pathlib import Path
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, Literal
 
-from pydantic import ConfigDict, Field, ValidationError, model_validator
+from pydantic import Field, ValidationError
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import StoredModel
@@ -15,7 +15,6 @@ from swarm_arena._model.settings import (
     GatewayConfig,
     SecretsPolicy,
     TracingConfig,
-    _sanitize_human_config,
 )
 from swarm_arena._model.toml_io import dumps_toml, read_toml
 
@@ -74,7 +73,7 @@ class RunConfig(StoredModel):
     0.15
     """
 
-    model_config = ConfigDict(hide_input_in_errors=True)
+    _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
     schema_kind: ClassVar[str] = "run_config"
     limits: Limits = Limits()
     reserve_fraction: float = Field(default=0.15, ge=0, lt=1)
@@ -157,5 +156,3 @@ class RunConfig(StoredModel):
         True
         """
         return dumps_toml(self.model_dump(mode="json", exclude_none=True))
-
-    _sanitize_errors = model_validator(mode="wrap")(_sanitize_human_config)
