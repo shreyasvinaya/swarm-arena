@@ -45,10 +45,29 @@ class CheckContext:
 
     Examples
     --------
+    >>> import asyncio
+    >>> from swarm_arena import Goal, Resources
+    >>> from swarm_arena.executor import Executor, Job
     >>> from swarm_arena.scoring import CheckContext
-    >>> context = CheckContext(goal=goal, executor=executor,  # doctest: +SKIP
-    ...                        artifact_root='/artifacts')
-    >>> output = await context.execute(command)  # doctest: +SKIP
+    >>> from swarm_arena.tool import Command, RunStatus, ToolOutput
+    >>> class RecordingExecutor(Executor):
+    ...     def __init__(self) -> None:
+    ...         self.jobs: list[Job] = []
+    ...     async def submit(self, job: Job) -> ToolOutput:
+    ...         self.jobs.append(job)
+    ...         return ToolOutput(status=RunStatus.OK)
+    ...     async def capacity(self) -> Resources | None:
+    ...         return None
+    ...     async def aclose(self) -> None:
+    ...         return None
+    >>> executor = RecordingExecutor()
+    >>> context = CheckContext(goal=Goal(id='g', namespace='example'),
+    ...                        executor=executor, artifact_root='/artifacts')
+    >>> output = asyncio.run(context.execute(Command(argv=['example'])))
+    >>> output.status == RunStatus.OK
+    True
+    >>> executor.jobs[0].command.argv
+    ['example']
     """
 
     def __init__(
@@ -109,10 +128,8 @@ class CheckContext:
 
         Examples
         --------
-        >>> from swarm_arena.tool import Command
-        >>> output = await context.execute(  # doctest: +SKIP
-        ...     Command(argv=['python', 'checks/check.py']),
-        ...     files=manifest, candidate=candidate)
+        The :class:`CheckContext` example uses ``asyncio.run(context.execute(...))``
+        with an in-memory recording executor and inspects the submitted command.
         """
         stage = (
             plan_script_stage(
@@ -167,9 +184,24 @@ class Check(Configurable, ABC):
 
     Examples
     --------
-    >>> from swarm_arena.scoring import Check
+    >>> import asyncio
+    >>> from unittest.mock import Mock
+    >>> from swarm_arena.board import Candidate
+    >>> from swarm_arena.scoring import Check, CheckContext, CheckResult
+    >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
     >>> sorted(Check.__abstractmethods__)
     ['check']
+    >>> class ExampleCheck(Check):
+    ...     name = 'example'
+    ...     async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+    ...         return CheckResult(check=self.name, passed=not candidate.gated_out)
+    >>> check = ExampleCheck()
+    >>> check.preflight()
+    >>> candidate = Candidate(id='c1', run_id='r', goal_id='g', team='t', agent='a',
+    ...     round=1, request=ToolRequest(), output=ToolOutput(status=RunStatus.OK))
+    >>> result = asyncio.run(check.check(candidate, Mock(spec=CheckContext)))
+    >>> (result.check, result.passed, check.feedback)
+    ('example', True, 'reasons')
     """
 
     name: ClassVar[str]
@@ -183,7 +215,7 @@ class Check(Configurable, ABC):
 
         Examples
         --------
-        >>> check.preflight()  # doctest: +SKIP
+        The :class:`Check` example calls ``check.preflight()`` without I/O.
         """
 
     @abstractmethod
@@ -205,5 +237,6 @@ class Check(Configurable, ABC):
 
         Examples
         --------
-        >>> result = await check.check(candidate, context)  # doctest: +SKIP
+        The :class:`Check` example runs ``check.check(candidate, context)`` with
+        ``asyncio.run`` and inspects the result entirely in memory.
         """

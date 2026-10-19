@@ -57,10 +57,16 @@ class JudgeContext(CheckContext):
 
     Examples
     --------
+    >>> from unittest.mock import Mock
+    >>> from swarm_arena import Goal
+    >>> from swarm_arena.executor import Executor
     >>> from swarm_arena.scoring import JudgeContext
-    >>> context = JudgeContext(goal=goal, executor=executor,  # doctest: +SKIP
-    ...                        artifact_root='/artifacts', batch_id='b1')
-    >>> context.judge_error('c1', 'non-finite key')  # doctest: +SKIP
+    >>> context = JudgeContext(goal=Goal(id='g', namespace='example'),
+    ...     executor=Mock(spec=Executor), artifact_root='/artifacts', batch_id='b1')
+    >>> context.judge_error('c1', 'non-finite key')
+    >>> context.judge_error('c1', 'later reason')
+    >>> (context.batch_id, context.errors)
+    ('b1', {'c1': 'non-finite key'})
     """
 
     def __init__(
@@ -115,7 +121,8 @@ class JudgeContext(CheckContext):
 
         Examples
         --------
-        >>> context.judge_error('c1', 'non-finite key')  # doctest: +SKIP
+        The :class:`JudgeContext` example calls ``context.judge_error(...)`` twice
+        and verifies that the first reason wins.
         """
         self.errors.setdefault(candidate_id, reason)
 
@@ -137,9 +144,32 @@ class Judge(Configurable, ABC):
 
     Examples
     --------
-    >>> from swarm_arena.scoring import Judge
+    >>> import asyncio
+    >>> from collections.abc import Sequence
+    >>> from unittest.mock import Mock
+    >>> from swarm_arena import Goal, Score
+    >>> from swarm_arena.board import Candidate
+    >>> from swarm_arena.scoring import Judge, JudgeContext
+    >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
     >>> sorted(Judge.__abstractmethods__)
     ['judge']
+    >>> class ExampleJudge(Judge):
+    ...     name = 'example'
+    ...     async def judge(self, goal: Goal, candidates: Sequence[Candidate],
+    ...                     ctx: JudgeContext) -> list[Score]:
+    ...         return [Score(key=(1.0,), candidate_id=c.id) for c in candidates]
+    >>> judge = ExampleJudge()
+    >>> judge.preflight()
+    >>> len(judge.rubric_hash())
+    64
+    >>> (judge.panel_hash(), judge.anchor_count(), judge.providers(), judge.models())
+    ('', 0, frozenset(), ())
+    >>> goal = Goal(id='g', namespace='example')
+    >>> candidate = Candidate(id='c1', run_id='r', goal_id=goal.id, team='t', agent='a',
+    ...     round=1, request=ToolRequest(), output=ToolOutput(status=RunStatus.OK))
+    >>> scores = asyncio.run(judge.judge(goal, [candidate], Mock(spec=JudgeContext)))
+    >>> [(s.candidate_id, s.key) for s in scores]
+    [('c1', (1.0,))]
     """
 
     name: ClassVar[str]
@@ -152,7 +182,7 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> judge.preflight()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.preflight()`` without I/O.
         """
 
     def rubric_hash(self) -> str:
@@ -171,7 +201,8 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> digest = judge.rubric_hash()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.rubric_hash()`` and checks its
+        digest length.
         """
         cls = type(self)
         try:
@@ -197,7 +228,7 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> panel = judge.panel_hash()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.panel_hash()`` and gets ``''``.
         """
         return ""
 
@@ -212,7 +243,7 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> anchors = judge.anchor_count()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.anchor_count()`` and gets zero.
         """
         return 0
 
@@ -227,7 +258,7 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> providers = judge.providers()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.providers()`` and gets an empty set.
         """
         return frozenset()
 
@@ -242,7 +273,7 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> models = judge.models()  # doctest: +SKIP
+        The :class:`Judge` example calls ``judge.models()`` and gets an empty tuple.
         """
         return ()
 
@@ -269,7 +300,8 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        >>> scores = await judge.judge(goal, candidates, context)  # doctest: +SKIP
+        The :class:`Judge` example runs ``judge.judge(goal, candidates, context)``
+        with ``asyncio.run`` and inspects the returned candidate scores.
         """
 
 
@@ -285,7 +317,8 @@ def is_finite_score(score: Score) -> bool:
     Returns
     -------
     bool
-        True for a nonempty key containing only finite numbers.
+        True for a nonempty tuple of finite int/float values, excluding bool.
+        False for malformed or missing keys; validation bypasses never raise.
 
     Examples
     --------
@@ -293,7 +326,17 @@ def is_finite_score(score: Score) -> bool:
     >>> is_finite_score(Score.maximize(1.0))
     True
     """
-    return _finite_key(score.key)
+    try:
+        key = score.key
+        return (
+            isinstance(key, tuple)
+            and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool) for value in key
+            )
+            and _finite_key(key)
+        )
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return False
 
 
 def stamp_scores(
@@ -323,18 +366,37 @@ def stamp_scores(
 
     Examples
     --------
-    >>> stamped = stamp_scores(  # doctest: +SKIP
-    ...     scores, judge=judge, judge_name='quality', ids=context.ids, batch_id='b1')
+    >>> from collections.abc import Sequence
+    >>> from swarm_arena import Goal, Score
+    >>> from swarm_arena.board import Candidate
+    >>> from swarm_arena.scoring import Judge, JudgeContext
+    >>> from swarm_arena._model.ids import IdGen
+    >>> class ExampleJudge(Judge):
+    ...     name = 'example'
+    ...     async def judge(self, goal: Goal, candidates: Sequence[Candidate],
+    ...                     ctx: JudgeContext) -> list[Score]:
+    ...         return [Score(key=(1.0,), candidate_id=c.id) for c in candidates]
+    >>> raw = Score(key=(1.0,), candidate_id='c1')
+    >>> [score] = stamp_scores([raw], judge=ExampleJudge(), judge_name='quality',
+    ...                        ids=IdGen('r', 0), batch_id='b1')
+    >>> (score.judge, score.candidate_id, score.batch_id, bool(score.id), raw.id)
+    ('quality', 'c1', 'b1', True, '')
     """
-    return [
-        score.model_copy(
-            update={
-                "id": ids.next("s"),
-                "judge": judge_name,
-                "rubric_hash": judge.rubric_hash(),
-                "panel_hash": score.panel_hash or judge.panel_hash(),
-                "batch_id": score.batch_id or batch_id,
-            }
+    rubric_hash = judge.rubric_hash()
+    panel_hash: str | None = None
+    stamped = []
+    for score in scores:
+        if not score.panel_hash and panel_hash is None:
+            panel_hash = judge.panel_hash()
+        stamped.append(
+            score.model_copy(
+                update={
+                    "id": ids.next("s"),
+                    "judge": judge_name,
+                    "rubric_hash": rubric_hash,
+                    "panel_hash": score.panel_hash or panel_hash,
+                    "batch_id": score.batch_id or batch_id,
+                }
+            )
         )
-        for score in scores
-    ]
+    return stamped

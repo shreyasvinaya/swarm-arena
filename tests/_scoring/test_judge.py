@@ -82,6 +82,32 @@ def test_stamp_scores() -> None:
     assert a.value == raw[0].value
 
 
+@pytest.mark.parametrize("panel", ["", "fallback"])
+@pytest.mark.parametrize("panels", [[], ["own", "owned"], ["own", "", "", "last"]])
+def test_stamp_hashes_once_per_batch(panel: str, panels: list[str]) -> None:
+    class CountingJudge(FixedJudge):
+        rubric_calls = 0
+        panel_calls = 0
+
+        def rubric_hash(self) -> str:
+            self.rubric_calls += 1
+            return f"rubric-{self.rubric_calls}"
+
+        def panel_hash(self) -> str:
+            self.panel_calls += 1
+            return panel
+
+    judge = CountingJudge(CountingJudge.Config(value=1.0))
+    raw = [Score(key=(1.0,), panel_hash=value) for value in panels]
+    ids = IdGen("r", 1)
+    for call in range(1, 3):
+        scores = stamp_scores(raw, judge=judge, judge_name="j", ids=ids, batch_id="b")
+        assert judge.rubric_calls == call
+        assert judge.panel_calls == (call if "" in panels else 0)
+        assert [s.rubric_hash for s in scores] == [f"rubric-{call}"] * len(raw)
+        assert [s.panel_hash for s in scores] == [value or panel for value in panels]
+
+
 def test_stamp_overwrites_core_fields_and_uses_panel_default() -> None:
     class Panel(FixedJudge):
         def panel_hash(self) -> str:
@@ -138,6 +164,40 @@ def test_is_finite_score() -> None:
 @pytest.mark.parametrize("key", [(float("inf"),), (1.0, -float("inf")), (1.0, float("nan"))])
 def test_is_finite_score_model_copy(key: tuple[float, ...]) -> None:
     assert not is_finite_score(Score.maximize(1.0).model_copy(update={"key": key}))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(0.25, id="scalar"),
+        pytest.param(("bad",), id="str-element"),
+        pytest.param((None,), id="none-element"),
+        pytest.param((10**400,), id="overflow"),
+        pytest.param([1.0], id="list-key"),
+        pytest.param((True,), id="bool-element"),
+        pytest.param(None, id="none-key"),
+        pytest.param((), id="empty"),
+        pytest.param((float("inf"),), id="inf"),
+        pytest.param((float("nan"),), id="nan"),
+    ],
+)
+@pytest.mark.parametrize("construction", ["construct", "copy"])
+def test_is_finite_score_rejects_malformed_key(key: object, construction: str) -> None:
+    score = (
+        Score.model_construct(key=key)
+        if construction == "construct"
+        else Score.maximize(1.0).model_copy(update={"key": key})
+    )
+    assert is_finite_score(score) is False
+
+
+def test_is_finite_score_rejects_missing_key() -> None:
+    assert is_finite_score(Score.model_construct()) is False
+
+
+@pytest.mark.parametrize("key", [(0,), (-1, 2.5), (1.0,)])
+def test_is_finite_score_accepts_finite_numeric_tuple(key: tuple[int | float, ...]) -> None:
+    assert is_finite_score(Score.model_construct(key=key)) is True
 
 
 def test_rubric_hash_sanitizes_serialization_errors() -> None:

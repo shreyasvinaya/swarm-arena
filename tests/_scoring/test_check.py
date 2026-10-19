@@ -1,10 +1,9 @@
-from typing import cast
-
 import anyio
 import pytest
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
-from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._exec.executor import Job
+from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.ids import IdGen, run_tag
 from swarm_arena._model.plan import Resources
@@ -30,8 +29,9 @@ async def test_check_contract() -> None:
 
 async def test_execute_builds_a_command_job() -> None:
     ex = RecordingExecutor()
+    goal = GOAL.model_copy(update={"id": "goal-20"})
     ctx = CheckContext(
-        goal=GOAL,
+        goal=goal,
         executor=ex,
         artifact_root="/a",
         run_id="r",
@@ -39,7 +39,7 @@ async def test_execute_builds_a_command_job() -> None:
         secrets_file="/s.env",
         ids=IdGen("r", 1),
     )
-    c = cand(id="c9")
+    c = cand(id="c9", goal_id=goal.id)
     await ctx.execute(
         Command(argv=["python", "checks/check.py"], env=["K"], grace_s=2.0),
         files={"checks/check.py": H1},
@@ -59,6 +59,8 @@ async def test_execute_builds_a_command_job() -> None:
     assert job.stage.candidate is not None
     assert job.env["SWARM_ARENA_CANDIDATE_ID"] == "c9"
     assert job.env["SWARM_ARENA_ROUND"] == "2"
+    assert job.env["SWARM_ARENA_RUN_ID"] == "r"
+    assert job.env["SWARM_ARENA_GOAL_ID"] == goal.id
 
 
 @pytest.mark.parametrize(("configured", "expected"), [(None, 60.0), (30.0, 30.0), (99_999.0, 60.0)])
@@ -88,7 +90,8 @@ async def test_execute_passes_on_started_to_job() -> None:
 
 async def test_execute_without_candidate_and_default_ids() -> None:
     ex = RecordingExecutor()
-    ctx = CheckContext(goal=GOAL, executor=ex, artifact_root="/a", part="p")
+    goal = GOAL.model_copy(update={"id": "goal-20"})
+    ctx = CheckContext(goal=goal, executor=ex, artifact_root="/a", run_id="r", part="p")
     command = Command(argv=["x"])
     resources = Resources(cpus=0.5)
     out = await ctx.execute(command, resources=resources)
@@ -99,13 +102,13 @@ async def test_execute_without_candidate_and_default_ids() -> None:
     assert a.resources is resources
     assert a.stage == Job.Stage()
     assert b.stage.root == {"checks/x.txt": H1}
-    assert a.id == f"x-{run_tag('local')}-e0-0001"
-    assert b.id == f"x-{run_tag('local')}-e0-0002"
+    assert a.id == f"x-{run_tag('r')}-e0-0001"
+    assert b.id == f"x-{run_tag('r')}-e0-0002"
     assert ctx.ids.counters() == {"x": 2}
     assert ctx.part == "p"
     assert a.env == {
-        "SWARM_ARENA_RUN_ID": "local",
-        "SWARM_ARENA_GOAL_ID": "g",
+        "SWARM_ARENA_RUN_ID": "r",
+        "SWARM_ARENA_GOAL_ID": goal.id,
         "SWARM_ARENA_CANDIDATE_ID": "",
         "SWARM_ARENA_TEAM": "",
         "SWARM_ARENA_AGENT": "",
@@ -148,11 +151,8 @@ async def test_execute_stages_effective_and_output_files() -> None:
 
 
 async def test_execute_on_local_executor(
-    request: pytest.FixtureRequest, artifacts: ArtifactStore, artifact_root: str
+    local_executor: LocalExecutor, artifacts: ArtifactStore, artifact_root: str
 ) -> None:
-    # Task 20 is dispatched before Task 17; run this automatically after integration.
-    pytest.importorskip("swarm_arena._exec.local", reason="Task 17 LocalExecutor not integrated")
-    local_executor = cast(Executor, request.getfixturevalue("local_executor"))
     own_hash = await anyio.to_thread.run_sync(artifacts.put_bytes, b"own")
     output_hash = await anyio.to_thread.run_sync(artifacts.put_bytes, b"output")
     c = cand(
