@@ -176,14 +176,25 @@ def test_typed_enum_rejects_members_of_the_wrong_type(
         compile_object_schema("P", {"p": prop})
 
 
-@pytest.mark.parametrize("typed", [False, True])
-@pytest.mark.parametrize(("choice", "other"), [(True, 1), (1, True), (1, 1.0), (1.0, 1)])
+@pytest.mark.parametrize(
+    ("kind", "choice", "other"),
+    [
+        (None, True, 1),
+        (None, 1, True),
+        (None, 1, 1.0),
+        (None, 1.0, 1),
+        ("boolean", True, 1),
+        ("integer", 1, True),
+        ("integer", 1, 1.0),
+        ("number", 1.0, True),
+    ],
+)
 def test_enum_membership_distinguishes_equal_values_of_different_types(
-    choice: Any, other: Any, *, typed: bool
+    kind: str | None, choice: Any, other: Any
 ) -> None:
     prop = {"enum": [choice]}
-    if typed:
-        prop["type"] = {bool: "boolean", int: "integer", float: "number"}[type(choice)]
+    if kind is not None:
+        prop["type"] = kind
     M = compile_object_schema("P", {"p": prop})
     result = M.model_validate({"p": choice}).model_dump()["p"]
     assert type(result) is type(choice)
@@ -221,6 +232,64 @@ def test_typed_enum_keeps_declared_output_type_for_values_and_defaults(
     assert type(M.model_validate({"p": choice}).model_dump()["p"]) is expected_type
     assert type(M().model_dump()["p"]) is expected_type
     assert M.model_json_schema()["properties"]["p"]["const"] == choice
+
+
+@pytest.mark.parametrize("use_default", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "choice", "value", "expected_type"),
+    [
+        ("integer", 1, 1, int),
+        ("boolean", True, True, bool),
+        ("boolean", False, False, bool),
+        ("number", 1, 1, float),
+        ("number", 1, 1.0, float),
+        ("number", 1.0, 1, float),
+        ("number", 1.5, 1.5, float),
+    ],
+)
+def test_typed_enum_values_and_defaults_roundtrip(
+    kind: str, choice: Any, value: Any, expected_type: type, *, use_default: bool
+) -> None:
+    prop = {"type": kind, "enum": [choice]}
+    if use_default:
+        prop["default"] = value
+    M = compile_object_schema("P", {"p": prop})
+    model = M() if use_default else M.model_validate({"p": value})
+    dumped = model.model_dump()
+    assert dumped == {"p": value}
+    assert type(dumped["p"]) is expected_type
+    restored = M.model_validate(dumped).model_dump()
+    assert restored == dumped
+    assert type(restored["p"]) is expected_type
+
+
+def test_recursive_number_enum_roundtrip() -> None:
+    M = compile_object_schema(
+        "P",
+        {
+            "xs": {
+                "type": "array",
+                "items": {"type": "number", "enum": [1, 2.5]},
+                "default": [1, 2.5],
+            }
+        },
+    )
+    for model in (M(), M.model_validate({"xs": [1.0, 2.5]})):
+        dumped = model.model_dump()
+        assert dumped == {"xs": [1.0, 2.5]}
+        assert all(type(value) is float for value in dumped["xs"])
+        assert M.model_validate(dumped).model_dump() == dumped
+
+
+@pytest.mark.parametrize("choice", [1, 1.0])
+@pytest.mark.parametrize("bad", [True, False, "1", 2])
+def test_number_enum_rejects_wrong_types_and_nonmembers(choice: int | float, bad: Any) -> None:
+    prop = {"type": "number", "enum": [choice]}
+    M = compile_object_schema("P", {"p": prop})
+    with pytest.raises(ValidationError):
+        M.model_validate({"p": bad})
+    with pytest.raises(ValueError, match=r"P\.p: default does not match the schema"):
+        compile_object_schema("P", {"p": {**prop, "default": bad}})
 
 
 def test_recursive_enum_membership_is_strict() -> None:

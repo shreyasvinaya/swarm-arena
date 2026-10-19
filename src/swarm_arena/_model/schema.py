@@ -37,9 +37,9 @@ def _validate_enum(
 ) -> Any:
     """Check membership by type and value, preserving the declared output type."""
     validated = adapter.validate_python(value, strict=True) if adapter is not None else value
-    if not any(type(value) is type(choice) and value == choice for choice in choices):
+    if not any(type(validated) is type(choice) and validated == choice for choice in choices):
         raise ValueError("value does not match an enum member")
-    handler(value)
+    handler(validated)
     # Literal can substitute an equal member of another type; keep our validated value.
     return validated
 
@@ -72,13 +72,10 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
             raise ValueError(f"{path}: enum must be a non-empty list")
         adapter = TypeAdapter(annotation, config=ConfigDict(strict=True)) if kind else None
         if adapter is not None:
-            for choice in choices:
-                try:
-                    adapter.validate_python(choice, strict=True)
-                except ValidationError:
-                    raise ValueError(
-                        f"{path}: enum member does not match the declared type"
-                    ) from None
+            try:
+                choices = [adapter.validate_python(choice, strict=True) for choice in choices]
+            except ValidationError:
+                raise ValueError(f"{path}: enum member does not match the declared type") from None
         # Enum values are runtime schema data rather than static type arguments.
         literal = cast(Any, Literal)[tuple(choices)]
         annotation = Annotated[
@@ -130,9 +127,10 @@ def compile_object_schema(
         number, boolean, and array, with recursive items, enum, numeric bounds,
         string length and pattern constraints, default, and description.
         Properties without a default are required; extra fields are forbidden.
-        Enum membership compares both type and value; explicitly typed members
-        must satisfy the declared strict type. Number outputs, including
-        defaults, are floats even when an integer enum member is used.
+        Enum membership compares both type and value after declared strict type
+        validation of members and inputs. Number enums accept equivalent integer
+        and float values, excluding booleans; their outputs and defaults are
+        floats, so dumped values can be validated again.
 
     Returns
     -------
