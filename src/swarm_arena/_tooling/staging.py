@@ -1,6 +1,6 @@
 """Plan workspace contents and preserve the receiving tool's edit boundary."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any
 
@@ -14,12 +14,14 @@ from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import (
+    PARENT_DATA,
     check_key,
     check_relpath,
     fold_conflicts,
     fold_key,
     fold_merge,
     matches,
+    parent_data_conflicts,
 )
 from swarm_arena._tooling.result_file import request_json as _request_json
 
@@ -91,13 +93,15 @@ def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str:
         raise ValueError(f"{ref.path}: cannot encode tool identity") from None
 
 
-def _edit_collisions(edits: Mapping[str, str], root: AbstractSet[str]) -> dict[str, str]:
-    """Report edit conflicts using the same layout rule as the sink."""
+def _layout_collisions(paths: Collection[str], root: AbstractSet[str]) -> dict[str, str]:
+    """Report new paths the sink would refuse, in this root or a later parent tree."""
     errors: dict[str, str] = {}
-    for first, second in fold_conflicts(dict.fromkeys([*sorted(root), *edits])):
+    for first, second in fold_conflicts(dict.fromkeys([*sorted(root), *paths])):
         for path, other in ((first, second), (second, first)):
-            if path in edits:
+            if path in paths:
                 errors.setdefault(path, f"folded path collision with {other}")
+    for path in parent_data_conflicts(paths):
+        errors.setdefault(path, f"folded path collision with parent {PARENT_DATA}")
     return errors
 
 
@@ -130,13 +134,20 @@ def validate_edits(
     ------
     SoftError
         If any path, protection, collision, glob, size, or stored-reference rule fails.
+        Collisions include folded aliases of each other or of ``root``, and a
+        path below a top-level directory that folds to ``data.json``, which the
+        edit's later ``parents/<id>/`` tree reserves for the parent's data.
 
     Examples
     --------
     >>> validate_edits({"p/a.txt": "hi"}, editable=["p/*"], protected=set(), max_edit_bytes=10)
+    >>> validate_edits({"Data.json/x": "hi"}, editable=["**"], protected=set(), max_edit_bytes=10)
+    Traceback (most recent call last):
+    ...
+    swarm_arena._errors.SoftError: Data.json/x: folded path collision with parent data.json
     """
     protected = {fold_key(check_relpath(path)) for path in protected}
-    collisions = _edit_collisions(edits, root)
+    collisions = _layout_collisions(edits, root)
     errors: list[str] = []
     for path, content in edits.items():
         reason = ""
@@ -250,15 +261,30 @@ def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]:
     Returns
     -------
     dict[str, str]
-        Goal files replaced at matching paths by the candidate overlay.
+        Goal files replaced at matching folded paths by the candidate overlay,
+        keeping the goal's spelling, as in the producing run's root.
+
+    Raises
+    ------
+    ValueError
+        If the paths conflict; the error names them under ``candidate/files/``.
 
     Examples
     --------
-    >>> files = effective_files(goal, candidate)  # doctest: +SKIP
+    >>> from swarm_arena import Goal
+    >>> from swarm_arena._model.results import Candidate
+    >>> from swarm_arena.tool import FileSet, RunStatus, ToolOutput, ToolRequest
+    >>> goal = Goal(id="g", namespace="n", files=FileSet(globs=["p/*"],
+    ...             manifest={"p/a.txt": "1" * 64, "p/b.txt": "1" * 64}))
+    >>> candidate = Candidate(id="c1", run_id="r", goal_id="g", team="t", agent="a", round=1,
+    ...                       request=ToolRequest(), output=ToolOutput(status=RunStatus.OK),
+    ...                       overlay={"p/b.txt": "2" * 64})
+    >>> effective_files(goal, candidate) == {"p/a.txt": "1" * 64, "p/b.txt": "2" * 64}
+    True
     """
     _check_keys(goal.files.manifest)
     _check_keys(candidate.overlay)
-    return fold_merge(goal.files.manifest, candidate.overlay)
+    return fold_merge(goal.files.manifest, candidate.overlay, prefix="candidate/files/")
 
 
 def _check_keys(files: Mapping[str, str]) -> None:
@@ -284,7 +310,11 @@ def plan_tool_stage(
     Callers first run ``validate_edits`` with root paths and the same protection set. Recheck
     edit permissions here as an internal invariant. Only the first parent's
     overlay can enter the root, and only as a whole with a nonempty matching
-    tool identity. Every parent also remains available in its read-only tree.
+    tool identity, when every path is editable here and fits the root layout
+    as an exact-spelling replacement or a new path. Otherwise the overlay is
+    refused with a soft warning. Every parent also remains available in its
+    read-only tree. Tool files replace goal files at a shared folded key and
+    keep the goal's spelling, the spelling every later stage uses.
 
     Parameters
     ----------
@@ -319,13 +349,22 @@ def plan_tool_stage(
     ValueError
         If a path is invalid, noncanonical, or an edit is a stored reference.
     SoftError
-        If edits collide by folded key with each other or the effective root.
+        If edits collide by folded key with each other or the effective root,
+        or lie below a top-level directory that folds to ``data.json``.
 
     Examples
     --------
-    >>> stage, overlay, warnings = plan_tool_stage(  # doctest: +SKIP
-    ...     goal_files={}, tool_files={}, editable=[], protected=set(),
-    ...     private_paths=set(), parents=[], receiving_identity="T", edits={}, request_json=None)
+    >>> from swarm_arena.tool import ParentRef
+    >>> base = ParentRef(candidate_id="c1", run_id="r", tool_identity="T",
+    ...                  overlay={"P/notes.txt": "2" * 64})
+    >>> stage, overlay, warnings = plan_tool_stage(
+    ...     goal_files={"p/run.py": "1" * 64}, tool_files={"P/RUN.py": "3" * 64},
+    ...     editable=["**/*"], protected={"p/run.py"}, private_paths=set(), parents=[base],
+    ...     receiving_identity="T", edits={}, request_json=None)
+    >>> stage.root == {"p/run.py": "3" * 64}, overlay
+    (True, {})
+    >>> warnings
+    ['base parent c1 not overlaid: paths conflict with the workspace layout; paths: P/notes.txt']
     """
     _check_keys(goal_files)
     _check_keys(tool_files)
@@ -362,6 +401,8 @@ def plan_tool_stage(
             refused = sorted(path for path in base.overlay if not editable_here(path))
             if refused:
                 reason = "paths not editable here"
+            elif refused := sorted(_layout_collisions(base.overlay, root.keys())):
+                reason = "paths conflict with the workspace layout"
         if reason:
             warnings.append(
                 f"base parent {base.candidate_id} not overlaid: {reason}; "
@@ -370,7 +411,7 @@ def plan_tool_stage(
         else:
             overlay.update(base.overlay)
     root = fold_merge(root, overlay)
-    collisions = _edit_collisions(edits, root.keys())
+    collisions = _layout_collisions(edits, root.keys())
     if collisions:
         raise SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
     overlay.update(edit_hashes(edits))
@@ -395,12 +436,28 @@ def plan_script_stage(
     Returns
     -------
     Job.Stage
-        Script workspace plan; output files replace matching effective paths.
+        Script workspace plan; output files replace the content at matching
+        folded effective paths and keep the effective spelling.
+
+    Raises
+    ------
+    ValueError
+        If a path is not in normal form, or the candidate files conflict; the
+        error names them under ``candidate/files/``.
 
     Examples
     --------
-    >>> stage = plan_script_stage(  # doctest: +SKIP
-    ...     own_files={}, candidate=candidate, effective_files={})
+    >>> from swarm_arena._model.results import Candidate
+    >>> from swarm_arena.tool import FileRef, RunStatus, ToolOutput, ToolRequest
+    >>> out = FileRef(name="a.txt", path="p/a.txt", sha256="2" * 64, size=1)
+    >>> candidate = Candidate(id="c1", run_id="r", goal_id="g", team="t", agent="a", round=1,
+    ...                       request=ToolRequest(),
+    ...                       output=ToolOutput(status=RunStatus.OK, files=[out]))
+    >>> stage = plan_script_stage(
+    ...     own_files={"judge.py": "3" * 64}, candidate=candidate,
+    ...     effective_files={"p/a.txt": "1" * 64})
+    >>> stage.root == {"judge.py": "3" * 64}, stage.candidate.files == {"p/a.txt": "2" * 64}
+    (True, True)
     """
     _check_keys(own_files)
     _check_keys(effective_files)
@@ -419,6 +476,10 @@ def plan_script_stage(
                 "usage": output.usage.model_dump(mode="json"),
                 "files": [file.path for file in output.files],
             },
-            files=fold_merge(effective_files, {file.path: file.sha256 for file in output.files}),
+            files=fold_merge(
+                effective_files,
+                {file.path: file.sha256 for file in output.files},
+                prefix="candidate/files/",
+            ),
         ),
     )

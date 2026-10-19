@@ -6,6 +6,8 @@ import os
 import secrets
 import stat
 from collections.abc import Generator, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -13,7 +15,14 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.tooling import FileRef, check_parent_id
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_key, fold_conflicts, fold_key, fold_merge, output_paths
+from swarm_arena._tooling.paths import (
+    PARENT_DATA,
+    check_key,
+    fold_conflicts,
+    fold_key,
+    output_paths,
+    parent_tree,
+)
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
 
 
@@ -27,8 +36,20 @@ def _json_bytes(value: dict[str, Any], rel: str, *, compact: bool = False) -> by
         raise ValueError(f"cannot serialize workspace path: {rel}") from None
 
 
-def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[str, bytes]]:
-    """Validate every input path before merging and prepare metadata before I/O."""
+@dataclass(frozen=True)
+class _Layout:
+    """Every destination of one stage, planned once for materialize and collection."""
+
+    files: dict[str, tuple[str, bool]]
+    """Artifact digest and read-only flag per workspace path."""
+    metadata: dict[str, tuple[dict[str, Any], bool]]
+    """Generated JSON value and compact-encoding flag per workspace path."""
+    directories: frozenset[str]
+    """Generated directories, created even when empty."""
+
+
+def _stage_layout(stage: Job.Stage) -> _Layout:
+    """Validate every input path, then plan all destinations without any I/O."""
     for path in stage.root:
         check_key(path)
     ids: set[str] = set()
@@ -46,35 +67,28 @@ def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[st
         for path in stage.candidate.files:
             check_key(path)
     files = {path: (digest, False) for path, digest in stage.root.items()}
-    metadata: dict[str, bytes] = {}
+    metadata: dict[str, tuple[dict[str, Any], bool]] = {}
+    directories = {"swarm"}
     for parent in stage.parents:
-        prefix = f"parents/{parent.candidate_id}"
-        merged = fold_merge(parent.overlay, {file.path: file.sha256 for file in parent.files})
-        files.update(
-            {
-                f"{prefix}/{path}": (digest, True)
-                for path, digest in merged.items()
-                if fold_key(path) != "data.json"
-            }
-        )
-        metadata[f"{prefix}/data.json"] = _json_bytes(
-            parent.data, f"{prefix}/data.json", compact=True
-        )
+        prefix = f"parents/{parent.candidate_id}/"
+        outputs = {file.path: file.sha256 for file in parent.files}
+        tree = parent_tree(parent.overlay, outputs, prefix=prefix)
+        files.update({prefix + path: (digest, True) for path, digest in tree.items()})
+        metadata[prefix + PARENT_DATA] = (parent.data, True)
     if stage.candidate is not None:
         candidate = stage.candidate
+        directories.add("candidate/files")
         files.update(
             {f"candidate/files/{path}": (digest, True) for path, digest in candidate.files.items()}
         )
-        metadata["candidate/request.json"] = _json_bytes(
-            candidate.request, "candidate/request.json"
-        )
-        metadata["candidate/output.json"] = _json_bytes(candidate.output, "candidate/output.json")
+        metadata["candidate/request.json"] = (candidate.request, False)
+        metadata["candidate/output.json"] = (candidate.output, False)
     if stage.request_json is not None:
-        metadata["swarm/request.json"] = _json_bytes(stage.request_json, "swarm/request.json")
-    return files, metadata
+        metadata["swarm/request.json"] = (stage.request_json, False)
+    return _Layout(files=files, metadata=metadata, directories=frozenset(directories))
 
 
-def _check_layout(workspace: Path, files: set[str], directories: set[str]) -> None:
+def _check_layout(workspace: Path, files: AbstractSet[str], directories: AbstractSet[str]) -> None:
     """Reject conflicting paths and existing symlinks before creating anything."""
     conflicts = fold_conflicts(sorted(files), directories=sorted(directories))
     if conflicts:
@@ -161,17 +175,31 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
     ------
     ValueError
         If paths, parent ids, metadata, or destination file types are invalid.
+        Merge and layout errors name full workspace paths, such as
+        ``parents/c1/p/a.txt``, so they show which parent or tree failed.
 
     Examples
     --------
+    >>> import tempfile
+    >>> from swarm_arena._store.artifacts import ArtifactStore
+    >>> from swarm_arena._store.base import open_store
     >>> from swarm_arena.executor import Job
-    >>> materialize(Job.Stage(), Path("workspace"), artifacts)  # doctest: +SKIP
+    >>> from swarm_arena.tool import ParentRef
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     artifacts = ArtifactStore(open_store(f"{tmp}/artifacts"))
+    ...     parent = ParentRef(candidate_id="c1", run_id="r", tool_identity="T",
+    ...                        data={"loss": 0.5}, overlay={"p/a.txt": artifacts.put_bytes(b"A")})
+    ...     materialize(Job.Stage(parents=[parent]), Path(tmp) / "ws", artifacts)
+    ...     sorted(p.name for p in (Path(tmp) / "ws/parents/c1").iterdir())
+    ['data.json', 'p']
     """
-    files, metadata = _stage_files(stage)
-    directories = {"swarm"}
-    if stage.candidate is not None:
-        directories.add("candidate/files")
-    _check_layout(workspace, set(files) | set(metadata), directories)
+    layout = _stage_layout(stage)
+    files, directories = layout.files, layout.directories
+    metadata = {
+        rel: _json_bytes(value, rel, compact=compact)
+        for rel, (value, compact) in layout.metadata.items()
+    }
+    _check_layout(workspace, files.keys() | metadata.keys(), directories)
     try:
         workspace.mkdir(parents=True, exist_ok=True)
         root = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -197,6 +225,9 @@ def collect_output_files(
 ) -> list[FileRef]:
     """Upload declared regular outputs after checking paths and symlinks.
 
+    Declarations are checked, before any read, against the same planned layout
+    that ``materialize`` wrote, and against the later parent tree they join.
+
     Parameters
     ----------
     workspace : Path
@@ -217,19 +248,32 @@ def collect_output_files(
     Raises
     ------
     ValueError
-        If a path is invalid, duplicated after normalization and folding, missing,
+        If a path is invalid, duplicated after normalization and folding, conflicts
+        with the staged layout or with a parent tree's ``data.json``, missing,
         symlinked, nonregular, or cannot be collected.
 
     Examples
     --------
-    >>> refs = collect_output_files(  # doctest: +SKIP
-    ...     Path("ws"), ["out/a.txt"], artifacts, stage=Job.Stage())
+    >>> import tempfile
+    >>> from swarm_arena._store.artifacts import ArtifactStore
+    >>> from swarm_arena._store.base import open_store
+    >>> stage = Job.Stage(root={"p/run.py": "1" * 64})
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     artifacts = ArtifactStore(open_store(f"{tmp}/artifacts"))
+    ...     size = (Path(tmp) / "out.txt").write_text("x")
+    ...     [ref] = collect_output_files(Path(tmp), ["./out.txt"], artifacts, stage=stage)
+    ...     (ref.path, ref.size)
+    ('out.txt', 1)
+    >>> collect_output_files(Path("ws"), ["P/out.txt"], artifacts, stage=stage)
+    Traceback (most recent call last):
+    ...
+    ValueError: conflicting output path with staged layout: p/run.py and P/out.txt
     """
-    files, metadata = _stage_files(stage)
+    layout = _stage_layout(stage)
     paths = output_paths(
         declared,
-        effective_files=files.keys() | metadata.keys(),
-        directories={"swarm", "candidate/files"} if stage.candidate is not None else {"swarm"},
+        effective_files=[*layout.files, *layout.metadata],
+        directories=sorted(layout.directories),
     )
     output: list[FileRef] = []
     for rel in paths:

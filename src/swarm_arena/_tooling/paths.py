@@ -9,11 +9,19 @@ from pathlib import PurePosixPath
 from typing import Final, TypeVar
 
 RESERVED: Final = frozenset({"swarm", "parents", "candidate"})
+PARENT_DATA: Final = "data.json"
 _T = TypeVar("_T")
 
 
 def fold_key(path: str) -> str:
-    """Fold a path for case- and Unicode-insensitive security comparisons.
+    r"""Fold a path for case- and Unicode-insensitive security comparisons.
+
+    This is canonical caseless matching (Unicode D145): decompose, case fold,
+    then compose. Case folding can return text that is not normalized, so
+    folding NFC text alone splits names that APFS treats as one file, such as
+    a long s (U+017F) with a combining caron and an s with caron (U+0161).
+    Equal keys mean equal names under any mix of case and composed or
+    decomposed spelling.
 
     Parameters
     ----------
@@ -23,14 +31,20 @@ def fold_key(path: str) -> str:
     Returns
     -------
     str
-        NFC-normalized path with Unicode case folding applied.
+        ``NFC(casefold(NFD(path)))``, an internal comparison key.
 
     Examples
     --------
     >>> fold_key("problem/RUN.py")
     'problem/run.py'
+    >>> alias = "\N{LATIN SMALL LETTER LONG S}\N{COMBINING CARON}olver.py"
+    >>> fold_key(alias) == fold_key("\N{LATIN SMALL LETTER S WITH CARON}olver.py")
+    True
+    >>> decomposed = "Cafe\N{COMBINING ACUTE ACCENT}"
+    >>> fold_key(decomposed) == fold_key("caf\N{LATIN SMALL LETTER E WITH ACUTE}")
+    True
     """
-    return unicodedata.normalize("NFC", path).casefold()
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFD", path).casefold())
 
 
 def fold_conflicts(
@@ -83,15 +97,25 @@ def fold_conflicts(
     return list(conflicts)
 
 
-def fold_merge(base: Mapping[str, _T], overlay: Mapping[str, _T]) -> dict[str, _T]:
-    """Merge file maps by folded key, keeping each winner's spelling.
+def fold_merge(
+    base: Mapping[str, _T], overlay: Mapping[str, _T], *, prefix: str = ""
+) -> dict[str, _T]:
+    """Merge file maps by folded key; a replacement keeps the base spelling.
+
+    This is the one spelling rule for every stage: a later layer replaces a
+    file's content, never its name. Every later stage starts from the same
+    goal manifest, so the goal's spelling is the one all stages agree on.
 
     Parameters
     ----------
     base : Mapping[str, _T]
-        Lower-priority file entries.
+        Lower-priority file entries. Their spellings are kept.
     overlay : Mapping[str, _T]
-        Higher-priority entries. These replace folded matches in ``base``.
+        Higher-priority entries. Each replaces the value of the ``base`` entry
+        with the same folded key; other entries keep their own spelling.
+    prefix : str, optional
+        Workspace prefix of the tree, such as ``"parents/c1/"``. Errors name
+        paths with it, so they show which parent or tree failed.
 
     Returns
     -------
@@ -105,27 +129,106 @@ def fold_merge(base: Mapping[str, _T], overlay: Mapping[str, _T]) -> dict[str, _
 
     Examples
     --------
-    >>> fold_merge({"p/a": "old"}, {"P/A": "new"})
-    {'P/A': 'new'}
+    >>> fold_merge({"p/a": "old"}, {"p/A": "new", "p/b": "add"})
+    {'p/a': 'new', 'p/b': 'add'}
+    >>> fold_merge({"p/a": "x"}, {"P/b": "y"}, prefix="parents/c1/")
+    Traceback (most recent call last):
+    ...
+    ValueError: conflicting workspace path: parents/c1/p/a and parents/c1/P/b
     """
-    conflicts = fold_conflicts(base) + fold_conflicts(overlay)
-    if conflicts:
-        first, second = conflicts[0]
-        raise ValueError(f"conflicting workspace path: {first} and {second}")
+
+    def check(files: Iterable[str]) -> None:
+        conflicts = fold_conflicts(files)
+        if conflicts:
+            first, second = conflicts[0]
+            raise ValueError(f"conflicting workspace path: {prefix}{first} and {prefix}{second}")
+
+    check(base)
+    check(overlay)
     entries = {fold_key(path): (path, value) for path, value in base.items()}
-    entries.update({fold_key(path): (path, value) for path, value in overlay.items()})
+    for path, value in overlay.items():
+        key = fold_key(path)
+        entries[key] = (entries[key][0] if key in entries else path, value)
     merged = dict(entries.values())
-    conflicts = fold_conflicts(merged)
-    if conflicts:
-        first, second = conflicts[0]
-        raise ValueError(f"conflicting workspace path: {first} and {second}")
+    check(merged)
     return merged
+
+
+def parent_tree(
+    overlay: Mapping[str, _T], outputs: Mapping[str, _T], *, prefix: str = ""
+) -> dict[str, _T]:
+    """Lay out a parent's read-only tree: output files over its overlay.
+
+    The core writes the parent's structured output to ``data.json`` at the top
+    of the tree, so an entry whose whole path folds to ``data.json`` is
+    skipped. Producers refuse paths below a folded ``data.json`` directory
+    with ``parent_data_conflicts``, the same rule the sink applies.
+
+    Parameters
+    ----------
+    overlay : Mapping[str, _T]
+        The parent's effective overlay.
+    outputs : Mapping[str, _T]
+        The parent's output files. At a shared folded key an output replaces
+        the overlay's content, and the overlay's spelling is kept.
+    prefix : str, optional
+        Workspace prefix for errors, such as ``"parents/c1/"``.
+
+    Returns
+    -------
+    dict[str, _T]
+        Tree-relative paths to values, without the generated ``data.json``.
+
+    Raises
+    ------
+    ValueError
+        If the overlay and outputs do not form a valid folded layout.
+
+    Examples
+    --------
+    >>> parent_tree({"p/a": "old", "Data.json": "x"}, {"p/a": "out"})
+    {'p/a': 'out'}
+    """
+    merged = fold_merge(overlay, outputs, prefix=prefix)
+    return {path: value for path, value in merged.items() if fold_key(path) != PARENT_DATA}
+
+
+def parent_data_conflicts(paths: Iterable[str]) -> list[str]:
+    """Return paths that a later parent tree cannot hold beside ``data.json``.
+
+    A candidate's overlay and output files are staged under ``parents/<id>/``
+    in later runs, next to the generated ``data.json`` file. A path below a
+    top-level directory that folds to ``data.json`` would conflict with that
+    file there, so producers refuse it in the run that made it. A path that
+    folds to ``data.json`` itself is skipped by ``parent_tree`` instead.
+
+    Parameters
+    ----------
+    paths : Iterable[str]
+        Tree-relative overlay, edit, or output paths in normal form.
+
+    Returns
+    -------
+    list[str]
+        Conflicting input paths, in input order.
+
+    Examples
+    --------
+    >>> parent_data_conflicts(["Data.json/x", "data.json", "p/data.json/x"])
+    ['Data.json/x']
+    """
+    kept = [path for path in paths if fold_key(path) != PARENT_DATA]
+    return [path for first, path in fold_conflicts([PARENT_DATA, *kept]) if first == PARENT_DATA]
 
 
 def output_paths(
     declared: Sequence[str], *, effective_files: Iterable[str], directories: Iterable[str] = ()
 ) -> list[str]:
     """Normalize outputs and reject conflicts within their destination layout.
+
+    Outputs are also checked against the later parent tree they join, so an
+    output below a folded top-level ``data.json`` directory fails the run that
+    made it rather than every later stage that stages the candidate.
 
     Parameters
     ----------
@@ -152,6 +255,10 @@ def output_paths(
     --------
     >>> output_paths(["./p/a.txt"], effective_files=["p/a.txt"])
     ['p/a.txt']
+    >>> output_paths(["Data.json/x"], effective_files=[])
+    Traceback (most recent call last):
+    ...
+    ValueError: conflicting output path with parent data.json: Data.json/x
     """
     paths = [check_relpath(path) for path in declared]
     conflicts = fold_conflicts(paths)
@@ -165,6 +272,8 @@ def output_paths(
         raise ValueError(
             "duplicate output path or conflicting output paths: " + " and ".join(originals)
         )
+    if reserved := parent_data_conflicts(paths):
+        raise ValueError(f"conflicting output path with parent {PARENT_DATA}: {reserved[0]}")
     conflicts = fold_conflicts(dict.fromkeys([*effective_files, *paths]), directories=directories)
     if conflicts:
         first, second = conflicts[0]

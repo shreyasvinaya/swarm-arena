@@ -10,8 +10,11 @@ from swarm_arena._tooling.paths import check_relpath, fold_conflicts, fold_key, 
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
 
 
-def _listed_path(base: Path, relative: str) -> str:
+def _listed_path(base: Path, relative: str, listings: dict[Path, dict[str, list[str]]]) -> str:
     """Recover each component's directory-entry spelling using file identity.
+
+    Each directory is listed once per snapshot: ``listings`` caches its entry
+    names by folded key, so a snapshot stays linear in the number of entries.
 
     Parameters
     ----------
@@ -19,35 +22,58 @@ def _listed_path(base: Path, relative: str) -> str:
         Trusted source root.
     relative : str
         Glob result which may retain a literal pattern's alias spelling.
+    listings : dict[Path, dict[str, list[str]]]
+        Cache shared by one snapshot: listed directory to its entry names,
+        grouped by ``fold_key``.
 
     Returns
     -------
     str
         Workspace-relative path using on-disk names for every component.
 
+    Raises
+    ------
+    ValueError
+        If no listed entry is the same file as an alias spelling.
+
     Examples
     --------
-    >>> _listed_path(Path("source"), "problem/RUN.py")  # doctest: +SKIP
+    >>> import tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     (Path(tmp) / "problem").mkdir()
+    ...     (Path(tmp) / "problem/run.py").touch()
+    ...     _listed_path(Path(tmp), "problem/run.py", {})
     'problem/run.py'
     """
     current = base
     for part in Path(relative).parts:
-        target = (current / part).stat(follow_symlinks=False)
-        entries = list(current.iterdir())
-        # An exact directory entry is authoritative on a case-sensitive volume.
-        exact = next((entry for entry in entries if entry.name == part), None)
-        if exact is not None:
-            current = exact
+        if (names := listings.get(current)) is None:
+            names = listings[current] = _listing(current)
+        spellings = names.get(fold_key(part), [])
+        if part in spellings:
+            # An exact directory entry is authoritative on a case-sensitive volume.
+            current = current / part
             continue
-        for entry in entries:
-            if fold_key(entry.name) == fold_key(part):
-                info = entry.stat(follow_symlinks=False)
-                if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
-                    current = entry
-                    break
-        else:
+        target = _identity(current / part)
+        listed = next((name for name in spellings if _identity(current / name) == target), None)
+        if listed is None:
             raise ValueError(f"cannot find directory entry for path: {relative}")
+        current = current / listed
     return current.relative_to(base).as_posix()
+
+
+def _listing(directory: Path) -> dict[str, list[str]]:
+    """List a directory's entry names, grouped by folded key."""
+    names: dict[str, list[str]] = {}
+    for entry in directory.iterdir():
+        names.setdefault(fold_key(entry.name), []).append(entry.name)
+    return names
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    """Return the device and inode of a path without following a final symlink."""
+    info = path.stat(follow_symlinks=False)
+    return info.st_dev, info.st_ino
 
 
 def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> FileSet:
@@ -56,6 +82,11 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     Already snapshotted sets and sets with no globs are returned unchanged,
     without accessing source files. Each glob must match at least one regular
     file. Symlinks below the base directory and reserved top-level paths fail.
+    A glob spelling that only a case-insensitive lookup resolves, such as
+    ``problem/RUN.py`` for a listed ``run.py``, is recorded once with the
+    listed spelling. Names that both appear in a directory listing are two
+    entries, even when they are hard links to one file, so a folded pair of
+    them is refused. Each directory is listed once per snapshot.
 
     Parameters
     ----------
@@ -75,19 +106,27 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     ------
     ValueError
         If a glob matches no regular file, a selected path is reserved or
-        symlinked, or the source cannot be read.
+        symlinked, two selected names conflict after folding, or the source
+        cannot be read.
 
     Examples
     --------
+    >>> import tempfile
+    >>> from swarm_arena._store.artifacts import ArtifactStore
+    >>> from swarm_arena._store.base import open_store
     >>> from swarm_arena.tool import FileSet
-    >>> files = snapshot_fileset(FileSet(), Path("missing"), artifacts)  # doctest: +SKIP
-    >>> files.snapshotted  # doctest: +SKIP
-    True
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     artifacts = ArtifactStore(open_store(f"{tmp}/artifacts"))
+    ...     (Path(tmp) / "problem").mkdir()
+    ...     size = (Path(tmp) / "problem/run.py").write_text("print(1)")
+    ...     files = snapshot_fileset(FileSet(globs=["problem/*"]), Path(tmp), artifacts)
+    >>> list(files.manifest), files.snapshotted
+    (['problem/run.py'], True)
     """
     if fs.manifest or not fs.globs:
         return fs
-    selected: dict[str, tuple[int, int]] = {}
-    paths: list[str] = []
+    listings: dict[Path, dict[str, list[str]]] = {}
+    selected: dict[str, None] = {}
     for glob in fs.globs:
         found = False
         try:
@@ -100,22 +139,16 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
                 if not path.is_file():
                     continue
                 check_relpath(relative)
-                rel = check_relpath(_listed_path(base_dir, relative))
+                # A lookup alias resolves to its listed name, so it dedupes with
+                # it. Two listed names stay two entries, even as hard links, and
+                # the shared layout checker below refuses a folded pair.
+                selected[check_relpath(_listed_path(base_dir, relative, listings))] = None
                 found = True
-                info = path.stat(follow_symlinks=False)
-                identity = (info.st_dev, info.st_ino)
-                key = fold_key(rel)
-                previous = selected.get(key)
-                if previous is None or previous != identity:
-                    # Only aliases of the same file are deduplicated. Keep
-                    # distinct identities for the shared layout checker below.
-                    paths.append(rel)
-                selected.setdefault(key, identity)
         except OSError:
             raise ValueError(f"cannot snapshot glob {glob!r}") from None
         if not found:
             raise ValueError(f"glob {glob!r} matched no file")
-    paths.sort()
+    paths = sorted(selected)
     conflicts = fold_conflicts(paths)
     if conflicts:
         first, second = conflicts[0]

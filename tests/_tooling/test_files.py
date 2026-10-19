@@ -245,13 +245,12 @@ def test_snapshot_ref_sanitizes_validator_message(
             raise ValueError(f"invalid secret: {value}")
 
     monkeypatch.setattr(Widget, "Config", Config)
+    # Python 3.13 tracebacks quote the whole multi-line call, so the sentinel
+    # must not be a literal inside it.
+    secret = "snapshot-secret-sentinel"
     with pytest.raises(ConfigError) as exc:
-        snapshot_ref(
-            Ref(path="_fakes.tools:Widget", config={"size": "snapshot-secret-sentinel"}),
-            tmp_path,
-            artifacts,
-        )
-    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+        snapshot_ref(Ref(path="_fakes.tools:Widget", config={"size": secret}), tmp_path, artifacts)
+    assert secret not in "".join(format_exception(exc.value))
 
 
 def test_snapshot_ref_sanitizes_import_errors(
@@ -434,11 +433,22 @@ def test_snapshot_ref_config_validation_failures_are_secret_safe(
     assert exc.value.__cause__ is None
 
 
-@pytest.mark.parametrize("same_inode", [False, True])
+@pytest.mark.parametrize(
+    ("upper_listed", "same_inode"),
+    [
+        (False, True),  # APFS: RUN.py is a lookup alias of the one listed name
+        (True, False),  # case-sensitive volume: two distinct files
+        (True, True),  # case-sensitive volume: two listed hard links to one file
+    ],
+)
 def test_snapshot_folded_alias_identity(
-    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, same_inode: bool
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    upper_listed: bool,
+    same_inode: bool,
 ) -> None:
-    """Exercise both filesystem identity cases independently of the host volume."""
+    """Exercise the filesystem identity cases independently of the host volume."""
     import stat
 
     import swarm_arena._tooling.files as files_module
@@ -459,7 +469,7 @@ def test_snapshot_folded_alias_identity(
 
     def iterdir(self: Path) -> Iterator[Path]:
         if self == tmp_path:
-            yield from [lower] if same_inode else [lower, upper]
+            yield from [lower, upper] if upper_listed else [lower]
         else:
             yield from original_iterdir(self)
 
@@ -470,7 +480,7 @@ def test_snapshot_folded_alias_identity(
     monkeypatch.setattr(Path, "glob", glob)
     monkeypatch.setattr(Path, "iterdir", iterdir)
     monkeypatch.setattr(files_module, "read_regular_file", read)
-    if same_inode:
+    if not upper_listed:
         snapshot = snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
         assert snapshot.manifest == {"run.py": sha256_hex(b"x")}
     else:
@@ -478,3 +488,36 @@ def test_snapshot_folded_alias_identity(
             snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
         assert "run.py" in str(exc.value)
         assert "RUN.py" in str(exc.value)
+
+
+def test_snapshot_refuses_listed_case_variant_hard_links(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    _write(tmp_path, "p/run.py")
+    if (tmp_path / "p/RUN.py").exists():
+        pytest.skip("needs a case-sensitive filesystem")
+    os.link(tmp_path / "p/run.py", tmp_path / "p/RUN.py")
+    with pytest.raises(ValueError, match="conflicting snapshot paths") as exc:
+        snapshot_fileset(FileSet(globs=["p/*"]), tmp_path, artifacts)
+    assert str(exc.value) == "conflicting snapshot paths: p/RUN.py and p/run.py"
+
+
+def test_snapshot_lists_each_directory_once(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import swarm_arena._tooling.files as files_module
+
+    for index in range(40):
+        _write(tmp_path, f"data/f{index:02}.txt", b"%d" % index)
+    _write(tmp_path, "data/sub/g.txt")
+    listed: list[Path] = []
+    original_listing = files_module._listing
+
+    def listing(directory: Path) -> dict[str, list[str]]:
+        listed.append(directory)
+        return original_listing(directory)
+
+    monkeypatch.setattr(files_module, "_listing", listing)
+    snapshot = snapshot_fileset(FileSet(globs=["data/*", "data/**/*.txt"]), tmp_path, artifacts)
+    assert len(snapshot.manifest) == 41
+    assert sorted(listed) == [tmp_path, tmp_path / "data", tmp_path / "data/sub"]
