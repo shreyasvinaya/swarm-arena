@@ -5,12 +5,13 @@ from typing import Any
 
 import anyio
 import pytest
-from _fakes.tools import GOAL, RecordingExecutor, cand
+from _fakes.tools import GOAL, WRITE, RecordingExecutor, cand
 from pydantic import ValidationError
 
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.catalog import PlannerCatalog
 from swarm_arena._model.goal import FileSet
+from swarm_arena._model.plan import Resources
 from swarm_arena._model.results import CheckResult
 from swarm_arena._model.tooling import FileRef, RunStatus, ToolOutput
 from swarm_arena._scoring.check import CheckContext
@@ -19,7 +20,6 @@ from swarm_arena._scoring.script_judge import ScriptJudge, _JudgeResultFile
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
 
-WRITE = "import json, os; json.dump({}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
 SECRET = "SENTINEL_PRIVATE_VALUE_22"
 
 
@@ -189,3 +189,16 @@ async def test_invalid_check_result_hides_secret() -> None:
     result = await ScriptCheck(command=["x"]).check(cand(), context)
     assert result.passed is False
     assert SECRET not in repr(result)
+
+
+async def test_resources_pass_through() -> None:
+    executor = RecordingExecutor()
+    context = CheckContext(goal=GOAL, executor=executor, artifact_root="/a")
+    resources = Resources(cpus=2)
+    await ScriptCheck(command=["x"], resources=resources).check(cand(), context)
+    assert executor.jobs[0].resources == resources
+
+
+@pytest.mark.parametrize("model", [_CheckResultFile, _JudgeResultFile])
+def test_result_models_disallow_nonfinite_numbers(model: Any) -> None:
+    assert model.model_config.get("allow_inf_nan") is False

@@ -5,10 +5,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import AfterValidator, Field, field_serializer
+from pydantic import AfterValidator, Field, field_serializer, field_validator
 
 from swarm_arena._model.base import FrozenModel
-from swarm_arena._model.canonical import UtcDatetime, sha256_hex
+from swarm_arena._model.canonical import UtcDatetime, canonical_json, sha256_hex
 from swarm_arena._tooling.paths import check_key, check_relpath
 
 _Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -365,6 +365,16 @@ class ToolOutput(FrozenModel):
     started_at: UtcDatetime | None = None
     ended_at: UtcDatetime | None = None
     failed_provider: str | None = None
+
+    @field_validator("data")
+    @classmethod
+    def _finite_data(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Require finite JSON data without exposing values or dynamic keys."""
+        try:
+            canonical_json(data)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise ValueError("data must be finite JSON") from None
+        return data
 
 
 class Command(FrozenModel):

@@ -189,7 +189,7 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
             data = artifacts.get_bytes(digest)
             _write(root, rel, data, read_only=read_only)
         for rel, data in metadata.items():
-            _write(root, rel, data, read_only=rel.startswith("parents/"))
+            _write(root, rel, data, read_only=rel.startswith(("parents/", "candidate/")))
 
 
 def collect_output_files(

@@ -19,7 +19,7 @@ from swarm_arena._tooling.script_tool import script_command
 class _JudgeResultFile(_ConfigInputModel):
     """Validate numeric judge output without coercing strings or booleans."""
 
-    model_config = ConfigDict(strict=True, extra="ignore", frozen=True)
+    model_config = ConfigDict(strict=True, extra="ignore", frozen=True, allow_inf_nan=False)
 
     value: float | None = None
     key: list[float] | None = None
@@ -159,7 +159,29 @@ class ScriptJudge(Judge):
 
         Examples
         --------
-        >>> scores = await judge.judge(goal, candidates, context)  # doctest: +SKIP
+        >>> import asyncio
+        >>> from swarm_arena import Goal, Resources, ScriptJudge
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.executor import Executor, Job
+        >>> from swarm_arena.scoring import JudgeContext
+        >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+        >>> class MemoryExecutor(Executor):
+        ...     async def submit(self, job: Job) -> ToolOutput:
+        ...         return ToolOutput(status=RunStatus.OK, data={'value': 0.25})
+        ...     async def capacity(self) -> Resources | None:
+        ...         return None
+        ...     async def aclose(self) -> None:
+        ...         return None
+        >>> goal = Goal(id='g', namespace='example')
+        >>> candidate = Candidate(id='c1', run_id='r', goal_id='g', team='t',
+        ...                       agent='a', round=1, request=ToolRequest(),
+        ...                       output=ToolOutput(status=RunStatus.OK))
+        >>> context = JudgeContext(goal=goal, executor=MemoryExecutor(),
+        ...                          artifact_root='/artifacts')
+        >>> judge = ScriptJudge(command=['example'], direction='min')
+        >>> [score] = asyncio.run(judge.judge(goal, [candidate], context))
+        >>> (score.candidate_id, score.key, score.value)
+        ('c1', (-0.25,), 0.25)
         """
         scores: list[Score | None] = [None] * len(candidates)
 
@@ -191,7 +213,16 @@ class ScriptJudge(Judge):
         try:
             result = _JudgeResultFile.model_validate(out.data)
         except ValidationError as error:
-            ctx.judge_error(candidate.id, _result_error("judge", _JudgeResultFile, error))
+            nonfinite_key = any(
+                item["loc"][0:1] == ("key",) and item["type"] == "finite_number"
+                for item in error.errors(include_input=False, include_context=False)
+            )
+            reason = (
+                "invalid judge result: key: must be nonempty and finite"
+                if nonfinite_key
+                else _result_error("judge", _JudgeResultFile, error)
+            )
+            ctx.judge_error(candidate.id, reason)
             return None
         if result.key is None and result.value is None:
             ctx.judge_error(candidate.id, "result needs key or value")
@@ -210,6 +241,6 @@ class ScriptJudge(Judge):
                     cast(float, result.value), verdict=result.verdict, notes=result.notes
                 )
             return score.model_copy(update={"candidate_id": candidate.id})
-        except Exception as error:
-            ctx.judge_error(candidate.id, _result_error("judge", Score, error))
+        except Exception:
+            ctx.judge_error(candidate.id, "invalid judge result: key: must be nonempty and finite")
             return None

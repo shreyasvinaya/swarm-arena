@@ -17,7 +17,7 @@ from swarm_arena._tooling.script_tool import script_command
 class _CheckResultFile(_ConfigInputModel):
     """Validate check output strictly without exposing rejected values."""
 
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, allow_inf_nan=False)
 
     passed: bool
     reasons: list[str] = []
@@ -165,7 +165,31 @@ class ScriptCheck(Check):
 
         Examples
         --------
-        >>> result = await check.check(candidate, context)  # doctest: +SKIP
+        >>> import asyncio
+        >>> from swarm_arena import Goal, Resources, ScriptCheck
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.executor import Executor, Job
+        >>> from swarm_arena.scoring import CheckContext
+        >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+        >>> class MemoryExecutor(Executor):
+        ...     async def submit(self, job: Job) -> ToolOutput:
+        ...         return ToolOutput(status=RunStatus.OK, data={'passed': 'yes'})
+        ...     async def capacity(self) -> Resources | None:
+        ...         return None
+        ...     async def aclose(self) -> None:
+        ...         return None
+        >>> goal = Goal(id='g', namespace='example')
+        >>> candidate = Candidate(id='c1', run_id='r', goal_id='g', team='t',
+        ...                       agent='a', round=1, request=ToolRequest(),
+        ...                       output=ToolOutput(status=RunStatus.OK))
+        >>> context = CheckContext(goal=goal, executor=MemoryExecutor(),
+        ...                          artifact_root='/artifacts')
+        >>> check = ScriptCheck(command=['example'])
+        >>> result = asyncio.run(check.check(candidate, context))
+        >>> result.passed
+        False
+        >>> result.reasons
+        ['invalid check result: passed: bool_type']
         """
         out = await ctx.execute(
             script_command(self.config),

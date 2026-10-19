@@ -59,6 +59,8 @@ def test_materialize_script_stage(tmp_path: Path, artifacts: ArtifactStore) -> N
     materialize(stage, ws, artifacts)
     assert json.loads((ws / "candidate/request.json").read_text()) == {"params": {}}
     assert json.loads((ws / "candidate/output.json").read_text()) == {"status": "ok"}
+    for rel in ("candidate/request.json", "candidate/output.json"):
+        assert (ws / rel).stat().st_mode & 0o222 == 0
     assert (ws / "candidate/files").is_dir()
     assert list((ws / "candidate/files").iterdir()) == []
     assert (ws / "swarm").is_dir()

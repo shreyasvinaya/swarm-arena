@@ -34,6 +34,7 @@ before traversing explicit `FileSet` and nested `Ref` fields, including lists of
 refs. Omitted defaults stay omitted, unrelated settings keep their original
 representation, and the returned plan retains its original base directory.
 
+(workspace-staging)=
 ## Workspace staging
 
 A tool workspace starts with goal and tool files. Tool files replace goal files
@@ -59,11 +60,11 @@ refused, including normalization collisions. Edit values are literal UTF-8 text;
 the reserved `sha256:` followed by exactly 64 lowercase hex digits is a stored
 reference and cannot be submitted as a live edit.
 
-`validate_edits` soft-refuses differently spelled edits sharing an NFC/casefold
+Edit validation soft-refuses differently spelled edits sharing an NFC/casefold
 key, including ancestor directory aliases and file/directory conflicts. For
 example, `P/b.txt` conflicts with root file `p/a.txt`, and file `P` conflicts
-with directory `p/`. Pass the existing workspace paths as `root` to also refuse
-aliases of existing files; an exact-spelling edit still replaces that file.
+with directory `p/`. Aliases of existing workspace files are also refused; an
+exact-spelling edit still replaces that file.
 Stage planning rechecks edit collisions against goal files, tool files, and the accepted base
 overlay before creating the stage. Refusals identify the conflicting paths
 without including edit contents.
@@ -91,11 +92,9 @@ symlink components and special files. The sink, staging helpers, snapshotter,
 and output collectors use one folded-layout checker for files, implicit ancestor
 directories, and file/directory conflicts.
 
-`collect_output_files` requires the original `stage` as a keyword-only argument
-and checks declarations against its complete layout before uploading any output.
-Result parsing uses the same output helper for declarations against each other;
-it has no original stage. The executor then supplies `job.stage` for the full
-check. Declarations such as `out/a.txt` and `OUT/b.txt`, or output `P/RUN.py`
+Output collection checks declarations against each other and against the
+complete original workspace layout before uploading any output. Declarations
+such as `out/a.txt` and `OUT/b.txt`, or output `P/RUN.py`
 against staged `p/run.py`, therefore fail the producing run with both paths in
 the log. Exact-spelling replacements remain allowed. The original stage is used
 even if the process renames or removes a staged file.
@@ -163,8 +162,6 @@ The tool provides two read-only actions, each counted as a board read:
 Candidate lookup uses the agent context, so candidates outside its view cannot
 be read. Artifact reads run on a worker thread. Neither action exposes arbitrary
 filesystem paths or artifact hashes as a way to select additional files.
-
-<!-- Task 22: standalone workspace-contract guide. -->
 
 ## Configure files, a tool, a check, and a judge
 
@@ -253,13 +250,9 @@ A tool starts in a fresh workspace with this layout:
   swarm/stderr.log
 ```
 
-Staging starts with goal files and then tool-owned files; a tool-owned file wins
-at the same exact path. Next comes the first (base) parent's full overlay, then
-the current request's edits. The overlay is accepted only if its nonempty tool
-identity matches the receiving tool and every path is editable and unprotected.
-An overlay with any refused path is rejected as a whole. The run still proceeds
-with a soft warning naming the parent and refused paths. For example, a parent
-from another tool remains available under `parents/c1/` but does not replace
+See [Workspace staging](#workspace-staging) for the staging order, folded-path
+replacement rule, and overlay acceptance rules. For example, a parent from
+another tool remains available under `parents/c1/` but does not replace
 `problem/ns_solver.phyk` at the root. A matching parent's editable change can
 be inherited and then replaced by the current edit.
 
@@ -277,7 +270,7 @@ rejected rather than allowed to overwrite each other.
 
 ### Request parameters and parents
 
-`swarm/request.json` uses the shape produced by `request_json`:
+`swarm/request.json` contains the request parameters and run settings:
 
 ```json
 {
@@ -374,7 +367,8 @@ edits = {"problem/ns_solver.phyk": "# revised solver source\n"}
 Checks and judges stage their own files at the root and one candidate under
 `candidate/`. A judge runs once per candidate, concurrently subject to executor
 capacity, with a separate workspace for each run. Private files are not staged
-into tool workspaces.
+into tool workspaces. If a check or judge runs candidate code, see the
+[Isolation boundary](#isolation-boundary) warning below before using private data.
 
 ```text
 <check-or-judge workspace>/
@@ -431,6 +425,7 @@ candidate order. Executor exceptions, including lifecycle fencing, propagate
 from checks and judges; a judge cancels sibling runs and raises the first
 exception directly. Cancellation is not converted to a candidate error.
 
+(isolation-boundary)=
 ### Isolation boundary
 
 Local execution is **not strong isolation**. Programs run as the same OS user,
@@ -439,3 +434,13 @@ resource limits. Read-only candidate files prevent accidental edits but do not
 sandbox a hostile script. For example, use this local workflow with a trusted
 `problem/run.py`; a script must be trusted even when its private inputs are
 kept out of agents' staged workspaces.
+
+A check or judge that runs candidate code gives that code read access to its
+private files, write access to the check or judge's own files and
+`swarm/result.json`, and access to its allowlisted environment. For example,
+`candidate/files/problem/solve.py` could read or overwrite
+`judge/hidden/points.csv` or forge the result file. Read hidden data into memory
+first and run candidate code in a separate process and directory, passing only
+the inputs it needs and keeping result writing in the trusted judge. These
+precautions reduce accidental exposure; a separate process or directory under
+the same OS user is still not a security sandbox for hostile code.

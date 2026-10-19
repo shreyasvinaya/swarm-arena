@@ -4,10 +4,11 @@ from typing import Any
 
 import anyio
 import pytest
-from _fakes.tools import GOAL, RecordingExecutor, cand
+from _fakes.tools import GOAL, WRITE, RecordingExecutor, cand
 
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.goal import FileSet
+from swarm_arena._model.plan import Resources
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest
 from swarm_arena._scoring.check import CheckContext
 from swarm_arena._scoring.judge import JudgeContext
@@ -15,8 +16,6 @@ from swarm_arena._scoring.script_check import ScriptCheck
 from swarm_arena._scoring.script_judge import ScriptJudge
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
-
-WRITE = "import json, os; json.dump({}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
 
 
 def sj(tmp_path: Path, artifacts: ArtifactStore, body: str, **cfg: Any) -> ScriptJudge:
@@ -37,19 +36,26 @@ async def test_value_with_direction(
     key: tuple[float, ...],
 ) -> None:
     judge = await anyio.to_thread.run_sync(
-        partial(sj, tmp_path, artifacts, WRITE.format("{'value': 0.25}"), direction=direction)
+        partial(
+            sj,
+            tmp_path,
+            artifacts,
+            WRITE.format("{'value': 0.25, 'verdict': 'ok', 'notes': 'n'}"),
+            direction=direction,
+        )
     )
     [s] = await judge.judge(GOAL, [cand(id="c1")], jctx)
     assert (s.candidate_id, s.key, s.value) == ("c1", key, 0.25)
+    assert (s.verdict, s.notes) == ("ok", "n")
 
 
 async def test_key_list_and_extras(
     tmp_path: Path, artifacts: ArtifactStore, jctx: JudgeContext
 ) -> None:
-    body = WRITE.format("{'key': [1, 2], 'verdict': 'ok', 'notes': 'n', 'extra': 9}")
+    body = WRITE.format("{'key': [1, 2], 'value': 0.25, 'verdict': 'ok', 'notes': 'n', 'extra': 9}")
     judge = await anyio.to_thread.run_sync(sj, tmp_path, artifacts, body)
     [s] = await judge.judge(GOAL, [cand(id="c1")], jctx)
-    assert (s.key, s.value, s.verdict, s.notes) == ((1.0, 2.0), None, "ok", "n")
+    assert (s.key, s.value, s.verdict, s.notes) == ((1.0, 2.0), 0.25, "ok", "n")
 
 
 async def test_nonfinite_value_is_judge_error(
@@ -115,6 +121,7 @@ RESULTS = {
     "c3": {"value": "0.5"},
     "c4": {"key": [1, "a"]},
     "c5": {"value": True},
+    "c6": {"key": []},
 }
 
 
@@ -131,6 +138,7 @@ async def test_malformed_results_are_per_candidate_errors(
     assert [s.candidate_id for s in scores] == ["c0"]
     assert jctx.errors["c1"] == jctx.errors["c2"] == "result needs key or value"
     assert all("invalid judge result" in jctx.errors[c] for c in ("c3", "c4", "c5"))
+    assert jctx.errors["c6"] == "invalid judge result: key: must be nonempty and finite"
 
 
 async def test_execute_errors_propagate() -> None:
@@ -187,9 +195,77 @@ async def test_executor_error_cancels_sibling() -> None:
 async def test_result_errors_hide_secrets(data: dict[str, Any]) -> None:
     class Results(RecordingExecutor):
         async def submit(self, job: Job) -> ToolOutput:
-            return ToolOutput(status=RunStatus.OK, data=data)
+            return ToolOutput.model_construct(status=RunStatus.OK, data=data)
 
     context = JudgeContext(goal=GOAL, executor=Results(), artifact_root="/a")
     assert await ScriptJudge(command=["x"]).judge(GOAL, [cand()], context) == []
     assert "invalid judge result" in context.errors["c1"]
     assert "SENTINEL_PRIVATE_VALUE_22" not in repr(context.errors)
+
+
+async def test_resources_pass_through() -> None:
+    executor = RecordingExecutor()
+    context = JudgeContext(goal=GOAL, executor=executor, artifact_root="/a")
+    resources = Resources(cpus=2)
+    await ScriptJudge(command=["x"], resources=resources).judge(GOAL, [cand()], context)
+    assert executor.jobs[0].resources == resources
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("field", ["key", "value"])
+async def test_nonfinite_result_is_per_candidate_error(number: float, field: str) -> None:
+    class Results(RecordingExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            assert job.stage.candidate is not None
+            cid = job.stage.candidate.request["params"]["cid"]
+            data = {"key": [1.0], "value": 0.25}
+            if cid == "bad":
+                data[field] = [number] if field == "key" else number
+            # A custom executor bypassing validation must still fail closed.
+            return ToolOutput.model_construct(status=RunStatus.OK, data=data)
+
+    context = JudgeContext(goal=GOAL, executor=Results(), artifact_root="/a")
+    candidates = [cand(id=cid, request=ToolRequest(inputs={"cid": cid})) for cid in ("bad", "good")]
+    scores = await ScriptJudge(command=["x"]).judge(GOAL, candidates, context)
+    assert [score.candidate_id for score in scores] == ["good"]
+    expected = (
+        "invalid judge result: key: must be nonempty and finite"
+        if field == "key"
+        else "invalid judge result: value: finite_number"
+    )
+    assert context.errors == {"bad": expected}
+
+
+async def test_nonfinite_candidate_output_does_not_cancel_batch(
+    tmp_path: Path, artifacts: ArtifactStore, jctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import PyTool, make_job
+
+    from swarm_arena._model.ref import Ref
+    from swarm_arena._model.tooling import CompletedRun
+
+    def collect(
+        self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        return ToolOutput(status=RunStatus.OK, data={"nested": [{"loss": float("nan")}]})
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    output = await jctx.executor.submit(
+        make_job(
+            id="nonfinite-collect",
+            kind="tool",
+            command=None,
+            request=ToolRequest(),
+            tool=Ref.of(PyTool({"code": "pass"})),
+            artifact_root=jctx.artifact_root,
+        )
+    )
+    body = (
+        "import json; output = json.load(open('candidate/output.json')); "
+        "assert output['status'] == 'ok'; " + WRITE.format("{'value': 1.0}")
+    )
+    judge = await anyio.to_thread.run_sync(sj, tmp_path, artifacts, body)
+    scores = await judge.judge(GOAL, [cand(id="bad", output=output), cand(id="good")], jctx)
+    assert output.status is RunStatus.ERROR
+    assert [score.candidate_id for score in scores] == ["good"]
+    assert jctx.errors == {"bad": "judge script failed: error"}
