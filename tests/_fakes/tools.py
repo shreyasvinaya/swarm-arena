@@ -1,11 +1,12 @@
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
-from swarm_arena._exec.executor import Job
+from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
@@ -18,6 +19,10 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
+from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
+from swarm_arena._scoring.check import Check, CheckContext
+from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
@@ -192,3 +197,47 @@ class GhostFileTool(PyTool):
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
         ghost = FileRef(name="ghost.txt", path="out/ghost.txt", sha256="0" * 64, size=0)
         return ToolOutput(status=run.status, data={"x": 1}, files=[ghost])
+# --- Task 20 ---
+
+
+class AlwaysPass(Check):
+    name = "always-pass"
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(check=self.name, passed=True)
+
+
+class FixedJudge(Judge):
+    name = "fixed"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        value: float
+
+    @property
+    def config(self) -> Config:
+        return cast(FixedJudge.Config, super().config)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [
+            Score.maximize(self.config.value).model_copy(update={"candidate_id": c.id})
+            for c in candidates
+        ]
+
+
+class RecordingExecutor(Executor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.jobs: list[Job] = []
+
+    async def submit(self, job: Job) -> ToolOutput:
+        self.jobs.append(job)
+        return ToolOutput(status=RunStatus.OK)
+
+    async def capacity(self) -> Resources | None:
+        return None
+
+    async def aclose(self) -> None:
+        return None

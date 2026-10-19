@@ -798,16 +798,22 @@ class Score(FrozenModel):                       # judges return it; the core sta
 class CheckContext:                             # built by the core and by swarm_arena.testing
     def __init__(self, *, goal: Goal, executor: Executor, artifact_root: str, run_id: str = "local",
                  round: int = 0, part: str | None = None,
-                 on_started: Callable[[Job.Started], Awaitable[None]] | None = None) -> None: ...
+                 on_started: Callable[[Job.Started], Awaitable[None]] | None = None,
+                 secrets_file: str | None = None, ids: IdGen | None = None,
+                 tool_timeout_s: float = 3600.0) -> None: ...
     goal: Goal; run_id: str; round: int; part: str | None
+    secrets_file: str | None; ids: IdGen; tool_timeout_s: float  # ids=None -> IdGen(run_id, 0)
     on_started: Callable[[Job.Started], Awaitable[None]] | None   # execute() puts it on the command Job; the core sets it
                                                                     # in a run (R4.14 command_start)
     async def execute(self, command: Command, *, files: Mapping[str, str] | None = None,
                       candidate: Candidate | None = None, resources: Resources | None = None) -> ToolOutput: ...
     # files: path → sha256 staged at the workspace root; candidate: staged under candidate/ (§4.12);
     # ToolOutput.data is the parsed swarm/result.json.
+    # execute uses min(command.timeout_s or tool_timeout_s, tool_timeout_s), computed by cap_timeout;
+    # ctx.ids is the only id source for command jobs and score stamping (M1b's scoring runner calls
+    # stamp_scores(..., ids=ctx.ids) and turns ctx.errors into judge_error events).
 
-class Check(ABC):
+class Check(Configurable, ABC):
     name: ClassVar[str]
     feedback: Literal["pass_fail", "reasons"] = "reasons"
     Config: ClassVar[type[BaseModel]]
@@ -820,12 +826,17 @@ class JudgeContext(CheckContext):
     def __init__(self, *, goal: Goal, executor: Executor, artifact_root: str, run_id: str = "local",
                  round: int = 0, part: str | None = None, fidelity: str = "", batch_id: str = "",
                  anchors: frozenset[str] = frozenset(), final: bool = False, read_cache: bool = True,
-                 on_started: Callable[[Job.Started], Awaitable[None]] | None = None) -> None: ...
+                 on_started: Callable[[Job.Started], Awaitable[None]] | None = None,
+                 secrets_file: str | None = None, ids: IdGen | None = None,
+                 tool_timeout_s: float = 3600.0) -> None: ...
     fidelity: str; batch_id: str; anchors: frozenset[str]; final: bool; read_cache: bool
+    secrets_file: str | None; ids: IdGen; tool_timeout_s: float  # ids=None -> IdGen(run_id, 0)
+    errors: dict[str, str]
+    def judge_error(self, candidate_id: str, reason: str) -> None: ...  # first reason per candidate wins
     on_started: Callable[[Job.Started], Awaitable[None]] | None   # execute() puts it on the command Job; the core sets it
                                                                     # in a run (R4.14 command_start)
 
-class Judge(ABC):
+class Judge(Configurable, ABC):
     name: ClassVar[str]
     Config: ClassVar[type[BaseModel]]
     def preflight(self) -> None: ...
@@ -838,6 +849,11 @@ class Judge(ABC):
     async def judge(self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext) -> list[Score]: ...
 def is_finite_score(score: Score) -> bool: ...   # the finite-key check of M1b judge-error rule 3 (scores built with
                                                  # model_construct/model_copy skip the Score validator)
+
+def stamp_scores(scores: Sequence[Score], *, judge: Judge, judge_name: str, ids: IdGen,
+                 batch_id: str) -> list[Score]: ...
+    # Always set id=ids.next("s"), judge=judge_name, and rubric_hash=judge.rubric_hash(); use the score's
+    # own nonempty panel_hash/batch_id, else the judge's panel hash / supplied batch id; keep candidate_id.
 
 # _scoring/program_judge.py — M1a
 class ProgramJudge(Judge):

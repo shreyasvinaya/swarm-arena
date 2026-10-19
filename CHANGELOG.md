@@ -21,3 +21,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Plan` and its specs with TOML load and dump, and `Limits` with the §8.1 defaults.
 - `Executor` ABC and `Job` (`swarm_arena.executor`).
 - `LocalExecutor`: process-group supervision, launcher handshake, env allowlist, rlimits, and logs by hash.
+- `Check` and `Judge` ABCs with `CheckContext.execute` and score stamping.
