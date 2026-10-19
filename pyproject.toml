@@ -1,0 +1,91 @@
+[project]
+name = "swarm-arena"
+version = "0.1.0.dev0"
+description = "Run a swarm of agents on hard goals: fan out to teams, prune weak branches, converge on answers you can prove."
+readme = "README.md"
+authors = [
+    { name = "Shreyas Vinaya", email = "vinaya.shreyas@gmail.com" }
+]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: POSIX",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anyio>=4.15,<5",
+    "pydantic>=2.11,<3",
+    "typing-extensions>=4.12",
+]
+
+[project.scripts]
+swarm-arena = "swarm_arena._cli.main:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "numpydoc>=1.11",
+    "pytest>=9,<10",
+    "ruff==0.17.1",
+    "ty==0.0.89",
+]
+docs = [
+    "myst-parser>=4",
+    "numpydoc>=1.11",
+    "sphinx>=9.0,<10",
+    "sphinx-rtd-theme>=3.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["docs/superpowers"]   # design docs: ruff 0.17 formats code blocks in Markdown
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "ASYNC", "D", "RUF", "ANN", "SIM", "PT", "TID"]
+ignore = ["ANN401", "RUF012"]   # RUF012: ruff cannot see that FrozenModel subclasses are pydantic models
+pydocstyle.convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"examples/**" = ["D"]
+"src/swarm_arena/__init__.py" = ["E402"]   # the core facades are imported after _publish
+"src/swarm_arena/llm/**" = ["TID251"]
+"src/swarm_arena/ray/**" = ["TID251"]
+"src/swarm_arena/_store/s3.py" = ["TID251"]
+"src/swarm_arena/testing/_fake_model.py" = ["TID251"]
+"tests/llm/**" = ["TID251"]
+"tests/ray/**" = ["TID251"]
+"tests/_store/test_s3.py" = ["TID251"]
+"tests/testing/test_fake_model.py" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"agents".msg = "only swarm_arena.llm and swarm_arena.testing._fake_model may import agents"
+"litellm".msg = "only swarm_arena.llm may import litellm"
+"ray".msg = "only swarm_arena.ray may import ray"
+"s3fs".msg = "only swarm_arena._store.s3 may import s3fs"
+"langfuse".msg = "only swarm_arena.llm may import langfuse"
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.pytest.ini_options]
+anyio_mode = "auto"
+testpaths = ["tests", "src"]
+pythonpath = ["tests"]                # tests import tests/_fakes as `_fakes.<module>` (refs use that path)
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib", "--doctest-modules",
+           "-m", "not ray and not s3 and not llm_live and not gateway_live"]
+doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+filterwarnings = ["error::DeprecationWarning"]
+markers = ["ray", "s3", "llm_live", "gateway_live", "slow"]

@@ -214,6 +214,7 @@ Rules [plan]:
 | `_launch.py` | Entry `python -I -m swarm_arena._launch`: block on the "go" pipe, then `os.execve` the tool command; exit 0 with no exec if the pipe closes first | M1a | `tests/test_launch.py` |
 | `_errors.py` | Private exception classes (R4.13.1) | M1a +M1b | `tests/test_errors.py` |
 | `_version.py` | `__version__` from `importlib.metadata` | M1a | `tests/test_public_api.py` |
+| `_facade.py` | `publish()`: sets `__module__` of exported names, their nested classes, and their methods to their facade (R0), so doctest collects method examples | M1a | `tests/test_public_api.py` |
 | `_model/__init__.py` | Empty | M1a | — |
 | `_model/base.py` | `FrozenModel`, `StoredModel`, `JsonValue`, the `Origin` and role literals | M1a | `tests/_model/test_base.py` |
 | `_model/canonical.py` | Canonical JSON, sha256 helpers, UTC time format | M1a | `tests/_model/test_canonical.py` |
@@ -2229,9 +2230,11 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
   [tool.ruff]
   line-length = 100
   target-version = "py311"
+  extend-exclude = ["docs/superpowers"] # design docs: ruff 0.17 formats code blocks in Markdown
   [tool.ruff.lint]
   select = ["E", "W", "F", "I", "UP", "B", "ASYNC", "D", "RUF", "ANN", "SIM", "PT", "TID"]
-  ignore = ["ANN401"]                   # Any is needed for config dicts and **fields
+  ignore = ["ANN401", "RUF012"]         # ANN401: Any is needed for config dicts and **fields;
+                                        # RUF012: ruff cannot see that FrozenModel subclasses are pydantic models
   pydocstyle.convention = "numpy"
   [tool.ruff.lint.per-file-ignores]
   "tests/**" = ["D"]
