@@ -1,0 +1,393 @@
+import gc
+import os
+import signal
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any
+
+import anyio
+import pytest
+from _fakes.proc import pid_alive, wait_for_file, wait_until
+
+from swarm_arena._exec import supervisor
+from swarm_arena._exec.executor import Job
+from swarm_arena._exec.procinfo import host_id
+from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
+from swarm_arena._model.tooling import CompletedRun, RunStatus
+
+# A grandchild that ignores SIGTERM (so only the group SIGKILL ends it); the tool waits until the
+# grandchild has installed the ignore, writes its pid to gc.pid, and sleeps.
+_GRANDCHILD = (
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "open('gc.ready', 'w'); time.sleep(60)"
+)
+STUBBORN = (
+    "import os, subprocess, sys, time\n"
+    f"c = subprocess.Popen([sys.executable, '-c', {_GRANDCHILD!r}])\n"
+    "while not os.path.exists('gc.ready'): time.sleep(0.01)\n"
+    "open('gc.pid', 'w').write(str(c.pid))\n"
+    "time.sleep(60)\n"
+)
+
+
+NOFILE = (
+    "import resource; open('nofile', 'w').write(str(resource.getrlimit(resource.RLIMIT_NOFILE)[0]))"
+)
+
+
+def sup() -> ProcessSupervisor:
+    return ProcessSupervisor(host_id=host_id())
+
+
+def py(code: str) -> list[str]:
+    return [sys.executable, "-c", code]
+
+
+async def call(tmp_path: Path, argv: list[str], **kw: Any) -> CompletedRun:
+    args: dict[str, Any] = {
+        "cwd": tmp_path,
+        "env": dict(os.environ),
+        "stdout": tmp_path / "stdout.log",
+        "stderr": tmp_path / "stderr.log",
+        "timeout_s": None,
+        "grace_s": 1.0,
+        "rlimits": None,
+        "on_started": None,
+        "before_kill": None,
+    }
+    args.update(kw)
+    return await sup().run(argv, **args)
+
+
+async def test_exit_codes(tmp_path: Path) -> None:
+    ok = await call(tmp_path, py("print('hi')"))
+    assert (ok.status, ok.returncode, ok.stdout_path.read_text()) == (RunStatus.OK, 0, "hi\n")
+    bad = await call(tmp_path, py("import sys; sys.stderr.write('e'); raise SystemExit(3)"))
+    assert (bad.status, bad.returncode, bad.stderr_path.read_text()) == (RunStatus.ERROR, 3, "e")
+    assert ok.started_at <= ok.ended_at
+
+
+async def test_tool_gets_env_and_empty_stdin(tmp_path: Path) -> None:
+    code = "import os, sys; print(os.environ['SA_TEST_VAR'], repr(sys.stdin.read()))"
+    done = await call(tmp_path, py(code), env={**os.environ, "SA_TEST_VAR": "v1"})
+    assert (done.status, done.stdout_path.read_text()) == (RunStatus.OK, "v1 ''\n")
+
+
+async def test_on_started_receives_started(tmp_path: Path) -> None:
+    seen: list[Job.Started] = []
+
+    async def record(s: Job.Started) -> None:
+        seen.append(s)
+
+    await call(tmp_path, py("pass"), on_started=record)
+    [s] = seen
+    assert (s.kind, s.pgid == s.pid, s.host_id) == ("process", True, host_id())
+    assert s.start_time
+
+
+async def test_tool_never_starts_when_on_started_fails(tmp_path: Path) -> None:
+    async def fail(s: Job.Started) -> None:
+        raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await call(tmp_path, py("open('ran', 'w')"), on_started=fail)
+    await anyio.sleep(1)
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_tool_waits_for_on_started(tmp_path: Path) -> None:  # the handshake
+    seen: list[bool] = []
+
+    async def slow_commit(s: Job.Started) -> None:
+        await anyio.sleep(1)  # longer than the launcher needs to start
+        seen.append((tmp_path / "ran").exists())
+
+    done = await call(tmp_path, py("open('ran', 'w')"), on_started=slow_commit)
+    assert done.status is RunStatus.OK
+    assert seen == [False]
+    assert (tmp_path / "ran").exists()
+
+
+async def test_cancel_in_on_started_kills_launcher(tmp_path: Path) -> None:
+    pids: list[int] = []
+
+    async def hang(s: Job.Started) -> None:
+        assert s.pid is not None
+        pids.append(s.pid)
+        await anyio.sleep_forever()
+
+    with anyio.move_on_after(1) as scope:
+        await call(tmp_path, py("open('ran', 'w')"), on_started=hang)
+    await anyio.sleep(0.5)
+    assert scope.cancelled_caught
+    assert not (tmp_path / "ran").exists()
+    assert wait_until(lambda: not pid_alive(pids[0]), 5)
+
+
+@pytest.mark.parametrize("pythonpath", [None, "."])  # "." = an allowlisted PYTHONPATH
+async def test_workspace_package_cannot_run_before_go(
+    tmp_path: Path, pythonpath: str | None
+) -> None:  # spec §4.8
+    (tmp_path / "swarm_arena").mkdir()
+    (tmp_path / "swarm_arena/__init__.py").write_text("open('shadow', 'w')")
+    seen: list[bool] = []
+
+    async def slow_fail(s: Job.Started) -> None:
+        await anyio.sleep(1)
+        seen.append((tmp_path / "shadow").exists())
+        raise RuntimeError("commit failed")
+
+    env = {**os.environ, "PYTHONPATH": pythonpath} if pythonpath else dict(os.environ)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await call(tmp_path, py("pass"), on_started=slow_fail, env=env)
+    await anyio.sleep(0.5)
+    assert seen == [False]
+    assert not (tmp_path / "shadow").exists()
+
+
+async def test_launcher_gone_before_go_is_error(
+    tmp_path: Path,
+) -> None:  # BrokenPipeError on the "go" write
+    async def kill_it(s: Job.Started) -> None:
+        assert s.pid is not None
+        os.kill(s.pid, signal.SIGKILL)
+        await anyio.sleep(0.2)
+
+    done = await call(tmp_path, py("open('ran', 'w')"), on_started=kill_it)  # raises nothing
+    assert (done.status, done.returncode) == (RunStatus.ERROR, -signal.SIGKILL)
+    assert not (tmp_path / "ran").exists()
+
+
+async def test_partial_collect_after_timeout(tmp_path: Path) -> None:  # exit criterion
+    seen: list[tuple[CompletedRun, bool]] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        seen.append((r, (tmp_path / "partial.txt").exists()))
+
+    started = time.monotonic()
+    done = await call(
+        tmp_path,
+        py("open('partial.txt', 'w').write('x'); import time; time.sleep(60)"),
+        timeout_s=1.0,
+        grace_s=0.5,
+        before_kill=before_kill,
+    )
+    assert done.status is RunStatus.TIMEOUT
+    assert time.monotonic() - started < 10
+    [(provisional, partial_seen)] = seen
+    assert (provisional.status, provisional.returncode, partial_seen) == (
+        RunStatus.TIMEOUT,
+        None,
+        True,
+    )
+    assert provisional.stderr_path == done.stderr_path
+    assert provisional.started_at == done.started_at
+
+
+async def test_sigterm_handler_runs_within_grace(tmp_path: Path) -> None:
+    code = (
+        "import signal, sys, time\n"
+        "def stop(*_): open('term.txt', 'w').write('t'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "time.sleep(60)\n"
+    )
+    seen: list[bool] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        seen.append((tmp_path / "term.txt").exists())
+
+    done = await call(tmp_path, py(code), timeout_s=1.0, grace_s=3.0, before_kill=before_kill)
+    assert (done.status, done.returncode, seen) == (RunStatus.TIMEOUT, 0, [True])
+
+
+async def test_descendant_gets_full_grace_after_leader_exits(tmp_path: Path) -> None:
+    child = (
+        "import signal, sys, time\n"
+        "def stop(*_): time.sleep(1.0); open('child_partial.txt', 'w').write('x'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "open('child.ready', 'w')\n"
+        "time.sleep(60)\n"
+    )
+    leader = (  # keeps the default SIGTERM action, so it dies at once
+        "import os, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "while not os.path.exists('child.ready'): time.sleep(0.01)\n"
+        "time.sleep(60)\n"
+    )
+    seen: list[bool] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        seen.append((tmp_path / "child_partial.txt").exists())
+
+    done = await call(tmp_path, py(leader), timeout_s=1.5, grace_s=3.0, before_kill=before_kill)
+    assert done.status is RunStatus.TIMEOUT
+    assert seen == [True]
+
+
+async def test_stop_returns_early_when_group_is_gone(tmp_path: Path) -> None:
+    started = time.monotonic()
+    done = await call(tmp_path, py("import time; time.sleep(60)"), timeout_s=1.0, grace_s=30.0)
+    assert done.status is RunStatus.TIMEOUT
+    assert time.monotonic() - started < 10
+
+
+async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit criterion
+    code = (
+        "import subprocess, time; c = subprocess.Popen(['sleep', '60']); "
+        "open('gc.pid', 'w').write(str(c.pid)); time.sleep(60)"
+    )
+    statuses: list[RunStatus] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        statuses.append(r.status)
+
+    async def go() -> None:
+        await call(tmp_path, py(code), before_kill=before_kill)
+
+    with anyio.move_on_after(30) as scope:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(go)
+            await wait_for_file(tmp_path / "gc.pid", 10)
+            tg.cancel_scope.cancel()
+    assert not scope.cancelled_caught
+    assert statuses == [RunStatus.CANCELLED]
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+
+
+async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
+    async def broken(r: CompletedRun) -> None:
+        raise RuntimeError("collector broke")
+
+    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=broken)
+    assert done.status is RunStatus.TIMEOUT
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert "before_kill failed: RuntimeError: collector broke" in done.stderr_path.read_text()
+
+
+async def test_blocked_before_kill_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
+
+    async def blocked(r: CompletedRun) -> None:
+        await anyio.sleep_forever()
+
+    started = time.monotonic()
+    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=blocked)
+    assert done.status is RunStatus.TIMEOUT
+    assert time.monotonic() - started < 10
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert "before_kill timed out" in done.stderr_path.read_text()
+
+
+async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> None:
+    alive: list[bool] = []
+
+    async def before_kill(r: CompletedRun) -> None:
+        alive.append(pid_alive(int((tmp_path / "gc.pid").read_text())))
+
+    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=before_kill)
+    assert done.status is RunStatus.TIMEOUT
+    assert alive == [True]
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert "swarm-arena" not in done.stderr_path.read_text()  # no note on success
+
+
+@pytest.mark.parametrize("mode", ["blocked", "raises"])
+async def test_fifo_stderr_cannot_block_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
+    err = str(tmp_path / "stderr.log")
+    code = (
+        f"import os; os.remove({err!r}); os.mkfifo({err!r})\n" + STUBBORN
+    )  # the test never reads the FIFO
+
+    async def blocked(r: CompletedRun) -> None:
+        await anyio.sleep_forever()
+
+    async def broken(r: CompletedRun) -> None:
+        raise RuntimeError("collector broke")
+
+    with anyio.fail_after(10):
+        done = await call(
+            tmp_path,
+            py(code),
+            timeout_s=1.0,
+            grace_s=0.5,
+            before_kill=blocked if mode == "blocked" else broken,
+        )
+    assert done.status is RunStatus.TIMEOUT
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+
+
+async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None:
+    async def broken(r: CompletedRun) -> None:
+        raise RuntimeError("collector broke")
+
+    async def go() -> None:
+        await call(tmp_path, py(STUBBORN), grace_s=0.5, before_kill=broken)
+
+    with anyio.move_on_after(30) as scope:
+        async with anyio.create_task_group() as tg:  # no ExceptionGroup leaves the group
+            tg.start_soon(go)
+            await wait_for_file(tmp_path / "gc.pid", 10)
+            tg.cancel_scope.cancel()
+    assert not scope.cancelled_caught
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert (
+        "before_kill failed: RuntimeError: collector broke" in (tmp_path / "stderr.log").read_text()
+    )
+
+
+async def test_background_child_killed_after_normal_exit(tmp_path: Path) -> None:
+    code = (
+        "import subprocess; c = subprocess.Popen(['sleep', '60']); "
+        "open('bg.pid', 'w').write(str(c.pid))"
+    )
+    done = await call(tmp_path, py(code))
+    assert (done.status, done.returncode) == (RunStatus.OK, 0)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "bg.pid").read_text())), 5)
+
+
+async def test_oom_status_needs_memory_limit(tmp_path: Path) -> None:
+    code = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+    assert (
+        await call(tmp_path, py(code), rlimits=RLimits(memory_bytes=8 * 2**30))
+    ).status is RunStatus.OOM
+    assert (await call(tmp_path, py(code))).status is RunStatus.ERROR
+
+
+async def test_other_signal_is_error_with_memory_limit(tmp_path: Path) -> None:
+    code = "import os, signal; os.kill(os.getpid(), signal.SIGABRT)"
+    done = await call(tmp_path, py(code), rlimits=RLimits(memory_bytes=8 * 2**30))
+    assert (done.status, done.returncode) == (RunStatus.ERROR, -signal.SIGABRT)
+
+
+async def test_default_rlimits_cap_open_files(tmp_path: Path) -> None:
+    code = NOFILE
+    done = await call(tmp_path, py(code), rlimits=RLimits())
+    assert done.status is RunStatus.OK
+    assert 0 < int((tmp_path / "nofile").read_text()) <= 4096
+
+
+async def test_no_descriptor_or_transport_leak(tmp_path: Path) -> None:  # api-anyio-packaging.md §A
+    async def fail(s: Job.Started) -> None:
+        raise RuntimeError("commit failed")
+
+    n0 = len(os.listdir("/dev/fd"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        for _ in range(10):
+            await call(tmp_path, py("pass"))
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="commit failed"):
+                await call(tmp_path, py("pass"), on_started=fail)
+        for _ in range(2):
+            with pytest.raises(FileNotFoundError, match="missing"):
+                await call(tmp_path, py("pass"), cwd=tmp_path / "missing")
+        gc.collect()
+    assert len(os.listdir("/dev/fd")) == n0
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)]
