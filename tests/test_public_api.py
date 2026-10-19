@@ -69,6 +69,17 @@ PUBLIC["swarm_arena.protocol"] += [
 ]
 PUBLIC["swarm_arena.tool"] += ["Tool", "Action"]
 PUBLIC["swarm_arena.executor"] += ["Executor", "Job"]
+PUBLIC["swarm_arena"] += ["RunConfig"]
+PUBLIC["swarm_arena.config"] += [
+    "CachePolicy",
+    "CatalogEntry",
+    "GatewayConfig",
+    "ModelCatalog",
+    "ModelSpec",
+    "PlannerCatalog",
+    "SecretsPolicy",
+    "TracingConfig",
+]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))

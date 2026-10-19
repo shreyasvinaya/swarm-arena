@@ -146,6 +146,11 @@ def make_job(**fields: Any) -> Job:
 
 class FilesWidget(Configurable):
     name: ClassVar[str] = "files-widget"
+# --- Task 9 ---
+
+
+class HumanOnlyWidget(Configurable):
+    _human_only: ClassVar[frozenset[str]] = frozenset({"command"})
 
     class Config(BaseModel):
         model_config = ConfigDict(extra="forbid", frozen=True)
@@ -153,3 +158,5 @@ class FilesWidget(Configurable):
         files: FileSet = FileSet()
         members: list[RefField] = []
         label: str = ""
+        command: list[str] = []
+        timeout_s: float | None = None
