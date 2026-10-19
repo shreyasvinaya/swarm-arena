@@ -14,7 +14,11 @@ files = ["problem/*.txt", "problem/run.py"]
 ```
 
 Snapshotting stores each selected regular file by SHA-256 and records a sorted
-`path → sha256` manifest while keeping the original globs. Every glob must match
+`path → sha256` manifest while keeping the original globs. Folded aliases of
+the same device/inode are recorded once using the directory listing’s spelling,
+including ancestor names. Distinct files whose names collide after NFC/casefold
+comparison are refused with both paths named; the manifest must also have a
+portable file/directory layout. Every glob must match
 at least one regular file. Symlinks below the plan directory and reserved
 top-level paths (`swarm`, `parents`, `candidate`) are rejected, including case
 variants such as `SWARM` and `Parents`. Those names are
@@ -32,8 +36,9 @@ representation, and the returned plan retains its original base directory.
 
 ## Workspace staging
 
-A tool workspace starts with goal and tool files. The first parent's full overlay
-is applied only when its nonempty tool identity matches the receiving tool and
+A tool workspace starts with goal and tool files. Tool files replace goal files
+at a shared NFC/casefold key and keep the tool file’s spelling. The first
+parent's full overlay is applied only when its nonempty tool identity matches the receiving tool and
 every overlay path is editable, unprotected, and outside check or judge private
 files. Otherwise the whole overlay is refused with a warning identifying the
 parent and the refused paths; an empty overlay needs no warning. Live edits are
@@ -55,16 +60,20 @@ the reserved `sha256:` followed by exactly 64 lowercase hex digits is a stored
 reference and cannot be submitted as a live edit.
 
 `validate_edits` soft-refuses differently spelled edits sharing an NFC/casefold
-key. Pass the existing workspace paths as `root` to also refuse aliases of
-existing files; an exact-spelling edit still replaces that file. Stage planning
-rechecks edit collisions against goal files, tool files, and the accepted base
+key, including ancestor directory aliases and file/directory conflicts. For
+example, `P/b.txt` conflicts with root file `p/a.txt`, and file `P` conflicts
+with directory `p/`. Pass the existing workspace paths as `root` to also refuse
+aliases of existing files; an exact-spelling edit still replaces that file.
+Stage planning rechecks edit collisions against goal files, tool files, and the accepted base
 overlay before creating the stage. Refusals identify the conflicting paths
 without including edit contents.
 
 Every parent, including the base parent, has read-only overlay and output files
-under `parents/<id>/`. Output files win at a shared path; `data.json` always holds
-the parent's structured output. Parent ids must be single safe path components
-and must be distinct after NFC normalization and case folding.
+under `parents/<id>/`. Output files win at a shared NFC/casefold key, retaining
+the output’s spelling, both over parent overlays and over effective candidate
+files. `data.json` always holds the parent's structured output; aliases such as
+`DATA.json` and `Data.json` are skipped at that level too. Parent ids must be
+single safe path components and must be distinct after NFC normalization and case folding.
 Checks and judges instead receive their own root files and read-only candidate
 files under `candidate/files/`, with request and output metadata beside that
 directory. The directory exists even for a candidate with no files.
@@ -78,10 +87,18 @@ bytes directly, and publishes through pinned directory descriptors.
 Root artifacts are writable; parent and candidate
 artifacts are read-only. The workspace's ancestors are trusted executor-owned
 directories. Output collection uses the shared regular-file reader, refuses
-symlink components and special files, and rejects duplicate normalized paths
-after NFC/casefold comparison before uploading any outputs. Result parsing
-applies the same rule, so declarations such as `out.txt` and `OUT.txt` turn a
-successful producing run into an error naming both paths.
+symlink components and special files. The sink, staging helpers, snapshotter,
+and output collectors use one folded-layout checker for files, implicit ancestor
+directories, and file/directory conflicts.
+
+`collect_output_files` requires the original `stage` as a keyword-only argument
+and checks declarations against its complete layout before uploading any output.
+Result parsing uses the same output helper for declarations against each other;
+it has no original stage. The executor then supplies `job.stage` for the full
+check. Declarations such as `out/a.txt` and `OUT/b.txt`, or output `P/RUN.py`
+against staged `p/run.py`, therefore fail the producing run with both paths in
+the log. Exact-spelling replacements remain allowed. The original stage is used
+even if the process renames or removes a staged file.
 These file-handling protections do not provide strong process isolation.
 
 ## ScriptTool

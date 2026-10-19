@@ -13,7 +13,14 @@ from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_key, check_relpath, fold_key, matches
+from swarm_arena._tooling.paths import (
+    check_key,
+    check_relpath,
+    fold_conflicts,
+    fold_key,
+    fold_merge,
+    matches,
+)
 from swarm_arena._tooling.result_file import request_json as _request_json
 
 
@@ -85,13 +92,12 @@ def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str:
 
 
 def _edit_collisions(edits: Mapping[str, str], root: AbstractSet[str]) -> dict[str, str]:
-    """Identify differently spelled edits sharing a folded edit or root key."""
-    spellings = {fold_key(path): path for path in sorted(root)}
+    """Report edit conflicts using the same layout rule as the sink."""
     errors: dict[str, str] = {}
-    for path in edits:
-        previous = spellings.setdefault(fold_key(path), path)
-        if previous != path:
-            errors[path] = f"folded path collision with {previous}"
+    for first, second in fold_conflicts(dict.fromkeys([*sorted(root), *edits])):
+        for path, other in ((first, second), (second, first)):
+            if path in edits:
+                errors.setdefault(path, f"folded path collision with {other}")
     return errors
 
 
@@ -252,7 +258,7 @@ def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]:
     """
     _check_keys(goal.files.manifest)
     _check_keys(candidate.overlay)
-    return {**goal.files.manifest, **candidate.overlay}
+    return fold_merge(goal.files.manifest, candidate.overlay)
 
 
 def _check_keys(files: Mapping[str, str]) -> None:
@@ -337,7 +343,7 @@ def plan_tool_stage(
         _check_keys(parent.overlay)
         for file in parent.files:
             check_key(file.path)
-    root = {**goal_files, **tool_files}
+    root = fold_merge(goal_files, tool_files)
     for path in root:
         if fold_key(path) in private_paths:
             raise RuntimeError(f"private path in tool root: {path}")
@@ -363,11 +369,12 @@ def plan_tool_stage(
             )
         else:
             overlay.update(base.overlay)
-    collisions = _edit_collisions(edits, root.keys() | overlay.keys())
+    root = fold_merge(root, overlay)
+    collisions = _edit_collisions(edits, root.keys())
     if collisions:
         raise SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
     overlay.update(edit_hashes(edits))
-    root.update(overlay)
+    root = fold_merge(root, overlay)
     return Job.Stage(root=root, parents=list(parents), request_json=request_json), overlay, warnings
 
 
@@ -412,6 +419,6 @@ def plan_script_stage(
                 "usage": output.usage.model_dump(mode="json"),
                 "files": [file.path for file in output.files],
             },
-            files={**effective_files, **{file.path: file.sha256 for file in output.files}},
+            files=fold_merge(effective_files, {file.path: file.sha256 for file in output.files}),
         ),
     )

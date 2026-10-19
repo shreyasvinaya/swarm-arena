@@ -419,3 +419,29 @@ async def test_confirm_dead_and_kill_orphan(local_executor: LocalExecutor) -> No
         assert await local_executor.confirm_dead(dispatch) is None
     finally:
         await anyio.to_thread.run_sync(reap, proc)
+
+
+@pytest.mark.parametrize(
+    ("staged", "declared"),
+    [("p/run.py", "P/RUN.py"), ("problem/run.py", "Problem/out.txt")],
+)
+async def test_folded_output_vs_staged_path_fails_producing_run(
+    local_executor: LocalExecutor, tmp_path: Path, staged: str, declared: str
+) -> None:
+    artifacts = store(tmp_path)
+    digest = await anyio.to_thread.run_sync(artifacts.put_bytes, b"staged-secret")
+    code = (
+        "from pathlib import Path; "
+        f"p = Path({declared!r}); p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text('output-secret'); " + WRITE.format(repr({"data": {}, "files": [declared]}))
+    )
+    output = await local_executor.submit(
+        tool_job(tmp_path, code, stage=Job.Stage(root={staged: digest}))
+    )
+    assert output.status == RunStatus.ERROR
+    assert output.files == []
+    diagnostic = log(tmp_path, output, 2).decode()
+    assert staged in diagnostic
+    assert declared in diagnostic
+    assert "staged-secret" not in diagnostic
+    assert "output-secret" not in diagnostic

@@ -266,7 +266,10 @@ class _JobRun:
         update: dict[str, Any] = {}
         try:
             update["files"] = collect_output_files(
-                self._workspace, [ref.path for ref in output.files], self._artifacts
+                self._workspace,
+                [ref.path for ref in output.files],
+                self._artifacts,
+                stage=self._job.stage,
             )
         except ValueError as exc:
             note_in_log(self._stderr, f"output files not uploaded: {exc}")

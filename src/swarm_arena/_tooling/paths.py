@@ -3,12 +3,13 @@
 import fnmatch
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from functools import cache
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Final, TypeVar
 
 RESERVED: Final = frozenset({"swarm", "parents", "candidate"})
+_T = TypeVar("_T")
 
 
 def fold_key(path: str) -> str:
@@ -30,6 +31,145 @@ def fold_key(path: str) -> str:
     'problem/run.py'
     """
     return unicodedata.normalize("NFC", path).casefold()
+
+
+def fold_conflicts(
+    files: Iterable[str], *, directories: Iterable[str] = ()
+) -> list[tuple[str, str]]:
+    """Find folded layout conflicts, including implicit ancestor directories.
+
+    Parameters
+    ----------
+    files : Iterable[str]
+        Normal-form file paths. Repeated files are conflicts; callers allowing
+        exact-path replacement must merge those entries first.
+    directories : Iterable[str], optional
+        Explicit directories, including empty generated directories.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        Pairs of original input paths whose nodes disagree in spelling or
+        file/directory kind, or repeat a file. Shared same-spelling directories
+        are allowed. Paths need not pass ``check_key``: sink paths can include
+        generated reserved trees.
+
+    Examples
+    --------
+    >>> fold_conflicts(["p/a.txt", "P/b.txt"])
+    [('p/a.txt', 'P/b.txt')]
+    >>> fold_conflicts(["p", "p/a.txt"])
+    [('p', 'p/a.txt')]
+    >>> fold_conflicts(["p/a.txt", "p/b.txt"])
+    []
+    """
+    nodes: dict[str, tuple[str, bool, str]] = {}
+    conflicts: dict[tuple[str, str], None] = {}
+    for paths, is_directory in ((files, False), (directories, True)):
+        for rel in paths:
+            path = PurePosixPath(rel)
+            for component in (path, *path.parents):
+                if component == PurePosixPath("."):
+                    continue
+                spelling = component.as_posix()
+                directory = is_directory or component != path
+                key = fold_key(spelling)
+                previous = nodes.get(key)
+                if previous is None:
+                    nodes[key] = (spelling, directory, rel)
+                    continue
+                if previous[0] != spelling or not (previous[1] and directory):
+                    conflicts[previous[2], rel] = None
+    return list(conflicts)
+
+
+def fold_merge(base: Mapping[str, _T], overlay: Mapping[str, _T]) -> dict[str, _T]:
+    """Merge file maps by folded key, keeping each winner's spelling.
+
+    Parameters
+    ----------
+    base : Mapping[str, _T]
+        Lower-priority file entries.
+    overlay : Mapping[str, _T]
+        Higher-priority entries. These replace folded matches in ``base``.
+
+    Returns
+    -------
+    dict[str, _T]
+        A new mapping with a valid folded layout.
+
+    Raises
+    ------
+    ValueError
+        If either input or the merged layout has conflicting paths.
+
+    Examples
+    --------
+    >>> fold_merge({"p/a": "old"}, {"P/A": "new"})
+    {'P/A': 'new'}
+    """
+    conflicts = fold_conflicts(base) + fold_conflicts(overlay)
+    if conflicts:
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting workspace path: {first} and {second}")
+    entries = {fold_key(path): (path, value) for path, value in base.items()}
+    entries.update({fold_key(path): (path, value) for path, value in overlay.items()})
+    merged = dict(entries.values())
+    conflicts = fold_conflicts(merged)
+    if conflicts:
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting workspace path: {first} and {second}")
+    return merged
+
+
+def output_paths(
+    declared: Sequence[str], *, effective_files: Iterable[str], directories: Iterable[str] = ()
+) -> list[str]:
+    """Normalize outputs and reject conflicts within their destination layout.
+
+    Parameters
+    ----------
+    declared : Sequence[str]
+        Output declarations, including any redundant separators or dot segments.
+    effective_files : Iterable[str]
+        Original staged file paths. Exact-spelling output replacements are
+        allowed; differently spelled aliases are refused.
+    directories : Iterable[str], optional
+        Explicit staged directories.
+
+    Returns
+    -------
+    list[str]
+        Normalized output paths in declaration order.
+
+    Raises
+    ------
+    ValueError
+        If a path is invalid or the combined layout conflicts. Diagnostics
+        name paths only, never file contents.
+
+    Examples
+    --------
+    >>> output_paths(["./p/a.txt"], effective_files=["p/a.txt"])
+    ['p/a.txt']
+    """
+    paths = [check_relpath(path) for path in declared]
+    conflicts = fold_conflicts(paths)
+    if conflicts:
+        first, second = conflicts[0]
+        originals = [
+            original
+            for original, rel in zip(declared, paths, strict=True)
+            if rel in (first, second)
+        ]
+        raise ValueError(
+            "duplicate output path or conflicting output paths: " + " and ".join(originals)
+        )
+    conflicts = fold_conflicts(dict.fromkeys([*effective_files, *paths]), directories=directories)
+    if conflicts:
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting output path with staged layout: {first} and {second}")
+    return paths
 
 
 def check_relpath(path: str) -> str:

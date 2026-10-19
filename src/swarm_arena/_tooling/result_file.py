@@ -22,7 +22,7 @@ from swarm_arena._model.tooling import (
     ToolRequest,
     Usage,
 )
-from swarm_arena._tooling.paths import check_relpath, fold_key
+from swarm_arena._tooling.paths import output_paths
 
 _RESULT = "swarm/result.json"
 
@@ -253,22 +253,9 @@ def _load_result(workspace: Path) -> tuple[ToolResultFile, list[FileRef]]:
     # Pydantic may coerce strings such as "NaN" to floats after JSON parsing.
     if result.usage.usd is not None and not math.isfinite(result.usage.usd):
         raise ValueError("non-finite number in swarm/result.json")
-    paths: list[str] = []
-    seen: dict[str, str] = {}
-    for index, path in enumerate(result.files):
-        try:
-            rel = check_relpath(path)
-        except ValueError:
-            raise ValueError(
-                f"files.{index}: invalid path (absolute, parent, empty, NUL, or reserved)"
-            ) from None
-        key = fold_key(rel)
-        if key in seen:
-            raise ValueError(
-                f"duplicate output path after normalization and folding: {seen[key]} and {path}"
-            )
-        seen[key] = path
-        paths.append(rel)
+    # The result parser has no original stage. The executor's upload collector
+    # performs the full staged-layout check with its required stage argument.
+    paths = output_paths(result.files, effective_files=())
     files: list[FileRef] = []
     for rel in paths:
         data = read_regular_file(workspace, rel)

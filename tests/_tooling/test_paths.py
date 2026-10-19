@@ -152,3 +152,36 @@ def test_matches_accepts_any_matching_glob() -> None:
 def test_matches_rejects_invalid_glob() -> None:
     with pytest.raises(ValueError, match="glob"):
         matches("a.txt", ["../*.txt"])
+
+
+@pytest.mark.parametrize(
+    ("files", "directories", "conflict"),
+    [
+        (["p/a", "p/b"], [], None),
+        (["p/a", "P/b"], [], ("p/a", "P/b")),
+        (["p/a", "p"], [], ("p/a", "p")),
+        (["p", "p/a"], [], ("p", "p/a")),
+        (["p/a", "P"], [], ("p/a", "P")),
+        (["p/a", "p/a"], [], ("p/a", "p/a")),
+        (["p"], ["p"], ("p", "p")),
+        (["p/a"], ["P"], ("p/a", "P")),
+        (["p/a"], ["p"], None),
+    ],
+)
+def test_shared_folded_layout(
+    files: list[str], directories: list[str], conflict: tuple[str, str] | None
+) -> None:
+    from swarm_arena._tooling.paths import fold_conflicts
+
+    conflicts = fold_conflicts(files, directories=directories)
+    assert conflicts == ([] if conflict is None else [conflict])
+
+
+def test_fold_merge_keeps_winning_spelling_without_mutation() -> None:
+    from swarm_arena._tooling.paths import fold_merge
+
+    base = {"p/a": "base", "p/b": "keep", "caf\u00e9/a": "base"}
+    overlay = {"p/A": "winner", "cafe\u0301/a": "unicode"}
+    assert fold_merge(base, overlay) == {"p/A": "winner", "p/b": "keep", "cafe\u0301/a": "unicode"}
+    assert base == {"p/a": "base", "p/b": "keep", "caf\u00e9/a": "base"}
+    assert overlay == {"p/A": "winner", "cafe\u0301/a": "unicode"}

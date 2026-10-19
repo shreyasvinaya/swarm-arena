@@ -13,7 +13,7 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.tooling import FileRef, check_parent_id
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_key, check_relpath, fold_key
+from swarm_arena._tooling.paths import check_key, fold_conflicts, fold_key, fold_merge, output_paths
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
 
 
@@ -49,12 +49,12 @@ def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[st
     metadata: dict[str, bytes] = {}
     for parent in stage.parents:
         prefix = f"parents/{parent.candidate_id}"
-        merged = {**parent.overlay, **{file.path: file.sha256 for file in parent.files}}
+        merged = fold_merge(parent.overlay, {file.path: file.sha256 for file in parent.files})
         files.update(
             {
                 f"{prefix}/{path}": (digest, True)
                 for path, digest in merged.items()
-                if path != "data.json"
+                if fold_key(path) != "data.json"
             }
         )
         metadata[f"{prefix}/data.json"] = _json_bytes(
@@ -76,26 +76,13 @@ def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[st
 
 def _check_layout(workspace: Path, files: set[str], directories: set[str]) -> None:
     """Reject conflicting paths and existing symlinks before creating anything."""
-    spellings: dict[str, str] = {}
-    for rel in sorted(files | directories):
-        path = PurePosixPath(rel)
-        # Include implicit directories: p/a and P/b must not share a directory
-        # under different spellings, even when neither leaf collides.
-        for component in (path, *path.parents):
-            spelling = component.as_posix()
-            key = fold_key(spelling)
-            previous = spellings.setdefault(key, spelling)
-            if previous != spelling:
-                raise ValueError(f"conflicting workspace path: {spelling} and {previous}")
+    conflicts = fold_conflicts(sorted(files), directories=sorted(directories))
+    if conflicts:
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting workspace path: {first} and {second}")
     if workspace.is_symlink():
         raise ValueError("symlink not allowed: workspace path")
     for rel in sorted(files | directories):
-        parts = PurePosixPath(rel)
-        for ancestor in parts.parents:
-            if ancestor.as_posix() in files:
-                raise ValueError(f"conflicting workspace path: {rel}")
-        if rel in files and rel in directories:
-            raise ValueError(f"conflicting workspace path: {rel}")
         try:
             if symlinked_component(workspace, rel) is not None:
                 raise ValueError(f"symlink not allowed: {rel}")
@@ -206,7 +193,7 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
 
 
 def collect_output_files(
-    workspace: Path, declared: Sequence[str], artifacts: ArtifactStore
+    workspace: Path, declared: Sequence[str], artifacts: ArtifactStore, *, stage: Job.Stage
 ) -> list[FileRef]:
     """Upload declared regular outputs after checking paths and symlinks.
 
@@ -218,6 +205,9 @@ def collect_output_files(
         Relative output paths; aliases normalize before collection.
     artifacts : ArtifactStore
         Store receiving output contents.
+    stage : Job.Stage
+        Original materialized stage, including the effective root, parents,
+        candidate files, and generated metadata. Required even for an empty stage.
 
     Returns
     -------
@@ -232,19 +222,15 @@ def collect_output_files(
 
     Examples
     --------
-    >>> refs = collect_output_files(Path("ws"), ["out/a.txt"], artifacts)  # doctest: +SKIP
+    >>> refs = collect_output_files(  # doctest: +SKIP
+    ...     Path("ws"), ["out/a.txt"], artifacts, stage=Job.Stage())
     """
-    paths: list[str] = []
-    seen: dict[str, str] = {}
-    for path in declared:
-        rel = check_relpath(path)
-        key = fold_key(rel)
-        if key in seen:
-            raise ValueError(
-                f"duplicate output path after normalization and folding: {seen[key]} and {path}"
-            )
-        seen[key] = path
-        paths.append(rel)
+    files, metadata = _stage_files(stage)
+    paths = output_paths(
+        declared,
+        effective_files=files.keys() | metadata.keys(),
+        directories={"swarm", "candidate/files"} if stage.candidate is not None else {"swarm"},
+    )
     output: list[FileRef] = []
     for rel in paths:
         try:

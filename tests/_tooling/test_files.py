@@ -11,6 +11,7 @@ from pydantic import create_model, field_validator
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
+from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.ref import Ref, RefField
@@ -431,3 +432,49 @@ def test_snapshot_ref_config_validation_failures_are_secret_safe(
     assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
     assert exc.value.__suppress_context__
     assert exc.value.__cause__ is None
+
+
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_snapshot_folded_alias_identity(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, same_inode: bool
+) -> None:
+    """Exercise both filesystem identity cases independently of the host volume."""
+    import stat
+
+    import swarm_arena._tooling.files as files_module
+
+    lower, upper = tmp_path / "run.py", tmp_path / "RUN.py"
+    original_stat = Path.stat
+    original_iterdir = Path.iterdir
+
+    def stat_path(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self in (lower, upper):
+            inode = 1 if self == lower or same_inode else 2
+            return os.stat_result((stat.S_IFREG | 0o644, inode, 1, 1, 0, 0, 1, 0, 0, 0))
+        return original_stat(self, follow_symlinks=follow_symlinks)
+
+    def glob(self: Path, pattern: str) -> Iterator[Path]:
+        assert self == tmp_path
+        yield from [lower, upper]
+
+    def iterdir(self: Path) -> Iterator[Path]:
+        if self == tmp_path:
+            yield from [lower] if same_inode else [lower, upper]
+        else:
+            yield from original_iterdir(self)
+
+    def read(base: Path, rel: str) -> bytes:
+        return b"x"
+
+    monkeypatch.setattr(Path, "stat", stat_path)
+    monkeypatch.setattr(Path, "glob", glob)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(files_module, "read_regular_file", read)
+    if same_inode:
+        snapshot = snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
+        assert snapshot.manifest == {"run.py": sha256_hex(b"x")}
+    else:
+        with pytest.raises(ValueError, match=r"conflicting.*path") as exc:
+            snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
+        assert "run.py" in str(exc.value)
+        assert "RUN.py" in str(exc.value)

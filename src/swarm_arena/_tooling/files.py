@@ -6,8 +6,48 @@ from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_relpath, matches
+from swarm_arena._tooling.paths import check_relpath, fold_conflicts, fold_key, matches
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
+
+
+def _listed_path(base: Path, relative: str) -> str:
+    """Recover each component's directory-entry spelling using file identity.
+
+    Parameters
+    ----------
+    base : Path
+        Trusted source root.
+    relative : str
+        Glob result which may retain a literal pattern's alias spelling.
+
+    Returns
+    -------
+    str
+        Workspace-relative path using on-disk names for every component.
+
+    Examples
+    --------
+    >>> _listed_path(Path("source"), "problem/RUN.py")  # doctest: +SKIP
+    'problem/run.py'
+    """
+    current = base
+    for part in Path(relative).parts:
+        target = (current / part).stat(follow_symlinks=False)
+        entries = list(current.iterdir())
+        # An exact directory entry is authoritative on a case-sensitive volume.
+        exact = next((entry for entry in entries if entry.name == part), None)
+        if exact is not None:
+            current = exact
+            continue
+        for entry in entries:
+            if fold_key(entry.name) == fold_key(part):
+                info = entry.stat(follow_symlinks=False)
+                if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                    current = entry
+                    break
+        else:
+            raise ValueError(f"cannot find directory entry for path: {relative}")
+    return current.relative_to(base).as_posix()
 
 
 def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> FileSet:
@@ -46,7 +86,8 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     """
     if fs.manifest or not fs.globs:
         return fs
-    manifest: dict[str, str] = {}
+    selected: dict[str, tuple[int, int]] = {}
+    paths: list[str] = []
     for glob in fs.globs:
         found = False
         try:
@@ -58,15 +99,29 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
                     raise ValueError(f"symlink not allowed: {link}")
                 if not path.is_file():
                     continue
-                rel = check_relpath(relative)
+                check_relpath(relative)
+                rel = check_relpath(_listed_path(base_dir, relative))
                 found = True
-                if rel not in manifest:
-                    manifest[rel] = artifacts.put_bytes(read_regular_file(base_dir, rel))
+                info = path.stat(follow_symlinks=False)
+                identity = (info.st_dev, info.st_ino)
+                key = fold_key(rel)
+                previous = selected.get(key)
+                if previous is None or previous != identity:
+                    # Only aliases of the same file are deduplicated. Keep
+                    # distinct identities for the shared layout checker below.
+                    paths.append(rel)
+                selected.setdefault(key, identity)
         except OSError:
             raise ValueError(f"cannot snapshot glob {glob!r}") from None
         if not found:
             raise ValueError(f"glob {glob!r} matched no file")
-    return fs.model_copy(update={"manifest": dict(sorted(manifest.items()))})
+    paths.sort()
+    conflicts = fold_conflicts(paths)
+    if conflicts:
+        first, second = conflicts[0]
+        raise ValueError(f"conflicting snapshot paths: {first} and {second}")
+    manifest = {rel: artifacts.put_bytes(read_regular_file(base_dir, rel)) for rel in paths}
+    return fs.model_copy(update={"manifest": manifest})
 
 
 def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:

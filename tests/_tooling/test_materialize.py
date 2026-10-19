@@ -103,17 +103,9 @@ def test_folded_destination_collisions_fail_before_write(
     files = {first: h, second: h}
     stage = Job.Stage(root=files)
     if location == "parent":
-        # Check collisions across overlay and output sources as well as within root/candidate.
-        stage = Job.Stage(
-            parents=[
-                PARENT.model_copy(
-                    update={
-                        "overlay": {first: h},
-                        "files": [FileRef(name="output", path=second, sha256=h, size=7)],
-                    }
-                )
-            ]
-        )
+        # A single source must be valid. Output-over-overlay folded replacement
+        # is allowed by F2 and covered separately in test_folded_layout.py.
+        stage = Job.Stage(parents=[PARENT.model_copy(update={"overlay": files})])
     elif location == "candidate":
         stage = Job.Stage(candidate=Job.CandidateFiles(request={}, output={}, files=files))
     with pytest.raises(ValueError, match="conflicting workspace path"):
@@ -121,7 +113,7 @@ def test_folded_destination_collisions_fail_before_write(
     assert not (tmp_path / "ws").exists()
 
 
-@pytest.mark.parametrize("path", ["DATA.json", "DATA.json/x"])
+@pytest.mark.parametrize("path", ["DATA.json/x"])
 def test_folded_parent_metadata_collision_fails_before_write(
     tmp_path: Path, artifacts: ArtifactStore, path: str
 ) -> None:
@@ -196,13 +188,13 @@ def test_collect_output_files_rejects(
     (tmp_path / "target").write_text("t")
     os.mkfifo(tmp_path / "fifo.txt")
     with pytest.raises(ValueError, match=match):
-        collect_output_files(tmp_path, [declared], artifacts)
+        collect_output_files(tmp_path, [declared], artifacts, stage=Job.Stage())
 
 
 def test_collect_output_files_uploads(tmp_path: Path, artifacts: ArtifactStore) -> None:
     (tmp_path / "out").mkdir()
     (tmp_path / "out/p.txt").write_bytes(b"p")
-    [ref] = collect_output_files(tmp_path, ["out/p.txt"], artifacts)
+    [ref] = collect_output_files(tmp_path, ["out/p.txt"], artifacts, stage=Job.Stage())
     assert (ref.name, ref.path, ref.size) == ("p.txt", "out/p.txt", 1)
     assert artifacts.get_bytes(ref.sha256) == b"p"
 
@@ -352,7 +344,7 @@ def test_collection_rejects_symlinked_parent(tmp_path: Path, artifacts: Artifact
     (tmp_path / "target/a").write_text("secret-content")
     (tmp_path / "p").symlink_to(tmp_path / "target")
     with pytest.raises(ValueError, match="symlink not allowed: p/a"):
-        collect_output_files(tmp_path, ["p/a"], artifacts)
+        collect_output_files(tmp_path, ["p/a"], artifacts, stage=Job.Stage())
 
 
 def test_collection_normalizes_and_refuses_collisions(
@@ -360,8 +352,8 @@ def test_collection_normalizes_and_refuses_collisions(
 ) -> None:
     (tmp_path / "a.txt").write_bytes(b"A")
     with pytest.raises(ValueError, match="duplicate output path"):
-        collect_output_files(tmp_path, ["a.txt", "./a.txt"], artifacts)
-    [ref] = collect_output_files(tmp_path, ["./a.txt"], artifacts)
+        collect_output_files(tmp_path, ["a.txt", "./a.txt"], artifacts, stage=Job.Stage())
+    [ref] = collect_output_files(tmp_path, ["./a.txt"], artifacts, stage=Job.Stage())
     assert ref.path == "a.txt"
 
 
@@ -394,7 +386,7 @@ def test_collection_storage_errors_suppress_secret_exception_chains(
 
     monkeypatch.setattr(artifacts, "put_bytes", fail)
     with pytest.raises(ValueError, match=r"cannot store output path: a\.txt") as exc:
-        collect_output_files(tmp_path, ["a.txt"], artifacts)
+        collect_output_files(tmp_path, ["a.txt"], artifacts, stage=Job.Stage())
     assert secret not in "".join(format_exception(exc.value))
 
 
@@ -428,7 +420,7 @@ def test_collection_refuses_folded_output_duplicates_before_upload(
     (tmp_path / first).write_bytes(content)
     (tmp_path / second).write_bytes(content)
     with pytest.raises(ValueError, match="duplicate output path") as exc:
-        collect_output_files(tmp_path, [first, second], artifacts)
+        collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage())
     assert first in str(exc.value)
     assert second in str(exc.value)
     assert content.decode() not in str(exc.value)

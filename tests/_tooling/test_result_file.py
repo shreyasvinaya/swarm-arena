@@ -657,3 +657,26 @@ def test_open_log_refuses_fifo_with_reader(tmp_path: Path) -> None:
             open_log(p, truncate=False)
     finally:
         os.close(reader)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("out/a.txt", "OUT/b.txt"), ("caf\u00e9/a.txt", "cafe\u0301/b.txt")],
+)
+def test_output_directory_alias_fails_producing_run(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    secret = "output-directory-secret"
+    for rel in [first, second]:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(secret)
+    write_result(tmp_path, {"data": {}, "files": [first, second]})
+    completed = run(tmp_path, RunStatus.OK, 0)
+    output = tool_output_from_result(tmp_path, completed)
+    assert output.status == RunStatus.ERROR
+    assert output.files == []
+    diagnostic = completed.stderr_path.read_text()
+    assert first in diagnostic
+    assert second in diagnostic
+    assert secret not in diagnostic
