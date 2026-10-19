@@ -1,10 +1,12 @@
 import os
 import sys
+import math
+import secrets
 import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -17,6 +19,7 @@ from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._model.tooling import (
     Command,
     CompletedRun,
+    Estimate,
     FileRef,
     RunStatus,
     ToolOutput,
@@ -420,3 +423,100 @@ def exits() -> dict[str, int]:
 def changes_directory(directory: str) -> dict[str, bool]:
     os.chdir(directory)
     return {"changed": True}
+# Conformance-kit fakes: each one breaks one component contract.
+
+
+class EmptyFingerprintTool(PyTool):
+    def fingerprint(self, output: ToolOutput) -> str:
+        return ""
+
+
+class BrokenTool(Tool):
+    """Runs Python code; the method named by ``broken`` breaks the Tool contract."""
+
+    name = "broken"
+    description = "Runs Python code."
+    input_model = PyInputs
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        code: str
+        broken: str = ""
+
+    @property
+    def config(self) -> Config:
+        return cast(BrokenTool.Config, super().config)
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        return Command(argv=["python", "-c", self.config.code])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return tool_output_from_result(workspace, run)
+
+    def _breaks(self, method: str) -> bool:
+        return self.config.broken == method
+
+    def get_input_model(self) -> type[BaseModel]:
+        return cast(Any, dict) if self._breaks("get_input_model") else super().get_input_model()
+
+    def get_description(self) -> str:
+        return cast(Any, None) if self._breaks("get_description") else super().get_description()
+
+    def editable(self) -> Sequence[str]:
+        return cast(Any, [1]) if self._breaks("editable") else super().editable()
+
+    def providers(self) -> frozenset[str]:
+        return cast(Any, {"openai"}) if self._breaks("providers") else super().providers()
+
+    def fingerprint(self, output: ToolOutput) -> str:
+        return secrets.token_hex(8) if self._breaks("fingerprint") else super().fingerprint(output)
+
+    def is_deterministic(self, request: ToolRequest) -> bool:
+        broken = self._breaks("is_deterministic")
+        return cast(Any, 1) if broken else super().is_deterministic(request)
+
+    def estimate(self, request: ToolRequest) -> Estimate | None:
+        broken = self._breaks("estimate")
+        return cast(Any, {"seconds": 1.0}) if broken else super().estimate(request)
+
+
+class StrayJudge(Judge):
+    name = "stray"
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [Score.maximize(1.0).model_copy(update={"candidate_id": "nope"})]
+
+
+class BrokenJudge(Judge):
+    """A judge that breaks one Judge contract, chosen by ``mode``."""
+
+    name = "broken"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        mode: Literal["duplicate", "nan", "not_score"]
+
+    @property
+    def config(self) -> Config:
+        return cast(BrokenJudge.Config, super().config)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        if self.config.mode == "not_score":
+            return cast(Any, [1.0])
+        if self.config.mode == "nan":  # model_construct skips the Score validator
+            return [Score.model_construct(key=(math.nan,), candidate_id=c.id) for c in candidates]
+        one = Score.maximize(1.0)
+        return [one.model_copy(update={"candidate_id": c.id}) for c in candidates for _ in "ab"]
+
+
+class BadFeedbackCheck(AlwaysPass):
+    feedback = cast(Any, "everything")
+
+
+class NotACheckResult(AlwaysPass):
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return cast(Any, {"passed": True})

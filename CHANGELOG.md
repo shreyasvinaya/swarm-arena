@@ -35,3 +35,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProgramJudge` and `Lexicographic` judges.
 
 - `ScriptCheck` and `ScriptJudge`, and the "Use your own files and script" docs page.
+- Conformance kit `swarm_arena.testing` and the "Writing a connector" and "Concepts" docs pages.
