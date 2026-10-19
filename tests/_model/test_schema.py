@@ -4,7 +4,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from swarm_arena._model.schema import compile_object_schema
+from swarm_arena._model.schema import _SchemaError, compile_object_schema
 
 SPEC_PARAMS = {
     "lr": {"type": "number", "minimum": 1e-5, "maximum": 1.0},
@@ -345,3 +345,73 @@ def test_compile_errors_hide_values_and_preserve_identifiers(keyword: str) -> No
     if isinstance(error, ValidationError):
         assert secret not in repr(error.errors())
         assert secret not in error.json()
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        ["SECRET_SENTINEL_subschema"],
+        "SECRET_SENTINEL_subschema",
+        73918462,
+        [73918462],
+        None,
+        True,
+        [],
+        ("SECRET_SENTINEL_subschema",),
+    ],
+)
+def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, depth: int) -> None:
+    schema = malformed
+    for _ in range(depth):
+        schema = {"type": "array", "items": schema}
+    with pytest.raises(_SchemaError, match="invalid schema") as caught:
+        compile_object_schema("P", {"xs": schema})
+    error = caught.value
+    assert str(error) == "P.xs" + ".items" * depth + ": invalid schema"
+    for diagnostic in (
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(getattr(error, "__notes__", ())),
+        "".join(traceback.format_exception(error)),
+    ):
+        assert "SECRET_SENTINEL_subschema" not in diagnostic
+        assert "73918462" not in diagnostic
+    assert error.__cause__ is None
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    "prop",
+    [
+        "model_validate",
+        "model_validate_json",
+        "model_dump",
+        "model_dump_json",
+        "model_config",
+        "model_fields",
+        "model_post_init",
+        "model_custom",
+        "schema",
+        "schema_json",
+        "dict",
+        "copy",
+        "json",
+        "parse_obj",
+        "construct",
+        "validate",
+        "Config",
+    ],
+)
+def test_reserved_property_names_are_rejected_at_compile_time(prop: str) -> None:
+    with pytest.raises(_SchemaError, match="invalid property name") as caught:
+        compile_object_schema("P", {prop: {"type": "string", "default": "secret-default"}})
+    assert str(caught.value) == f"P.{prop}: invalid property name"
+    assert caught.value.__cause__ is None
+
+
+def test_nonreserved_property_names_remain_usable() -> None:
+    values = {"modelvalue": 1, "schema_version": 2, "dictionary": 3, "copy_count": 4, "config": 5}
+    model = compile_object_schema("P", {key: {"type": "integer"} for key in values})
+    assert model.model_validate(values).model_dump() == values

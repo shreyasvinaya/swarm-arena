@@ -606,3 +606,58 @@ def test_command_accepts_config_boundary_values() -> None:
     assert tool.command(ToolRequest(), Path("/ws")) == Command(
         argv=["x"], env=["API_KEY", "_VALUE_2"], timeout_s=0.001, grace_s=0
     )
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize(
+    "malformed", [[SECRET], SECRET, 73918462, [73918462], None, True, [], (SECRET,)]
+)
+def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, depth: int) -> None:
+    schema = malformed
+    for _ in range(depth):
+        schema = {"type": "array", "items": schema}
+    tool = ScriptTool(command=["x"], params={"xs": schema})
+    with pytest.raises(ConfigError) as caught:
+        tool.get_input_model()
+    assert str(caught.value) == "script_params.xs" + ".items" * depth + ": invalid schema"
+    _assert_secret_safe(caught.value, SECRET)
+    _assert_secret_safe(caught.value, "73918462")
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    "prop",
+    [
+        "model_validate",
+        "model_validate_json",
+        "model_dump",
+        "model_dump_json",
+        "model_config",
+        "model_fields",
+        "model_post_init",
+        "model_custom",
+        "schema",
+        "schema_json",
+        "dict",
+        "copy",
+        "json",
+        "parse_obj",
+        "construct",
+        "validate",
+        "Config",
+    ],
+)
+def test_reserved_property_names_raise_config_error(prop: str) -> None:
+    tool = ScriptTool(command=["x"], params={prop: {"type": "string", "default": SECRET}})
+    with pytest.raises(ConfigError) as caught:
+        tool.get_input_model()
+    assert str(caught.value) == f"script_params.{prop}: invalid property name"
+    _assert_secret_safe(caught.value, SECRET)
+    assert caught.value.__cause__ is None
+
+
+def test_nonreserved_parameter_names_remain_usable() -> None:
+    values = {"modelvalue": 1, "schema_version": 2, "dictionary": 3, "copy_count": 4, "config": 5}
+    tool = ScriptTool(command=["x"], params={key: {"type": "integer"} for key in values})
+    assert tool.get_input_model().model_validate(values).model_dump() == values

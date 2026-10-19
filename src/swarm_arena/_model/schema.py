@@ -50,6 +50,8 @@ def _validate_enum(
 
 def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo]:
     """Compile a property or array item and validate its declared default."""
+    if not isinstance(schema, Mapping):
+        raise _SchemaError(f"{path}: invalid schema")
     for keyword in schema:
         if keyword not in _KEYWORDS:
             raise _SchemaError(f"{path}: unsupported JSON-schema keyword {keyword!r}")
@@ -152,6 +154,10 @@ def compile_object_schema(
         validation of members and inputs. Number enums accept equivalent integer
         and float values, excluding booleans; their outputs and defaults are
         floats, so dumped values can be validated again.
+        Every property and items schema must be a mapping. Property names must
+        start with an ASCII letter and contain only ASCII letters, digits, or
+        underscores; BaseModel member names, the model_ prefix, and Config are
+        reserved.
 
     Returns
     -------
@@ -171,7 +177,12 @@ def compile_object_schema(
     """
     fields: dict[str, Any] = {}
     for prop, schema in properties.items():
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", prop):
+        if (
+            not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", prop)
+            or prop.startswith("model_")
+            or prop == "Config"
+            or hasattr(BaseModel, prop)
+        ):
             raise _SchemaError(f"{name}.{prop}: invalid property name")
         fields[prop] = _compile_field(f"{name}.{prop}", schema)
     return create_model(
