@@ -129,6 +129,60 @@ def test_exact_tool_file_replaces_goal_file(tmp_path: Path, artifacts: ArtifactS
 
 
 @pytest.mark.parametrize(
+    ("goal_files", "tool_files", "message"),
+    [
+        # The goal manifest alone conflicts: the tool files are not blamed.
+        ({"p/a.txt": H, "P/b.txt": H}, {}, "goal files conflict: p/a.txt and P/b.txt"),
+        ({"p/a.txt": H, "P/b.txt": H}, {"q/run.py": H}, "goal files conflict: p/a.txt and P/b.txt"),
+        ({"p": H, "p/a.txt": H}, {}, "goal files conflict: p and p/a.txt"),
+        # The tool files alone conflict: no goal file is involved.
+        ({}, {"t/a.py": H, "T/b.py": H}, "tool files conflict: t/a.py and T/b.py"),
+        # A tool file over a goal directory is not a respelling: no respell hint.
+        (
+            {"p/a.txt": H},
+            {"p": H},
+            "tool files do not fit the goal files: conflicting workspace path: p/a.txt and p",
+        ),
+        # A respelled goal directory gets the hint.
+        (
+            {"p/a.txt": H},
+            {"P/b.txt": H},
+            "tool files do not fit the goal files: conflicting workspace path: p/a.txt and "
+            "P/b.txt; spell a replaced goal file exactly as the goal does",
+        ),
+    ],
+)
+def test_tool_root_names_the_layer_that_conflicts(
+    goal_files: dict[str, str], tool_files: dict[str, str], message: str
+) -> None:  # IF3 A0b
+    with pytest.raises(ConfigError, match=exactly(message)):
+        tool_root(goal_files, tool_files)
+    with pytest.raises(ConfigError, match=exactly(message)):
+        _tool_stage(goal_files=goal_files, tool_files=tool_files)
+
+
+@pytest.mark.parametrize(
+    ("on_disk", "declared"),
+    [("Results/OUT.txt", "results/out.txt"), (CAFE_TXT_NFD, CAFE_TXT), ("p/a.txt", "p/A.txt")],
+)
+def test_declared_output_must_use_its_on_disk_spelling(
+    tmp_path: Path, artifacts: ArtifactStore, on_disk: str, declared: str
+) -> None:  # IF3 A0b: the same rule as snapshots (G6)
+    ws = tmp_path / "ws"
+    (ws / on_disk).parent.mkdir(parents=True)
+    (ws / on_disk).write_text(SECRET)
+    if not (ws / declared).exists():
+        pytest.skip("this filesystem tells the spellings apart, so the output is missing")
+    expected = exactly(f"declared output {declared} is spelled {on_disk} on disk")
+    with pytest.raises(ValueError, match=expected):
+        collect_output_files(ws, [declared], artifacts, stage=Job.Stage(), max_bytes=CAP)
+    with pytest.raises(NotFound):
+        artifacts.get_bytes(sha256_hex(SECRET.encode()))
+    [ref] = collect_output_files(ws, [on_disk], artifacts, stage=Job.Stage(), max_bytes=CAP)
+    assert ref.path == on_disk
+
+
+@pytest.mark.parametrize(
     ("original", "variant"),
     [("p/a.txt", "P/A.txt"), ("p/a.txt", "p/A.txt"), (CAFE_TXT, CAFE_TXT_NFD)],
 )

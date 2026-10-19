@@ -15,6 +15,7 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.tooling import FileRef, check_parent_id
 from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._tooling.files import _listed_path
 from swarm_arena._tooling.paths import (
     PARENT_DATA,
     check_key,
@@ -234,7 +235,10 @@ def collect_output_files(
     that ``materialize`` wrote, and against the later parent tree they join.
     Files are read and uploaded one at a time. Each file's size is checked
     before it is read, against what is left of ``max_bytes``, so a file over
-    the cap (a sparse one too) is never read.
+    the cap (a sparse one too) is never read. A declaration must use the
+    spelling of the directory listing, as snapshots do: on a case- or
+    normalization-insensitive disk, ``results/out.txt`` also opens
+    ``Results/OUT.txt``, but a case-sensitive disk would not find it.
 
     Parameters
     ----------
@@ -261,7 +265,8 @@ def collect_output_files(
     ValueError
         If a path is invalid, duplicated after normalization and folding, conflicts
         with the staged layout or with a parent tree's ``data.json``, missing,
-        symlinked, nonregular, crosses ``max_bytes``, or cannot be collected.
+        spelled another way on disk, symlinked, nonregular, crosses
+        ``max_bytes``, or cannot be collected.
 
     Examples
     --------
@@ -289,15 +294,19 @@ def collect_output_files(
     )
     output: list[FileRef] = []
     left = max_bytes
+    listings: dict[Path, dict[str, list[str]]] = {}
     for rel in paths:
         try:
             if symlinked_component(workspace, rel) is not None:
                 raise ValueError(f"symlink not allowed: {rel}")
             (workspace / rel).lstat()
+            listed = _listed_path(workspace, rel, listings)
         except FileNotFoundError:
             raise ValueError(f"{rel} is missing") from None
         except OSError:
             raise ValueError(f"cannot inspect output path: {rel}") from None
+        if listed != rel:  # a case-sensitive disk would not find it (G6, as for snapshots)
+            raise ValueError(f"declared output {rel} is spelled {listed} on disk")
         data = read_regular_file(workspace, rel, max_bytes=left)
         left -= len(data)
         try:

@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `surrogateescape` spelling of a non-ASCII name, is refused everywhere a
   path is checked (`not valid UTF-8`): it names the same file on disk as the
   real name but folds to another key, so an edit could replace a protected script.
+- A tool root whose goal manifest (or tool files) conflict by themselves reports
+  `goal files conflict: …` (or `tool files conflict: …`); the respell hint is
+  given only when a tool path respells a goal path. A declared output must use
+  its on-disk spelling (`declared output <p> is spelled <q> on disk`), as
+  snapshots do, so a run that passes on APFS also passes on a case-sensitive disk.
 - Every read of a tool-written file is bounded, and a file's size is checked
   before it is read, so a sparse file is never read whole: `swarm/result.json`
   is at most 16 MiB, the files one result declares at most 256 MiB together

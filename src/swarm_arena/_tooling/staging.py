@@ -2,6 +2,7 @@
 
 from collections.abc import Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from pathlib import PurePosixPath
 from typing import Any
 
 from swarm_arena._errors import ConfigError, SoftError
@@ -303,13 +304,26 @@ def _check_keys(files: Mapping[str, str]) -> None:
         check_key(path)
 
 
+def _respelled(first: str, second: str) -> bool:
+    """Return whether two paths spell one folded path, or a shared ancestor, two ways."""
+    for one, other in zip(PurePosixPath(first).parts, PurePosixPath(second).parts, strict=False):
+        if fold_key(one) != fold_key(other):
+            return False
+        if one != other:
+            return True
+    return False
+
+
 def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> dict[str, str]:
     """Build a tool's workspace root: the goal files, then the tool's own files.
 
     A tool file replaces a goal file only at the exact same spelling. A
     respelling (the same ``fold_key``, another spelling) or any other folded
     conflict is a configuration error, raised here before any run, so one
-    workspace works on case-sensitive and case-insensitive filesystems.
+    workspace works on case-sensitive and case-insensitive filesystems. The
+    goal files and the tool files are each checked alone first, so the error
+    names the layer that conflicts; the respell hint is given only when a tool
+    path respells a goal path.
 
     Parameters
     ----------
@@ -326,7 +340,9 @@ def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> d
     Raises
     ------
     ConfigError
-        If the tool files do not fit the goal files; the message names both paths.
+        ``goal files conflict: <a> and <b>`` or ``tool files conflict: <a> and
+        <b>`` if one layer conflicts by itself; otherwise ``tool files do not
+        fit the goal files: ...`` naming both paths.
     ValueError
         If a path is not in normal form.
 
@@ -338,16 +354,26 @@ def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> d
     Traceback (most recent call last):
     ...
     swarm_arena._errors.ConfigError: tool files do not fit the goal files: ...P/RUN.py; ...
+    >>> tool_root({"p/a.txt": "1" * 64, "P/b.txt": "1" * 64}, {})
+    Traceback (most recent call last):
+    ...
+    swarm_arena._errors.ConfigError: goal files conflict: p/a.txt and P/b.txt
     """
     _check_keys(goal_files)
     _check_keys(tool_files)
-    try:
-        return fold_merge(goal_files, tool_files)
-    except ValueError as exc:
+    for layer, files in (("goal", goal_files), ("tool", tool_files)):
+        if conflicts := fold_conflicts(files):
+            first, second = conflicts[0]
+            raise ConfigError(f"{layer} files conflict: {first} and {second}")
+    root = {**goal_files, **tool_files}
+    if conflicts := fold_conflicts(root):
+        first, second = conflicts[0]
+        hint = "; spell a replaced goal file exactly as the goal does"
         raise ConfigError(
-            f"tool files do not fit the goal files: {exc}; "
-            "spell a replaced goal file exactly as the goal does"
-        ) from None
+            f"tool files do not fit the goal files: conflicting workspace path: {first} and "
+            f"{second}{hint if _respelled(first, second) else ''}"
+        )
+    return root
 
 
 def plan_tool_stage(
