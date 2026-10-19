@@ -92,6 +92,11 @@ PUBLIC["swarm_arena.scoring"] += ["Check", "CheckContext", "Judge", "JudgeContex
 PUBLIC["swarm_arena"] += ["FunctionTool"]
 
 
+# --- Task 21 ---
+PUBLIC["swarm_arena"] += ["ProgramJudge"]
+PUBLIC["swarm_arena.scoring"] += ["Lexicographic"]
+
+
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_all_snapshot(module: str) -> None:
     names = importlib.import_module(module).__all__

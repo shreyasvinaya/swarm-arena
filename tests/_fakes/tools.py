@@ -307,3 +307,68 @@ def secret_error(value: str) -> dict[str, int]:
 
 def non_json_result() -> dict[str, Any]:
     return {"value": {1, 2}}
+
+
+# --- Task 21 ---
+
+
+def rosen_score(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(candidate.output.data["f"])
+
+
+def small_b(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(abs(candidate.output.data["b"]))
+
+
+def raising_score(goal: Goal, candidate: Candidate) -> Score:
+    raise RuntimeError("no")
+
+
+def nan_score(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(float("nan"))
+
+
+def list_score(goal: Goal, candidate: Candidate) -> list[int]:
+    return [1]
+
+
+async def async_score(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(1.0)
+
+
+class PanelJudge(Judge):
+    name = "panel"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        panel: str = ""
+        per_candidate: dict[str, str] = {}
+        anchors: int = 0
+        providers: list[str] = []
+        models: list[str] = []
+
+    @property
+    def config(self) -> Config:
+        return cast(PanelJudge.Config, super().config)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [
+            Score.maximize(1.0).model_copy(
+                update={"candidate_id": c.id, "panel_hash": self.config.per_candidate.get(c.id, "")}
+            )
+            for c in candidates
+        ]
+
+    def panel_hash(self) -> str:
+        return self.config.panel
+
+    def anchor_count(self) -> int:
+        return self.config.anchors
+
+    def providers(self) -> frozenset[str]:
+        return frozenset(self.config.providers)
+
+    def models(self) -> tuple[str, ...]:
+        return tuple(self.config.models)
