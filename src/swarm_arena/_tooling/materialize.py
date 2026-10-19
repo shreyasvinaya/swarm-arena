@@ -7,14 +7,13 @@ import secrets
 import stat
 from collections.abc import Generator, Sequence
 from pathlib import Path, PurePosixPath
-from tempfile import TemporaryDirectory
 from typing import Any
 
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.tooling import FileRef, check_parent_id
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_key, check_relpath
+from swarm_arena._tooling.paths import check_key, check_relpath, fold_key
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
 
 
@@ -35,9 +34,10 @@ def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[st
     ids: set[str] = set()
     for parent in stage.parents:
         check_parent_id(parent.candidate_id)
-        if parent.candidate_id in ids:
+        key = fold_key(parent.candidate_id)
+        if key in ids:
             raise ValueError(f"duplicate parent id: {parent.candidate_id}")
-        ids.add(parent.candidate_id)
+        ids.add(key)
         for path in parent.overlay:
             check_key(path)
         for file in parent.files:
@@ -76,6 +76,17 @@ def _stage_files(stage: Job.Stage) -> tuple[dict[str, tuple[str, bool]], dict[st
 
 def _check_layout(workspace: Path, files: set[str], directories: set[str]) -> None:
     """Reject conflicting paths and existing symlinks before creating anything."""
+    spellings: dict[str, str] = {}
+    for rel in sorted(files | directories):
+        path = PurePosixPath(rel)
+        # Include implicit directories: p/a and P/b must not share a directory
+        # under different spellings, even when neither leaf collides.
+        for component in (path, *path.parents):
+            spelling = component.as_posix()
+            key = fold_key(spelling)
+            previous = spellings.setdefault(key, spelling)
+            if previous != spelling:
+                raise ValueError(f"conflicting workspace path: {spelling} and {previous}")
     if workspace.is_symlink():
         raise ValueError("symlink not allowed: workspace path")
     for rel in sorted(files | directories):
@@ -144,8 +155,9 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
     """Validate a stage again and write its workspace with explicit permissions.
 
     All input paths and parent ids are checked before any writes, including
-    objects created through validator-bypassing model methods. Fetch artifacts
-    into a private scratch directory, then publish through pinned directory
+    objects created through validator-bypassing model methods. Reject case and
+    Unicode destination collisions, including ancestors, before any writes.
+    Read verified artifact bytes and publish through pinned directory
     descriptors, so existing or swapped symlinks cannot redirect writes.
     Workspace ancestors are trusted executor-owned directories.
 
@@ -186,13 +198,8 @@ def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> 
                     pass
             except OSError:
                 raise ValueError(f"cannot create workspace path: {rel}") from None
-        scratch = Path(stack.enter_context(TemporaryDirectory(prefix="swarm-stage-"))) / "artifact"
         for rel, (digest, read_only) in files.items():
-            # ArtifactStore.fetch uses path-based writes; keep those writes out
-            # of the destination tree, where only the pinned writer operates.
-            artifacts.fetch(digest, scratch, read_only=read_only)
-            data = scratch.read_bytes()
-            scratch.unlink()
+            data = artifacts.get_bytes(digest)
             _write(root, rel, data, read_only=read_only)
         for rel, data in metadata.items():
             _write(root, rel, data, read_only=rel.startswith("parents/"))

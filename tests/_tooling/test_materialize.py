@@ -65,6 +65,94 @@ def test_materialize_script_stage(tmp_path: Path, artifacts: ArtifactStore) -> N
 PARENT = ParentRef(candidate_id="c1", run_id="r", tool_identity="T")
 
 
+@pytest.mark.parametrize("path", ["SWARM/result.json", "Parents/x", "Candidate/x", "\u017fwarm/x"])
+def test_folded_reserved_root_rejected_before_write(
+    tmp_path: Path, artifacts: ArtifactStore, path: str
+) -> None:
+    h = artifacts.put_bytes(b"planted")
+    stage = Job.Stage.model_construct(root={"valid.txt": h, path: h})
+    with pytest.raises(ValueError, match="reserved"):
+        materialize(stage, tmp_path / "ws", artifacts)
+    assert not (tmp_path / "ws").exists()
+
+
+def test_folded_parent_ids_rejected_before_write(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    parents = [PARENT.model_copy(update={"candidate_id": name}) for name in ("c1", "C1")]
+    with pytest.raises(ValueError, match="duplicate parent id"):
+        materialize(Job.Stage(parents=parents), tmp_path / "ws", artifacts)
+    assert not (tmp_path / "ws").exists()
+
+
+@pytest.mark.parametrize("location", ["root", "parent", "candidate"])
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("p/run.py", "p/RUN.py"),
+        ("caf\u00e9.txt", "cafe\u0301.txt"),
+        ("p", "P/x"),
+        ("p/a", "P/b"),
+        ("caf\u00e9/a", "cafe\u0301/b"),
+    ],
+)
+def test_folded_destination_collisions_fail_before_write(
+    tmp_path: Path, artifacts: ArtifactStore, first: str, second: str, location: str
+) -> None:
+    h = artifacts.put_bytes(b"content")
+    files = {first: h, second: h}
+    stage = Job.Stage(root=files)
+    if location == "parent":
+        # Check collisions across overlay and output sources as well as within root/candidate.
+        stage = Job.Stage(
+            parents=[
+                PARENT.model_copy(
+                    update={
+                        "overlay": {first: h},
+                        "files": [FileRef(name="output", path=second, sha256=h, size=7)],
+                    }
+                )
+            ]
+        )
+    elif location == "candidate":
+        stage = Job.Stage(candidate=Job.CandidateFiles(request={}, output={}, files=files))
+    with pytest.raises(ValueError, match="conflicting workspace path"):
+        materialize(stage, tmp_path / "ws", artifacts)
+    assert not (tmp_path / "ws").exists()
+
+
+@pytest.mark.parametrize("path", ["DATA.json", "DATA.json/x"])
+def test_folded_parent_metadata_collision_fails_before_write(
+    tmp_path: Path, artifacts: ArtifactStore, path: str
+) -> None:
+    parent = PARENT.model_copy(update={"overlay": {path: artifacts.put_bytes(b"planted")}})
+    with pytest.raises(ValueError, match="conflicting workspace path"):
+        materialize(Job.Stage(parents=[parent]), tmp_path / "ws", artifacts)
+    assert not (tmp_path / "ws").exists()
+
+
+def test_distinct_destination_names_still_materialize(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    stage = Job.Stage(
+        root={"p/a.txt": artifacts.put_bytes(b"a"), "p/b.txt": artifacts.put_bytes(b"b")}
+    )
+    materialize(stage, tmp_path / "ws", artifacts)
+    assert (tmp_path / "ws/p/a.txt").read_bytes() == b"a"
+    assert (tmp_path / "ws/p/b.txt").read_bytes() == b"b"
+
+
+def test_materialize_reads_artifacts_without_scratch_fetch(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = artifacts.put_bytes(b"content")
+
+    def refuse_fetch(sha256: str, dest: Path, *, read_only: bool = True) -> Never:
+        pytest.fail("materialize must read verified bytes directly")
+
+    monkeypatch.setattr(artifacts, "fetch", refuse_fetch)
+    materialize(Job.Stage(root={"a.txt": digest}), tmp_path / "ws", artifacts)
+    assert (tmp_path / "ws/a.txt").read_bytes() == b"content"
+
+
 @pytest.mark.parametrize(
     "make",
     [  # model_copy skips validators, so the sink checks again
@@ -203,13 +291,14 @@ def test_materialize_rechecks_symlinks_after_preflight(
     ws.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    fetch = artifacts.fetch
+    get_bytes = artifacts.get_bytes
 
-    def swap(digest: str, dest: Path, *, read_only: bool = True) -> None:
-        fetch(digest, dest, read_only=read_only)
+    def swap(digest: str) -> bytes:
+        data = get_bytes(digest)
         (ws / "p").symlink_to(outside)
+        return data
 
-    monkeypatch.setattr(artifacts, "fetch", swap)
+    monkeypatch.setattr(artifacts, "get_bytes", swap)
     with pytest.raises(ValueError, match="workspace path"):
         materialize(Job.Stage(root={"p/a.txt": h}), ws, artifacts)
     assert list(outside.iterdir()) == []

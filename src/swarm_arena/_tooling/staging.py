@@ -13,7 +13,7 @@ from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.paths import check_key, check_relpath, matches
+from swarm_arena._tooling.paths import check_key, check_relpath, fold_key, matches
 from swarm_arena._tooling.result_file import request_json as _request_json
 
 
@@ -100,7 +100,8 @@ def validate_edits(
     editable : Sequence[str]
         Receiving tool's editable globs.
     protected : AbstractSet[str]
-        Tool scripts, interpreters, and private paths, normalized before checks.
+        Tool scripts, interpreters, and private paths, normalized and folded
+        for case- and Unicode-insensitive protection checks.
     max_edit_bytes : int
         Maximum UTF-8 byte count per edit.
 
@@ -113,7 +114,7 @@ def validate_edits(
     --------
     >>> validate_edits({"p/a.txt": "hi"}, editable=["p/*"], protected=set(), max_edit_bytes=10)
     """
-    protected = {check_relpath(path) for path in protected}
+    protected = {fold_key(check_relpath(path)) for path in protected}
     errors: list[str] = []
     for path, content in edits.items():
         reason = ""
@@ -122,7 +123,7 @@ def validate_edits(
         except ValueError as exc:
             reason = str(exc).removeprefix(f"path {path!r}: ")
         if not reason:
-            if path in protected:
+            if fold_key(path) in protected:
                 reason = "protected"
             elif not matches(path, editable):
                 reason = "not editable"
@@ -303,8 +304,14 @@ def plan_tool_stage(
     _check_keys(goal_files)
     _check_keys(tool_files)
     _check_keys(edits)
-    protected = {check_relpath(path) for path in protected}
-    private_paths = {check_relpath(path) for path in private_paths}
+    protected = {fold_key(check_relpath(path)) for path in protected}
+    private_paths = {fold_key(check_relpath(path)) for path in private_paths}
+
+    def editable_here(path: str) -> bool:
+        """Apply the same receiving permissions to edits and base overlays."""
+        key = fold_key(path)
+        return key not in protected and key not in private_paths and matches(path, editable)
+
     for parent in parents:
         check_parent_id(parent.candidate_id)
         _check_keys(parent.overlay)
@@ -312,25 +319,21 @@ def plan_tool_stage(
             check_key(file.path)
     root = {**goal_files, **tool_files}
     for path in root:
-        if path in private_paths:
+        if fold_key(path) in private_paths:
             raise RuntimeError(f"private path in tool root: {path}")
     for path in edits:
-        if path in protected or path in private_paths or not matches(path, editable):
+        if not editable_here(path):
             raise RuntimeError(f"edit path not editable here: {path}")
     overlay: dict[str, str] = {}
     warnings: list[str] = []
-    if parents:
+    if parents and parents[0].overlay:
         base = parents[0]
         reason = ""
         refused = sorted(base.overlay)
         if not receiving_identity or base.tool_identity != receiving_identity:
             reason = "made by another tool"
         else:
-            refused = sorted(
-                path
-                for path in base.overlay
-                if path in protected or path in private_paths or not matches(path, editable)
-            )
+            refused = sorted(path for path in base.overlay if not editable_here(path))
             if refused:
                 reason = "paths not editable here"
         if reason:

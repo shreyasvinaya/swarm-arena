@@ -19,7 +19,7 @@ from swarm_arena._tooling.script_tool import (
     ScriptTool,
     script_command,
 )
-from swarm_arena._tooling.staging import plan_tool_stage, validate_edits
+from swarm_arena._tooling.staging import plan_tool_stage, put_edits, validate_edits
 from swarm_arena.board import Candidate
 from swarm_arena.config import PlannerCatalog
 from swarm_arena.tool import Command, CompletedRun, FileSet, ParentRef, RunStatus, ToolRequest
@@ -222,6 +222,38 @@ def test_protected_script_survives_materialization(
     assert set(overlay) == {"problem/a.txt"}
     assert len(warnings) == 1
     assert "problem/run.py" in warnings[0]
+
+
+def test_folded_script_edit_is_refused_and_original_unchanged(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    tool = ScriptTool(command=["python", "problem/run.py"], editable=["problem/*"])
+    original = b"original script"
+    goal_files = {"problem/run.py": artifacts.put_bytes(original)}
+    protected = tool._protected(set(goal_files))
+    workspace = tmp_path / "workspace"
+
+    def stage_edits(edits: dict[str, str]) -> None:
+        validate_edits(edits, editable=tool.editable(), protected=protected, max_edit_bytes=262_144)
+        put_edits(edits, artifacts)
+        stage, _, _ = plan_tool_stage(
+            goal_files=goal_files,
+            tool_files=tool._own_files(),
+            editable=tool.editable(),
+            protected=protected,
+            private_paths=set(),
+            parents=[],
+            receiving_identity="T",
+            edits=edits,
+            request_json=None,
+        )
+        materialize(stage, workspace, artifacts)
+
+    stage_edits({})
+    with pytest.raises(SoftError, match=r"problem/RUN\.py: protected"):
+        stage_edits({"problem/RUN.py": "secret-edit-sentinel"})
+    assert (workspace / "problem/run.py").read_bytes() == original
+    assert [path.name for path in (workspace / "problem").iterdir()] == ["run.py"]
 
 
 @pytest.mark.parametrize("status", [RunStatus.OK, RunStatus.TIMEOUT, RunStatus.ERROR])

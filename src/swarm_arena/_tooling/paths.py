@@ -2,12 +2,34 @@
 
 import fnmatch
 import re
+import unicodedata
 from collections.abc import Sequence
 from functools import cache
 from pathlib import PurePosixPath
 from typing import Final
 
 RESERVED: Final = frozenset({"swarm", "parents", "candidate"})
+
+
+def fold_key(path: str) -> str:
+    """Fold a path for case- and Unicode-insensitive security comparisons.
+
+    Parameters
+    ----------
+    path : str
+        Path spelling to compare without changing its stored representation.
+
+    Returns
+    -------
+    str
+        NFC-normalized path with Unicode case folding applied.
+
+    Examples
+    --------
+    >>> fold_key("problem/RUN.py")
+    'problem/run.py'
+    """
+    return unicodedata.normalize("NFC", path).casefold()
 
 
 def check_relpath(path: str) -> str:
@@ -44,7 +66,7 @@ def check_relpath(path: str) -> str:
         reason = "contains '..'"
     elif "\x00" in path:
         reason = "contains NUL"
-    elif parts[0] in RESERVED:
+    elif fold_key(parts[0]) in RESERVED:
         reason = f"uses the reserved name {parts[0]!r}"
     if reason is not None:
         raise ValueError(f"path {path!r}: {reason}")

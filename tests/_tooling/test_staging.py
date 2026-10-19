@@ -67,6 +67,53 @@ def stage(**kw: Any) -> tuple[Job.Stage, dict[str, str], list[str]]:
     return plan_tool_stage(**{**base, **kw})
 
 
+@pytest.mark.parametrize(
+    ("protected", "edit"),
+    [("problem/run.py", "problem/RUN.py"), ("p/caf\u00e9.py", "p/cafe\u0301.py")],
+)
+def test_folded_edit_is_protected(protected: str, edit: str) -> None:
+    with pytest.raises(SoftError, match="protected") as exc:
+        validate_edits(
+            {edit: "secret-edit-sentinel"},
+            editable=["**/*"],
+            protected={protected},
+            max_edit_bytes=100,
+        )
+    assert str(exc.value) == f"{edit}: protected"
+    assert "secret-edit-sentinel" not in str(exc.value)
+
+
+@pytest.mark.parametrize("boundary", ["protected", "private_paths"])
+@pytest.mark.parametrize(
+    ("original", "variant"), [("p/run.py", "p/RUN.py"), ("p/caf\u00e9.py", "p/cafe\u0301.py")]
+)
+def test_folded_staging_permissions(original: str, variant: str, boundary: str) -> None:
+    permissions = {boundary: {original}}
+    with pytest.raises(RuntimeError, match="edit path not editable"):
+        stage(
+            goal_files={}, editable=["p/*"], edits={variant: "secret-edit-sentinel"}, **permissions
+        )
+    parent = ParentRef(
+        candidate_id="c1", run_id="r", tool_identity="T", overlay={variant: H3, "p/a.txt": H3}
+    )
+    st, overlay, warnings = stage(goal_files={}, editable=["p/*"], parents=[parent], **permissions)
+    assert st.root == {}
+    assert overlay == {}
+    assert warnings == [f"base parent c1 not overlaid: paths not editable here; paths: {variant}"]
+
+
+@pytest.mark.parametrize("private", ["P/RUN.py", "p/cafe\u0301.py"])
+def test_folded_private_path_cannot_enter_root(private: str) -> None:
+    with pytest.raises(RuntimeError, match="private path in tool root"):
+        stage(goal_files={"p/run.py": H1, "p/caf\u00e9.py": H1}, private_paths={private})
+
+
+@pytest.mark.parametrize("identity", ["", "U"])
+def test_empty_base_overlay_has_no_warning(identity: str) -> None:
+    parent = ParentRef(candidate_id="c1", run_id="r", tool_identity=identity)
+    assert stage(parents=[parent])[2] == []
+
+
 def test_order_goal_then_same_identity_overlay_then_edits() -> None:
     parent = ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={"p/a.txt": H3})
     st, overlay, warnings = stage(parents=[parent], edits={"p/b.txt": "new"})

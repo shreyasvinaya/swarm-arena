@@ -16,7 +16,8 @@ files = ["problem/*.txt", "problem/run.py"]
 Snapshotting stores each selected regular file by SHA-256 and records a sorted
 `path → sha256` manifest while keeping the original globs. Every glob must match
 at least one regular file. Symlinks below the plan directory and reserved
-top-level paths (`swarm`, `parents`, `candidate`) are rejected. Those names are
+top-level paths (`swarm`, `parents`, `candidate`) are rejected, including case
+variants such as `SWARM` and `Parents`. Those names are
 allowed as basenames below an ordinary directory, such as `problem/candidate`.
 
 Once a file set has a manifest, snapshotting reuses it without reading the source
@@ -35,10 +36,14 @@ A tool workspace starts with goal and tool files. The first parent's full overla
 is applied only when its nonempty tool identity matches the receiving tool and
 every overlay path is editable, unprotected, and outside check or judge private
 files. Otherwise the whole overlay is refused with a warning identifying the
-parent and the refused paths. Live edits are applied last. For example, an
+parent and the refused paths; an empty overlay needs no warning. Live edits are
+applied last. For example, an
 editable `problem/*.txt` file can inherit its base parent's contents and then be
 replaced by the current request's text. A protected `problem/run.py` remains
-protected even if its command path was spelled `./problem/run.py`.
+protected even if its command path was spelled `./problem/run.py`. Protection
+and private-path comparisons normalize Unicode to NFC and then casefold, so
+an edit to `problem/RUN.py` is refused as protected too. Editable glob matching
+remains case sensitive.
 
 Identity hashes the import path and validated configuration with defaults
 expanded, excluding catalog-settable fields. Dictionary path keys must already
@@ -49,15 +54,19 @@ reference and cannot be submitted as a live edit.
 
 Every parent, including the base parent, has read-only overlay and output files
 under `parents/<id>/`. Output files win at a shared path; `data.json` always holds
-the parent's structured output. Parent ids must be single safe path components.
+the parent's structured output. Parent ids must be single safe path components
+and must be distinct after NFC normalization and case folding.
 Checks and judges instead receive their own root files and read-only candidate
 files under `candidate/files/`, with request and output metadata beside that
 directory. The directory exists even for a candidate with no files.
 
 Materialization revalidates every path before writing, even for model objects
-constructed without validation. It rejects symlinks and file/directory conflicts,
-fetches artifacts into private scratch space, and publishes through pinned
-directory descriptors. Root artifacts are writable; parent and candidate
+constructed without validation. Before any write, it rejects destination names
+or ancestor directories with different spellings but the same NFC/casefold key,
+including `a.txt`/`A.txt` and composed/decomposed Unicode names, on every platform.
+It also rejects symlinks and file/directory conflicts, reads verified artifact
+bytes directly, and publishes through pinned directory descriptors.
+Root artifacts are writable; parent and candidate
 artifacts are read-only. The workspace's ancestors are trusted executor-owned
 directories. Output collection uses the shared regular-file reader, refuses
 symlink components and special files, and rejects duplicate normalized paths.

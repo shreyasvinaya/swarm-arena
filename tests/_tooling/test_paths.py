@@ -5,6 +5,22 @@ import pytest
 from swarm_arena._tooling.paths import RESERVED, check_glob, check_key, check_relpath, matches
 
 
+@pytest.mark.parametrize("path", ["SWARM/x", "Parents/x", "Candidate/x", "\u017fwarm/x"])
+def test_folded_reserved_names_are_refused(path: str) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        check_relpath(path)
+    with pytest.raises(ValueError, match="reserved"):
+        check_key(path)
+
+
+def test_fold_key_normalizes_unicode_then_casefolds() -> None:
+    from swarm_arena._tooling.paths import fold_key
+
+    assert fold_key("PROBLEM/Cafe\u0301.py") == fold_key("problem/Caf\u00e9.py")
+    assert fold_key("Straße/x") == "strasse/x"
+    assert fold_key("a.txt") != fold_key("b.txt")
+
+
 def test_check_relpath_normalizes() -> None:
     assert check_relpath("./problem//run.py") == "problem/run.py"
     assert check_relpath("swarmy/x") == "swarmy/x"
