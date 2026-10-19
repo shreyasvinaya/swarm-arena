@@ -43,13 +43,13 @@ _VALIDATION_BY_ALIAS: ContextVar[bool | None] = ContextVar(
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class _ValidationOwner:
     """Own nested field validation only while active in the originating thread."""
 
-    thread_id: int
-    active: bool = True
-    sanitized: set[tuple[tuple[str | int, ...], str, str]] = field(default_factory=set)
+    thread_id: int | None
+    # Successful validation never needs to allocate or initialize this error-only slot.
+    sanitized: set[tuple[tuple[str | int, ...], str, str]] = field(init=False, repr=False)
 
 
 _VALIDATION_ACTIVE: ContextVar[_ValidationOwner | None] = ContextVar(
@@ -317,7 +317,9 @@ def _sanitize_validation_error(
     -------
     ValidationError
         Error containing only schema locations, built-in codes (or ``invalid``),
-        fixed messages, and ``input=None`` without context. Raise it ``from None``.
+        fixed messages, and ``input=None`` without context. At most 20 original
+        details survive, followed by ``and N more errors`` when truncated.
+        Raise it ``from None``.
 
     Examples
     --------
@@ -336,8 +338,8 @@ def _sanitize_validation_error(
             sequence_paths = _sequence_paths(_schema_index(model))
             owner = _VALIDATION_ACTIVE.get()
             known = (
-                owner.sanitized
-                if owner is not None and owner.active and owner.thread_id == get_ident()
+                getattr(owner, "sanitized", set())
+                if owner is not None and owner.thread_id == get_ident()
                 else set()
             )
             types: dict[tuple[str, str], PydanticCustomError] = {}
@@ -345,6 +347,8 @@ def _sanitize_validation_error(
                 list[dict[str, Any]],
                 error.errors(include_input=False, include_url=False, include_context=False),
             )
+            omitted = max(0, len(items) - 20)
+            items = items[:20]
             previous: tuple[str, str] | None = None
             safe_type: PydanticCustomError | None = None
             for item in items:
@@ -395,6 +399,16 @@ def _sanitize_validation_error(
                     )
                 item["loc"] = location
             details = cast(list[InitErrorDetails], items)
+            if omitted:
+                details.append(
+                    InitErrorDetails(
+                        type=PydanticCustomError(
+                            "invalid", cast(LiteralString, f"and {omitted} more errors")
+                        ),
+                        loc=(),
+                        input=None,
+                    )
+                )
         else:
             details.append(
                 InitErrorDetails(
@@ -407,7 +421,8 @@ def _sanitize_validation_error(
             )
         return ValidationError.from_exception_data(model.__name__, details, hide_input=True)
     except Exception:
-        return _minimal_validation_error(model)
+        pass
+    return _minimal_validation_error(model)
 
 
 def _minimal_validation_error(model: type[BaseModel]) -> ValidationError:
@@ -427,16 +442,15 @@ def _validation_wrapper(
     def validate(data: Any, handler: Callable[[Any], Any]) -> Any:
         """Suppress input-bearing exception chains and rebuild safe error details."""
         current = _VALIDATION_ACTIVE.get()
-        if (
-            not explicit
-            and current is not None
-            and current.active
-            and current.thread_id == get_ident()
-        ):
+        if not explicit and current is not None and current.thread_id == get_ident():
             return handler(data)
         owner = _ValidationOwner(get_ident())
         token = _VALIDATION_ACTIVE.set(owner)
-        alias_token = _VALIDATION_BY_ALIAS.set(by_alias)
+        alias_token = (
+            _VALIDATION_BY_ALIAS.set(by_alias)
+            if _VALIDATION_BY_ALIAS.get() is not by_alias
+            else None
+        )
         try:
             return handler(data)
         except Exception as error:
@@ -447,20 +461,24 @@ def _validation_wrapper(
                     model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
                 )
             except Exception:
-                safe = _minimal_validation_error(model)
-            else:
-                if current is not None and current.active and current.thread_id == get_ident():
-                    current.sanitized.update(
-                        (item["loc"], item["type"], item["msg"])
-                        for item in safe.errors(
-                            include_input=False, include_url=False, include_context=False
-                        )
-                    )
-                raise safe from None
+                safe = None
         finally:
-            owner.active = False
-            _VALIDATION_BY_ALIAS.reset(alias_token)
+            owner.thread_id = None
+            if alias_token is not None:
+                _VALIDATION_BY_ALIAS.reset(alias_token)
             _VALIDATION_ACTIVE.reset(token)
+        # No raw error is active if stack exhaustion also defeats the fallback.
+        if safe is None:
+            safe = _minimal_validation_error(model)
+        if current is not None and current.thread_id == get_ident():
+            if not hasattr(current, "sanitized"):
+                current.sanitized = set()
+            current.sanitized.update(
+                (item["loc"], item["type"], item["msg"])
+                for item in safe.errors(
+                    include_input=False, include_url=False, include_context=False
+                )
+            )
         raise safe from None
 
     validate.__name__ = model.__name__
@@ -515,6 +533,10 @@ class _SafeModel(BaseModel):
         >>> _SafeModel().model_dump()
         {}
         """
+        owner = _VALIDATION_ACTIVE.get()
+        if owner is None or owner.thread_id != get_ident():
+            BaseModel.__init__(self, **data)
+            return
         initialize = super().__init__
         _validation_wrapper(type(self), explicit=True)(data, lambda values: initialize(**values))
 

@@ -2,11 +2,15 @@
 
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import anyio
+import pytest
+
+from swarm_arena._exec.procinfo import _proc_hides_pids
 
 
 def pid_alive(pid: int) -> bool:
@@ -50,3 +54,57 @@ def reap(proc: subprocess.Popen[bytes]) -> None:
     if proc.poll() is None:
         proc.kill()
     proc.wait()
+
+
+# A child whose main thread calls pthread_exit while a worker thread keeps running: Linux then
+# shows state Z in /proc/<pid>/stat although the process is alive.
+THREADED = (
+    "import ctypes, signal, threading, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "def work():\n"
+    "    time.sleep({work_s})\n"
+    "    open('worker.done', 'w').close()\n"
+    "threading.Thread(target=work).start()\n"
+    "open('child.ready', 'w').close()\n"
+    "ctypes.CDLL(None).pthread_exit(None)\n"
+)
+
+
+def main_thread_state(pid: int) -> str:
+    """
+    Read the Linux main thread state, or an empty string when unavailable.
+
+    Parameters
+    ----------
+    pid : int
+        Process identifier to inspect.
+
+    Returns
+    -------
+    str
+        Linux state letter, or an empty string.
+
+    Examples
+    --------
+    >>> main_thread_state(-1)
+    ''
+    """
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return ""
+    return data[data.rfind(b")") + 1 :].split()[0].decode()
+
+
+def require_visible_proc() -> None:
+    """
+    Skip host liveness assertions when Linux hides process information.
+
+    Examples
+    --------
+    >>> import sys
+    >>> if sys.platform != "linux":
+    ...     require_visible_proc()
+    """
+    if sys.platform == "linux" and _proc_hides_pids(Path("/proc")):
+        pytest.skip("Linux /proc uses hidepid or its visibility cannot be established")

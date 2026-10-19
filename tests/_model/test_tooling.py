@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import ValidationError
 
 from swarm_arena._model.canonical import sha256_hex
@@ -247,25 +248,13 @@ def test_tool_output_and_completed_run_reject_naive_times() -> None:
 @pytest.mark.parametrize("number", [float("nan"), float("inf"), -float("inf")])
 @pytest.mark.parametrize("nested", [False, True])
 def test_tool_output_rejects_nonfinite_data_without_values(number: float, nested: bool) -> None:
-    import traceback
-
     secret = "SENTINEL_TOOL_OUTPUT_DATA"
     data = {secret: [{"loss": number, "note": secret}]} if nested else {secret: number}
     with pytest.raises(ValidationError) as caught:
         ToolOutput(status=RunStatus.OK, data=data)
     error = caught.value
     assert error.errors()[0]["loc"] == ("data",)
-    surfaces = (
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", [])),
-        repr(error.__cause__),
-        repr(error.errors()),
-        error.json(),
-        "".join(traceback.format_exception(error)),
-    )
-    assert all(secret not in surface for surface in surfaces)
+    assert_secret_absent(error, secret, sanitized=True)
 
 
 def test_tool_output_preserves_finite_json_data() -> None:

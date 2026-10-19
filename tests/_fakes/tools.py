@@ -31,8 +31,6 @@ from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Action, Tool
 
-# --- Task 5 ---
-
 
 class Widget(Configurable):
     name: ClassVar[str] = "widget"
@@ -52,12 +50,7 @@ class NoNameWidget(Configurable):
     pass
 
 
-# --- Task 6 ---
-
 GOAL = Goal(id="g", namespace="n")
-
-
-# --- Task 7 ---
 
 
 def cand(*, data: dict[str, Any] | None = None, **fields: Any) -> Candidate:
@@ -72,9 +65,6 @@ def cand(*, data: dict[str, Any] | None = None, **fields: Any) -> Candidate:
         "output": ToolOutput(status=RunStatus.OK, data=data or {}),
     }
     return Candidate(**{**defaults, **fields})
-
-
-# --- Task 13 ---
 
 
 class PyInputs(BaseModel):
@@ -140,9 +130,6 @@ class EchoTool(Tool):
 WRITE = "import json, os; json.dump({0}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
 
 
-# --- Task 12 ---
-
-
 def make_job(**fields: Any) -> Job:
     defaults: dict[str, Any] = {
         "id": "x-1",
@@ -160,9 +147,6 @@ def make_job(**fields: Any) -> Job:
     return Job(**{**defaults, **fields})
 
 
-# --- Task 11 ---
-
-
 class FilesWidget(Configurable):
     name: ClassVar[str] = "files-widget"
 
@@ -174,9 +158,6 @@ class FilesWidget(Configurable):
         label: str = ""
 
 
-# --- Task 9 ---
-
-
 class HumanOnlyWidget(Configurable):
     _human_only: ClassVar[frozenset[str]] = frozenset({"command"})
 
@@ -186,8 +167,6 @@ class HumanOnlyWidget(Configurable):
         command: list[str] = []
         timeout_s: float | None = None
 
-
-# --- Task 17 ---
 
 RELEASE = threading.Event()
 
@@ -236,9 +215,6 @@ class UnreadFilesTool(PyTool):  # declares out/a.txt and out/b.txt without readi
         return ToolOutput(status=run.status, files=files)
 
 
-# --- Task 20 ---
-
-
 class AlwaysPass(Check):
     name = "always-pass"
 
@@ -280,9 +256,6 @@ class RecordingExecutor(Executor):
 
     async def aclose(self) -> None:
         return None
-
-
-# --- Task 18 ---
 
 
 def gradient_descent(lr: float, steps: int, x0: float = -1.5, y0: float = 2.0) -> dict[str, float]:
@@ -346,9 +319,6 @@ def secret_error(value: str) -> dict[str, int]:
 
 def non_json_result() -> dict[str, Any]:
     return {"value": {1, 2}}
-
-
-# --- Task 21 ---
 
 
 def rosen_score(goal: Goal, candidate: Candidate) -> Score:

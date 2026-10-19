@@ -14,12 +14,14 @@ files = ["problem/*.txt", "problem/run.py"]
 ```
 
 Snapshotting stores each selected regular file by SHA-256 and records a sorted
-`path → sha256` manifest while keeping the original globs. Folded aliases of
-the same device/inode are recorded once using the directory listing’s spelling,
-including ancestor names. Distinct files whose names collide after NFC/casefold
-comparison are refused with both paths named; the manifest must also have a
-portable file/directory layout. Every glob must match
-at least one regular file. Symlinks below the plan directory and reserved
+`path → sha256` manifest while keeping the original globs. A glob spelling that
+only a case-insensitive lookup resolves (an alias of the same device/inode) is
+recorded once with the directory listing's spelling, including ancestor names.
+Names that both appear in a directory listing are separate entries, even as
+hard links to one file, and two such names that collide after canonical caseless
+folding are refused with both paths named. Each directory is listed once per
+snapshot; the manifest must also have a portable file/directory layout. Every
+glob must match at least one regular file. Symlinks below the plan directory and reserved
 top-level paths (`swarm`, `parents`, `candidate`) are rejected, including case
 variants such as `SWARM` and `Parents`. Those names are
 allowed as basenames below an ordinary directory, such as `problem/candidate`.
@@ -37,17 +39,23 @@ representation, and the returned plan retains its original base directory.
 (workspace-staging)=
 ## Workspace staging
 
-A tool workspace starts with goal and tool files. Tool files replace goal files
-at a shared NFC/casefold key and keep the tool file’s spelling. The first
+A tool workspace starts with goal and tool files. A tool file replaces a goal
+file only at the exact same spelling. A tool file that respells a goal file
+(the same folded key, another spelling, such as `P/RUN.py` for `p/run.py`) is a
+configuration error, raised before any run and naming both paths, so one
+workspace works on case-sensitive and case-insensitive filesystems. The first
 parent's full overlay is applied only when its nonempty tool identity matches the receiving tool and
 every overlay path is editable, unprotected, and outside check or judge private
-files. Otherwise the whole overlay is refused with a warning identifying the
-parent and the refused paths; an empty overlay needs no warning. Live edits are
+files, and every path fits the receiving root as an exact-spelling replacement
+or a new path (no respelling, no ancestor or file/directory conflict, nothing
+below a top-level `data.json/`). Otherwise the whole overlay is refused with a
+warning identifying the parent and the refused paths; an empty overlay needs no warning. Live edits are
 applied last. For example, an
 editable `problem/*.txt` file can inherit its base parent's contents and then be
 replaced by the current request's text. A protected `problem/run.py` remains
 protected even if its command path was spelled `./problem/run.py`. Protection
-and private-path comparisons normalize Unicode to NFC and then casefold, so
+and private-path comparisons use canonical caseless folding (NFD, casefold,
+then NFC; Unicode D145), so
 an edit to `problem/RUN.py` is refused as protected too. A command spelled
 `problem/RUN.py` likewise protects a root file stored as `problem/run.py`.
 Editable glob matching
@@ -60,29 +68,35 @@ refused, including normalization collisions. Edit values are literal UTF-8 text;
 the reserved `sha256:` followed by exactly 64 lowercase hex digits is a stored
 reference and cannot be submitted as a live edit.
 
-Edit validation soft-refuses differently spelled edits sharing an NFC/casefold
-key, including ancestor directory aliases and file/directory conflicts. For
+Edit validation soft-refuses differently spelled edits sharing a folded key
+(a respelling), including ancestor directory aliases and file/directory conflicts. For
 example, `P/b.txt` conflicts with root file `p/a.txt`, and file `P` conflicts
-with directory `p/`. Aliases of existing workspace files are also refused; an
+with directory `p/`. An edit below a top-level directory that folds to
+`data.json`, such as `Data.json/notes.txt`, is refused too, because later runs
+stage the candidate under `parents/<id>/`, where `data.json` holds the parent's
+output. An edit to the file `data.json` itself is allowed and is skipped in
+parent trees. Aliases of existing workspace files are also refused; an
 exact-spelling edit still replaces that file.
 Stage planning rechecks edit collisions against goal files, tool files, and the accepted base
 overlay before creating the stage. Refusals identify the conflicting paths
 without including edit contents.
 
 Every parent, including the base parent, has read-only overlay and output files
-under `parents/<id>/`. Output files win at a shared NFC/casefold key, retaining
-the output’s spelling, both over parent overlays and over effective candidate
-files. `data.json` always holds the parent's structured output; aliases such as
+under `parents/<id>/`. An output file replaces an overlay or effective file
+only at the exact same path. An output that respells a staged path fails the
+producing run. `data.json` always holds the parent's structured output; aliases such as
 `DATA.json` and `Data.json` are skipped at that level too. Parent ids must be
-single safe path components and must be distinct after NFC normalization and case folding.
+single safe path components and must be distinct after canonical caseless folding.
 Checks and judges instead receive their own root files and read-only candidate
 files under `candidate/files/`, with request and output metadata beside that
 directory. The directory exists even for a candidate with no files.
 
 Materialization revalidates every path before writing, even for model objects
 constructed without validation. Before any write, it rejects destination names
-or ancestor directories with different spellings but the same NFC/casefold key,
+or ancestor directories with different spellings but the same folded key,
 including `a.txt`/`A.txt` and composed/decomposed Unicode names, on every platform.
+No layer merge accepts a respelling. Merge and layout errors name full
+workspace paths such as `parents/c2/p/a.txt` or `candidate/files/p/a.txt`.
 It also rejects symlinks and file/directory conflicts, reads verified artifact
 bytes directly, and publishes through pinned directory descriptors.
 Root artifacts are writable; parent and candidate
@@ -96,7 +110,8 @@ Output collection checks declarations against each other and against the
 complete original workspace layout before uploading any output. Declarations
 such as `out/a.txt` and `OUT/b.txt`, or output `P/RUN.py`
 against staged `p/run.py`, therefore fail the producing run with both paths in
-the log. Exact-spelling replacements remain allowed. The original stage is used
+the log. An output below a top-level `data.json/` directory (any case) also
+fails the producing run. Exact-spelling replacements remain allowed. The original stage is used
 even if the process renames or removes a staged file.
 These file-handling protections do not provide strong process isolation.
 
@@ -128,15 +143,31 @@ indices, while each free-form mapping or `Any` segment becomes `<…>`. Commands
 argument, `env` contains variable names such as `API_KEY` (matching
 `[A-Za-z_][A-Za-z0-9_]*`), `timeout_s` is positive when set, and `grace_s` is
 nonnegative. These constraints are checked when the config is constructed.
+Parameter schemas are checked on the first `get_input_model()` call.
 Snapshots are prepared separately before staging.
 
 Configuration, parameter, and file-action input errors hide rejected values,
 including malformed JSON in `model_validate_json()` and the resulting
 `ValidationError.errors()` / `.json()` details. For example,
 `ScriptTool(command=["x"], timeout_s=-1)` reports the `timeout_s` field and the
-`greater_than` error code without the rejected timeout. Invalid parameter
-schemas raise `ConfigError` retaining the property path and keyword identifiers,
-such as `script_params.lr` and `minimum`, while omitting configured values.
+`greater_than` error code without the rejected timeout.
+
+Parameter names must match `[A-Za-z][A-Za-z0-9_]*`. Names that shadow `pydantic.BaseModel`
+members (for example, `schema`, `dict`, `copy`, or `model_fields`), `Config`, and names
+matching the generated model's configured protected namespaces are reserved to prevent clashes
+with Pydantic model APIs and configuration. The project's explicit `protected_namespaces`
+setting reserves names starting with `model_validate` or `model_dump`; other names such as
+`model_name`, `model_id`, `model_type`, and `model_path` are allowed. Every property schema and
+every recursive `items` sub-schema must be a table (a mapping in Python); lists, scalar values,
+and JSON Schema boolean sub-schemas are unsupported. Numeric bounds must be integers or finite
+floats; on integer properties, float bounds must be integral and within the int64 range. Length
+bounds must be nonnegative integers, and neither numeric nor length bounds accept booleans;
+`description` and `pattern` must be strings. Non-finite numbers are refused in enum members and
+defaults, and `number` inputs must be finite. An `enum` cannot be combined with numeric bounds
+or `pattern`. Patterns use the Rust regex dialect, with no lookaround or backreferences; `\d`
+is Unicode-aware. Invalid parameter schemas raise `ConfigError` on the first
+`get_input_model()` call, with the property path and keyword identifiers while hiding
+configured values.
 
 The command runs in the staged workspace and reads its parameters from
 `swarm/request.json`. It writes a tool envelope such as
@@ -149,7 +180,7 @@ Every command argument or configured interpreter that names a root file is
 protected using its canonical relative path: `problem/run.py`,
 `./problem/run.py`, and `problem//run.py` protect the same file. All tool-owned
 manifest paths are protected too. Command and interpreter matching compares
-NFC/casefold keys and retains the root's stored spelling, including composed
+folded (canonical caseless) keys and retains the root's stored spelling, including composed
 and decomposed Unicode names. These restrictions apply even under a broad
 editable glob, both to live edits and to a base parent's overlay.
 
@@ -260,10 +291,10 @@ be inherited and then replaced by the current edit.
 Only the paths named in `command` and `python`, and the tool's own `files`, are protected. A helper module your script imports (for example `problem/helpers.py`) can be edited when an `editable` glob matches it. To keep it fixed, list it in the tool's `files` or narrow `editable`.
 
 Check and judge private paths and the core's reserved paths are also excluded
-from edits and overlays. Protected names use NFC normalization and casefold;
+from edits and overlays. Protected names use canonical caseless folding;
 editable globs remain case sensitive. For example, `./problem/RUN.py` in a
 command protects the root's `problem/run.py`, even with `editable=["problem/*"]`.
-All workspace paths must be relative, without `..` or symlinks. Top-level
+All workspace paths must be relative strict UTF-8 (no lone surrogates), without `..` or symlinks. Top-level
 `swarm/`, `parents/`, and `candidate/` are reserved, including folded variants.
 For example, `out/plot.png` is a valid output path; `../plot.png` and
 `candidate/plot.png` are not. Distinct spellings with the same folded key are
@@ -289,8 +320,10 @@ Inputs appear under `params`; edits have already been applied to workspace
 files. The first parent is the base for overlay inheritance. Every parent,
 including the first, has a read-only directory under `parents/<id>/` containing
 its `data.json`, full overlay copy, and declared output files. If an output file
-shares an overlay path, the output wins in that parent directory. `data.json`
-is reserved there for structured output. For example,
+has the exact path of an overlay file, the output wins in that parent directory.
+`data.json` is reserved there for structured output, as a file name and as a
+directory name: edits and outputs below a top-level `data.json/` are refused
+in the run that makes them. For example,
 `json.load(open("parents/c1/data.json"))["loss"]` reads the parent's loss.
 
 ### Tool results, exit codes, and partial output
@@ -317,9 +350,10 @@ OOM, which takes precedence.
 
 On timeout or cancellation the process group gets SIGTERM, a `grace_s` wait,
 partial collection, and SIGKILL. A valid result written before collection is
-kept with `partial=true` and status `timeout` or `cancelled`; without one, data
-is empty. Write partial results atomically so collection never sees half a JSON
-document:
+kept with `partial=true` and status `timeout` or `cancelled`, even if empty or
+its files are dropped later by a size cap or upload failure. Failed, timed-out,
+or invalid collection gets empty data, `partial=false`, and a note. Write partial
+results atomically so collection never sees half a JSON document:
 
 ```python
 import json

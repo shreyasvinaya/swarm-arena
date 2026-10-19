@@ -9,9 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `ScriptTool` parameter schemas allow non-clashing names such as `model_name`,
-  refuse reserved model names and malformed sub-schemas or keyword values,
-  and bound default-mismatch diagnostics without exposing configured values.
 - Consolidate model validation diagnostics: rejected inputs and validator context
   are removed from `errors()` and `json()` as well as text and tracebacks.
   Schema fields, aliases and list/tuple indices remain visible at every depth;
@@ -19,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owns the unknown-key policy for nested fields; explicit constructor and
   `model_validate*` calls inside validators use the called model's own policy,
   and contexts copied to another thread establish their own boundary. For
-  ambiguous alias or union paths, integer mapping keys remain redacted. The
+  ambiguous alias or union paths, any segment on which the matching schema
+  paths disagree is hidden, string identifiers included. The
   policy is: human plan/settings models show nested typo names,
   while runtime records and component configs use `<field>` for unknown keys.
   Empty locations stay empty, restoring `plan`/`run_config` loader fallbacks and
@@ -36,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redact data keys and hide unknown model keys as `<field>`. Pydantic developer
   errors retain their original type and fix-it hint at every entry point. If
   sanitization itself fails, diagnostics fall back to an empty location with
-  type and message `invalid`, without exposing the original failure.
+  type and message `invalid`, without exposing the original failure. Diagnostic
+  details are capped at 20 in Pydantic order, plus `and N more errors` when truncated.
 - `ToolOutput.data` and script-check `details` must be finite JSON, with fixed
   `data must be finite JSON` / `details must be finite JSON` validation messages;
   invalid connector output is reported as an execution error.
@@ -48,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload output files, and verify candidate overlays and parent file staging.
   Document installation from a clone before running the README example.
 - `ScriptTool`: bring your own files and script, with `list_files` and `read_file` actions.
+  ScriptTool parameters and catalog `settable` schemas use a strict, frozen subset
+  compiler with validated defaults, bounded value-free diagnostics, explicit
+  protected namespaces, and non-clashing names such as `model_name`. Numeric
+  inputs, bounds, enum members and defaults must be finite; integer float bounds
+  must be integral int64 values. Enum cannot be combined with bounds or pattern.
+  Patterns use Rust regex syntax (no lookaround or backreferences; Unicode-aware
+  `\d`).
 - `RunConfig` and the `swarm_arena.config` models, with load-time catalog rules.
 
 - Project scaffold: package, `swarm-arena --version`, CI, and docs skeleton.

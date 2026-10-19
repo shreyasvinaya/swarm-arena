@@ -3,6 +3,7 @@ import traceback
 from typing import Any, cast
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_core import InitErrorDetails
 
@@ -149,7 +150,7 @@ def test_rejects_nested_and_inapplicable_keywords(prop: dict[str, Any]) -> None:
 
 
 def test_typed_enum_preserves_strict_type_and_constraints() -> None:
-    M = compile_object_schema("P", {"n": {"type": "integer", "enum": [1, 2], "minimum": 2}})
+    M = compile_object_schema("P", {"n": {"type": "integer", "enum": [2]}})
     assert M.model_validate({"n": 2}).model_dump() == {"n": 2}
     for bad in (1, True, "2", 2.0, 3):
         with pytest.raises(ValidationError):
@@ -335,18 +336,8 @@ def test_compile_errors_hide_values_and_preserve_identifiers(keyword: str) -> No
     error = caught.value
     assert "P.lr" in str(error)
     assert keyword in str(error)
-    for diagnostic in (
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", ())),
-        "".join(traceback.format_exception(error)),
-    ):
-        assert secret not in diagnostic
+    assert_secret_absent(error, secret)
     assert error.__cause__ is None
-    if isinstance(error, ValidationError):
-        assert secret not in repr(error.errors())
-        assert secret not in error.json()
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
@@ -371,15 +362,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         compile_object_schema("P", {"xs": schema})
     error = caught.value
     assert str(error) == "P.xs" + ".items" * depth + ": invalid schema"
-    for diagnostic in (
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", ())),
-        "".join(traceback.format_exception(error)),
-    ):
-        assert "SECRET_SENTINEL_subschema" not in diagnostic
-        assert "73918462" not in diagnostic
+    assert_secret_absent(error, "SECRET_SENTINEL_subschema")
+    assert_secret_absent(error, "73918462")
     assert error.__cause__ is None
 
 
@@ -493,14 +477,7 @@ def test_wrong_typed_keywords_have_exact_value_free_errors(
         compile_object_schema("P", {"p": schema})
     assert str(caught.value) == "P.p" + (".items" if nested else "") + f": invalid {keyword}"
     error = caught.value
-    for diagnostic in (
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", ())),
-        "".join(traceback.format_exception(error)),
-    ):
-        assert "SECRET_keyword" not in diagnostic
+    assert_secret_absent(error, "SECRET_keyword")
     assert error.__cause__ is None
 
 
@@ -581,3 +558,72 @@ def test_default_reasons_show_at_most_five_types(
     expected = sorted(set(codes))[:5] + (["…"] if count > 5 else [])
     assert str(caught.value) == f"P.p: default does not match the schema ({', '.join(expected)})"
     assert "SECRET_default" not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "keyword", ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "enum", "default"]
+)
+def test_nonfinite_schema_values_are_refused(keyword: str, value: float) -> None:
+    schema = {"type": "number", keyword: [value] if keyword == "enum" else value}
+    with pytest.raises(ValueError, match=rf"^Params.p: invalid {keyword}$"):
+        compile_object_schema("Params", {"p": schema})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_number_input_must_be_finite(value: float) -> None:
+    model = compile_object_schema("Params", {"p": {"type": "number"}})
+    with pytest.raises(ValidationError):
+        model.model_validate({"p": value})
+
+
+@pytest.mark.parametrize("bound", [0.5, -0.5, float(2**63), -float(2**63) * 2])
+@pytest.mark.parametrize("keyword", ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"])
+def test_integer_float_bounds_must_be_integral_int64(keyword: str, bound: float) -> None:
+    with pytest.raises(ValueError, match=rf"^Params.p: invalid {keyword}$"):
+        compile_object_schema("Params", {"p": {"type": "integer", keyword: bound}})
+
+
+@pytest.mark.parametrize("bound", [0.0, 400.0, -float(2**63), 9.2e18])
+def test_integer_integral_float_bounds_are_supported(bound: float) -> None:
+    model = compile_object_schema("Params", {"p": {"type": "integer", "minimum": bound}})
+    assert model.model_validate({"p": int(bound)}).model_dump()["p"] == int(bound)
+
+
+@pytest.mark.parametrize(
+    "keyword", ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "pattern"]
+)
+def test_enum_refuses_bounds_and_pattern(keyword: str) -> None:
+    schema = (
+        {"type": "string", "enum": ["x"], "pattern": "x"}
+        if keyword == "pattern"
+        else {"type": "integer", "enum": [1], keyword: 0}
+    )
+    with pytest.raises(ValueError, match=rf"^Params.p: enum cannot be combined with {keyword}$"):
+        compile_object_schema("Params", {"p": schema})
+
+
+def test_rust_pattern_unicode_digit() -> None:
+    model = compile_object_schema("Params", {"p": {"type": "string", "pattern": r"^\d$"}})
+    assert model.model_validate({"p": "\u0661"}).model_dump()["p"] == "\u0661"
+
+
+@pytest.mark.parametrize("keyword", ["enum", "default"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_nonfinite_nested_schema_data_is_refused(keyword: str, nested: bool) -> None:
+    value = {"private": [float("inf")]}
+    prop = {"type": "array", keyword: [value]}
+    schema = {"type": "array", "items": prop} if nested else prop
+    path = "P.p.items" if nested else "P.p"
+    with pytest.raises(_SchemaError) as caught:
+        compile_object_schema("P", {"p": schema})
+    assert str(caught.value) == f"{path}: invalid {keyword}"
+    assert_secret_absent(caught.value, "private")
+
+
+@pytest.mark.parametrize("pattern", [r"^(?!foo)", r"^(a)\1$"])
+def test_unsupported_rust_patterns_are_value_free(pattern: str) -> None:
+    with pytest.raises(_SchemaError) as caught:
+        compile_object_schema("P", {"p": {"type": "string", "pattern": pattern}})
+    assert str(caught.value) == "P.p: invalid schema (keywords: type, pattern)"
+    assert_secret_absent(caught.value, pattern)

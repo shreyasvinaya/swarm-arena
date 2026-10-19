@@ -6,11 +6,13 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import pytest
-from _fakes.proc import pid_alive, wait_until
+from _fakes import proc as shared_proc
+from _fakes.proc import THREADED, main_thread_state, pid_alive, require_visible_proc, wait_until
 
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Job
@@ -130,6 +132,7 @@ def _is_zombie(pid: int) -> bool:
 
 
 def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
+    require_visible_proc()
     p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
     try:
         assert group_has_live_member(p.pid)
@@ -142,6 +145,7 @@ def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
 
 
 def test_group_has_live_member_sees_a_live_child_of_a_zombie_leader(tmp_path: Path) -> None:
+    require_visible_proc()
     code = (
         "import subprocess; "
         "open('child.pid', 'w').write(str(subprocess.Popen(['sleep', '30']).pid))"
@@ -238,34 +242,13 @@ def test_proc_scan_unreadable_entry_cannot_tell(
     assert procinfo._live_in_proc(777, proc)  # the pid still exists, but its state is unknown
 
 
-# A child whose main thread calls pthread_exit while a worker thread keeps running: Linux then
-# shows state Z in /proc/<pid>/stat although the process is alive.
-THREADED = (
-    "import ctypes, signal, threading, time\n"
-    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-    "def work():\n"
-    "    time.sleep({work_s})\n"
-    "    open('worker.done', 'w').close()\n"
-    "threading.Thread(target=work).start()\n"
-    "open('child.ready', 'w').close()\n"
-    "ctypes.CDLL(None).pthread_exit(None)\n"
-)
-
-
-def _main_thread_state(pid: int) -> str:
-    try:
-        data = Path(f"/proc/{pid}/stat").read_bytes()
-    except OSError:
-        return ""
-    return data[data.rfind(b")") + 1 :].split()[0].decode()
-
-
 @pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
 def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
+    require_visible_proc()
     code = THREADED.format(work_s=1.0)
     p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
-        assert wait_until(lambda: _main_thread_state(p.pid) == "Z", 5)
+        assert wait_until(lambda: main_thread_state(p.pid) == "Z", 5)
         assert not (tmp_path / "worker.done").exists()
         assert group_has_live_member(p.pid)  # the worker thread still runs
         assert wait_until(lambda: (tmp_path / "worker.done").exists(), 5)
@@ -346,3 +329,20 @@ def test_liveness_reads_as_alive_when_it_cannot_tell(
 def test_group_of_another_user_has_a_live_member() -> None:
     # init's group: signal 0 gives PermissionError to a normal user, and its leader is not a zombie
     assert group_has_live_member(1)
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+def test_liveness_host_guard_skips_hidden_proc(
+    monkeypatch: pytest.MonkeyPatch, hidden: bool
+) -> None:
+    monkeypatch.setattr(shared_proc, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(shared_proc, "_proc_hides_pids", lambda path: hidden)
+    if hidden:
+        with pytest.raises(pytest.skip.Exception, match="hidepid"):
+            require_visible_proc()
+    else:
+        require_visible_proc()
+
+
+def test_shared_main_thread_state_handles_unavailable_process() -> None:
+    assert main_thread_state(-1) == ""

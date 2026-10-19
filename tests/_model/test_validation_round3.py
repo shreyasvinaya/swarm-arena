@@ -1,7 +1,6 @@
 """Pin Round 3 totality, schema-index cost, and validation-boundary ownership."""
 
 import json
-import traceback
 from collections.abc import Callable
 from contextvars import Context, copy_context
 from functools import partial
@@ -9,6 +8,7 @@ from threading import Thread
 from typing import Annotated, Any, ClassVar, Self, cast
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -30,23 +30,6 @@ from swarm_arena._model.base import _SafeModel
 from swarm_arena._model.ref import _validate_config
 
 SECRET = "R3_PRIVATE_SENTINEL"
-
-
-def assert_secret_absent(error: Exception) -> None:
-    surfaces = [
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(error.__cause__),
-        repr(getattr(error, "__notes__", None)),
-        "".join(traceback.format_exception(error)),
-    ]
-    if isinstance(error, ValidationError):
-        surfaces.extend([repr(error.errors()), error.json()])
-        assert all(item["input"] is None and "ctx" not in item for item in error.errors())
-    assert all(SECRET not in surface for surface in surfaces), surfaces
-    assert error.__cause__ is None
-    assert error.__context__ is None or error.__suppress_context__
 
 
 def validate(model: type[BaseModel], entry: str, data: dict[str, Any]) -> BaseModel:
@@ -82,7 +65,7 @@ def test_callable_union_never_crashes_or_leaks(fn: Any, boundary: str) -> None:
     )
     with pytest.raises(ValidationError if boundary == "safe" else ConfigError) as caught:
         action()
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 @pytest.mark.parametrize("boundary", ["safe", "config"])
@@ -104,7 +87,7 @@ def test_boundary_falls_back_when_sanitizer_crashes(
     )
     with pytest.raises(ValidationError if boundary == "safe" else ConfigError) as caught:
         action()
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
     if isinstance(caught.value, ValidationError):
         assert caught.value.errors() == [
             {"type": "invalid", "loc": (), "msg": "invalid", "input": None}
@@ -148,7 +131,7 @@ def test_schema_index_built_once_and_rebuilt_with_schema(monkeypatch: pytest.Mon
     for _ in range(2):
         with pytest.raises(ValidationError) as caught:
             Config(items=[SECRET] * 1000)
-        assert caught.value.error_count() == 1000
+        assert caught.value.error_count() == 21
     assert calls == 1
     assert walks < 20  # Two thousand errors must not re-walk even the root fields.
     Config.model_rebuild(force=True)
@@ -191,7 +174,7 @@ def test_copied_context_validates_safely_in_another_thread() -> None:
     Outer()
     assert len(errors) == 1
     assert isinstance(errors[0], ValidationError)
-    assert_secret_absent(errors[0])
+    assert_secret_absent(errors[0], SECRET, sanitized=True)
 
 
 @pytest.mark.parametrize("entry", ["constructor", "python", "json", "strings"])
@@ -219,7 +202,7 @@ def test_explicit_nested_validation_owns_its_policy(entry: str, outer_policy: st
     error = errors[0]
     assert isinstance(error, ValidationError)
     assert error.errors()[0]["loc"] == ("<field>" if outer_policy == "show" else "typo",)
-    assert_secret_absent(error)
+    assert_secret_absent(error, SECRET, sanitized=True)
 
 
 @pytest.mark.parametrize("entry", ["constructor", "python", "json", "strings"])
@@ -299,7 +282,7 @@ def test_same_name_union_uses_mapping_node_for_integer_keys() -> None:
         model(branch={"value": {739201: SECRET}})
     assert any(item["loc"] == ("branch", "<…>", "value", "<…>") for item in caught.value.errors())
     assert "739201" not in caught.value.json()
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 @pytest.mark.parametrize("entry", ["constructor", "python", "json", "strings"])
@@ -316,7 +299,7 @@ def test_escaping_explicit_error_keeps_inner_schema(entry: str) -> None:
     with pytest.raises(ValidationError) as caught:
         Outer()
     assert caught.value.errors()[0]["loc"] == ("count",)
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 def test_explicit_error_preserves_field_prefix_and_redacts_mapping_key() -> None:
@@ -336,7 +319,7 @@ def test_explicit_error_preserves_field_prefix_and_redacts_mapping_key() -> None
         Outer(value=1)
     assert caught.value.errors()[0]["loc"] == ("value", "values", "<…>")
     assert "739201" not in caught.value.json()
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 def test_copied_context_becomes_inactive_when_owner_finishes() -> None:
@@ -354,7 +337,7 @@ def test_copied_context_becomes_inactive_when_owner_finishes() -> None:
     Outer()
     with pytest.raises(ValidationError) as caught:
         copies[0].run(Config.__pydantic_validator__.validate_python, {"count": SECRET})
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 def test_sanitizer_itself_is_total(monkeypatch: pytest.MonkeyPatch) -> None:

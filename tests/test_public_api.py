@@ -84,15 +84,12 @@ PUBLIC["swarm_arena.config"] += [
 ]
 
 
-# --- Task 20 ---
 PUBLIC["swarm_arena.scoring"] += ["Check", "CheckContext", "Judge", "JudgeContext"]
 
 
-# --- Task 18 ---
 PUBLIC["swarm_arena"] += ["FunctionTool"]
 
 
-# --- Task 21 ---
 PUBLIC["swarm_arena"] += ["ProgramJudge"]
 PUBLIC["swarm_arena.scoring"] += ["Lexicographic"]
 
@@ -187,7 +184,6 @@ def test_root_import_publishes_core_facades() -> None:  # __module__ never depen
     assert done.stdout.strip() == "[]"
 
 
-# --- Task 22 ---
 PUBLIC["swarm_arena"] += ["ScriptCheck", "ScriptJudge"]
 
 PUBLIC["swarm_arena.testing"] += ["check_tool", "check_check", "check_judge", "make_candidate"]

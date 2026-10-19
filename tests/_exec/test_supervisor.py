@@ -11,25 +11,13 @@ from typing import Any
 
 import anyio
 import pytest
-from _fakes.proc import pid_alive, wait_for_file, wait_until
+from _fakes.proc import THREADED, pid_alive, require_visible_proc, wait_for_file, wait_until
 
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.procinfo import ExitWatch, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._model.tooling import CompletedRun, RunStatus
-
-# The child of tests/_exec/test_procinfo.py: its main thread exits, a worker thread runs on.
-THREADED = (
-    "import ctypes, signal, threading, time\n"
-    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-    "def work():\n"
-    "    time.sleep({work_s})\n"
-    "    open('worker.done', 'w').close()\n"
-    "threading.Thread(target=work).start()\n"
-    "open('child.ready', 'w').close()\n"
-    "ctypes.CDLL(None).pthread_exit(None)\n"
-)
 
 # A grandchild that ignores SIGTERM (so only the group SIGKILL ends it); the tool waits until the
 # grandchild has installed the ignore, writes its pid to gc.pid, and sleeps.
@@ -241,6 +229,7 @@ async def test_descendant_gets_full_grace_after_leader_exits(tmp_path: Path) -> 
 
 
 async def test_stop_returns_early_when_group_is_gone(tmp_path: Path) -> None:
+    require_visible_proc()
     started = time.monotonic()
     done = await call(tmp_path, py("import time; time.sleep(60)"), timeout_s=1.0, grace_s=30.0)
     assert done.status is RunStatus.TIMEOUT
@@ -274,8 +263,8 @@ async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
     async def broken(r: CompletedRun) -> None:
         raise RuntimeError("collector broke")
 
-    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=broken)
-    assert done.status is RunStatus.TIMEOUT
+    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=broken)
+    assert done.status is RunStatus.CANCELLED
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
     assert done.stderr_path.read_text().endswith("swarm-arena: before_kill failed: RuntimeError\n")
 
@@ -289,8 +278,8 @@ async def test_blocked_before_kill_is_bounded(
         await anyio.sleep_forever()
 
     started = time.monotonic()
-    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=blocked)
-    assert done.status is RunStatus.TIMEOUT
+    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=blocked)
+    assert done.status is RunStatus.CANCELLED
     assert time.monotonic() - started < 10
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
     assert "before_kill timed out" in done.stderr_path.read_text()
@@ -302,8 +291,8 @@ async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> N
     async def before_kill(r: CompletedRun) -> None:
         alive.append(pid_alive(int((tmp_path / "gc.pid").read_text())))
 
-    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=before_kill)
-    assert done.status is RunStatus.TIMEOUT
+    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=before_kill)
+    assert done.status is RunStatus.CANCELLED
     assert alive == [True]
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
     assert "swarm-arena" not in done.stderr_path.read_text()  # no note on success
@@ -326,14 +315,13 @@ async def test_fifo_stderr_cannot_block_kill(
         raise RuntimeError("collector broke")
 
     with anyio.fail_after(10):
-        done = await call(
+        done = await stop_after_ready(
             tmp_path,
-            py(code),
-            timeout_s=1.0,
+            code,
             grace_s=0.5,
             before_kill=blocked if mode == "blocked" else broken,
         )
-    assert done.status is RunStatus.TIMEOUT
+    assert done.status is RunStatus.CANCELLED
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
 
 
@@ -458,12 +446,12 @@ async def test_kill_at_deadline_when_before_kill_ignores_cancel(
 
     async def stuck(r: CompletedRun) -> None:
         entered.append(time.monotonic())
-        await anyio.to_thread.run_sync(time.sleep, 2.0)  # not abandonable: ignores cancellation
+        await anyio.to_thread.run_sync(time.sleep, 4.0)  # not abandonable: ignores cancellation
 
-    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=stuck)
+    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=stuck)
     kills = [at for sig, _, at in seen if sig == signal.SIGKILL]
-    assert done.status is RunStatus.TIMEOUT
-    assert 0.4 <= kills[0] - entered[0] < 1.5  # at the 0.5 s deadline, not after the 2 s thread
+    assert done.status is RunStatus.CANCELLED
+    assert 0.4 <= kills[0] - entered[0] < 3.5  # deadline precedes the blocked 4 s collector
     assert "before_kill timed out after 0.5 s" in done.stderr_path.read_text()
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
 
@@ -472,7 +460,7 @@ async def test_before_kill_failure_note_names_only_the_type(tmp_path: Path) -> N
     async def leaky(r: CompletedRun) -> None:
         raise ValueError("sentinel-secret")
 
-    done = await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=leaky)
+    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=leaky)
     log = done.stderr_path.read_text()
     assert "before_kill failed: ValueError" in log
     assert "sentinel-secret" not in log
@@ -548,7 +536,9 @@ async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, ki
 
     caught: BaseException | None = None
     try:
-        await call(tmp_path, py(STUBBORN), timeout_s=1.0, grace_s=0.5, before_kill=broken)
+        await stop_after_ready(
+            tmp_path, STUBBORN, grace_s=0.5, before_kill=broken, propagate_cancel=True
+        )
     except BaseException as exc:
         caught = exc
     assert type(caught) is expected
@@ -599,6 +589,7 @@ async def test_safety_net_reap_does_not_block_the_loop(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
 async def test_grace_waits_for_live_threads_of_an_exited_main_thread(tmp_path: Path) -> None:
+    require_visible_proc()
     child = THREADED.format(work_s=1.5)
     leader = (  # keeps the default SIGTERM action; the child ignores SIGTERM
         "import os, subprocess, sys, time\n"
@@ -611,6 +602,54 @@ async def test_grace_waits_for_live_threads_of_an_exited_main_thread(tmp_path: P
     async def before_kill(r: CompletedRun) -> None:
         seen.append((tmp_path / "worker.done").exists())
 
-    done = await call(tmp_path, py(leader), timeout_s=1.0, grace_s=5.0, before_kill=before_kill)
-    assert done.status is RunStatus.TIMEOUT
+    done = await stop_after_ready(
+        tmp_path, leader, ready="child.ready", grace_s=5.0, before_kill=before_kill
+    )
+    assert done.status is RunStatus.CANCELLED
     assert seen == [True]  # the grace covered the worker thread, not just the main thread
+
+
+async def stop_after_ready(
+    tmp_path: Path,
+    code: str,
+    *,
+    ready: str = "gc.pid",
+    propagate_cancel: bool = False,
+    **kwargs: Any,
+) -> CompletedRun:
+    """Cancel after child readiness and return the provisional stopped run."""
+    runs: list[CompletedRun] = []
+    failure: BaseException | None = None
+    collect = kwargs.pop("before_kill", None)
+
+    async def record(run: CompletedRun) -> None:
+        runs.append(run)
+        if collect is not None:
+            await collect(run)
+
+    async def stop_when_ready(scope: anyio.CancelScope) -> None:
+        await wait_for_file(tmp_path / ready, 30)
+        scope.cancel()
+
+    with anyio.CancelScope() as scope:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(stop_when_ready, scope)
+            try:
+                await call(tmp_path, py(code), before_kill=record, **kwargs)
+            except BaseException as error:
+                failure = error
+            finally:
+                tasks.cancel_scope.cancel()
+    if failure is not None and (
+        propagate_cancel or not isinstance(failure, anyio.get_cancelled_exc_class())
+    ):
+        raise failure
+    assert runs, "child must be ready before the stop sequence"
+    return runs[-1]
+
+
+async def test_stop_timing_waits_for_slow_child_startup(tmp_path: Path) -> None:
+    code = "import time; time.sleep(1.5)\n" + STUBBORN
+    done = await stop_after_ready(tmp_path, code, grace_s=0.1)
+    assert (tmp_path / "gc.pid").exists()
+    assert done.status is RunStatus.CANCELLED

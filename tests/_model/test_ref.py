@@ -5,6 +5,7 @@ from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, Literal
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import NoNameWidget, Widget
 from pydantic import (
     AliasChoices,
@@ -121,8 +122,8 @@ def test_build_config_error_redacts_data_locations(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"credentials": credentials}).build(Configurable)
 
+    assert_secret_absent(exc.value, secret)
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
         assert "739201" not in diagnostic
         assert "credentials" in diagnostic
     assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
@@ -134,8 +135,7 @@ def test_build_config_error_redacts_unknown_field_names() -> None:
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={secret: 1}).build(Configurable)
 
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
+    assert_secret_absent(exc.value, secret)
     assert str(exc.value) == "_fakes.tools:Widget: <field>: extra_forbidden"
 
 
@@ -167,8 +167,8 @@ def test_build_config_error_redacts_nested_schema_locations(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"credentials": [entry]}).build(Configurable)
 
+    assert_secret_absent(exc.value, secret)
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
         assert "credentials" in diagnostic
     location = (
         "counts.0"
@@ -202,8 +202,8 @@ def test_build_config_error_redacts_nested_models(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"credentials": credentials}).build(Configurable)
 
+    assert_secret_absent(exc.value, secret)
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
         assert "credentials" in diagnostic
     location = {
         "model": "count",
@@ -234,8 +234,8 @@ def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) 
             config={"credentials": {"kind": secret, "amount": "invalid"}},
         ).build(Configurable)
 
+    assert_secret_absent(exc.value, secret)
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
         assert "credentials" in diagnostic
     assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>.amount: int_parsing"
 
@@ -276,8 +276,8 @@ def test_build_config_error_preserves_top_level_alias(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"items": value}).build(Configurable)
 
+    assert_secret_absent(exc.value, secret)
     for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
         assert "items" in diagnostic
     location = "items.0" if isinstance(alias, AliasPath) else "items"
     assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
@@ -308,8 +308,7 @@ def test_build_config_error_redacts_model_level_error(monkeypatch: pytest.Monkey
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"label": secret}).build(Configurable)
 
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
+    assert_secret_absent(exc.value, secret)
     assert str(exc.value) == "_fakes.tools:Widget: value_error"
     assert exc.value.__suppress_context__
 
@@ -493,8 +492,7 @@ def test_build_config_validation_failures_are_secret_safe(
     with pytest.raises(ConfigError) as exc:
         ref.build(Configurable)
 
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
+    assert_secret_absent(exc.value, secret)
     assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
     assert exc.value.__suppress_context__
     assert exc.value.__cause__ is None

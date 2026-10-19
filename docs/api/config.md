@@ -39,7 +39,11 @@ mapping of settable field names to supported JSON-schema property definitions.
 Schemas are checked when the entry is validated. `settable_model()` produces a
 strict, frozen override model that rejects unknown keys. Omitted fields default
 to `None`, including fields whose schema specifies a default. Explicitly supplied
-values must satisfy their property schemas.
+values must satisfy their property schemas. The supported subset and reserved
+parameter names are described in [ScriptTool parameters](../own-files.md):
+numeric values must be finite, integer float bounds must be integral int64
+values, enum cannot be combined with bounds or pattern, and patterns use Rust
+regex syntax (no lookaround or backreferences; `\d` is Unicode-aware).
 
 `PlannerCatalog` rejects duplicate names. For entries with settable fields it
 imports the component class during validation and rejects fields listed in that
@@ -52,3 +56,7 @@ list/tuple indices; human settings show unknown model keys as typo identifiers,
 component configs use `<field>`, and free-form mapping or `Any` segments use `<…>`. Rejected
 values, schema defaults, import exception contents, and data-derived mapping keys
 are omitted from diagnostics.
+
+Validation diagnostics contain at most 20 error details in Pydantic order,
+followed by `and N more errors` when truncated. Any segment on which matching
+schema paths disagree is hidden, including string identifiers.

@@ -4,11 +4,11 @@ import ast
 import importlib
 import json
 import pkgutil
-import traceback
 from pathlib import Path
 from typing import Any, LiteralString, Self, cast
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL
 from pydantic import AliasChoices, AliasPath, BaseModel, Field, ValidationError, model_validator
 from pydantic_core import PydanticCustomError
@@ -215,21 +215,6 @@ def _validate_bad_input(model: type[BaseModel], surface: str, secret: str) -> ob
     return model.model_validate(secret)
 
 
-def _assert_secret_absent(error: Exception, secret: str) -> None:
-    surfaces = [
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", ())),
-        repr(error.__cause__),
-        "".join(traceback.format_exception(error)),
-    ]
-    if isinstance(error, ValidationError):
-        surfaces += [repr(error.errors()), error.json()]
-        assert all(item["input"] is None and "ctx" not in item for item in error.errors())
-    assert all(secret not in surface for surface in surfaces), surfaces
-
-
 @pytest.mark.parametrize("model", MODELS, ids=lambda cls: cls.__module__ + "." + cls.__qualname__)
 @pytest.mark.parametrize(
     "surface", ["bad-value", "bad-field", "extra-value", "json-invalid", "strings"]
@@ -241,7 +226,7 @@ def test_every_model_rejects_secret_safely(model: type[BaseModel], surface: str)
         try:
             accepted = _validate_bad_input(model, surface, secret)
         except ValidationError as error:
-            _assert_secret_absent(error, secret)
+            assert_secret_absent(error, secret, sanitized=True)
         else:
             assert isinstance(accepted, BaseModel)
             assert secret not in repr(accepted)
@@ -252,7 +237,7 @@ def test_every_model_rejects_secret_safely(model: type[BaseModel], surface: str)
         return
     with pytest.raises(ValidationError) as caught:
         _validate_bad_input(model, surface, secret)
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 @pytest.mark.parametrize("model", MODELS, ids=lambda cls: cls.__module__ + "." + cls.__qualname__)
@@ -271,7 +256,7 @@ def test_unknown_key_policy(model: type[BaseModel]) -> None:
         expected = "misspelled_field" if expected_policy == "show" else "<field>"
         assert [item["loc"] for item in extras] == [(expected,)]
         assert ("misspelled_field" in str(caught.value)) == (expected != "<field>")
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 @pytest.mark.parametrize("kind", ["custom-code", "custom-builtin", "value-error", "type-error"])
@@ -303,7 +288,7 @@ def test_subclass_after_validator_is_inside_shared_boundary(kind: str, entry: st
     }[entry]
     with pytest.raises(ValidationError) as caught:
         validate()
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
     expected_code = {
         "custom-code": "invalid",
         "custom-builtin": "int_parsing",
@@ -326,7 +311,7 @@ def test_shared_location_handles_aliases(alias: str | AliasChoices | AliasPath) 
     data = {"items": [secret]} if isinstance(alias, AliasPath) else {"amount": secret}
     with pytest.raises(ValidationError) as caught:
         Aliased.model_validate(data)
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
     expected = ("items", 0) if isinstance(alias, AliasPath) else ("amount",)
     assert caught.value.errors()[0]["loc"] == expected
 
@@ -338,7 +323,7 @@ def test_core_is_idempotent_and_defaults_to_hidden_unknown_keys() -> None:
     once = _sanitize_validation_error(_SafeModel, caught.value)
     twice = _sanitize_validation_error(_SafeModel, once)
     assert once.errors() == twice.errors()
-    _assert_secret_absent(twice, secret)
+    assert_secret_absent(twice, secret, sanitized=True)
 
 
 def test_frozen_assignment_and_deletion_are_safe() -> None:
@@ -347,17 +332,17 @@ def test_frozen_assignment_and_deletion_are_safe() -> None:
     field_name = "max_teams"
     with pytest.raises(ValidationError) as caught:
         setattr(model, field_name, secret)
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
     assert caught.value.errors()[0]["type"] == "frozen_instance"
     with pytest.raises(ValidationError) as deleted:
         del model.max_teams
-    _assert_secret_absent(deleted.value, secret)
+    assert_secret_absent(deleted.value, secret, sanitized=True)
 
 
 def test_root_catalog_redacts_data_keys_colliding_with_schema_names() -> None:
     secret = "root_" + "sentinel"
     with pytest.raises(ValidationError) as caught:
         ModelCatalog.model_validate({secret: {"model": secret}, "root": {"model": secret}})
-    _assert_secret_absent(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
     # RootModel.root is a serialization field, not an input mapping key identifier.
     assert all(item["loc"][0] == "<…>" for item in caught.value.errors())

@@ -221,12 +221,13 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
         try:
             safe = _sanitize_validation_error(model_cls, error)
         except Exception:
-            safe = _minimal_validation_error(model_cls)
-        summary = "; ".join(
-            (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "")
-            + item["type"]
-            for item in safe.errors(include_input=False, include_url=False, include_context=False)
-        )
+            safe = None
+    if safe is None:
+        safe = _minimal_validation_error(model_cls)
+    summary = "; ".join(
+        (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "") + item["type"]
+        for item in safe.errors(include_input=False, include_url=False, include_context=False)
+    )
     raise ConfigError(f"{where}: {summary}") from None
 
 

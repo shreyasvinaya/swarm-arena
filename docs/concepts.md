@@ -76,7 +76,7 @@ never compared. Built-in judges:
   example hidden test data.
 - `Lexicographic` combines ordered judges: the first judge's key decides, and
   the next judge breaks ties. Only candidates that every member scored get a
-  composite score.
+  composite score. Each member must use one key length per batch, even as the sole member.
 
 ```python
 from swarm_arena import ProgramJudge

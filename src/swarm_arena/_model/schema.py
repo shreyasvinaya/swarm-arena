@@ -1,5 +1,6 @@
 """Compile the supported JSON-schema property subset into pydantic models."""
 
+import math
 import re
 from collections.abc import Mapping
 from functools import partial
@@ -34,17 +35,34 @@ class _SchemaError(ValueError):
     """Identify compiler diagnostics containing only schema identifiers and fixed reasons."""
 
 
+def _contains_nonfinite(value: Any) -> bool:
+    """Check numeric schema data, including defaults inside arrays and mappings."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Mapping):
+        return any(_contains_nonfinite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite(item) for item in value)
+    return False
+
+
 def _check_keyword_types(path: str, schema: Mapping[str, Any]) -> None:
     """Refuse malformed keyword values before pydantic can coerce them."""
     for keyword, value in schema.items():
         if keyword in _BOUNDS:
             valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if isinstance(value, float):
+                valid = valid and math.isfinite(value)
+                if schema.get("type") == "integer":
+                    valid = valid and value.is_integer() and -(2**63) <= value < 2**63
         elif keyword in ("minLength", "maxLength"):
             valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
         elif keyword in ("type", "description", "pattern"):
             valid = isinstance(value, str)
         elif keyword == "enum":
-            valid = isinstance(value, list) and bool(value)
+            valid = isinstance(value, list) and bool(value) and not _contains_nonfinite(value)
+        elif keyword == "default":
+            valid = not _contains_nonfinite(value)
         else:
             # items is compiled recursively; default is checked against its annotation.
             continue
@@ -94,6 +112,9 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
     if "items" in schema and kind != "array":
         raise _SchemaError(f"{path}: items requires type 'array'")
     if "enum" in schema:
+        for keyword in (*_BOUNDS, "pattern"):
+            if keyword in schema:
+                raise _SchemaError(f"{path}: enum cannot be combined with {keyword}")
         choices = schema["enum"]
         adapter = TypeAdapter(annotation, config=ConfigDict(strict=True)) if kind else None
         if adapter is not None:
@@ -110,11 +131,14 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
             WrapValidator(partial(_validate_enum, choices=tuple(choices), adapter=adapter)),
         ]
     constraints: dict[str, Any] = {}
+    if kind == "number" and "enum" not in schema:
+        constraints["allow_inf_nan"] = False
     for keyword, constraint in _BOUNDS.items():
         if keyword in schema:
             if kind not in ("integer", "number"):
                 raise _SchemaError(f"{path}: {keyword} requires type 'integer' or 'number'")
-            constraints[constraint] = schema[keyword]
+            bound = schema[keyword]
+            constraints[constraint] = int(bound) if kind == "integer" else bound
     for keyword, constraint in _STRINGS.items():
         if keyword in schema:
             if kind != "string":
@@ -160,7 +184,7 @@ def _compile_field(path: str, schema: Mapping[str, Any]) -> tuple[Any, FieldInfo
 def compile_object_schema(
     name: str, properties: Mapping[str, Mapping[str, Any]]
 ) -> type[BaseModel]:
-    """
+    r"""
     Compile supported JSON-schema properties into a strict frozen model.
 
     Parameters
@@ -181,8 +205,13 @@ def compile_object_schema(
         underscores; BaseModel member names, names matching the generated model's
         configured protected namespaces, and Config are reserved. Other model_
         names, such as model_name, are allowed. Numeric bounds must be integers
-        or floats, length bounds must be non-negative integers, and neither
-        accepts booleans. Descriptions and patterns must be strings.
+        or finite floats, length bounds must be non-negative integers, and neither
+        accepts booleans. On integer properties, float bounds must be integral
+        and within int64 range. Non-finite numbers in enum members or defaults
+        are refused, and number inputs must be finite. Enum cannot be combined
+        with numeric bounds or pattern. Descriptions and patterns must be strings.
+        Patterns use the Rust regex dialect: no lookaround or backreferences;
+        ``\d`` is Unicode-aware.
 
     Returns
     -------
