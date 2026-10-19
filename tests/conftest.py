@@ -1,8 +1,12 @@
 """Shared fixtures, and collection rules for test paths that need an optional extra."""
 
 import importlib.metadata
+from pathlib import Path
 
 import pytest
+
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.base import open_store
 
 
 def _missing(dist: str) -> bool:
@@ -43,3 +47,13 @@ collect_ignore_glob = ["*/data/*", "_fakes/*"]
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+def artifact_root(tmp_path: Path) -> str:
+    return str(tmp_path / "artifacts")
+
+
+@pytest.fixture
+def artifacts(artifact_root: str) -> ArtifactStore:
+    return ArtifactStore(open_store(artifact_root))
