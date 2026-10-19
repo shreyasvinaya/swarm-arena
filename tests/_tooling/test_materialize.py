@@ -6,7 +6,9 @@ from typing import Never
 
 import pytest
 
+from swarm_arena._errors import NotFound
 from swarm_arena._exec.executor import Job
+from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.tooling import FileRef, ParentRef
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files, materialize
@@ -413,3 +415,22 @@ def test_materialize_write_errors_suppress_secret_exception_chains(
         materialize(Job.Stage(root={"a.txt": digest}), tmp_path / "ws", artifacts)
     assert secret not in "".join(format_exception(exc.value))
     assert list((tmp_path / "ws").iterdir()) == [tmp_path / "ws/swarm"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("out.txt", "OUT.txt"), ("caf\u00e9.txt", "cafe\u0301.txt")],
+)
+def test_collection_refuses_folded_output_duplicates_before_upload(
+    tmp_path: Path, artifacts: ArtifactStore, first: str, second: str
+) -> None:
+    content = b"secret-output-sentinel"
+    (tmp_path / first).write_bytes(content)
+    (tmp_path / second).write_bytes(content)
+    with pytest.raises(ValueError, match="duplicate output path") as exc:
+        collect_output_files(tmp_path, [first, second], artifacts)
+    assert first in str(exc.value)
+    assert second in str(exc.value)
+    assert content.decode() not in str(exc.value)
+    with pytest.raises(NotFound):
+        artifacts.get_bytes(sha256_hex(content))

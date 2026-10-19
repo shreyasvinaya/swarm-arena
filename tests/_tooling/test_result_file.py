@@ -569,3 +569,29 @@ def test_log_supports_relative_paths(tmp_path: Path, monkeypatch: pytest.MonkeyP
     note_in_log(Path("stderr.log"), "leaf")
     assert (tmp_path / "swarm/stderr.log").read_text() == "swarm-arena: relative\n"
     assert (tmp_path / "stderr.log").read_text() == "swarm-arena: leaf\n"
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("out.txt", "OUT.txt"),
+        ("caf\u00e9.txt", "cafe\u0301.txt"),
+        ("out.txt", "./out.txt"),
+        ("out.txt", "out.txt"),
+    ],
+)
+def test_folded_output_duplicates_fail_producing_run(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    secret = "secret-output-sentinel"
+    (tmp_path / first).write_text(secret)
+    (tmp_path / second).write_text(secret)
+    write_result(tmp_path, {"data": {"value": secret}, "files": [first, second]})
+    completed = run(tmp_path, RunStatus.OK, 0)
+    out = tool_output_from_result(tmp_path, completed)
+    assert (out.status, out.data, out.files) == (RunStatus.ERROR, {}, [])
+    diagnostic = completed.stderr_path.read_text()
+    assert "duplicate output path" in diagnostic
+    assert first in diagnostic
+    assert second in diagnostic
+    assert secret not in diagnostic

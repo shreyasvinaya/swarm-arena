@@ -42,7 +42,9 @@ editable `problem/*.txt` file can inherit its base parent's contents and then be
 replaced by the current request's text. A protected `problem/run.py` remains
 protected even if its command path was spelled `./problem/run.py`. Protection
 and private-path comparisons normalize Unicode to NFC and then casefold, so
-an edit to `problem/RUN.py` is refused as protected too. Editable glob matching
+an edit to `problem/RUN.py` is refused as protected too. A command spelled
+`problem/RUN.py` likewise protects a root file stored as `problem/run.py`.
+Editable glob matching
 remains case sensitive.
 
 Identity hashes the import path and validated configuration with defaults
@@ -51,6 +53,13 @@ be in normal form: aliases such as `./problem/a.txt` or `problem//a.txt` are
 refused, including normalization collisions. Edit values are literal UTF-8 text;
 the reserved `sha256:` followed by exactly 64 lowercase hex digits is a stored
 reference and cannot be submitted as a live edit.
+
+`validate_edits` soft-refuses differently spelled edits sharing an NFC/casefold
+key. Pass the existing workspace paths as `root` to also refuse aliases of
+existing files; an exact-spelling edit still replaces that file. Stage planning
+rechecks edit collisions against goal files, tool files, and the accepted base
+overlay before creating the stage. Refusals identify the conflicting paths
+without including edit contents.
 
 Every parent, including the base parent, has read-only overlay and output files
 under `parents/<id>/`. Output files win at a shared path; `data.json` always holds
@@ -69,7 +78,10 @@ bytes directly, and publishes through pinned directory descriptors.
 Root artifacts are writable; parent and candidate
 artifacts are read-only. The workspace's ancestors are trusted executor-owned
 directories. Output collection uses the shared regular-file reader, refuses
-symlink components and special files, and rejects duplicate normalized paths.
+symlink components and special files, and rejects duplicate normalized paths
+after NFC/casefold comparison before uploading any outputs. Result parsing
+applies the same rule, so declarations such as `out.txt` and `OUT.txt` turn a
+successful producing run into an error naming both paths.
 These file-handling protections do not provide strong process isolation.
 
 ## ScriptTool
@@ -105,7 +117,9 @@ successful process with a missing or invalid result as an error. `python`, `env`
 Every command argument or configured interpreter that names a root file is
 protected using its canonical relative path: `problem/run.py`,
 `./problem/run.py`, and `problem//run.py` protect the same file. All tool-owned
-manifest paths are protected too. These restrictions apply even under a broad
+manifest paths are protected too. Command and interpreter matching compares
+NFC/casefold keys and retains the root's stored spelling, including composed
+and decomposed Unicode names. These restrictions apply even under a broad
 editable glob, both to live edits and to a base parent's overlay.
 
 The tool provides two read-only actions, each counted as a board read:

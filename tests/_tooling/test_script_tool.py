@@ -351,6 +351,50 @@ def test_folded_script_edit_is_refused_and_original_unchanged(
     assert [path.name for path in (workspace / "problem").iterdir()] == ["run.py"]
 
 
+@pytest.mark.parametrize(
+    ("stored", "argument", "interpreter"),
+    [
+        ("problem/run.py", "problem/RUN.py", False),
+        ("problem/cafe\u0301.py", "problem/caf\u00e9.py", False),
+        ("problem/caf\u00e9.py", "problem/cafe\u0301.py", False),
+        ("env/python", "env/PYTHON", True),
+    ],
+)
+def test_folded_command_path_protects_root_spelling(
+    stored: str, argument: str, interpreter: bool
+) -> None:
+    tool = ScriptTool(
+        command=["python"] if interpreter else ["python", argument],
+        python=argument if interpreter else None,
+        editable=["**/*"],
+    )
+    protected = tool._protected({stored, "data.txt"})
+    assert protected == frozenset({stored})
+    with pytest.raises(SoftError, match="protected") as exc:
+        validate_edits(
+            {stored: "secret-edit-sentinel"},
+            editable=tool.editable(),
+            protected=protected,
+            max_edit_bytes=100,
+        )
+    assert str(exc.value) == f"{stored}: protected"
+    assert "secret-edit-sentinel" not in str(exc.value)
+    stage, overlay, warnings = plan_tool_stage(
+        goal_files={stored: HR},
+        tool_files={},
+        editable=tool.editable(),
+        protected=protected,
+        private_paths=set(),
+        parents=[ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={stored: HR})],
+        receiving_identity="T",
+        edits={},
+        request_json=None,
+    )
+    assert stage.root == {stored: HR}
+    assert overlay == {}
+    assert warnings == [f"base parent c1 not overlaid: paths not editable here; paths: {stored}"]
+
+
 @pytest.mark.parametrize("status", [RunStatus.OK, RunStatus.TIMEOUT, RunStatus.ERROR])
 def test_collect_uses_result_rules(tmp_path: Path, status: RunStatus) -> None:
     (tmp_path / "swarm").mkdir()

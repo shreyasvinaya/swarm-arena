@@ -227,7 +227,7 @@ def collect_output_files(
     Raises
     ------
     ValueError
-        If a path is invalid, duplicated after normalization, missing,
+        If a path is invalid, duplicated after normalization and folding, missing,
         symlinked, nonregular, or cannot be collected.
 
     Examples
@@ -235,12 +235,15 @@ def collect_output_files(
     >>> refs = collect_output_files(Path("ws"), ["out/a.txt"], artifacts)  # doctest: +SKIP
     """
     paths: list[str] = []
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     for path in declared:
         rel = check_relpath(path)
-        if rel in seen:
-            raise ValueError(f"duplicate output path after normalization: {rel}")
-        seen.add(rel)
+        key = fold_key(rel)
+        if key in seen:
+            raise ValueError(
+                f"duplicate output path after normalization and folding: {seen[key]} and {path}"
+            )
+        seen[key] = path
         paths.append(rel)
     output: list[FileRef] = []
     for rel in paths:

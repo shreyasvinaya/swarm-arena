@@ -84,12 +84,24 @@ def tool_identity(ref: Ref, entry: CatalogEntry | None) -> str:
         raise ValueError(f"{ref.path}: cannot encode tool identity") from None
 
 
+def _edit_collisions(edits: Mapping[str, str], root: AbstractSet[str]) -> dict[str, str]:
+    """Identify differently spelled edits sharing a folded edit or root key."""
+    spellings = {fold_key(path): path for path in sorted(root)}
+    errors: dict[str, str] = {}
+    for path in edits:
+        previous = spellings.setdefault(fold_key(path), path)
+        if previous != path:
+            errors[path] = f"folded path collision with {previous}"
+    return errors
+
+
 def validate_edits(
     edits: Mapping[str, str],
     *,
     editable: Sequence[str],
     protected: AbstractSet[str],
     max_edit_bytes: int,
+    root: AbstractSet[str] = frozenset(),
 ) -> None:
     """Report the first refusal reason for every invalid live edit.
 
@@ -104,17 +116,21 @@ def validate_edits(
         for case- and Unicode-insensitive protection checks.
     max_edit_bytes : int
         Maximum UTF-8 byte count per edit.
+    root : AbstractSet[str], optional
+        Existing workspace paths in their stored spelling. Supply the effective
+        root to refuse differently spelled aliases before planning a stage.
 
     Raises
     ------
     SoftError
-        If any path, protection, glob, size, or stored-reference rule fails.
+        If any path, protection, collision, glob, size, or stored-reference rule fails.
 
     Examples
     --------
     >>> validate_edits({"p/a.txt": "hi"}, editable=["p/*"], protected=set(), max_edit_bytes=10)
     """
     protected = {fold_key(check_relpath(path)) for path in protected}
+    collisions = _edit_collisions(edits, root)
     errors: list[str] = []
     for path, content in edits.items():
         reason = ""
@@ -125,6 +141,8 @@ def validate_edits(
         if not reason:
             if fold_key(path) in protected:
                 reason = "protected"
+            elif path in collisions:
+                reason = collisions[path]
             elif not matches(path, editable):
                 reason = "not editable"
             elif (size := len(content.encode())) > max_edit_bytes:
@@ -257,7 +275,7 @@ def plan_tool_stage(
 ) -> tuple[Job.Stage, dict[str, str], list[str]]:
     """Stage goal and tool files, an eligible base overlay, then live edits.
 
-    Callers first run ``validate_edits`` with the same protection set. Recheck
+    Callers first run ``validate_edits`` with root paths and the same protection set. Recheck
     edit permissions here as an internal invariant. Only the first parent's
     overlay can enter the root, and only as a whole with a nonempty matching
     tool identity. Every parent also remains available in its read-only tree.
@@ -294,6 +312,8 @@ def plan_tool_stage(
         If private files enter the root or edits violate receiving permissions.
     ValueError
         If a path is invalid, noncanonical, or an edit is a stored reference.
+    SoftError
+        If edits collide by folded key with each other or the effective root.
 
     Examples
     --------
@@ -343,6 +363,9 @@ def plan_tool_stage(
             )
         else:
             overlay.update(base.overlay)
+    collisions = _edit_collisions(edits, root.keys() | overlay.keys())
+    if collisions:
+        raise SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
     overlay.update(edit_hashes(edits))
     root.update(overlay)
     return Job.Stage(root=root, parents=list(parents), request_json=request_json), overlay, warnings

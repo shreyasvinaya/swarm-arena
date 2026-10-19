@@ -23,7 +23,7 @@ from swarm_arena._model.ref import _CONFIG_ERROR_TYPES, _validate_config, config
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.schema import _TYPES, compile_object_schema
 from swarm_arena._model.tooling import Command, CompletedRun, ToolOutput, ToolRequest
-from swarm_arena._tooling.paths import check_relpath
+from swarm_arena._tooling.paths import check_relpath, fold_key
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.staging import effective_files
 from swarm_arena._tooling.tool import Action, Tool
@@ -525,9 +525,12 @@ class ScriptTool(Tool):
         return self.config.files.manifest
 
     def _protected(self, root: AbstractSet[str]) -> frozenset[str]:
-        """Protect canonical command paths present in root and all tool-owned files."""
-        return frozenset(
-            path
+        """Match folded command paths, retaining root spellings and all own files."""
+        command_keys = {
+            fold_key(path)
             for argument in (*self.config.command, self.config.python)
-            if argument and (path := _as_relpath(argument)) is not None and path in root
-        ) | frozenset(self.config.files.manifest)
+            if argument and (path := _as_relpath(argument)) is not None
+        }
+        return frozenset(path for path in root if fold_key(path) in command_keys) | frozenset(
+            self.config.files.manifest
+        )

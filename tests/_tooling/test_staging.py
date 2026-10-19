@@ -389,3 +389,64 @@ def test_identity_errors_suppress_secret_exception_chains(
     with pytest.raises(ValueError, match="cannot") as exc:
         tool_identity(Ref(path="_fakes.tools:PyTool", config={"code": secret}), None)
     assert secret not in "".join(format_exception(exc.value))
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("p/a.txt", "p/A.txt"), ("p/caf\u00e9.txt", "p/cafe\u0301.txt")],
+)
+def test_validate_edits_soft_refuses_folded_duplicates(first: str, second: str) -> None:
+    with pytest.raises(SoftError, match="folded path collision") as exc:
+        validate_edits(
+            {first: "secret-edit-sentinel", second: "replacement"},
+            editable=["p/*"],
+            protected=set(),
+            max_edit_bytes=100,
+        )
+    assert first in str(exc.value)
+    assert second in str(exc.value)
+    assert "secret-edit-sentinel" not in str(exc.value)
+    assert "replacement" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("stored", "edit"),
+    [("p/a.txt", "p/A.txt"), ("p/caf\u00e9.txt", "p/cafe\u0301.txt")],
+)
+def test_validate_edits_soft_refuses_folded_root_alias(stored: str, edit: str) -> None:
+    with pytest.raises(SoftError, match="folded path collision") as exc:
+        validate_edits(
+            {edit: "secret-edit-sentinel"},
+            root={stored},
+            editable=["p/*"],
+            protected=set(),
+            max_edit_bytes=100,
+        )
+    assert stored in str(exc.value)
+    assert edit in str(exc.value)
+    assert "secret-edit-sentinel" not in str(exc.value)
+
+
+@pytest.mark.parametrize("source", ["edits", "goal", "tool", "parent"])
+def test_staging_soft_refuses_folded_edit_collisions(source: str) -> None:
+    original, alias = "p/a.txt", "p/A.txt"
+    with pytest.raises(SoftError, match="folded path collision"):
+        stage(
+            goal_files={original: H1} if source == "goal" else {},
+            tool_files={original: H1} if source == "tool" else {},
+            parents=[
+                ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={original: H1})
+            ]
+            if source == "parent"
+            else [],
+            edits={original: "first", alias: "second"} if source == "edits" else {alias: "second"},
+        )
+
+
+def test_validate_edits_keeps_exact_root_updates_and_distinct_names() -> None:
+    edits = {"p/a.txt": "updated", "p/b.txt": "new"}
+    validate_edits(edits, root={"p/a.txt"}, editable=["p/*"], protected=set(), max_edit_bytes=100)
+    st, overlay, warnings = stage(edits=edits)
+    assert st.root == {"p/run.py": H1, **edit_hashes(edits)}
+    assert overlay == edit_hashes(edits)
+    assert warnings == []
