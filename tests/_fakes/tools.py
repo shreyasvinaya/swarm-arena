@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -197,6 +198,38 @@ class GhostFileTool(PyTool):
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
         ghost = FileRef(name="ghost.txt", path="out/ghost.txt", sha256="0" * 64, size=0)
         return ToolOutput(status=run.status, data={"x": 1}, files=[ghost])
+
+
+COLLECTING = threading.Event()  # set when SlowCollectTool.collect starts
+STAGING = threading.Event()  # set when SlowCommandTool.command starts
+
+
+class SlowCollectTool(PyTool):
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        COLLECTING.set()
+        time.sleep(1.0)
+        return super().collect(request, workspace, run)
+
+
+class SlowCommandTool(PyTool):
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        STAGING.set()
+        time.sleep(0.5)
+        return super().command(request, workspace)
+
+
+class OkCollectTool(PyTool):  # ignores run.status, as a careless connector might
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(status=RunStatus.OK, data={"k": 1})
+
+
+class UnreadFilesTool(PyTool):  # declares out/a.txt and out/b.txt without reading them
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        files = [
+            FileRef(name=name, path=f"out/{name}", sha256="0" * 64, size=0)
+            for name in ("a.txt", "b.txt")
+        ]
+        return ToolOutput(status=run.status, files=files)
 
 
 # --- Task 20 ---

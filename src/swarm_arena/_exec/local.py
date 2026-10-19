@@ -1,68 +1,78 @@
 """Run tool and command jobs on this host, each in its own workspace and process group."""
 
 import contextlib
+import logging
 import os
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Final, cast
 
 import anyio
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
-from swarm_arena._exec import procinfo
+from swarm_arena._exec import procinfo, supervisor
 from swarm_arena._exec.env import build_env
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.pool import ResourcePool
-from swarm_arena._exec.procinfo import group_alive, host_id
+from swarm_arena._exec.procinfo import group_has_live_member, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.plan import Resources
-from swarm_arena._model.ref import config_or_fields
-from swarm_arena._model.tooling import CompletedRun, RunStatus, ToolOutput, ToolRequest
+from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
+from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, ToolRequest
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.materialize import collect_output_files, materialize
-from swarm_arena._tooling.result_file import (
-    command_output_from_result,
-    note_in_log,
-    read_regular_file,
-)
+from swarm_arena._tooling.result_file import command_output_from_result, note_in_log, open_log
 from swarm_arena._tooling.tool import Tool
 
+_LOG: Final = logging.getLogger(__name__)
 _STDOUT: Final = "swarm/stdout.log"
 _STDERR: Final = "swarm/stderr.log"
 _STOPPED: Final = frozenset({RunStatus.TIMEOUT, RunStatus.CANCELLED})
 _PREFIX_UNSAFE: Final = re.compile(r"[^A-Za-z0-9._-]")
 _PREFIX_MAX: Final = 64
+_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+_CHUNK: Final = 1 << 20
+_UNSAFE_ROOT: Final = (
+    "workspace root is not safe: it and every parent directory must be owned by this user "
+    "or root, and not writable by group or others unless sticky (like /tmp)"
+)
+
+
+def _default_root() -> Path:
+    """Return this user's default workspace root, so users of one host never share it."""
+    return Path(tempfile.gettempdir()) / f"swarm-arena-{os.getuid()}"
+
+
+def _only_owner_can_change(info: os.stat_result) -> bool:
+    """Return whether only this user or root can add, rename, or remove a directory's entries."""
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (os.getuid(), 0):
+        return False
+    shared = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    return not shared or bool(info.st_mode & stat.S_ISVTX)
 
 
 def _workspace_root(configured: str | None) -> Path:
     """Create the workspace root if needed; refuse one that another user could change."""
-    if configured is None:
-        root = Path(tempfile.gettempdir()) / "swarm-arena"
-    else:
-        root = Path(configured).expanduser()
+    root = Path(configured).expanduser() if configured is not None else _default_root()
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root = root.resolve(strict=True)
-        info = root.stat()
+        safe = all(_only_owner_can_change(os.stat(path)) for path in (root, *root.parents))
     except OSError:
         raise RuntimeError("cannot create the workspace root") from None
-    owner_ok = info.st_uid in (os.getuid(), 0)
-    others_write = bool(info.st_mode & stat.S_IWOTH) and not info.st_mode & stat.S_ISVTX
-    if not stat.S_ISDIR(info.st_mode) or not owner_ok or others_write:
-        raise RuntimeError(
-            "workspace root must be a directory owned by this user (or root) that other "
-            "users cannot write to, unless it is sticky like /tmp"
-        )
+    if not safe:
+        raise RuntimeError(_UNSAFE_ROOT)
     return root
 
 
@@ -74,69 +84,151 @@ def _open_workspace(configured: str | None, job: Job) -> tuple[Path, ArtifactSto
     return Path(tempfile.mkdtemp(prefix=prefix, dir=root)), artifacts
 
 
+def _open_subdirectory(parent: int, name: str) -> int:
+    """Open a real subdirectory, first giving it back to the owner if the tool locked it."""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except PermissionError:
+        os.chmod(name, 0o700, dir_fd=parent)  # the caller's lstat saw a directory, not a link
+        return os.open(name, _DIR_FLAGS, dir_fd=parent)
+
+
+def _clear_files(directory: int) -> str | None:
+    """Unlink every entry that is not a directory, and return one subdirectory or None."""
+    os.fchmod(directory, 0o700)  # a read-only directory refuses unlink
+    subdirectory: str | None = None
+    for name in os.listdir(directory):
+        if stat.S_ISDIR(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+            subdirectory = subdirectory or name
+        else:
+            os.unlink(name, dir_fd=directory)
+    return subdirectory
+
+
+def _remove_tree(top: Path) -> None:
+    """
+    Remove a tree without recursion, holding at most two descriptors at a time.
+
+    The walk keeps an explicit stack of names and inodes and opens every child
+    from its parent's descriptor, so neither the recursion limit nor PATH_MAX
+    applies, and a symlink is unlinked, never followed. Going back up opens
+    ``..`` and checks that it is the directory the walk came from.
+    """
+    if not stat.S_ISDIR(os.lstat(top).st_mode):
+        os.unlink(top)
+        return
+    fd = os.open(top, _DIR_FLAGS)
+    try:
+        info = os.fstat(fd)
+        stack: list[tuple[str, tuple[int, int]]] = [("", (info.st_dev, info.st_ino))]
+        while True:
+            child = _clear_files(fd)
+            if child is not None:
+                opened = _open_subdirectory(fd, child)
+                os.close(fd)
+                fd = opened
+                info = os.fstat(fd)
+                stack.append((child, (info.st_dev, info.st_ino)))
+                continue
+            if len(stack) == 1:
+                break
+            name, _ = stack.pop()
+            parent = os.open("..", _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = parent
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != stack[-1][1]:
+                raise OSError("workspace tree changed during removal")
+            os.rmdir(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+    os.rmdir(top)
+
+
+_REMOVERS: tuple[Callable[[Path], None], ...] = (shutil.rmtree, _remove_tree)
+
+
 def _remove_workspace(workspace: Path) -> None:
-    """Delete a workspace, also when the tool left read-only directories in it."""
-    try:
-        shutil.rmtree(workspace)
-    except FileNotFoundError:
-        return
-    except OSError:
-        _make_directories_writable(workspace)
-        shutil.rmtree(workspace, ignore_errors=True)
-
-
-def _make_directories_writable(top: Path) -> None:
-    """Give the owner full access to every real directory below ``top``, never via a symlink."""
-    try:
-        if not stat.S_ISDIR(top.lstat().st_mode):
-            top.unlink()
+    """Remove a workspace without ever raising; log a warning for one that is left."""
+    for remove in _REMOVERS:
+        # RecursionError included: on Python 3.11 rmtree recurses once per directory level.
+        with contextlib.suppress(Exception):
+            remove(workspace)
+        if not os.path.lexists(workspace):
             return
-        top.chmod(0o700)
-    except OSError:
-        return
-    for parent, names, _ in os.walk(top):  # top-down: each directory is fixed before entered
-        for name in names:
-            path = os.path.join(parent, name)
-            with contextlib.suppress(OSError):
-                if stat.S_ISDIR(os.lstat(path).st_mode):
-                    os.chmod(path, 0o700)
+    _LOG.warning("could not remove workspace %s", workspace)
 
 
-def _group_running(pgid: int) -> bool:
-    """Report whether a process group has a member that is not a zombie."""
-    if not group_alive(pgid):
-        return False
-    # A killed member that nobody has reaped yet still answers signal 0 (macOS: with
-    # PermissionError), so ask ps for the members' states.
+def _open_regular(workspace: Path, rel: str) -> int:
+    """Open a regular workspace file read-only through pinned directories, never via a link."""
+    parts = PurePosixPath(rel).parts
+    if not parts or rel.startswith("/") or ".." in parts:
+        raise ValueError(f"{rel} is not a regular file")
+    directories: list[int] = []
     try:
-        done = subprocess.run(
-            ["ps", "-A", "-o", "pgid=", "-o", "stat="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.SubprocessError):
-        return True
-    if done.returncode != 0:
-        return True
-    for line in done.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and fields[0] == str(pgid) and not fields[1].startswith("Z"):
-            return True
-    return False
+        try:
+            directories.append(os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK))
+            for part in parts[:-1]:
+                directories.append(
+                    os.open(part, _READ_FLAGS | os.O_DIRECTORY, dir_fd=directories[-1])
+                )
+            fd = os.open(parts[-1], _READ_FLAGS, dir_fd=directories[-1])
+        finally:
+            for directory in directories:
+                os.close(directory)
+    except OSError:
+        raise ValueError(f"{rel} is not a regular file") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"{rel} is not a regular file")
+    return fd
+
+
+def _read_tail(fd: int, size: int, limit: int) -> bytes:
+    """Read the last ``limit`` of ``size`` bytes at most, even if the file grows meanwhile."""
+    offset = max(0, size - limit)
+    remaining = size - offset
+    chunks: list[bytes] = []
+    while remaining > 0:
+        chunk = os.pread(fd, min(remaining, _CHUNK), offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _truncated(rel: str, dropped: int) -> str:
+    """Return the note for a log whose first ``dropped`` bytes are not uploaded."""
+    return f"log truncated: {rel}: dropped the first {dropped} bytes"
+
+
+def _cwd_fault(workspace: Path, rel: str) -> str | None:
+    """Return a note when the command's cwd is not a real directory in the workspace."""
+    directories: list[int] = []
+    try:
+        directories.append(os.open(workspace, _DIR_FLAGS))
+        for part in PurePosixPath(rel).parts:
+            directories.append(os.open(part, _DIR_FLAGS, dir_fd=directories[-1]))
+    except OSError:
+        return f"command cwd {rel} is not a directory in the workspace"
+    finally:
+        for directory in directories:
+            os.close(directory)
+    return None
 
 
 @dataclass(frozen=True)
 class _Staged:
-    """A materialized workspace and the command to run in it."""
+    """A materialized workspace and the command to run in it, or why it cannot run."""
 
     tool: Tool | None
     request: ToolRequest | None
     argv: list[str]
     cwd: Path
     env: dict[str, str]
+    fault: str | None
 
 
 def _stage(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged:
@@ -155,40 +247,39 @@ def _stage(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged:
     if argv[0] == "python":
         argv[0] = command.python or sys.executable
     cwd = workspace / command.cwd if command.cwd is not None else workspace
+    fault = _cwd_fault(workspace, command.cwd) if command.cwd is not None else None
     env = build_env(job, command, workspace=workspace, node_env=os.environ)
-    return _Staged(tool=tool, request=job.request, argv=argv, cwd=cwd, env=env)
-
-
-def _tag_start(job: Job) -> Callable[[Job.Started], Awaitable[None]] | None:
-    """Wrap ``job.on_started`` so the start event carries the job id."""
-    commit = job.on_started
-    if commit is None:
-        return None
-
-    async def on_started(started: Job.Started) -> None:
-        await commit(started.model_copy(update={"job_id": job.id}))
-
-    return on_started
+    return _Staged(tool=tool, request=job.request, argv=argv, cwd=cwd, env=env, fault=fault)
 
 
 class _JobRun:
-    """Supervise one staged job, keep its partial output, and upload its results."""
+    """Supervise one staged job, keep its collected output, and upload its results."""
 
     def __init__(
-        self, job: Job, staged: _Staged, workspace: Path, artifacts: ArtifactStore
+        self,
+        job: Job,
+        staged: _Staged,
+        workspace: Path,
+        artifacts: ArtifactStore,
+        config: "LocalExecutor.Config",
     ) -> None:
         self._job = job
         self._staged = staged
         self._workspace = workspace
         self._artifacts = artifacts
+        self._max_log = config.max_log_bytes
+        self._max_output = config.max_output_bytes
         self._stderr = workspace / _STDERR
-        self._partial: ToolOutput | None = None
-        self._provisional: CompletedRun | None = None
+        self._started = False  # the launcher reached the start handshake
+        self._output: ToolOutput | None = None  # the latest collected output
+        self._collected = False  # the collect after a normal exit finished
+        self._run: CompletedRun | None = None  # what the supervisor returned
+        self._provisional: CompletedRun | None = None  # the run a stop-path collect saw
 
-    async def run(self, supervisor: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput:
-        """Run the job; on cancellation deliver the partial output, then re-raise."""
+    async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput:
+        """Run the job; on a cancel after the start, deliver its output, then re-raise."""
         try:
-            run = await supervisor.run(
+            run = await sup.run(
                 self._staged.argv,
                 cwd=self._staged.cwd,
                 env=self._staged.env,
@@ -197,45 +288,67 @@ class _JobRun:
                 timeout_s=self._job.timeout_s,
                 grace_s=self._job.grace_s,
                 rlimits=rlimits,
-                on_started=_tag_start(self._job),
+                on_started=self._on_started,
                 before_kill=self._before_kill,
             )
+            self._run = run
             if run.status in _STOPPED:  # collect ran (or was given up) in before_kill
-                output = self._partial or await anyio.to_thread.run_sync(
-                    self._without_partial, run.status
-                )
+                output = await anyio.to_thread.run_sync(self._stopped_output, run.status)
             else:
-                collected = await anyio.to_thread.run_sync(
-                    self._collect, run, abandon_on_cancel=True
-                )
-                output = collected or ToolOutput(status=RunStatus.ERROR)
+                self._output = await run_sync_daemon(self._collect, run)
+                self._collected = True
+                output = self._output or ToolOutput(status=RunStatus.ERROR)
             return await anyio.to_thread.run_sync(
                 self._finish, output, (run.started_at, run.ended_at)
             )
         except anyio.get_cancelled_exc_class():
-            with anyio.CancelScope(shield=True):
-                await self._deliver_partial()
+            if self._started:  # a cancel before the start handshake has no output to give
+                with anyio.CancelScope(shield=True):
+                    await self._deliver_partial()
             raise
 
-    async def _deliver_partial(self) -> None:
-        """Finish the cancel-path output and hand it to ``job.on_partial`` (caller shields)."""
-        output = self._partial or await anyio.to_thread.run_sync(
-            self._without_partial, RunStatus.CANCELLED
-        )
-        provisional = self._provisional
-        times = None if provisional is None else (provisional.started_at, provisional.ended_at)
-        # An upload failure must not replace the cancellation; the output goes without logs.
-        with contextlib.suppress(Exception):
-            output = await anyio.to_thread.run_sync(self._finish, output, times)
-        if self._job.on_partial is not None:
-            await self._job.on_partial(output)
+    def fault_output(self, reason: str) -> ToolOutput:
+        """Return an ERROR output for a job that cannot start, with the reason in stderr."""
+        for rel in (_STDOUT, _STDERR):
+            os.close(open_log(self._workspace / rel, truncate=True))
+        note_in_log(self._stderr, reason)
+        return self._finish(ToolOutput(status=RunStatus.ERROR), None)
+
+    async def _on_started(self, started: Job.Started) -> None:
+        """Mark the start, then commit it through ``job.on_started`` with the job id."""
+        self._started = True
+        commit = self._job.on_started
+        if commit is not None:
+            await commit(started.model_copy(update={"job_id": self._job.id}))
 
     async def _before_kill(self, provisional: CompletedRun) -> None:
-        """Collect the partial output in a thread the supervisor's deadline can abandon."""
+        """Collect the partial output in a daemon thread the supervisor can stop waiting on."""
         self._provisional = provisional
-        self._partial = await anyio.to_thread.run_sync(
-            self._collect, provisional, abandon_on_cancel=True
-        )
+        self._output = await run_sync_daemon(self._collect, provisional)
+
+    async def _deliver_partial(self) -> None:
+        """Hand the best output to ``job.on_partial`` after a cancel (the caller shields)."""
+        run = self._run
+        if run is not None and run.status not in _STOPPED and not self._collected:
+            # The tool exited on its own, but the cancel came before its collect ended.
+            cancelled = run.model_copy(update={"status": RunStatus.CANCELLED})
+            self._provisional = cancelled
+            with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S):
+                self._output = await run_sync_daemon(self._collect, cancelled)
+        output = await anyio.to_thread.run_sync(self._stopped_output, RunStatus.CANCELLED)
+        timed = run or self._provisional
+        times = None if timed is None else (timed.started_at, timed.ended_at)
+        try:
+            output = await anyio.to_thread.run_sync(self._finish, output, times)
+        except Exception as exc:  # an upload failure must not replace the cancellation
+            note = f"uploads failed: {type(exc).__name__}"
+            await anyio.to_thread.run_sync(note_in_log, self._stderr, note)
+            update: dict[str, Any] = {"files": []}  # never hand over refs that were not stored
+            if times is not None:
+                update["started_at"], update["ended_at"] = times
+            output = output.model_copy(update=update)
+        if self._job.on_partial is not None:
+            await self._job.on_partial(output)
 
     def _collect(self, run: CompletedRun) -> ToolOutput | None:
         """Collect the output; on an exception note the traceback and return None."""
@@ -247,24 +360,55 @@ class _JobRun:
             note_in_log(run.stderr_path, "collect failed: " + traceback.format_exc())
             return None
 
-    def _without_partial(self, status: RunStatus) -> ToolOutput:
-        """Return an empty output for a stopped run whose collect failed or never ran."""
-        if self._provisional is not None:
-            note_in_log(self._stderr, "no partial output: collect failed or timed out")
-        return ToolOutput(status=status)
+    def _stopped_output(self, status: RunStatus) -> ToolOutput:
+        """Stamp the stop on the kept output: the stop status and ``partial=True``."""
+        if self._output is None:
+            if self._provisional is not None:  # a collect was tried and gave nothing
+                note_in_log(self._stderr, "no partial output: collect failed or timed out")
+            return ToolOutput(status=status)
+        return self._output.model_copy(update={"status": status, "partial": True})
 
     def _read_log(self, rel: str) -> bytes:
-        """Read a log that is a regular file; anything else is uploaded as empty bytes."""
+        """Read the last ``max_log_bytes`` of a regular log; anything else is empty."""
         try:
-            return read_regular_file(self._workspace, rel)
+            fd = _open_regular(self._workspace, rel)
         except ValueError:
             note_in_log(self._stderr, f"{rel} is not a regular file; its log is uploaded empty")
             return b""
+        try:
+            size = os.fstat(fd).st_size
+            if size > self._max_log:
+                dropped = size - self._max_log
+                if rel == _STDERR:  # the note lands in this log and pushes out its own length
+                    for _ in range(3):
+                        line = f"swarm-arena: {_truncated(rel, dropped)}\n"  # note_in_log's form
+                        dropped = size + len(line.encode()) - self._max_log
+                note_in_log(self._stderr, _truncated(rel, dropped))
+                size = os.fstat(fd).st_size
+            return _read_tail(fd, size, self._max_log)
+        finally:
+            os.close(fd)
+
+    def _check_output_sizes(self, files: Sequence[FileRef]) -> None:
+        """Raise ValueError naming the declared output whose size crosses the run's cap."""
+        total = 0
+        for ref in files:
+            try:
+                fd = _open_regular(self._workspace, ref.path)
+            except ValueError:
+                continue  # collect_output_files names what is wrong with it
+            try:
+                total += os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            if total > self._max_output:
+                raise ValueError(f"{ref.path} crosses max_output_bytes")
 
     def _finish(self, output: ToolOutput, times: tuple[datetime, datetime] | None) -> ToolOutput:
-        """Upload declared files and both logs, then set ``logs_ref`` and the run times."""
+        """Upload declared files, then both logs, one at a time; set ``logs_ref`` and times."""
         update: dict[str, Any] = {}
         try:
+            self._check_output_sizes(output.files)
             update["files"] = collect_output_files(
                 self._workspace,
                 [ref.path for ref in output.files],
@@ -286,16 +430,19 @@ class LocalExecutor(Executor):
     """
     Run jobs on this POSIX host, each in a fresh workspace and its own process group.
 
-    For each job, ``submit`` waits for a slot in the resource pool, creates
-    ``<workspace_root>/<job id>-<random>``, stages ``job.stage`` into it, and
-    runs the command through the launcher (``python -I -m swarm_arena._launch``)
-    under a process-group supervisor: the command starts only after
-    ``job.on_started`` returns. A leading ``"python"`` in the command becomes
+    For each job, ``submit`` waits for a slot in the resource pool, creates a
+    workspace ``<workspace_root>/<id>-<random>``, stages ``job.stage`` into it,
+    and runs the command through the launcher (``python -I -m
+    swarm_arena._launch``) under a process-group supervisor: the command starts
+    only after ``job.on_started`` returns. In the workspace name, every
+    character of the job id outside ``[A-Za-z0-9._-]`` becomes ``_``, and the
+    id is cut to 64 characters. A leading ``"python"`` in the command becomes
     ``Command.python`` or ``sys.executable``. The environment is the allowlist
     of ``build_env``; ``Job.timeout_s`` and ``Job.grace_s`` replace the
     command's own values. stdout and stderr go to ``swarm/stdout.log`` and
-    ``swarm/stderr.log`` in the workspace and are uploaded to
-    ``job.artifact_root``; ``logs_ref`` is ``"sha256:<stdout>:<stderr>"``.
+    ``swarm/stderr.log`` in the workspace; the last ``max_log_bytes`` of each
+    are uploaded to ``job.artifact_root``, and ``logs_ref`` is
+    ``"sha256:<stdout>:<stderr>"``.
 
     Construction does no I/O; the pool and the host id are made on the first
     ``submit``.
@@ -314,11 +461,15 @@ class LocalExecutor(Executor):
     neither ``PYTHONPATH`` nor the user site.
 
     On a timeout or a cancel, the group gets SIGTERM, then ``grace_s``, then
-    ``Tool.collect`` for the partial output, then SIGKILL. A collect that blocks
-    is abandoned after ``BEFORE_KILL_TIMEOUT_S`` and is not tried again. The
-    cancel-path output goes to ``job.on_partial``. Every diagnostic is appended
-    to the stderr log only while it is a regular file, so a tool that replaces
-    a log with a FIFO or a symlink cannot stall the executor.
+    ``Tool.collect`` for the partial output, then SIGKILL. A blocked collect
+    delays the SIGKILL by at most ``BEFORE_KILL_TIMEOUT_S`` after the grace
+    period: at that deadline the supervisor kills the group, and the collect is
+    abandoned and not tried again. Collect runs in a daemon thread, so an
+    abandoned one never keeps the interpreter from exiting; it may still write
+    into the workspace, even into a kept workspace after ``submit`` returned.
+    The cancel-path output goes to ``job.on_partial``. Every diagnostic is
+    appended to the stderr log only while it is a regular file, so a tool that
+    replaces a log with a FIFO or a symlink cannot stall the executor.
 
     This is not strong isolation: the tool runs as the same user, with
     resource limits but without a sandbox.
@@ -332,28 +483,43 @@ class LocalExecutor(Executor):
     >>> output = await executor.submit(job)  # doctest: +SKIP
     """
 
-    class Config(BaseModel):
+    class Config(_ConfigInputModel):
         """
-        Configure local concurrency, workspaces, and resource limits.
+        Configure local concurrency, workspaces, resource limits, and upload caps.
+
+        Validation errors name fields and error types but never echo a value.
 
         Parameters
         ----------
         max_concurrent : int or None, default=None
-            Most jobs that run at once; None selects ``os.cpu_count()``.
+            Most jobs that run at once (at least 1); None selects
+            ``os.cpu_count()``.
         workspace_root : str or None, default=None
             Directory that holds the job workspaces; None selects
-            ``tempfile.gettempdir()/swarm-arena``. It must be owned by this
-            user and not writable by other users (unless it is sticky).
+            ``tempfile.gettempdir()/swarm-arena-<uid>``. It and every parent
+            must be owned by this user or root and not writable by group or
+            others unless sticky (like ``/tmp``).
         keep_workspaces : bool, default=False
             Keep each workspace after its job instead of removing it.
         rlimits : bool, default=True
-            Apply resource limits; ``Resources.memory_gib`` becomes the
-            address-space limit.
+            Apply resource limits: a soft open-file limit of 4096, and
+            ``Resources.memory_gib`` as the address-space limit
+            (``RLIMIT_AS``) where the OS enforces it (Linux). macOS refuses
+            ``RLIMIT_AS``, so there the memory limit is not applied and the
+            launcher notes this in the stderr log.
+        max_log_bytes : int, default=8 * 2**20
+            Most bytes uploaded per log. A longer log keeps its last
+            ``max_log_bytes`` (the tail holds the error), with a
+            ``log truncated`` note in the stderr log.
+        max_output_bytes : int, default=256 * 2**20
+            Most bytes of all declared output files of one run. A run that
+            crosses it gets status ERROR and no files, with a note naming the
+            file that crossed it.
 
         Examples
         --------
         >>> from swarm_arena.executor import LocalExecutor
-        >>> LocalExecutor.Config().rlimits
+        >>> LocalExecutor.Config().max_log_bytes == 8 * 2**20
         True
         """
 
@@ -363,6 +529,8 @@ class LocalExecutor(Executor):
         workspace_root: str | None = None
         keep_workspaces: bool = False
         rlimits: bool = True
+        max_log_bytes: Annotated[int, Field(ge=0)] = 8 * 2**20
+        max_output_bytes: Annotated[int, Field(ge=0)] = 256 * 2**20
 
     def __init__(self, config: Config | None = None, /, **fields: Any) -> None:
         """Validate configuration without touching the filesystem or processes."""
@@ -418,7 +586,10 @@ class LocalExecutor(Executor):
 
         Examples
         --------
-        >>> capacity = await LocalExecutor().capacity()  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> anyio.run(LocalExecutor().capacity).cpus >= 1
+        True
         """
         return Resources(cpus=float(os.cpu_count() or 1))
 
@@ -428,7 +599,9 @@ class LocalExecutor(Executor):
 
         Examples
         --------
-        >>> await executor.aclose()  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> anyio.run(LocalExecutor().aclose)
         """
 
     async def submit(self, job: Job) -> ToolOutput:
@@ -438,10 +611,18 @@ class LocalExecutor(Executor):
         A job that exits on its own is collected with ``Tool.collect`` (tool
         jobs) or from its raw ``swarm/result.json`` (command jobs); an exception
         in collect gives status ERROR, with the traceback in the stderr log.
-        After a timeout the partial output collected before SIGKILL is
-        returned. A declared output file that cannot be uploaded gives status
-        ERROR with no files. The workspace is removed unless
-        ``keep_workspaces`` is set.
+        After a timeout, the output collected before SIGKILL is returned with
+        status TIMEOUT and ``partial=True``. On a cancel after the start
+        handshake, ``job.on_partial`` gets the best output there is (status
+        CANCELLED, ``partial=True`` when a collect gave one), also when the tool
+        had already exited and its collect was still running. A command
+        ``cwd`` that is not a directory in the workspace gives status ERROR
+        and the command never starts. A declared output file that is missing,
+        unsafe, or over ``max_output_bytes`` gives status ERROR with no files.
+        Uploaded file references are named after the file's basename, as
+        ``collect_output_files`` makes them. The workspace is removed unless
+        ``keep_workspaces`` is set; a failed removal is logged as a warning and
+        never replaces the output or the cancellation.
 
         Parameters
         ----------
@@ -458,11 +639,18 @@ class LocalExecutor(Executor):
         ------
         ValueError
             If the job needs more CPUs than this host has (before anything
-            starts), or its stage or secrets cannot be read.
+            starts), its stage is invalid, its tool cannot be built, or its
+            secrets file cannot be read.
         RuntimeError
             If the workspace root cannot be created or is not safe.
+        swarm_arena._errors.StorageError
+            If a stage artifact is missing or corrupt (``NotFound``), or the
+            artifact store fails while the logs are uploaded.
+        OSError
+            If the system cannot create the workspace or start the launcher.
         Exception
-            Whatever ``job.on_started`` raises; the command then never runs.
+            Whatever ``job.on_started`` or ``Tool.command`` raises; the command
+            then never runs.
 
         Examples
         --------
@@ -476,16 +664,17 @@ class LocalExecutor(Executor):
                 cpus=float(cpus), max_concurrent=self.config.max_concurrent or cpus
             )
         async with self._pool.slot(job.resources):
-            supervisor = await self._get_supervisor()
+            sup = await self._get_supervisor()
             with anyio.CancelScope(shield=True):  # a cancel here must not lose the directory
                 workspace, artifacts = await anyio.to_thread.run_sync(
                     _open_workspace, self.config.workspace_root, job
                 )
             try:
                 staged = await anyio.to_thread.run_sync(_stage, job, workspace, artifacts)
-                return await _JobRun(job, staged, workspace, artifacts).run(
-                    supervisor, self._rlimits(job)
-                )
+                job_run = _JobRun(job, staged, workspace, artifacts, self.config)
+                if staged.fault is not None:
+                    return await anyio.to_thread.run_sync(job_run.fault_output, staged.fault)
+                return await job_run.run(sup, self._rlimits(job))
             finally:
                 if not self.config.keep_workspaces:
                     with anyio.CancelScope(shield=True):
@@ -496,6 +685,7 @@ class LocalExecutor(Executor):
         Report whether a recorded process group on this host has stopped.
 
         Members that were killed but not yet reaped (zombies) count as dead.
+        When liveness cannot be read, the group counts as alive.
 
         Parameters
         ----------
@@ -517,7 +707,7 @@ class LocalExecutor(Executor):
             return None
         if recorded.endswith(":unknown") or recorded != await self._get_host_id():
             return None
-        return not await anyio.to_thread.run_sync(_group_running, pgid)
+        return not await anyio.to_thread.run_sync(group_has_live_member, pgid)
 
     async def kill_orphan(self, started: Job.Started) -> bool:
         """
@@ -552,11 +742,11 @@ class LocalExecutor(Executor):
 
     async def _get_supervisor(self) -> ProcessSupervisor:
         """Return the one supervisor, made on first use."""
-        supervisor = self._supervisor
-        if supervisor is None:
-            supervisor = ProcessSupervisor(host_id=await self._get_host_id())
-            self._supervisor = supervisor
-        return supervisor
+        sup = self._supervisor
+        if sup is None:
+            sup = ProcessSupervisor(host_id=await self._get_host_id())
+            self._supervisor = sup
+        return sup
 
     def _rlimits(self, job: Job) -> RLimits | None:
         """Return the job's resource limits, or None when they are turned off."""

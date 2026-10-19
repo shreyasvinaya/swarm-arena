@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Tool` ABC and `Action`; the `swarm/result.json` contract.
 - `Plan` and its specs with TOML load and dump, and `Limits` with the §8.1 defaults.
 - `Executor` ABC and `Job` (`swarm_arena.executor`).
-- `LocalExecutor`: process-group supervision, launcher handshake, env allowlist, rlimits, and logs by hash.
+- `LocalExecutor`: process-group supervision, launcher handshake, env allowlist, rlimits, and logs by hash, with capped log and output uploads (`max_log_bytes`, `max_output_bytes`).
 - `Check` and `Judge` ABCs with `CheckContext.execute` and score stamping.
 - `FunctionTool`: a module-level Python function run in a subprocess.
 - `ProgramJudge` and `Lexicographic` judges.

@@ -41,12 +41,29 @@ declared top-level field names or aliases are shown, with deeper locations redac
 ## LocalExecutor
 
 `LocalExecutor` runs each job on this POSIX host in a fresh workspace,
-`<workspace_root>/<job id>-<random>`, and in its own process group. The command
-starts only after `Job.on_started` returns. On a timeout or a cancel, the group
-gets SIGTERM, then `grace_s`, then `collect` for the partial output, then SIGKILL.
-A blocked `collect` cannot delay the kill. The cancel-path output goes to
-`Job.on_partial`. Logs live at `swarm/stdout.log` and `swarm/stderr.log` and are
-uploaded to `artifact_root`, with `logs_ref = "sha256:<stdout>:<stderr>"`.
+`<workspace_root>/<id>-<random>`, and in its own process group. In the name, each
+character of the job id outside `[A-Za-z0-9._-]` becomes `_`, and the id is cut
+to 64 characters. The default `workspace_root` is per user:
+`tempfile.gettempdir()/swarm-arena-<uid>`. The root and every parent directory
+must be owned by you or root, and not writable by group or others unless sticky
+(like `/tmp`). The command starts only after `Job.on_started` returns.
+
+On a timeout or a cancel, the group gets SIGTERM, then `grace_s`, then `collect`
+for the partial output, then SIGKILL. The kept output gets the stop status and
+`partial=True`. A blocked `collect` delays the SIGKILL by at most
+`BEFORE_KILL_TIMEOUT_S` (30 s) after the grace period: at that deadline the
+supervisor kills the group, and the collect is abandoned and not tried again.
+Collect runs in a daemon thread, so an abandoned one never keeps the interpreter
+from exiting. It may still write into the workspace after `submit` returned.
+
+The cancel-path output goes to `Job.on_partial`, once the start handshake was
+reached. This includes a cancel that comes after the tool exited on its own: if
+its collect had not finished, it runs once more, bounded by
+`BEFORE_KILL_TIMEOUT_S`. Logs live at `swarm/stdout.log` and `swarm/stderr.log`.
+The last `max_log_bytes` (8 MiB) of each are uploaded to `artifact_root`, with
+`logs_ref = "sha256:<stdout>:<stderr>"`, and a `log truncated` note in the
+stderr log. If the declared output files of a run are more than
+`max_output_bytes` (256 MiB) in total, the run gets status `error` and no files.
 
 ```python
 from swarm_arena.executor import LocalExecutor
