@@ -107,3 +107,23 @@ def test_limits_errors_do_not_leak_values() -> None:
         Limits.model_validate({"max_rounds": secret})
     assert secret not in "".join(traceback.format_exception(exc.value))
     assert secret not in str(exc.value.errors())
+
+
+@pytest.mark.parametrize(
+    ("values", "location"),
+    [
+        ({"max_roundz": "sentinel-secret-92845"}, "max_roundz"),
+        (
+            {"default_run_reservation": {"tokenz": "sentinel-secret-92845"}},
+            "default_run_reservation.tokenz",
+        ),
+    ],
+)
+def test_limits_unknown_fields_show_identifiers_without_values(
+    values: dict[str, Any], location: str
+) -> None:
+    with pytest.raises(ValidationError) as exc:
+        Limits.model_validate(values)
+    assert location in str(exc.value)
+    assert "sentinel-secret-92845" not in "".join(traceback.format_exception(exc.value))
+    assert "sentinel-secret-92845" not in str(exc.value.errors())

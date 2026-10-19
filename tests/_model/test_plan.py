@@ -153,8 +153,7 @@ def test_load_errors_name_the_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"a\.toml"):
         Plan.load(tmp_path / "a.toml")
     (tmp_path / "b.toml").write_text("teamz = 1\n" + SPEC_TOML)
-    # Unknown field names are input-derived, so the controller ruling redacts them.
-    with pytest.raises(ConfigError, match=r"(?s)b\.toml.*<key>.*extra_forbidden"):
+    with pytest.raises(ConfigError, match=r"(?s)b\.toml.*teamz"):
         Plan.load(tmp_path / "b.toml")
 
 
@@ -165,7 +164,7 @@ def test_ranking_name() -> None:
     assert plan_with(judges=two, ranking="a").ranking_name() == "a"
     with pytest.raises(ValueError, match="several judges"):
         plan_with(judges=two).ranking_name()
-    with pytest.raises(ValueError, match="ranking"):
+    with pytest.raises(ValueError, match="zz"):
         plan_with(judges=two, ranking="zz").ranking_name()
     with pytest.raises(ValueError, match="duplicate"):
         plan_with(judges=[two[0], two[0]], ranking="a").ranking_name()
@@ -194,6 +193,31 @@ def test_structure_rules() -> None:
         len(plan_with(teams=[*TEAMS, TeamSpec(name="t2", rationale="r", agents=[AGENT])]).teams)
         == 2
     )
+
+
+@pytest.mark.parametrize("mode", ["team", "select"])
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"agents": [AGENT, AGENT]}, "duplicate agent"),
+        ({"name": "t"}, "duplicate team"),
+        ({"part": "missing"}, "unknown part"),
+        ({"rationale": "  "}, "rationale"),
+        ({"agents": [AGENT.model_dump() | {"rationale": "  "}]}, "rationale"),
+        ({"name": "a/b"}, "name"),
+    ],
+)
+def test_converge_team_structure(mode: str, updates: dict[str, Any], message: str) -> None:
+    team = TEAMS[0].model_dump() | {"name": "converger"} | updates
+    with pytest.raises(ValidationError, match=message):
+        plan_with(converge={"mode": mode, "team": team})
+
+
+def test_converge_team_accepts_declared_part_and_scoped_agent_name() -> None:
+    team = TeamSpec(name="converger", rationale="r", part="p", agents=[AGENT])
+    plan = plan_with(parts=[PartSpec(name="p", goal=GOAL)], converge=ConvergeSpec(team=team))
+    assert plan.converge.team == team
+    assert plan.teams == TEAMS
 
 
 @pytest.mark.parametrize("name", ["a/b", "A", "", "../a", "a b"])
@@ -279,7 +303,7 @@ SECRET = "sentinel-secret-92845"
     "text",
     [
         f'origin = "{SECRET}"\n' + SPEC_TOML,
-        f'"{SECRET}" = 1\n' + SPEC_TOML,
+        f'teamz = "{SECRET}"\n' + SPEC_TOML,
         SPEC_TOML.replace('name = "fd-solver"', f'name = "{SECRET}/bad"'),
         SPEC_TOML + f'\n[goal.files.manifest]\n"{SECRET}" = "bad"\n',
         SPEC_TOML.replace(
@@ -308,10 +332,63 @@ def test_validation_locations_keep_only_schema_fields(tmp_path: Path) -> None:
         Plan.loads(text, base_dir=tmp_path)
 
 
-def test_ranking_errors_do_not_leak_values() -> None:
-    for judges, ranking in ((JUDGES, SECRET), ([Ref(path="m:J", name=SECRET)] * 2, SECRET)):
-        with pytest.raises(ValueError, match=r"ranking|duplicate") as exc:
-            plan_with(judges=judges, ranking=ranking).ranking_name()
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_ranking_errors_show_identifiers_without_config_values(duplicate: bool) -> None:
+    judge = Ref(path="m:J", name="judge-id", config={"token": SECRET})
+    judges = [judge, judge] if duplicate else [judge]
+    identifier = "judge-id" if duplicate else "unknown-ranking"
+    with pytest.raises(ValueError, match=identifier) as exc:
+        plan_with(judges=judges, ranking="unknown-ranking").ranking_name()
+    assert SECRET not in "".join(traceback.format_exception(exc.value))
+
+
+def test_ranking_resolution_errors_do_not_leak_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_name(self: Ref) -> str:
+        raise ValueError(SECRET)
+
+    monkeypatch.setattr(Ref, "component_name", fail_name)
+    with pytest.raises(ValueError, match="judges") as exc:
+        plan_with().ranking_name()
+    assert SECRET not in "".join(traceback.format_exception(exc.value))
+
+
+@pytest.mark.parametrize(
+    ("table", "key", "location"),
+    [
+        ("", "teamz", "teamz"),
+        ("teams", "agentz", "teams.0.agentz"),
+        ("teams.agents", "replicatez", "teams.0.agents.0.replicatez"),
+        ("teams.agents.resources", "cpuz", "teams.0.agents.0.resources.cpuz"),
+    ],
+)
+def test_unknown_plan_fields_show_identifiers_without_values(
+    tmp_path: Path, table: str, key: str, location: str
+) -> None:
+    data = plan_with().model_dump()
+    target = data
+    for segment in table.split(".") if table else []:
+        target = target[segment]
+        if isinstance(target, list):
+            target = target[0]
+    target[key] = SECRET
+    with pytest.raises(ValidationError) as exc:
+        Plan.model_validate(data)
+    assert location in str(exc.value)
+    assert SECRET not in "".join(traceback.format_exception(exc.value))
+    assert SECRET not in str(exc.value.errors())
+    text = (
+        f'{key} = "{SECRET}"\n' + SPEC_TOML
+        if not table
+        else SPEC_TOML + (f'\n[{table}]\n{key} = "{SECRET}"\n')
+    )
+    if table in ("teams", "teams.agents"):
+        text = SPEC_TOML.replace(f"[[{table}]]", f'[[{table}]]\n{key} = "{SECRET}"')
+    path = tmp_path / "typo.toml"
+    path.write_text(text)
+    for load in (lambda: Plan.load(path), lambda: Plan.loads(text, base_dir=tmp_path)):
+        with pytest.raises(ConfigError) as exc:
+            load()
+        assert location in str(exc.value)
         assert SECRET not in "".join(traceback.format_exception(exc.value))
 
 
@@ -319,7 +396,11 @@ def test_roundtrip_all_nested_specs() -> None:
     plan = plan_with(
         parts=[PartSpec(name="p", goal=GOAL, checks=[], judges=JUDGES, ranking="rel-error")],
         rounds=[RoundSpec(tool_overrides={"epochs": 10}, tool_timeout_s=5)],
-        converge=ConvergeSpec(mode="team", team=TEAMS[0], round=RoundSpec(fidelity="full")),
+        converge=ConvergeSpec(
+            mode="team",
+            team=TEAMS[0].model_copy(update={"name": "converger"}),
+            round=RoundSpec(fidelity="full"),
+        ),
         revision=2,
         parent_revision=1,
     )
@@ -345,7 +426,7 @@ def test_models_frozen_and_extra_forbidden() -> None:
         (AgentSpec, AGENT.model_dump() | {"name": SECRET + "/bad"}),
         (TeamSpec, {"name": "t", "rationale": SECRET, "agents": [{"name": SECRET + "/bad"}]}),
         (PartSpec, {"name": "p", "goal": {"id": SECRET + "/bad", "namespace": "n"}}),
-        (FlowSpec, {"sender": "a", "recipient": "*", "rationale": "r", SECRET: 1}),
+        (FlowSpec, {"sender": "a", "recipient": "*", "rationale": "r", "typo": SECRET}),
         (Plan, {"goal": GOAL, "teams": TEAMS, "judges": JUDGES, "origin": SECRET}),
         (
             Plan,

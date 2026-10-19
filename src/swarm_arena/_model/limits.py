@@ -23,11 +23,13 @@ class _SafeModel(FrozenModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
 
-def _safe_location(model: type[BaseModel], loc: tuple[str | int, ...]) -> tuple[str | int, ...]:
-    """Keep schema fields and list indices while redacting input-derived keys."""
+def _safe_location(
+    model: type[BaseModel], loc: tuple[str | int, ...], *, extra_field: bool = False
+) -> tuple[str | int, ...]:
+    """Keep model field identifiers and list indices, redacting arbitrary mapping keys."""
     annotation: Any = model
     parts: list[str | int] = []
-    for segment in loc:
+    for index, segment in enumerate(loc):
         while get_origin(annotation) in (Annotated, Union, UnionType):
             annotation = next(arg for arg in get_args(annotation) if arg is not type(None))
         origin = get_origin(annotation)
@@ -43,6 +45,10 @@ def _safe_location(model: type[BaseModel], loc: tuple[str | int, ...]) -> tuple[
             if field is not None:
                 parts.append(segment)
                 annotation = field.annotation
+                continue
+            if extra_field and index == len(loc) - 1 and isinstance(segment, str):
+                # Unknown model fields are typo identifiers, not their rejected values.
+                parts.append(segment)
                 continue
         elif origin is list and isinstance(segment, int):
             parts.append(segment)
@@ -73,7 +79,7 @@ _STRUCTURAL_REASONS: frozenset[LiteralString] = frozenset(
 def _sanitize_validation(
     cls: type[BaseModel], data: Any, handler: ModelWrapValidatorHandler[Any]
 ) -> Any:
-    """Rebuild errors with schema-only locations and no input or context values."""
+    """Rebuild errors with field identifiers and no input or context values."""
     try:
         return handler(data)
     except ValidationError as err:
@@ -84,7 +90,7 @@ def _sanitize_validation(
             errors.append(
                 InitErrorDetails(
                     type=PydanticCustomError(code, reason),
-                    loc=_safe_location(cls, item["loc"]),
+                    loc=_safe_location(cls, item["loc"], extra_field=code == "extra_forbidden"),
                     input=None,
                 )
             )

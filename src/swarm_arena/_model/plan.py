@@ -305,7 +305,8 @@ class Plan(StoredModel, _SafeModel):
     rounds : list[RoundSpec], default=[]
         Explicit rounds, or empty to use the limit's default round count.
     converge : ConvergeSpec, default=ConvergeSpec()
-        Final selection or convergence settings.
+        Final selection or convergence settings. Its team follows the same
+        structure rules and must have a name distinct from every regular team.
     sharing : {"round"}, default="round"
         Timing of shared information between agents.
     flows : list[FlowSpec], default=[]
@@ -353,10 +354,13 @@ class Plan(StoredModel, _SafeModel):
             raise ValueError("Plan.flows is reserved for v2 messaging and must be empty")
         if len({part.name for part in self.parts}) != len(self.parts):
             raise ValueError("duplicate part names")
-        if len({team.name for team in self.teams}) != len(self.teams):
+        teams = [*self.teams]
+        if self.converge.team is not None:
+            teams.append(self.converge.team)
+        if len({team.name for team in teams}) != len(teams):
             raise ValueError("duplicate team names")
         parts = {part.name for part in self.parts}
-        for team in self.teams:
+        for team in teams:
             if len({agent.name for agent in team.agents}) != len(team.agents):
                 raise ValueError("duplicate agent names within a team")
             if team.part is not None and team.part not in parts:
@@ -396,7 +400,8 @@ class Plan(StoredModel, _SafeModel):
         Raises
         ------
         ConfigError
-            If TOML parsing or plan validation fails; includes the file path.
+            If TOML parsing or plan validation fails; includes the file path and
+            invalid field identifiers, but omits rejected values.
         OSError
             If the plan file cannot be read.
 
@@ -437,7 +442,8 @@ class Plan(StoredModel, _SafeModel):
         Raises
         ------
         ConfigError
-            If TOML parsing or plan validation fails.
+            If TOML parsing or plan validation fails. Unknown field identifiers
+            are included; rejected values and arbitrary mapping keys are omitted.
 
         Examples
         --------
@@ -504,7 +510,8 @@ class Plan(StoredModel, _SafeModel):
         ------
         ValueError
             If judges have invalid or duplicate names, the ranking is unknown,
-            or no unique ranking judge can be selected.
+            or no unique ranking judge can be selected. Duplicate and unknown
+            names are included without exposing component configuration values.
 
         Examples
         --------
@@ -514,9 +521,12 @@ class Plan(StoredModel, _SafeModel):
         'score'
         """
         try:
-            names = unique_names(self.judges)
+            judges = [ref.model_copy(update={"name": ref.component_name()}) for ref in self.judges]
         except (ValueError, TypeError):
-            raise ValueError("judges: invalid or duplicate component names") from None
+            raise ValueError("judges: invalid component names") from None
+        # Name resolution can raise unsafe import errors; uniqueness errors contain
+        # only the already-resolved identifiers and may retain their diagnostics.
+        names = unique_names(judges)
         if not self.ranking:
             if len(names) == 1:
                 return names[0]
@@ -524,7 +534,7 @@ class Plan(StoredModel, _SafeModel):
                 raise ValueError("ranking is required with several judges")
             raise ValueError("judges: no ranking judge available")
         if self.ranking not in names:
-            raise ValueError("ranking does not name a declared judge")
+            raise ValueError(f"ranking {self.ranking!r} does not name a declared judge")
         return self.ranking
 
     def rounds_total(self, limits: Limits) -> int:
