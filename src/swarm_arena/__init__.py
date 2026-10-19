@@ -20,36 +20,32 @@ from swarm_arena._model.plan import (
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._scoring.program_judge import ProgramJudge  # Task 21
-from swarm_arena._scoring.script_check import ScriptCheck  # Task 22
-from swarm_arena._scoring.script_judge import ScriptJudge  # Task 22
-from swarm_arena._tooling.function_tool import FunctionTool  # Task 18
+from swarm_arena._scoring.program_judge import ProgramJudge
+from swarm_arena._scoring.script_check import ScriptCheck
+from swarm_arena._scoring.script_judge import ScriptJudge
+from swarm_arena._tooling.function_tool import FunctionTool
 from swarm_arena._tooling.script_tool import ScriptTool
 from swarm_arena._version import __version__ as __version__
 
 __all__: list[str] = [
     "AgentSpec",
     "ConvergeSpec",
+    "FunctionTool",
     "Goal",
     "Limits",
     "PartSpec",
     "Plan",
+    "ProgramJudge",
     "Ref",
     "Resources",
     "RoundSpec",
     "RunConfig",
     "Score",
+    "ScriptCheck",
+    "ScriptJudge",
     "ScriptTool",
     "TeamSpec",
 ]
-
-# --- Task 18 ---
-__all__ += ["FunctionTool"]
-
-# --- Task 21 ---
-__all__ += ["ProgramJudge"]
-# --- Task 22 ---
-__all__ += ["ScriptCheck", "ScriptJudge"]
 
 _publish(__name__, __all__)
 
