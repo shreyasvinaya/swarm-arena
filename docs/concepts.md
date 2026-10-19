@@ -105,8 +105,11 @@ host:
   the `SWARM_ARENA_*` identity variables, and `SWARM_ARENA_RESULT`. Nothing
   else leaks in from the driver.
 
-Logs and output files are uploaded by their SHA-256. A `LocalExecutor` applies
-resource limits, but it is not a sandbox: the tool runs as the same user.
+Logs and output files are uploaded by their SHA-256. Each log keeps at most its
+last 8 MiB (`max_log_bytes`), and the output files of one run can hold at most
+256 MiB together (`max_output_bytes`); a run that crosses it gets status
+`error`. A `LocalExecutor` applies resource limits, but it is not a sandbox:
+the tool runs as the same user.
 
 ## Artifact storage
 

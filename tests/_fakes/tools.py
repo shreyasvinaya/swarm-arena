@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import secrets
@@ -6,7 +7,7 @@ import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -28,7 +29,7 @@ from swarm_arena._model.tooling import (
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._tooling.result_file import tool_output_from_result
-from swarm_arena._tooling.tool import Tool
+from swarm_arena._tooling.tool import Action, Tool
 
 # --- Task 5 ---
 
@@ -433,8 +434,15 @@ class EmptyFingerprintTool(PyTool):
         return ""
 
 
+async def _no_action(context: Any, inputs: PyInputs) -> int:
+    return inputs.n
+
+
+_ACTION = Action(name="same", description="An action.", input_model=PyInputs, handler=_no_action)
+
+
 class BrokenTool(Tool):
-    """Runs Python code; the method named by ``broken`` breaks the Tool contract."""
+    """Runs Python code; the contract named by ``broken`` is broken."""
 
     name = "broken"
     description = "Runs Python code."
@@ -449,14 +457,25 @@ class BrokenTool(Tool):
     def config(self) -> Config:
         return cast(BrokenTool.Config, super().config)
 
+    def _breaks(self, method: str) -> bool:
+        return self.config.broken == method
+
+    def preflight(self) -> None:
+        if self._breaks("preflight"):
+            raise RuntimeError("preflight refused the tool")
+
     def command(self, request: ToolRequest, workspace: Path) -> Command:
         return Command(argv=["python", "-c", self.config.code])
 
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
-        return tool_output_from_result(workspace, run)
-
-    def _breaks(self, method: str) -> bool:
-        return self.config.broken == method
+        if self._breaks("collect_ok"):  # ignores run.status
+            return ToolOutput(status=RunStatus.OK, data={})
+        output = tool_output_from_result(workspace, run)
+        if self._breaks("collect_nan"):  # model_copy skips the finite-data validator
+            return output.model_copy(update={"data": {"x": math.nan}})
+        if self._breaks("collect_construct"):
+            return ToolOutput.model_construct(status=run.status, data={"x": math.inf})
+        return output
 
     def get_input_model(self) -> type[BaseModel]:
         return cast(Any, dict) if self._breaks("get_input_model") else super().get_input_model()
@@ -465,13 +484,30 @@ class BrokenTool(Tool):
         return cast(Any, None) if self._breaks("get_description") else super().get_description()
 
     def editable(self) -> Sequence[str]:
-        return cast(Any, [1]) if self._breaks("editable") else super().editable()
+        if self._breaks("editable"):
+            return cast(Any, [1])
+        if self._breaks("editable_str"):
+            return "problem/*"
+        if self._breaks("editable_dict"):
+            return cast(Any, {"problem/*": True})
+        return super().editable()
 
     def providers(self) -> frozenset[str]:
         return cast(Any, {"openai"}) if self._breaks("providers") else super().providers()
 
+    def extra_actions(self) -> Sequence[Action[Any]]:
+        if self._breaks("extra_actions"):
+            return cast(Any, [42])
+        if self._breaks("extra_actions_names"):
+            return (_ACTION, _ACTION)
+        return super().extra_actions()
+
     def fingerprint(self, output: ToolOutput) -> str:
-        return secrets.token_hex(8) if self._breaks("fingerprint") else super().fingerprint(output)
+        if self._breaks("fingerprint"):
+            return secrets.token_hex(8)
+        if self._breaks("fingerprint_run"):  # includes logs_ref and the run times
+            return hashlib.sha256(output.model_dump_json().encode()).hexdigest()
+        return super().fingerprint(output)
 
     def is_deterministic(self, request: ToolRequest) -> bool:
         broken = self._breaks("is_deterministic")
@@ -498,21 +534,58 @@ class BrokenJudge(Judge):
 
     class Config(BaseModel):
         model_config = ConfigDict(extra="forbid", frozen=True)
-        mode: Literal["duplicate", "nan", "not_score"]
+        mode: str
 
     @property
     def config(self) -> Config:
         return cast(BrokenJudge.Config, super().config)
 
+    def preflight(self) -> None:
+        if self.config.mode == "preflight":
+            raise RuntimeError("preflight refused the judge")
+
+    def rubric_hash(self) -> str:
+        mode = self.config.mode
+        if mode == "rubric_unstable":
+            return secrets.token_hex(32)
+        if mode == "rubric_per_instance":  # stable for one object, new for a second build
+            return f"{id(self):x}"
+        if mode == "rubric_type":
+            return cast(Any, 123)
+        if mode == "rubric_empty":
+            return ""
+        return super().rubric_hash()
+
+    def panel_hash(self) -> str:
+        return cast(Any, None) if self.config.mode == "panel_type" else super().panel_hash()
+
+    def anchor_count(self) -> int:
+        return cast(Any, True) if self.config.mode == "anchor_count" else super().anchor_count()
+
+    def providers(self) -> frozenset[str]:
+        return cast(Any, ["openai"]) if self.config.mode == "providers" else super().providers()
+
+    def models(self) -> tuple[str, ...]:
+        return cast(Any, "gpt") if self.config.mode == "models" else super().models()
+
     async def judge(
         self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
     ) -> list[Score]:
-        if self.config.mode == "not_score":
+        mode = self.config.mode
+        if mode == "not_score":
             return cast(Any, [1.0])
-        if self.config.mode == "nan":  # model_construct skips the Score validator
+        if mode == "nan":  # model_construct skips the Score validator
             return [Score.model_construct(key=(math.nan,), candidate_id=c.id) for c in candidates]
+        if mode == "invalid_score":
+            return [
+                Score.model_construct(key=(1.0,), candidate_id=c.id, notes=cast(Any, 5))
+                for c in candidates
+            ]
+        if mode == "drop":  # neither a score nor a judge error
+            return []
         one = Score.maximize(1.0)
-        return [one.model_copy(update={"candidate_id": c.id}) for c in candidates for _ in "ab"]
+        copies = "ab" if mode == "duplicate" else "a"
+        return [one.model_copy(update={"candidate_id": c.id}) for c in candidates for _ in copies]
 
 
 class BadFeedbackCheck(AlwaysPass):
@@ -522,3 +595,30 @@ class BadFeedbackCheck(AlwaysPass):
 class NotACheckResult(AlwaysPass):
     async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
         return cast(Any, {"passed": True})
+
+
+class InvalidCheckResult(AlwaysPass):
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult.model_construct(
+            check=self.name, passed=cast(Any, "no"), reasons=cast(Any, "oops")
+        )
+
+
+class PreflightFailsCheck(AlwaysPass):
+    def preflight(self) -> None:
+        raise RuntimeError("preflight refused the check")
+
+
+class GoalCheck(Check):
+    """Pass and report the goal that the kit gave the check."""
+
+    name = "goal-check"
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        goal = ctx.goal
+        details = {"goal": f"{goal.namespace}/{goal.id}", "files": sorted(goal.files.manifest)}
+        return CheckResult(check=self.name, passed=True, details=details)
+
+
+def manifest_size(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(len(goal.files.manifest))

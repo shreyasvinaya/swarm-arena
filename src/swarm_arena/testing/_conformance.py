@@ -9,6 +9,7 @@ import threading
 import warnings
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Final, TypeVar
@@ -19,13 +20,14 @@ from pydantic import BaseModel
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._model.base import _sanitize_validation_error
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
-from swarm_arena._model.tooling import Estimate, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import CompletedRun, Estimate, RunStatus, ToolOutput, ToolRequest
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score, stamp_scores
 from swarm_arena._store.artifacts import ArtifactStore
@@ -40,11 +42,12 @@ from swarm_arena._tooling.staging import (
     tool_identity,
     validate_edits,
 )
-from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
+from swarm_arena._tooling.tool import Action, Tool, effective_tool_timeout, tool_grace
 
 _DEFAULT_GOAL: Final = Goal(id="check", namespace="testing")
 _IDS: Final = IdGen("local", 0)
 _ROOT_LOCK: Final = threading.Lock()
+_LOG_TAIL_BYTES: Final = 2048
 _root: str | None = None
 
 _C = TypeVar("_C", Tool, Check, Judge)
@@ -87,17 +90,82 @@ def _build(component: _C | Ref, base: type[_C], goal: Goal | None) -> tuple[Ref,
     return ref, built, goal.model_copy(update={"files": files})
 
 
+class _Watched(Executor):
+    """Pass jobs to another executor and keep every output, to report failed runs."""
+
+    def __init__(self, inner: Executor) -> None:
+        super().__init__()
+        self._inner = inner
+        self.outputs: list[tuple[str, object]] = []
+
+    async def submit(self, job: Job) -> ToolOutput:
+        """Submit the job to the wrapped executor and keep its output."""
+        out = await self._inner.submit(job)
+        self.outputs.append((job.id, out))
+        return out
+
+    async def capacity(self) -> Resources | None:
+        """Return the wrapped executor's capacity."""
+        return await self._inner.capacity()
+
+    async def aclose(self) -> None:
+        """Leave closing to the owner of the wrapped executor."""
+
+    async def confirm_dead(self, started: Job.Started) -> bool | None:
+        """Ask the wrapped executor whether a recorded job has stopped."""
+        return await self._inner.confirm_dead(started)
+
+    async def kill_orphan(self, started: Job.Started) -> bool:
+        """Ask the wrapped executor to stop an orphan."""
+        return await self._inner.kill_orphan(started)
+
+
 @contextlib.asynccontextmanager
-async def _executor(executor: Executor | None) -> AsyncGenerator[Executor, None]:
-    """Yield the caller's executor, or a new LocalExecutor that is closed afterwards."""
+async def _executor(executor: Executor | None) -> AsyncGenerator[_Watched, None]:
+    """Wrap the caller's executor, or a new LocalExecutor that is closed afterwards."""
     if executor is not None:
-        yield executor
+        yield _Watched(executor)
         return
     owned = LocalExecutor()
     try:
-        yield owned
+        yield _Watched(owned)
     finally:
         await owned.aclose()
+
+
+def _stderr_tail(out: ToolOutput) -> str:
+    """Read the last bytes of a run's stderr log from this process's artifact store."""
+    parts = (out.logs_ref or "").split(":")
+    if len(parts) != 3 or parts[0] != "sha256":
+        return "(no stderr log)"
+    try:
+        data = _artifacts().get_bytes(parts[2])
+    except Exception:
+        return "(the stderr log cannot be read)"
+    return data[-_LOG_TAIL_BYTES:].decode(errors="replace")
+
+
+def _failed_runs(outputs: Sequence[tuple[str, object]]) -> list[str]:
+    """Describe each run with status error and the end of its log (the tool's own text)."""
+    return [
+        f"run {job_id} ended with status error; the end of its stderr log:\n{_stderr_tail(out)}"
+        for job_id, out in outputs
+        if isinstance(out, ToolOutput) and getattr(out, "status", None) == RunStatus.ERROR
+    ]
+
+
+def _is_sequence_of(value: object, kind: type) -> bool:
+    """Return whether a value is a non-str sequence whose items are all ``kind``."""
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, str)
+        and all(isinstance(item, kind) for item in value)
+    )
+
+
+def _is_set_of_str(value: object) -> bool:
+    """Return whether a value is a frozenset of str."""
+    return isinstance(value, frozenset) and all(isinstance(item, str) for item in value)
 
 
 def _check_tool_methods(tool: Tool) -> None:
@@ -107,12 +175,13 @@ def _check_tool_methods(tool: Tool) -> None:
         raise _fail("Tool.get_input_model() must return a pydantic BaseModel subclass")
     if not isinstance(tool.get_description(), str):
         raise _fail("Tool.get_description() must return a str")
-    globs = tool.editable()
-    if isinstance(globs, str) or not all(isinstance(glob, str) for glob in globs):
+    if not _is_sequence_of(tool.editable(), str):
         raise _fail("Tool.editable() must return a sequence of str globs")
-    providers = tool.providers()
-    if not (isinstance(providers, frozenset) and all(isinstance(p, str) for p in providers)):
+    if not _is_set_of_str(tool.providers()):
         raise _fail("Tool.providers() must return a frozenset of str")
+    actions = tool.extra_actions()
+    if not _is_sequence_of(actions, Action) or len({a.name for a in actions}) != len(actions):
+        raise _fail("Tool.extra_actions() must return a sequence of Action with unique names")
 
 
 @dataclass(frozen=True)
@@ -138,8 +207,13 @@ def _plan_tool(
     """Build the tool and plan its stage with the core's edit and overlay rules."""
     ref, built, goal = _build(tool, Tool, goal)
     _check_tool_methods(built)
+    model = built.get_input_model()
+    try:
+        params = model.model_validate(inputs).model_dump(mode="json")
+    except Exception as error:  # a connector's own model can show input values
+        raise _sanitize_validation_error(model, error) from None
     request = ToolRequest(
-        inputs=built.get_input_model().model_validate(inputs).model_dump(mode="json"),
+        inputs=params,
         parents=[parent_ref(parent) for parent in parents],
         edits=dict(edits or {}),
     )
@@ -168,10 +242,42 @@ def _plan_tool(
     return _ToolPlan(ref, built, goal, request, stage, notes)
 
 
+def _probe_collect(tool: Tool, request: ToolRequest) -> None:
+    """Assert that collect() keeps a failure: run it on an empty workspace after exit 1."""
+    with tempfile.TemporaryDirectory(prefix="swarm-arena-probe-") as directory:
+        workspace = Path(directory)
+        (workspace / "swarm").mkdir()
+        stdout, stderr = workspace / "swarm/stdout.log", workspace / "swarm/stderr.log"
+        stdout.touch()
+        stderr.touch()
+        now = datetime.now(UTC)
+        run = CompletedRun(
+            returncode=1,
+            status=RunStatus.ERROR,
+            stdout_path=stdout,
+            stderr_path=stderr,
+            started_at=now,
+            ended_at=now,
+        )
+        try:
+            out = tool.collect(request, workspace, run)
+        except Exception:  # a raise is a valid failure: the executor gives status error
+            return
+    if not isinstance(out, ToolOutput):
+        raise _fail("Tool.collect() must return a ToolOutput")
+    if getattr(out, "status", None) == RunStatus.OK:
+        raise _fail("Tool.collect() must not report ok for a failed run")
+
+
 def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOutput:
     """Assert the executor's output and the Tool methods that read an output."""
     if not isinstance(out, ToolOutput):
         raise _fail("Executor.submit() must return a ToolOutput")
+    try:  # model_copy and model_construct skip validation, for example of finite data
+        ToolOutput.model_validate(out.model_dump(warnings=False))
+    except Exception:
+        message = "Tool.collect() must return a valid ToolOutput (data must be finite JSON)"
+        raise _fail(message) from None
     store = open_store(_artifact_root())
     for file in out.files:
         if not store.exists(file.sha256):
@@ -181,12 +287,35 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
         raise _fail("Tool.fingerprint() must return a nonempty str")
     if tool.fingerprint(out) != fingerprint:
         raise _fail("Tool.fingerprint() must return the same str for the same output")
+    rerun = out.model_copy(update={"logs_ref": None, "started_at": None, "ended_at": None})
+    if tool.fingerprint(rerun) != fingerprint:
+        raise _fail("Tool.fingerprint() must not depend on logs_ref or the run times")
     if not isinstance(tool.is_deterministic(request), bool):
         raise _fail("Tool.is_deterministic() must return a bool")
     estimate = tool.estimate(request)
     if not (estimate is None or isinstance(estimate, Estimate)):
         raise _fail("Tool.estimate() must return None or an Estimate")
+    _probe_collect(tool, request)
     return out
+
+
+def _check_judge_methods(ref: Ref, judge: Judge) -> None:
+    """Assert a stable judge identity and the types of the optional Judge methods."""
+    rubric = judge.rubric_hash()
+    same = rubric == judge.rubric_hash() == ref.build(Judge).rubric_hash()
+    if not (isinstance(rubric, str) and rubric and same):
+        raise _fail("Judge.rubric_hash() must return the same nonempty str")
+    panel = judge.panel_hash()
+    if not (isinstance(panel, str) and judge.panel_hash() == panel):
+        raise _fail("Judge.panel_hash() must return the same str")
+    anchors = judge.anchor_count()
+    if not (isinstance(anchors, int) and not isinstance(anchors, bool) and anchors >= 0):
+        raise _fail("Judge.anchor_count() must return an int >= 0")
+    if not _is_set_of_str(judge.providers()):
+        raise _fail("Judge.providers() must return a frozenset of str")
+    models = judge.models()
+    if not (isinstance(models, tuple) and all(isinstance(model, str) for model in models)):
+        raise _fail("Judge.models() must return a tuple of str")
 
 
 async def check_tool(
@@ -210,7 +339,14 @@ async def check_tool(
     identity and every overlay path is editable. A refused overlay gives a
     ``UserWarning``, as the core gives a soft warning. The job runs on
     ``executor`` with the run identity ``local`` and the goal's id in its
-    environment.
+    environment. A run that ends with status ``error`` gives a ``UserWarning``
+    with the last 2 KB of its stderr log.
+
+    After the run, the output must be a valid ``ToolOutput`` (finite JSON
+    data), and its files must be in the artifact store. ``fingerprint()`` must
+    give the same nonempty str twice and must not depend on ``logs_ref`` or
+    the run times. ``collect()`` is also called once on an empty workspace with
+    a failed run: it may raise, but it must not report ``ok``.
 
     Parameters
     ----------
@@ -243,7 +379,8 @@ async def check_tool(
     AssertionError
         If the tool or executor breaks its contract; the message names the method.
     pydantic.ValidationError
-        If ``inputs`` do not match the tool's input model.
+        If ``inputs`` do not match the tool's input model. Only field names
+        and error types are kept, never the input values.
     ValueError
         If an edit is refused (a ``SoftError``, one line per path with its
         reason), a file glob matches no file, or the tool cannot be built.
@@ -282,6 +419,8 @@ async def check_tool(
     )
     async with _executor(executor) as runner:
         out = await runner.submit(job)
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+        warnings.warn(note, UserWarning, stacklevel=2)
     return await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
 
 
@@ -297,7 +436,9 @@ async def check_check(
 
     The check's files and the goal's files are snapshotted relative to the
     current working directory, the check is built and preflighted, and it runs
-    with a ``CheckContext`` whose commands go to ``executor``.
+    with a ``CheckContext`` whose commands go to ``executor``. A command that
+    ends with status ``error`` gives a ``UserWarning`` with the last 2 KB of
+    its stderr log.
 
     Parameters
     ----------
@@ -315,14 +456,14 @@ async def check_check(
     Returns
     -------
     CheckResult
-        The check's result, with ``check`` set to the component name (the
-        reference's ``name`` or the class's ``name``).
+        The check's result, validated again, with ``check`` set to the
+        component name (the reference's ``name`` or the class's ``name``).
 
     Raises
     ------
     AssertionError
         If ``feedback`` is not ``"pass_fail"`` or ``"reasons"``, or ``check()``
-        does not return a ``CheckResult``.
+        does not return a valid ``CheckResult``.
     ValueError
         If a file glob matches no file or the check cannot be built.
 
@@ -344,8 +485,14 @@ async def check_check(
     async with _executor(executor) as runner:
         ctx = CheckContext(goal=goal, executor=runner, artifact_root=_artifact_root(), ids=_ids())
         result = await built.check(candidate, ctx)
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+        warnings.warn(note, UserWarning, stacklevel=2)
     if not isinstance(result, CheckResult):
         raise _fail("Check.check() must return a CheckResult")
+    try:  # model_construct skips validation, and a truthy passed="no" would fail open
+        result = CheckResult.model_validate(result.model_dump(warnings=False))
+    except Exception:
+        raise _fail("Check.check() must return a valid CheckResult") from None
     return result.model_copy(update={"check": ref.component_name()})
 
 
@@ -360,11 +507,16 @@ async def check_judge(
     Judge one batch of candidates and stamp the scores, as the core does.
 
     The judge's files and the goal's files are snapshotted relative to the
-    current working directory, the judge is built and preflighted, and it runs
-    with a ``JudgeContext`` that has a new batch id. Each candidate error the
-    judge records with ``ctx.judge_error`` gives a ``UserWarning``
-    ``"judge error for <id>: <reason>"``. A score with a non-finite key is
-    dropped as a judge error, as the core rejects it.
+    current working directory, and the judge is built and preflighted. Its
+    identity must be stable: ``rubric_hash()`` gives the same nonempty str on
+    two calls and after a second build, and ``panel_hash()`` the same str.
+    Then it runs with a ``JudgeContext`` that has a new batch id. Each
+    candidate error that the judge records with ``ctx.judge_error`` gives a
+    ``UserWarning`` ``"judge error for <id>: <reason>"``, and so does a
+    candidate that got neither a score nor a judge error. A score with a
+    non-finite key is dropped as a judge error, as the core rejects it. A
+    command that ends with status ``error`` gives a ``UserWarning`` with the
+    last 2 KB of its stderr log.
 
     Parameters
     ----------
@@ -381,14 +533,16 @@ async def check_judge(
     Returns
     -------
     list[Score]
-        Scores stamped with ids, the judge name, the rubric hash, and the
-        batch id, in the judge's order.
+        Scores validated again and stamped with ids, the judge name, the
+        rubric hash, and the batch id, in the judge's order.
 
     Raises
     ------
     AssertionError
-        If ``judge()`` does not return a list of ``Score``, or returns a score
-        for an unknown candidate or two scores for one candidate.
+        If the judge identity is not stable, an optional Judge method returns
+        the wrong type, or ``judge()`` does not return a list of valid
+        ``Score`` objects, returns a score for an unknown candidate, or two
+        scores for one candidate.
     ValueError
         If a file glob matches no file or the judge cannot be built.
 
@@ -401,6 +555,7 @@ async def check_judge(
     []
     """
     ref, built, goal = await anyio.to_thread.run_sync(_build, judge, Judge, goal)
+    await anyio.to_thread.run_sync(_check_judge_methods, ref, built)
     async with _executor(executor) as runner:
         ctx = JudgeContext(
             goal=goal,
@@ -410,24 +565,33 @@ async def check_judge(
             batch_id="b-" + secrets.token_hex(4),
         )
         scores = await built.judge(goal, candidates, ctx)
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+        warnings.warn(note, UserWarning, stacklevel=2)
     if not (isinstance(scores, list) and all(isinstance(score, Score) for score in scores)):
         raise _fail("Judge.judge() must return a list of Score")
     batch = {candidate.id for candidate in candidates}
     seen: set[str] = set()
-    finite: list[Score] = []
+    valid: list[Score] = []
     for score in scores:
         candidate_id = score.candidate_id
-        if candidate_id not in batch:
+        if not isinstance(candidate_id, str) or candidate_id not in batch:
             raise _fail(f"Judge.judge() returned a score for unknown candidate {candidate_id!r}")
         if candidate_id in seen:
             raise _fail(f"Judge.judge() returned more than one score for candidate {candidate_id}")
         seen.add(candidate_id)
-        if is_finite_score(score):
-            finite.append(score)
-        else:
+        if not is_finite_score(score):  # the core rejects the key as a judge error (spec 4.4)
             ctx.judge_error(candidate_id, "score key must be nonempty and finite")
+            continue
+        try:  # model_construct and model_copy skip validation of the other fields
+            valid.append(Score.model_validate(score.model_dump(warnings=False)))
+        except Exception:
+            raise _fail("Judge.judge() must return valid Score objects") from None
     for candidate_id, reason in ctx.errors.items():
         warnings.warn(f"judge error for {candidate_id}: {reason}", UserWarning, stacklevel=2)
+    for candidate in candidates:
+        if candidate.id not in seen and candidate.id not in ctx.errors:
+            message = f"judge gave no score and no judge error for {candidate.id}"
+            warnings.warn(message, UserWarning, stacklevel=2)
     return stamp_scores(
-        finite, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
+        valid, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
     )

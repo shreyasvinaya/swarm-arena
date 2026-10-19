@@ -43,6 +43,8 @@ from swarm_arena.tool import Command, CompletedRun, RunStatus, Tool, ToolOutput,
 class RouteInputs(BaseModel):
     """What the manager may set for one run."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)  # an LLM writes these values
+
     target: str
     max_steps: int = 5
 
@@ -105,11 +107,18 @@ The rules:
   class keeps the validated model.
 - **The `config` property override.** Return your own `Config` type, as above,
   so that `self.config.python` type-checks.
+- **Inputs come from a manager**, often an LLM. Set
+  `hide_input_in_errors=True` on the input model, so that an invalid value
+  never shows in an error message or a log. (The kit also removes input values
+  from the errors that it raises.)
 - **No I/O in `__init__`.** Construction must not read files, import the
   program, or use the network. Put those checks in `preflight()`.
 - **`command()` and `collect()` run next to the program**, on the worker that
-  runs the tool, in the job's workspace. Only the `ToolOutput` and its declared
-  files travel back to the driver. The core never imports the program.
+  runs the tool. They get the workspace path: build every path from
+  `workspace`, never from the process's working directory. (The kit runs them
+  in your test's working directory, so it cannot find this mistake.) Only the
+  `ToolOutput` and its files travel back to the driver. The core never imports
+  the program.
 - **`"python"` as the first argument** becomes `Command.python`, or the current
   interpreter when it is None. A tool is never started with `uv run`.
 - **`collect()` always runs**, also after a timeout or a cancel (after SIGTERM
@@ -125,13 +134,20 @@ writes its result to the path in `SWARM_ARENA_RESULT`
 (`<workspace>/swarm/result.json`):
 
 ```json
-{"data": {"target": "CCO", "steps": ["step 1", "step 2"]}, "files": ["out/route.svg"]}
+{"data": {"target": "CCO", "steps": ["step 1", "step 2"]}}
 ```
 
 `data` is required. `usage`, `files`, `failed_provider`, and `schema_version`
-are optional. Each path in `files` is uploaded by its SHA-256. The full
-contract (request shape, parents, edits, exit codes, partial results, the
+are optional in the file format that the built-in `ScriptTool` reader uses. The
+full contract (request shape, parents, edits, exit codes, partial results, the
 environment) is in [Use your own files and script](own-files.md).
+
+For your own `Tool`, `collect()` decides what is kept: the core sees only the
+`ToolOutput` that it returns. The executor uploads only the files in
+`ToolOutput.files` (it reads each path in the workspace and stores the file by
+its SHA-256). So a file that the program writes but `collect()` does not list
+is lost, and so are `usage` and `failed_provider` if `collect()` does not set
+them. The `RouteTool.collect()` above keeps `data` only.
 
 ### Optional methods and their defaults
 
@@ -157,7 +173,7 @@ selects what managers see: `"pass_fail"` shows only passed or failed, and
 `ctx.execute(command, candidate=...)` runs a command through the executor, for
 example a validator that needs RDKit in the tool's interpreter. The command's
 workspace has the candidate's request, output, and files under `candidate/`,
-and the command writes a raw JSON object (no `data` envelope) to
+which is read-only, and the command writes a raw JSON object (no `data` envelope) to
 `swarm/result.json`. A check must **fail closed**: a crash or a missing result
 is a failed check, never a pass.
 
@@ -251,24 +267,42 @@ breaks its contract:
 
 - `check_tool(tool, inputs, *, goal, parents, edits, executor, timeout_s)`
   snapshots the tool's and the goal's files from the current working directory,
-  validates `inputs` with `get_input_model()`, applies the edit rules and the
-  base-parent overlay rule, runs one job on `executor` (a `LocalExecutor` by
-  default), and returns the `ToolOutput`. It asserts that `get_input_model()`
-  returns a pydantic model class, `get_description()` a `str`, `editable()` str
-  globs, `providers()` a frozenset of `str`, `fingerprint()` the same nonempty
-  `str` twice, `is_deterministic()` a `bool`, and `estimate()` `None` or an
-  `Estimate`, and that the output's files are in the artifact store. A refused
-  edit raises a `ValueError` that names the path and the reason; a refused
-  base-parent overlay gives a `UserWarning`.
+  calls `preflight()`, validates `inputs` with `get_input_model()` (an invalid
+  input raises a `pydantic.ValidationError` without the input values), applies
+  the edit rules and the base-parent overlay rule, runs one job on `executor`
+  (a `LocalExecutor` by default), and returns the `ToolOutput`. It asserts that
+  `get_input_model()` returns a pydantic model class, `get_description()` a
+  `str`, `editable()` a sequence of `str` globs, `providers()` a frozenset of
+  `str`, and `extra_actions()` a sequence of `Action` with unique names. After
+  the run it asserts that the output is a valid `ToolOutput` whose files are in
+  the artifact store, that `fingerprint()` gives the same nonempty `str` twice
+  and does not change with `logs_ref` or the run times, that
+  `is_deterministic()` returns a `bool`, and that `estimate()` returns `None` or
+  an `Estimate`. It also calls `collect()` once on an empty workspace after a
+  failed run: `collect()` may raise there, but it must not report `ok`. A
+  refused edit raises a `ValueError` that names the path and the reason; a
+  refused base-parent overlay gives a `UserWarning`.
 - `check_check(check, candidate, *, goal, executor)` runs one check and returns
-  its `CheckResult`.
+  its `CheckResult`, validated again. `feedback` must be `"pass_fail"` or
+  `"reasons"`.
 - `check_judge(judge, goal, candidates, *, executor)` judges one batch and
-  returns the stamped scores. Each `ctx.judge_error` gives a `UserWarning`
-  `"judge error for <id>: <reason>"`. A score for a candidate that is not in
-  the batch, or two scores for one candidate, raise `AssertionError`.
+  returns the stamped scores, validated again. The judge identity must be
+  stable: `rubric_hash()` gives the same nonempty `str` on two calls and on a
+  second build, and `panel_hash()` the same `str`. `anchor_count()` must return
+  an `int` of 0 or more, `providers()` a frozenset of `str`, and `models()` a
+  tuple of `str`. Each `ctx.judge_error` gives a `UserWarning`
+  `"judge error for <id>: <reason>"`, and a candidate with neither a score nor
+  a judge error gives a `UserWarning` too. A score for a candidate that is not
+  in the batch, or two scores for one candidate, raise `AssertionError`.
 - `make_candidate(output, *, request, tool, **fields)` makes a `Candidate` with
   local defaults. With `tool=`, it gets that tool's identity, so `check_tool`
   applies its overlay when it is the first parent.
+
+Install the connector in the interpreter that runs the tool, for example with
+`uv sync` or `pip install -e .`. The program runs with the workspace as its
+working directory and a fresh environment without `PYTHONPATH`, so the
+`pythonpath` setting of pytest or a source checkout is not enough: the driver
+imports your package, but `python -m my_connector.route` fails.
 
 One complete test module, run with `pytest` (the `anyio` plugin comes with
 swarm-arena):
@@ -317,3 +351,33 @@ are relative to the plan file. A tool, check, or judge can be given as an
 instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
+
+### When a run ends with status `error`
+
+The kit gives a `UserWarning` that holds the last 2 KB of the run's stderr log,
+for a tool run and for each command that a check or judge runs. To keep the
+whole workspace, with its logs, pass your own executor:
+
+```python
+# tests/test_logs.py
+from pathlib import Path
+
+import pytest
+from swarm_arena.executor import LocalExecutor
+from swarm_arena.testing import check_tool
+from swarm_arena.tool import RunStatus
+
+from my_connector.tools import RouteTool
+
+
+def stderr_log(root: Path) -> str:
+    # Each workspace is root/<job id>-<random>/, and its log is swarm/stderr.log.
+    return next(root.glob("*/swarm/stderr.log")).read_text()
+
+
+@pytest.mark.anyio
+async def test_tool_with_kept_workspace(tmp_path: Path) -> None:
+    executor = LocalExecutor(workspace_root=str(tmp_path), keep_workspaces=True)
+    out = await check_tool(RouteTool(), {"target": "CCO"}, executor=executor)
+    assert out.status == RunStatus.OK, stderr_log(tmp_path)
+```
