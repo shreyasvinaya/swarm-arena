@@ -13,8 +13,10 @@ from swarm_arena._model.tooling import (
     ToolRequest,
     Usage,
 )
+from swarm_arena._tooling.tool import Action, Tool
 
 __all__: list[str] = [
+    "Action",
     "Command",
     "CompletedRun",
     "Estimate",
@@ -22,6 +24,7 @@ __all__: list[str] = [
     "FileSet",
     "ParentRef",
     "RunStatus",
+    "Tool",
     "ToolOutput",
     "ToolRequest",
     "Usage",

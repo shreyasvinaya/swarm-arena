@@ -56,6 +56,7 @@ PUBLIC["swarm_arena.protocol"] += [
     "TaskState",
     "Role",
 ]
+PUBLIC["swarm_arena.tool"] += ["Tool", "Action"]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))

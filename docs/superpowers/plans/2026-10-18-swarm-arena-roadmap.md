@@ -694,15 +694,18 @@ class CompletedRun(FrozenModel):
     ended_at: datetime
 
 # _tooling/tool.py — M1a
+InputT = TypeVar("InputT", bound=BaseModel)
+
 @dataclass(frozen=True, kw_only=True)
-class Action:                                   # [plan] fields
+class Action(Generic[InputT]):                   # [plan] fields
     name: str
     description: str
-    input_model: type[BaseModel]
-    handler: Callable[["AgentContext", BaseModel], Awaitable[JsonValue]]
+    input_model: type[InputT]
+    handler: Callable[[Any, InputT], Awaitable[JsonValue]]
+    # first argument: the agent's AgentContext; M1b may narrow Any to AgentContext
     counts_as: Literal["board_read", "none"] = "none"
 
-class Tool(ABC):
+class Tool(Configurable, ABC):
     name: ClassVar[str]
     description: ClassVar[str]
     input_model: ClassVar[type[BaseModel]]
@@ -713,13 +716,17 @@ class Tool(ABC):
     def estimate(self, request: ToolRequest) -> Estimate | None: ...        # default None
     def providers(self) -> frozenset[str]: ...                              # default frozenset()
     def fingerprint(self, output: ToolOutput) -> str: ...                   # default sha256(canonical(output.data))
-    def extra_actions(self) -> Sequence[Action]: ...                        # default ()
+    def extra_actions(self) -> Sequence[Action[Any]]: ...                        # default ()
     def get_input_model(self) -> type[BaseModel]: ...                       # [plan] default type(self).input_model
     def get_description(self) -> str: ...                                   # [plan] default type(self).description
     @abstractmethod
     def command(self, request: ToolRequest, workspace: Path) -> Command: ...
     @abstractmethod
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput: ...
+    def _own_files(self) -> dict[str, str]: ...                            # default {}
+    def _protected(self, root: AbstractSet[str]) -> frozenset[str]: ...     # default frozenset()
+    # _own_files(): the tool's own root files; the driver's protected set is
+    # tool._protected(root) | private_paths (R4.13.9).
     # get_input_model and get_description exist because FunctionTool and ScriptTool derive them per instance.
 
 # _tooling/function_tool.py — M1a
@@ -1820,6 +1827,20 @@ def kill_orphan(started: Job.Started) -> bool: ...   # only if host_id and start
 #### R4.13.9 Files, paths, staging — M1a
 
 ```python
+# _tooling/tool.py
+# The only tool timeout and grace computation; M1b passes round_spec.tool_timeout_s and limits.tool_timeout_s.
+def effective_tool_timeout(tool: Tool, *, round_timeout_s: float | None, limit_s: float) -> float: ...
+def tool_grace(tool: Tool) -> float: ...
+def cap_timeout(configured: float | None, limit_s: float) -> float: ...  # shared cap, also used by CheckContext.execute
+
+# _tooling/result_file.py
+# The read_regular_file of R4.13.8: O_NOFOLLOW | O_NONBLOCK, regular files only, no symlinked component.
+def read_regular_file(workspace: Path, rel: str) -> bytes: ...
+def symlinked_component(base: Path, rel: str) -> str | None: ...  # shared component check for snapshots and collection
+# Never blocks or follows: O_APPEND | O_NOFOLLOW | O_NONBLOCK, regular files only,
+# otherwise the note is dropped; M4 job steps reuse it.
+def note_in_log(path: Path, message: str) -> None: ...
+
 RESERVED: Final = frozenset({"swarm", "parents", "candidate"})
 def check_relpath(path: str) -> str: ...             # ValueError: absolute, "..", reserved top level, empty
 def matches(path: str, globs: Sequence[str]) -> bool: ...
