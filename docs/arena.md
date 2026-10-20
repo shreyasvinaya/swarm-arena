@@ -37,3 +37,10 @@ Each probe writes one small object under `.swarm-arena-probe/` within each S3
 root. The objects are retained because `Store` has no delete operation. Configure
 a bucket lifecycle rule for each root's probe prefix to expire old probes.
 Local stores require no probe objects.
+
+Conditional PUTs use a dedicated client with automatic retries disabled in
+s3fs, the SDK, and the underlying HTTP transport. A lost response or transport failure raises
+`WriteOutcomeUnknown`, even if the server committed the write. Reads and listings
+retain their retry settings. Only an observed HTTP 409 conflict uses the bounded
+Store retry policy; callers must reconcile an unknown write outcome by reading
+stored state.

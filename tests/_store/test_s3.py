@@ -1,16 +1,25 @@
 """Exercise conditional storage against a loopback moto server."""
 
+import http.client
+import os
 import re
+import socket
+import threading
 import time
 import traceback
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import s3fs
 from _fakes.secrecy import assert_secret_absent
-from botocore.exceptions import ClientError, EndpointConnectionError
+from aiobotocore.httpsession import AIOHTTPSession
+from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
 
 from swarm_arena._errors import (
     AlreadyExists,
@@ -211,7 +220,7 @@ def test_write_maps_response_without_leaking_values(
 ) -> None:
     store = S3Store(s3_url)
     store._conditional_params()
-    fs = store._filesystem()
+    fs = store._filesystem(write=True)
 
     def fail(method: str, **kwargs: Any) -> dict[str, Any]:
         error = ClientError(
@@ -240,7 +249,7 @@ def test_transport_write_outcome_unknown(s3_url: str, monkeypatch: pytest.Monkey
     def fail(method: str, **kwargs: Any) -> dict[str, Any]:
         raise EndpointConnectionError(endpoint_url=SECRET)
 
-    monkeypatch.setattr(store._filesystem(), "call_s3", fail)
+    monkeypatch.setattr(store._filesystem(write=True), "call_s3", fail)
     with pytest.raises(WriteOutcomeUnknown) as caught:
         store.create("k", b"1")
     assert_secret_absent(caught.value, SECRET)
@@ -458,3 +467,150 @@ def test_client_initialization_failure_is_sanitized(
         store.create("k", b"1")
     assert_secret_absent(caught.value, SECRET)
     assert _rebuild_core_signal(caught.value) is not None
+
+
+@pytest.mark.parametrize("operation", ["create", "replace", "same-body-replace"])
+@pytest.mark.parametrize("sdk_attempts", [1, 3])
+def test_committed_put_lost_response_is_unknown_without_retry(
+    s3_url: str, monkeypatch: pytest.MonkeyPatch, operation: str, sdk_attempts: int
+) -> None:
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "9")
+    store = S3Store(s3_url, config_kwargs={"retries": {"total_max_attempts": sdk_attempts}})
+    old = store.create("lost", b"old") if operation != "create" else None
+    payload = b"old" if operation == "same-body-replace" else b"new"
+    statuses: list[int] = []
+    real_send = AIOHTTPSession.send
+
+    async def drop_first_response(session: Any, request: Any) -> Any:
+        response = await real_send(session, request)
+        if request.method == "PUT":
+            statuses.append(response.status_code)
+            if len(statuses) == 1:
+                assert response.status_code == 200
+                await response.content
+                raise ConnectionClosedError(endpoint_url=request.url)
+        return response
+
+    monkeypatch.setattr(AIOHTTPSession, "send", drop_first_response)
+    error: Exception | None = None
+    try:
+        if operation == "create":
+            store.create("lost", payload)
+        else:
+            assert old is not None
+            store.replace("lost", payload, if_match=old)
+    except Exception as exc:
+        error = exc
+    assert store.read("lost").data == payload
+    assert isinstance(error, WriteOutcomeUnknown), type(error).__name__
+    assert statuses == [200]
+    assert _rebuild_core_signal(error) is not None
+    if operation == "same-body-replace":
+        assert store.read("lost").etag == old
+
+
+def test_put_client_has_one_attempt_without_changing_read_retries(s3_url: str) -> None:
+    store = S3Store(s3_url, config_kwargs={"retries": {"total_max_attempts": 7}})
+    read_fs = store._filesystem()
+    write_fs = store._filesystem(write=True)
+    assert write_fs is not read_fs
+    assert write_fs.retries == 1
+    assert write_fs.s3.meta.config.retries["total_max_attempts"] == 1
+    assert read_fs.retries > 1
+    assert read_fs.s3.meta.config.retries["total_max_attempts"] == 7
+
+
+@dataclass
+class _DroppedResponse:
+    armed: bool = False
+    dropped: bool = False
+    statuses: list[int] = field(default_factory=list)
+
+
+@pytest.fixture
+def dropped_response_proxy(
+    s3_url: str, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_DroppedResponse]:
+    backend = urlsplit(os.environ["AWS_ENDPOINT_URL_S3"])
+    assert backend.hostname == "127.0.0.1"
+    assert backend.port is not None
+    state = _DroppedResponse()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+        def relay(self) -> None:
+            assert "Transfer-Encoding" not in self.headers
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            connection = http.client.HTTPConnection("127.0.0.1", backend.port, timeout=10)
+            try:
+                connection.request(self.command, self.path, body, dict(self.headers))
+                response = connection.getresponse()
+                payload = response.read()
+                if self.command == "PUT" and state.armed:
+                    state.statuses.append(response.status)
+                    if response.status == 200 and not state.dropped:
+                        state.dropped = True
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+                self.send_response_only(response.status, response.reason)
+                for name, value in response.getheaders():
+                    if name.lower() not in {"transfer-encoding", "connection", "content-length"}:
+                        self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                connection.close()
+
+        do_PUT = relay
+        do_GET = relay
+        do_HEAD = relay
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    proxy.daemon_threads = True
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", f"http://127.0.0.1:{proxy.server_port}")
+    try:
+        yield state
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("operation", ["create", "replace", "same-body-replace"])
+def test_socket_response_loss_never_resends_put(
+    s3_url: str, dropped_response_proxy: _DroppedResponse, operation: str
+) -> None:
+    store = S3Store(s3_url, config_kwargs={"request_checksum_calculation": "when_required"})
+    state = dropped_response_proxy
+    try:
+        old = store.create("lost", b"old") if operation != "create" else None
+        payload = b"old" if operation == "same-body-replace" else b"new"
+        state.armed = True
+        error: Exception | None = None
+        try:
+            if operation == "create":
+                store.create("lost", payload)
+            else:
+                assert old is not None
+                store.replace("lost", payload, if_match=old)
+        except Exception as exc:
+            error = exc
+        assert state.dropped
+        assert store.read("lost").data == payload
+        assert isinstance(error, WriteOutcomeUnknown), type(error).__name__
+        assert state.statuses == [200]
+        assert _rebuild_core_signal(error) is not None
+    finally:
+        for fs in (store._fs, store._write_fs):
+            if fs is not None and fs._s3creator is not None:
+                type(fs).close_session(fs.loop, fs._s3creator)

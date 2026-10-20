@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - Unreleased
 
+### Fixed
+
+- Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
+  retries in s3fs, the SDK, and the underlying HTTP transport.
+
 ### Added
 
 - Arena cache sequence indexing keeps junction and newest-segment queries bounded

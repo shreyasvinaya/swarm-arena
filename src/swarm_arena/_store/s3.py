@@ -50,6 +50,20 @@ def _response_error(error: Exception) -> _S3Error:
     return _S3Error(None, "")
 
 
+def _single_attempt_http_session() -> type[Any]:
+    """Disable aiohttp's internal retry without importing extras at module load."""
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    class SingleAttemptSession(AIOHTTPSession):
+        async def _get_session(self, proxy_url: str | None) -> Any:
+            session: Any = await super()._get_session(proxy_url)
+            # aiohttp can resend idempotent methods below the SDK retry layer.
+            session._retry_connection = False
+            return session
+
+    return SingleAttemptSession
+
+
 class S3Store(Store):
     """Store objects with server-enforced creation and version conditions.
 
@@ -101,6 +115,7 @@ class S3Store(Store):
         self._url = f"s3://{self._bucket}" + (f"/{prefix}" if prefix else "")
         self._options = dict(storage_options)
         self._fs: Any = None
+        self._write_fs: Any = None
         self._params: frozenset[str] | None = None
 
     @property
@@ -119,14 +134,30 @@ class S3Store(Store):
         """
         return self._url
 
-    def _filesystem(self) -> Any:
-        """Build the uncached s3fs instance only when an operation needs it."""
-        if self._fs is None:
+    def _filesystem(self, *, write: bool = False) -> Any:
+        """Build separate read and single-attempt PUT clients lazily."""
+        fs = self._write_fs if write else self._fs
+        if fs is None:
             import s3fs
 
-            options = {**self._options, "skip_instance_cache": True, "use_listings_cache": False}
-            self._fs = s3fs.S3FileSystem(**options)
-        return self._fs
+            options: dict[str, Any] = {
+                **self._options,
+                "skip_instance_cache": True,
+                "use_listings_cache": False,
+            }
+            if write:
+                config = dict(options.get("config_kwargs") or {})
+                config["retries"] = {"total_max_attempts": 1, "mode": "standard"}
+                config["http_session_cls"] = _single_attempt_http_session()
+                options["config_kwargs"] = config
+            fs = s3fs.S3FileSystem(**options)
+            if write:
+                # Automatic PUT retries must not hide an ambiguous response.
+                fs.retries = 1
+                self._write_fs = fs
+            else:
+                self._fs = fs
+        return fs
 
     def _key(self, key: str) -> str:
         """Validate a relative key using the common Store contract."""
@@ -141,7 +172,7 @@ class S3Store(Store):
         """Cache the live client's PutObject input model."""
         if self._params is None:
             try:
-                fs = self._filesystem()
+                fs = self._filesystem(write=True)
                 client = fs.s3
                 self._params = frozenset(
                     client.meta.service_model.operation_model("PutObject").input_shape.members
@@ -168,7 +199,7 @@ class S3Store(Store):
     def _put_object(self, key: str, data: bytes, **condition: str) -> str:
         """Send one conditional PUT and retain only response classification."""
         try:
-            result = self._filesystem().call_s3(
+            result = self._filesystem(write=True).call_s3(
                 "put_object", Bucket=self._bucket, Key=key, Body=data, **condition
             )
             return cast(str, result["ETag"])
