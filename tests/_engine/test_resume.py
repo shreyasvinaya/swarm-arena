@@ -947,7 +947,9 @@ async def test_orphan_command_job_killed_on_resume(
     await runner.aclose()
     assert spy.killed == ([c.command_started] if same_host else [])
     assert _events(c, "run_lost") == []
-    assert _events(c, "command_end")[-1].payload == {"job_id": "command1", "status": "lost"}
+    payload = dict(_events(c, "command_end")[-1].payload)
+    assert payload.pop("run_elapsed_s") >= 0
+    assert payload == {"job_id": "command1", "status": "lost"}
     assert RunState.from_events(_events(c)).started_commands == {}
     runner = await resume_run(c.config, c.run_id, force=True, replanner=None)
     await runner.aclose()
@@ -2056,12 +2058,20 @@ async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
         if boundary == "before_close"
         else ["no_result", "goal_finished"]
     )
-    assert _events(c, "goal_finished")[-1].payload == _events(control, "goal_finished")[-1].payload
+
+    def without_clock(event: Event) -> dict[str, Any]:
+        payload = dict(event.payload)
+        assert payload.pop("run_elapsed_s") >= 0
+        return payload
+
+    assert without_clock(_events(c, "goal_finished")[-1]) == without_clock(
+        _events(control, "goal_finished")[-1]
+    )
     solution = json.loads(c.store.read("goals/g/solution.json").data)
     expected = json.loads(control.store.read("goals/g/solution.json").data)
     for key in ("status", "reason", "finalists", "parts"):
         assert solution[key] == expected[key]
     for event_type in ("reserve", "settle"):
-        assert [e.payload for e in _events(c, event_type)] == [
-            e.payload for e in _events(control, event_type)
+        assert [without_clock(e) for e in _events(c, event_type)] == [
+            without_clock(e) for e in _events(control, event_type)
         ]

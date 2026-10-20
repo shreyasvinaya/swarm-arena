@@ -26,7 +26,6 @@ from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
-from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.planner import Planner
@@ -140,7 +139,7 @@ class _ResumeServices:
                 / "journals"
                 / f"{self.run_id}-e{lease.doc.epoch}.jsonl"
             )
-            async with JournalWriter(
+            async with run_module._RunJournal(
                 self.store,
                 lease,
                 run_id=self.run_id,
@@ -155,6 +154,8 @@ class _ResumeServices:
                         EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
                     )
                     events, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
+                    clock = RunClock(state.run_elapsed_s)
+                    journal.clock = clock
                     continued = _check(state, config)
                     self.order = [
                         g
@@ -255,7 +256,7 @@ class _ResumeServices:
                         ids=ids,
                         views=ViewWriter(self.store, journal),
                         stops=StopState(),
-                        clock=RunClock(state.run_elapsed_s),
+                        clock=clock,
                         admission=RunAdmission(config.limits.max_agents_total),
                     )
                     self.resumed = ResumeState(state, lease, lease.doc.epoch, ledger, killed, self)

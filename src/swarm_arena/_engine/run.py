@@ -28,7 +28,7 @@ from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
 from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._journal.event import EventDraft, EventType
+from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState
@@ -50,6 +50,24 @@ from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 if TYPE_CHECKING:
     from swarm_arena._engine.resume import ResumeState
+
+
+class _RunJournal(JournalWriter):
+    """Stamp every durable producer's progress with the shared active clock."""
+
+    clock: RunClock | None = None
+
+    async def __aenter__(self) -> "_RunJournal":
+        await super().__aenter__()
+        return self
+
+    def append(self, draft: EventDraft) -> Event:
+        """Include elapsed active time without changing producer payloads in place."""
+        if self.clock is not None:
+            draft = draft.model_copy(
+                update={"payload": {**draft.payload, "run_elapsed_s": self.clock.elapsed()}}
+            )
+        return super().append(draft)
 
 
 def _require_asyncio() -> None:
@@ -393,7 +411,8 @@ class RunRunner:
             / "journals"
             / f"{run_id}-e{lease.doc.epoch}.jsonl"
         )
-        async with JournalWriter(
+        clock = RunClock(0)
+        async with _RunJournal(
             store,
             lease,
             run_id=run_id,
@@ -401,6 +420,7 @@ class RunRunner:
             local_path=local_path,
             sync_interval_s=config.sync_interval_s,
         ) as journal:
+            journal.clock = clock
             await anyio.to_thread.run_sync(store.create, "run.toml", config.dumps().encode())
             await anyio.to_thread.run_sync(
                 store.create,
@@ -469,7 +489,7 @@ class RunRunner:
                     ids=ids,
                     views=views,
                     stops=StopState(),
-                    clock=RunClock(0),
+                    clock=clock,
                     admission=RunAdmission(config.limits.max_agents_total),
                 )
                 return await self._drive(deps, lease.doc.epoch)
