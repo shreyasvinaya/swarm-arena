@@ -1980,7 +1980,9 @@ class AgentRuntime:
                                                      # the agent address, or "<goal>/:final" for a converge-team agent (§8.1)
     goal: Goal; goal_key: GoalKey; part: str | None
     team: TeamSpec; spec: AgentSpec; round: int; round_spec: RoundSpec; fidelity: str
-    tool: Tool; tool_ref: Ref; tool_identity: str; catalog_entry: CatalogEntry | None
+    tool: Tool; tool_ref: Ref; execution_ref: Ref; tool_identity: str; catalog_entry: CatalogEntry | None
+        # tool_ref is the snapshotted base for identity/repeat keys; required private execution_ref is the
+        # merged effective ref submitted to the executor, paired with the effective built tool
     checks: Sequence[tuple[str, Check]]
     view: BoardView; own: list[Candidate | Learning]; digest: str; notes: str
     ledger: Ledger; tranche: Tranche; limits: Limits; counters: AgentCounters
