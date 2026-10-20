@@ -75,6 +75,32 @@ def test_tool_request_reserved_form_is_a_reference() -> None:
     assert ToolRequest.model_validate(dumped).model_dump(mode="json") == dumped  # stable
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../outside.txt",
+        "/abs.txt",
+        "swarm/result.json",
+        "PARENTS/c1/x",
+        "./p/a.txt",
+        "p//a.txt",
+        "a\x00b",
+        "problem/\udcc5\udca1olver.py",  # a surrogateescape spelling (integration fix 3, A0)
+        "",
+    ],
+)
+def test_tool_request_edit_keys_are_checked_paths(path: str) -> None:  # IF3 RC5
+    secret = "SECRET_SENTINEL_edit_content"
+    for build in (
+        lambda: ToolRequest(edits={path: secret}),
+        lambda: ToolRequest.model_validate({"edits": {path: secret}}),
+    ):
+        with pytest.raises(ValidationError, match="edits") as caught:
+            build()
+        assert_secret_absent(caught.value, secret, sanitized=True)
+    assert ToolRequest(edits={"p/a.txt": secret}).edits == {"p/a.txt": secret}
+
+
 def test_parent_ref_rules() -> None:
     base = {"candidate_id": "c1", "run_id": "r", "tool_identity": "T"}
     for bad in (

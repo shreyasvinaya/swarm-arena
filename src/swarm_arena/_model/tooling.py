@@ -293,7 +293,9 @@ class ToolRequest(FrozenModel):
     round_overrides : dict[str, Any], default={}
         Tool configuration overrides for this round.
     edits : dict[str, str], default={}
-        Paths mapped to live contents or reserved stored references.
+        Workspace paths mapped to live contents or reserved stored references.
+        Each key must pass ``check_key``: a relative path in normal form,
+        strict UTF-8, with no ``..``, NUL, or reserved top-level name.
 
     Examples
     --------
@@ -311,7 +313,7 @@ class ToolRequest(FrozenModel):
     replicate: int = 0
     round: int = 0
     round_overrides: dict[str, Any] = {}
-    edits: dict[str, str] = {}
+    edits: dict[Annotated[str, AfterValidator(check_key)], str] = {}
 
     @field_serializer("edits")
     def _serialize_edits(self, edits: dict[str, str]) -> dict[str, str]:
