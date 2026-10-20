@@ -1071,3 +1071,152 @@ class FeedbackCheck(AlwaysFailCheck):
             reasons=[self.config.reason],
             details={"private": self.config.reason},
         )
+
+
+class ThreeDollarTool(Tool):
+    """
+    Charge three dollars for nonzero inputs, ten cents for the default input.
+
+    Preflight estimates the default empty request; actual requests have their
+    own estimates and matching reported usage through the normal engine path.
+
+    Examples
+    --------
+    >>> ThreeDollarTool().estimate(ToolRequest(inputs={'n': 1})).usd
+    3.0
+    """
+
+    name = "paid-value"
+    description = "Evaluate a value at the input's stated price."
+    input_model = PyInputs
+
+    def estimate(self, request: ToolRequest) -> Estimate:
+        """
+        Estimate the selected input's price.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Proposed invocation.
+
+        Returns
+        -------
+        Estimate
+            Three dollars for a nonzero input, otherwise ten cents; zero tokens.
+
+        Examples
+        --------
+        >>> ThreeDollarTool().estimate(ToolRequest()).tokens
+        0
+        >>> ThreeDollarTool().estimate(ToolRequest()).usd
+        0.1
+        """
+        return Estimate(tokens=0, usd=3.0 if request.inputs.get("n", 0) else 0.1)
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        """
+        Execute a real local process without an external provider.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Validated invocation.
+        workspace : Path
+            Staged working directory.
+
+        Returns
+        -------
+        Command
+            A successful no-op command.
+
+        Examples
+        --------
+        >>> ThreeDollarTool().command(ToolRequest(), Path('.')).argv
+        ['true']
+        """
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        """
+        Report the request value and its actual connector usage.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation containing the numeric value.
+        workspace : Path
+            Completed working directory.
+        run : CompletedRun
+            Real process outcome and timestamps.
+
+        Returns
+        -------
+        ToolOutput
+            Scorable value and explicit actual usage for settlement.
+
+        Examples
+        --------
+        >>> from datetime import UTC, datetime
+        >>> now = datetime(2026, 1, 1, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status=RunStatus.OK,
+        ...     stdout_path=Path('stdout'), stderr_path=Path('stderr'),
+        ...     started_at=now, ended_at=now)
+        >>> ThreeDollarTool().collect(ToolRequest(inputs={'n': 1}), Path('.'), run).usage.usd
+        3.0
+        """
+        from swarm_arena.tool import Usage
+
+        return ToolOutput(
+            status=run.status,
+            data={"value": request.inputs["n"]},
+            usage=Usage(usd=self.estimate(request).usd),
+            started_at=run.started_at,
+            ended_at=run.ended_at,
+        )
+
+
+class ReportRefusalManager(Manager):
+    """
+    Offer two distinct requests and record a public action's refusal identifier.
+
+    Examples
+    --------
+    >>> ReportRefusalManager().models()
+    ()
+    """
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        """
+        Run sequential paid requests until the budget refuses one.
+
+        Parameters
+        ----------
+        ctx : AgentContext
+            Public action context supplied by the engine.
+
+        Returns
+        -------
+        RoundReport
+            Summary after both requests or a recorded limit refusal.
+
+        Examples
+        --------
+        >>> import anyio
+        >>> from unittest.mock import AsyncMock, Mock
+        >>> ctx = Mock(run_tool=AsyncMock())
+        >>> anyio.run(ReportRefusalManager().run_round, ctx).summary
+        'both requests admitted'
+        """
+        from swarm_arena.manager import LimitReached
+
+        evidence: list[str] = []
+        for n in (1, 2):
+            try:
+                candidate = await ctx.run_tool({"n": n})
+            except LimitReached as error:
+                await ctx.post_learning(
+                    title="Tool request refused", text=error.limit, evidence=evidence
+                )
+                return RoundReport(summary="request refused")
+            evidence.append(candidate.id)
+        return RoundReport(summary="both requests admitted")

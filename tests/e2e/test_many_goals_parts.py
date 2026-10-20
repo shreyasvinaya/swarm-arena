@@ -142,23 +142,34 @@ def _first_agent_share(cfg: RunConfig, goal_id: str, *, round: int) -> Decimal:
 
 
 def _peak_charged_usd(events: Sequence[Event]) -> Decimal:
+    """Express the integer micro-dollar oracle in dollars for existing checks."""
+    return Decimal(_peak_charged_micro_usd(events)) / 1_000_000
+
+
+def _peak_charged_micro_usd(events: Sequence[Event]) -> int:
     """Measure charged exposure after each committed event, allowing refunds.
 
     Open, estimated and keep-charged reservations retain the full estimate.
     Ordinary settlements replace it with actual usage, including overspend;
     terminal usage overflow overrides even conservative charging with actuals.
-    Decimal sums retain exact micro-dollar arithmetic without clamping overflow.
+    Integer micro-dollar sums do not round or clamp aggregate overflow.
     """
-    charges: dict[str, Decimal] = {}
+
+    def micro_usd(usd: float) -> int:
+        units = Decimal(str(usd)) * 1_000_000
+        assert units == units.to_integral_value()
+        return int(units)
+
+    charges: dict[str, int] = {}
     keep_charged: set[str] = set()
-    peak = Decimal(0)
+    peak = 0
     for event in events:
         payload = event.payload
         if event.type == "reserve":
             reservation = payload["reservation"]
             id = reservation["id"]
             assert id not in charges
-            charges[id] = Decimal(str(reservation["amount"]["usd"]))
+            charges[id] = micro_usd(reservation["amount"]["usd"])
             if reservation["keep_charged"]:
                 keep_charged.add(id)
         elif event.type == "settle":
@@ -167,8 +178,8 @@ def _peak_charged_usd(events: Sequence[Event]) -> Decimal:
             if payload.get("usage_overflow") or (
                 not payload["estimated"] and id not in keep_charged
             ):
-                charges[id] = Decimal(str(payload["actual"]["usd"]))
-        peak = max(peak, sum(charges.values(), Decimal(0)))
+                charges[id] = micro_usd(payload["actual"]["usd"])
+        peak = max(peak, sum(charges.values()))
     return peak
 
 
@@ -299,3 +310,66 @@ async def test_two_goals_shared_budget_and_parts_join(run_config: RunConfig) -> 
         event.payload["actual"] == {"tokens": 0, "usd": 0.0} and event.payload["estimated"] is False
         for event in settlements
     )
+
+
+async def test_two_goals_refuse_demand_above_shared_budget(run_config: RunConfig) -> None:
+    """Offer $12 of paid requests and admit only one $3 request per goal."""
+    cfg = run_config.model_copy(
+        update={"limits": run_config.limits.model_copy(update={"max_usd": 10.0})}
+    )
+    plans = []
+    for goal_id in ("g-first", "g-second"):
+        plan = _line_plan(goal_id, rounds=1)
+        team = plan.teams[0]
+        agent = team.agents[0].model_copy(
+            update={
+                "tool": Ref(path="_fakes.tools:ThreeDollarTool"),
+                "manager": Ref(path="_fakes.tools:ReportRefusalManager"),
+            }
+        )
+        plans.append(
+            plan.model_copy(update={"teams": [team.model_copy(update={"agents": [agent]})]})
+        )
+
+    out = await Swarm(cfg).run(plans)
+    assert set(out) == {"g-first", "g-second"}
+    assert all(len(candidates) == 1 for candidates in out.values())
+    assert all(
+        candidates[0].output.status is RunStatus.OK
+        and candidates[0].output.data == {"value": 1}
+        and candidates[0].output.usage.usd == 3.0
+        for candidates in out.values()
+    )
+
+    events = await anyio.to_thread.run_sync(_events, cfg)
+    reservations = [event.payload["reservation"] for event in events if event.type == "reserve"]
+    assert len(reservations) == 2
+    assert {reservation["holder"] for reservation in reservations} == {
+        "g-first/line/worker",
+        "g-second/line/worker",
+    }
+    assert all(reservation["amount"] == {"tokens": 0, "usd": 3.0} for reservation in reservations)
+    # The manager records the public LimitReached.limit via post_learning;
+    # envelope identities establish which two agents were actually refused.
+    refusals = [event for event in events if event.type == "learning"]
+    assert len(refusals) == 2
+    assert {
+        (event.goal_id, event.team, event.agent, event.payload["learning"]["text"])
+        for event in refusals
+    } == {("g-first", "line", "worker", "budget"), ("g-second", "line", "worker", "budget")}
+    starts = [event for event in events if event.type == "tool_start"]
+    assert len(starts) == 2
+    assert {(event.goal_id, event.team, event.agent) for event in starts} == {
+        ("g-first", "line", "worker"),
+        ("g-second", "line", "worker"),
+    }
+    settlements = [event.payload for event in events if event.type == "settle"]
+    assert len(settlements) == 2
+    assert {settled["id"] for settled in settlements} == {
+        reservation["id"] for reservation in reservations
+    }
+    assert all(
+        settled["actual"] == {"tokens": 0, "usd": 3.0} and settled["estimated"] is False
+        for settled in settlements
+    )
+    assert _peak_charged_micro_usd(events) == 6_000_000 <= 10_000_000
