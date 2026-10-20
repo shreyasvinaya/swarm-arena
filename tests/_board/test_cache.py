@@ -1,18 +1,25 @@
 import sqlite3
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 from threading import Barrier
 
 import pytest
-from _fakes.journals import FakeRun, candidate_ids
+from _fakes.journals import START, FakeRun, candidate_ids
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._board.cache import ArenaCache, goal_key_digest
+from swarm_arena._board.frontier import build_frontier
+from swarm_arena._board.human_objects import HumanObject
 from swarm_arena._board.ingest import ingest_run
 from swarm_arena._errors import ChainError
+from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState
+from swarm_arena._model.board_types import Frontier
+from swarm_arena._model.canonical import canonical_json
+from swarm_arena._model.results import Learning, Score
 
 
 def test_ingest_is_idempotent(tmp_path: Path) -> None:
@@ -703,3 +710,513 @@ def test_bulk_ingest_sql_work_grows_linearly(tmp_path: Path) -> None:
             cache.close()
     assert work[1] <= work[0] * 2.5, (sizes, work)
     assert work[2] <= work[1] * 2.5, (sizes, work)
+
+
+def test_items_after_mark_are_hidden(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    h1 = run.commit(
+        run.plan(),
+        run.candidate("c-1"),
+        run.score("s-1", "c-1", 1),
+        run.learning("L-1", "First", evidence=["c-1"]),
+    )
+    h2 = run.commit(
+        run.candidate("c-2"),
+        run.score("s-2", "c-2", 2),
+        run.learning("L-2", "Second", evidence=["c-2"]),
+        run.plan(revision=1, first_round=2),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, h2)
+    f1 = build_frontier([("r1", run.run_root, h1)], [], [])
+    f2 = build_frontier([("r1", run.run_root, h2)], [], [])
+    assert [c.id for c, _ in cache.candidates(f1)] == ["c-1"]
+    assert [c.id for c, _ in cache.candidates(f2)] == ["c-1", "c-2"]
+    assert [s.id for s, _ in cache.scores(f1)] == ["s-1"]
+    assert [s.id for s, _ in cache.scores(f2)] == ["s-1", "s-2"]
+    assert [learning.id for learning in cache.learnings_by_id(f1, ["L-1", "L-2"])] == ["L-1"]
+    assert [learning.id for learning in cache.learnings_by_id(f2, ["L-1", "L-2"])] == ["L-1", "L-2"]
+    assert [(p.revision, origin, seq) for p, origin, seq in cache.plans(f1, "r1", "g1")] == [
+        (0, "human", 1),
+    ]
+    assert [p.revision for p, _, _ in cache.plans(f2, "r1", "g1")] == [0, 1]
+    cache.close()
+
+
+def test_run_without_mark_is_hidden(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    runs = [FakeRun(str(tmp_path / "runs"), rid) for rid in ("r1", "r2")]
+    for run in runs:
+        cid = "c-" + run.run_id
+        head = run.commit(
+            run.plan(),
+            run.candidate(cid),
+            run.score("s-" + run.run_id, cid, 1),
+            run.learning("L-" + run.run_id, "Hint", evidence=[cid]),
+        )
+        ingest_run(cache, run.store, run.run_id, run.run_root, head)
+    run = runs[0]
+    frontier = build_frontier([("r1", run.run_root, run.heads[-1])], [], [])
+    assert cache.membership(frontier) == canonical_json(
+        {
+            "candidates": ["c-r1"],
+            "scores": ["s-r1"],
+            "learnings": [["L-r1", False, False]],
+        }
+    )
+    assert cache.plans(frontier, "r2", "g1") == []
+    assert cache.candidates(frontier, run_id="r2") == []
+    assert cache.membership(Frontier()) == canonical_json(
+        {
+            "candidates": [],
+            "scores": [],
+            "learnings": [],
+        }
+    )
+    cache.close()
+
+
+PIN_NAME = "toy/curation/20261018T000002.000Z-00000001.jsonl"
+HIDE_NAME = "toy/curation/20261018T000002.000Z-00000002.jsonl"
+REVIEW_NAME = "toy/reviews/alice/20261018T000002.000Z-00000001.jsonl"
+
+
+def _human_learning(lid: str = "L-h-0000000000000001") -> Learning:
+    return Learning(
+        id=lid,
+        namespace="toy",
+        run_id="human",
+        goal_id="g1",
+        round=0,
+        author="human:alice",
+        title="Human hint",
+        text="Try this",
+        tags=["tag"],
+        evidence=["c-1"],
+        refines=["L-0"],
+        supersedes=["L-old"],
+    )
+
+
+def _human_review(sid: str = "s-human") -> HumanObject:
+    return HumanObject(
+        kind="review",
+        author="human:alice",
+        score=Score(
+            id=sid,
+            candidate_id="c-1",
+            judge="human:alice",
+            rubric_hash="r1",
+            key=(1,),
+        ),
+    )
+
+
+def test_curation_applies_only_when_named(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    cache.apply_human_objects(
+        [PIN_NAME],
+        [
+            HumanObject(kind="pin", learning_id="L-1", author="human:a"),
+        ],
+    )
+    assert cache.flags(build_frontier([], [], [])) == {}
+    assert cache.flags(build_frontier([], [], [PIN_NAME])) == {"L-1": (True, False)}
+    cache.apply_human_objects(
+        [HIDE_NAME],
+        [
+            HumanObject(kind="hide", learning_id="L-1", author="human:a"),
+        ],
+    )
+    assert cache.flags(build_frontier([], [], [HIDE_NAME, PIN_NAME])) == {"L-1": (False, True)}
+    assert cache.flags(build_frontier([], [PIN_NAME], [])) == {}
+    cache.close()
+
+
+def test_review_scores_come_from_named_objects(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    review = _human_review()
+    assert review.score is not None
+    head = run.commit(
+        run.plan(),
+        run.candidate("c-1"),
+        EventDraft(
+            type=EventType.REVIEW_IMPORTED,
+            goal_id="g1",
+            payload={"scores": [review.score.model_dump(mode="json")]},
+        ),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    marks = [("r1", run.run_root, head)]
+    assert cache.scores(build_frontier(marks, [], [])) == []
+    cache.apply_human_objects([REVIEW_NAME], [review])
+    assert cache.scores(build_frontier(marks, [], []), judge="human:alice") == []
+    frontier = build_frontier(marks, [REVIEW_NAME], [])
+    assert [s.id for s, _ in cache.scores(frontier, judge="human:alice")] == ["s-human"]
+    assert cache.scores(frontier, judge="j") == []
+    assert cache.scores(frontier, candidate_ids=[]) == []
+    assert cache.scores(frontier, candidate_ids=["missing"]) == []
+    assert cache.scores(frontier, candidate_ids=["c-1", "c-1"]) == cache.scores(frontier)
+    assert cache.scores(build_frontier(marks, [], [REVIEW_NAME])) == []
+    cache.close()
+
+
+def test_human_added_learning_needs_its_object(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    learning = _human_learning()
+    cache.apply_human_objects(
+        [PIN_NAME],
+        [
+            HumanObject(
+                kind="add",
+                learning=learning,
+                author="human:alice",
+            )
+        ],
+    )
+    assert cache.learnings_by_id(Frontier(), [learning.id]) == []
+    assert cache.learnings_by_id(build_frontier([], [PIN_NAME], []), [learning.id]) == []
+    frontier = build_frontier([], [], [PIN_NAME])
+    assert cache.learnings_by_id(frontier, [learning.id]) == [learning]
+    cache.apply_human_objects(
+        [HIDE_NAME],
+        [
+            HumanObject(
+                kind="hide",
+                learning_id=learning.id,
+                author="human:alice",
+            )
+        ],
+    )
+    hidden = build_frontier([], [], [PIN_NAME, HIDE_NAME])
+    assert cache.learnings_by_id(hidden, [learning.id])[0].hidden
+    assert not cache.learnings_by_id(frontier, [learning.id])[0].hidden
+    assert cache.learnings_by_id(hidden, []) == []
+    assert cache.membership(hidden) == canonical_json(
+        {
+            "candidates": [],
+            "scores": [],
+            "learnings": [[learning.id, False, True]],
+        }
+    )
+    assert cache._conn.execute("SELECT goal_key FROM learnings").fetchone() == (None,)
+    assert cache._conn.execute("SELECT * FROM learning_tags").fetchall() == [(learning.id, "tag")]
+    assert cache._conn.execute("SELECT * FROM learning_evidence").fetchall() == [
+        (learning.id, "c-1")
+    ]
+    assert cache._conn.execute(
+        "SELECT kind, target_id FROM learning_links ORDER BY kind"
+    ).fetchall() == [
+        ("refines", "L-0"),
+        ("supersedes", "L-old"),
+    ]
+    cache.close()
+
+
+def test_membership_is_order_independent(tmp_path: Path) -> None:
+    runs = [FakeRun(str(tmp_path / "runs"), rid) for rid in ("r1", "r2")]
+    for run in runs:
+        cid = "c-" + run.run_id
+        run.commit(
+            run.plan(),
+            run.candidate(cid),
+            run.score("s-" + run.run_id, cid, 1),
+            run.learning("L-" + run.run_id, "Hint", evidence=[cid]),
+        )
+    caches = [ArenaCache(tmp_path / str(i) / "toy.sqlite") for i in range(2)]
+    pin = HumanObject(kind="pin", learning_id="L-r1", author="human:alice")
+    hide = HumanObject(kind="hide", learning_id="L-r1", author="human:alice")
+    batches = [(PIN_NAME, pin), (HIDE_NAME, hide), (REVIEW_NAME, _human_review())]
+    for i, cache in enumerate(caches):
+        for run in runs[:: 1 if i == 0 else -1]:
+            ingest_run(cache, run.store, run.run_id, run.run_root, run.heads[-1])
+        for name, obj in batches[:: 1 if i == 0 else -1]:
+            cache.apply_human_objects([name], [obj])
+    frontier = build_frontier(
+        [(r.run_id, r.run_root, r.heads[-1]) for r in runs],
+        [REVIEW_NAME],
+        [HIDE_NAME, PIN_NAME],
+    )
+    assert caches[0].membership(frontier) == caches[1].membership(frontier)
+    assert caches[0].membership(frontier) == canonical_json(
+        {
+            "candidates": ["c-r1", "c-r2"],
+            "scores": ["s-human", "s-r1", "s-r2"],
+            "learnings": [["L-r1", False, True], ["L-r2", False, False]],
+        }
+    )
+    for cache in caches:
+        cache.close()
+
+
+def test_positions_are_commit_order(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    run.commit(run.plan(), run.candidate("c-1"))
+    head = run.commit(run.candidate("c-2"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    frontier = build_frontier([("r1", run.run_root, head)], [], [])
+    positions = [position for _, position in cache.candidates(frontier)]
+    assert positions == [
+        ((START + timedelta(seconds=seq)).isoformat(timespec="microseconds"), "r1", seq)
+        for seq in (2, 3)
+    ]
+    assert positions[0] < positions[1]
+    cache.close()
+
+
+def test_human_ts_orders_with_journal_ts(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1", start=START - timedelta(seconds=2))
+    head = run.commit(run.plan(), run.candidate("c-1"), run.score("s-run", "c-1", 1))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    cache.apply_human_objects([REVIEW_NAME], [_human_review()])
+    frontier = build_frontier([("r1", run.run_root, head)], [REVIEW_NAME], [])
+    rows = cache.scores(frontier)
+    assert [s.id for s, _ in rows] == ["s-run", "s-human"]
+    assert rows[0][1] == (
+        (START + timedelta(seconds=1)).isoformat(timespec="microseconds"),
+        "r1",
+        3,
+    )
+    assert rows[1][1] == (
+        (START + timedelta(seconds=2)).isoformat(timespec="microseconds"),
+        REVIEW_NAME,
+        0,
+    )
+    assert rows[0][1] < rows[1][1]
+    cache.close()
+
+
+def test_human_objects_are_atomic_idempotent_and_keep_line_order(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    learning = _human_learning()
+    names = [PIN_NAME, REVIEW_NAME, PIN_NAME, REVIEW_NAME, PIN_NAME]
+    objects = [
+        HumanObject(kind="add", learning=learning, author="human:alice"),
+        _human_review("s-1"),
+        HumanObject(kind="hide", learning_id=learning.id, author="human:alice"),
+        _human_review("s-2"),
+        HumanObject(kind="pin", learning_id=learning.id, author="human:alice"),
+    ]
+    assert not cache.has_object(PIN_NAME)
+    for _ in range(2):
+        cache.apply_human_objects(names, objects)
+    assert cache.has_object(PIN_NAME)
+    assert cache.has_object(REVIEW_NAME)
+    frontier = build_frontier([], [REVIEW_NAME, REVIEW_NAME], [PIN_NAME, PIN_NAME])
+    assert cache.flags(frontier) == {learning.id: (True, False)}
+    assert [(s.id, p[2]) for s, p in cache.scores(frontier)] == [("s-1", 0), ("s-2", 1)]
+    assert cache._conn.execute("SELECT line FROM curation_ops ORDER BY line").fetchall() == [
+        (1,),
+        (2,),
+    ]
+    assert cache._conn.execute("SELECT count(*) FROM learning_tags").fetchone() == (1,)
+    expected = cache.membership(frontier)
+    cache.close()
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    assert cache.has_object(PIN_NAME)
+    assert cache.membership(frontier) == expected
+    cache.close()
+
+
+@pytest.mark.parametrize("kind", ["name", "folder", "length", "namespace"])
+def test_invalid_human_batch_leaves_no_partial_rows(tmp_path: Path, kind: str) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    secret = "SENTINEL_SECRET"
+    names = [PIN_NAME, HIDE_NAME]
+    objects = [
+        HumanObject(kind="add", learning=_human_learning(), author="human:alice"),
+        HumanObject(kind="pin", learning_id="L-1", author="human:alice"),
+    ]
+    if kind == "name":
+        names[1] = "toy/curation/" + secret
+    elif kind == "folder":
+        objects[1] = _human_review()
+    elif kind == "length":
+        names.pop()
+    else:
+        objects[1] = HumanObject(
+            kind="add",
+            author="human:alice",
+            learning=_human_learning().model_copy(update={"namespace": secret}),
+        )
+    with pytest.raises(ValueError, match=r"human object|human learning") as caught:
+        cache.apply_human_objects(names, objects)
+    assert_secret_absent(caught.value, secret)
+    assert secret not in "".join(traceback.format_exception(caught.value))
+    for table in ("human_objects", "learnings", "scores", "curation_ops", "learning_tags"):
+        assert cache._conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+    assert not cache._conn.in_transaction
+    cache.close()
+
+
+@pytest.mark.parametrize(
+    "method", ["candidates", "scores", "flags", "learnings_by_id", "plans", "membership"]
+)
+@pytest.mark.parametrize("bad", ["seq", "epoch", "uncovered", "conflict"])
+def test_reads_require_exact_covered_marks(tmp_path: Path, method: str, bad: str) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    old = run.commit(run.plan(), run.candidate("c-1"))
+    head = run.commit(run.candidate("c-2"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    frontier = build_frontier([("r1", run.run_root, old)], [], [])
+    mark = frontier.marks[0]
+    if bad == "seq":
+        frontier = frontier.model_copy(
+            update={"marks": [mark.model_copy(update={"seq": head.seq})]}
+        )
+    elif bad == "epoch":
+        frontier = frontier.model_copy(update={"marks": [mark.model_copy(update={"epoch": 99})]})
+    elif bad == "uncovered":
+        frontier = build_frontier([("r1", run.run_root, run.commit(run.candidate("c-3")))], [], [])
+    else:
+        frontier = frontier.model_copy(
+            update={
+                "marks": frontier.marks
+                + build_frontier([("r1", run.run_root, head)], [], []).marks,
+            }
+        )
+    extra: tuple[object, ...] = ()
+    if method == "learnings_by_id":
+        extra = (["L-1"],)
+    elif method == "plans":
+        extra = ("r1", "g1")
+    with pytest.raises(ChainError):
+        getattr(cache, method)(frontier, *extra)
+    cache.close()
+
+
+@pytest.mark.parametrize("change", ["inputs", "manifest"])
+def test_candidate_filters_preserve_fixed_producing_keys(tmp_path: Path, change: str) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    old = run.commit(run.plan(parts=["a"]), run.candidate("old", part="a"), run.candidate("main"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, old)
+    frontier = build_frontier([("r1", run.run_root, old)], [], [])
+    old_key = goal_key_digest(cache._replay("r1", through_seq=old.seq).candidate_goal_keys["old"])
+    before = cache.membership(frontier)
+    revision = run.plan(revision=1, parts=["a"], first_round=3)
+    goal = revision.payload["plan"]["parts"][0]["goal"]
+    if change == "inputs":
+        goal["inputs"] = {"changed": True}
+    else:
+        goal["files"] = {"globs": [], "manifest": {"input.txt": "a" * 64}}
+    head = run.commit(
+        revision, run.candidate("late", part="a", round=2), run.candidate("new", part="a", round=3)
+    )
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    current = build_frontier([("r1", run.run_root, head)], [], [])
+    new_key = goal_key_digest(cache._replay("r1", through_seq=head.seq).candidate_goal_keys["new"])
+    assert cache.membership(frontier) == before
+    assert [c.id for c, _ in cache.candidates(frontier, part_key=old_key)] == ["old"]
+    assert cache.candidates(frontier, part_key=new_key) == []
+    assert [c.id for c, _ in cache.candidates(current, part_key=old_key)] == ["old", "late"]
+    assert [c.id for c, _ in cache.candidates(current, part_key=new_key)] == ["new"]
+    assert [
+        c.id
+        for c, _ in cache.candidates(
+            current,
+            ids=["new", "new", "old"],
+            goal_key=goal_key_digest(run.goal.key()),
+            run_id="r1",
+            part_key=new_key,
+        )
+    ] == ["new"]
+    assert cache.candidates(current, ids=[]) == []
+    assert cache.candidates(current, goal_key="missing") == []
+    assert cache.candidates(current, run_id="missing") == []
+    duplicate = frontier.model_copy(update={"marks": frontier.marks * 2})
+    assert cache.membership(duplicate) == before
+    assert cache._plan_for_round("r1", "g1", 2, through_seq=head.seq).revision == 0
+    assert cache._plan_for_round("r1", "g1", 3, through_seq=head.seq).revision == 1
+    assert [p.revision for p, _, _ in cache.plans(frontier, "r1", "g1")] == [0]
+    cache.close()
+
+
+def test_human_objects_concurrent_connections_apply_each_line_once(tmp_path: Path) -> None:
+    path = tmp_path / "toy.sqlite"
+    caches = [ArenaCache(path), ArenaCache(path)]
+    barrier = Barrier(2)
+    learning = _human_learning()
+    operations = [
+        HumanObject(kind="add", learning=learning, author="human:a"),
+        HumanObject(kind="pin", learning_id=learning.id, author="human:a"),
+        HumanObject(kind="hide", learning_id=learning.id, author="human:a"),
+    ]
+
+    def apply(cache: ArenaCache) -> None:
+        barrier.wait(timeout=5)
+        cache.apply_human_objects([PIN_NAME] * len(operations), operations)
+
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(apply, cache) for cache in caches]
+            for future in futures:
+                future.result(timeout=10)
+        assert caches[0].flags(build_frontier([], [], [PIN_NAME])) == {learning.id: (False, True)}
+        assert caches[0]._conn.execute("SELECT count(*) FROM curation_ops").fetchone() == (2,)
+        assert caches[0]._conn.execute("SELECT count(*) FROM learning_tags").fetchone() == (1,)
+    finally:
+        for cache in caches:
+            cache.close()
+
+
+def test_human_import_ignores_foreign_namespace(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    foreign = PIN_NAME.replace("toy/", "other/")
+    cache.apply_human_objects(
+        [foreign],
+        [
+            HumanObject(
+                kind="add",
+                learning=_human_learning().model_copy(update={"namespace": "other"}),
+                author="human:a",
+            )
+        ],
+    )
+    assert not cache.has_object(foreign)
+    assert cache.learnings_by_id(build_frontier([], [], [foreign]), [_human_learning().id]) == []
+    cache.apply_human_objects([], [])
+    cache.close()
+
+
+def test_learning_flags_come_only_from_named_curation(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    draft = run.learning("L-1", "Hint", evidence=["c-1"])
+    draft.payload["learning"].update(pinned=True, hidden=True)
+    head = run.commit(run.plan(), run.candidate("c-1"), draft)
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    frontier = build_frontier([("r1", run.run_root, head)], [], [])
+    learning = cache.learnings_by_id(frontier, ["L-1"])[0]
+    assert not learning.pinned
+    assert not learning.hidden
+    learning.tags.append("local edit")
+    assert cache.learnings_by_id(frontier, ["L-1"])[0].tags == []
+    cache.close()
+
+
+def test_failed_human_transaction_can_be_retried(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    learning = _human_learning()
+    objects = [HumanObject(kind="add", learning=learning, author="human:a"), _human_review()]
+    # Force a real SQL failure after the learning and its child rows were inserted.
+    cache._conn.execute(
+        "CREATE TRIGGER refuse_review BEFORE INSERT ON scores "
+        "BEGIN SELECT RAISE(ABORT, 'fixture failure'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="fixture failure"):
+        cache.apply_human_objects([PIN_NAME, REVIEW_NAME], objects)
+    assert not cache.has_object(PIN_NAME)
+    assert not cache.has_object(REVIEW_NAME)
+    assert cache._conn.execute("SELECT count(*) FROM learning_tags").fetchone() == (0,)
+    assert cache._conn.execute("SELECT count(*) FROM learnings").fetchone() == (0,)
+    assert not cache._conn.in_transaction
+    cache._conn.execute("DROP TRIGGER refuse_review")
+    cache.apply_human_objects([PIN_NAME, REVIEW_NAME], objects)
+    assert cache.has_object(PIN_NAME)
+    assert cache.has_object(REVIEW_NAME)
+    cache.close()

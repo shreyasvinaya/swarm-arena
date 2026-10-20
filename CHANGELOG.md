@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Open arena caches retain committed replay checkpoints across refreshes, fold
   only missing events, and discard uncommitted state after rollback.
+- Arena cache reads use exact recorded frontiers, immutable producing keys, and
+  named human review and curation objects for reproducible snapshot membership.
 
 - Local arena caches incrementally index committed run chains, preserve producing
   part identities across replans, and validate historical frontier coverage.

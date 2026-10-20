@@ -7,22 +7,33 @@ import sqlite3
 import time
 from collections.abc import Sequence
 from copy import deepcopy
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
+from pydantic import JsonValue
+
+from swarm_arena._board.human_objects import (
+    HumanObject,
+    _check_folder_payload,
+    _validate_human_key,
+    fold_curation,
+    human_object_order,
+)
 from swarm_arena._errors import ChainError, _core_error
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.segment import parse_segment_name
+from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.results import Candidate, Learning, Score
 
 _LOG = logging.getLogger("swarm_arena.board")
+Position = tuple[str, str, int]
 _SCHEMA = (
     "runs(run_id TEXT PRIMARY KEY, run_root TEXT NOT NULL)",
     (
@@ -291,6 +302,481 @@ class ArenaCache:
                 "SELECT run_root FROM runs WHERE run_id=?", (run_id,)
             ).fetchone()
             return row[0] if row else None
+
+    def apply_human_objects(self, names: Sequence[str], objects: Sequence[HumanObject]) -> None:
+        """
+        Atomically index complete human objects, retaining their original lines.
+
+        Parameters
+        ----------
+        names : Sequence[str]
+            One arena-relative name per operation, repeated for each object's
+            lines. Supply every line of each named object in its original order.
+        objects : Sequence[HumanObject]
+            Corresponding validated operations. Foreign namespaces are ignored.
+
+        Raises
+        ------
+        ValueError
+            If lengths, reserved locations, folders, or namespaces disagree.
+
+        Notes
+        -----
+        Each name is immutable. Reapplying it has no effect. The line number is
+        zero-based within that name, even when names are interleaved. Completion
+        markers and indexed rows commit together under the cache lock.
+
+        Examples
+        --------
+        >>> cache.apply_human_objects([name], [operation])  # doctest: +SKIP
+        """
+        if len(names) != len(objects):
+            raise _core_error(ValueError, "human object names and operations must align")
+        grouped: dict[str, list[HumanObject]] = {}
+        for name, obj in zip(names, objects, strict=True):
+            folder = _validate_human_key(name)
+            _check_folder_payload(folder, [obj])
+            if obj.learning is not None and obj.learning.namespace != name.split("/", 1)[0]:
+                raise _core_error(ValueError, "human learning namespace does not match object")
+            grouped.setdefault(name, []).append(obj)
+        with self._lock:
+            pending: list[str] = []
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for name in sorted(grouped, key=human_object_order):
+                    if name.split("/", 1)[0] != self.namespace or self.has_object(name):
+                        continue
+                    ts = datetime.strptime(human_object_order(name)[0], "%Y%m%dT%H%M%S.%fZ")
+                    stamp = ts.replace(tzinfo=UTC).isoformat(timespec="microseconds")
+                    for line, obj in enumerate(grouped[name]):
+                        self._index_human(name, line, stamp, obj, pending)
+                    self._conn.execute("INSERT INTO human_objects VALUES (?)", (name,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self.warnings.extend(pending)
+            for warning in pending:
+                _LOG.warning("%s", warning)
+
+    def _index_human(
+        self, name: str, line: int, ts: str, obj: HumanObject, pending: list[str]
+    ) -> None:
+        """Project one validated operation inside its object's transaction."""
+        if obj.kind in {"pin", "hide"}:
+            self._conn.execute(
+                "INSERT INTO curation_ops VALUES (?, ?, ?, ?)",
+                (name, line, obj.kind, obj.learning_id),
+            )
+        elif obj.kind == "review":
+            assert obj.score is not None
+            score = obj.score
+            self._insert(
+                "scores",
+                dict(
+                    id=score.id,
+                    source="review",
+                    run_id=None,
+                    epoch=None,
+                    seq=None,
+                    ts=ts,
+                    obj_name=name,
+                    line=line,
+                    candidate_id=score.candidate_id,
+                    judge=score.judge,
+                    rubric_hash=score.rubric_hash,
+                    panel_hash=score.panel_hash,
+                    json=score.model_dump_json(),
+                ),
+                "score",
+                pending,
+            )
+        else:
+            assert obj.learning is not None
+            learning = obj.learning
+            if self._insert(
+                "learnings",
+                dict(
+                    id=learning.id,
+                    source="human",
+                    run_id=learning.run_id,
+                    epoch=None,
+                    seq=None,
+                    ts=ts,
+                    obj_name=name,
+                    line=line,
+                    goal_id=learning.goal_id,
+                    goal_key=None,
+                    author=learning.author,
+                    verified=learning.verified,
+                    from_human=learning.from_human,
+                    json=learning.model_dump_json(),
+                ),
+                "learning",
+                pending,
+            ):
+                self._conn.executemany(
+                    "INSERT INTO learning_tags VALUES (?, ?)",
+                    [(learning.id, tag) for tag in learning.tags],
+                )
+                self._conn.executemany(
+                    "INSERT INTO learning_evidence VALUES (?, ?)",
+                    [(learning.id, cid) for cid in learning.evidence],
+                )
+                self._conn.executemany(
+                    "INSERT INTO learning_links VALUES (?, ?, ?)",
+                    [
+                        (learning.id, kind, target)
+                        for kind in ("refines", "supersedes")
+                        for target in getattr(learning, kind)
+                    ],
+                )
+
+    def has_object(self, name: str) -> bool:
+        """
+        Test whether a complete human object has been indexed.
+
+        Parameters
+        ----------
+        name : str
+            Exact arena-relative object name.
+
+        Returns
+        -------
+        bool
+            Whether the object's transaction committed in this namespace.
+
+        Examples
+        --------
+        >>> cache.has_object(name)  # doctest: +SKIP
+        True
+        """
+        with self._lock:
+            return (
+                self._conn.execute("SELECT 1 FROM human_objects WHERE name=?", (name,)).fetchone()
+                is not None
+            )
+
+    def _frontier_sql(self, frontier: Frontier, names: Sequence[str]) -> tuple[str, list[Any]]:
+        """Reuse exact committed-mark validation before constructing membership SQL."""
+        # Ingest depends on this cache; defer its shared validation import.
+        from swarm_arena._board.ingest import _validate_marks
+
+        marks = _validate_marks(frontier.marks)
+        for mark in marks:
+            if not self._covered(
+                mark.run_id, Head(epoch=mark.epoch, seq=mark.seq, segment=mark.segment)
+            ):
+                raise _core_error(ChainError, "frontier mark is not covered by cache")
+        marked = [(mark.run_id, mark.seq) for mark in marks] or [("", -1)]
+        named = sorted(set(names)) or [""]
+        sql = (
+            "WITH marks(run_id, seq) AS (VALUES "
+            + ",".join("(?,?)" for _ in marked)
+            + "), objs(name) AS (VALUES "
+            + ",".join("(?)" for _ in named)
+            + ") "
+        )
+        return sql, [value for pair in marked for value in pair] + list(named)
+
+    def _item_rows(
+        self,
+        frontier: Frontier,
+        table: Literal["candidates", "scores", "learnings"],
+        *,
+        ids: Sequence[str] | None = None,
+        filters: dict[str, str] | None = None,
+        candidate_ids: Sequence[str] | None = None,
+    ) -> list[tuple[str, Position]]:
+        """Read immutable rows using only their marked run or named source object."""
+        names = frontier.reviews if table == "scores" else frontier.curation
+        cte, params = self._frontier_sql(frontier, names)
+        marked = "EXISTS (SELECT 1 FROM marks m WHERE m.run_id=i.run_id AND i.seq<=m.seq)"
+        if table == "candidates":
+            included = marked
+            origin, ordinal = "i.run_id", "i.seq"
+        else:
+            source = "review" if table == "scores" else "human"
+            included = (
+                f"((i.source='run' AND {marked}) OR (i.source='{source}' "
+                "AND EXISTS (SELECT 1 FROM objs WHERE name=i.obj_name)))"
+            )
+            origin, ordinal = "coalesce(i.obj_name, i.run_id)", "coalesce(i.line, i.seq)"
+        clauses = [included]
+        for column, values in (("id", ids), ("candidate_id", candidate_ids)):
+            if values is not None:
+                clauses.append(
+                    f"i.{column} IN (" + ",".join("?" for _ in values) + ")" if values else "0"
+                )
+                params.extend(values)
+        for column, value in (filters or {}).items():
+            clauses.append(f"i.{column}=?")
+            params.append(value)
+        rows = self._conn.execute(
+            cte
+            + f"SELECT i.json, i.ts, {origin}, {ordinal} FROM {table} i WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY i.ts, {origin}, {ordinal}, i.id",
+            params,
+        ).fetchall()
+        return [(data, (ts, source, seq)) for data, ts, source, seq in rows]
+
+    def candidates(
+        self,
+        frontier: Frontier,
+        *,
+        ids: Sequence[str] | None = None,
+        goal_key: str | None = None,
+        part_key: str | None = None,
+        run_id: str | None = None,
+    ) -> list[tuple[Candidate, Position]]:
+        """
+        Read candidates within exact committed marks and producing-key filters.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Covered committed marks; later cached events remain invisible.
+        ids : Sequence[str] or None, default=None
+            Candidate IDs to include; an empty sequence selects none.
+        goal_key : str or None, default=None
+            Main goal identity digest.
+        part_key : str or None, default=None
+            Immutable producing identity digest, never a later revision's key.
+        run_id : str or None, default=None
+            Producing run identifier.
+
+        Returns
+        -------
+        list[tuple[Candidate, Position]]
+            Independent models and UTC timestamp/run/sequence positions, ordered
+            by position. All supplied filters are intersected.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered. Reads never fetch.
+
+        Examples
+        --------
+        >>> rows = cache.candidates(frontier, ids=['c-1'])  # doctest: +SKIP
+        """
+        with self._lock:
+            filters = {
+                key: value
+                for key, value in (
+                    ("goal_key", goal_key),
+                    ("part_key", part_key),
+                    ("run_id", run_id),
+                )
+                if value is not None
+            }
+            return [
+                (Candidate.model_validate_json(data), position)
+                for data, position in self._item_rows(
+                    frontier, "candidates", ids=ids, filters=filters
+                )
+            ]
+
+    def scores(
+        self,
+        frontier: Frontier,
+        *,
+        candidate_ids: Sequence[str] | None = None,
+        judge: str | None = None,
+    ) -> list[tuple[Score, Position]]:
+        """
+        Read marked journal scores and exactly named human review scores.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Covered marks and exact review names. Review receipts add no scores.
+        candidate_ids : Sequence[str] or None, default=None
+            Candidate IDs to include; an empty sequence selects none.
+        judge : str or None, default=None
+            Exact recorded judge name.
+
+        Returns
+        -------
+        list[tuple[Score, Position]]
+            Scores ordered by UTC timestamp, run/object name, and sequence/line.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered.
+
+        Examples
+        --------
+        >>> rows = cache.scores(frontier, judge='human:alice')  # doctest: +SKIP
+        """
+        with self._lock:
+            filters = {} if judge is None else {"judge": judge}
+            return [
+                (Score.model_validate_json(data), position)
+                for data, position in self._item_rows(
+                    frontier, "scores", candidate_ids=candidate_ids, filters=filters
+                )
+            ]
+
+    def flags(self, frontier: Frontier) -> dict[str, tuple[bool, bool]]:
+        """
+        Fold pins and hides from only the frontier's named curation objects.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Covered marks and exact curation names.
+
+        Returns
+        -------
+        dict[str, tuple[bool, bool]]
+            Learning IDs mapped to pinned/hidden flags. The latest operation by
+            object timestamp, full name, and line wins, even for an absent ID.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered.
+
+        Examples
+        --------
+        >>> flags = cache.flags(frontier)  # doctest: +SKIP
+        """
+        with self._lock:
+            cte, params = self._frontier_sql(frontier, frontier.curation)
+            rows = self._conn.execute(
+                cte + "SELECT obj_name, line, kind, learning_id FROM curation_ops "
+                "WHERE EXISTS (SELECT 1 FROM objs WHERE name=obj_name)",
+                params,
+            ).fetchall()
+            return fold_curation(
+                (
+                    name,
+                    line,
+                    HumanObject(
+                        kind=kind,
+                        learning_id=lid,
+                        author="human:cache",
+                    ),
+                )
+                for name, line, kind, lid in rows
+            )
+
+    def _learnings(self, frontier: Frontier, ids: Sequence[str] | None = None) -> list[Learning]:
+        """Materialize frontier members, including hidden and superseded records."""
+        rows = self._item_rows(frontier, "learnings", ids=ids)
+        flags = self.flags(frontier)
+        result: list[Learning] = []
+        for data, _ in rows:
+            learning = Learning.model_validate_json(data)
+            pinned, hidden = flags.get(learning.id, (False, False))
+            result.append(learning.model_copy(update={"pinned": pinned, "hidden": hidden}))
+        return result
+
+    def learnings_by_id(self, frontier: Frontier, ids: Sequence[str]) -> list[Learning]:
+        """
+        Read member learnings with frontier-local flags, including hidden ones.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Covered marks and exact human-object names.
+        ids : Sequence[str]
+            Requested learning IDs. Unknown and nonmember IDs are omitted.
+
+        Returns
+        -------
+        list[Learning]
+            Independent models in commit/object position order. Hidden and
+            superseded records remain available for explicit-ID inspection.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered.
+
+        Examples
+        --------
+        >>> rows = cache.learnings_by_id(frontier, ['L-1'])  # doctest: +SKIP
+        """
+        with self._lock:
+            return self._learnings(frontier, ids)
+
+    def plans(self, frontier: Frontier, run_id: str, goal_id: str) -> list[tuple[Plan, str, int]]:
+        """
+        Read committed plan revisions for one marked run and goal.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Covered committed marks, without any latest-head fallback.
+        run_id : str
+            Owning run identifier.
+        goal_id : str
+            Owning main goal identifier.
+
+        Returns
+        -------
+        list[tuple[Plan, str, int]]
+            Plan, recorded origin, and event sequence, ordered by revision.
+            Activation remains available through the private replay lookups;
+            publication of a revision does not imply immediate activation.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered.
+
+        Examples
+        --------
+        >>> rows = cache.plans(frontier, 'r1', 'g1')  # doctest: +SKIP
+        """
+        with self._lock:
+            cte, params = self._frontier_sql(frontier, [])
+            rows = self._conn.execute(
+                cte + "SELECT plan_json, origin, p.seq FROM plans p WHERE p.run_id=? AND goal_id=? "
+                "AND EXISTS (SELECT 1 FROM marks m WHERE m.run_id=p.run_id AND p.seq<=m.seq) "
+                "ORDER BY revision",
+                [*params, run_id, goal_id],
+            ).fetchall()
+            return [(Plan.model_validate_json(data), origin, seq) for data, origin, seq in rows]
+
+    def membership(self, frontier: Frontier) -> bytes:
+        """
+        Encode sorted candidate, score, and flagged learning membership.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Exact covered journal marks and human-object names.
+
+        Returns
+        -------
+        bytes
+            Canonical JSON with sorted candidates, scores, and learning triples
+            containing ID, pinned, and hidden. Hidden learnings are retained.
+
+        Raises
+        ------
+        ChainError
+            If marks conflict or are not exactly covered.
+
+        Examples
+        --------
+        >>> encoded = cache.membership(frontier)  # doctest: +SKIP
+        """
+        with self._lock:
+            members: dict[str, JsonValue] = {
+                "candidates": [cid for cid in sorted(c.id for c, _ in self.candidates(frontier))],
+                "scores": [sid for sid in sorted(s.id for s, _ in self.scores(frontier))],
+                "learnings": [
+                    [learning.id, learning.pinned, learning.hidden]
+                    for learning in sorted(self._learnings(frontier), key=lambda item: item.id)
+                ],
+            }
+            return canonical_json(members)
 
     def _covered(self, run_id: str, head: Head) -> bool:
         """Validate full metadata and ancestry, rejecting divergent older marks."""
