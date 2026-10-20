@@ -23,7 +23,6 @@ from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
     COLLECTING,
     RELEASE,
-    STAGING,
     WRITE,
     BadCollectTool,
     BlockingCollectTool,
@@ -31,7 +30,6 @@ from _fakes.tools import (
     OkCollectTool,
     PyTool,
     SlowCollectTool,
-    SlowCommandTool,
     UnreadFilesTool,
     make_job,
 )
@@ -621,26 +619,45 @@ async def test_stop_facts_are_stamped_on_the_partial(
 
 
 async def test_cancel_during_staging_delivers_nothing(
-    local_executor: LocalExecutor, tmp_path: Path
+    local_executor: LocalExecutor,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     got: list[ToolOutput] = []
+    entered = threading.Event()
+    release = threading.Event()
+    threads: list[threading.Thread] = []
+    original = PyTool.command
+
+    def blocked(tool: PyTool, request: ToolRequest, workspace: Path) -> Command:
+        threads.append(threading.current_thread())
+        entered.set()
+        release.wait(30)
+        return original(tool, request, workspace)
 
     async def on_partial(o: ToolOutput) -> None:
         got.append(o)
 
     async def staging() -> bool:
-        return STAGING.is_set()
+        return entered.is_set()
 
-    STAGING.clear()
+    monkeypatch.setattr(PyTool, "command", blocked)
     marker = tmp_path / "ran"
-    job = tool_job(
-        tmp_path, f"open({str(marker)!r}, 'w')", tool_cls=SlowCommandTool, on_partial=on_partial
-    )
-    await cancel_when(lambda: local_executor.submit(job), staging)
-    await anyio.sleep(0.5)
+    job = tool_job(tmp_path, f"open({str(marker)!r}, 'w')", on_partial=on_partial)
+    try:
+        await cancel_when(lambda: local_executor.submit(job), staging)
+        [workspace] = (tmp_path / "ws").iterdir()
+        assert workspace.is_dir()
+        assert f"retaining workspace {workspace}: preparation is still running" in caplog.text
+    finally:
+        release.set()
+        for thread in threads:
+            await anyio.to_thread.run_sync(thread.join, 5)
+            assert not thread.is_alive()
     assert got == []
     assert not marker.exists()
-    assert list((tmp_path / "ws").iterdir()) == []
+    assert workspace.is_dir()
 
 
 async def test_failed_cancel_path_upload_sends_no_unstored_refs(

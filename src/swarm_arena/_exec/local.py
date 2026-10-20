@@ -1,7 +1,8 @@
 """Run tool and command jobs on this host with bounded resources and private workspaces."""
 
+import logging
 import os
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Final, cast
 
 import anyio
 from pydantic import ConfigDict, Field
@@ -10,14 +11,17 @@ from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local_run import _NOT_AN_OUTPUT as _NOT_AN_OUTPUT
 from swarm_arena._exec.local_run import _JobRun
-from swarm_arena._exec.local_stage import _stage
+from swarm_arena._exec.local_stage import _Preparation
 from swarm_arena._exec.local_workspace import _open_workspace, _remove_workspace
 from swarm_arena._exec.pool import ResourcePool
 from swarm_arena._exec.procinfo import group_has_live_member, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.tooling import ToolOutput
+
+_LOG: Final = logging.getLogger(__name__)
 
 
 class LocalExecutor(Executor):
@@ -41,6 +45,12 @@ class LocalExecutor(Executor):
 
     Construction does no I/O; the pool and the host id are made on the first
     ``submit``.
+
+    Tool construction and command preparation run in a daemon thread.
+    Cancellation stops waiting and releases the resource slot. Preparation
+    still running at cancellation retains its workspace, with a warning naming
+    the path, even if it later returns. Its result is discarded: the executor
+    never launches that command or invokes lifecycle callbacks for it.
 
     Parameters
     ----------
@@ -234,8 +244,13 @@ class LocalExecutor(Executor):
         unsafe, or over ``max_output_bytes`` gives status ERROR with no files.
         Uploaded file references are named after the file's basename, as
         ``collect_output_files`` makes them. The workspace is removed unless
-        ``keep_workspaces`` is set; a failed removal is logged as a warning and
-        never replaces the output or the cancellation.
+        ``keep_workspaces`` is set or preparation is still running when cancelled.
+        In the latter case, a warning identifies the retained workspace; it is
+        never removed automatically, even after a late preparation return.
+        Cancellation releases the slot without waiting for user construction
+        or command preparation, and their late results cannot start a command
+        or invoke ``on_started``/``on_partial``. A failed removal is logged as a
+        warning and never replaces the output or the cancellation.
 
         Parameters
         ----------
@@ -283,14 +298,19 @@ class LocalExecutor(Executor):
                 workspace, artifacts = await anyio.to_thread.run_sync(
                     _open_workspace, self.config.workspace_root, job
                 )
+            preparation = _Preparation(job, workspace, artifacts)
             try:
-                staged = await anyio.to_thread.run_sync(_stage, job, workspace, artifacts)
+                staged = await run_sync_daemon(preparation.run)
+                # Deliver a pending cancel before any launch or lifecycle callback.
+                await anyio.lowlevel.checkpoint()
                 job_run = _JobRun(job, staged, workspace, artifacts, self.config)
                 if staged.fault is not None:
                     return await anyio.to_thread.run_sync(job_run.fault_output, staged.fault)
                 return await job_run.run(sup, self._rlimits(job))
             finally:
-                if not self.config.keep_workspaces:
+                if not preparation.finished.is_set():
+                    _LOG.warning("retaining workspace %s: preparation is still running", workspace)
+                elif not self.config.keep_workspaces:
                     with anyio.CancelScope(shield=True):
                         await anyio.to_thread.run_sync(_remove_workspace, workspace)
 

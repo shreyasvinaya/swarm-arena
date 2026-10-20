@@ -4,6 +4,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
 
+from swarm_arena._exec import env as exec_env
 from swarm_arena._exec.env import BASE_ENV_NAMES, build_env, read_secrets_file, tool_env_vars
 from swarm_arena.tool import Command
 
@@ -94,14 +95,18 @@ def test_secrets_file_preserves_values_and_last_duplicate(tmp_path: Path) -> Non
     ],
 )
 def test_unreadable_secrets_file_is_sanitized(
-    monkeypatch: pytest.MonkeyPatch, error: Exception
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    def fail_read(self: Path, *, encoding: str) -> str:
+    import os
+
+    def fail_read(fd: int, size: int) -> bytes:
         raise error
 
-    monkeypatch.setattr(Path, "read_text", fail_read)
+    path = tmp_path / "s.env"
+    path.write_text("A=1")
+    monkeypatch.setattr(os, "read", fail_read)
     with pytest.raises(ValueError, match="cannot read secrets file") as exc:
-        read_secrets_file("s.env")
+        read_secrets_file(str(path))
     assert_secret_absent(exc.value, "0996cfd4-7bda-48c7-938c-cda7b0dd532d")
 
 
@@ -131,11 +136,11 @@ def test_build_env_reads_file_once_only_when_needed(
 ) -> None:
     reads: list[Path] = []
 
-    def read(self: Path, *, encoding: str) -> str:
-        reads.append(self)
-        return "FROM_FILE=file\nSECOND=two\nUNLISTED=hidden\nNODE=file\n"
+    def read(path: str) -> dict[str, str]:
+        reads.append(Path(path))
+        return {"FROM_FILE": "file", "SECOND": "two", "UNLISTED": "hidden", "NODE": "file"}
 
-    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(exec_env, "read_secrets_file", read)
     path = str(tmp_path / "s.env")
     job = make_job(secrets_file=path, secret_env=("NODE",))
     command = Command(argv=["x"], env=["NODE"])
@@ -166,12 +171,12 @@ def test_build_env_reads_empty_file_only_once(
 ) -> None:
     reads = 0
 
-    def read(self: Path, *, encoding: str) -> str:
+    def read(path: str) -> dict[str, str]:
         nonlocal reads
         reads += 1
-        return ""
+        return {}
 
-    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(exec_env, "read_secrets_file", read)
     env = build_env(
         make_job(secrets_file="s.env", secret_env=("THIRD",)),
         Command(argv=["x"], env=["FIRST", "SECOND"]),
@@ -180,3 +185,68 @@ def test_build_env_reads_empty_file_only_once(
     )
     assert reads == 1
     assert env == {"SWARM_ARENA_RESULT": str(tmp_path / "swarm/result.json")}
+
+
+@pytest.mark.parametrize("source", ["fifo", "device"])
+def test_nonregular_secrets_source_is_refused_promptly(tmp_path: Path, source: str) -> None:
+    import os
+    import subprocess
+    import sys
+
+    path = tmp_path / "s.env" if source == "fifo" else Path("/dev/null")
+    if source == "fifo":
+        os.mkfifo(path)
+    script = """
+import sys
+from _fakes.secrecy import assert_secret_absent
+from swarm_arena._exec.env import read_secrets_file
+try:
+    read_secrets_file(sys.argv[1])
+except ValueError as error:
+    assert 'regular file' in str(error)
+    assert_secret_absent(error, 'bd1281fb-d6af-4260-b9c9-f806bef9dfeb')
+else:
+    raise AssertionError('non-regular source accepted')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_secrets_file_read_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from _fakes.read_counts import count_reads
+
+    secret = "bd1281fb-d6af-4260-b9c9-f806bef9dfeb"
+    path = tmp_path / "s.env"
+    path.write_bytes(f"KEY={secret}".encode() + b"x" * (2 * 2**20))
+    counts: list[int] = []
+    with count_reads(monkeypatch, counts), pytest.raises(ValueError, match="1 MiB") as exc:
+        read_secrets_file(str(path))
+    assert sum(counts) == 2**20 + 1
+    assert_secret_absent(exc.value, secret)
+
+
+def test_secrets_file_at_byte_limit_and_regular_symlink(tmp_path: Path) -> None:
+    path = tmp_path / "s.env"
+    value = "é" * ((2**20 - 4) // 2)
+    path.write_bytes(f"KEY={value}".encode())
+    assert path.stat().st_size == 2**20
+    assert read_secrets_file(str(path)) == {"KEY": value}
+    link = tmp_path / "link.env"
+    link.symlink_to(path)
+    assert read_secrets_file(str(link)) == {"KEY": value}
+
+
+def test_invalid_utf8_secrets_is_sanitized(tmp_path: Path) -> None:
+    secret = "bd1281fb-d6af-4260-b9c9-f806bef9dfeb"
+    path = tmp_path / "s.env"
+    path.write_bytes(f"KEY={secret}".encode() + b"\xff")
+    with pytest.raises(ValueError, match="cannot read secrets file") as exc:
+        read_secrets_file(str(path))
+    assert_secret_absent(exc.value, secret)

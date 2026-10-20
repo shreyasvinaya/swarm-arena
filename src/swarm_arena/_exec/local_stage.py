@@ -2,7 +2,8 @@
 
 import os
 import sys
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from swarm_arena._exec.env import build_env
@@ -41,6 +42,23 @@ class _Staged:
     fault: str | None
     timeout_s: float | None
     grace_s: float
+
+
+@dataclass
+class _Preparation:
+    """Own a workspace until all synchronous preparation has stopped using it."""
+
+    job: Job
+    workspace: Path
+    artifacts: ArtifactStore
+    finished: threading.Event = field(default_factory=threading.Event, init=False)
+
+    def run(self) -> _Staged:
+        """Prepare once, marking workspace access finished even on a user error."""
+        try:
+            return _stage(self.job, self.workspace, self.artifacts)
+        finally:
+            self.finished.set()
 
 
 def _stage(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged:

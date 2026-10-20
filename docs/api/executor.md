@@ -55,6 +55,30 @@ The execution timeout is the smaller non-`None` value of `Command.timeout_s`
 and `Job.timeout_s`; if both are `None`, there is no execution timeout. Shutdown
 grace is the smaller of `Command.grace_s` and `Job.grace_s`.
 
+Tool construction (`Ref.build`) and command preparation (`Tool.command`) run in
+a daemon thread. Cancelling `submit` stops waiting and releases the resource
+slot even if either callback never returns. An abandoned preparation's result
+is discarded; the executor never launches its command or calls `on_started` or
+`on_partial`, including after a late return. The daemon cannot keep the Python
+interpreter alive, but cancellation cannot forcibly stop its Python code.
+
+If preparation is still running at cancellation, the executor retains the
+workspace and logs a warning with its path, including when `keep_workspaces`
+is false. It does not remove that workspace automatically after a late return.
+Remove it only after establishing that preparation has stopped using it, or
+after the executor process has exited. Ordinary preparation exceptions and
+KeyboardInterrupt still propagate; `SystemExit` from `Tool.command` remains a
+job error without launching the command.
+
+The configured secrets source must open as a regular file and contain at most
+**1 MiB (1,048,576 bytes)** of UTF-8 text. The executor reads at most 1 MiB plus
+one byte to detect overflow. FIFOs and devices are refused without waiting for
+a writer; human-configured symlinks to regular files remain supported. No new
+file-mode or ownership restriction applies to this source. Entries remain
+`KEY=VALUE`, with blank lines and full-line comments ignored, literal quotes
+and inline `#` preserved, and the last duplicate key taking precedence. Errors
+identify the path and, for malformed entries, the line; they omit contents.
+
 On a timeout or a cancel, the group gets SIGTERM, then `grace_s`, then `collect`
 for the partial output, then SIGKILL. The output gets the stop status, and
 `partial=True` if and only if that collect returned a valid `ToolOutput` that
