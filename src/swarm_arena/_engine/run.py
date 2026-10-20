@@ -70,7 +70,13 @@ def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[s
             teams = [(team, list(enumerate(rounds, 1))) for team in plan.teams]
             if plan.converge.mode == "team" and plan.converge.team is not None:
                 teams.append(
-                    (plan.converge.team, [(len(rounds) + 1, plan.converge.round or rounds[-1])])
+                    (
+                        plan.converge.team,
+                        [
+                            (number, plan.converge.round or rounds[-1])
+                            for number in range(1, len(rounds) + 2)
+                        ],
+                    )
                 )
             for team, specs in teams:
                 for agent in team.agents:
@@ -215,6 +221,9 @@ class RunRunner:
         Preapproval snapshots use a temporary store removed on refusal. Approved
         snapshots are promoted without rereading sources. Estimate hooks run in
         abandonable daemon threads and assume empty, unknown future inputs.
+        Executor shutdown is shielded for at most ``config.settle_timeout_s``.
+        On expiry the original result or exception is preserved; shutdown
+        failures never replace an exception already raised by the run.
 
         Examples
         --------
@@ -229,7 +238,7 @@ class RunRunner:
             seen.add(plan.goal.id)
         artifacts = ArtifactStore(open_store(self.config.artifact_root))
         executor: Executor | None = None
-        fenced = False
+        failed = False
         try:
             with TemporaryDirectory(prefix="swarm-arena-approval-") as directory:
                 stage = Path(directory)
@@ -256,18 +265,38 @@ class RunRunner:
                 total = sum(slices.values(), Amount())
                 if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
                     raise RuntimeError("reserve cannot hold the final slices")
-                executor = await run_sync_daemon(_build_executor, self.config)
+                try:
+                    executor = await run_sync_daemon(_build_executor, self.config)
+                except Exception as exc:
+                    if _has_fenced(exc):
+                        raise
+                    raise RuntimeError(
+                        f"executor construction failed: {type(exc).__name__}"
+                    ) from None
                 try:
                     capacity = await executor.capacity()
+                    invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
+                    if not invalid_capacity:
+                        warnings.extend(_capacity_warning(admitted, capacity))
                 except Exception as exc:
                     if _has_fenced(exc):
                         raise
                     raise RuntimeError(f"executor capacity failed: {type(exc).__name__}") from None
-                warnings.extend(_capacity_warning(admitted, capacity))
-                if self.approve is not None and not await self.approve(
-                    estimate.to_estimate(), warnings
-                ):
-                    raise RuntimeError("run not approved")
+                if invalid_capacity:
+                    raise RuntimeError(
+                        f"executor capacity failed: {type(capacity).__name__}"
+                    ) from None
+                if self.approve is not None:
+                    try:
+                        approved = await self.approve(estimate.to_estimate(), warnings)
+                    except Exception as exc:
+                        if _has_fenced(exc):
+                            raise
+                        raise RuntimeError(f"approval failed: {type(exc).__name__}") from None
+                    if type(approved) is not bool:
+                        raise RuntimeError(f"approval failed: {type(approved).__name__}") from None
+                    if not approved:
+                        raise RuntimeError("run not approved")
                 await run_preflight(admitted, self.config, executor)
                 self.run_id = self.run_id or new_run_id(utc_now())
                 manifest = await build_manifest_async(
@@ -276,21 +305,22 @@ class RunRunner:
                 await anyio.to_thread.run_sync(_promote, stage, artifacts)
             return await self._execute(executor, artifacts, estimate, slices, warnings, manifest)
         except BaseException as exc:
-            fenced = _has_fenced(exc)
-            if fenced:
+            failed = True
+            if _has_fenced(exc):
                 raise Fenced() from None
             raise
         finally:
             if executor is not None:
-                with anyio.CancelScope(shield=True):
+                with anyio.move_on_after(self.config.settle_timeout_s, shield=True) as shutdown:
                     try:
                         await executor.aclose()
                     except Exception as exc:
-                        if fenced or _has_fenced(exc):
-                            raise Fenced() from None
-                        raise RuntimeError(
-                            f"executor shutdown failed: {type(exc).__name__}"
-                        ) from None
+                        if not failed and not shutdown.cancel_called:
+                            if _has_fenced(exc):
+                                raise Fenced() from None
+                            raise RuntimeError(
+                                f"executor shutdown failed: {type(exc).__name__}"
+                            ) from None
 
     async def _execute(
         self,
