@@ -357,16 +357,17 @@ instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
 
-### When a run ends with status `error`
+### When a run does not end with status `ok`
 
-The kit shows the last 2 KB of the run's stderr log when a tool run, or a
-command that a check or judge runs, ends with status `error`. If the kit call
-then returns, each such run gives a `UserWarning` with that text. If the call
-raises an error after such a run instead (a failed contract assert, or an error
-from your own code that the kit passes on, such as a `KeyError` in
-`fingerprint()`, `check()`, or `judge()`), the kit adds the text to that error
-as a note and raises the error unchanged. To keep the whole workspace, with its
-logs, pass your own executor:
+The kit shows the last 2 KB of a run's stderr log for a tool run, or a command
+that a check or judge runs, that does not end with status `ok`. If the kit call
+then returns, each run with status `error` gives a `UserWarning` with that text.
+If the call raises an error instead (a failed contract assert, or an error from
+your own code that the kit passes on, such as a `KeyError` in `fingerprint()`,
+`check()`, or `judge()`), the kit adds the tail of each run whose status is not
+`ok` (`error`, `timeout`, `cancelled`, and so on) to that error as a note and
+raises the error unchanged. To keep the whole workspace, with its logs, pass
+your own executor:
 
 ```python
 # tests/test_logs.py
