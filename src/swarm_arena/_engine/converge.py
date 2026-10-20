@@ -151,8 +151,13 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
             goal.final_parts = {}
             for part in goal.plan.parts:
                 candidate = kept_best(state, part.name)
+                kept = goal.kept_parts.get(part.name)
                 goal.final_parts[part.name] = (
-                    candidate.id if candidate else goal.kept_parts.get(part.name)
+                    candidate.id
+                    if candidate
+                    else kept
+                    if any(c.id == kept for c in state.candidates)
+                    else None
                 )
             return []
         identity = state.ranking_identity.get(None)

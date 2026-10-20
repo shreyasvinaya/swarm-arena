@@ -13,6 +13,7 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._model.base import FrozenModel, Origin
 from swarm_arena._model.board_types import Frontier
+from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.planning_types import Decision
@@ -172,6 +173,9 @@ class RunState:
     processes, reservations, stop state, elapsed time, epoch, and id counters.
     ``ledger_events`` retains whole budget events for history-only accounting.
     ``manifest`` retains the run_started metadata independently of its event.
+    ``candidate_goal_keys`` retains each candidate's producing GoalKey, derived
+    from its applicable committed revision when tool_end is folded. Historical
+    evidence is never relabeled by a later same-name part revision.
     ``llm_request_sha256`` is reserved for the later LLM event fold.
 
     Examples
@@ -188,6 +192,7 @@ class RunState:
     plan_first_rounds: dict[str, list[int]] = field(default_factory=dict)
     goals: dict[str, GoalState] = field(default_factory=dict)
     candidates: dict[str, Candidate] = field(default_factory=dict)
+    candidate_goal_keys: dict[str, GoalKey] = field(default_factory=dict)
     fingerprints: dict[str, str | None] = field(default_factory=dict)
     scores: dict[str, Score] = field(default_factory=dict)
     learnings: dict[str, Learning] = field(default_factory=dict)
@@ -355,6 +360,17 @@ class RunState:
             case EventType.TOOL_END:
                 candidate = Candidate.model_validate(payload["candidate"])
                 self.candidates[candidate.id] = candidate
+                if self.plans.get(candidate.goal_id):
+                    plan = self.plan_for_round(candidate.goal_id, candidate.round)
+                    producing_goal = (
+                        plan.goal
+                        if candidate.part is None
+                        else next(
+                            (part.goal for part in plan.parts if part.name == candidate.part), None
+                        )
+                    )
+                    if producing_goal is not None:
+                        self.candidate_goal_keys[candidate.id] = producing_goal.key()
                 fingerprint = payload.get("fingerprint")
                 if fingerprint is not None and not isinstance(fingerprint, str):
                     raise _core_error(ValueError, "invalid fingerprint")

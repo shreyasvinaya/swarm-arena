@@ -485,3 +485,47 @@ def test_from_state_uses_latest_revision_and_recorded_score_order() -> None:
     assert old_view.leaderboard(KEY, judge="program")[0].rubric_hash == "old"
     state.candidates["c-1"].parent_ids.append("mutated")
     assert board.get_candidate("c-1").parent_ids == []
+
+
+def test_part_identity_change_preserves_history_but_not_current_parents(board: RunBoard) -> None:
+    old = _c("old", part="p")
+    board.put_candidate(old, epoch=1, seq=1)
+    board.put_score(_score("old-score", "old", 100), epoch=1, seq=2)
+    frozen = board.snapshot(PART_KEY, _frontier())
+    current = Goal(id="sub", namespace="n", inputs={"version": 2}).key()
+    board.register_goal(current, "g", "p")
+    empty = board.snapshot(current, _frontier())
+    assert empty.best(current, 1, judge="program") == []
+    assert empty._visible_candidate_ids() == frozenset()
+    with pytest.raises(ValueError, match="outside"):
+        empty.get_candidate("old")
+    new = _c("new", part="p", parent_ids=["old"])
+    board.put_candidate(new, epoch=1, seq=3)
+    board.put_score(_score("new-score", "new", 1), epoch=1, seq=4)
+    view = board.snapshot(current, _frontier())
+    assert [c.id for c in view.best(current, 5, judge="program")] == ["new"]
+    assert view._visible_candidate_ids() == frozenset({"new"})
+    assert set(view.lineage("new").nodes) == {"old", "new"}
+    assert frozen.get_candidate("old") == old
+
+
+def test_rebuild_does_not_assign_current_identity_to_unattributed_history() -> None:
+    plan = Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[],
+        judges=[],
+        parts=[PartSpec(name="p", goal=Goal(id="sub", namespace="n"))],
+    )
+    old = _c("old", part="p")
+    state = RunState(
+        run_id="run-1",
+        plans={"g": [(plan, "human")]},
+        candidates={old.id: old},
+        positions={old.id: (1, 1)},
+    )
+    board = RunBoard.from_state(state, run_root="/runs", head=lambda: HEAD)
+    view = board.snapshot(PART_KEY, _frontier())
+    assert view._visible_candidate_ids() == frozenset()
+    with pytest.raises(ValueError, match="outside"):
+        view.get_candidate(old.id)
+    assert board.get_candidate(old.id) == old

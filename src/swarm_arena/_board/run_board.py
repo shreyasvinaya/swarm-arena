@@ -22,6 +22,8 @@ class _Records:
     """Own independently copied indexed records and their journal positions."""
 
     goals: dict[GoalKey, tuple[str, str | None]] = field(default_factory=dict)
+    active_goals: dict[tuple[str, str | None], GoalKey] = field(default_factory=dict)
+    candidate_goals: dict[str, GoalKey] = field(default_factory=dict)
     candidates: dict[str, Candidate] = field(default_factory=dict)
     scores: dict[str, Score] = field(default_factory=dict)
     learnings: dict[str, Learning] = field(default_factory=dict)
@@ -63,10 +65,20 @@ class _MemoryReads:
     ) -> list[tuple[Candidate, Score]]:
         """Rank one group using the last put score's complete judge identity."""
         goal_id, part = self._group(goal, part)
+        identity = (
+            goal
+            if self._records.goals[goal] == (goal_id, part)
+            else self._records.active_goals.get((goal_id, part))
+        )
+        if identity is None:
+            return []
         candidates = [
             c
             for c in self._records.candidates.values()
-            if c.goal_id == goal_id and c.part == part and (run_id is None or c.run_id == run_id)
+            if c.goal_id == goal_id
+            and c.part == part
+            and (run_id is None or c.run_id == run_id)
+            and self._records.candidate_goals.get(c.id) == identity
         ]
         ids = {candidate.id for candidate in candidates}
         scores = [
@@ -314,7 +326,9 @@ class _MemoryReads:
         candidate = self._records.candidates[id]
         if self._scope is not None:
             goal_id, part = self._group(self._scope)
-            if (candidate.goal_id, candidate.part) != (goal_id, part):
+            if (candidate.goal_id, candidate.part) != (goal_id, part) or (
+                self._records.candidate_goals.get(id) != self._scope
+            ):
                 raise ValueError("candidate outside board snapshot goal")
         return deepcopy(candidate)
 
@@ -465,7 +479,9 @@ class _RunView(_MemoryReads, BoardView):
         self._records = records
         group = self._group(goal)
         self._candidate_ids = frozenset(
-            id for id, c in records.candidates.items() if (c.goal_id, c.part) == group
+            id
+            for id, c in records.candidates.items()
+            if (c.goal_id, c.part) == group and records.candidate_goals.get(id) == goal
         )
 
     def _visible_candidate_ids(self) -> frozenset[str]:
@@ -508,7 +524,11 @@ class RunBoard(_MemoryReads, Board):
 
     def register_goal(self, key: GoalKey, goal_id: str, part: str | None) -> None:
         """
-        Associate a snapshotted goal identity with its stored ranking group.
+        Associate a snapshotted goal identity with its current ranking group.
+
+        Candidate identity is captured at publication and remains unchanged when
+        a same-name part is registered under a new key. Earlier keys remain
+        available for explicit historical reads.
 
         Parameters
         ----------
@@ -527,6 +547,13 @@ class RunBoard(_MemoryReads, Board):
         """
         with self._lock:
             self._records.goals[key] = (goal_id, part)
+            if part is None:
+                self._records.active_goals = {
+                    group: identity
+                    for group, identity in self._records.active_goals.items()
+                    if group[0] != goal_id
+                }
+            self._records.active_goals[(goal_id, part)] = key
 
     def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:
         """
@@ -554,6 +581,9 @@ class RunBoard(_MemoryReads, Board):
         copied = deepcopy(candidate)
         with self._lock:
             self._records.candidates[candidate.id] = copied
+            key = self._records.active_goals.get((candidate.goal_id, candidate.part))
+            if key is not None:
+                self._records.candidate_goals.setdefault(candidate.id, key)
             self._records.positions[candidate.id] = (epoch, seq)
 
     def put_score(self, score: Score, *, epoch: int, seq: int) -> None:
@@ -699,6 +729,8 @@ class RunBoard(_MemoryReads, Board):
             self._group(goal)
             records = _Records(
                 goals=self._records.goals.copy(),
+                active_goals=self._records.active_goals.copy(),
+                candidate_goals=self._records.candidate_goals.copy(),
                 candidates=self._records.candidates.copy(),
                 scores=self._records.scores.copy(),
                 learnings=self._records.learnings.copy(),
@@ -725,7 +757,7 @@ class RunBoard(_MemoryReads, Board):
             }
             records.positions = {id: records.positions[id] for id in visible}
         else:
-            records = _Records(goals=records.goals)
+            records = _Records(goals=records.goals, active_goals=records.active_goals)
         return _RunView(goal, frontier, deepcopy(records))
 
     @classmethod
@@ -780,5 +812,12 @@ class RunBoard(_MemoryReads, Board):
             board.put_learning(learning, epoch=epoch, seq=seq)
         decisions = {goal_id: deepcopy(goal.decisions) for goal_id, goal in state.goals.items()}
         with board._lock:
+            # An unknown historical part identity must never inherit the current key.
+            board._records.candidate_goals = {
+                id: key
+                for id, key in board._records.candidate_goals.items()
+                if state.candidates[id].part is None or id in state.candidate_goal_keys
+            }
+            board._records.candidate_goals.update(state.candidate_goal_keys)
             board._decisions = decisions
         return board

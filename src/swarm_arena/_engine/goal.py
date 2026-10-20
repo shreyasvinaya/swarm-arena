@@ -417,7 +417,19 @@ class GoalRunner:
         return name or (refs[0].component_name() if len(refs) == 1 else "")
 
     def _round_state(self) -> RoundState:
-        candidates = [c for c in self.recorded.candidates.values() if c.goal_id == self.goal_id]
+        part_keys = {part.name: part.goal.key() for part in self.plan.parts}
+        candidates = [
+            c
+            for c in self.recorded.candidates.values()
+            if c.goal_id == self.goal_id
+            and (
+                c.part is None
+                or (
+                    c.part in part_keys
+                    and self.recorded.candidate_goal_keys.get(c.id) == part_keys[c.part]
+                )
+            )
+        ]
         boundary: tuple[int, int] | None = None
         if self._recovering_converge and self._frontier is not None:
             # Selection and assigned parents must use the original converge snapshot.
