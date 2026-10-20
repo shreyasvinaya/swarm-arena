@@ -57,7 +57,9 @@ the remaining fixed settings. JSON types and values must agree recursively:
 Mapping order does not matter; list order does. A nested field remains fixed even
 if its name matches a settable top-level field. Matching performs no imports or
 I/O and does not validate defaults or settable values; full component validation
-belongs to the later planning validation layer.
+belongs to the current `validate_plan` admission checks. See
+[Planning modes](../planning-modes.md#frozen-files-and-catalog-defaults) for the
+engine's default-aware catalog matching and history-based manifest trust.
 
 Load errors report the configuration path and schema field names, aliases and
 list/tuple indices; human settings show unknown model keys as typo identifiers,

@@ -1,8 +1,69 @@
 # Scoring and review
 
-Script and function judges work locally today; see the
-[scoring API](api/scoring.md). Review workflows and model-based judges are
-planned for a later release.
+Checks gate results, judges score them, policies prune between rounds, and a
+final judging batch determines solution order. Script and trusted Python
+judges run offline today. See the [scoring API](api/scoring.md),
+[planning API](api/planning.md), [board API](api/board.md), and
+[plan API](api/swarm_arena.md).
+
+## Checks and manager feedback
+
+Tool candidates are checked in plan order before publication to the manager;
+cancelled preparations without a start skip checks.
+`CheckResult.passed=False` makes a candidate **gated out**: it remains
+recorded but cannot be judged or selected. A malformed result or check exception
+fails closed. `ScriptCheck` also fails closed on crashes, timeouts, and missing
+results. The core stamps each result with its check's plan name.
+
+A check's `feedback` controls the manager's view:
+
+- `"reasons"` (default) exposes its reasons and details.
+- `"pass_fail"` exposes only the verdict; reasons and details are removed from
+  manager-visible copies, including assigned convergence parents.
+
+Checks and judges keep their private files out of tool workspaces. Feedback
+filtering is not OS isolation; see [Limits and safety](limits-and-safety.md).
+For a working check and scoring function, the integrated Rosenbrock source is:
+
+```{literalinclude} ../examples/rosenbrock/rosen.py
+:language: python
+```
+
+The [four-file script workflow](own-files.md#try-it-offline) also exercises a tool,
+check, and judge without running managers. Use public
+`swarm_arena.testing.read_output_file` and `read_logs` to read verified artifact
+bytes from kit outputs; a run journal's relative log path is a different kind of
+reference from the kit's content-addressed log reference.
+
+## Scores, identities, and anchors
+
+A larger `Score.key` wins, comparing tuple elements in order. `Score.minimize(x)`
+uses `(-x,)`; `Score.maximize(x)` uses `(x,)`. `value` is a human-facing number,
+not a replacement for the ranking key. Keys must be finite. Missing scores,
+non-finite keys, or judge errors leave the affected candidate unranked; foreign
+candidate IDs and later duplicate scores are discarded.
+
+```python
+from swarm_arena import Score
+
+assert Score.minimize(0.25).key > Score.minimize(0.5).key
+assert Score.maximize(2).value == 2
+```
+
+Each score is stamped with the judge's plan name, `rubric_hash`, and `panel_hash`.
+Their tuple is `Score.identity`. Different identities are never compared within
+ordinary ranking. Main goals and each part form separate ranking groups; ranks
+also use one fidelity, by default the fidelity of the group's highest candidate
+round. A new fidelity without a passing score does not revive older-fidelity
+leaders. Ordinary ties break by earlier candidate round, then numeric trailing
+ID counter, then full ID.
+
+`ProgramJudge` calls a trusted scoring function. `ScriptJudge` executes a
+scoring program with its own files. `Lexicographic` combines ordered judges:
+only candidates scored by every member get a composite score.
+With one judge the plan can omit `ranking`; with several, `ranking` must name
+the declared judge whose scores drive selection. A part can inherit main
+scoring or supply its own checks, judges, and ranking.
 
 `Lexicographic` concatenates member keys in order, so each member must return
 keys of one fixed length within a candidate batch. Different members may use
@@ -11,3 +72,99 @@ the whole batch receives judge errors and no composite scores are produced.
 For example, a member returning `(1.0,)` for one candidate and `(1.0, 2.0)` for
 another must pad or otherwise normalize its keys within the batch, even when
 it is the only member of `Lexicographic`.
+
+A judge can request `anchor_count()` earlier leaders. The core appends unique
+leaders to new gated-in candidates and identifies them in `JudgeContext.anchors`,
+so a judge can calibrate the batch against earlier evidence. Empty gated-in
+batches skip judging. Anchors remain in the same group and comparison domain;
+they do not authorize cross-part ranking.
+
+## Pruning policies
+
+Policies consume `RoundState` after a round barrier and return a `Decision` with
+recorded reasons. Pruning compares only each group's current ranking identity
+and newest fidelity. The four built-ins are:
+
+| Policy | Exact retention rule |
+|---|---|
+| `KeepTopTeams(k)` | Keep the best `k` live teams in each group by team-best score. Unscored teams rank last; tied teams follow plan order. Prune teams below that cutoff. |
+| `SuccessiveHalving(keep=0.5, min_per_team=1)` | Rank live, non-starved agents in each group by best result; keep `ceil(keep × agent_count)`, then additionally keep each team's best `min_per_team` agents with ranked results. Unscored agents follow scored agents in plan order. Prune other agents, or the whole team when all its live agents would be removed. |
+| `Patience(rounds=2)` | After more than `rounds` history entries, compare the latest cumulative team best with the best `rounds` rounds earlier. Prune when there is no latest score, or when that earlier score exists and the latest key has not improved. Both use the current identity and fidelity. |
+| `Chain(...)` | Apply member policies to the same state in order and merge prunes, keeping the first reason for each target. Guard the merged decision again. |
+
+Every decision is guarded: already pruned, stopped, and watchdog-stopped agents
+are excluded; a prune targeting a starved agent is dropped; the last live team
+of a group is retained. This protection can keep more agents or teams than a
+policy's nominal cutoff. A policy may also return `Decision.no_result` to end a
+goal with a reason. Hard limits and watchdogs can stop work mid-round; they do
+not wait for a policy barrier.
+
+```python
+from swarm_arena import Chain, KeepTopTeams, Patience, SuccessiveHalving
+
+policy = Chain(KeepTopTeams(2), SuccessiveHalving(keep=0.5), Patience(rounds=2))
+assert len(policy.config.policies) == 3
+```
+
+## Convergence and the final judge
+
+`ConvergeSpec(mode="select")` selects up to `top_n` eligible main-goal leaders.
+Team mode runs a converge team, seeded with leaders or `parents_per_part` ranked
+parents from each part. Assigned `AgentContext.seed_parents` are read-only and
+are prepended to explicit tool parents, removing duplicate IDs. A manager's
+`best(part=...)` is restricted to its own group; it does not grant arbitrary
+cross-part leaderboard access. Reads automatically populate later candidates'
+`read_ids` provenance.
+
+Partial results require `converge.allow_partial=True`. `distinct=True` skips
+repeated recorded fingerprints; an unknown fingerprint does not collapse
+otherwise distinct candidates. Failed part joins can replan and retry only
+within remaining rounds, budget, and `max_join_attempts`. Immediate stop or run
+timeout suppresses the converge team and retains best parts as `unjoined`.
+
+The ranking judge then re-scores all finalists together in **one uncached
+batch**, with `JudgeContext.final=True`, `read_cache=False`, and no anchors.
+The resulting keys determine final order; tied final keys use candidate ID
+ascending. The final batch is journaled with `round=0`. Earlier scores remain
+attached to candidates, so their first stored score is not necessarily the
+final score. `top_n` and distinct selection apply to this final order.
+
+Final judging uses the protected final slice. After an immediate stop or run
+deadline it is bounded by `settle_timeout_s`; if interrupted, only available
+committed ranking evidence can supply a fallback order and judge errors are
+recorded. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
+
+## No result and solution records
+
+When no candidate survives checks and final judging, the goal records
+`NO_RESULT` with a reason and writes `status="no_result"`; `Swarm.run` returns
+an empty list for that goal rather than raising. A queued goal prevented from
+starting reports reason `stopped`. A no-result solution's `reason` can differ
+from the lifecycle's `goal_finished` termination reason, for example when a
+stop leaves no passing candidate. `unjoined` also returns no main finalists;
+its part selections are available in the solution file.
+
+`goals/<goal-id>/solution.json` is a versioned view of committed journal state:
+
+| Field | Contents |
+|---|---|
+| `schema_version`, `run_id`, `goal_id` | Stored format and run/goal identifiers |
+| `status`, `reason` | `ok`, `no_result`, or `unjoined`, plus termination/no-result reason or null |
+| `finalists` | Final order, with one-based `rank`, full `candidate`, recorded `scores`, direct-parent `lineage`, and zero-based final-evaluation `plan_revision` |
+| `parts` | For `unjoined`, each part name and its candidate (possibly null), scores, and direct-parent lineage |
+| `replicate_stats` | Cohorts by part, exact judge identity, fidelity, tool identity, and canonical inputs hash; `n`, `mean`, `min`, and `max` of finite score values when a cohort includes an explicit replicate |
+| `best_of_n` | First finalist's ranking value and candidate ID when available; otherwise null |
+| `plan_revisions` | Recorded plans with journal-authoritative origins |
+| `manifest` | Run provenance metadata |
+| `source_head` | Journal head from which this view was rendered |
+
+`status` and solution views describe the latest goal lifecycle. Continuing a
+stopped goal can replace its solution while earlier final orders and stop
+reasons remain durable in the journal. See [Getting started](getting-started.md#read-the-solution)
+for reading an actual solution.
+
+## Human review (M2)
+
+Human review, curation, and the shared arena are M2 features. Built-in model
+judges and provider integrations are M3 features. Current scripts and custom
+judges can supply scores, but do not create those review workflows.

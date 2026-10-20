@@ -74,7 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Ref` selects components by public import path and validates their configuration.
   `Plan`, `PartSpec`, `TeamSpec`, `AgentSpec`, `RoundSpec`, `ConvergeSpec`, and
   `FlowSpec` describe plans; `Plan` and `RunConfig` load and save TOML.
-  Plan orchestration and full swarm runs are not yet available.
 - `Limits` and `Resources` describe budgets and execution requirements.
   `ModelCatalog`, `ModelSpec`, `PlannerCatalog`, and `CatalogEntry` describe model
   aliases and permitted planner choices. `CachePolicy`, `GatewayConfig`,
@@ -113,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provide A2A protocol records without requiring an A2A SDK.
 
 #### Offline development and documentation
+
+- Planning, limits and safety, scoring and review, and concepts guides cover
+  manual swarm execution, catalog and snapshot trust, exact pruning rules,
+  committed budgets, epoch-scoped stops, and stopped-goal continuation.
 
 - `swarm_arena.testing.check_tool`, `check_check`, `check_judge`, and
   `make_candidate` exercise connectors locally without a manager or provider.
