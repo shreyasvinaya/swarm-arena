@@ -1,14 +1,15 @@
 """Authorize raw planner references before component imports or file snapshots."""
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, get_args
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import CatalogKind
-from swarm_arena._model.catalog import CatalogEntry, PlannerCatalog
+from swarm_arena._model.catalog import CatalogEntry, PlannerCatalog, _field_input_keys
 from swarm_arena._model.data import json_equal
+from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan
-from swarm_arena._model.ref import Ref, _validate_config
+from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.provenance import (
     RefSite,
@@ -76,7 +77,53 @@ def catalog_form(config: Mapping[str, Any]) -> dict[str, Any]:
     return {key: _catalog_value(value) for key, value in config.items()}
 
 
-def find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog) -> CatalogEntry | None:
+def _check_catalog_defaults(
+    deferred: Sequence[tuple[RefSite, CatalogEntry, tuple[str, ...]]],
+) -> tuple[list[str], set[_ManifestPair]]:
+    """Decide raw deferrals using only matched human Configs, without file I/O.
+
+    A matching default declaration also preserves its supplied frozen manifest
+    on reload, independently of revision history. All other manifests retain
+    the ordinary history-based trust rule.
+    """
+    errors: list[str] = []
+    trusted: set[_ManifestPair] = set()
+    for site, entry, fields in deferred:
+        try:
+            component = Ref(path=entry.ref).load()
+            schema = component.Config if issubclass(component, Configurable) else None
+        except Exception:
+            schema = None
+        for key in fields:
+            raw = site.ref.config[key]
+            accepted = False
+            try:
+                field = schema.model_fields.get(key) if schema is not None else None
+                if (
+                    field is not None
+                    and _field_input_keys(key, field).isdisjoint(entry.config)
+                    and any(
+                        isinstance(candidate, type) and issubclass(candidate, FileSet)
+                        for candidate in (field.annotation, *get_args(field.annotation))
+                    )
+                ):
+                    value = field.get_default(call_default_factory=True)
+                    accepted = isinstance(value, FileSet) and json_equal(
+                        catalog_form({key: raw}),
+                        catalog_form({key: value.model_dump(mode="json")}),
+                    )
+            except Exception:
+                accepted = False
+            if not accepted:
+                errors.append(f"{site.pointer}: field '<field>' is not in the planner catalog")
+            elif _is_fileset(raw):
+                trusted.add(_manifest_pair(raw))
+    return errors, trusted
+
+
+def find_entry(
+    ref: Ref, kind: CatalogKind, catalog: PlannerCatalog, *, defer_defaults: bool = False
+) -> CatalogEntry | None:
     """
     Find the first canonical fixed-config match without importing components.
 
@@ -88,6 +135,9 @@ def find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog) -> CatalogE
         Required component role.
     catalog : PlannerCatalog
         Human-approved catalog, searched in configured order.
+    defer_defaults : bool, default=False
+        Ignore extra fixed fields for candidate selection only. The caller must
+        collect them with ``check_catalog`` and check their typed defaults.
 
     Returns
     -------
@@ -105,14 +155,24 @@ def find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog) -> CatalogE
     """
     for entry in catalog.entries:
         if entry.kind == kind and entry.ref == ref.path:
-            fixed = {key: value for key, value in ref.config.items() if key not in entry.settable}
-            if json_equal(catalog_form(fixed), catalog_form(entry.config)):
+            fixed = catalog_form(
+                {
+                    key: value
+                    for key, value in ref.config.items()
+                    if key not in entry.settable and (not defer_defaults or key in entry.config)
+                }
+            )
+            if json_equal(fixed, catalog_form(entry.config)):
                 return entry
     return None
 
 
 def check_catalog(
-    site: RefSite, catalog: PlannerCatalog, *, overrides: Mapping[str, Any]
+    site: RefSite,
+    catalog: PlannerCatalog,
+    *,
+    overrides: Mapping[str, Any],
+    deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] | None = None,
 ) -> list[str]:
     """
     Check fixed fields and planner-settable values without resolving references.
@@ -125,6 +185,10 @@ def check_catalog(
         Human-approved component configurations and override schemas.
     overrides : Mapping[str, Any]
         Explicit round overrides; even an unchanged fixed value is forbidden.
+    deferred : list or None, default=None
+        Optional collector for omitted extra fields at catalog-matched paths.
+        These require a typed default decision before resolution or snapshotting.
+        Without a collector, extra fields are reported immediately.
 
     Returns
     -------
@@ -138,7 +202,7 @@ def check_catalog(
     >>> check_catalog(site, PlannerCatalog(), overrides={})
     ["/policy: demo:Policy is not in the planner catalog for kind 'policy'"]
     """
-    entry = find_entry(site.ref, site.kind, catalog)
+    entry = find_entry(site.ref, site.kind, catalog, defer_defaults=deferred is not None)
     if entry is None:
         entry = next(
             (e for e in catalog.entries if e.kind == site.kind and e.ref == site.ref.path),
@@ -155,10 +219,14 @@ def check_catalog(
     for key, value in expected.items():
         if key not in fixed or not json_equal(fixed[key], value):
             errors.append(f"{site.pointer}: fixed field {key!r} differs from the planner catalog")
-    for key in fixed.keys() - expected.keys():
-        # Only the human catalog can authorize a diagnostic field name.
-        label = key if key in entry.settable else "<field>"
-        errors.append(f"{site.pointer}: field {label!r} is not in the planner catalog")
+    extra = tuple(sorted(fixed.keys() - expected.keys()))
+    if deferred is not None and extra:
+        deferred.append((site, entry, extra))
+    else:
+        for key in extra:
+            # Only the human catalog can authorize a diagnostic field name.
+            label = key if key in entry.settable else "<field>"
+            errors.append(f"{site.pointer}: field {label!r} is not in the planner catalog")
     for key in overrides:
         if key not in entry.settable:
             label = key if key in entry.config else "<field>"
@@ -335,7 +403,12 @@ def _diagnostic_pointers(sites: Sequence[RefSite], catalog: PlannerCatalog) -> d
 
 
 def authorize_revision(
-    plan: Plan, config: RunConfig, *, history: Sequence[Plan] = ()
+    plan: Plan,
+    config: RunConfig,
+    *,
+    history: Sequence[Plan] = (),
+    deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] | None = None,
+    _default_pairs: frozenset[_ManifestPair] = frozenset(),
 ) -> tuple[Plan, list[str]]:
     """
     Authorize a revision's raw references and discard untrusted frozen manifests.
@@ -348,14 +421,23 @@ def authorize_revision(
         Human-controlled planner catalog.
     history : Sequence[Plan], default=()
         Previously admitted revisions in chronological order.
+    deferred : list or None, default=None
+        Collector for extra fields omitted by a matching catalog entry. Both
+        admission and validation must decide these with the shared typed check
+        after rejecting raw errors, before any resolution or snapshotting.
+    _default_pairs : frozenset, default=frozenset()
+        Frozen pairs approved by that typed default check for this invocation.
+        Only the admission boundary supplies these on its second raw pass.
 
     Returns
     -------
     tuple[Plan, list[str]]
         Human input unchanged, or a deep copy with untrusted manifests replaced
         by globs in non-carried sites, plus catalog errors. Trusted pairs may
-        come from any historical Ref site at any depth. No components are
-        imported or built, and no files are read. Diagnostic pointers redact
+        come from any historical Ref site at any depth or from the typed default
+        decision. No components are imported or built, and no files are read.
+        Extra fields are deferred, not authorized, until the typed check passes.
+        Diagnostic pointers redact
         unconfigured nested mapping keys as ``<field>``. Callers must reject
         errors before resolving components or snapshotting files.
 
@@ -371,7 +453,8 @@ def authorize_revision(
         return plan, []
     sites = _revision_sites(history[-1] if history else None, plan, parent_human(history))
     pointers = _diagnostic_pointers(sites, config.planner_catalog)
-    trusted = _trusted_pairs(history)
+    trusted = _trusted_pairs(history) | _default_pairs
+    deferred = [] if deferred is None else deferred
     result = plan.model_copy(deep=True)
     errors: list[str] = []
     for site in sites:
@@ -384,7 +467,14 @@ def authorize_revision(
             else {}
         )
         diagnostic_site = site.model_copy(update={"pointer": pointers[site.pointer]})
-        errors.extend(check_catalog(diagnostic_site, config.planner_catalog, overrides=overrides))
+        errors.extend(
+            check_catalog(
+                diagnostic_site,
+                config.planner_catalog,
+                overrides=overrides,
+                deferred=deferred,
+            )
+        )
         if override_site is not None:
             target = _at_pointer(result, override_site[0])
         else:

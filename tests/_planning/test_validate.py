@@ -40,7 +40,7 @@ from swarm_arena._planning.validate import (
 )
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
-from swarm_arena._tooling.files import snapshot_plan
+from swarm_arena._tooling.files import snapshot_plan, snapshot_ref
 from swarm_arena._tooling.tool import effective_tool_ref
 
 J_A = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="a")
@@ -1256,6 +1256,8 @@ def test_paired_rule_matrix(depth: int, merged: bool, rule: str) -> None:
         bad_cfg = {"text": BOUNDARY_SECRET}
     elif rule == "human_only":
         bad_cfg = {"command": BOUNDARY_SECRET}
+        if merged and depth == 0:
+            needle = "override sets fixed field"
     elif rule == "alias_schema":
         good_cfg = {"tune_alias": 3}
         bad_cfg = {"tune_alias": BOUNDARY_SECRET}
@@ -1721,3 +1723,198 @@ def test_script_command_alias_protected_at_every_depth(
     with pytest.raises(PlanError) as error:
         admit_revision(bad, unsafe, artifacts, history=history)
     assert_secret_absent(error.value, BOUNDARY_SECRET)
+
+
+def test_catalog_omitted_fileset_default_is_frozen_and_private(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    source = tmp_path / "judge.py"
+    source.write_text("private judge source")
+    judge = Ref(
+        path="_fakes.admission:DefaultScriptJudge",
+        config={"command": ["python", "judge.py"]},
+        name="score",
+    )
+    raw = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False).model_copy(update={"judges": [judge]})
+    raw._base_dir = tmp_path
+    config = _boundary_catalog(raw, {})
+    raw = stamp(raw, origin="llm", parent=None)
+    frozen, warnings = admit_revision(raw, config, artifacts)
+    assert warnings == []
+    assert frozen.judges[0].config["files"] == {
+        "globs": ["judge.py"],
+        "manifest": {"judge.py": sha256_hex(source.read_bytes())},
+    }
+    assert judge_private_paths(frozen) == frozenset({"judge.py"})
+    overlap = frozen.model_copy(
+        update={
+            "goal": frozen.goal.model_copy(
+                update={"files": FileSet.model_validate(frozen.judges[0].config["files"])}
+            )
+        }
+    )
+    with pytest.raises(PlanError, match="private to a check or judge"):
+        validate_plan(overlap, config)
+    source.unlink()
+    for restored in (
+        Plan.model_validate_json(frozen.model_dump_json()),
+        Plan.loads(frozen.dumps(), base_dir=tmp_path),
+    ):
+        restored._base_dir = tmp_path
+        assert validate_plan(restored, config) == []
+        readmitted, warnings = admit_revision(restored, config, artifacts)
+        assert warnings == []
+        assert readmitted.judges == frozen.judges
+        assert judge_private_paths(readmitted) == frozenset({"judge.py"})
+        revision = stamp(readmitted, origin="autonomous", parent=readmitted)
+        carried, warnings = admit_revision(revision, config, artifacts, history=[readmitted])
+        assert warnings == []
+        assert carried.judges == frozen.judges
+        assert judge_private_paths(carried) == frozenset({"judge.py"})
+
+
+@pytest.mark.parametrize("field", ["files", "unrelated"])
+@pytest.mark.parametrize("post_snapshot", [False, True])
+def test_catalog_omitted_default_does_not_authorize_other_values(
+    field: str,
+    post_snapshot: bool,
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = Ref(
+        path="_fakes.admission:DefaultScriptJudge",
+        config={"command": ["python", "judge.py"]},
+        name="score",
+    )
+    plan = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False).model_copy(update={"judges": [judge]})
+    config = _boundary_catalog(plan, {})
+    value: Any = [BOUNDARY_SECRET]
+    if field == "files" and post_snapshot:
+        value = {"globs": [BOUNDARY_SECRET], "manifest": {BOUNDARY_SECRET: "aa" * 32}}
+    changed = judge.model_copy(update={"config": {**judge.config, field: value}})
+    plan = stamp(plan.model_copy(update={"judges": [changed]}), origin="llm", parent=None)
+    if post_snapshot:
+        with pytest.raises(PlanError, match="not in the planner catalog") as caught:
+            validate_plan(plan, config)
+        assert_secret_absent(caught.value, BOUNDARY_SECRET)
+    else:
+        deferred: list[Any] = []
+        _, errors = validation.authorize_revision(plan, config, deferred=deferred)
+        assert errors == []
+        assert deferred
+        plan._base_dir = tmp_path
+
+        def forbidden(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("snapshot read before default authorization")
+
+        monkeypatch.setattr(validation, "_resolve_revision", forbidden)
+        monkeypatch.setattr(validation, "snapshot_plan", forbidden)
+        with pytest.raises(PlanError) as caught:
+            admit_revision(plan, config, artifacts)
+        assert caught.value.errors == ["/judges/0: field '<field>' is not in the planner catalog"]
+        assert_secret_absent(caught.value, BOUNDARY_SECRET)
+
+
+def test_snapshot_preserves_unrelated_normalized_list(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    ref = Ref(path="_fakes.admission:NormalizeTool", config={"labels": ["one", "one"]})
+    plan = _boundary_plan(ref, 0, False)
+    plan._base_dir = tmp_path
+    assert validate_plan(plan, RunConfig()) == []
+    _, config = ref._resolve_config(Configurable)
+    assert cast(Any, config).labels == ["one"]
+    assert snapshot_ref(ref, tmp_path, artifacts).config == ref.config
+    admitted, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    assert admitted.teams[0].agents[0].tool.config["labels"] == ["one", "one"]
+
+
+def test_snapshot_preserves_unrelated_normalized_mapping(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    metadata = {"Key": "original", "key": "changed"}
+    ref = Ref(path="_fakes.admission:NormalizeTool", config={"metadata": metadata})
+    plan = _boundary_plan(ref, 0, False)
+    plan._base_dir = tmp_path
+    _, config = ref._resolve_config(Configurable)
+    assert cast(Any, config).metadata == {"key": "changed"}
+    assert snapshot_ref(ref, tmp_path, artifacts).config["metadata"] == metadata
+    admitted, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    assert admitted.teams[0].agents[0].tool.config["metadata"] == metadata
+
+
+def test_snapshot_refuses_shape_change_in_reference_list(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    member = {"path": BOUNDARY_LEAF, "config": {"text": BOUNDARY_SECRET}}
+    ref = Ref(path="_fakes.admission:ShrinkingRefsTool", config={"members": [member, member]})
+    plan = _boundary_plan(ref, 0, False)
+    plan._base_dir = tmp_path
+    for action in (
+        lambda: snapshot_ref(ref, tmp_path, artifacts),
+        lambda: admit_revision(plan, RunConfig(), artifacts),
+    ):
+        with pytest.raises(PlanError) as caught:
+            action()
+        assert caught.value.errors == [
+            "field 'members': validation changed the shape of a file or reference list"
+        ]
+        assert_secret_absent(caught.value, BOUNDARY_SECRET)
+
+
+def test_snapshot_heterogeneous_container_preserves_unrelated_list(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.admission import ProbeTool
+    from pydantic import create_model, field_validator
+
+    from swarm_arena._model.ref import RefField
+
+    def normalize(value: tuple[list[str], Ref]) -> tuple[list[str], Ref]:
+        return list(dict.fromkeys(value[0])), value[1]
+
+    schema = create_model(
+        "Config",
+        __base__=ProbeTool.Config,
+        payload=(tuple[list[str], RefField], ...),
+        __validators__={"normalize": field_validator("payload")(normalize)},
+    )
+    monkeypatch.setattr(ProbeTool, "Config", schema)
+    (tmp_path / "judge.py").write_text("private")
+    child = {"path": "_fakes.admission:DefaultScriptJudge", "config": {"command": ["score"]}}
+    ref = Ref(path=BOUNDARY_LEAF, config={"payload": [["one", "one"], child]})
+    frozen = snapshot_ref(ref, tmp_path, artifacts)
+    assert frozen.config["payload"][0] == ["one", "one"]
+    assert frozen.config["payload"][1]["config"]["files"]["manifest"] == {
+        "judge.py": sha256_hex(b"private")
+    }
+
+
+def test_snapshot_refuses_shape_change_in_reference_mapping(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.admission import MapJudge
+    from pydantic import create_model, field_validator
+
+    def normalize(value: dict[str, Ref]) -> dict[str, Ref]:
+        return {"normalized": next(iter(value.values()))}
+
+    schema = create_model(
+        "Config",
+        __base__=MapJudge.Config,
+        __validators__={"normalize": field_validator("children")(normalize)},
+    )
+    monkeypatch.setattr(MapJudge, "Config", schema)
+    ref = Ref(
+        path="_fakes.admission:MapJudge",
+        config={"value": 1, "children": {BOUNDARY_SECRET: {"path": "_fakes.tools:FixedJudge"}}},
+    )
+    with pytest.raises(PlanError) as caught:
+        snapshot_ref(ref, tmp_path, artifacts)
+    assert caught.value.errors == [
+        "field 'children': validation changed the shape of a file or reference mapping"
+    ]
+    assert_secret_absent(caught.value, BOUNDARY_SECRET)

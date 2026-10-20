@@ -15,6 +15,7 @@ from swarm_arena._errors import PlanError
 from swarm_arena._model.base import CatalogKind
 from swarm_arena._model.catalog import CatalogEntry, PlannerCatalog
 from swarm_arena._planning.catalog_check import (
+    _check_catalog_defaults,
     authorize_revision,
     catalog_form,
     check_catalog,
@@ -709,3 +710,163 @@ def test_component_config_remains_a_mapping_when_its_fields_resemble_fileset(nes
     result, errors = authorize_revision(child, _cfg(PlannerCatalog(entries=entries)), history=[r0])
     assert errors == []
     assert result.teams[0].agents[0].tool.config == child.teams[0].agents[0].tool.config
+
+
+def _with_default_decision(
+    site: RefSite, catalog: PlannerCatalog, *, overrides: dict[str, Any] | None = None
+) -> list[str]:
+    deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] = []
+    errors = check_catalog(site, catalog, overrides=overrides or {}, deferred=deferred)
+    if errors:
+        return errors
+    return _check_catalog_defaults(deferred)[0]
+
+
+@pytest.mark.parametrize("path", ["DefaultScriptJudge", "AliasedDefaultScriptJudge"])
+def test_frozen_catalog_allows_only_omitted_fileset_defaults(path: str) -> None:
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref=f"_fakes.admission:{path}",
+        description="d",
+        config={"command": ["python", "judge.py"]},
+    )
+    catalog = PlannerCatalog(entries=[entry])
+    frozen = {"globs": ["judge.py"], "manifest": {"judge.py": "ab" * 32}}
+    site = _site({**entry.config, "files": frozen}, path=entry.ref, kind="judge")
+    assert check_catalog(site, catalog, overrides={})
+    assert find_entry(site.ref, "judge", catalog) is None
+    assert _with_default_decision(site, catalog) == []
+    assert find_entry(site.ref, "judge", catalog, defer_defaults=True) is entry
+    assert site.ref.config["files"] == frozen
+    assert entry.config == {"command": ["python", "judge.py"]}
+    for extra in (
+        {"files": {"globs": ["SECRET_VALUE"], "manifest": {"SECRET_VALUE": "ab" * 32}}},
+        {"files": {**frozen, "editable": ["SECRET_VALUE"]}},
+        {"files": frozen, "direction": "max"},  # Non-FileSet defaults remain fixed.
+        {"files": frozen, "SECRET_KEY": "SECRET_VALUE"},
+        {"files": frozen, "command": ["SECRET_VALUE"]},
+    ):
+        changed = _site({**entry.config, **extra}, path=entry.ref, kind="judge")
+        errors = _with_default_decision(changed, catalog)
+        assert errors
+        assert_secret_absent(PlanError(errors), "SECRET_VALUE")
+        assert_secret_absent(PlanError(errors), "SECRET_KEY")
+    assert _with_default_decision(site, catalog, overrides={"files": frozen})
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"files": ["fixed.py"]},
+        {"sources": ["fixed.py"]},
+        {"bundle": {"sources": ["fixed.py"]}},
+    ],
+)
+def test_explicit_catalog_alias_is_not_an_omitted_default(supplied: dict[str, Any]) -> None:
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref="_fakes.admission:AliasedDefaultScriptJudge",
+        description="d",
+        config={"command": ["python", "judge.py"], **supplied},
+    )
+    site = _site(
+        {**entry.config, "files": {"globs": ["judge.py"], "manifest": {"judge.py": "ab" * 32}}},
+        path=entry.ref,
+        kind="judge",
+    )
+    assert _with_default_decision(site, PlannerCatalog(entries=[entry]))
+
+
+def test_default_resolution_requires_matching_human_catalog_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref="_fakes.admission:DefaultScriptJudge",
+        description="d",
+        config={"command": ["python", "judge.py"]},
+    )
+    catalog = PlannerCatalog(entries=[entry])
+    config = {**entry.config, "files": {"globs": ["judge.py"], "manifest": {}}}
+    calls: list[str] = []
+    original = Ref.load
+
+    def tracked(ref: Ref) -> type:
+        calls.append(ref.path)
+        assert ref.path == entry.ref
+        return original(ref)
+
+    monkeypatch.setattr(Ref, "load", tracked)
+    assert check_catalog(_site(config, path=entry.ref, kind="judge"), catalog, overrides={})
+    assert calls == []
+    for path, kind in [("_fakes.import_canary:Tool", "judge"), (entry.ref, "tool")]:
+        site = _site(config, path=path, kind=kind)  # ty: ignore[invalid-argument-type]
+        assert _with_default_decision(site, catalog)
+    assert calls == []
+    assert _with_default_decision(_site(config, path=entry.ref, kind="judge"), catalog) == []
+    assert calls
+    assert set(calls) == {entry.ref}
+
+
+def test_default_resolution_failure_keeps_catalog_error_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref="_fakes.admission:DefaultScriptJudge",
+        description="d",
+        config={"command": ["python", "judge.py"]},
+    )
+    site = _site({**entry.config, "files": ["judge.py"]}, path=entry.ref, kind="judge")
+
+    def broken(ref: Ref) -> type:
+        raise RuntimeError("SECRET_VALUE")
+
+    monkeypatch.setattr(Ref, "load", broken)
+    errors = _with_default_decision(site, PlannerCatalog(entries=[entry]))
+    assert errors == [f"{site.pointer}: field '<field>' is not in the planner catalog"]
+    assert_secret_absent(PlanError(errors), "SECRET_VALUE")
+
+
+def test_frozen_default_lookup_retains_first_fixed_match() -> None:
+    first = CatalogEntry(
+        name="first",
+        kind="judge",
+        ref="_fakes.admission:DefaultScriptJudge",
+        description="d",
+        config={"command": ["first"]},
+    )
+    second = first.model_copy(update={"name": "second", "config": {"command": ["second"]}})
+    duplicate = second.model_copy(update={"name": "duplicate"})
+    catalog = PlannerCatalog(entries=[first, second, duplicate])
+    ref = Ref(path=first.ref, config={**second.config, "files": ["judge.py"]})
+    assert find_entry(ref, "judge", catalog, defer_defaults=True) is second
+
+
+def test_default_decision_needs_no_component_construction_or_required_settable_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.admission import DefaultScriptJudge
+    from pydantic import create_model
+
+    schema = create_model("Config", __base__=DefaultScriptJudge.Config, tuning=(int, ...))
+    monkeypatch.setattr(DefaultScriptJudge, "Config", schema)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("constructed a component during the typed default check")
+
+    monkeypatch.setattr(DefaultScriptJudge, "__init__", forbidden)
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref="_fakes.admission:DefaultScriptJudge",
+        description="d",
+        config={"command": ["score"]},
+        settable={"tuning": {"type": "integer"}},
+    )
+    site = _site({**entry.config, "tuning": 1, "files": ["judge.py"]}, path=entry.ref, kind="judge")
+    assert _with_default_decision(site, PlannerCatalog(entries=[entry])) == []

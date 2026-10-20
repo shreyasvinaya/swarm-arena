@@ -5,11 +5,13 @@ import stat
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, cast
+from types import UnionType
+from typing import Annotated, Any, Final, Union, cast, get_args, get_origin
 
 from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic_core import PydanticUndefined
 
+from swarm_arena._errors import PlanError
 from swarm_arena._model.compat import _alias_paths
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
@@ -228,23 +230,87 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     return fs.model_copy(update={"manifest": manifest})
 
 
-def _snapshot_value(value: Any, raw: Any, base_dir: Path, artifacts: ArtifactStore) -> Any:
-    """Freeze typed files and refs inside containers without coercing raw scalars."""
+def _contains_file_ref(annotation: Any, seen: frozenset[type] = frozenset()) -> bool:
+    """Recognize only schemas capable of carrying files or component references."""
+    if get_origin(annotation) is Annotated:
+        return _contains_file_ref(get_args(annotation)[0], seen)
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if issubclass(annotation, (FileSet, Ref)):
+            return True
+        if annotation in seen:
+            return False
+        return any(
+            _contains_file_ref(field.annotation, seen | {annotation})
+            for field in annotation.model_fields.values()
+        )
+    return any(_contains_file_ref(item, seen) for item in get_args(annotation))
+
+
+def _snapshot_value(
+    value: Any,
+    raw: Any,
+    base_dir: Path,
+    artifacts: ArtifactStore,
+    *,
+    annotation: Any,
+    field: str,
+) -> Any:
+    """Freeze file/ref-bearing schemas while retaining all unrelated raw values."""
+    if not _contains_file_ref(annotation):
+        return raw
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if origin is Annotated:
+        return _snapshot_value(
+            value, raw, base_dir, artifacts, annotation=arguments[0], field=field
+        )
+    if origin in (Union, UnionType):
+        for branch in arguments:
+            candidate = branch
+            while get_origin(candidate) is Annotated:
+                candidate = get_args(candidate)[0]
+            kind = get_origin(candidate) or candidate
+            if isinstance(kind, type) and isinstance(value, kind) and _contains_file_ref(branch):
+                return _snapshot_value(
+                    value, raw, base_dir, artifacts, annotation=branch, field=field
+                )
+        return raw
     if isinstance(value, FileSet):
         return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
     if isinstance(value, Ref):
         return snapshot_ref(value, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
     if isinstance(value, BaseModel) and isinstance(raw, dict):
         return _snapshot_config(value, raw, base_dir, artifacts)
-    if isinstance(value, Mapping) and isinstance(raw, dict):
+    if isinstance(value, Mapping):
+        if not isinstance(raw, dict) or value.keys() != raw.keys():
+            raise PlanError(
+                [f"field {field!r}: validation changed the shape of a file or reference mapping"]
+            ) from None
         return {
-            key: _snapshot_value(value[key], child, base_dir, artifacts) if key in value else child
+            key: _snapshot_value(
+                value[key], child, base_dir, artifacts, annotation=arguments[1], field=field
+            )
             for key, child in raw.items()
         }
-    if isinstance(value, (list, tuple)) and isinstance(raw, list):
+    if isinstance(value, (list, tuple)):
+        if not isinstance(raw, list) or len(value) != len(raw):
+            raise PlanError(
+                [f"field {field!r}: validation changed the shape of a file or reference list"]
+            ) from None
         return [
-            _snapshot_value(item, child, base_dir, artifacts)
-            for item, child in zip(value, raw, strict=True)
+            _snapshot_value(
+                item,
+                child,
+                base_dir,
+                artifacts,
+                annotation=(
+                    arguments[index]
+                    if origin is tuple and arguments[-1] is not Ellipsis
+                    else arguments[0]
+                ),
+                field=field,
+            )
+            for index, (item, child) in enumerate(zip(value, raw, strict=True))
         ]
     return raw
 
@@ -257,6 +323,9 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     written back; nonempty FileSet defaults are frozen under their canonical
     field names. Empty FileSet defaults and other defaults stay omitted.
     Typed reference mappings retain their keys and unrelated values stay raw.
+    Only annotations that can hold FileSets or Refs are traversed. Validation
+    may normalize unrelated lists and mappings without changing their stored
+    raw values; shape changes in file/reference containers are refused.
     Validation aliases retain their original input paths and precedence.
     Nested references omit absent model fields, and the returned reference is
     validated so its configuration remains reloadable from JSON and TOML.
@@ -279,6 +348,9 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     ------
     TypeError
         If the referenced object is not a Configurable subclass.
+    PlanError
+        If validation changes a file/reference container's shape. The error
+        names the schema field without including configured values.
     ValueError
         If importing, validating configuration, or snapshotting files fails.
         ConfigError diagnostics omit values, validator messages, and data keys.
@@ -311,6 +383,8 @@ def _snapshot_config(
     updated = deepcopy(raw)
     settings = type(config).model_config
     for key, field in type(config).model_fields.items():
+        if not _contains_file_ref(field.annotation):
+            continue
         alias = field.validation_alias
         paths = (
             _alias_paths(
@@ -348,6 +422,8 @@ def _snapshot_config(
             target.get(path[-1]) if isinstance(target, dict) else target[path[-1]],
             base_dir,
             artifacts,
+            annotation=field.annotation,
+            field=key,
         )
     return updated
 

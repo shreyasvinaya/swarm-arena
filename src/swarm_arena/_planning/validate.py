@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from swarm_arena._agent.manager import Manager
 from swarm_arena._errors import ConfigError, PlanError
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._model.catalog import _human_only_inputs
+from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
 from swarm_arena._model.data import json_equal
 from swarm_arena._model.goal import FileSet, Goal, GoalKey
 from swarm_arena._model.locations import _safe_location
@@ -19,7 +19,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._planning.catalog_check import authorize_revision
+from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
 from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
 from swarm_arena._scoring.check import Check
@@ -67,19 +67,40 @@ def _inherited_converge(plan: Plan) -> Plan:
 
 def _authorize(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> Plan:
     projected = _inherited_converge(plan)
+    projected_history = [_inherited_converge(p) for p in history]
+    deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] = []
     authorized, errors = _safe_call(
         "/refs",
         partial(
             authorize_revision,
             projected,
             config,
-            history=[_inherited_converge(p) for p in history],
+            history=projected_history,
+            deferred=deferred,
         ),
     )
     if errors:
         # Retired addresses are also import-free, so report them even when a
         # restored agent has already lost its inherited catalog authority.
         raise PlanError([*errors, *_rule_addresses(plan, config, history)]) from None
+    default_errors, default_pairs = _safe_call("/refs", partial(_check_catalog_defaults, deferred))
+    if default_errors:
+        raise PlanError(default_errors) from None
+    if default_pairs:
+        # Reapply the unchanged raw checks/manifest cleanup with only the frozen
+        # default declarations approved above added to this invocation's trust.
+        authorized, errors = _safe_call(
+            "/refs",
+            partial(
+                authorize_revision,
+                projected,
+                config,
+                history=projected_history,
+                _default_pairs=frozenset(default_pairs),
+            ),
+        )
+        if errors:
+            raise PlanError(errors) from None
     if projected is not plan:
         authorized = authorized.model_copy(
             update={"converge": authorized.converge.model_copy(update={"round": None})}
@@ -694,9 +715,11 @@ def validate_plan(
     """
     Validate plan admission and return optional model warnings.
 
-    Raw non-human references are authorized before importing any component.
-    All subsequent rule errors are collected. File identities must already be
-    snapshotted; the engine uses ``admit_revision`` to resolve them first.
+    Import-free raw authorization runs before typed catalog-default checks.
+    Only catalog-matched Configs may resolve omitted FileSet defaults. The same
+    two steps run in admission before snapshotting. Subsequent rule errors are
+    collected. File identities must already be snapshotted; the engine uses
+    ``admit_revision`` to resolve them first.
 
     Parameters
     ----------

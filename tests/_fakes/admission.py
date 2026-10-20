@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
+import pydantic
 from _fakes.tools import FixedJudge
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
@@ -87,3 +88,37 @@ class DefaultScriptJudge(ScriptJudge):
 class AliasScriptTool(ScriptTool):
     class Config(ScriptTool.Config):  # ty: ignore[invalid-attribute-override]
         command: list[str] = Field(default_factory=lambda: ["true"], validation_alias="argv")
+
+
+class AliasedDefaultScriptJudge(DefaultScriptJudge):
+    class Config(DefaultScriptJudge.Config):  # ty: ignore[invalid-attribute-override]
+        files: FileSet = Field(
+            default_factory=lambda: FileSet(globs=["judge.py"]),
+            validation_alias=AliasChoices("sources", AliasPath("bundle", "sources"), "files"),
+        )
+
+
+class NormalizeTool(ProbeTool):
+    class Config(ProbeTool.Config):  # ty: ignore[invalid-attribute-override]
+        labels: list[str] = []
+        metadata: dict[str, str] = {}
+
+        @pydantic.field_validator("labels")
+        @classmethod
+        def unique(cls, value: list[str]) -> list[str]:
+            return list(dict.fromkeys(value))
+
+        @pydantic.field_validator("metadata")
+        @classmethod
+        def normalize_keys(cls, value: dict[str, str]) -> dict[str, str]:
+            return {key.lower(): item for key, item in value.items()}
+
+
+class ShrinkingRefsTool(ProbeTool):
+    class Config(ProbeTool.Config):  # ty: ignore[invalid-attribute-override]
+        members: list[RefField] = []
+
+        @pydantic.field_validator("members")
+        @classmethod
+        def first_only(cls, value: list[Any]) -> list[Any]:
+            return value[:1]
