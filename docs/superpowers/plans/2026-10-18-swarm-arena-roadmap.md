@@ -2176,6 +2176,26 @@ class RoundRunner:                                   # _engine/round.py
     async def run(self, round: int) -> RoundOutcome: ...
 async def converge(goal: GoalRunner, *, select_only: bool) -> list[Candidate]: ...   # _engine/converge.py
 def solution_view(state: RunState, goal_id: str, source: Head) -> bytes: ...         # _engine/solution.py, pure
+async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Executor) -> None: ...
+    # _engine/preflight.py: each distinct (path, normalized built config) once per call. Main/part checks and judges,
+    # managers, executor, and effective tool variants across ordinary and converge rounds only; no Policy/Planner hook.
+    # Admitted later revisions use this same preflight before dispatch. User construction/hooks use run_sync_daemon;
+    # failures aggregate reference paths and exception types only.
+def build_manifest(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
+                   capacity: Resources | None) -> dict[str, Any]: ...  # _engine/manifest.py; offload from async callers
+    # Validated JSON-mode RunManifest dump, with nulls preserved. Hash deterministic UTF-8 config/plan TOML dumps;
+    # record GoalKey.files_sha256, base-ref tool identities (catalog settable fields excluded), and bounded git probes.
+class GoalStatus(FrozenModel):
+    status: str; round: int; rounds_total: int; candidates: int; best: float | None
+    # best is the current main group's best ranking Score.value, or None when absent/non-scalar or unjoined.
+    # Rank within one newest stamped identity/fidelity, using explicit plan judge metadata or stamped main scores.
+    # Never import components to resolve names, combine parts, or substitute a tuple key coordinate for value.
+class StatusReport(FrozenModel):
+    run_id: str; epoch: int; owner_live: bool; head_seq: int
+    stop: Literal["none", "stop", "stop-now"]; goals: dict[str, GoalStatus]; spent: Amount; lost: int
+    # spent uses reservation amounts while open/estimated/keep_charged, actual for settled, preserving overflow actuals.
+    # stop is committed RunState.stop; lost is len(RunState.lost). One owner read selects the committed chain.
+def format_status(report: StatusReport) -> str: ...  # _engine/control.py
 async def read_status(run_root: str, run_id: str) -> StatusReport: ...               # _engine/control.py
 def stop_key(epoch: int, *, now: bool) -> str: ...   # _engine/control.py: "control/stop-e<epoch>" or "control/stop-now-e<epoch>"
 async def request_stop(run_root: str, run_id: str, *, now: bool) -> int: ...         # _engine/control.py; returns the epoch
@@ -2370,8 +2390,9 @@ each `replicate_stats` row carries `part` (null for the main goal), `judge`,
 input hash only within that same group, identity and fidelity. A cohort is
 included only when at least one member has `replicate > 0`; main-goal and part
 cohorts are never combined. `manifest.json` similarly uses a private
-`RunManifest` StoredModel, kind `manifest`, when its
-producer is implemented. These artifact models are distinct from
+`RunManifest` StoredModel, kind `manifest`, with validated finite JSON subtrees
+and nullable capacity/commit fields. Readers use its migration-aware loading path.
+These artifact models are distinct from
 `_model.data.Manifest`, the workspace-path-to-SHA-256 file-map alias.
 
 ## R5. Global constraints

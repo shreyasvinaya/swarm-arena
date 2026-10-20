@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from swarm_arena import Plan, RunConfig
+from swarm_arena._engine.manifest import RunManifest, build_manifest
 from swarm_arena._engine.solution import SolutionDocument
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
@@ -23,6 +24,7 @@ from swarm_arena._tooling.result_file import ToolResultFile, request_json
 from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
+    ("manifest", 1): "1d2a6841f6bef3f68d79b19eba61c50bce6f00f834a7d5b58291a2a6be64fd95",
     ("solution", 1): "a325bf2c0a9df566ae25ad655f29491c59ec671bead59f34048deb4808a1d449",
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",
@@ -53,6 +55,7 @@ FIELD_SETS = {
         OwnerDoc,
         Frontier,
         SolutionDocument,
+        RunManifest,
     ],
 )
 def test_stored_field_sets_require_a_version_bump(model: type[StoredModel]) -> None:
@@ -225,4 +228,19 @@ def test_solution_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) 
     assert upgraded.reason == "migrated"
     assert upgraded.manifest == {"git_commit": None}
     assert calls == [raw]
+    assert raw["schema_version"] == 1
+
+
+@pytest.mark.usefixtures("isolated_migrations")
+def test_manifest_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "manifest": 2})
+
+    @migration("manifest", 1)
+    def step(data: dict[str, Any]) -> dict[str, Any]:
+        return {**data, "run_id": "migrated"}
+
+    upgraded = RunManifest.model_validate_json(json.dumps(raw))
+    assert upgraded.schema_version == 2
+    assert upgraded.run_id == "migrated"
     assert raw["schema_version"] == 1

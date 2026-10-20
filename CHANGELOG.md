@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Run preflight checks distinct effective component configurations; versioned run
+  manifests record provenance, and epoch-scoped stop requests and committed-journal
+  status provide run control without importing user components for status.
+
 - `ScriptedManager` runs ordered baseline requests without a model;
   `testing.check_manager` exercises managers offline through real core actions.
 

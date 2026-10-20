@@ -883,3 +883,26 @@ def score_min_y(goal: Goal, candidate: Candidate) -> Score:
 
 def score_max_y(goal: Goal, candidate: Candidate) -> Score:
     return Score.maximize(candidate.output.data["y"])
+
+
+class CountingTool(PyTool):
+    calls: ClassVar[int] = 0
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        # These fixtures give the parent config's required code field a default.
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        code: str = ""
+        k: int = 1
+
+    def preflight(self) -> None:
+        CountingTool.calls += 1
+
+
+class FailingPreflightTool(PyTool):
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        # These fixtures give the parent config's required code field a default.
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        code: str = ""
+
+    def preflight(self) -> None:
+        raise RuntimeError("no license")
