@@ -110,14 +110,17 @@ Settlement is idempotent by reservation ID. Ordinary reported usage releases
 unused funding back to its original pools. After a committed start,
 provider-using tools retain the full reservation when usage cannot be recovered,
 including invalid output; available usage otherwise settles the reported amount.
-Settlement cleanup is bounded by `settle_timeout_s`; without a committed settle,
-the reservation stays charged in full. Cancelling construction or command preparation
+`settle_timeout_s` bounds the wait for pending call reports, not the subsequent
+durable settlement writes. Without a committed settle, the reservation stays
+charged in full. Cancelling construction or command preparation
 before a committed start releases the reservation at zero while ownership is
 held; a late preparation result never launches or journals work.
 
 On resume, every reservation without a committed settlement stays charged in
-full. Completed committed runs are recovered; dispatched runs without committed
-completion become `lost`, and retrying them needs new budget. Thus a crash's
+full. Runs with a committed completion are recovered; runs with a committed
+start but no committed completion become `lost`, and retrying them needs new
+budget. Reservations for dispatches without a committed start remain charged
+conservatively, without a lost marker. Thus a crash's
 additional accounting loss is bounded by unsettled reservations: in-flight tool
 runs and open per-holder tranches. The accounting cap cannot be enlarged by a
 crash or forced takeover. A tool's **actual external spend** still depends on

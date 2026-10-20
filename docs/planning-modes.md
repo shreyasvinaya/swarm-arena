@@ -143,12 +143,18 @@ field is accepted only when its declaration equals that typed default, after
 the import-free catalog match. This permits default files without making other
 extra fields or different file declarations planner-settable.
 
-Non-human file manifests are trusted only through admitted history. A supplied
-manifest, even for a catalog-default declaration, cannot authorize arbitrary
+Non-human component-file manifests (tools, checks, judges, and nested references)
+are trusted only through admitted history. A supplied component manifest, even
+for a catalog-default declaration, cannot authorize arbitrary
 stored blobs. Without trusted history those files are snapshotted again from
 the human source directory; missing sources fail admission. A human can
 explicitly vouch for a saved snapshot by changing its origin to `"human"`.
 Loading it alone never makes that change.
+
+An initial plan's goal snapshot may be supplied. Later revisions must keep the
+main goal's `GoalKey`. Non-human part manifests must be exact path-and-digest
+subsets of the main manifest. These goal-file rules are separate from
+component-file manifest trust.
 
 Check- and judge-private files cannot appear in main or part goal files or in
 tool-owned files, including alternate Unicode/case spellings. See
