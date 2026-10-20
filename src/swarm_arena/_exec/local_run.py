@@ -14,10 +14,13 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_stage import _Staged
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
-from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput
+from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, format_logs_ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files
 from swarm_arena._tooling.result_file import (
+    _OUTPUT_BYTE_LIMIT,
+    MAX_DECLARED_FILES,
+    NOTE_PREFIX,
     command_output_from_result,
     note_in_log,
     open_log,
@@ -164,6 +167,7 @@ class _JobRun:
 
     def _collect(self, run: CompletedRun) -> ToolOutput | None:
         """Collect and validate the output; on any failure, note it and return None."""
+        token = _OUTPUT_BYTE_LIMIT.set(self._max_output)
         try:
             output: object
             if self._staged.tool is not None and self._staged.request is not None:
@@ -173,9 +177,14 @@ class _JobRun:
         except (Exception, SystemExit):
             note_in_log(run.stderr_path, "collect failed: " + traceback.format_exc())
             return None
+        finally:
+            _OUTPUT_BYTE_LIMIT.reset(token)
         try:
             if not isinstance(output, ToolOutput):
                 raise TypeError(_NOT_AN_OUTPUT)
+            if len(output.files) > MAX_DECLARED_FILES:
+                note_in_log(run.stderr_path, "too many declared files")
+                return None
             # model_copy and model_construct skip validation (the finite-JSON rule too).
             return ToolOutput.model_validate(output.model_dump(warnings=False))
         except (Exception, SystemExit):
@@ -216,7 +225,7 @@ class _JobRun:
                 dropped = size - self._max_log
                 if rel == _STDERR:  # the note lands in this log and pushes out its own length
                     for _ in range(3):
-                        line = f"swarm-arena: {_truncated(rel, dropped)}\n"  # note_in_log's form
+                        line = f"{NOTE_PREFIX}{_truncated(rel, dropped)}\n"  # note_in_log's form
                         dropped = size + len(line.encode()) - self._max_log
                 note_in_log(self._stderr, _truncated(rel, dropped))
                 size = os.fstat(fd).st_size
@@ -226,6 +235,8 @@ class _JobRun:
 
     def _check_output_sizes(self, files: Sequence[FileRef]) -> None:
         """Raise ValueError naming the declared output whose size crosses the run's cap."""
+        if len(files) > MAX_DECLARED_FILES:
+            raise ValueError("too many declared files")
         total = 0
         for ref in files:
             try:
@@ -256,7 +267,7 @@ class _JobRun:
             update |= {"status": RunStatus.ERROR, "files": []}
         # stdout first: a note about it must reach stderr before stderr is read.
         hashes = [self._artifacts.put_bytes(self._read_log(rel)) for rel in (_STDOUT, _STDERR)]
-        update["logs_ref"] = "sha256:" + ":".join(hashes)
+        update["logs_ref"] = format_logs_ref(hashes[0], hashes[1])
         if times is not None:
             update["started_at"], update["ended_at"] = times
         return output.model_copy(update=update)

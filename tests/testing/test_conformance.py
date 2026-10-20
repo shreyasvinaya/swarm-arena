@@ -56,9 +56,12 @@ from swarm_arena import (
     ScriptTool,
 )
 from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._exec.local import _NOT_AN_OUTPUT
 from swarm_arena._model.ids import run_tag
+from swarm_arena._model.tooling import format_logs_ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
+from swarm_arena._tooling.result_file import NOTE_PREFIX
 from swarm_arena.board import Candidate
 from swarm_arena.executor import Job, LocalExecutor
 from swarm_arena.scoring import (
@@ -82,7 +85,7 @@ from swarm_arena.tool import (
 )
 
 SECRET = "d9be8c92-4d1c-4b85-a2c7-632b17d8499f"
-INVALID_COLLECT_NOTE = "swarm-arena: collect failed: Tool.collect() did not return a ToolOutput"
+INVALID_COLLECT_NOTE = NOTE_PREFIX + _NOT_AN_OUTPUT
 RUN_PY = """\
 import json, os
 data = {name: open(f"problem/{name}.txt").read() for name in ("a", "b")}
@@ -533,7 +536,7 @@ def with_stderr(status: RunStatus, stderr: str) -> ToolOutput:
     """Return an output whose stored stderr log is ``stderr``, as LocalExecutor stores it."""
     store = ArtifactStore(open_store(_artifact_root()))
     hashes = [store.put_bytes(b""), store.put_bytes(stderr.encode())]
-    return ToolOutput(status=status, logs_ref="sha256:" + ":".join(hashes))
+    return ToolOutput(status=status, logs_ref=format_logs_ref(hashes[0], hashes[1]))
 
 
 @pytest.mark.parametrize("status", list(RunStatus))
@@ -558,7 +561,7 @@ async def test_note_check_reads_the_statuses_of_a_replaced_collect(status: RunSt
         pytest.param(f"{INVALID_COLLECT_NOTE}\nmore output\n", True, id="line-anywhere"),
         pytest.param(f"50%{INVALID_COLLECT_NOTE}\n", True, id="joined-to-final-tool-line"),
         pytest.param(
-            f"50%{INVALID_COLLECT_NOTE}\nswarm-arena: no partial output\n",
+            f"50%{INVALID_COLLECT_NOTE}\n{NOTE_PREFIX}no partial output\n",
             True,
             id="joined-then-notes",
         ),

@@ -217,6 +217,11 @@ Rules [plan]:
 | `_facade.py` | `publish()`: sets `__module__` of exported names, their nested classes, and their methods to their facade (R0), so doctest collects method examples | M1a | `tests/test_public_api.py` |
 | `_model/__init__.py` | Empty | M1a | — |
 | `_model/base.py` | `FrozenModel`, `StoredModel`, `JsonValue`, the `Origin` and role literals | M1a | `tests/_model/test_base.py` |
+| `_model/compat.py` | Isolated Pydantic implementation assumptions | M1a | `tests/_model/test_compat.py` |
+| `_model/data.py` | Finite JSON and depth bounds, `Sha256`, manifest validation | M1a | `tests/_model/test_data_validation.py` |
+| `_model/diagnostics.py` | Transportable sanitized validation errors and `validation_summary` | M1a | `tests/_model/test_validation_safety.py` |
+| `_model/safe.py` | Shared model validation and error sanitization boundaries | M1a | `tests/_model/test_validation_boundaries.py`, `tests/_model/test_validation_safety.py` |
+| `_model/locations.py` | Schema-aware identifier-only validation locations | M1a | `tests/_model/test_validation_locations.py` |
 | `_model/canonical.py` | Canonical JSON, sha256 helpers, UTC time format | M1a | `tests/_model/test_canonical.py` |
 | `_model/migrate.py` | `schema_version` migration registry; refuses newer versions | M1a +M2 | `tests/_model/test_migrate.py` |
 | `_model/toml_io.py` | TOML read (`tomllib`) and a deterministic TOML writer for plan and run views | M1a | `tests/_model/test_toml_io.py` |
@@ -228,7 +233,7 @@ Rules [plan]:
 | `_model/settings.py` | `SecretsPolicy`, `TracingConfig`, `GatewayConfig`, `CachePolicy` | M1a | `tests/_model/test_settings.py` |
 | `_model/catalog.py` | `ModelSpec`, `ModelCatalog`, `CatalogEntry`, `PlannerCatalog` (load-time rules) | M1a | `tests/_model/test_catalog.py` |
 | `_model/run_config.py` | `RunConfig`, `RunConfig.load` and `dumps` | M1a | `tests/_model/test_run_config.py` |
-| `_model/tooling.py` | `RunStatus`, `Usage`, `Estimate`, `FileRef`, `ParentRef`, `ToolRequest`, `ToolOutput`, `Command`, `CompletedRun` | M1a | `tests/_model/test_tooling.py` |
+| `_model/tooling.py` | `RunStatus`, `Usage`, `Estimate`, `FileRef`, `ParentRef`, `ToolRequest`, `ToolOutput`, `Command`, `CompletedRun`; `format_logs_ref`, `parse_logs_ref` | M1a | `tests/_model/test_tooling.py` |
 | `_model/results.py` | `Candidate`, `CheckResult`, `Score`, `Learning`, `LLMCall`, `AgentStatus` | M1a | `tests/_model/test_results.py` |
 | `_model/protocol.py` | A2A v1.0.1 frozen dataclasses and the `RunStatus → TaskState` map | M1a | `tests/_model/test_protocol.py` |
 | `_model/ids.py` | `IdGen`, `run_tag`, `human_learning_id`, `new_run_id` (R4.13.5) | M1a | `tests/_model/test_ids.py` |
@@ -243,11 +248,12 @@ Rules [plan]:
 | `_tooling/tool.py` | `Tool` ABC, `Action` | M1a | `tests/_tooling/test_tool.py` |
 | `_tooling/function_tool.py` | `FunctionTool`; input model from the function signature | M1a | `tests/_tooling/test_function_tool.py` |
 | `_tooling/script_tool.py` | `ScriptTool`; `list_files` and `read_file` actions | M1a | `tests/_tooling/test_script_tool.py` |
+| `_tooling/shadowing.py` | Editable-glob Python import-shadowing witnesses | M1a | `tests/_tooling/test_script_tool.py` |
 | `_tooling/files.py` | Glob snapshot of `FileSet`s, of one `Ref` (`snapshot_ref`), and of a whole plan into `artifact_root` | M1a | `tests/_tooling/test_files.py` |
 | `_tooling/paths.py` | Path rules, reserved names, `editable` glob matching | M1a | `tests/_tooling/test_paths.py` |
 | `_tooling/staging.py` | Staging order, overlay rule, protected paths, `tool_identity`, `fixed_config`, script-workspace `candidate/` plan | M1a | `tests/_tooling/test_staging.py` |
 | `_tooling/materialize.py` | Write a `Job.Stage` into a directory; collect output files | M1a | `tests/_tooling/test_materialize.py` |
-| `_tooling/result_file.py` | Parse and validate `swarm/result.json`; write `swarm/request.json` | M1a | `tests/_tooling/test_result_file.py` |
+| `_tooling/result_file.py` | Parse and validate `swarm/result.json`; write `swarm/request.json`; `NOTE_PREFIX`, `MAX_DECLARED_FILES`, collection byte-budget context | M1a | `tests/_tooling/test_result_file.py` |
 | `_tooling/llm_calls.py` | Collect `swarm/llm_calls.jsonl`; set `llm_calls_source` | M4 | `tests/_tooling/test_llm_calls.py` |
 | `_exec/__init__.py` | Empty | M1a | — |
 | `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` | M1a | `tests/_exec/test_executor.py` |
@@ -256,6 +262,9 @@ Rules [plan]:
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/local.py` | `LocalExecutor` | M1a | `tests/_exec/test_local.py` |
+| `_exec/local_stage.py` | Staging, command preparation, effective limits and environment | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
+| `_exec/local_workspace.py` | Workspace creation, ownership checks and cleanup | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
+| `_exec/local_run.py` | Supervision, daemon collection, bounded output reads and uploads | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_output_bounds.py` |
 | `_scoring/__init__.py` | Empty | M1a | — |
 | `_scoring/check.py` | `Check` ABC, `CheckContext` | M1a | `tests/_scoring/test_check.py` |
 | `_scoring/judge.py` | `Judge` ABC, `JudgeContext`, identity hashes, score stamping, finite-key rule | M1a | `tests/_scoring/test_judge.py` |
@@ -678,6 +687,11 @@ class ToolOutput(FrozenModel):
     llm_calls_file: FileRef | None = None       # [plan] M4: swarm/llm_calls.jsonl in artifact_root, set where the tool runs
         # (a Ray worker too) so it reaches the driver with the output (§4.3, §7.3 item 2b); None if absent
 
+# Private shared codec beside ToolOutput; executor and conformance kit use the same format.
+def format_logs_ref(stdout_sha: str, stderr_sha: str) -> str: ...
+def parse_logs_ref(ref: str) -> tuple[str, str]: ...
+# sha256:<stdout SHA-256>:<stderr SHA-256>; malformed references raise value-free ValueError.
+
 class Command(FrozenModel):
     argv: list[str]
     cwd: str | None = None                      # relative to the workspace; None → the workspace
@@ -739,6 +753,7 @@ class FunctionTool(Tool):
         providers: list[str] = []
         timeout_s: float | None = None
         grace_s: float = 10.0
+        env: list[EnvName] = []                 # list[str] with environment-name syntax
     def __init__(self, function: "str | Callable[..., Any] | FunctionTool.Config", /, **fields: Any) -> None: ...
     # command(): `python -P -m swarm_arena.run_function --import-root <dir> <function>`
     # (`-P` suppresses only the implicit cwd/script-directory `sys.path` entry; explicit `PYTHONPATH`
@@ -747,6 +762,9 @@ class FunctionTool(Tool):
     # imports what the driver imported; no `Job.env` entry is needed.
     # Inputs are validated by a model built from the function's annotated parameters,
     # so the driver imports the function (a recorded exception to §4.3, R5.4); the return value must be a JSON object → data.
+
+    # env is human-only and forwarded to Command.env. Results are data-only on every status;
+    # files written by the function are never uploaded, including after timeout or cancellation.
 
 # _tooling/script_tool.py — M1a
 class ScriptTool(Tool):
@@ -1872,6 +1890,9 @@ def tool_grace(tool: Tool) -> float: ...
 def cap_timeout(configured: float | None, limit_s: float) -> float: ...  # shared cap, also used by CheckContext.execute
 
 # _tooling/result_file.py
+NOTE_PREFIX: Final = "swarm-arena: "
+MAX_DECLARED_FILES: Final = 4096
+_OUTPUT_BYTE_LIMIT: Final[ContextVar[int | None]]  # set/reset inside daemon collect from executor config
 # The read_regular_file of R4.13.8: O_NOFOLLOW | O_NONBLOCK, regular files only, no symlinked component.
 def read_regular_file(workspace: Path, rel: str) -> bytes: ...
 def symlinked_component(base: Path, rel: str) -> str | None: ...  # shared component check for snapshots and collection

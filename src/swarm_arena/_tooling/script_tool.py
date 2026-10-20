@@ -203,6 +203,7 @@ class ScriptTool(Tool):
     name: ClassVar[str] = "script"
     description: ClassVar[str] = "Runs your script on your files."
     input_model: ClassVar[type[BaseModel]] = _EmptyInputs
+    """Default empty input schema; use ``get_input_model`` for the configured schema."""
     _human_only: ClassVar[frozenset[str]] = frozenset(
         {"command", "python", "files", "env", "editable"}
     )

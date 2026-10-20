@@ -145,6 +145,17 @@ the built-in `ScriptTool` reader uses. The full contract (request shape,
 parents, edits, exit codes, partial results, the environment) is in
 [Use your own files and script](own-files.md).
 
+`LocalExecutor.Config.max_output_bytes` bounds the combined declared output
+bytes (default 256 MiB), including during built-in collection before hashing.
+Increasing that setting also increases the collection budget. Each result may
+declare at most 4096 files, counting empty files; the executor rejects larger
+custom results before serializing their models or reading their output files.
+The built-in reader accepts at most 1 MiB of result JSON, with nesting limited
+to 100 levels. Use output artifacts for larger script results. Hashing and
+upload use reads of at most 1 MiB each. `FunctionTool` returns data only and
+never uploads function-written artifacts on success, timeout or cancellation;
+use `ScriptTool` or a custom `Tool` for output files.
+
 For your own `Tool`, `collect()` decides what is kept: the core sees only the
 `ToolOutput` that it returns. The executor uploads only the files in
 `ToolOutput.files` (it reads each path in the workspace and stores the file by

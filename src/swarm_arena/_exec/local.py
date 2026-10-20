@@ -30,9 +30,9 @@ class LocalExecutor(Executor):
 
     For each job, ``submit`` waits for a slot in the resource pool, creates a
     workspace ``<workspace_root>/<id>-<random>``, stages ``job.stage`` into it,
-    and runs the command through the launcher (``python -I -m
-    swarm_arena._launch``) under a process-group supervisor: the command starts
-    only after ``job.on_started`` returns. In the workspace name, every
+    and runs the command through a private launcher process (``python -I``)
+    under a process-group supervisor: the command starts only after
+    ``job.on_started`` returns. In the workspace name, every
     character of the job id outside ``[A-Za-z0-9._-]`` becomes ``_``, and the
     id is cut to 64 characters. A leading ``"python"`` in the command becomes
     ``Command.python`` or ``sys.executable``. The environment is the allowlist
@@ -67,7 +67,7 @@ class LocalExecutor(Executor):
 
     On a timeout or a cancel, the group gets SIGTERM, then ``grace_s``, then
     ``Tool.collect`` for the partial output, then SIGKILL. A blocked collect
-    delays the SIGKILL by at most ``BEFORE_KILL_TIMEOUT_S`` after the grace
+    delays the SIGKILL by at most 30 seconds after the grace
     period: at that deadline the supervisor kills the group, and the collect is
     abandoned and not tried again. Collect runs in a daemon thread, so an
     abandoned one never keeps the interpreter from exiting; it may still write
@@ -272,7 +272,7 @@ class LocalExecutor(Executor):
             conversion to bytes.
         RuntimeError
             If the workspace root cannot be created or is not safe.
-        swarm_arena._errors.StorageError
+        StorageError
             If a stage artifact is missing or corrupt (``NotFound``), or the
             artifact store fails while the logs are uploaded.
         OSError

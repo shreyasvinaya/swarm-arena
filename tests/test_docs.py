@@ -3,6 +3,7 @@
 import re
 import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,17 @@ def test_script_guides_explain_import_shadowing(name: str) -> None:
     assert "problem/*.physk" in text
 
 
+class RenderedText(HTMLParser):
+    """Read displayed HTML text without scanning styles, URLs or element attributes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.chunks.append(data)
+
+
 def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
     output = tmp_path / "html"
     done = subprocess.run(
@@ -43,16 +55,32 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
         check=False,
     )
     assert done.returncode == 0, done.stdout + done.stderr
-    pages = list((output / "api").glob("*.html"))
+    pages = sorted((output / "api").rglob("*.html"))
+    leaks: list[str] = []
     assert pages
     for path in pages:
         html = path.read_text()
         assert not re.search(r'id="[^"]+\.(model_config|model_post_init|model_fields)"', html)
         assert "_Pydantic" not in html, path.name
+        rendered = RenderedText()
+        rendered.feed(html)
+        text = "".join(rendered.chunks)
+        if "swarm_arena._" in html or "swarm_arena._" in text:
+            leaks.append(f"{path.name}: private import path")
+        names = sorted(set(re.findall(r"(?<![\w])_(?!_)[A-Za-z]\w*", text)))
+        if names:
+            leaks.append(f"{path.name}: {names}")
+        if "BEFORE_KILL_TIMEOUT_S" in text:
+            leaks.append(f"{path.name}: private timeout constant")
+    assert not leaks, "\n".join(leaks)
     root_api = (output / "api" / "swarm_arena.html").read_text()
     assert 'id="swarm_arena.Goal"' in root_api
     assert 'id="swarm_arena.Plan.loads"' in root_api
     assert "Parameters" in root_api
+    protocol = RenderedText()
+    protocol.feed((output / "api" / "protocol.html").read_text())
+    assert "data=..." in "".join(protocol.chunks).replace(" ", "")
+    assert "omission, not a content value" in "".join(protocol.chunks)
 
 
 def test_own_files_offline_example_runs(tmp_path: Path) -> None:

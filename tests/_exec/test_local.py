@@ -1250,6 +1250,18 @@ async def test_partial_stays_true_when_kept_files_are_dropped_later(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drop: str
 ) -> None:
     ws = tmp_path / "kept"
+
+    def collect(
+        self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        # A custom connector can declare a valid file before final upload checks.
+        # Built-in collection rejects an over-budget envelope before hashing now.
+        return ToolOutput(
+            status=run.status,
+            files=[FileRef(name="x.txt", path="out/x.txt", sha256=sha256_hex(b"x"), size=1)],
+        )
+
+    monkeypatch.setattr(PyTool, "collect", collect)
     if drop == "upload":
 
         def down(self: ArtifactStore, data: bytes) -> str:
@@ -1259,9 +1271,7 @@ async def test_partial_stays_true_when_kept_files_are_dropped_later(
     ex = LocalExecutor(
         workspace_root=str(ws), keep_workspaces=True, max_output_bytes=0 if drop == "cap" else 1024
     )
-    code = "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x'); " + WRITE.format(
-        "{'data': {}, 'files': ['out/x.txt']}"
-    )
+    code = "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x')"
     out = await _cancel_when_ready(ex, ws, {}, tmp_path, code)
     status = RunStatus.ERROR if drop == "cap" else RunStatus.CANCELLED  # over a cap is an error
     assert (out.status, out.partial, out.data, out.files) == (status, True, {}, [])

@@ -29,13 +29,20 @@ from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
-from swarm_arena._model.tooling import CompletedRun, Estimate, RunStatus, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    CompletedRun,
+    Estimate,
+    RunStatus,
+    ToolOutput,
+    ToolRequest,
+    parse_logs_ref,
+)
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score, stamp_scores
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_ref
-from swarm_arena._tooling.result_file import request_json
+from swarm_arena._tooling.result_file import NOTE_PREFIX, request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
     plan_tool_stage,
@@ -50,8 +57,7 @@ _DEFAULT_GOAL: Final = Goal(id="check", namespace="testing")
 _IDS: Final = IdGen("local", 0)
 _ROOT_LOCK: Final = threading.Lock()
 _LOG_TAIL_BYTES: Final = 2048
-_NOTE_PREFIX: Final = "swarm-arena: "  # as note_in_log writes each note line
-_INVALID_COLLECT_NOTE: Final = _NOTE_PREFIX + _NOT_AN_OUTPUT
+_INVALID_COLLECT_NOTE: Final = NOTE_PREFIX + _NOT_AN_OUTPUT
 # LocalExecutor gives an invalid collect result one of these statuses: the run's stop
 # status after a timeout or a cancel, else error.
 _REPLACED_COLLECT: Final = (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED)
@@ -180,11 +186,14 @@ async def _executor(executor: Executor | None) -> AsyncGenerator[_Watched, None]
 def _stderr_tail(out: ToolOutput) -> str:
     """Read the last bytes of a run's stderr log from this process's artifact store."""
     logs_ref = getattr(out, "logs_ref", None)  # model_construct can leave it unset or wrong
-    parts = logs_ref.split(":") if isinstance(logs_ref, str) else []
-    if len(parts) != 3 or parts[0] != "sha256":
+    if not isinstance(logs_ref, str):
         return "(no stderr log)"
     try:
-        data = _artifacts().get_bytes(parts[2])
+        _, stderr_sha = parse_logs_ref(logs_ref)
+    except ValueError:
+        return "(no stderr log)"
+    try:
+        data = _artifacts().get_bytes(stderr_sha)
     except Exception:
         return "(the stderr log cannot be read)"
     return data[-_LOG_TAIL_BYTES:].decode(errors="replace")
@@ -204,7 +213,7 @@ def _has_invalid_collect_note(tail: str) -> bool:
     for line in reversed(lines):
         if line.endswith(_INVALID_COLLECT_NOTE):
             return True
-        if not line.startswith(_NOTE_PREFIX):
+        if not line.startswith(NOTE_PREFIX):
             return False  # the tool's final line, and it does not end with the note
     return False
 

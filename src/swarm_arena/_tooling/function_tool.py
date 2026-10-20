@@ -179,6 +179,7 @@ class FunctionTool(Tool):
     name: ClassVar[str] = "function"
     description: ClassVar[str] = "Runs a Python function in a subprocess."
     input_model: ClassVar[type[BaseModel]] = _EmptyInputs
+    """Default empty input schema; use ``get_input_model`` for the configured schema."""
 
     class Config(_ConfigInputModel):
         """

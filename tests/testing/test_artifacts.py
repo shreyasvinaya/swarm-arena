@@ -8,6 +8,8 @@ from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import ScriptTool, testing
 from swarm_arena._errors import NotFound, StorageError
+from swarm_arena._model.tooling import format_logs_ref, parse_logs_ref
+from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena.executor import LocalExecutor
 from swarm_arena.testing import _conformance
 from swarm_arena.testing._conformance import _artifact_root, _artifacts
@@ -28,7 +30,7 @@ def output_with_artifacts() -> ToolOutput:
     ]
     stdout = _artifacts().put_bytes(b"stdout\x00\xff")
     stderr = _artifacts().put_bytes(b"stderr\xfe")
-    return ToolOutput(status=RunStatus.OK, files=files, logs_ref=f"sha256:{stdout}:{stderr}")
+    return ToolOutput(status=RunStatus.OK, files=files, logs_ref=format_logs_ref(stdout, stderr))
 
 
 def test_read_output_file_uses_exact_path_and_returns_bytes() -> None:
@@ -58,7 +60,7 @@ def test_readers_verify_artifacts(kind: str, failure: str) -> None:
     digest = out.files[0].sha256
     if kind == "logs":
         assert out.logs_ref is not None
-        digest = out.logs_ref.split(":")[1]
+        digest, _ = parse_logs_ref(out.logs_ref)
     path = Path(_artifact_root()) / digest
     if failure == "missing":
         path.unlink()
@@ -96,3 +98,25 @@ def test_artifact_helpers_are_public() -> None:
     for name in ("read_output_file", "read_logs"):
         assert name in testing.__all__
         assert getattr(testing, name).__module__ == "swarm_arena.testing"
+
+
+@pytest.mark.parametrize("value", [None, SECRET, "sha256:" + SECRET + ":" + SECRET, 12])
+def test_stderr_tail_rejects_malformed_reference_before_storage(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden() -> ArtifactStore:
+        pytest.fail("malformed reference reached storage")
+
+    monkeypatch.setattr(_conformance, "_artifacts", forbidden)
+    out = ToolOutput.model_construct(status=RunStatus.ERROR, logs_ref=value)
+    assert _conformance._stderr_tail(out) == "(no stderr log)"
+
+
+def test_stderr_tail_reads_only_stderr_and_handles_missing_log() -> None:
+    stderr = _artifacts().put_bytes(b"e" * 3000)
+    # Stdout is deliberately missing: diagnostic tails must never read it.
+    out = ToolOutput(status=RunStatus.ERROR, logs_ref=format_logs_ref("0" * 64, stderr))
+    assert _conformance._stderr_tail(out) == "e" * 2048
+    missing = ToolOutput(status=RunStatus.ERROR, logs_ref=format_logs_ref("0" * 64, "1" * 64))
+    assert _conformance._stderr_tail(missing) == "(the stderr log cannot be read)"

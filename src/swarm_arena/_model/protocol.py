@@ -74,8 +74,9 @@ class Part:
         Inline binary content.
     url : str or None, default=None
         External content URL.
-    data : JsonValue or _Unset, optional
-        Structured content, including null, or the absent-data sentinel.
+    data : JsonValue, optional
+        Structured content, including null. Omit this argument for absent data;
+        the displayed ellipsis denotes omission, not a content value.
     media_type : str or None, default=None
         Content media type.
     filename : str or None, default=None

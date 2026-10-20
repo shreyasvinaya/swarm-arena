@@ -50,6 +50,13 @@ to 64 characters. The default `workspace_root` is per user:
 must be owned by you or root, and not writable by group or others unless sticky
 (like `/tmp`). The command starts only after `Job.on_started` returns.
 
+The total declared output size is bounded by `LocalExecutor.Config.max_output_bytes`
+(default **256 MiB**). This same budget reaches built-in collection before hashing
+and final upload; larger configured limits are supported. At most **4096 files**
+may be declared, including empty files. Excess declarations are refused before
+output revalidation or file reads. Hashing and upload read in chunks of at most
+**1 MiB**. The built-in result envelope itself is limited to **1 MiB** of JSON.
+
 A Command returned by `Tool.command()` may tighten the job's effective limits.
 The execution timeout is the smaller non-`None` value of `Command.timeout_s`
 and `Job.timeout_s`; if both are `None`, there is no execution timeout. Shutdown

@@ -1,8 +1,6 @@
 """Read verified artifacts produced by the process-local conformance kit."""
 
-import re
-
-from swarm_arena._model.tooling import ToolOutput
+from swarm_arena._model.tooling import ToolOutput, parse_logs_ref
 from swarm_arena.testing._conformance import _artifacts
 
 
@@ -97,8 +95,11 @@ def read_logs(output: ToolOutput) -> tuple[bytes, bytes]:
     ('hello', 'diagnostic')
     """
     ref = getattr(output, "logs_ref", None)
-    if not isinstance(ref, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}:[0-9a-f]{64}", ref):
-        raise ValueError("logs_ref must identify stored stdout and stderr logs")
-    _, stdout, stderr = ref.split(":")
+    try:
+        if not isinstance(ref, str):
+            raise ValueError
+        stdout, stderr = parse_logs_ref(ref)
+    except ValueError:
+        raise ValueError("logs_ref must identify stored stdout and stderr logs") from None
     artifacts = _artifacts()
     return artifacts.get_bytes(stdout), artifacts.get_bytes(stderr)
