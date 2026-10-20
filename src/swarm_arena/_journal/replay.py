@@ -63,6 +63,8 @@ class GoalState(FrozenModel):
         Snapshots for ordinary and converge rounds.
     end_reason : str or None, default=None
         Latest goal_finished reason.
+    no_result_reason : str or None, default=None
+        Latest no_result reason, separate from the goal_finished reason.
     notes : dict[str, str], default={}
         Most recent saved notes by team/agent.
     repeat_keys : dict[str, str], default={}
@@ -97,6 +99,7 @@ class GoalState(FrozenModel):
     decisions: list[tuple[int, Decision]] = []
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
+    no_result_reason: str | None = None
     notes: dict[str, str] = {}
     repeat_keys: dict[str, str] = {}
     final_order: list[str] = []
@@ -141,6 +144,7 @@ class RunState:
     Fields contain plans, goals, board items and their journal positions, open
     processes, reservations, stop state, elapsed time, epoch, and id counters.
     ``ledger_events`` retains whole budget events for history-only accounting.
+    ``manifest`` retains the run_started metadata independently of its event.
     ``llm_request_sha256`` is reserved for the later LLM event fold.
 
     Examples
@@ -151,6 +155,7 @@ class RunState:
     """
 
     run_id: str = ""
+    manifest: dict[str, Any] = field(default_factory=dict)
     config: RunConfig = field(default_factory=RunConfig)
     plans: dict[str, list[tuple[Plan, Origin]]] = field(default_factory=dict)
     goals: dict[str, GoalState] = field(default_factory=dict)
@@ -225,6 +230,8 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.RUN_STARTED:
+                self.manifest = deepcopy(payload.get("manifest", {}))
             case EventType.RUN_CONFIG:
                 self.config = RunConfig.model_validate(payload["config"])
             case EventType.LIMITS_CHANGED:
@@ -311,6 +318,7 @@ class RunState:
                 self._finished_goals.add(event.goal_id)
             case EventType.NO_RESULT:
                 updates["status"] = "no_result"
+                updates["no_result_reason"] = payload.get("reason")
             case EventType.ROUND_STARTED:
                 updates["counters"] = {}
                 if payload.get("converge", False):
@@ -371,6 +379,7 @@ class RunState:
 def _reset_converge() -> dict[str, Any]:
     """Start a fresh ordinary round or continued lifecycle."""
     return {
+        "no_result_reason": None,
         "converge_started": False,
         "converge_round": None,
         "select_only": False,

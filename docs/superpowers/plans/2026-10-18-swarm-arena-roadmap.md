@@ -1698,6 +1698,7 @@ class RunState:                                      # pure fold of committed ev
     @classmethod
     def from_events(cls, events: Iterable[Event]) -> "RunState": ...
     run_id: str
+    manifest: dict[str, Any]                        # run_started.manifest, independent of the event payload
     run_elapsed_s: float                            # maximum journaled active elapsed time
     epoch: int                                      # latest committed ownership epoch
     lost: set[str]                                  # candidate ids recorded by run_lost
@@ -1725,6 +1726,11 @@ class RunState:                                      # pure fold of committed ev
     stop: Literal["none", "stop", "stop-now"]        # this epoch only: a takeover event resets it to "none"
     llm_request_sha256: dict[str, str]               # [plan] M3: LLM call id → request sha256, from llm_call events (R4.13.19)
 ```
+
+`GoalState.no_result_reason` retains `no_result.reason` independently of
+`end_reason` (`goal_finished.reason`) and resets on continuation. The existing
+`final_order` and `final_parts` fields retain `final_order.candidate_ids` and
+`final_order.parts`; a null parts mapping denotes a main-goal or joined result.
 
 #### R4.13.5 Ids — M1a (R2.7 item 7)
 
@@ -2288,6 +2294,17 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
 ### R4.15 Stored formats and `schema_version`
 
 All start at `schema_version = 1`: journal `Event` and the segment link line, `OwnerDoc`, `RunConfig` (`run.toml`), `Plan` (`plan.rN.toml`), `manifest.json`, `solution.json`, `Candidate`, `Learning`, `LLMCall`, `Frontier`, `Job.Started`, `RunPointer`, `HumanObject`, `swarm/request.json` [plan], `candidate/request.json` and `candidate/output.json` [plan]. User-written `swarm/result.json` and `swarm/llm_calls.jsonl` may omit it (default 1). Older versions load through `_model/migrate.py`; newer versions fail with a clear `ValueError`.
+
+`solution.json` is the canonical JSON serialization of the private
+`_engine.solution.SolutionDocument(StoredModel)`, kind `solution`, with a validated
+`source_head`. Its JSON-only candidate, score, part, replicate-statistic,
+best-of-N, plan-revision, and run-metadata subtrees use `FiniteJsonObject` and
+retain nulls. Readers use `SolutionDocument.model_validate_json` for the registered
+upgrade path and newer-version refusal. Finalist `plan_revision` is the zero-based
+final evaluation revision; `lineage` lists direct parent ids. `manifest.json`
+similarly uses a private `RunManifest` StoredModel, kind `manifest`, when its
+producer is implemented. These artifact models are distinct from
+`_model.data.Manifest`, the workspace-path-to-SHA-256 file-map alias.
 
 ## R5. Global constraints
 

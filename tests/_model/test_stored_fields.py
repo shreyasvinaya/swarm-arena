@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from swarm_arena import Plan, RunConfig
+from swarm_arena._engine.solution import SolutionDocument
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import OwnerDoc
@@ -22,6 +23,7 @@ from swarm_arena._tooling.result_file import ToolResultFile, request_json
 from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
+    ("solution", 1): "a325bf2c0a9df566ae25ad655f29491c59ec671bead59f34048deb4808a1d449",
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",
     ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
@@ -50,6 +52,7 @@ FIELD_SETS = {
         SegmentLink,
         OwnerDoc,
         Frontier,
+        SolutionDocument,
     ],
 )
 def test_stored_field_sets_require_a_version_bump(model: type[StoredModel]) -> None:
@@ -191,3 +194,35 @@ def test_frontier_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) 
 def test_frontier_refuses_newer_version() -> None:
     with pytest.raises(ValueError, match="newer"):
         Frontier.model_validate_json('{"schema_version": 2}')
+
+
+@pytest.mark.usefixtures("isolated_migrations")
+def test_solution_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = {
+        "schema_version": 1,
+        "run_id": "r",
+        "goal_id": "g",
+        "status": "no_result",
+        "reason": None,
+        "finalists": [],
+        "parts": [],
+        "replicate_stats": [],
+        "best_of_n": None,
+        "plan_revisions": [],
+        "manifest": {"git_commit": None},
+        "source_head": {"epoch": 1, "seq": 1, "segment": "journal/e1-1.jsonl"},
+    }
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "solution": 2})
+    calls: list[dict[str, Any]] = []
+
+    @migration("solution", 1)
+    def step(data: dict[str, Any]) -> dict[str, Any]:
+        calls.append(data.copy())
+        return {**data, "reason": "migrated"}
+
+    upgraded = SolutionDocument.model_validate_json(json.dumps(raw))
+    assert upgraded.schema_version == 2
+    assert upgraded.reason == "migrated"
+    assert upgraded.manifest == {"git_commit": None}
+    assert calls == [raw]
+    assert raw["schema_version"] == 1

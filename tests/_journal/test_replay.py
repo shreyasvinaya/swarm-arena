@@ -692,3 +692,31 @@ def test_round_started_preserves_recorded_agent_statuses(converge: bool) -> None
         ]
     )
     assert state.goals["g"].agents == {"t/a": AgentStatus.PRUNED}
+
+
+def test_final_order_and_manifest_folded() -> None:
+    events = [
+        *_PRE,
+        _ev(3, "run_started", {"estimate": {}, "warnings": [], "manifest": {"run_id": "r"}}),
+        _ev(9, "final_order", {"candidate_ids": [], "parts": {"a": "c-1", "b": None}}, goal_id="g"),
+    ]
+    state = RunState.from_events(events)
+    assert (state.goals["g"].final_order, state.goals["g"].final_parts) == (
+        [],
+        {"a": "c-1", "b": None},
+    )
+    assert state.manifest == {"run_id": "r"}
+    state.manifest["run_id"] = "changed"
+    assert events[2].payload["manifest"] == {"run_id": "r"}
+
+
+def test_no_result_reason_is_distinct_from_terminal_reason_and_resets() -> None:
+    events = [
+        *_PRE,
+        _ev(3, "no_result", {"reason": "no passing candidate"}, goal_id="g"),
+        _ev(4, "goal_finished", {"reason": "stop"}, goal_id="g"),
+    ]
+    goal = RunState.from_events(events).goals["g"]
+    assert (goal.no_result_reason, goal.end_reason) == ("no passing candidate", "stop")
+    continued = RunState.from_events([*events, _ev(5, "goal_started", {}, goal_id="g")])
+    assert continued.goals["g"].no_result_reason is None
