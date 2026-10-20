@@ -3,8 +3,10 @@
 import fcntl
 import logging
 import os
+import re
 import sqlite3
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -26,6 +28,7 @@ from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.segment import parse_segment_name
+from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import GoalKey
@@ -98,6 +101,82 @@ def goal_key_digest(key: GoalKey) -> str:
     return sha256_hex(canonical_json(key.model_dump(mode="json")))
 
 
+def fts_query(text: str) -> str | None:
+    """
+    Convert literal user text into a disjunction of quoted FTS tokens.
+
+    Parameters
+    ----------
+    text : str
+        Text whose Unicode alphanumeric tokens are lowercased; underscores split.
+
+    Returns
+    -------
+    str or None
+        Quoted OR query, or None when no tokens remain.
+
+    Examples
+    --------
+    >>> fts_query('log(nu) "x"')
+    '"log" OR "nu" OR "x"'
+    >>> fts_query('___') is None
+    True
+    """
+    tokens = re.findall(r"[^\W_]+", text.lower())
+    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens) or None
+
+
+class LearningFilter(FrozenModel):
+    """
+    Select learning metadata with intersected optional predicates.
+
+    Parameters
+    ----------
+    goal_key : str or None, default=None
+        Exact goal digest. With goal_id, also accepts NULL digests of that ID.
+    goal_id : str or None, default=None
+        Goal ID, used alone or as the human-learning fallback with goal_key.
+    run : str or None, default=None
+        Producing run ID.
+    team : str or None, default=None
+        Team component of the author address.
+    agent : str or None, default=None
+        Agent component of the author address.
+    round : int or None, default=None
+        Posting round.
+    part : str or None, default=None
+        Part of at least one evidence candidate inside the frontier.
+    tags : list[str], default=[]
+        Any-of tags; an empty list imposes no tag condition.
+    verified : bool or None, default=None
+        Evidence verification flag.
+    human : bool or None, default=None
+        Whether the author has the human prefix.
+    pinned : bool or None, default=None
+        Frontier-local pin status.
+    hidden : bool or None, default=False
+        False excludes hidden, True selects hidden, None includes both.
+
+    Examples
+    --------
+    >>> LearningFilter(tags=['solver']).hidden
+    False
+    """
+
+    goal_key: str | None = None
+    goal_id: str | None = None
+    run: str | None = None
+    team: str | None = None
+    agent: str | None = None
+    round: int | None = None
+    part: str | None = None
+    tags: list[str] = []
+    verified: bool | None = None
+    human: bool | None = None
+    pinned: bool | None = None
+    hidden: bool | None = False
+
+
 def _enable_wal(conn: sqlite3.Connection) -> None:
     """Retry WAL's lock upgrade, which can bypass SQLite's busy handler."""
     deadline = time.monotonic() + 30
@@ -165,6 +244,7 @@ class ArenaCache:
         self.namespace = path.stem
         self.warnings: list[str] = []
         self._lock = RLock()
+        self._fts_tables: OrderedDict[str, None] = OrderedDict()
         self._closed = False
         self._ingest_states: dict[str, tuple[str, int, RunState]] = {}
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -781,6 +861,294 @@ class ArenaCache:
                 ],
             }
             return canonical_json(members)
+
+    def _search_members(self, frontier: Frontier) -> list[tuple[int, str | None, str, Learning]]:
+        """Validate complete coverage and materialize the exact immutable corpus."""
+        cte, params = self._frontier_sql(frontier, frontier.curation)
+        for name in set(frontier.curation + frontier.reviews):
+            if not self.has_object(name):
+                raise _core_error(ChainError, "frontier human object is not covered by cache")
+        rows = self._conn.execute(
+            cte + "SELECT rowid, id, goal_key, ts, json FROM learnings l WHERE "
+            "(source='run' AND EXISTS (SELECT 1 FROM marks m "
+            "WHERE m.run_id=l.run_id AND l.seq<=m.seq)) OR "
+            "(source='human' AND EXISTS (SELECT 1 FROM objs WHERE name=l.obj_name)) ORDER BY id",
+            params,
+        ).fetchall()
+        flags = self.flags(frontier)
+        return [
+            (
+                rowid,
+                goal_key,
+                ts,
+                Learning.model_validate_json(data).model_copy(
+                    update=dict(
+                        zip(("pinned", "hidden"), flags.get(lid, (False, False)), strict=True)
+                    )
+                ),
+            )
+            for rowid, lid, goal_key, ts, data in rows
+        ]
+
+    def _fts_index(
+        self, frontier: Frontier, members: list[tuple[int, str | None, str, Learning]]
+    ) -> str:
+        """Build a complete TEMP corpus once, retaining eight by access order."""
+        name = "fts_" + frontier.digest()[:16]
+        if name in self._fts_tables:
+            self._fts_tables.move_to_end(name)
+            return name
+        self._conn.execute(f"CREATE VIRTUAL TABLE temp.{name} USING fts5(title, text, tags)")
+        try:
+            self._conn.executemany(
+                f"INSERT INTO temp.{name}(rowid, title, text, tags) VALUES (?, ?, ?, ?)",
+                [
+                    (rowid, item.title, item.text, " ".join(item.tags))
+                    for rowid, _, _, item in members
+                ],
+            )
+        except BaseException:
+            self._conn.execute(f"DROP TABLE temp.{name}")
+            raise
+        self._fts_tables[name] = None
+        if len(self._fts_tables) > 8:
+            oldest, _ = self._fts_tables.popitem(last=False)
+            self._conn.execute(f"DROP TABLE temp.{oldest}")
+        return name
+
+    def find(
+        self,
+        frontier: Frontier,
+        *,
+        query: str | None,
+        filters: LearningFilter,
+        relevance_goal: tuple[str, str] | None,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> list[str]:
+        """
+        Find learning IDs by frontier-local text rank and relevance.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Fully covered fixed journal marks and human-object names.
+        query : str or None
+            Literal user text, or None to use relevance alone. Tokenless text
+            matches nothing; punctuation is never interpreted as FTS syntax.
+        filters : LearningFilter
+            Intersected metadata predicates; tags use any-of matching.
+        relevance_goal : tuple[str, str] or None
+            Preferred goal digest and ID, independent of the goal filter.
+        offset : int, default=0
+            Number of ranked matches to skip; negative values act as zero.
+        limit : int, default=10
+            Maximum returned IDs; a negative value returns all remaining IDs.
+
+        Returns
+        -------
+        list[str]
+            IDs ordered by bm25 when querying, then pinned, not superseded,
+            goal match, verified, matching tag count, newest timestamp, and ID.
+            Only visible frontier members can supersede another learning.
+
+        Raises
+        ------
+        ChainError
+            If a journal mark or named human object is not fully covered.
+
+        Notes
+        -----
+        Each connection caches at most eight TEMP FTS corpora by least recent
+        use. Corpus statistics include hidden members, but exclude all rows
+        outside the fixed frontier. Later ingestion cannot alter that corpus.
+
+        Examples
+        --------
+        >>> ids = cache.find(frontier, query='log(nu)', filters=LearningFilter(),
+        ...     relevance_goal=None)  # doctest: +SKIP
+        """
+        with self._lock:
+            members = self._search_members(frontier)
+            ranks: dict[int, float] | None = None
+            if query is not None:
+                match = fts_query(query)
+                if match is None:
+                    return []
+                table = self._fts_index(frontier, members)
+                ranks = dict(
+                    self._conn.execute(
+                        f"SELECT rowid, bm25({table}) FROM temp.{table} WHERE {table} MATCH ?",
+                        (match,),
+                    ).fetchall()
+                )
+            superseded = {
+                target for _, _, _, item in members if not item.hidden for target in item.supersedes
+            }
+            part_ids = (
+                None
+                if filters.part is None
+                else {
+                    candidate.id
+                    for candidate, _ in self.candidates(frontier)
+                    if candidate.part == filters.part
+                }
+            )
+            tags = set(filters.tags)
+            matched: list[tuple[int, str | None, str, Learning]] = []
+            for rowid, goal_key, ts, item in members:
+                if ranks is not None and rowid not in ranks:
+                    continue
+                if filters.goal_key is not None:
+                    if not (
+                        goal_key == filters.goal_key
+                        or (
+                            goal_key is None
+                            and filters.goal_id is not None
+                            and item.goal_id == filters.goal_id
+                        )
+                    ):
+                        continue
+                elif filters.goal_id is not None and item.goal_id != filters.goal_id:
+                    continue
+                team, _, agent = item.author.partition("/")
+                if any(
+                    expected is not None and actual != expected
+                    for actual, expected in (
+                        (item.run_id, filters.run),
+                        (team, filters.team),
+                        (agent, filters.agent),
+                        (item.round, filters.round),
+                        (item.verified, filters.verified),
+                        (item.from_human, filters.human),
+                        (item.pinned, filters.pinned),
+                        (item.hidden, filters.hidden),
+                    )
+                ):
+                    continue
+                if tags and not tags.intersection(item.tags):
+                    continue
+                if part_ids is not None and not part_ids.intersection(item.evidence):
+                    continue
+                matched.append((rowid, goal_key, ts, item))
+
+            def key(
+                row: tuple[int, str | None, str, Learning],
+            ) -> tuple[float, bool, bool, bool, bool, int, int, str]:
+                rowid, goal_key, ts, item = row
+                goal_match = relevance_goal is not None and (
+                    goal_key == relevance_goal[0]
+                    or (goal_key is None and item.goal_id == relevance_goal[1])
+                )
+                stamp = datetime.fromisoformat(ts)
+                micros = (
+                    ((stamp.toordinal() * 24 + stamp.hour) * 60 + stamp.minute) * 60 + stamp.second
+                ) * 1_000_000 + stamp.microsecond
+                return (
+                    ranks[rowid] if ranks is not None else 0.0,
+                    not item.pinned,
+                    item.id in superseded,
+                    not goal_match,
+                    not item.verified,
+                    -len(tags.intersection(item.tags)),
+                    -micros,
+                    item.id,
+                )
+
+            matched.sort(key=key)
+            start = max(offset, 0)
+            return [
+                row[3].id
+                for row in (matched[start:] if limit < 0 else matched[start : start + limit])
+            ]
+
+    def count(self, frontier: Frontier, *, filters: LearningFilter) -> int:
+        """
+        Count the frontier members satisfying learning filters.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Fully covered fixed journal marks and human-object names.
+        filters : LearningFilter
+            Same predicates and hidden default as ``find``.
+
+        Returns
+        -------
+        int
+            Total matches before pagination, without a text query.
+
+        Raises
+        ------
+        ChainError
+            If the fixed frontier is not fully covered.
+
+        Examples
+        --------
+        >>> total = cache.count(frontier, filters=LearningFilter())  # doctest: +SKIP
+        """
+        with self._lock:
+            return len(
+                self.find(frontier, query=None, filters=filters, relevance_goal=None, limit=-1)
+            )
+
+    def search(
+        self,
+        namespace: str,
+        query: str,
+        *,
+        frontier: Frontier,
+        goal: GoalKey | None,
+        tags: Sequence[str],
+        limit: int,
+    ) -> list[str]:
+        """
+        Search this namespace with an optional goal and any-of tags.
+
+        Parameters
+        ----------
+        namespace : str
+            Must equal this cache's namespace.
+        query : str
+            User text to tokenize and match literally.
+        frontier : Frontier
+            Fully covered fixed journal marks and human-object names.
+        goal : GoalKey or None
+            Goal filter and relevance preference, including human goal-ID fallback.
+        tags : Sequence[str]
+            Any-of tags, also used for relevance tie ordering.
+        limit : int
+            Maximum number of learning IDs.
+
+        Returns
+        -------
+        list[str]
+            Visible learning IDs in text rank and relevance order.
+
+        Raises
+        ------
+        ValueError
+            If namespace differs from the cache namespace.
+        ChainError
+            If the fixed frontier is not fully covered.
+
+        Examples
+        --------
+        >>> ids = cache.search('toy', 'log(nu)', frontier=frontier,
+        ...     goal=None, tags=(), limit=10)  # doctest: +SKIP
+        """
+        if namespace != self.namespace:
+            raise _core_error(ValueError, "search namespace does not match cache")
+        digest = goal_key_digest(goal) if goal is not None else None
+        return self.find(
+            frontier,
+            query=query,
+            filters=LearningFilter(
+                goal_key=digest, goal_id=goal.id if goal else None, tags=list(tags)
+            ),
+            relevance_goal=(digest, goal.id) if digest is not None and goal is not None else None,
+            limit=limit,
+        )
 
     def _covered(self, run_id: str, head: Head) -> bool:
         """Validate full metadata and ancestry, rejecting divergent older marks."""

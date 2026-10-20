@@ -4,12 +4,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from threading import Barrier
+from threading import Event as ThreadEvent
+from time import monotonic
 
 import pytest
 from _fakes.journals import START, FakeRun, candidate_ids
 from _fakes.secrecy import assert_secret_absent
 
-from swarm_arena._board.cache import ArenaCache, goal_key_digest
+from swarm_arena._board.cache import ArenaCache, LearningFilter, fts_query, goal_key_digest
 from swarm_arena._board.frontier import build_frontier
 from swarm_arena._board.human_objects import HumanObject
 from swarm_arena._board.ingest import ingest_run
@@ -1257,3 +1259,588 @@ def test_human_and_event_learnings_have_identical_child_rows(tmp_path: Path) -> 
             assert event_rows == human_rows == expected
     finally:
         cache.close()
+@pytest.fixture
+def cache_with_learnings(tmp_path: Path) -> tuple[ArenaCache, FakeRun, Frontier]:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(
+        run.plan(parts=["a"]),
+        run.candidate("c-1", part="a"),
+        run.learning(
+            "L-log",
+            "Fitting log(nu) instead of nu converges about 3x faster.",
+            evidence=["c-1"],
+            tags=["a", "b"],
+            verified=True,
+        ),
+        run.learning(
+            "L-other", "Other hint", text="t", evidence=["c-1"], tags=["a"], author="t2/a2", round=2
+        ),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, run.run_id, run.run_root, head)
+    return cache, run, build_frontier([(run.run_id, run.run_root, head)], [], [])
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        'nu" OR',
+        "-lr:(",
+        "log(nu)",
+        "fd-solver",
+        "NEAR(a b)",
+        "*",
+        '"',
+        "AND OR NOT",
+        "()",
+        "___",
+        "a_b",
+    ],
+)
+def test_search_never_raises_on_fts_syntax(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+    query: str,
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    assert isinstance(
+        cache.search("toy", query, frontier=frontier, goal=None, tags=(), limit=10), list
+    )
+    cache.close()
+
+
+def test_search_finds_parenthesised_term(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    assert cache.search("toy", "log(nu)", frontier=frontier, goal=None, tags=(), limit=1) == [
+        "L-log"
+    ]
+    for query in ("()", "___", "*", '"'):
+        assert cache.search("toy", query, frontier=frontier, goal=None, tags=(), limit=10) == []
+    cache.close()
+
+
+def test_fts_query_quotes_tokens() -> None:
+    assert fts_query('log(nu) "x"') == '"log" OR "nu" OR "x"'
+    assert fts_query("()") is None
+    assert fts_query("___") is None
+    assert fts_query("fd_solver") == '"fd" OR "solver"'
+    assert fts_query("CAFÉ λ") == '"café" OR "λ"'
+
+
+def test_search_order_ignores_rows_outside_frontier(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    h1 = run.commit(
+        run.plan(),
+        run.candidate("c"),
+        run.learning("L-short", "alpha", evidence=["c"]),
+        run.learning("L-long", "Long hint", evidence=["c"], text="alpha " * 3 + "word " * 57),
+    )
+    frontier = build_frontier([("r1", run.run_root, h1)], [], [])
+    a = ArenaCache(tmp_path / "a" / "toy.sqlite")
+    b = ArenaCache(tmp_path / "b" / "toy.sqlite")
+    ingest_run(a, run.store, "r1", run.run_root, h1)
+    h2 = run.commit(
+        *(
+            run.learning(f"L-later-{i}", "Later", evidence=["c"], text="word " * 250)
+            for i in range(200)
+        )
+    )
+    ingest_run(b, run.store, "r1", run.run_root, h2)
+    outsider = FakeRun(str(tmp_path / "runs"), "outside")
+    oh = outsider.commit(
+        outsider.plan(), outsider.learning("L-outsider", "alpha", author="human:x")
+    )
+    ingest_run(b, outsider.store, outsider.run_id, outsider.run_root, oh)
+    # An unnamed human addition also must not affect corpus statistics.
+    human = _human_learning().model_copy(update={"title": "alpha"})
+    b.apply_human_objects([PIN_NAME], [HumanObject(kind="add", learning=human, author="human:x")])
+    for limit in (10, 1):
+        assert (
+            a.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
+            == b.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
+            == ["L-short", "L-long"][:limit]
+        )
+    table = "fts_" + frontier.digest()[:16]
+    assert b._conn.execute(f"SELECT count(*) FROM temp.{table}").fetchone() == (2,)
+    a.close()
+    b.close()
+
+
+def test_human_added_learning_is_searchable(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    learning = _human_learning().model_copy(update={"text": "zebra"})
+    cache.apply_human_objects(
+        [PIN_NAME], [HumanObject(kind="add", learning=learning, author="human:x")]
+    )
+    for frontier, expected in ((Frontier(curation=[PIN_NAME]), [learning.id]), (Frontier(), [])):
+        assert (
+            cache.search("toy", "zebra", frontier=frontier, goal=None, tags=(), limit=10)
+            == expected
+        )
+    cache.close()
+
+
+def test_hidden_summary_restores_superseded(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(
+        run.plan(),
+        run.candidate("c"),
+        run.learning("L-b", "Hint", evidence=["c"]),
+        run.learning("L-a", "Hint", evidence=["c"]),
+        run.learning("L-sum", "Summary", evidence=["c"], supersedes=["L-a"]),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    f1 = build_frontier([("r1", run.run_root, head)], [], [])
+    cache.apply_human_objects(
+        [HIDE_NAME], [HumanObject(kind="hide", learning_id="L-sum", author="human:x")]
+    )
+    f2 = f1.model_copy(update={"curation": [HIDE_NAME]})
+    for frontier, expected in ((f1, ["L-b", "L-a"]), (f2, ["L-a", "L-b"]), (f1, ["L-b", "L-a"])):
+        ids = cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None)
+        assert [lid for lid in ids if lid != "L-sum"] == expected
+        assert ("L-sum" in ids) == (frontier == f1)
+    cache.close()
+
+
+def test_human_learning_ts_orders_with_journal_ts(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1", start=START - timedelta(seconds=2))
+    head = run.commit(run.plan(), run.candidate("c"), run.learning("L-run", "Hint", evidence=["c"]))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    name = "toy/curation/20261018T000000.000Z-00000001.jsonl"
+    learning = _human_learning()
+    cache.apply_human_objects(
+        [name], [HumanObject(kind="add", learning=learning, author="human:x")]
+    )
+    frontier = build_frontier([("r1", run.run_root, head)], [], [name])
+    assert cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None) == [
+        "L-run",
+        learning.id,
+    ]
+    cache.close()
+
+
+def test_goal_filter_keeps_human_learning_with_goal_id(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), run.learning("L-run", "Hint", author="human:x"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    one = _human_learning()
+    two = one.model_copy(update={"id": "L-h-two", "goal_id": "g2"})
+    cache.apply_human_objects(
+        [PIN_NAME] * 2,
+        [HumanObject(kind="add", learning=learning, author="human:x") for learning in (one, two)],
+    )
+    frontier = build_frontier([("r1", run.run_root, head)], [], [PIN_NAME])
+    gk = goal_key_digest(run.goal.key())
+    for filters, expected in (
+        (LearningFilter(goal_key=gk, goal_id="g1"), {"L-run", one.id}),
+        (LearningFilter(goal_key=gk), {"L-run"}),
+        (LearningFilter(goal_id="g2"), {two.id}),
+        (LearningFilter(goal_key="different", goal_id="g1"), {one.id}),
+    ):
+        assert (
+            set(cache.find(frontier, query=None, filters=filters, relevance_goal=None)) == expected
+        )
+    assert set(
+        cache.search("toy", "hint", frontier=frontier, goal=run.goal.key(), tags=(), limit=10)
+    ) == {"L-run", one.id}
+    cache.close()
+
+
+def test_relevance_goal_without_goal_filter(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    marks = []
+    for gid in ("g1", "g2"):
+        run = FakeRun(str(tmp_path / "runs"), gid, goal_id=gid)
+        head = run.commit(run.plan(), run.learning("L-" + gid, "Hint", author="human:x"))
+        ingest_run(cache, run.store, gid, run.run_root, head)
+        marks.append((gid, run.run_root, head))
+    frontier = build_frontier(marks, [], [])
+    assert cache.find(
+        frontier,
+        query=None,
+        filters=LearningFilter(),
+        relevance_goal=(goal_key_digest(run.goal.key()), "g2"),
+    ) == ["L-g2", "L-g1"]
+    cache.close()
+
+
+def test_search_orders_by_bm25_then_relevance(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(
+        run.plan(),
+        run.candidate("c"),
+        run.learning("L-verified", "alpha", evidence=["c"], verified=True),
+        run.learning("L-newer", "alpha", evidence=["c"]),
+        run.learning(
+            "L-long", "Long hint", evidence=["c"], verified=True, text="alpha " + "word " * 60
+        ),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    frontier = build_frontier([("r1", run.run_root, head)], [], [])
+    cache.apply_human_objects(
+        [PIN_NAME], [HumanObject(kind="pin", learning_id="L-long", author="human:x")]
+    )
+    frontier = frontier.model_copy(update={"curation": [PIN_NAME]})
+    assert cache.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == [
+        "L-verified",
+        "L-newer",
+        "L-long",
+    ]
+    cache.close()
+
+
+def test_relevance_order(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    marks = []
+    goal_key = ""
+    for gid, specs in (
+        ("g1", [("L-old-sup", False, ["a"]), ("L-goal", False, ["a"])]),
+        (
+            "g2",
+            [
+                ("L-ns", False, ["a"]),
+                ("L-ver", True, ["a"]),
+                ("L-tag", False, ["a", "b"]),
+                ("L-new", False, ["a"]),
+                ("L-pin", False, ["a"]),
+            ],
+        ),
+    ):
+        run = FakeRun(str(tmp_path / "runs"), gid, goal_id=gid)
+        drafts = [run.plan(), run.candidate("c-" + gid)]
+        for lid, verified, tags in specs:
+            drafts.append(
+                run.learning(
+                    lid,
+                    "Hint",
+                    evidence=["c-" + gid],
+                    tags=tags,
+                    verified=verified,
+                    supersedes=["L-old-sup"] if lid == "L-goal" else [],
+                )
+            )
+        head = run.commit(*drafts)
+        ingest_run(cache, run.store, gid, run.run_root, head)
+        marks.append((gid, run.run_root, head))
+        if gid == "g1":
+            goal_key = goal_key_digest(run.goal.key())
+    cache.apply_human_objects(
+        [PIN_NAME], [HumanObject(kind="pin", learning_id="L-pin", author="human:x")]
+    )
+    frontier = build_frontier(marks, [], [PIN_NAME])
+    assert cache.find(
+        frontier,
+        query=None,
+        filters=LearningFilter(tags=["a", "b"]),
+        relevance_goal=(goal_key, "g1"),
+    ) == ["L-pin", "L-goal", "L-ver", "L-tag", "L-new", "L-ns", "L-old-sup"]
+    cache.close()
+
+
+def test_hidden_excluded_by_default_and_filterable(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    cache.apply_human_objects(
+        [HIDE_NAME], [HumanObject(kind="hide", learning_id="L-log", author="human:x")]
+    )
+    frontier = frontier.model_copy(update={"curation": [HIDE_NAME]})
+    for hidden, expected in ((False, {"L-other"}), (True, {"L-log"}), (None, {"L-log", "L-other"})):
+        assert (
+            set(
+                cache.find(
+                    frontier, query=None, filters=LearningFilter(hidden=hidden), relevance_goal=None
+                )
+            )
+            == expected
+        )
+    cache.close()
+
+
+def test_tags_filter_is_any_of(cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier]) -> None:
+    cache, _, frontier = cache_with_learnings
+    for tags, expected in (
+        (["b", "absent"], {"L-log"}),
+        (["a", "absent"], {"L-log", "L-other"}),
+        (["absent"], set()),
+    ):
+        assert (
+            set(
+                cache.find(
+                    frontier, query=None, filters=LearningFilter(tags=tags), relevance_goal=None
+                )
+            )
+            == expected
+        )
+    cache.close()
+
+
+@pytest.mark.parametrize(
+    ("filters", "expected"),
+    [
+        (LearningFilter(run="r1"), {"L-log", "L-other"}),
+        (LearningFilter(run="other"), set()),
+        (LearningFilter(team="t1"), {"L-log"}),
+        (LearningFilter(agent="a2"), {"L-other"}),
+        (LearningFilter(round=2), {"L-other"}),
+        (LearningFilter(part="a"), {"L-log", "L-other"}),
+        (LearningFilter(part="b"), set()),
+        (LearningFilter(human=False), {"L-log", "L-other"}),
+        (LearningFilter(human=True), set()),
+        (LearningFilter(verified=True), {"L-log"}),
+        (LearningFilter(verified=False), {"L-other"}),
+        (LearningFilter(pinned=True), set()),
+        (LearningFilter(team="t1", agent="a2"), set()),
+    ],
+)
+def test_filters_run_team_agent_round_part_human_verified(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+    filters: LearningFilter,
+    expected: set[str],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    assert set(cache.find(frontier, query=None, filters=filters, relevance_goal=None)) == expected
+    assert cache.count(frontier, filters=filters) == len(expected)
+    cache.close()
+
+
+def test_count_matches_find(cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier]) -> None:
+    cache, _, frontier = cache_with_learnings
+    filters = LearningFilter()
+    ids = cache.find(frontier, query=None, filters=filters, relevance_goal=None)
+    assert cache.count(frontier, filters=filters) == len(ids) == 2
+    assert (
+        cache.find(frontier, query=None, filters=filters, relevance_goal=None, offset=1, limit=1)
+        == ids[1:2]
+    )
+    assert cache.find(frontier, query=None, filters=filters, relevance_goal=None, limit=0) == []
+    cache.close()
+
+
+def test_search_rejects_other_namespace(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    secret = "SECRET-NAMESPACE-INPUT"
+    with pytest.raises(ValueError, match="namespace does not match cache") as caught:
+        cache.search(secret, "hint", frontier=frontier, goal=None, tags=(), limit=10)
+    assert_secret_absent(caught.value, secret)
+    cache.close()
+
+
+@pytest.mark.parametrize("missing", ["mark", "curation", "review"])
+def test_search_requires_complete_frontier_coverage(tmp_path: Path, missing: str) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), run.learning("L-1", "alpha", author="human:x"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    frontier = build_frontier(
+        [("r1", run.run_root, head)],
+        [REVIEW_NAME] if missing == "review" else [],
+        [PIN_NAME] if missing == "curation" else [],
+    )
+    if missing != "mark":
+        ingest_run(cache, run.store, "r1", run.run_root, head)
+    for query in ("alpha", "___", None):
+        with pytest.raises(ChainError):
+            cache.find(frontier, query=query, filters=LearningFilter(), relevance_goal=None)
+    assert (
+        cache._conn.execute(
+            "SELECT name FROM sqlite_temp_master WHERE name LIKE 'fts_%'"
+        ).fetchall()
+        == []
+    )
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    if missing == "curation":
+        cache.apply_human_objects(
+            [PIN_NAME], [HumanObject(kind="pin", learning_id="L-1", author="human:x")]
+        )
+    if missing == "review":
+        cache.apply_human_objects([REVIEW_NAME], [_human_review()])
+    assert cache.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == ["L-1"]
+    cache.close()
+
+
+def test_frontier_fts_lru_is_connection_local(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    frontiers = [frontier.model_copy(update={"reviews": [REVIEW_NAME] * i}) for i in range(10)]
+    cache.apply_human_objects([REVIEW_NAME], [_human_review()])
+    for f in frontiers[:8]:
+        cache.search("toy", "hint", frontier=f, goal=None, tags=(), limit=10)
+    cache.search("toy", "hint", frontier=frontiers[0], goal=None, tags=(), limit=10)
+    for f in frontiers[8:]:
+        cache.search("toy", "hint", frontier=f, goal=None, tags=(), limit=10)
+    tables = {
+        row[0]
+        for row in cache._conn.execute("SELECT name FROM sqlite_temp_master WHERE type='table'")
+    }
+    assert "fts_" + frontiers[0].digest()[:16] in tables
+    assert "fts_" + frontiers[1].digest()[:16] not in tables
+    assert "fts_" + frontiers[2].digest()[:16] not in tables
+    assert sum(name.startswith("fts_") and name.endswith("_config") for name in tables) == 8
+    assert (
+        cache._conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'fts_%'").fetchall()
+        == []
+    )
+    cache.close()
+
+
+def test_one_cache_shared_by_threads(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    runs = [FakeRun(str(tmp_path / "runs"), rid) for rid in ("r1", "r2")]
+    initial = []
+    for run in runs:
+        head = run.commit(
+            run.plan(),
+            run.candidate("c-" + run.run_id),
+            run.learning("L-" + run.run_id, "t alpha", evidence=["c-" + run.run_id]),
+        )
+        ingest_run(cache, run.store, run.run_id, run.run_root, head)
+        initial.append((run.run_id, run.run_root, head))
+    fixed = build_frontier(initial, [], [])
+    expected = cache.find(fixed, query="t", filters=LearningFilter(), relevance_goal=None)
+    barrier = Barrier(4)
+    done = [ThreadEvent(), ThreadEvent()]
+
+    def write(run: FakeRun, finished: ThreadEvent) -> None:
+        barrier.wait(timeout=10)
+        for i in range(20):
+            drafts = [run.candidate(f"c-{run.run_id}-{i}-{j}") for j in range(10)]
+            drafts.append(
+                run.learning(
+                    f"L-{run.run_id}-{i}",
+                    "t later",
+                    evidence=[drafts[0].payload["candidate"]["id"]],
+                )
+            )
+            head = run.commit(*drafts)
+            ingest_run(cache, run.store, run.run_id, run.run_root, head)
+        finished.set()
+
+    def read() -> None:
+        barrier.wait(timeout=10)
+        deadline = monotonic() + 30
+        while not all(finished.is_set() for finished in done):
+            assert monotonic() < deadline
+            assert len(cache.candidates(fixed)) == 2
+            assert (
+                cache.find(fixed, query="t", filters=LearningFilter(), relevance_goal=None)
+                == expected
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(write, run, finished) for run, finished in zip(runs, done, strict=True)
+        ] + [pool.submit(read) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=60)
+    later = build_frontier([(run.run_id, run.run_root, run.heads[-1]) for run in runs], [], [])
+    assert len(cache.candidates(later)) == 402
+    assert cache.count(later, filters=LearningFilter()) == 42
+    assert (
+        len(cache.find(later, query="t", filters=LearningFilter(), relevance_goal=None, limit=100))
+        == 42
+    )
+    assert cache.find(fixed, query="t", filters=LearningFilter(), relevance_goal=None) == expected
+    assert not cache._conn.in_transaction
+    cache.close()
+
+
+def test_relevance_timestamp_and_id_ties(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    marks = []
+    for rid, lid, micros in (("older", "L-a", 0), ("newer", "L-z", 1000)):
+        run = FakeRun(
+            str(tmp_path / "runs"), rid, start=START.replace(year=9999, microsecond=micros)
+        )
+        head = run.commit(run.plan(), run.learning(lid, "Hint", author="human:x"))
+        ingest_run(cache, run.store, rid, run.run_root, head)
+        marks.append((rid, run.run_root, head))
+    first = _human_learning("L-human-z")
+    second = first.model_copy(update={"id": "L-human-a"})
+    cache.apply_human_objects(
+        [PIN_NAME] * 2,
+        [
+            HumanObject(kind="add", learning=learning, author="human:x")
+            for learning in (first, second)
+        ],
+    )
+    frontier = build_frontier(marks, [], [PIN_NAME])
+    assert cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None) == [
+        "L-z",
+        "L-a",
+        "L-human-a",
+        "L-human-z",
+    ]
+    cache.close()
+
+
+def test_part_filter_uses_evidence_inside_frontier(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    h1 = run.commit(run.plan(parts=["a"]))
+    h2 = run.commit(run.candidate("future", part="a"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, h2)
+    learning = _human_learning().model_copy(update={"evidence": ["future"], "text": "zebra"})
+    cache.apply_human_objects(
+        [PIN_NAME], [HumanObject(kind="add", learning=learning, author="human:x")]
+    )
+    for head, expected in ((h1, []), (h2, [learning.id])):
+        frontier = build_frontier([("r1", run.run_root, head)], [], [PIN_NAME])
+        assert (
+            cache.find(frontier, query=None, filters=LearningFilter(part="a"), relevance_goal=None)
+            == expected
+        )
+    cache.close()
+
+
+def test_search_corpus_keeps_hidden_rows_and_ignores_filters(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    cache.apply_human_objects(
+        [HIDE_NAME], [HumanObject(kind="hide", learning_id="L-log", author="human:x")]
+    )
+    frontier = frontier.model_copy(update={"curation": [HIDE_NAME]})
+    assert cache.find(frontier, query="log", filters=LearningFilter(), relevance_goal=None) == []
+    assert cache.find(
+        frontier, query="log", filters=LearningFilter(hidden=True), relevance_goal=None
+    ) == ["L-log"]
+    assert cache.find(
+        frontier, query="b", filters=LearningFilter(hidden=None), relevance_goal=None
+    ) == ["L-log"]
+    table = "fts_" + frontier.digest()[:16]
+    assert cache._conn.execute(f"SELECT title FROM temp.{table} ORDER BY rowid").fetchall() == [
+        ("Fitting log(nu) instead of nu converges about 3x faster.",),
+        ("Other hint",),
+    ]
+    cache.close()
+
+
+def test_summary_outside_frontier_does_not_supersede(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    h1 = run.commit(
+        run.plan(),
+        run.learning("L-b", "Hint", author="human:x"),
+        run.learning("L-a", "Hint", author="human:x"),
+    )
+    h2 = run.commit(run.learning("L-summary", "Summary", author="human:x", supersedes=["L-a"]))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, h2)
+    for head, expected in (
+        (h1, ["L-a", "L-b"]),
+        (h2, ["L-summary", "L-b", "L-a"]),
+        (h1, ["L-a", "L-b"]),
+    ):
+        frontier = build_frontier([("r1", run.run_root, head)], [], [])
+        assert (
+            cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None)
+            == expected
+        )
+    cache.close()
