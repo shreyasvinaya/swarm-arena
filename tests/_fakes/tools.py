@@ -735,6 +735,8 @@ class ProviderJudge(Judge):
             Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
             for c in candidates
         ]
+
+
 class AliasedEnvTool(Tool):
     _human_only: ClassVar[frozenset[str]] = frozenset({"env"})
 
