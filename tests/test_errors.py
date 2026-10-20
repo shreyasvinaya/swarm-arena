@@ -112,7 +112,22 @@ def test_core_signal_registry_rejects_user_equality() -> None:
 
 
 @pytest.mark.parametrize(
-    "kind", [PlanError, ConfigError, LeaseHeld, Fenced, RuntimeError, ValueError, StorageError]
+    "kind",
+    [
+        PlanError,
+        ConfigError,
+        LeaseHeld,
+        Fenced,
+        RuntimeError,
+        ValueError,
+        StorageError,
+        NotFound,
+        AlreadyExists,
+        PreconditionFailed,
+        WriteOutcomeUnknown,
+        ConditionalWritesUnsupported,
+        ChainError,
+    ],
 )
 def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     kind: type[Exception],
@@ -137,6 +152,8 @@ def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     assert rebuilt is not None
     assert rebuilt is not original
     assert isinstance(rebuilt, kind)
+    if issubclass(kind, StorageError):
+        assert type(rebuilt) is kind
     if kind is ValueError:
         assert not isinstance(rebuilt, ConfigError)
     assert str(rebuilt) == expected
@@ -155,14 +172,58 @@ def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     assert reference() is None
 
 
-def test_storage_registry_accepts_only_exact_storage_error() -> None:
-    from swarm_arena._errors import _core_error, _rebuild_core_signal
+@pytest.mark.parametrize(
+    "kind",
+    [
+        StorageError,
+        NotFound,
+        AlreadyExists,
+        PreconditionFailed,
+        WriteOutcomeUnknown,
+        ConditionalWritesUnsupported,
+        ChainError,
+    ],
+)
+def test_storage_registry_accepts_only_registered_exact_core_classes(
+    kind: type[StorageError],
+) -> None:
+    from swarm_arena._errors import _core_error, _core_signal, _rebuild_core_signal
 
-    class UserStorageError(StorageError):
-        pass
-
-    for error in (StorageError("unregistered"), UserStorageError("impostor")):
+    user_kind = type("UserStorageError", (kind,), {})
+    for error in (kind("unregistered"), user_kind("impostor")):
         assert _rebuild_core_signal(error) is None
-    for kind in (AlreadyExists, NotFound, UserStorageError):
-        with pytest.raises(TypeError, match="expected a core error"):
-            _core_error(kind, "not supported")
+    with pytest.raises(TypeError, match="expected a core error"):
+        _core_error(user_kind, "not supported")
+    with pytest.raises(TypeError, match="expected a core error"):
+        _core_signal(user_kind("not supported"))
+    original = _core_error(kind, "journal: unavailable")
+    assert type(original) is kind
+    rebuilt = _rebuild_core_signal(original)
+    assert type(rebuilt) is kind
+    assert str(rebuilt) == "journal: unavailable"
+
+
+def test_storage_subclass_cannot_impersonate_a_registered_error() -> None:
+    from swarm_arena._errors import _core_error, _core_signal, _rebuild_core_signal
+
+    original = _core_error(ChainError, "journal: invalid")
+
+    class EqualType(type):
+        def __eq__(cls, other: object) -> bool:
+            return True
+
+        def __hash__(cls) -> int:
+            return hash(ChainError)
+
+    class ForgedChainError(ChainError, metaclass=EqualType):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return hash(original)
+
+    forged = ForgedChainError("SECRET")
+    forged.__dict__.update(original.__dict__)
+    assert _rebuild_core_signal(forged) is None
+    with pytest.raises(TypeError, match="expected a core error"):
+        _core_signal(forged)

@@ -157,6 +157,17 @@ class _CoreValueError(ValueError):
     """Allow core value errors to be weakly registered."""
 
 
+_CORE_STORAGE_ERRORS: tuple[type[StorageError], ...] = (
+    StorageError,
+    NotFound,
+    AlreadyExists,
+    PreconditionFailed,
+    WriteOutcomeUnknown,
+    ConditionalWritesUnsupported,
+    ChainError,
+)
+
+
 _CORE_SIGNALS: WeakKeyDictionary[
     Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None]
 ] = WeakKeyDictionary()
@@ -189,7 +200,7 @@ def _core_signal(error: _SignalT) -> _SignalT:
         ConfigError,
         LeaseHeld,
         Fenced,
-        StorageError,
+        *_CORE_STORAGE_ERRORS,
         _CoreRuntimeError,
         _CoreValueError,
     )
@@ -208,6 +219,7 @@ def _core_signal(error: _SignalT) -> _SignalT:
 def _rebuild_core_signal(error: BaseException) -> Exception | None:
     """Reconstruct a registered signal from its snapshot, never user changes.
 
+    The storage family preserves its exact core type and vetted message.
     Only the exact supported core exception types may be registry keys: subclasses
     cannot supply custom equality or hashing to impersonate a registered key.
     The fresh result has no notes or exception chain and is registered so
@@ -222,7 +234,7 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
         ConfigError,
         LeaseHeld,
         Fenced,
-        StorageError,
+        *_CORE_STORAGE_ERRORS,
         _CoreRuntimeError,
         _CoreValueError,
     )
