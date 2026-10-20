@@ -10,6 +10,7 @@ import pytest
 from swarm_arena import Plan, RunConfig
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
+from swarm_arena._journal.lease import OwnerDoc
 from swarm_arena._journal.segment import SegmentLink
 from swarm_arena._model import migrate
 from swarm_arena._model.base import StoredModel
@@ -20,6 +21,7 @@ from swarm_arena._tooling.result_file import ToolResultFile, request_json
 from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
+    ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
     ("segment", 1): "24a9c075f402a838718212851482617251b3bab08bafa51018f9e4e6d0426f09",
     ("candidate", 1): "5cd32e071d3d68671ff5389518f120123539420ec264eca3e27c8f81ecadbc25",
@@ -44,6 +46,7 @@ FIELD_SETS = {
         ToolResultFile,
         Event,
         SegmentLink,
+        OwnerDoc,
     ],
 )
 def test_stored_field_sets_require_a_version_bump(model: type[StoredModel]) -> None:
@@ -132,4 +135,32 @@ def test_journal_stored_models_apply_registered_migration(
         assert upgraded.payload == {"migrated": True}
     else:
         assert upgraded.link == "journal/e1-1.jsonl"
+    assert raw["schema_version"] == 1
+
+
+@pytest.mark.usefixtures("isolated_migrations")
+def test_owner_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = {
+        "schema_version": 1,
+        "version": 3,
+        "epoch": 2,
+        "owner_id": "o1",
+        "host": "h",
+        "expires_at": "2026-10-18T13:00:00.000Z",
+        "head": {"epoch": 1, "seq": 3, "segment": "journal/e1-3.jsonl"},
+    }
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "owner": 2})
+    calls: list[dict[str, Any]] = []
+
+    @migration("owner", 1)
+    def step(data: dict[str, Any]) -> dict[str, Any]:
+        calls.append(data.copy())
+        return {**data, "host": "migrated-host"}
+
+    upgraded = OwnerDoc.model_validate_json(json.dumps(raw))
+    assert upgraded.schema_version == 2
+    assert upgraded.host == "migrated-host"
+    assert upgraded.version == 3
+    assert upgraded.epoch == 2
+    assert calls == [raw]
     assert raw["schema_version"] == 1
