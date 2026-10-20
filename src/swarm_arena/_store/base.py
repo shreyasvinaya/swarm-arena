@@ -134,8 +134,12 @@ class Store(ABC):
 
         Raises
         ------
-        NotImplementedError
-            Until conditional replacement arrives in M1b.
+        NotFound
+            If the key does not exist.
+        PreconditionFailed
+            If the current version differs from ``if_match``.
+        StorageError
+            If the conditional replacement fails.
 
         Examples
         --------
@@ -224,8 +228,9 @@ def open_store(url: str) -> Store:
     Parameters
     ----------
     url : str
-        Local path, optionally starting with a tilde. Remote backends are not
-        available in M1a.
+        Local path, optionally starting with a tilde. URL schemes, including
+        ``file://``, are refused. S3 support requires the ``swarm-arena[s3]``
+        extra planned for M2.
 
     Returns
     -------
@@ -249,6 +254,10 @@ def open_store(url: str) -> Store:
     if match is not None:
         # Only fixed, recognized scheme names may appear in diagnostics.
         scheme = match.group(1).lower()
+        if scheme == "s3":
+            raise ConditionalWritesUnsupported("s3:// needs the swarm-arena[s3] extra (M2)")
         label = f"{scheme}://" if scheme in {"s3", "gs", "file"} else "URL"
-        raise ConditionalWritesUnsupported(f"{label} storage is not available in this version")
+        raise ConditionalWritesUnsupported(
+            f"{label} has no conditional writes; swarm-arena refuses to run on it"
+        )
     return LocalStore(Path(url).expanduser().resolve())

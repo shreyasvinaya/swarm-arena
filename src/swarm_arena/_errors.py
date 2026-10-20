@@ -112,3 +112,36 @@ class ConditionalWritesUnsupported(StorageError):
     >>> isinstance(ConditionalWritesUnsupported("unsupported backend"), StorageError)
     True
     """
+
+
+class ChainError(StorageError):
+    """
+    Report an invalid committed journal chain.
+
+    Examples
+    --------
+    >>> isinstance(ChainError("journal chain is invalid"), StorageError)
+    True
+    """
+
+
+class Fenced(RuntimeError):
+    """
+    Report that the current owner has lost the run.
+
+    Examples
+    --------
+    >>> isinstance(Fenced("run ownership lost"), RuntimeError)
+    True
+    """
+
+
+class LeaseHeld(RuntimeError):
+    """
+    Report that a live owner already holds the run lease.
+
+    Examples
+    --------
+    >>> isinstance(LeaseHeld("run lease is held"), RuntimeError)
+    True
+    """

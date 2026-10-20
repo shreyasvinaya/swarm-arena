@@ -1,7 +1,10 @@
 from swarm_arena._errors import (
     AlreadyExists,
+    ChainError,
     ConditionalWritesUnsupported,
     ConfigError,
+    Fenced,
+    LeaseHeld,
     NotFound,
     PlanError,
     PreconditionFailed,
@@ -9,6 +12,11 @@ from swarm_arena._errors import (
     StorageError,
     WriteOutcomeUnknown,
 )
+
+
+def test_m1b_errors_are_runtime_errors() -> None:
+    assert issubclass(ChainError, StorageError) and issubclass(StorageError, RuntimeError)  # noqa: PT018
+    assert issubclass(Fenced, RuntimeError) and issubclass(LeaseHeld, RuntimeError)  # noqa: PT018
 
 
 def test_hierarchy() -> None:
