@@ -875,3 +875,11 @@ class AlwaysFailCheck(Check):
 
     async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
         return CheckResult(check=self.name, passed=False, reasons=[self.config.reason])
+
+
+def score_min_y(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(candidate.output.data["y"])
+
+
+def score_max_y(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(candidate.output.data["y"])

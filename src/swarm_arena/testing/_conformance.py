@@ -8,14 +8,18 @@ from typing import Any
 
 import anyio
 
+from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.goal import Goal
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
+from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolOutput
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext, stamp_scores
@@ -23,6 +27,7 @@ from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
 from swarm_arena.testing._components import _DEFAULT_GOAL, _build, _check_goal
 from swarm_arena.testing._contracts import _check_judge_methods, _check_result, _check_scores, _fail
 from swarm_arena.testing._execution import _executor, _failed_runs, _failed_runs_on
+from swarm_arena.testing._harness import OfflineHarness
 from swarm_arena.testing._state import _artifact_root, _ids
 from swarm_arena.testing._tool import _check_tool_output, _plan_tool, _probe_collect
 
@@ -363,3 +368,85 @@ async def check_judge(
             message = f"judge gave no score and no judge error for {candidate.id}"
             warnings.warn(message, UserWarning, stacklevel=2)
     return stamped
+
+
+async def check_manager(
+    manager: Manager | Ref,
+    *,
+    goal: Goal,
+    tool: Tool | Ref,
+    rounds: int = 1,
+    limits: Limits | None = None,
+    config: RunConfig | None = None,
+) -> list[RoundReport]:
+    """
+    Run a manager offline through the core action pipeline and validate reports.
+
+    Components and goal files are snapshotted and preflighted as in the other
+    kit helpers. Runs use a temporary journal store and the kit artifact root.
+    No judges are supplied: score reads are empty, including ``best``.
+    ``LimitReached`` ends a round normally, supplying an empty ``RoundReport``;
+    later rounds still run with fresh action counters. Every returned report
+    must already be valid in strict mode, and original report objects are
+    returned. A manager exception becomes a type-only ``AssertionError`` with
+    the original cause and failed-run stderr notes retained for debugging.
+    Successful calls warn with the stderr tail of every non-OK tool run.
+
+    Parameters
+    ----------
+    manager : Manager or Ref
+        Manager instance or reference, rebuilt and preflighted before execution.
+    goal : Goal
+        Goal passed to the manager and its tool.
+    tool : Tool or Ref
+        Tool available through ``AgentContext.run_tool``.
+    rounds : int, default=1
+        Positive number of rounds to run.
+    limits : Limits or None, default=None
+        Explicit action and budget limits, overriding ``config.limits``.
+    config : RunConfig or None, default=None
+        Run settings; None selects defaults. Storage uses temporary kit roots.
+
+    Returns
+    -------
+    list[RoundReport]
+        Original valid manager reports in round order.
+
+    Raises
+    ------
+    AssertionError
+        If the manager raises or returns a malformed report. The message
+        contains only the exception type; its original cause may contain the
+        connector's own text, as permitted by the kit diagnostic policy.
+    ValueError
+        If components cannot be built or snapshotted, or rounds is not positive.
+
+    Examples
+    --------
+    >>> import anyio
+    >>> from functools import partial
+    >>> from swarm_arena import FunctionTool, Goal, ScriptedManager
+    >>> from swarm_arena.testing import check_manager
+    >>> reports = anyio.run(partial(check_manager,  # doctest: +SKIP
+    ...     ScriptedManager(requests=[{"inputs": {"x": 1.0}}]),
+    ...     goal=Goal(id="g", namespace="demo"), tool=FunctionTool("my_package:solve")))
+    """
+    if rounds < 1:
+        raise ValueError("rounds must be positive")
+    _, built_manager, goal = await anyio.to_thread.run_sync(_build, manager, Manager, goal)
+    _, built_tool, goal = await anyio.to_thread.run_sync(_build, tool, Tool, goal)
+    config = RunConfig() if config is None else config
+    limits = config.limits if limits is None else limits
+    try:
+        return await OfflineHarness().run_rounds(
+            built_manager,
+            goal=goal,
+            tool=built_tool,
+            rounds=rounds,
+            limits=limits,
+            config=config,
+        )
+    except LimitReached:
+        raise
+    except Exception as error:
+        raise AssertionError(f"manager raised {type(error).__name__}") from error

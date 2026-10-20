@@ -53,6 +53,7 @@ from swarm_arena import (
     Ref,
     Score,
     ScriptCheck,
+    ScriptedManager,
     ScriptTool,
 )
 from swarm_arena._errors import ConfigError, SoftError
@@ -64,6 +65,7 @@ from swarm_arena._store.base import open_store
 from swarm_arena._tooling.result_file import NOTE_PREFIX
 from swarm_arena.board import Candidate
 from swarm_arena.executor import Job, LocalExecutor
+from swarm_arena.manager import AgentContext, Manager, RoundReport
 from swarm_arena.scoring import (
     Check,
     CheckContext,
@@ -72,7 +74,7 @@ from swarm_arena.scoring import (
     JudgeContext,
     Lexicographic,
 )
-from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
+from swarm_arena.testing import check_check, check_judge, check_manager, check_tool, make_candidate
 from swarm_arena.testing._state import _artifact_root
 from swarm_arena.tool import (
     Command,
@@ -1016,3 +1018,115 @@ async def test_candidate_goal_mismatch_is_refused_before_component_runs(kind: st
     with pytest.raises(ValueError, match=r"goal_id another does not match goal (g|check)"):
         await call
     assert executor.jobs == []
+
+
+class _RaisingManager(Manager):
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        raise RuntimeError("manager-secret-sentinel")
+
+
+async def test_check_manager_surfaces_manager_exception() -> None:
+    with pytest.raises(AssertionError, match="raised RuntimeError") as caught:
+        await check_manager(_RaisingManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert str(caught.value) == "manager raised RuntimeError"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize("result", [None, "done", RoundReport.model_construct(summary=123)])
+async def test_check_manager_rejects_invalid_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    result: object,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    async def run_round(self: Manager, ctx: AgentContext) -> object:
+        return result
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    with pytest.raises(AssertionError, match="manager raised AssertionError") as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert "Manager.run_round() must return" in str(caught.value.__cause__)
+
+
+async def test_check_manager_returns_original_reports_and_resets_round_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    original = RoundReport(summary="done")
+    seen: list[int] = []
+
+    async def run_round(self: Manager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        await ctx.run_tool({"x": float(ctx.round)})
+        return original
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    reports = await check_manager(
+        Ref.of(NoopManager()),
+        goal=GOAL,
+        tool=Ref.of(FunctionTool("_fakes.tools:square")),
+        rounds=2,
+        limits=Limits(max_tool_runs_per_round=1),
+    )
+    assert seen == [1, 2]
+    assert all(report is original for report in reports)
+
+
+async def test_check_manager_limit_reached_ends_only_the_round() -> None:
+    reports = await check_manager(
+        ScriptedManager(
+            [
+                {"inputs": {"x": 1.0}, "round": 1},
+                {"inputs": {"x": 2.0}, "round": 1},
+                {"inputs": {"x": 3.0}, "round": 2},
+                {"inputs": {"x": 4.0}, "round": 2},
+            ]
+        ),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        rounds=2,
+        limits=Limits(max_tool_runs_per_round=1),
+    )
+    assert reports == [RoundReport(), RoundReport()]
+
+
+@pytest.mark.parametrize("status", [status for status in RunStatus if status != RunStatus.OK])
+async def test_check_manager_preserves_all_non_ok_tails(
+    status: RunStatus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = with_stderr(status, "manager stderr marker")
+
+    async def submit(self: LocalExecutor, job: Job) -> ToolOutput:
+        return output
+
+    monkeypatch.setattr(LocalExecutor, "submit", submit)
+    with pytest.warns(UserWarning, match="manager stderr marker") as caught:
+        reports = await check_manager(
+            ScriptedManager([{"inputs": {"x": 1.0}}]),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+        )
+    assert reports == [RoundReport(summary="ran 1 of 1 requests")]
+    assert len(caught) == 1
+    assert f"status {status}" in str(caught[0].message)
+
+
+async def test_check_manager_exception_keeps_original_cause_and_failed_run_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    async def run_round(self: Manager, ctx: AgentContext) -> RoundReport:
+        await ctx.run_tool({})
+        raise RuntimeError("manager-secret-sentinel")
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    tool = PyTool({"code": "import sys; sys.stderr.write('original stderr marker'); sys.exit(1)"})
+    with pytest.raises(AssertionError, match="manager raised RuntimeError") as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=tool)
+    assert str(caught.value) == "manager raised RuntimeError"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "original stderr marker" in notes_of(caught.value.__cause__)
+    assert "manager-secret-sentinel" in str(caught.value.__cause__)

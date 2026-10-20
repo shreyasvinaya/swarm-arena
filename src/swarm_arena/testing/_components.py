@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final, TypeVar
 
+from swarm_arena._agent.manager import Manager
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate
@@ -14,7 +15,7 @@ from swarm_arena._tooling.tool import Tool
 from swarm_arena.testing._state import _artifacts
 
 _DEFAULT_GOAL: Final = Goal(id="check", namespace="testing")
-_C = TypeVar("_C", Tool, Check, Judge)
+_C = TypeVar("_C", Tool, Check, Judge, Manager)
 
 
 def _build(component: _C | Ref, base: type[_C], goal: Goal | None) -> tuple[Ref, _C, Goal]:

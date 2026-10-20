@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ScriptedManager` runs ordered baseline requests without a model;
+  `testing.check_manager` exercises managers offline through real core actions.
+
 - `AgentContext`, the manager action set (`swarm_arena.manager`).
 
 #### Tools and local execution
