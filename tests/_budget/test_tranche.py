@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
 import anyio
@@ -10,10 +11,13 @@ from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._journal.event import Event, EventDraft
+from swarm_arena._journal.lease import Lease
+from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.ids import IdGen
+from swarm_arena._store.local import LocalStore
 from swarm_arena.manager import LimitReached
 
 
@@ -161,6 +165,120 @@ async def test_settle_after_close_is_noop(env: LedgerEnv) -> None:
     await t.settle_call(a, Amount(usd=0.01))
     assert env.charged("g1/t/a") == Amount(usd=0.05)
     assert env.count("settle") == settles
+
+
+@pytest.mark.parametrize("direct", [False, True], ids=["batched", "direct"])
+@pytest.mark.parametrize("after_commit", [False, True], ids=["group-wait", "durable-ack"])
+async def test_cancelled_reserve_returns_unused_funding_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direct: bool, after_commit: bool
+) -> None:
+    store = LocalStore(tmp_path / "store")
+    lease = Lease.acquire_new(store, owner_id="cancel", host="local", ttl_s=60)
+    ids = IdGen("cancel", 1)
+    config = RunConfig(limits=Limits(max_usd=1), reserve_fraction=0)
+
+    def committed_events() -> list[Event]:
+        snapshot = read_committed(store)
+        assert snapshot is not None
+        return snapshot[1]
+
+    async with JournalWriter(
+        store,
+        lease,
+        run_id="cancel",
+        next_seq=1,
+        local_path=tmp_path / "journal.jsonl",
+        sync_interval_s=60,
+        group_window_s=0.05,
+    ) as journal:
+        ledger = Ledger(
+            config.limits, reserve_fraction=0, goal_weights=None, journal=journal, ids=ids
+        )
+        await journal.append_durable(
+            EventDraft(type="run_config", payload={"config": config.model_dump(mode="json")})
+        )
+        await ledger.hold_final_slices({"g": Amount()})
+        await journal.append_durable(
+            EventDraft(type="run_started", payload={"final_slices": {"g": Amount().model_dump()}})
+        )
+        ledger.open_goal("g")
+        await journal.append_durable(EventDraft(type="goal_started", goal_id="g"))
+        shares = ledger.open_round("g", 1, ["g/t/a"], 1)
+        await journal.append_durable(
+            EventDraft(
+                type="round_started",
+                goal_id="g",
+                payload={"round": 1, "shares": {h: a.model_dump() for h, a in shares.items()}},
+            )
+        )
+        tranche = Tranche(ledger, "g/t/a", "g", size=Amount(usd=0.25))
+        scope = anyio.CancelScope()
+        committed, release_ack = anyio.Event(), anyio.Event()
+        original = journal.append_durable
+
+        async def delayed_ack(draft: EventDraft) -> Event:
+            event = await original(draft)
+            if draft.type == "reserve":
+                committed.set()
+                await release_ack.wait()
+            return event
+
+        if after_commit:
+            monkeypatch.setattr(journal, "append_durable", delayed_ack)
+        dispatched: list[str] = []
+
+        async def request() -> None:
+            with scope:
+                dispatched.append(await tranche.reserve_call(Amount(usd=0.5 if direct else 0.1)))
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(request)
+                if after_commit:
+                    await committed.wait()
+                    assert any(e.type == "reserve" for e in committed_events())
+                else:
+                    while not ledger._entries:
+                        await anyio.lowlevel.checkpoint()
+                    assert not any(e.type == "reserve" for e in committed_events())
+                scope.cancel()
+                # Let a shielded acquisition finish, while cancellation remains pending.
+                release_ack.set()
+        assert scope.cancelled_caught
+        assert dispatched == []
+        await journal.commit()
+        outcome = await tranche.close()
+        assert await tranche.close() is outcome
+        assert not outcome.overflow
+        assert tranche.pending() == 0
+        events = committed_events()
+        reserves = [e for e in events if e.type == "reserve"]
+        settles = [e for e in events if e.type == "settle"]
+        assert len(reserves) == len(settles) == 1
+        reservation = Reservation.model_validate(reserves[0].payload["reservation"])
+        assert reservation.kind == ("call" if direct else "tranche")
+        assert settles[0].payload["id"] == reservation.id
+        assert Amount.model_validate(settles[0].payload["actual"]) == Amount()
+        assert settles[0].payload["estimated"] is False
+        replay = Ledger.replay(
+            RunState.from_events(events), journal=journal, ids=IdGen("cancel", 2)
+        )
+        for state in (ledger, replay):
+            assert state.remaining("g/t/a") == Amount(usd=1)
+            assert state._charges == {reservation.id: Amount()}
+            assert all(entry.settled for entry in state._entries.values())
+        assert replay.free() == ledger.free()
+        assert replay.goal_remaining("g") == ledger.goal_remaining("g")
+        # A fresh paid call proves the writer and returned funding remain usable.
+        followup = Tranche(ledger, "g/t/a", "g", size=Amount(usd=0.25))
+        cid = await followup.reserve_call(Amount(usd=1))
+        await followup.settle_call(cid, Amount(usd=0.1))
+        await followup.close()
+        replay = Ledger.replay(
+            RunState.from_events(committed_events()), journal=journal, ids=IdGen("cancel", 2)
+        )
+        assert replay.remaining("g/t/a") == ledger.remaining("g/t/a") == Amount(usd=0.9)
+        assert all(entry.settled for entry in replay._entries.values())
 
 
 async def test_new_tranche_shrinks_to_what_is_left() -> None:

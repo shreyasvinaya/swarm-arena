@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 
 import anyio
+import anyio.lowlevel
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
@@ -77,6 +78,9 @@ class Tranche:
     settlements update local room; closing settles every batch using reported
     actuals and the full estimates of calls still pending. Late settlements
     after closing are ignored, retaining conservative charges.
+    New reservations are shielded through durability and local registration.
+    Cancellation before a call identifier is returned leaves its unused
+    funding tracked for zero-usage settlement at close.
 
     Examples
     --------
@@ -175,10 +179,13 @@ class Tranche:
             self._ledger._check_usage_overflow()
             estimate = _nonnegative(estimate)
             if not estimate.fits_in(self._size, cap_tokens=True, cap_usd=True):
-                res = await self._ledger.reserve(
-                    self._holder, estimate, kind="call", goal_id=self._goal_id
-                )
-                self._calls[res.id] = _Call(estimate, None)
+                with anyio.CancelScope(shield=True):
+                    res = await self._ledger.reserve(
+                        self._holder, estimate, kind="call", goal_id=self._goal_id
+                    )
+                    call = self._calls[res.id] = _Call(estimate, None, actual=Amount())
+                await anyio.lowlevel.checkpoint_if_cancelled()
+                call.actual = None
                 return res.id
             batch = next(
                 (
@@ -201,11 +208,14 @@ class Tranche:
                 )
                 if not estimate.fits_in(size, cap_tokens=True, cap_usd=True):
                     raise LimitReached("budget", f"budget used up for {self._holder}")
-                res = await self._ledger.reserve(
-                    self._holder, size, kind="tranche", goal_id=self._goal_id
-                )
-                batch = _Batch(res.id, size.tokens, size._micro_usd)
-                self._batches.append(batch)
+                with anyio.CancelScope(shield=True):
+                    res = await self._ledger.reserve(
+                        self._holder, size, kind="tranche", goal_id=self._goal_id
+                    )
+                    batch = _Batch(res.id, size.tokens, size._micro_usd)
+                    self._batches.append(batch)
+                await anyio.lowlevel.checkpoint_if_cancelled()
+            assert batch is not None
             cid = f"{batch.id}/call-{len(batch.calls) + 1}"
             batch.tokens -= estimate.tokens
             batch.micros -= estimate._micro_usd
@@ -347,6 +357,8 @@ class Tranche:
         -----
         Repeated closes are idempotent. If a durable settlement fails, another
         close retries the remaining settlements without reopening admission.
+        Reservations acquired by cancelled calls whose identifiers were never
+        returned have zero usage; their unused funding is returned here.
         Batch usage is summed in integer micro-dollars. A total above
         ``USD_LIMIT`` charges exactly that limit, preserving reported tokens
         (which have no upper bound), and flags overflow for caller journaling.
