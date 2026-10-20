@@ -45,6 +45,7 @@ def build_digest(
     view: BoardView,
     *,
     goal: GoalKey,
+    round: int,
     ranking: str,
     cap_tokens: int,
     k: int = 5,
@@ -55,8 +56,9 @@ def build_digest(
     Newest titles are dropped from the end before pinned titles, then all but
     the first leaderboard row. The omitted-learning count is updated on every
     drop. If the remaining layout cannot fit, only the count line is returned,
-    cut at a complete UTF-8 character boundary. The round count covers learnings
-    in the latest visible learning round across the namespace.
+    cut at a complete UTF-8 character boundary. The recent count covers visible
+    learnings from the single run identified by the snapshot frontier, created
+    in the round that just ended. It is omitted when starting round one.
 
     Parameters
     ----------
@@ -64,6 +66,9 @@ def build_digest(
         Fixed goal snapshot with namespace-wide learning reads.
     goal : GoalKey
         Snapshot goal identity.
+    round : int
+        Round being started, numbered from one. Count this run's visible
+        learnings from round minus one, across all goals in the namespace.
     ranking : str
         Ranking judge name.
     cap_tokens : int
@@ -89,8 +94,20 @@ def build_digest(
     >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
     >>> board.register_goal(key, "g", None)
     >>> build_digest(board.snapshot(key, board.frontier()), goal=key,
-    ...              ranking="program", cap_tokens=1500)
+    ...              round=1, ranking="program", cap_tokens=1500)
     'No results yet. 0 learnings.'
+    >>> from swarm_arena.board import Learning
+    >>> from swarm_arena._journal.lease import Head
+    >>> head = Head(epoch=1, seq=1, segment="journal/e1-1.jsonl")
+    >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+    >>> board.register_goal(key, "g", None)
+    >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+    ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+    >>> board.put_learning(learning, epoch=1, seq=1)
+    >>> digest = build_digest(board.snapshot(key, board.frontier()), goal=key,
+    ...                       round=2, ranking="program", cap_tokens=1500)
+    >>> digest.splitlines()[-1]
+    '0 more learnings, 1 new since the last round. Use search_learnings.'
     """
     if cap_tokens < 0:
         raise ValueError("digest byte cap must be nonnegative")
@@ -98,8 +115,12 @@ def build_digest(
     learnings = view.learnings(goal.namespace, goal=goal, limit=sys.maxsize)
     if not rows and not learnings:
         return _clip("No results yet. 0 learnings.", cap_tokens)
-    latest_round = max((item.round for item in learnings), default=0)
-    round_count = sum(item.round == latest_round for item in learnings)
+    run_id = next((mark.run_id for mark in view.frontier.marks), None)
+    round_count = (
+        sum(item.run_id == run_id and item.round == round - 1 for item in learnings)
+        if round > 1
+        else 0
+    )
     leaders = [
         f"{row.rank}. {row.candidate_id} {row.team}/{row.agent} "
         f"score={row.value if row.value is not None else row.key} "
@@ -112,20 +133,26 @@ def build_digest(
     # Track byte totals while dropping lines; rendering each trial would be quadratic.
     body_bytes = sum(estimate_tokens(line) + 1 for line in [*headers, *leaders, *pinned, *newest])
 
-    def count_line() -> str:
+    def count_line(omitted: int | None = None) -> str:
         """Count visible learnings omitted from the current title lists."""
-        return (
-            f"{len(learnings) - len(pinned) - len(newest)} more learnings, "
-            f"{round_count} from this round. Use search_learnings."
-        )
+        if omitted is None:
+            omitted = len(learnings) - len(pinned) - len(newest)
+        recent = f", {round_count} new since the last round" if round > 1 else ""
+        return f"{omitted} more learnings{recent}. Use search_learnings."
 
     for lines, keep in ((newest, 0), (pinned, 0), (leaders, 1)):
         while len(lines) > keep and body_bytes + estimate_tokens(count_line()) > cap_tokens:
             body_bytes -= estimate_tokens(lines.pop()) + 1
     if body_bytes + estimate_tokens(count_line()) > cap_tokens:
-        return _clip(
-            f"{len(learnings)} more learnings, "
-            f"{round_count} from this round. Use search_learnings.",
-            cap_tokens,
-        )
-    return "\n".join([headers[0], *leaders, headers[1], *pinned, headers[2], *newest, count_line()])
+        return _clip(count_line(len(learnings)), cap_tokens)
+    return "\n".join(
+        [
+            headers[0],
+            *leaders,
+            headers[1],
+            *pinned,
+            headers[2],
+            *newest,
+            count_line(),
+        ]
+    )

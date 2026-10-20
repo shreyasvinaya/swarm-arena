@@ -1,5 +1,5 @@
 import pytest
-from _board.test_run_board import HEAD, KEY, _c, _frontier, _learning, _score
+from _board.test_run_board import HEAD, KEY, OTHER_KEY, _c, _frontier, _learning, _score
 
 from swarm_arena._board.digest import build_digest, estimate_tokens
 from swarm_arena._board.run_board import RunBoard
@@ -42,7 +42,7 @@ def non_ascii_view() -> BoardView:
 
 
 def test_digest_sections_and_count_line(view: BoardView) -> None:
-    d = build_digest(view, goal=KEY, ranking="program", cap_tokens=1500, k=5)
+    d = build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=1500, k=5)
     lines = d.splitlines()
     assert lines[0] == "Leaderboard (program, top 5):"
     assert lines[1].startswith("1. c-")
@@ -50,25 +50,27 @@ def test_digest_sections_and_count_line(view: BoardView) -> None:
     assert "built on" in lines[1]
     assert "Pinned:" in d
     assert d.index("Pinned:") < d.index("Newest:")
-    assert lines[-1] == "412 more learnings, 37 from this round. Use search_learnings."
+    assert lines[-1] == "412 more learnings, 37 new since the last round. Use search_learnings."
 
 
 def test_digest_respects_token_cap_for_any_board_size(big_view: BoardView) -> None:
     assert (
-        estimate_tokens(build_digest(big_view, goal=KEY, ranking="program", cap_tokens=1500))
+        estimate_tokens(
+            build_digest(big_view, goal=KEY, round=3, ranking="program", cap_tokens=1500)
+        )
         <= 1500
     )
 
 
 def test_digest_cap_holds_for_non_ascii_titles(non_ascii_view: BoardView) -> None:
-    d = build_digest(non_ascii_view, goal=KEY, ranking="program", cap_tokens=1500)
+    d = build_digest(non_ascii_view, goal=KEY, round=3, ranking="program", cap_tokens=1500)
     assert len(d.encode("utf-8")) <= 1500
     assert d.splitlines()[0].startswith("Leaderboard")
 
 
 def test_empty_board_digest() -> None:
     assert (
-        build_digest(_empty_view(), goal=KEY, ranking="program", cap_tokens=1500)
+        build_digest(_empty_view(), goal=KEY, round=3, ranking="program", cap_tokens=1500)
         == "No results yet. 0 learnings."
     )
 
@@ -81,25 +83,29 @@ def test_estimate_tokens() -> None:
 
 @pytest.mark.parametrize("cap", [0, 1, 7, 21, 60, 100, 200, 500, 1000, 1500])
 def test_tiny_caps_and_count_line_survive(view: BoardView, cap: int) -> None:
-    d = build_digest(view, goal=KEY, ranking="program", cap_tokens=cap)
+    d = build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=cap)
     assert len(d.encode("utf-8")) <= cap
     if cap < 60:
-        assert "415 more learnings, 37 from this round. Use search_learnings.".startswith(d)
+        assert "415 more learnings, 37 new since the last round. Use search_learnings.".startswith(
+            d
+        )
     elif cap >= 100:
-        assert d.endswith("from this round. Use search_learnings.")
+        assert d.endswith("new since the last round. Use search_learnings.")
 
 
 def test_valid_unicode_titles_unchanged_and_hidden_omitted() -> None:
     title = "日本🙂e\u0301"
     view = _view(1, title)
-    d = build_digest(view, goal=KEY, ranking="program", cap_tokens=1500)
+    d = build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=1500)
     assert title in d
     assert "unverified" not in d
     board = RunBoard(run_id="run-1", run_root="/runs", head=lambda: HEAD)
     board.register_goal(KEY, "g", None)
     board.put_learning(_learning("L-hidden", hidden=True, title="SECRET_SENTINEL"), epoch=1, seq=1)
     assert (
-        build_digest(board.snapshot(KEY, _frontier()), goal=KEY, ranking="program", cap_tokens=1500)
+        build_digest(
+            board.snapshot(KEY, _frontier()), goal=KEY, round=3, ranking="program", cap_tokens=1500
+        )
         == "No results yet. 0 learnings."
     )
 
@@ -113,11 +119,11 @@ def test_pruning_drops_newest_then_pinned_then_extra_rows() -> None:
     board.put_learning(_learning("pinned", pinned=True), epoch=1, seq=7)
     board.put_learning(_learning("newest", pinned=False, title="新" * 120), epoch=1, seq=8)
     view = board.snapshot(KEY, _frontier())
-    d = build_digest(view, goal=KEY, ranking="program", cap_tokens=400)
+    d = build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=400)
     assert "pinned A hint" in d
     assert "- newest " not in d
     assert "3. c-2" in d
-    d = build_digest(view, goal=KEY, ranking="program", cap_tokens=200)
+    d = build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=200)
     assert "1. c-0" in d
     assert "2. c-1" not in d
     assert "- pinned " not in d
@@ -126,5 +132,54 @@ def test_pruning_drops_newest_then_pinned_then_extra_rows() -> None:
 def test_negative_cap_rejected_and_empty_digest_clipped() -> None:
     view = _empty_view()
     with pytest.raises(ValueError, match="byte cap must be nonnegative"):
-        build_digest(view, goal=KEY, ranking="program", cap_tokens=-1)
-    assert build_digest(view, goal=KEY, ranking="program", cap_tokens=4) == "No r"
+        build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=-1)
+    assert build_digest(view, goal=KEY, round=3, ranking="program", cap_tokens=4) == "No r"
+
+
+@pytest.mark.parametrize(("round", "expected"), [(2, 2), (3, 1), (4, 0)])
+def test_digest_counts_only_previous_round_of_view_run(round: int, expected: int) -> None:
+    board = RunBoard(run_id="run-1", run_root="/runs", head=lambda: HEAD)
+    board.register_goal(KEY, "g", None)
+    board.register_goal(OTHER_KEY, "g2", None)
+    items = [
+        _learning("own-r1", round=1),
+        _learning("other-r1", goal_id="g2", round=1),
+        _learning("own-r2", round=2),
+        _learning("other-high", goal_id="g2", round=90),
+        _learning("old-high", run_id="old-run", round=100),
+        _learning("old-r1", run_id="old-run", round=1),
+        _learning("old-r2", run_id="old-run", round=2),
+        _learning("hidden-r1", hidden=True, round=1),
+        _learning("outside-namespace", namespace="elsewhere", round=1),
+        _learning("after-frontier", round=1),
+    ]
+    for seq, item in enumerate(items, 1):
+        board.put_learning(item, epoch=1, seq=seq)
+    view = board.snapshot(KEY, _frontier())
+    digest = build_digest(view, goal=KEY, round=round, ranking="program", cap_tokens=1500)
+    assert digest.splitlines()[-1] == (
+        f"0 more learnings, {expected} new since the last round. Use search_learnings."
+    )
+    assert "other-high" in digest
+    assert "old-high" in digest
+    assert "hidden-r1" not in digest
+    assert "outside-namespace" not in digest
+    assert "after-frontier" not in digest
+    assert len(digest.encode("utf-8")) <= 1500
+
+
+@pytest.mark.parametrize("cap", [*range(201), 1500])
+def test_first_round_omits_recent_count_and_keeps_cap(cap: int) -> None:
+    board = RunBoard(run_id="run-1", run_root="/runs", head=lambda: HEAD)
+    board.register_goal(KEY, "g", None)
+    board.put_learning(_learning("initial", round=0, title="日本🙂"), epoch=1, seq=1)
+    board.put_learning(_learning("older", run_id="old-run", round=99), epoch=1, seq=2)
+    view = board.snapshot(KEY, _frontier())
+    digest = build_digest(view, goal=KEY, round=1, ranking="program", cap_tokens=cap)
+    assert "since the last round" not in digest
+    assert "from this round" not in digest
+    assert len(digest.encode("utf-8")) <= cap
+    if cap == 1500:
+        assert digest.splitlines()[-1] == "0 more learnings. Use search_learnings."
+    elif cap == 50:
+        assert digest == "2 more learnings. Use search_learnings."
