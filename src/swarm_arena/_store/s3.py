@@ -110,10 +110,14 @@ class S3Store(Store):
                 _check_key(prefix)
         except ValueError:
             raise _core_error(ValueError, "invalid S3 store root") from None
-        self._bucket = parsed.netloc
+        self._init_components(parsed.netloc, prefix, storage_options)
+
+    def _init_components(self, bucket: str, prefix: str, options: dict[str, Any]) -> None:
+        """Initialize a validated raw root without interpreting key characters."""
+        self._bucket = bucket
         self._prefix = prefix + "/" if prefix else ""
         self._url = f"s3://{self._bucket}" + (f"/{prefix}" if prefix else "")
-        self._options = dict(storage_options)
+        self._options = dict(options)
         self._fs: Any = None
         self._write_fs: Any = None
         self._params: frozenset[str] | None = None
@@ -385,8 +389,10 @@ class S3Store(Store):
         >>> S3Store("s3://example").child("runs").url
         's3://example/runs'
         """
-        self._key(prefix)
-        return S3Store(f"{self.url}/{prefix}", **self._options)
+        key = self._key(prefix).rstrip("/")
+        child = object.__new__(S3Store)
+        child._init_components(self._bucket, key, self._options)
+        return child
 
     def probe_conditional_writes(self) -> None:
         """Verify create, stale replace, current replace and readback behavior.

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve valid raw key characters when opening S3 child stores.
+
 - Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
   retries in s3fs, the SDK, and the underlying HTTP transport.
 

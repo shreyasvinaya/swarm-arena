@@ -44,3 +44,6 @@ s3fs, the SDK, and the underlying HTTP transport. A lost response or transport f
 retain their retry settings. Only an observed HTTP 409 conflict uses the bounded
 Store retry policy; callers must reconcile an unknown write outcome by reading
 stored state.
+
+Child-store prefixes follow the raw Store key rules: characters such as `?`,
+`#`, `%`, and spaces remain part of the key when opening nested child stores.

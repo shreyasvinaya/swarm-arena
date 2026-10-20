@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -35,6 +36,7 @@ from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.segment import encode_segment, segment_name
 from swarm_arena._store.base import Blob, open_store
+from swarm_arena._store.local import LocalStore
 from swarm_arena._store.s3 import S3Store, _S3Error
 
 pytestmark = pytest.mark.s3
@@ -614,3 +616,17 @@ def test_socket_response_loss_never_resends_put(
         for fs in (store._fs, store._write_fs):
             if fs is not None and fs._s3creator is not None:
                 type(fs).close_session(fs.loop, fs._s3creator)
+
+
+@pytest.mark.parametrize("prefix", ["valid?prefix", "valid#prefix", "valid%prefix", "valid prefix"])
+def test_child_preserves_raw_key_components(s3_url: str, tmp_path: Path, prefix: str) -> None:
+    for store in (LocalStore(tmp_path / "local"), S3Store(s3_url)):
+        child = store.child(prefix)
+        child.create("a", b"from child")
+        assert store.read(f"{prefix}/a").data == b"from child"
+        store.create(f"{prefix}/b", b"from parent")
+        assert child.read("b").data == b"from parent"
+        nested = child.child("nested?#% space")
+        nested.create("c", b"nested")
+        assert store.read(f"{prefix}/nested?#% space/c").data == b"nested"
+        assert child.list("") == ["a", "b", "nested?#% space/c"]
