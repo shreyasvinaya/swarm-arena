@@ -28,7 +28,9 @@ def run_store(run_root: str, run_id: str) -> Store:
 
     Examples
     --------
-    >>> store = run_store('/runs', 'r1')  # doctest: +SKIP
+    >>> store = run_store('/runs', 'r1')
+    >>> store.url
+    '/runs/r1'
     """
     return open_store(run_root).child(run_id)
 

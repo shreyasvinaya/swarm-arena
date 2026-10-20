@@ -225,3 +225,19 @@ def test_conflicting_marks_keep_registered_cli_diagnostic(tmp_path: Path) -> Non
     caught.value.add_note("MUTATED-SECRET")
     assert _rebuild_core_signal(caught.value) is not None
     assert _error_message(caught.value) == expected
+
+
+def test_run_store_construction_does_not_create_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._board.ingest import run_store
+
+    root = tmp_path / "not-created"
+
+    def no_mkdir(*args: object, **kwargs: object) -> None:
+        raise AssertionError("store construction must not create directories")
+
+    monkeypatch.setattr("os.mkdir", no_mkdir)
+    store = run_store(str(root), "r1")
+    assert store.url == str(root / "r1")
+    assert not root.exists()
