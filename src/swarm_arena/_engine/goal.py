@@ -340,8 +340,8 @@ class GoalRunner:
             reason,
         )
 
-    def _restore_terminal_decision(self) -> None:
-        """Apply the latest closed-round policy in this lifecycle and revision."""
+    async def _restore_terminal_decision(self) -> None:
+        """Restore this lifecycle/revision's terminal policy and any owed closure."""
         latest: tuple[int, Decision] | None = None
         for event in self._events:
             if event.goal_id != self.goal_id:
@@ -358,8 +358,11 @@ class GoalRunner:
                 )
         if latest is not None:
             round, decision = latest
-            if round <= self.rounds_closed and decision.no_result:
+            if decision.no_result:
                 self.status, self.reason = "no_result", decision.no_result
+                if round > self.rounds_closed:
+                    self.rounds_closed = round
+                    await self._close_round(round, replan=False)
 
     def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
         seen = {candidate.id for _, candidate in self.repeat_entries}
@@ -951,6 +954,20 @@ class GoalRunner:
             await self.admission.update(self.goal_id, self.active_agents())
             self.agents = await self._slots(self.plan.teams, reuse=True)
 
+    async def _close_round(self, round: int, *, replan: bool) -> None:
+        """Commit a completed round with its replan boundary and lifecycle reason."""
+        await self.deps.journal.append_durable(
+            self._draft(
+                EventType.ROUND_CLOSED,
+                **{
+                    "round": round,
+                    "run_elapsed_s": self.deps.clock.elapsed(),
+                    "replan": replan,
+                    "reason": self.reason,
+                },
+            )
+        )
+
     async def _run_rounds(self) -> None:
         # A crash after closure must not silently skip the pending replanner.
         await self._complete_replan()
@@ -998,17 +1015,7 @@ class GoalRunner:
                 and not self._stop()
                 and self.replanner is not None
             )
-            await self.deps.journal.append_durable(
-                self._draft(
-                    EventType.ROUND_CLOSED,
-                    **{
-                        "round": round,
-                        "run_elapsed_s": self.deps.clock.elapsed(),
-                        "replan": replan,
-                        "reason": self.reason,
-                    },
-                )
-            )
+            await self._close_round(round, replan=replan)
             if not funded or self.status == "no_result":
                 break
             await self._complete_replan()
@@ -1027,6 +1034,8 @@ class GoalRunner:
         and rejections identify the first round to which they apply. Recovery
         completes a pending replan before starting that round. Final selection
         records its lifecycle reason independently of the live stop flags.
+        A terminal policy checkpoint restores its effect and completes any
+        owed round closure before constructing managers or judges.
 
         Returns
         -------
@@ -1047,7 +1056,7 @@ class GoalRunner:
             return await self._finish_recovered()
         if not self.history:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
-        self._restore_terminal_decision()
+        await self._restore_terminal_decision()
         self._restore_repeats()
         if self.status != "no_result":
             self.agents = await self._slots(self.plan.teams, reuse=False)

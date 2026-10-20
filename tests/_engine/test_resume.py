@@ -1863,6 +1863,8 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
     recorder = _Recorder()
     build, collect = Ref.build, FunctionTool.collect
     replace, append = LocalStore.replace, JournalWriter.append
+    durable = JournalWriter.append_durable
+    terminal_policy = mode in {"policy", "policy_before_close"}
 
     class TerminalPolicy(Policy):
         def after_round(self, state: RoundState) -> Decision:
@@ -1880,13 +1882,13 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
                     await anyio.sleep(0.01)
             return result
 
-    if mode != "policy":
+    if not terminal_policy:
         recorder = StopRecorder()
 
     def build_hook(self: Ref, expected: type[_T]) -> _T:
         if expected is Manager:
             return cast(_T, recorder)
-        if expected is Policy and mode == "policy":
+        if expected is Policy and terminal_policy:
             return cast(_T, TerminalPolicy())
         return build(self, expected)
 
@@ -1900,12 +1902,18 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
         return output.model_copy(update={"usage": Usage(input_tokens=3, usd=0.000003)})
 
     def append_hook(self: JournalWriter, draft: EventDraft) -> Event:
-        if mode == "policy" and draft.type == "round_closed":
+        if terminal_policy and draft.type == "round_closed":
             # The committed Decision is sufficient even without an optional reason checkpoint.
             draft = draft.model_copy(
                 update={"payload": {k: v for k, v in draft.payload.items() if k != "reason"}}
             )
         return append(self, draft)
+
+    async def durable_hook(self: JournalWriter, draft: EventDraft) -> Event:
+        if mode == "policy_before_close" and draft.type == "round_closed":
+            # Publish the real policy checkpoint before the closure can be appended.
+            await self.commit()
+        return await durable(self, draft)
 
     def replace_hook(self: LocalStore, key: str, data: bytes, *, if_match: str) -> str:
         result = replace(self, key, data, if_match=if_match)
@@ -1914,7 +1922,13 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
             if head:
                 lines = self.read(head["segment"]).data.splitlines()[1:]
                 batch = [json.loads(line) for line in lines]
-                target = "round_closed" if mode == "policy" else "converge_started"
+                target = (
+                    "decision"
+                    if mode == "policy_before_close"
+                    else "round_closed"
+                    if terminal_policy
+                    else "converge_started"
+                )
                 if any(e["type"] == target for e in batch):
                     os.kill(os.getpid(), signal.SIGKILL)
         return result
@@ -1924,6 +1938,7 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
         patch.setattr(FunctionTool, "collect", paid_collect)
         patch.setattr(LocalStore, "replace", replace_hook)
         patch.setattr(JournalWriter, "append", append_hook)
+        patch.setattr(JournalWriter, "append_durable", durable_hook)
         await swarm.run(_plan(agents=("a",), rounds=3), run_id="published")
 
 
@@ -1981,16 +1996,38 @@ async def test_real_crash_at_stopped_convergence_preserves_second_resume(
     assert _goal_status(c, "g") == "finished"
 
 
+@pytest.mark.parametrize("boundary", ["before_close", "after_close"])
 async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
     tmp_path: Path,
-    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
 ) -> None:
+    from swarm_arena._planning.policy import Policy
+    from swarm_arena._scoring.judge import Judge
+
     _, control = await _published_crash_case(tmp_path / "control", "policy", crash=False)
-    config, c = await _published_crash_case(tmp_path / "crash", "policy", crash=True)
-    boundary = _events(c)[-1].seq
-    recorders["a"] = _Recorder()
+    mode = "policy_before_close" if boundary == "before_close" else "policy"
+    config, c = await _published_crash_case(tmp_path / "crash", mode, crash=True)
+    before = RunState.from_events(_events(c)).goals["g"]
+    assert before.decisions[-1][0] == 1
+    assert before.decisions[-1][1].no_result == "policy terminal"
+    assert before.rounds_closed == (0 if boundary == "before_close" else 1)
+    assert not before.selection_recorded
+    assert not before.finished
+    last_seq = _events(c)[-1].seq
+    build = Ref.build
+    constructions: list[type[Configurable]] = []
+
+    def forbid_components(self: Ref, expected: type[_T]) -> _T:
+        if expected in {Manager, Judge, Policy}:
+            constructions.append(expected)
+            raise AssertionError("terminal policy recovery must not construct components")
+        return build(self, expected)
+
+    monkeypatch.setattr(Ref, "build", forbid_components)
     result = await Swarm(config).resume(c.run_id, force=True)
-    later = [e for e in _events(c) if e.seq > boundary]
+    assert constructions == []
+    later = [e for e in _events(c) if e.seq > last_seq]
     assert not [
         e
         for e in later
@@ -2002,6 +2039,9 @@ async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
             "score",
             "reserve",
             "converge_started",
+            "decision",
+            "plan_revision",
+            "plan_rejected",
         }
     ]
     assert result == {"g": []}
@@ -2009,5 +2049,19 @@ async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
     assert state.goals["g"].status == "no_result"
     assert state.goals["g"].no_result_reason == "policy terminal"
     assert state.goals["g"].rounds_closed == 1
-    for type in ("reserve", "settle"):
-        assert [e.payload for e in _events(c, type)] == [e.payload for e in _events(control, type)]
+    assert state.goals["g"].finished
+    assert [e.round for e in _events(c, "round_closed")] == [1]
+    assert [e.type for e in later if e.type in {"round_closed", "no_result", "goal_finished"}] == (
+        ["round_closed", "no_result", "goal_finished"]
+        if boundary == "before_close"
+        else ["no_result", "goal_finished"]
+    )
+    assert _events(c, "goal_finished")[-1].payload == _events(control, "goal_finished")[-1].payload
+    solution = json.loads(c.store.read("goals/g/solution.json").data)
+    expected = json.loads(control.store.read("goals/g/solution.json").data)
+    for key in ("status", "reason", "finalists", "parts"):
+        assert solution[key] == expected[key]
+    for event_type in ("reserve", "settle"):
+        assert [e.payload for e in _events(c, event_type)] == [
+            e.payload for e in _events(control, event_type)
+        ]
