@@ -175,12 +175,19 @@ async def test_command_cwd_is_inside_workspace(
 async def test_job_timeout_wins_and_partial_kept(
     local_executor: LocalExecutor, tmp_path: Path
 ) -> None:
-    code = WRITE.format("{'data': {'step': 1}}") + "; import time; time.sleep(60)"
+    # OkCollectTool's output does not depend on how fast the tool starts, so the 1 s
+    # timeout cannot race start-up under load (IF3 A8b); the data shows partial is kept.
     started = time.monotonic()
     out = await local_executor.submit(
-        tool_job(tmp_path, code, timeout_s=1.0, tool_timeout_in_config=100.0)
+        tool_job(
+            tmp_path,
+            "import time; time.sleep(60)",
+            tool_cls=OkCollectTool,
+            timeout_s=1.0,
+            tool_timeout_in_config=100.0,
+        )
     )
-    assert (out.status, out.partial, out.data) == (RunStatus.TIMEOUT, True, {"step": 1})
+    assert (out.status, out.partial, out.data) == (RunStatus.TIMEOUT, True, {"k": 1})
     assert time.monotonic() - started < 20
 
 
