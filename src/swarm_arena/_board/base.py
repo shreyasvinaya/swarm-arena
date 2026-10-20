@@ -54,12 +54,12 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena import Goal
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> board.best(key, 5, judge="program")
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.best(key, 5, judge="program")
         []
         """
 
@@ -99,9 +99,13 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> RunBoard(run_id="r", run_root="/runs", head=lambda: None).learnings("n")
-        []
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.learnings("n")[0].title
+        'Use the baseline'
         """
 
     @abstractmethod
@@ -142,10 +146,13 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-        >>> board.search_learnings("n", "baseline")
-        []
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.search_learnings("n", "baseline")[0].id
+        'L-1'
         """
 
     @abstractmethod
@@ -172,18 +179,11 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena import Goal
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> from swarm_arena._journal.lease import Head
-        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> from swarm_arena.board import Learning
-        >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
-        ...     round=1, author="human:a", title="Use the baseline", text="Start here")
-        >>> board.put_learning(learning, epoch=1, seq=1)
-        >>> view = board.snapshot(key, board.frontier())
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
         >>> view.get_learning("L-1").title
         'Use the baseline'
         """
@@ -212,19 +212,11 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena import Goal
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> from swarm_arena._journal.lease import Head
-        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> from swarm_arena.board import Candidate
-        >>> from swarm_arena.tool import ToolOutput, ToolRequest
-        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
-        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
-        >>> board.put_candidate(candidate, epoch=1, seq=1)
-        >>> view = board.snapshot(key, board.frontier())
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
         >>> view.get_candidate("c-1").id
         'c-1'
         """
@@ -253,19 +245,11 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena import Goal
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> from swarm_arena._journal.lease import Head
-        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> from swarm_arena.board import Candidate
-        >>> from swarm_arena.tool import ToolOutput, ToolRequest
-        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
-        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
-        >>> board.put_candidate(candidate, epoch=1, seq=1)
-        >>> view = board.snapshot(key, board.frontier())
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
         >>> view.scores("c-1")
         []
         """
@@ -294,19 +278,11 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena import Goal
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> from swarm_arena._journal.lease import Head
-        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> from swarm_arena.board import Candidate
-        >>> from swarm_arena.tool import ToolOutput, ToolRequest
-        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
-        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
-        >>> board.put_candidate(candidate, epoch=1, seq=1)
-        >>> view = board.snapshot(key, board.frontier())
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
         >>> view.lineage("c-1").parents("c-1")
         []
         """
@@ -335,13 +311,12 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> from swarm_arena._board.run_board import RunBoard
-        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-        >>> from swarm_arena import Goal
-        >>> key = Goal(id="g", namespace="n").key()
-        >>> board.register_goal(key, "g", None)
-        >>> view = board.snapshot(key, board.frontier())
-        >>> view.leaderboard(view.goal, judge="program")
+        Reuse the public in-memory setup in the :class:`BoardView` example:
+
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.leaderboard(key, judge="program")
         []
         """
 
@@ -364,9 +339,68 @@ class BoardView(_Reads):
 
     Examples
     --------
-    >>> from swarm_arena.board import BoardView
-    >>> bool(BoardView.__abstractmethods__)
-    True
+    This minimal single-goal view demonstrates unscored, parentless records.
+    A production connector also implements ranking, learning relevance, ancestry,
+    and selection by committed frontier. All setup uses public interfaces:
+
+    >>> from collections.abc import Sequence
+    >>> from swarm_arena import Goal, Score
+    >>> from swarm_arena.board import BoardView, Candidate, Frontier, GoalKey, Learning
+    >>> from swarm_arena.board import LineageGraph, Row
+    >>> from swarm_arena.tool import ToolOutput, ToolRequest
+    >>> class MemoryReads:
+    ...     def __init__(self, goal: GoalKey) -> None:
+    ...         self.goal = goal
+    ...         self.candidates: dict[str, Candidate] = {}
+    ...         self.learning_records: dict[str, Learning] = {}
+    ...         self.score_records: dict[str, list[Score]] = {}
+    ...     def best(self, goal: GoalKey, k: int, *, judge: str,
+    ...              run_id: str | None = None, part: str | None = None,
+    ...              fidelity: str | None = None) -> list[Candidate]:
+    ...         if goal != self.goal:
+    ...             raise ValueError("goal outside view")
+    ...         return []
+    ...     def learnings(self, namespace: str, *, tags: Sequence[str] = (),
+    ...                   goal: GoalKey | None = None, limit: int = 50) -> list[Learning]:
+    ...         if namespace != self.goal.namespace or goal not in (None, self.goal):
+    ...             raise ValueError("scope outside view")
+    ...         return [v.model_copy(deep=True) for v in self.learning_records.values()
+    ...                 if not v.hidden and set(tags) <= set(v.tags)][:max(0, limit)]
+    ...     def search_learnings(self, namespace: str, query: str, *,
+    ...                         tags: Sequence[str] = (), goal: GoalKey | None = None,
+    ...                         limit: int = 10) -> list[Learning]:
+    ...         return [v for v in self.learnings(namespace, tags=tags, goal=goal)
+    ...                 if query.casefold() in (v.title + " " + v.text).casefold()][:max(0, limit)]
+    ...     def get_learning(self, id: str) -> Learning:
+    ...         item = self.learning_records[id]
+    ...         if item.hidden:
+    ...             raise KeyError(id)
+    ...         return item.model_copy(deep=True)
+    ...     def get_candidate(self, id: str) -> Candidate:
+    ...         return self.candidates[id].model_copy(deep=True)
+    ...     def scores(self, candidate_id: str) -> list[Score]:
+    ...         self.get_candidate(candidate_id)
+    ...         return [v.model_copy(deep=True) for v in self.score_records.get(candidate_id, [])]
+    ...     def lineage(self, candidate_id: str) -> LineageGraph:
+    ...         candidate = self.get_candidate(candidate_id)
+    ...         return LineageGraph(root=candidate_id, nodes={candidate_id: candidate}, edges=[])
+    ...     def leaderboard(self, goal: GoalKey, *, judge: str) -> list[Row]:
+    ...         self.best(goal, 1, judge=judge)
+    ...         return []
+    >>> class MemoryView(MemoryReads, BoardView):
+    ...     def __init__(self, goal: GoalKey, frontier: Frontier) -> None:
+    ...         MemoryReads.__init__(self, goal)
+    ...         self.frontier = frontier
+    >>> key = Goal(id="g", namespace="n").key()
+    >>> view = MemoryView(key, Frontier())
+    >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+    ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+    >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+    ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+    >>> view.candidates[candidate.id] = candidate
+    >>> view.learning_records[learning.id] = learning
+    >>> view.get_candidate("c-1").id
+    'c-1'
     """
 
     goal: GoalKey
@@ -392,9 +426,45 @@ class Board(Configurable, _Reads):
 
     Examples
     --------
-    >>> from swarm_arena.board import Board
-    >>> bool(Board.__abstractmethods__)
-    True
+    Reuse the unscored ``MemoryReads`` mixin defined with public interfaces in the
+    :class:`BoardView` example. ``script_from_examples`` executes that displayed
+    setup so each example also runs independently. This demonstration stores
+    records in memory; a production connector selects committed journal heads.
+
+    >>> from doctest import script_from_examples
+    >>> from swarm_arena.board import Board, BoardView
+    >>> from swarm_arena.planning import Decision
+    >>> exec(script_from_examples(BoardView.__doc__))
+    >>> class MemoryBoard(MemoryReads, Board):
+    ...     def __init__(self) -> None:
+    ...         Board.__init__(self)
+    ...         MemoryReads.__init__(self, key)
+    ...         self.decisions: dict[tuple[str, int], Decision] = {}
+    ...     def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:
+    ...         self.candidates[candidate.id] = candidate.model_copy(deep=True)
+    ...     def put_score(self, score: Score, *, epoch: int, seq: int) -> None:
+    ...         records = self.score_records.setdefault(score.candidate_id, [])
+    ...         records.append(score.model_copy(deep=True))
+    ...     def put_learning(self, learning: Learning, *, epoch: int, seq: int) -> None:
+    ...         self.learning_records[learning.id] = learning.model_copy(deep=True)
+    ...     def put_decision(self, goal_id: str, round: int, decision: Decision,
+    ...                      *, epoch: int, seq: int) -> None:
+    ...         self.decisions[goal_id, round] = decision.model_copy(deep=True)
+    ...     def frontier(self) -> Frontier:
+    ...         return Frontier()
+    ...     def snapshot(self, goal: GoalKey, frontier: Frontier) -> BoardView:
+    ...         from copy import deepcopy
+    ...         if goal != self.goal:
+    ...             raise ValueError("unknown goal")
+    ...         result = MemoryView(goal, frontier.model_copy(deep=True))
+    ...         result.candidates = deepcopy(self.candidates)
+    ...         result.learning_records = deepcopy(self.learning_records)
+    ...         result.score_records = deepcopy(self.score_records)
+    ...         return result
+    >>> board = MemoryBoard()
+    >>> board.put_candidate(candidate, epoch=1, seq=1)
+    >>> board.snapshot(key, board.frontier()).get_candidate("c-1").id
+    'c-1'
     """
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
@@ -412,14 +482,12 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-
-        >>> board.open("r", "/runs", ["demo"])
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
+        >>> board.open("r", "/runs", ["n"])
         """
 
     def close(self) -> None:
@@ -428,13 +496,11 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
         >>> board.close()
         """
 
@@ -454,18 +520,14 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-            >>> from swarm_arena.board import Candidate
-            >>> from swarm_arena.tool import ToolOutput, ToolRequest
-            >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
-            ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
         >>> board.put_candidate(candidate, epoch=1, seq=4)
+        >>> board.get_candidate("c-1").id
+        'c-1'
         """
 
     @abstractmethod
@@ -484,17 +546,16 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-            >>> from swarm_arena import Score
-            >>> score = Score(id="s-1", candidate_id="c-1", judge="program",
-            ...     rubric_hash="r", panel_hash="p", key=(1.0,))
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
+        >>> score = Score(id="s-1", candidate_id="c-1", judge="program",
+        ...     rubric_hash="r", panel_hash="p", key=(1.0,))
         >>> board.put_score(score, epoch=1, seq=5)
+        >>> board.scores("c-1")[0].key
+        (1.0,)
         """
 
     @abstractmethod
@@ -513,17 +574,14 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-            >>> from swarm_arena.board import Learning
-            >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
-            ...     round=1, author="human:a", title="Use the baseline", text="Start here")
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
         >>> board.put_learning(learning, epoch=1, seq=6)
+        >>> board.get_learning("L-1").title
+        'Use the baseline'
         """
 
     @abstractmethod
@@ -554,16 +612,15 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-            >>> from swarm_arena.planning import Decision
-            >>> decision = Decision(prune={"search/a": "stalled"}, policy="patience")
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
+        >>> decision = Decision(prune={"search/a": "stalled"}, policy="patience")
         >>> board.put_decision("g", 1, decision, epoch=1, seq=7)
+        >>> board.decisions["g", 1].policy
+        'patience'
         """
 
     @abstractmethod
@@ -578,13 +635,11 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
         >>> board.frontier().marks
         []
         """
@@ -613,16 +668,11 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        With a board supplied by the run engine:
+        Reuse the public in-memory setup in the :class:`Board` example:
 
-        .. Standalone in-memory setup for the executable example.
-
-            >>> from swarm_arena._board.run_board import RunBoard
-            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-            >>> from swarm_arena import Goal
-            >>> key = Goal(id="g", namespace="n").key()
-            >>> board.register_goal(key, "g", None)
-
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import Board
+        >>> exec(script_from_examples(Board.__doc__))
         >>> board.snapshot(key, board.frontier()).goal == key
         True
         """

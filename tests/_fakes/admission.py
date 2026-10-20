@@ -11,8 +11,25 @@ from swarm_arena._model.ref import RefField
 from swarm_arena._model.results import ToolOutput
 from swarm_arena._model.tooling import Command, CompletedRun, ToolRequest
 from swarm_arena._tooling.tool import Tool
+from swarm_arena.manager import AgentContext, Manager, RoundReport
 
 SENTINEL = "d4dc419b-23f0-4efa-aadb-c96e836e0b25"
+
+
+class ReadOwnPartManager(Manager):
+    reads: ClassVar[list[tuple[str, str | None]]] = []
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        if ctx.round == 1 or ctx.spec.name == "join":
+            await ctx.run_tool({"a": 1.0})
+        else:
+            rows = ctx.best(1)
+            assert rows
+            candidate = ctx.get_candidate(rows[0].candidate_id)
+            self.reads.append((ctx.spec.name, candidate.part))
+            print(f"agent part {ctx.spec.name}: best candidate part {candidate.part}")
+            assert candidate.part == ctx.spec.name
+        return RoundReport()
 
 
 class ProbeTool(Tool):

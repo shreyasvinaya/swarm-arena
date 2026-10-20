@@ -609,7 +609,7 @@ For `direction="min"`, that value yields key `(-0.25,)`; for `"max"` (the
 default), it yields `(0.25,)`. Alternatively,
 `{"key": [1, 2], "value": 0.25}` supplies the ranking key directly, unaffected
 by direction; larger keys rank higher lexicographically. `verdict` is optional,
-`notes` defaults to `""`, and extra fields are ignored. Keys must be nonempty
+`notes` defaults to `""`, and unknown fields are rejected. Keys must be nonempty
 and finite. Numeric strings and booleans are rejected, and JSON containing
 NaN or Infinity fails result collection. Neither a non-null key nor a non-null
 value means `result needs key or value`.

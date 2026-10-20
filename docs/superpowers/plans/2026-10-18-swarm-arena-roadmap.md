@@ -470,6 +470,8 @@ class Goal(FrozenModel):
 class PartSpec(FrozenModel):
     name: str
     goal: Goal
+    # Every main goal and part group in a run must have a distinct snapshotted GoalKey;
+    # validate_plan rejects collisions within a plan, and run startup checks all plans before paid work.
     checks: list[Ref] | None = None
     judges: list[Ref] | None = None
     ranking: str | None = None
@@ -1112,6 +1114,8 @@ class GoalKey(FrozenModel):
     files_sha256: str                           # sha256(canonical(sorted manifest))
     @classmethod
     def of(cls, goal: Goal) -> "GoalKey": ...
+    # One key identifies exactly one main-goal or part group per run. Admission rejects part/part,
+    # main/part and cross-plan collisions with identifier-only PlanError naming the goal/part groups.
 
 # _model/results.py — M1a
 class Candidate(StoredModel):
@@ -1814,7 +1818,11 @@ class Ledger:
         # Spendable goal work, excluding the final slice and shared service reserve; uncapped units are None.
         # This is History.budget_left for replanning future rounds.
     async def reserve(self, holder: str, amount: Amount, *, kind: ReservationKind, goal_id: str,
-                      keep_charged: bool = False) -> Reservation: ...   # LimitReached("budget"); durable before return
+                      keep_charged: bool = False,
+                      on_admit: Callable[[Reservation], None] | None = None) -> Reservation: ...
+        # LimitReached("budget"); durable before return. on_admit runs synchronously after booking and before
+        # the durability wait, allowing cancellation cleanup to capture ownership. It does not authorize dispatch.
+        # A raising callback unwinds the booking exactly, writes no event and propagates unchanged; its id is unknown.
     async def settle(self, reservation_id: str, actual: Amount, *, estimated: bool = False) -> None: ...  # idempotent, durable
     async def settle_overflow(self, reservation_id: str, actual: Amount) -> None: ...
         # Charge reported tokens and exactly USD_LIMIT; settle carries usage_overflow=True. Replay restores
@@ -1963,7 +1971,8 @@ NOTE_PREFIX: Final = "swarm-arena: "
 MAX_DECLARED_FILES: Final = 4096
 _OUTPUT_BYTE_LIMIT: Final[ContextVar[int | None]]  # set/reset inside daemon collect from executor config
 # The read_regular_file of R4.13.8: O_NOFOLLOW | O_NONBLOCK, regular files only, no symlinked component.
-def read_regular_file(workspace: Path, rel: str) -> bytes: ...
+# Refuse an fstat size above max_bytes before reading (including sparse files); never read beyond the cap if it grows.
+def read_regular_file(workspace: Path, rel: str, *, max_bytes: int) -> bytes: ...
 def symlinked_component(base: Path, rel: str) -> str | None: ...  # shared component check for snapshots and collection
 # Never blocks or follows: O_APPEND | O_NOFOLLOW | O_NONBLOCK, regular files only,
 # otherwise the note is dropped; M4 job steps reuse it.
@@ -1976,8 +1985,8 @@ def matches(path: str, globs: Sequence[str]) -> bool: ...
 def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> FileSet: ...   # rejects symlinks
 def snapshot_plan(plan: Plan, artifacts: ArtifactStore) -> Plan: ...   # goal, parts, and every FileSet in component configs
 def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref: ...   # every FileSet and nested Ref in the
-    # validated config; writes back only keys present in ref.config (an omitted default FileSet stays omitted); other keys
-    # keep their raw form
+    # validated config; writes back explicit fields and freezes non-empty FileSet defaults under their canonical
+    # field names. Only empty FileSet defaults and other defaults stay omitted; unrelated values keep their raw form.
 # _tooling/staging.py
 def parent_ref(candidate: Candidate) -> ParentRef: ...
 def effective_files(goal: Goal, candidate: Candidate) -> dict[str, str]: ...
@@ -2002,7 +2011,9 @@ def plan_script_stage(*, own_files: Mapping[str, str], candidate: Candidate,
 def materialize(stage: Job.Stage, workspace: Path, artifacts: ArtifactStore) -> None: ...
 # [F4] The original stage is mandatory: reject output conflicts in the producing run.
 def collect_output_files(workspace: Path, declared: Sequence[str], artifacts: ArtifactStore,
-                         *, stage: Job.Stage) -> list[FileRef]: ...
+                         *, stage: Job.Stage, max_bytes: int) -> list[FileRef]: ...
+    # max_bytes is the total output byte budget; check each file's size against the remaining budget before reading
+    # or uploading it, including sparse files, and bound the read if it grows. Validate all declarations before reads.
 ```
 
 #### R4.13.10 Agent runtime and the `run_tool` pipeline — M1b
@@ -2134,7 +2145,10 @@ class RefSite(FrozenModel):
 def ref_sites(plan: Plan) -> list[RefSite]: ...      # every Ref at any depth, incl. nested refs and overrides
 def diff_revision(parent: Plan | None, child: Plan, *, parent_human: Mapping[str, bool]) -> list[RefSite]: ...
     # agents by stable address; checks, judges, parts by name
-def check_catalog(site: RefSite, catalog: PlannerCatalog, *, overrides: Mapping[str, Any]) -> list[str]: ...
+def check_catalog(site: RefSite, catalog: PlannerCatalog, *, overrides: Mapping[str, Any],
+                  deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] | None = None) -> list[str]: ...
+    # deferred=None is strict: extra fixed fields are errors. A supplied collector records catalog-matched extra
+    # fields for the typed default check after all import-free raw errors are rejected, before resolution/snapshotting.
     # Compares catalog_form(site config minus settable keys) with catalog_form(entry.config) using shared json_equal.
     # _planning/catalog_check.find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog, *, raw: bool = False,
     # defer_defaults: bool = False) -> CatalogEntry | None returns the first same-kind/path canonical fixed-config match.
@@ -2152,7 +2166,9 @@ def catalog_form(config: Mapping[str, Any]) -> dict[str, Any]: ...
     # than path, config, and name (the M1b Task 14 nested-ref rule). So a site that the core snapshotted, a journaled
     # revision, and a later unchanged revision still equal the raw catalog entry. A changed nested path, config value,
     # or name still differs. Shared json_equal preserves bool/int/float distinctions recursively after normalization.
-def authorize_revision(plan: Plan, config: RunConfig, *, history: Sequence[Plan] = ()) -> tuple[Plan, list[str]]: ...
+def authorize_revision(plan: Plan, config: RunConfig, *, history: Sequence[Plan] = (),
+                       deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] | None = None
+                       ) -> tuple[Plan, list[str]]: ...
     # [plan] _planning/catalog_check.py. No import, no I/O. Human origin -> (plan, []). Non-human: check_catalog on every
     # site with carried_human False. In each such site, a dumped FileSet keeps its manifest only when a revision in
     # `history` (the admitted revisions, as journaled) holds a FileSet with equal globs and an equal manifest, at any
@@ -2163,11 +2179,16 @@ def authorize_revision(plan: Plan, config: RunConfig, *, history: Sequence[Plan]
     # revisions authority and folds later revisions through diff_revision; validation reuses it. Effective-site authority
     # also requires unchanged raw overrides, even when an override edit leaves the merged Ref unchanged. Diagnostic
     # pointers retain configured nested keys and list indices while rendering planner-invented mapping keys as <field>.
+    # deferred=None is strict; extra fields are errors. With a collector, reject all import-free raw errors first,
+    # then check typed defaults only at matched catalog paths: accept extra fields only for FileSet declarations
+    # equal to the Config default. Never trust a planner manifest merely because its declaration equals a default:
+    # only admitted history grants manifest trust; otherwise snapshot from the human source, failing closed if absent.
 def admit_revision(plan: Plan, config: RunConfig, artifacts: ArtifactStore, *, history: Sequence[Plan] = (),
                    other_active_agents: int = 0) -> tuple[Plan, list[str]]: ...
     # [plan] _planning/validate.py. The one entry point for r0 (RunRunner), replanner and join-failure revisions
     # (GoalRunner), and `swarm-arena plan` / `run` of a plan file (M3). Human: snapshot_plan -> validate_plan.
-    # Non-human: authorize_revision (errors -> PlanError before any Ref.load) -> the revision takes r0's base_dir
+    # Non-human: authorize_revision with deferred collector (raw errors -> PlanError before any Ref.load) -> typed
+    # catalog-default check (before any resolution/snapshotting) -> the revision takes r0's base_dir
     # (history[0]; its own for r0) -> snapshot_plan (part-goal FileSets resolve against the main goal's manifest, never
     # from disk) -> validate_plan. Returns (snapshotted revision, warnings).
 def stamp(plan: Plan, *, origin: Origin, parent: Plan | None) -> Plan: ...   # sets origin, revision, parent_revision

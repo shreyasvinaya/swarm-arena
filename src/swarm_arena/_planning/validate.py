@@ -216,8 +216,26 @@ def _rule_max_agents_total(
     return []
 
 
+def _goal_key_errors(plans: Sequence[Plan]) -> list[str]:
+    """Refuse ambiguous board groups using only goal and part identifiers."""
+    seen: dict[GoalKey, str] = {}
+    errors: list[str] = []
+    for plan in plans:
+        groups = [(f"goal {plan.goal.id!r}", plan.goal)]
+        groups.extend(
+            (f"goal {plan.goal.id!r} part {part.name!r}", part.goal) for part in plan.parts
+        )
+        for group, goal in groups:
+            key = _safe_call("/goal", partial(GoalKey.of, goal))
+            if key in seen:
+                errors.append(f"/parts: duplicate GoalKey for {seen[key]} and {group}")
+            else:
+                seen[key] = group
+    return errors
+
+
 def _rule_parts(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> list[str]:
-    errors = []
+    errors = _goal_key_errors([plan])
     names = {p.name for p in plan.parts}
     for pointer, team in _teams(plan):
         if team.part is not None and team.part not in names:

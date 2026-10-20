@@ -1,10 +1,14 @@
 """Exercise the public documentation and its offline script workflow."""
 
+import ast
+import importlib
+import inspect
 import re
 import subprocess
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -12,6 +16,58 @@ ROOT = Path(__file__).resolve().parents[1]
 GUIDES = sorted(
     path for path in (ROOT / "docs").glob("*.md") if path.name != "writing-a-connector.md"
 )
+ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("_budget.ledger", "Ledger.reserve"),
+        ("_tooling.result_file", "read_regular_file"),
+        ("_tooling.materialize", "collect_output_files"),
+        ("_planning.catalog_check", "check_catalog"),
+        ("_planning.catalog_check", "authorize_revision"),
+    ],
+)
+def test_registry_admission_and_byte_budget_signatures(module: str, name: str) -> None:
+    text = (ROOT / ROADMAP).read_text()
+    func = importlib.import_module(f"swarm_arena.{module}")
+    for part in name.split("."):
+        func = getattr(func, part)
+    assert callable(func)
+    header = re.search(
+        rf"(?m)^[ \t]*(?:async )?def {name.split('.')[-1]}\([\s\S]*?\) -> [^\n]+?: \.\.\.",
+        text,
+    )
+    assert header is not None
+    declaration = ast.parse(dedent(header.group())).body[0]
+    assert isinstance(declaration, ast.FunctionDef | ast.AsyncFunctionDef)
+    arguments = declaration.args
+    signature = inspect.signature(func)
+    parameters = list(signature.parameters.values())
+    assert [arg.arg for arg in [*arguments.args, *arguments.kwonlyargs]] == [
+        param.name for param in parameters
+    ]
+    assert [arg.arg for arg in arguments.kwonlyargs] == [
+        param.name for param in parameters if param.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
+    for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
+        actual = signature.parameters[arg.arg].default
+        assert (None if default is None else ast.unparse(default)) == (
+            None if actual is inspect.Parameter.empty else repr(actual)
+        )
+
+
+def test_registry_describes_default_files_and_callback_ownership() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    snapshot = text.split("def snapshot_ref(", 1)[1].split("# _tooling/staging.py", 1)[0]
+    assert "non-empty FileSet defaults under their canonical" in snapshot
+    assert "Only empty FileSet defaults and other defaults stay omitted" in snapshot
+    reserve = text.split("async def reserve(", 1)[1].split("async def settle(", 1)[0]
+    assert "before" in reserve
+    assert "durability wait" in reserve
+    assert "does not authorize dispatch" in reserve
+    assert "unwinds the booking exactly, writes no event" in reserve
 
 
 def test_changelog_describes_one_initial_release() -> None:
@@ -52,6 +108,15 @@ def test_script_guides_explain_import_shadowing(name: str) -> None:
     text = (ROOT / "docs" / name).read_text()
     assert "import shadowing" in text.lower()
     assert "problem/*.physk" in text
+
+
+def test_judge_result_guide_rejects_unknown_fields() -> None:
+    text = (ROOT / "docs" / "own-files.md").read_text()
+    result = text.split("Judges likewise write a raw object:", 1)[1].split(
+        "(isolation-boundary)=", 1
+    )[0]
+    assert "unknown fields are rejected" in result
+    assert "extra fields are ignored" not in result
 
 
 class RenderedText(HTMLParser):
@@ -100,6 +165,19 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
     protocol.feed((output / "api" / "protocol.html").read_text())
     assert "data=..." in "".join(protocol.chunks).replace(" ", "")
     assert "omission, not a content value" in "".join(protocol.chunks)
+    board = (output / "api" / "board.html").read_text()
+    for cls in ("Board", "BoardView"):
+        for name in (
+            "best",
+            "learnings",
+            "search_learnings",
+            "get_learning",
+            "get_candidate",
+            "scores",
+            "lineage",
+            "leaderboard",
+        ):
+            assert f'id="swarm_arena.board.{cls}.{name}"' in board
 
 
 def test_own_files_offline_example_runs(tmp_path: Path) -> None:

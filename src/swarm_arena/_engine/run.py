@@ -42,7 +42,7 @@ from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import Estimate, ToolRequest
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import stamp
-from swarm_arena._planning.validate import admit_revision
+from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._store.local import LocalStore
@@ -308,6 +308,8 @@ class RunRunner:
                     )
                     admitted.append(frozen)
                     warnings.extend(notes)
+                if collisions := _goal_key_errors(admitted):
+                    raise _core_error(PlanError, collisions)
                 self.plans = admitted
                 estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
                 if _exceeds_limit(estimate, self.config):
