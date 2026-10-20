@@ -484,8 +484,24 @@ async def test_timed_out_run_with_an_invalid_collect_breaks_the_contract(
 ) -> None:
     # A broken collect is broken on every path: the executor gives timeout, not error, here.
     tool = NanCollectTool(PyTool.Config(code="import time; time.sleep(60)", grace_s=0.5))
-    with pytest.raises(AssertionError, match=VALID_OUTPUT):
+    with pytest.raises(AssertionError, match=VALID_OUTPUT) as caught:
         await check_tool(tool, {}, executor=local_executor, timeout_s=0.5)
+    [note] = caught.value.__notes__  # the run's tail, with the executor's note in it
+    assert "ended with status timeout; the end of its stderr log:" in note
+    assert INVALID_COLLECT_NOTE in note
+
+
+@pytest.mark.parametrize("status", list(RunStatus))
+async def test_error_after_a_run_that_is_not_ok_keeps_the_tail(status: RunStatus) -> None:
+    executor = FixedExecutor(with_stderr(status, "RUN-DIAG"))
+    tool = ResultFingerprintTool(PyTool.Config(code="pass"))  # fingerprint() raises KeyError
+    with pytest.raises(KeyError) as caught:
+        await check_tool(tool, {}, executor=executor)
+    if status == RunStatus.OK:
+        assert not hasattr(caught.value, "__notes__")
+    else:
+        [note] = caught.value.__notes__
+        assert f"ended with status {status.value}; the end of its stderr log:\nRUN-DIAG" in note
 
 
 async def test_ok_run_whose_tool_prints_the_note_passes(local_executor: LocalExecutor) -> None:
@@ -630,6 +646,31 @@ async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
             PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(rebuilt)
         )
     assert (checked.status, checked.data) == (RunStatus.OK, {"x": 1})
+
+
+async def test_post_checks_read_the_validated_copy_and_the_original_is_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An executor that builds its output with model_construct leaves each file a plain dict.
+    def fingerprint(self: PyTool, output: ToolOutput) -> str:  # reads each file's fields
+        return ",".join(file.sha256 for file in output.files)
+
+    monkeypatch.setattr(PyTool, "fingerprint", fingerprint)
+    tool = PyTool(PyTool.Config(code="pass"))
+    ghost = {"name": "ghost.txt", "path": "out/ghost.txt", "sha256": "0" * 64, "size": 0}
+    out = ToolOutput.model_construct(status=RunStatus.OK, files=[ghost])
+    with pytest.raises(AssertionError, match=r"output file out/ghost\.txt is not in the artifact"):
+        await check_tool(tool, {}, executor=FixedExecutor(out))
+    out = ToolOutput.model_construct(status=RunStatus.OK, files={"out/ghost.txt": ghost})
+    with pytest.raises(AssertionError, match=VALID_OUTPUT):  # a dict, not a list of files
+        await check_tool(tool, {}, executor=FixedExecutor(out))
+    sha256 = ArtifactStore(open_store(_artifact_root())).put_bytes(b"made")
+    made = {"name": "x.txt", "path": "out/x.txt", "sha256": sha256, "size": 4}
+    out = ToolOutput.model_construct(status=RunStatus.OK, files=[made])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        checked = await check_tool(tool, {}, executor=FixedExecutor(out))
+    assert checked is out
 
 
 async def test_preflight_runs_before_any_job() -> None:

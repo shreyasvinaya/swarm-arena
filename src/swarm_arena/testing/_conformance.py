@@ -53,6 +53,7 @@ _INVALID_COLLECT_NOTE: Final = _NOTE_PREFIX + _NOT_AN_OUTPUT
 # LocalExecutor gives an invalid collect result one of these statuses: the run's stop
 # status after a timeout or a cancel, else error.
 _REPLACED_COLLECT: Final = (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED)
+_NOT_OK: Final = tuple(status for status in RunStatus if status is not RunStatus.OK)
 _root: str | None = None
 
 _C = TypeVar("_C", Tool, Check, Judge)
@@ -171,23 +172,32 @@ def _has_invalid_collect_note(tail: str) -> bool:
     return False
 
 
-def _failed_runs(outputs: Sequence[tuple[str, object]]) -> list[str]:
-    """Describe each run with status error and the end of its log (the tool's own text)."""
-    return [
-        f"run {job_id} ended with status error; the end of its stderr log:\n{_stderr_tail(out)}"
-        for job_id, out in outputs
-        if isinstance(out, ToolOutput) and getattr(out, "status", None) == RunStatus.ERROR
-    ]
+def _failed_runs(
+    outputs: Sequence[tuple[str, object]], statuses: Sequence[RunStatus] = (RunStatus.ERROR,)
+) -> list[str]:
+    """Describe each run with one of ``statuses`` and the end of its log (the tool's own text)."""
+    notes = []
+    for job_id, out in outputs:
+        if not isinstance(out, ToolOutput):
+            continue
+        status = getattr(out, "status", None)  # model_construct can leave any object here
+        failed = next((member for member in statuses if status == member), None)
+        if failed is not None:
+            tail = _stderr_tail(out)
+            notes.append(
+                f"run {job_id} ended with status {failed}; the end of its stderr log:\n{tail}"
+            )
+    return notes
 
 
 @contextlib.asynccontextmanager
 async def _failed_runs_on(runner: _Watched) -> AsyncGenerator[None, None]:
-    """Add the failed-run notes to any error from the block, which then propagates unchanged."""
+    """Add a note for each run that is not ok to any error from the block, then re-raise it."""
     try:
         yield
     except Exception as error:  # not BaseException: a cancellation stays as it is
         with anyio.CancelScope(shield=True):  # bounded: it reads the stored logs' tails
-            notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs)
+            notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs, _NOT_OK)
         for note in notes:
             error.add_note(note)
         raise
@@ -330,19 +340,20 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     ):
         raise _fail(message)
     try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
-        ToolOutput.model_validate(out.model_dump(warnings=False))
+        valid = ToolOutput.model_validate(out.model_dump(warnings=False))
     except Exception:
         raise _fail(message) from None
+    # The checks read the validated copy, as the core would; the caller gets ``out`` itself.
     store = open_store(_artifact_root())
-    for file in out.files:
+    for file in valid.files:
         if not store.exists(file.sha256):
             raise _fail(f"output file {file.path} is not in the artifact store")
-    fingerprint = tool.fingerprint(out)
+    fingerprint = tool.fingerprint(valid)
     if not (isinstance(fingerprint, str) and fingerprint):
         raise _fail("Tool.fingerprint() must return a nonempty str")
-    if tool.fingerprint(out) != fingerprint:
+    if tool.fingerprint(valid) != fingerprint:
         raise _fail("Tool.fingerprint() must return the same str for the same output")
-    rerun = out.model_copy(update={"logs_ref": None, "started_at": None, "ended_at": None})
+    rerun = valid.model_copy(update={"logs_ref": None, "started_at": None, "ended_at": None})
     if tool.fingerprint(rerun) != fingerprint:
         raise _fail("Tool.fingerprint() must not depend on logs_ref or the run times")
     if not isinstance(tool.is_deterministic(request), bool):
@@ -431,18 +442,19 @@ async def check_tool(
     ``UserWarning``, as the core gives a soft warning. The job runs on
     ``executor`` with the run identity ``local`` and the goal's id in its
     environment. A run that ends with status ``error`` gives a ``UserWarning``
-    with the last 2 KB of its stderr log. If the call raises an error after
-    such a run instead (a failed contract assert, or an error from the tool's
-    own methods), that text is a note on the error, which is otherwise passed
-    on unchanged.
+    with the last 2 KB of its stderr log. If the call raises an error instead
+    (a failed contract assert, or an error from the tool's own methods), a run
+    with any status but ``ok`` (``error``, ``timeout``, ``cancelled``, ...)
+    adds that text as a note to the error, which is otherwise passed on
+    unchanged.
 
     After the run, the output must be a valid ``ToolOutput`` (finite JSON data;
-    it is validated again in lax mode, as the core does), and its files must
-    be in the artifact store. An invalid ``collect()`` result is a contract
-    failure on every path: ``LocalExecutor`` replaces it with an empty output
-    (status ``error``, or ``timeout`` or ``cancelled`` for a stopped run) and a
-    note in the stderr log, and the kit raises the ``AssertionError`` for that
-    note.
+    it is validated again in lax mode, as the core does, and the checks below
+    read that validated copy), and its files must be in the artifact store. An
+    invalid ``collect()`` result is a contract failure on every path:
+    ``LocalExecutor`` replaces it with an empty output (status ``error``, or
+    ``timeout`` or ``cancelled`` for a stopped run) and a note in the stderr
+    log, and the kit raises the ``AssertionError`` for that note.
     ``fingerprint()`` must give the same nonempty str twice and must not
     depend on ``logs_ref`` or the run times. ``collect()`` is also called once
     on an empty workspace with a failed run: it may raise, but it must not
@@ -472,7 +484,7 @@ async def check_tool(
     Returns
     -------
     ToolOutput
-        The executor's output, also when its status is not ``ok``.
+        The executor's own output object, also when its status is not ``ok``.
 
     Raises
     ------
@@ -543,9 +555,10 @@ async def check_check(
     be valid in strict mode as it is: a value that a lax validation would
     repair, such as ``passed="no"``, is a contract failure. A command that ends
     with status ``error`` gives a ``UserWarning`` with the last 2 KB of its
-    stderr log. If the call raises an error after such a command instead (a
-    failed contract assert, or an error from ``check()`` itself), that text is
-    a note on the error, which is otherwise passed on unchanged.
+    stderr log. If the call raises an error instead (a failed contract assert,
+    or an error from ``check()`` itself), each command with any status but
+    ``ok`` adds that text as a note to the error, which is otherwise passed on
+    unchanged.
 
     Parameters
     ----------
@@ -618,9 +631,10 @@ async def check_judge(
     non-finite key is dropped as a judge error, as the core rejects it. Every
     other score must be valid in strict mode as it is. A command that ends with
     status ``error`` gives a ``UserWarning`` with the last 2 KB of its stderr
-    log. If the call raises an error after such a command instead (a failed
-    contract assert, or an error from ``judge()`` itself), that text is a note
-    on the error, which is otherwise passed on unchanged.
+    log. If the call raises an error instead (a failed contract assert, or an
+    error from ``judge()`` itself), each command with any status but ``ok``
+    adds that text as a note to the error, which is otherwise passed on
+    unchanged.
 
     Parameters
     ----------
