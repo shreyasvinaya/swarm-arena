@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from _fakes.proc import wait_until
-from _fakes.tools import sleepy
+from _fakes.tools import score_value, sleepy
 
 from swarm_arena import (
     AgentSpec,
@@ -29,6 +29,7 @@ from swarm_arena import (
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.reader import read_chain
+from swarm_arena._model.results import Candidate, Score
 from swarm_arena._store.base import open_store
 from swarm_arena.tool import Estimate
 
@@ -99,6 +100,29 @@ def _events(run_dir: Path) -> list[Event]:
     return [] if head is None else [e for _, batch in read_chain(store, head) for e in batch]
 
 
+def _score_preparation_barrier(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Hold barrier judging within its stop grace while preparation returns.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal passed through to the ordinary value scorer.
+    candidate : Candidate
+        Result carrying the preparation fixture's coordination directory.
+
+    Returns
+    -------
+    Score
+        The ordinary value score after the preparation callback returns.
+    """
+    if candidate.round == 1:
+        root = Path(candidate.request.inputs["marker"]).parent
+        (root / "barrier-entered").touch()
+        _wait_for(lambda: (root / "barrier-release").exists())
+    return score_value(goal, candidate)
+
+
 def _plan(root: Path, *, preparation: bool = False) -> Plan:
     rounds = 2 if preparation else 3
     requests = [
@@ -131,24 +155,21 @@ def _plan(root: Path, *, preparation: bool = False) -> Plan:
                 manager=Ref.of(ScriptedManager([{"round": 1, "inputs": {}}])),
             )
         )
-    plan = Plan(
+    return Plan(
         goal=Goal(id="toy-goal", namespace="e2e"),
         teams=[TeamSpec(name="team", rationale="Exercise lifecycle transitions", agents=agents)],
         judges=[
-            Ref.of(ProgramJudge("_fakes.tools:score_value")).model_copy(update={"name": "value"})
+            Ref.of(
+                ProgramJudge(
+                    "e2e.test_cli_lifecycle:_score_preparation_barrier"
+                    if preparation
+                    else "_fakes.tools:score_value"
+                )
+            ).model_copy(update={"name": "value"})
         ],
         ranking="value",
         rounds=[RoundSpec() for _ in range(rounds)],
     )
-    if preparation:
-        plan = plan.model_copy(
-            update={
-                "policy": Ref(
-                    path="_fakes.tools:PreparationBarrierPolicy", config={"root": str(root)}
-                )
-            }
-        )
-    return plan
 
 
 def _write_inputs(root: Path, run_config: RunConfig, *, preparation: bool = False) -> list[str]:

@@ -251,6 +251,13 @@ class GoalRunner:
         )
 
     async def _slots(self, teams: Sequence[TeamSpec], *, reuse: bool) -> list[AgentSlot]:
+        completed, slots = await self._supervised_step(
+            partial(self._prepare_slots, teams, reuse=reuse),
+            final=self.plan.converge.team in teams,
+        )
+        return slots if completed and slots is not None else []
+
+    async def _prepare_slots(self, teams: Sequence[TeamSpec], *, reuse: bool) -> list[AgentSlot]:
         previous = {slot.address: slot for slot in self.agents} if reuse else {}
         slots: list[AgentSlot] = []
         for team in teams:
@@ -472,7 +479,7 @@ class GoalRunner:
     async def _supervised_step(
         self, operation: Callable[[], Awaitable[_T]], *, final: bool
     ) -> tuple[bool, _T | None]:
-        """Abandon replans on stops; give final judging a bounded stop grace."""
+        """Supervise user hooks with one stop, fence and deadline boundary."""
         results: list[_T] = []
         errors: list[BaseException] = []
         async with anyio.create_task_group() as group:
@@ -493,6 +500,8 @@ class GoalRunner:
             grace_until: float | None = None
             try:
                 while True:
+                    if self.deps.journal.fenced.is_set():
+                        raise Fenced()
                     stopped = self._stop()
                     if stopped and not final:
                         break
@@ -561,89 +570,115 @@ class GoalRunner:
     async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
         """Fund exact batches and publish each group's judges in plan order."""
         tranche = self._tranche("judges")
+        reservations: dict[str, tuple[Reservation, Amount, bool]] = {}
         try:
-            for part in [None, *(p.name for p in self.plan.parts)]:
-                batch = [
-                    c
-                    for c in candidates
-                    if c.part == part
-                    and not c.gated_out
-                    and (c.output.status == RunStatus.OK or c.output.partial)
-                ]
-                if not batch:
-                    continue
-                _, refs, _ = part_scoring(self.plan, part)
-                for ref in refs:
-                    leaders = [c for c, _ in self._round_state().ranked(part)]
-                    scope = self._scope("judge", round, tranche)
-                    try:
-                        judge = await run_sync_daemon(ref.build, Judge)
-                        prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
-                        amount = await run_sync_daemon(
-                            partial(
-                                judge_amount,
-                                judge,
-                                len(prepared[0]),
-                                self.deps.config,
-                                make_price_of(self.deps.config.models),
-                                llm=False,
-                            )
-                        )
-                    except Fenced:
-                        raise
-                    except Exception as error:
-                        outcome = JudgeOutcome(
-                            scores=[],
-                            errors=[
-                                JudgeError(
-                                    candidate_id=c.id,
-                                    judge=ref.component_name(),
-                                    reason=f"judge error: {type(error).__name__}",
-                                )
-                                for c in batch
-                            ],
-                        )
-                        self._publish_scores(outcome, scope, round)
-                        continue
-                    try:
-                        reservation = (
-                            await self.deps.ledger.reserve(
-                                f"{self.goal_id}/:judges",
-                                amount,
-                                kind="judge",
-                                goal_id=self.goal_id,
-                            )
-                            if amount != Amount()
-                            else None
-                        )
-                    except LimitReached:
-                        self.deps.journal.append(
-                            self._draft(
-                                EventType.RESERVE_EXHAUSTED,
-                                **{"round": round, "needed": amount.model_dump()},
-                            )
-                        )
-                        self.select_only = True
-                        self.status, self.reason = "stopped", "reserve_exhausted"
-                        return False
-                    with llm_scope(scope):
-                        outcome = await judge_round(
-                            self.goal_id,
-                            [(ref, judge)],
-                            batch,
-                            leaders,
-                            lambda _, ref=ref, prepared=prepared: self._judge_context(
-                                ref, prepared[0], round
-                            ),
-                            prepared=prepared,
-                        )
-                    if reservation is not None:
-                        await self.deps.ledger.settle(reservation.id, amount, estimated=True)
-                    self._publish_scores(outcome, scope, round)
-                    await self._refresh()
-            return True
+            completed, funded = await self._supervised_step(
+                partial(self._barrier_work, candidates, round, tranche, reservations), final=True
+            )
+            return bool(completed and funded)
         finally:
+            for reservation, amount, dispatched in reservations.values():
+                await self.deps.ledger.settle(
+                    reservation.id, amount if dispatched else Amount(), estimated=dispatched
+                )
             await self._close(tranche)
+            self._stop()
+
+    async def _barrier_work(
+        self,
+        candidates: Sequence[Candidate],
+        round: int,
+        tranche: Tranche,
+        reservations: dict[str, tuple[Reservation, Amount, bool]],
+    ) -> bool:
+        for part in [None, *(p.name for p in self.plan.parts)]:
+            batch = [
+                c
+                for c in candidates
+                if c.part == part
+                and not c.gated_out
+                and (c.output.status == RunStatus.OK or c.output.partial)
+            ]
+            if not batch:
+                continue
+            _, refs, _ = part_scoring(self.plan, part)
+            for ref in refs:
+                leaders = [c for c, _ in self._round_state().ranked(part)]
+                scope = self._scope("judge", round, tranche)
+                try:
+                    judge = await run_sync_daemon(ref.build, Judge)
+                    prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
+                    amount = await run_sync_daemon(
+                        partial(
+                            judge_amount,
+                            judge,
+                            len(prepared[0]),
+                            self.deps.config,
+                            make_price_of(self.deps.config.models),
+                            llm=False,
+                        )
+                    )
+                except Fenced:
+                    raise
+                except Exception as error:
+                    outcome = JudgeOutcome(
+                        scores=[],
+                        errors=[
+                            JudgeError(
+                                candidate_id=c.id,
+                                judge=ref.component_name(),
+                                reason=f"judge error: {type(error).__name__}",
+                            )
+                            for c in batch
+                        ],
+                    )
+                    self._publish_scores(outcome, scope, round)
+                    continue
+
+                def on_admit(admitted: Reservation, amount: Amount = amount) -> None:
+                    reservations[admitted.id] = (admitted, amount, False)
+
+                try:
+                    reservation = (
+                        await self.deps.ledger.reserve(
+                            f"{self.goal_id}/:judges",
+                            amount,
+                            kind="judge",
+                            goal_id=self.goal_id,
+                            on_admit=on_admit,
+                        )
+                        if amount != Amount()
+                        else None
+                    )
+                except LimitReached:
+                    self.deps.journal.append(
+                        self._draft(
+                            EventType.RESERVE_EXHAUSTED,
+                            **{"round": round, "needed": amount.model_dump()},
+                        )
+                    )
+                    self.select_only = True
+                    self.status, self.reason = "stopped", "reserve_exhausted"
+                    return False
+                if reservation is not None:
+                    reservations[reservation.id] = (reservation, amount, True)
+                with llm_scope(scope):
+                    outcome = await judge_round(
+                        self.goal_id,
+                        [(ref, judge)],
+                        batch,
+                        leaders,
+                        lambda _, ref=ref, prepared=prepared: self._judge_context(
+                            ref, prepared[0], round
+                        ),
+                        prepared=prepared,
+                    )
+                if reservation is not None:
+                    await self.deps.ledger.settle(reservation.id, amount, estimated=True)
+                    reservations.pop(reservation.id)
+                self._publish_scores(outcome, scope, round)
+                await self._refresh()
+        return True
 
     async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
         """Rescore within stop grace, falling back only to committed rankings."""
@@ -887,9 +922,17 @@ class GoalRunner:
     async def _round_decision(self, round: int) -> Decision:
         """Publish policy and its synchronous effects as one recoverable checkpoint."""
         state = self._round_state()
-        try:
+
+        async def invoke() -> Decision:
             policy = await run_sync_daemon(self.plan.policy.build, Policy)
-            decision = guard(await run_sync_daemon(policy.after_round, state), state)
+            proposed = await run_sync_daemon(policy.after_round, state)
+            if isawaitable(proposed):
+                proposed = await proposed
+            return guard(proposed, state)
+
+        try:
+            completed, result = await self._supervised_step(invoke, final=False)
+            decision = result if completed and result is not None else Decision()
         except Fenced:
             raise
         except Exception as error:
@@ -1026,9 +1069,11 @@ class GoalRunner:
         Execute rounds and publish a result after its terminal journal commit.
 
         Stop reasons are refreshed through convergence and final judging.
-        Pending replans are abandoned on any stop. After an immediate stop or
-        run deadline, final judging has ``settle_timeout_s`` to finish; on
-        timeout, selection uses only previously journaled ranking scores.
+        Pending replans, policy decisions and ordinary slot preparation are
+        abandoned on any stop. After an immediate stop or run deadline,
+        barrier judging, converge slot preparation and final judging have
+        ``settle_timeout_s`` to finish; on timeout, selection uses only previously
+        journaled ranking scores.
         Policy checkpoints complete an unfinished round without repeating its
         managers or barrier. Round closure commits before replanning; revisions
         and rejections identify the first round to which they apply. Recovery
