@@ -2109,7 +2109,7 @@ git commit -m "feat: run LLM-calling tool runs through the gateway with their fu
 - Test: `tests/_gateway/test_reconcile.py`, `tests/_cli/test_cluster_cmds.py`, `tests/_exec/test_local.py`, `tests/_engine/test_run.py`
 
 **Interfaces:**
-- Consumes: `KeyRecord`, `KeyManager.restore` (Task 13); `GatewayAdapter`, `ProfileReport` (Task 11); `adapter_for` (Task 12); `gateway_preflight` (Task 14); `check_storage(config: RunConfig) -> None` in `_engine/preflight.py` (M2 Task 2, R4.13.13) and `ConditionalWritesUnsupported` (R4.13.1); `Executor.confirm_dead` (R4.7, `RayExecutor` in Task 7); `open_store`, `read_owner`, `Lease.take_over` (with `expect_epoch`, M1b Task 3), `read_chain`, `JournalWriter`, `LeaseHeld`, `Fenced` (R4.13.1, R4.13.3; no core helper wraps the takeover retry of §7.1 step 1, so `take_run` writes its own loop, the same rule that M1b `resume_run` (Task 27) and M2 `HumanReview.import_csv` (Task 14) each write); the `takeover` payload shape of M1b `resume_run`, `{"force": bool}` (M1b Task 27 `test_seq_continues_and_takeover_logged`), which reconcile writes as `{"force": False}`; the driver's local journal path (R4.13.3, M1b Tasks 26 and 27), `Path(tempfile.gettempdir()) / "swarm-arena" / run_id / f"e{epoch}.jsonl"`, a local path even when `run_root` is `s3://`; `bind_run`, `unbind_run`, `record_call` (R4.13.19); `RunState.from_events` (R4.13.4), `IdGen(..., counters=...)`; `host_id`, `group_alive`, `process_start_time` (R4.13.8).
+- Consumes: `KeyRecord`, `KeyManager.restore` (Task 13); `GatewayAdapter`, `ProfileReport` (Task 11); `adapter_for` (Task 12); `gateway_preflight` (Task 14); `check_storage(config: RunConfig) -> None` in `_engine/preflight.py` (M2 Task 2, R4.13.13) and `ConditionalWritesUnsupported` (R4.13.1); `Executor.confirm_dead` (R4.7, `RayExecutor` in Task 7); `open_store`, `read_owner`, `Lease.take_over` (with `expect_epoch`, M1b Task 3), `read_chain`, `JournalWriter`, `LeaseHeld`, `Fenced` (R4.13.1, R4.13.3; no core helper wraps the takeover retry of §7.1 step 1, so `take_run` writes its own loop, the same rule that M1b `resume_run` (Task 27) and M2 `HumanReview.import_csv` (Task 14) each write); the `takeover` payload shape of M1b `resume_run`, `{"force": bool}` (M1b Task 27 `test_seq_continues_and_takeover_logged`), which reconcile writes as `{"force": False}`; the driver's local journal path (R4.13.3, M1b Tasks 26 and 27), `Path(tempfile.gettempdir()) / "swarm-arena" / run_id / f"e{epoch}.jsonl"`, a local path even when `run_root` is `s3://`; `bind_run`, `unbind_run`, `record_call` (R4.13.19); `RunState.from_events` (R4.13.4), `IdGen(..., counters=...)`; `host_id`, `group_has_live_member`, `process_start_time` (R4.13.8).
 - Produces:
 
 ```python
@@ -2169,9 +2169,9 @@ async def reconcile_run(config: RunConfig, run_id: str, adapter: GatewayAdapter,
     #       try: profile = await adapter.preflight() (a GatewayError → None); reconcile_keys; commit
     #       finally: unbind_run(run_id)
     #   leaving the writer context releases the lease
-# _exec/local.py (+M4): M1a confirm_dead returns `not group_alive(pgid)` on this host; M4 adds the start-time check
+# _exec/local.py (+M4): M1a confirm_dead returns `not group_has_live_member(pgid)` on this host; M4 adds the start-time check
 async def confirm_dead(self, started: Job.Started) -> bool | None: ...
-    # kind "process" on this host_id(): True if not group_alive(pgid), or if procinfo.process_start_time(pid) is not
+    # kind "process" on this host_id(): True if not group_has_live_member(pgid), or if procinfo.process_start_time(pid) is not
     # None and differs from started.start_time (the pgid now belongs to another process); False if alive with the
     # recorded (or an unknown) start time; None on another host or for kind "dispatch". local.py calls
     # procinfo.process_start_time through the module, so a test can patch it.
@@ -2327,7 +2327,7 @@ Test helper in `tests/_gateway/test_reconcile.py`: `_bump_owner_version(store: S
 - [ ] **Step 2: Run the tests to check that they fail**
 
 Run: `uv run pytest tests/_gateway/test_reconcile.py tests/_cli/test_cluster_cmds.py tests/_exec/test_local.py tests/_engine/test_run.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'swarm_arena._gateway.reconcile'`, and with `assert False is True` for the start-time mismatch (M1a `confirm_dead` checks only `group_alive`).
+Expected: FAIL with `ModuleNotFoundError: No module named 'swarm_arena._gateway.reconcile'`, and with `assert False is True` for the start-time mismatch (M1a `confirm_dead` checks only `group_has_live_member`).
 
 - [ ] **Step 3: Implement with the signatures and the order above. Write the docs section.** It covers the three conditions, the labels, why an observed number is never proof (late log batches), that reconcile never changes a live run's budget, that it probes `s3://` roots for conditional writes (`check_storage`) before it takes over, that it takes the run lease, and that a later `reconcile` updates the numbers.
 

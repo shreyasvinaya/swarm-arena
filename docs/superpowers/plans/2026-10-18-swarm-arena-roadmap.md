@@ -252,7 +252,7 @@ Rules [plan]:
 | `_exec/__init__.py` | Empty | M1a | — |
 | `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` | M1a | `tests/_exec/test_executor.py` |
 | `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (M4: the launcher argv, shared with the Ray task) | M1a +M4 | `tests/_exec/test_supervisor.py` |
-| `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_alive`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
+| `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/local.py` | `LocalExecutor` | M1a | `tests/_exec/test_local.py` |
@@ -1326,7 +1326,7 @@ class LocalExecutor(Executor):
     def __init__(self, config: "LocalExecutor.Config | None" = None, /, **fields: Any) -> None: ...
     # preflight() refuses a non-POSIX platform [plan].
     # [plan, M1a] The executor runs with `Job.timeout_s` and `Job.grace_s` and writes them into `Command.timeout_s` and `Command.grace_s`; the driver computes them with `effective_tool_timeout` and `tool_grace` (`_tooling/tool.py`).
-    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_alive(pgid), or if process_start_time(pid)
+    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_has_live_member(pgid), or if process_start_time(pid)
     # differs from started.start_time. False if the group is alive with the recorded start time or an unknown one. None on
     # another host or for kind "dispatch".
 ```
@@ -1846,7 +1846,7 @@ class ProcessSupervisor:
 
 def host_id() -> str: ...                            # [plan] f"{hostname}:{boot id}" (Linux boot_id, macOS kern.boottime)
 def process_start_time(pid: int) -> str | None: ...  # [plan] `ps -o lstart= -p <pid>`
-def group_alive(pgid: int) -> bool: ...
+def group_has_live_member(pgid: int) -> bool: ...
 def kill_orphan(started: Job.Started) -> bool: ...   # only if host_id and start_time match; else False and nothing is killed
 ```
 
