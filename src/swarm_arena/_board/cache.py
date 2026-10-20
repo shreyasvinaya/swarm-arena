@@ -7,7 +7,8 @@ import re
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -244,6 +245,7 @@ class ArenaCache:
         self.namespace = path.stem
         self.warnings: list[str] = []
         self._lock = RLock()
+        self._frontier_depth = 0
         self._fts_tables: OrderedDict[str, None] = OrderedDict()
         self._closed = False
         self._ingest_states: dict[str, tuple[str, int, RunState]] = {}
@@ -541,8 +543,12 @@ class ArenaCache:
                 is not None
             )
 
-    def _frontier_sql(self, frontier: Frontier, names: Sequence[str]) -> tuple[str, list[Any]]:
-        """Reuse exact committed-mark validation before constructing membership SQL."""
+    @contextmanager
+    def _frontier(self, frontier: Frontier) -> Generator[None, None, None]:
+        """Fill indexed connection-local membership once for an entire read."""
+        if self._frontier_depth:
+            yield
+            return
         # Ingest depends on this cache; defer its shared validation import.
         from swarm_arena._board.ingest import _validate_marks
 
@@ -552,16 +558,66 @@ class ArenaCache:
                 mark.run_id, Head(epoch=mark.epoch, seq=mark.seq, segment=mark.segment)
             ):
                 raise _core_error(ChainError, "frontier mark is not covered by cache")
-        marked = [(mark.run_id, mark.seq) for mark in marks] or [("", -1)]
-        named = sorted(set(names)) or [""]
-        sql = (
-            "WITH marks(run_id, seq) AS (VALUES "
-            + ",".join("(?,?)" for _ in marked)
-            + "), objs(name) AS (VALUES "
-            + ",".join("(?)" for _ in named)
-            + ") "
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _frontier_marks "
+            "(run_id TEXT PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID"
         )
-        return sql, [value for pair in marked for value in pair] + list(named)
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _frontier_objects "
+            "(kind TEXT, name TEXT, PRIMARY KEY(kind, name)) WITHOUT ROWID"
+        )
+        self._conn.execute("SAVEPOINT frontier_membership")
+        try:
+            self._conn.execute("DELETE FROM _frontier_marks")
+            self._conn.execute("DELETE FROM _frontier_objects")
+            self._conn.executemany(
+                "INSERT INTO _frontier_marks VALUES (?, ?)",
+                ((mark.run_id, mark.seq) for mark in marks),
+            )
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO _frontier_objects VALUES (?, ?)",
+                (
+                    (kind, name)
+                    for kind, names in (
+                        ("reviews", frontier.reviews),
+                        ("curation", frontier.curation),
+                    )
+                    for name in names
+                ),
+            )
+            self._conn.execute("RELEASE frontier_membership")
+        except BaseException:
+            self._conn.execute("ROLLBACK TO frontier_membership")
+            self._conn.execute("RELEASE frontier_membership")
+            raise
+        self._frontier_depth += 1
+        try:
+            yield
+        finally:
+            self._frontier_depth -= 1
+
+    @staticmethod
+    def _member_join(table: Literal["candidates", "scores", "learnings"], alias: str) -> str:
+        """Join requested marks and source-appropriate human names by their keys."""
+        marked = f" JOIN _frontier_marks m ON m.run_id={alias}.run_id AND {alias}.seq<=m.seq "
+        if table == "candidates":
+            return marked
+        kind = "reviews" if table == "scores" else "curation"
+        source = "review" if table == "scores" else "human"
+        return (
+            " LEFT" + marked + f"AND {alias}.source='run' "
+            f"LEFT JOIN _frontier_objects o ON o.kind='{kind}' AND o.name={alias}.obj_name "
+            f"AND {alias}.source='{source}' "
+        )
+
+    @staticmethod
+    def _member_condition(table: Literal["candidates", "scores", "learnings"]) -> str:
+        """Accept either a matched run mark or the proper named human source."""
+        return (
+            "m.run_id IS NOT NULL"
+            if table == "candidates"
+            else ("(m.run_id IS NOT NULL OR o.name IS NOT NULL)")
+        )
 
     def _item_rows(
         self,
@@ -573,20 +629,12 @@ class ArenaCache:
         candidate_ids: Sequence[str] | None = None,
     ) -> list[tuple[str, Position]]:
         """Read immutable rows using only their marked run or named source object."""
-        names = frontier.reviews if table == "scores" else frontier.curation
-        cte, params = self._frontier_sql(frontier, names)
-        marked = "EXISTS (SELECT 1 FROM marks m WHERE m.run_id=i.run_id AND i.seq<=m.seq)"
+        params: list[Any] = []
         if table == "candidates":
-            included = marked
             origin, ordinal = "i.run_id", "i.seq"
         else:
-            source = "review" if table == "scores" else "human"
-            included = (
-                f"((i.source='run' AND {marked}) OR (i.source='{source}' "
-                "AND EXISTS (SELECT 1 FROM objs WHERE name=i.obj_name)))"
-            )
             origin, ordinal = "coalesce(i.obj_name, i.run_id)", "coalesce(i.line, i.seq)"
-        clauses = [included]
+        clauses = [self._member_condition(table)]
         for column, values in (("id", ids), ("candidate_id", candidate_ids)):
             if values is not None:
                 clauses.append(
@@ -597,8 +645,9 @@ class ArenaCache:
             clauses.append(f"i.{column}=?")
             params.append(value)
         rows = self._conn.execute(
-            cte
-            + f"SELECT i.json, i.ts, {origin}, {ordinal} FROM {table} i WHERE "
+            f"SELECT i.json, i.ts, {origin}, {ordinal} FROM {table} i "
+            + self._member_join(table, "i")
+            + " WHERE "
             + " AND ".join(clauses)
             + f" ORDER BY i.ts, {origin}, {ordinal}, i.id",
             params,
@@ -645,7 +694,7 @@ class ArenaCache:
         --------
         >>> rows = cache.candidates(frontier, ids=['c-1'])  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             filters = {
                 key: value
                 for key, value in (
@@ -695,7 +744,7 @@ class ArenaCache:
         --------
         >>> rows = cache.scores(frontier, judge='human:alice')  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             filters = {} if judge is None else {"judge": judge}
             return [
                 (Score.model_validate_json(data), position)
@@ -728,12 +777,10 @@ class ArenaCache:
         --------
         >>> flags = cache.flags(frontier)  # doctest: +SKIP
         """
-        with self._lock:
-            cte, params = self._frontier_sql(frontier, frontier.curation)
+        with self._lock, self._frontier(frontier):
             rows = self._conn.execute(
-                cte + "SELECT obj_name, line, kind, learning_id FROM curation_ops "
-                "WHERE EXISTS (SELECT 1 FROM objs WHERE name=obj_name)",
-                params,
+                "SELECT obj_name, line, c.kind, learning_id FROM curation_ops c "
+                "JOIN _frontier_objects o ON o.kind='curation' AND o.name=c.obj_name"
             ).fetchall()
             return fold_curation(
                 (
@@ -785,7 +832,7 @@ class ArenaCache:
         --------
         >>> rows = cache.learnings_by_id(frontier, ['L-1'])  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             return self._learnings(frontier, ids)
 
     def plans(self, frontier: Frontier, run_id: str, goal_id: str) -> list[tuple[Plan, str, int]]:
@@ -817,13 +864,12 @@ class ArenaCache:
         --------
         >>> rows = cache.plans(frontier, 'r1', 'g1')  # doctest: +SKIP
         """
-        with self._lock:
-            cte, params = self._frontier_sql(frontier, [])
+        with self._lock, self._frontier(frontier):
             rows = self._conn.execute(
-                cte + "SELECT plan_json, origin, p.seq FROM plans p WHERE p.run_id=? AND goal_id=? "
-                "AND EXISTS (SELECT 1 FROM marks m WHERE m.run_id=p.run_id AND p.seq<=m.seq) "
-                "ORDER BY revision",
-                [*params, run_id, goal_id],
+                "SELECT plan_json, origin, p.seq FROM plans p "
+                "JOIN _frontier_marks m ON m.run_id=p.run_id AND p.seq<=m.seq "
+                "WHERE p.run_id=? AND goal_id=? ORDER BY revision",
+                (run_id, goal_id),
             ).fetchall()
             return [(Plan.model_validate_json(data), origin, seq) for data, origin, seq in rows]
 
@@ -851,7 +897,7 @@ class ArenaCache:
         --------
         >>> encoded = cache.membership(frontier)  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             members: dict[str, JsonValue] = {
                 "candidates": [cid for cid in sorted(c.id for c, _ in self.candidates(frontier))],
                 "scores": [sid for sid in sorted(s.id for s, _ in self.scores(frontier))],
@@ -864,16 +910,17 @@ class ArenaCache:
 
     def _search_members(self, frontier: Frontier) -> list[tuple[int, str | None, str, Learning]]:
         """Validate complete coverage and materialize the exact immutable corpus."""
-        cte, params = self._frontier_sql(frontier, frontier.curation)
-        for name in set(frontier.curation + frontier.reviews):
-            if not self.has_object(name):
-                raise _core_error(ChainError, "frontier human object is not covered by cache")
+        if self._conn.execute(
+            "SELECT 1 FROM _frontier_objects o LEFT JOIN human_objects h ON h.name=o.name "
+            "WHERE h.name IS NULL LIMIT 1"
+        ).fetchone():
+            raise _core_error(ChainError, "frontier human object is not covered by cache")
         rows = self._conn.execute(
-            cte + "SELECT rowid, id, goal_key, ts, json FROM learnings l WHERE "
-            "(source='run' AND EXISTS (SELECT 1 FROM marks m "
-            "WHERE m.run_id=l.run_id AND l.seq<=m.seq)) OR "
-            "(source='human' AND EXISTS (SELECT 1 FROM objs WHERE name=l.obj_name)) ORDER BY id",
-            params,
+            "SELECT l.rowid, l.id, l.goal_key, l.ts, l.json FROM learnings l "
+            + self._member_join("learnings", "l")
+            + " WHERE "
+            + self._member_condition("learnings")
+            + " ORDER BY l.id"
         ).fetchall()
         flags = self.flags(frontier)
         return [
@@ -968,7 +1015,7 @@ class ArenaCache:
         >>> ids = cache.find(frontier, query='log(nu)', filters=LearningFilter(),
         ...     relevance_goal=None)  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             members = self._search_members(frontier)
             ranks: dict[int, float] | None = None
             if query is not None:
@@ -1087,7 +1134,7 @@ class ArenaCache:
         --------
         >>> total = cache.count(frontier, filters=LearningFilter())  # doctest: +SKIP
         """
-        with self._lock:
+        with self._lock, self._frontier(frontier):
             return len(
                 self.find(frontier, query=None, filters=filters, relevance_goal=None, limit=-1)
             )

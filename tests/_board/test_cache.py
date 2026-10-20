@@ -1259,6 +1259,8 @@ def test_human_and_event_learnings_have_identical_child_rows(tmp_path: Path) -> 
             assert event_rows == human_rows == expected
     finally:
         cache.close()
+
+
 @pytest.fixture
 def cache_with_learnings(tmp_path: Path) -> tuple[ArenaCache, FakeRun, Frontier]:
     run = FakeRun(str(tmp_path / "runs"), "r1")
@@ -1843,4 +1845,75 @@ def test_summary_outside_frontier_does_not_supersede(tmp_path: Path) -> None:
             cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None)
             == expected
         )
+    cache.close()
+
+
+def test_all_reads_share_indexed_large_frontier(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    names = [f"toy/curation/20261018T000000.000Z-{i:08x}.jsonl" for i in range(40_000)]
+    cache.apply_human_objects(
+        names, [HumanObject(kind="pin", learning_id="L-absent", author="human:x")] * len(names)
+    )
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(
+        run.plan(), run.candidate("c"), run.learning("L-1", "rareword", evidence=["c"])
+    )
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    frontier = build_frontier([("r1", run.run_root, head)], [], names)
+    # Exercise the old variable ceiling even on SQLite builds with a higher default.
+    cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+        "L-1"
+    ]
+    assert cache.count(frontier, filters=LearningFilter()) == 1
+    assert [c.id for c, _ in cache.candidates(frontier)] == ["c"]
+    assert cache.scores(frontier) == []
+    assert cache.flags(frontier) == {"L-absent": (True, False)}
+    assert [learning.id for learning in cache.learnings_by_id(frontier, ["L-1"])] == ["L-1"]
+    assert len(cache.plans(frontier, "r1", "g1")) == 1
+    assert cache.membership(frontier)
+    assert not cache._conn.in_transaction
+    assert not hasattr(cache, "_frontier_sql")
+    cache.close()
+
+
+def test_frontier_membership_work_grows_with_names(tmp_path: Path) -> None:
+    work = []
+    for size in (1_000, 10_000, 50_000):
+        cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
+        names = [f"toy/curation/20261018T000000.000Z-{i:08x}.jsonl" for i in range(size)]
+        cache.apply_human_objects(
+            names, [HumanObject(kind="pin", learning_id="L-absent", author="human:x")] * size
+        )
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 1000
+            return 0
+
+        cache._conn.set_progress_handler(tick, 1000)
+        assert cache.flags(Frontier(curation=names)) == {"L-absent": (True, False)}
+        cache._conn.set_progress_handler(None, 0)
+        work.append(steps)
+        cache.close()
+    print("indexed frontier VM steps (1k/10k/50k):", work)
+    assert 0 < work[1] < 15 * work[0]
+    assert work[2] < 8 * work[1]
+
+
+def test_nested_reads_prepare_frontier_once(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    trace: list[str] = []
+    cache._conn.set_trace_callback(trace.append)
+    assert cache.membership(frontier)
+    cache._conn.set_trace_callback(None)
+    assert trace.count("DELETE FROM _frontier_marks") == 1
+    assert trace.count("DELETE FROM _frontier_objects") == 1
+    assert cache.membership(Frontier()) == canonical_json(
+        {"candidates": [], "scores": [], "learnings": []}
+    )
+    assert cache.membership(frontier)
     cache.close()

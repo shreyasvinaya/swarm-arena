@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
   retries in s3fs, the SDK, and the underlying HTTP transport.
+- Fixed-frontier cache reads share indexed connection-local membership tables,
+  including large human-object frontiers beyond SQLite parameter limits.
 
 - Arena cache sequence indexing keeps junction and newest-segment queries bounded
   as committed history grows, including existing version-1 cache files.
