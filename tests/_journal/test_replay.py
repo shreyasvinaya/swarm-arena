@@ -7,6 +7,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, Limits, Plan, RunConfig, Score
+from swarm_arena._errors import ChainError
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.replay import GoalState, ReservationState, RunState
 from swarm_arena._model.base import FrozenModel
@@ -439,6 +440,78 @@ def test_from_events_is_pure() -> None:
     state.reservations["r-1"].reservation["amount"]["usd"] = 9
     state.ledger_events[0].payload["config"]["run_root"] = "changed"
     assert events == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("index", [1, 4, 10], ids=["plan_revision", "reserve", "decision"])
+def test_duplicate_seq_is_rejected(index: int, *, reverse: bool) -> None:
+    events = _full_run_events()
+    duplicate = deepcopy(events[index])
+    events.append(duplicate)
+    before = deepcopy(events)
+    with pytest.raises(ChainError, match=rf"^duplicate journal seq {duplicate.seq}$"):
+        RunState.from_events(reversed(events) if reverse else iter(events))
+    assert events == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_seq_conflicting_converge_is_rejected(*, reverse: bool) -> None:
+    secret = "DUPLICATE_REPLAY_SECRET"
+    first = _ev(3, "converge_started", {"select_only": True, "extra": secret}, goal_id="g")
+    second = first.model_copy(update={"payload": {"select_only": False, "extra": secret}})
+    events = [*_PRE, *([second, first] if reverse else [first, second])]
+    with pytest.raises(ChainError, match=r"^duplicate journal seq 3$") as caught:
+        RunState.from_events(events)
+    assert_secret_absent(caught.value, secret)
+
+
+def test_duplicate_seq_is_rejected_before_applying_any_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_apply(self: RunState, event: Event) -> None:
+        pytest.fail("applied an event before validating sequence uniqueness")
+
+    monkeypatch.setattr(RunState, "_apply", unexpected_apply)
+    duplicate = _reserve(3, "r-1")
+    with pytest.raises(ChainError, match=r"^duplicate journal seq 3$"):
+        RunState.from_events([*_PRE, duplicate, duplicate])
+
+
+def test_reviewer_replay_edge_cases() -> None:
+    prefix = [
+        _PRE[0],
+        _ev(2, "goal_started", {}, goal_id="g"),
+        _ev(3, "round_started", {"round": 1}, goal_id="g"),
+        _ev(4, "round_closed", {"round": 1}, goal_id="g"),
+        _ev(5, "converge_started", {"select_only": True}, goal_id="g"),
+        _ev(6, "final_order", {"candidate_ids": ["c-1"], "parts": {"p": "c-1"}}, goal_id="g"),
+        _ev(7, "round_started", {"round": 2, "converge": True, "shares": {}}, goal_id="g"),
+    ]
+    prefix = [
+        event.model_copy(update={"task_id": "g/t/a#r1" if event.goal_id else "r"})
+        for event in prefix
+    ]
+    state = RunState.from_events(prefix)
+    goal = state.goals["g"]
+    assert (goal.status, goal.round, goal.rounds_closed, goal.converge_round) == (
+        "running",
+        1,
+        1,
+        2,
+    )
+    assert (goal.converge_started, goal.select_only, goal.final_order, goal.final_parts) == (
+        True,
+        True,
+        ["c-1"],
+        {"p": "c-1"},
+    )
+    assert state == RunState.from_events(reversed(prefix))
+    assert RunState.from_events([]) == RunState.from_events(iter([]))
+    assert all(event.context_id == event.run_id and event.task_id for event in prefix)
+    with pytest.raises(ValueError, match="EventType"):
+        _ev(8, "unknown_future_type", {})
+    unknown = prefix[-1].model_copy(update={"seq": 8, "type": "unknown_future_type", "payload": {}})
+    assert RunState.from_events([*prefix, unknown]) == state
 
 
 def test_folded_records_and_positions() -> None:

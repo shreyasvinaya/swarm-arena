@@ -4,9 +4,11 @@ import re
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
+from swarm_arena._errors import ChainError
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._model.base import FrozenModel, Origin
@@ -176,7 +178,8 @@ class RunState:
         Parameters
         ----------
         events : Iterable[Event]
-            Committed events; replay sorts them by sequence number.
+            Committed events; replay sorts them by sequence number and rejects
+            duplicate sequence numbers before applying any event.
 
         Returns
         -------
@@ -185,6 +188,9 @@ class RunState:
 
         Raises
         ------
+        ChainError
+            If sequence numbers repeat, including identical duplicate events.
+            The error identifies only the duplicate sequence number.
         ValueError
             If a consumed payload is invalid; the error contains no payload values.
 
@@ -193,8 +199,12 @@ class RunState:
         >>> RunState.from_events(iter([])) == RunState.from_events([])
         True
         """
+        ordered = sorted(events, key=lambda event: event.seq)
+        for previous, event in pairwise(ordered):
+            if previous.seq == event.seq:
+                raise ChainError(f"duplicate journal seq {event.seq}")
         state = cls()
-        for event in sorted(events, key=lambda event: event.seq):
+        for event in ordered:
             try:
                 state._apply(deepcopy(event))
             except (ValueError, TypeError, KeyError):
