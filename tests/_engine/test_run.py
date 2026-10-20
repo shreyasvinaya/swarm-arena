@@ -180,12 +180,7 @@ async def test_fenced_cancels_inflight_and_raises(run_config: RunConfig) -> None
     "types",
     [
         {"tool_start", "tool_end", "learning"},
-        pytest.param(
-            {"agent_status"},
-            marks=pytest.mark.xfail(
-                strict=True, reason="agent_status task_id lands with the Task 22 fix"
-            ),
-        ),
+        {"agent_status"},
     ],
 )
 async def test_every_event_has_context_and_task_ids(run_config: RunConfig, types: set[str]) -> None:
