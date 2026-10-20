@@ -40,8 +40,14 @@ PUBLIC["swarm_arena"] += [
     "Limits",
     "Resources",
 ]
-PUBLIC["swarm_arena.planning"] += ["Decision", "FlowSpec", "History", "Policy", "RoundState"]
-PUBLIC["swarm_arena.planning"] += ["Decision", "FlowSpec", "History", "Planner", "RoundState"]
+PUBLIC["swarm_arena.planning"] += [
+    "Decision",
+    "FlowSpec",
+    "History",
+    "Planner",
+    "Policy",
+    "RoundState",
+]
 PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",
