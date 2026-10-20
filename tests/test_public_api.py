@@ -39,8 +39,8 @@ PUBLIC["swarm_arena"] += [
     "Limits",
     "Resources",
 ]
-PUBLIC["swarm_arena.planning"] += ["FlowSpec"]
-PUBLIC["swarm_arena.board"] += ["GoalKey"]
+PUBLIC["swarm_arena.planning"] += ["Decision", "FlowSpec", "History", "RoundState"]
+PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",
     "CompletedRun",

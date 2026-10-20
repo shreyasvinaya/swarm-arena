@@ -14,6 +14,7 @@ from swarm_arena._journal.lease import OwnerDoc
 from swarm_arena._journal.segment import SegmentLink
 from swarm_arena._model import migrate
 from swarm_arena._model.base import StoredModel
+from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.migrate import CURRENT, migration
 from swarm_arena._model.results import Candidate, Learning, LLMCall
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
@@ -22,6 +23,7 @@ from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
+    ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",
     ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
     ("segment", 1): "24a9c075f402a838718212851482617251b3bab08bafa51018f9e4e6d0426f09",
     ("candidate", 1): "5cd32e071d3d68671ff5389518f120123539420ec264eca3e27c8f81ecadbc25",
@@ -47,6 +49,7 @@ FIELD_SETS = {
         Event,
         SegmentLink,
         OwnerDoc,
+        Frontier,
     ],
 )
 def test_stored_field_sets_require_a_version_bump(model: type[StoredModel]) -> None:
@@ -164,3 +167,27 @@ def test_owner_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) -> 
     assert upgraded.epoch == 2
     assert calls == [raw]
     assert raw["schema_version"] == 1
+
+
+@pytest.mark.usefixtures("isolated_migrations")
+def test_frontier_applies_registered_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = Frontier(reviews=["old"]).model_dump(mode="json")
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "frontier": 2})
+    calls: list[dict[str, Any]] = []
+
+    @migration("frontier", 1)
+    def step(data: dict[str, Any]) -> dict[str, Any]:
+        calls.append(data.copy())
+        return {**data, "reviews": ["migrated"]}
+
+    upgraded = Frontier.model_validate_json(json.dumps(raw))
+    assert upgraded.schema_version == 2
+    assert upgraded.reviews == ["migrated"]
+    assert calls == [raw]
+    assert raw["schema_version"] == 1
+    assert raw["reviews"] == ["old"]
+
+
+def test_frontier_refuses_newer_version() -> None:
+    with pytest.raises(ValueError, match="newer"):
+        Frontier.model_validate_json('{"schema_version": 2}')
