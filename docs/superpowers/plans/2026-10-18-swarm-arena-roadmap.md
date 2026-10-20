@@ -1829,7 +1829,9 @@ def final_slice_estimate(plan: Plan, config: RunConfig, tools: Mapping[str, Tool
     # [plan] _budget/estimate.py; M1b, +M3 for LLM terms. (1 + max_join_attempts) x sum over converge-team agents of
     # [max_tool_runs_per_round x (tool estimate or default_run_reservation) + sum over manager.models() of
     # max_turns_per_round x spec.max_tokens priced at max(input, output)] (0 in select mode)
-    # + judge_amount(ranking judge, top_n, llm=True). tools keys are agent addresses.
+    # + judge_amount(ranking, n_final, llm=True), where n_final = top_n in select mode and
+    # converge-team agents x max_tool_runs_per_round + top_n in team mode (the final-judge batch).
+    # tools keys are agent addresses.
 def worst_case_estimate(plans: Sequence[Plan], config: RunConfig, tools: Mapping[str, Tool],
                         price_of: Callable[[str], ModelSpec.Prices | None]) -> Amount: ...   # §5 step 2
     # The engine's price_of(alias): the catalog entry's prices first, then the registered source, else None.

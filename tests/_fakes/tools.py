@@ -717,3 +717,21 @@ class NoopManager(Manager):
 
     async def run_round(self, ctx: AgentContext) -> RoundReport:
         return RoundReport()
+
+
+class ProviderJudge(Judge):
+    name = "prov"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    def providers(self) -> frozenset[str]:
+        return frozenset({"openai"})
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [
+            Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
+            for c in candidates
+        ]
