@@ -785,3 +785,15 @@ def test_join_history_survives_round_and_resets_with_partition() -> None:
     )
     new = RunState.from_events(events).goals["g"]
     assert (new.join_attempts, new.join_failures, new.kept_parts) == (0, [], {})
+
+
+def test_goal_queue_lifecycle_and_stopped_no_result() -> None:
+    events = [_ev(1, "goal_queued", {}, goal_id="g"), _ev(2, "goal_started", {}, goal_id="g")]
+    assert RunState.from_events(events[:1]).goals["g"].status == "queued"
+    assert RunState.from_events(events).goals["g"].status == "running"
+    queued = [
+        events[0],
+        _ev(2, "no_result", {"reason": "stopped"}, goal_id="g"),
+        _ev(3, "goal_finished", {"reason": "stopped"}, goal_id="g"),
+    ]
+    assert RunState.from_events(queued).goals["g"].status == "no_result"

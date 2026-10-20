@@ -518,7 +518,7 @@ async def _run(
                 candidate_id=id,
                 reservation_id=res.id,
                 started=event.model_dump(mode="json"),
-            )
+            ).model_copy(update={"task_id": id})
         )
         started = True
         rt.started_runs += 1

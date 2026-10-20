@@ -6,6 +6,7 @@ on answers you can prove.
 """
 
 from swarm_arena._agent.scripted import ScriptedManager
+from swarm_arena._engine.swarm import Swarm
 from swarm_arena._facade import publish as _publish
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.limits import Limits
@@ -52,6 +53,7 @@ __all__: list[str] = [
     "ScriptTool",
     "ScriptedManager",
     "SuccessiveHalving",
+    "Swarm",
     "TeamSpec",
     "validate_plan",
 ]

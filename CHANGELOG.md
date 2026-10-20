@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Swarm.run` approves estimates before publishing snapshots, runs queued goals
+  with shared budgets and capacity, and returns durable finalists; `Swarm.stop`
+  requests graceful or immediate stops, with journaled stop modes and fencing.
+
 - Run preflight checks distinct effective component configurations; versioned run
   manifests record provenance, and epoch-scoped stop requests and committed-journal
   status provide run control without importing user components for status.

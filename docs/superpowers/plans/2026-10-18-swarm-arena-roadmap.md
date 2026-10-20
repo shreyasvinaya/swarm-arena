@@ -604,7 +604,9 @@ class Swarm:
                   approve: Callable[[Estimate, Sequence[str]], Awaitable[bool]] | None = None) -> dict[str, list[Candidate]]: ...
         # goal id → final finalists in final-judge order; [] for NO_RESULT. Raises RuntimeError on a non-asyncio backend.
         # [plan] approve(estimate, warnings) runs after validation and the worst-case estimate (§5 step 2; warnings include
-        # peak demand over Executor.capacity()) and before anything is written; False → RuntimeError, no run folder.
+        # peak demand over Executor.capacity()) before persistent run/artifact writes; False → RuntimeError, no run folder.
+        # Admission stages snapshots in temporary storage, discarded on refusal; approved bytes are promoted without
+        # rereading sources. Preflight and manifest preparation complete before promotion or lease acquisition.
         # None → the estimate is only journaled (autonomous mode logs it). The CLI passes a terminal prompt (manual mode).
         # Each plan keeps its own origin: r0 is stamped with it and never raised to "human" (R4.5).
     async def resume(self, run_id: str, *, force: bool = False) -> dict[str, list[Candidate]]: ...
@@ -1857,15 +1859,18 @@ def judge_amount(judge: Judge, n: int, config: RunConfig, price_of: Callable[[st
     # alias only when its input and output prices are each <= the member's (else the same alias formats) —; a judge with
     # non-empty providers() -> n x default_run_reservation (settled estimated at the barrier); any other judge -> Amount() (no
     # paid call, R5.4). The barrier's up-front batch reservation passes llm=False; estimates pass llm=True.
-def final_slice_estimate(plan: Plan, config: RunConfig, tools: Mapping[str, Tool],
+def final_slice_estimate(plan: Plan, config: RunConfig, tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
                          price_of: Callable[[str], ModelSpec.Prices | None]) -> Amount: ...
     # [plan] _budget/estimate.py; M1b, +M3 for LLM terms. (1 + max_join_attempts) x sum over converge-team agents of
     # [max_tool_runs_per_round x (tool estimate or default_run_reservation) + sum over manager.models() of
     # max_turns_per_round x spec.max_tokens priced at max(input, output)] (0 in select mode)
     # + judge_amount(ranking, n_final, llm=True), where n_final = top_n in select mode and
     # converge-team agents x max_tool_runs_per_round + top_n in team mode (the final-judge batch).
-    # tools keys are agent addresses.
-def worst_case_estimate(plans: Sequence[Plan], config: RunConfig, tools: Mapping[str, Tool],
+    # tools keys are agent addresses. A variant sequence takes the componentwise maximum over every effective
+    # ordinary round config/request for that address; converge addresses use their own effective converge config.
+    # Requests retain round and round_overrides but use empty inputs because future manager inputs are unknown.
+    # A single Tool remains supported with ToolRequest(). All hooks run in an abandonable daemon in the engine.
+def worst_case_estimate(plans: Sequence[Plan], config: RunConfig, tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
                         price_of: Callable[[str], ModelSpec.Prices | None]) -> Amount: ...   # §5 step 2
     # The engine's price_of(alias): the catalog entry's prices first, then the registered source, else None.
 ```
@@ -2412,7 +2417,9 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
 
 ### R4.14 Journal event types — M1b (additions noted)
 
-`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
+
+`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, `manifest`, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
 
 ### R4.15 Stored formats and `schema_version`
 

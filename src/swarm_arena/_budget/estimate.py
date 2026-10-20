@@ -175,17 +175,24 @@ def _team_amount(
     plan: Plan,
     teams: Sequence[TeamSpec],
     config: RunConfig,
-    tools: Mapping[str, Tool],
+    tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
     price_of: Callable[[str], ModelSpec.Prices | None],
 ) -> Amount:
     """Call synchronous tool/manager hooks for one round of the supplied teams."""
     total = Amount()
     for team in teams:
         for agent in team.agents:
-            tool = tools[f"{plan.goal.id}/{team.name}/{agent.name}"]
-            estimate = tool.estimate(ToolRequest())
-            run = config.limits.default_run_reservation if estimate is None else estimate
-            total += _scale(Amount.from_estimate(run), config.limits.max_tool_runs_per_round)
+            variants = tools[f"{plan.goal.id}/{team.name}/{agent.name}"]
+            pairs = [(variants, ToolRequest())] if isinstance(variants, Tool) else variants
+            if not pairs:
+                raise ValueError("effective tool variants must not be empty")
+            amounts = []
+            for tool, request in pairs:
+                estimate = tool.estimate(request)
+                run = config.limits.default_run_reservation if estimate is None else estimate
+                amounts.append(Amount.from_estimate(run))
+            maximum = Amount(tokens=max(a.tokens for a in amounts), usd=max(a.usd for a in amounts))
+            total += _scale(maximum, config.limits.max_tool_runs_per_round)
             manager = agent.manager.build(Manager)
             total += _model_amount(
                 manager.models(),
@@ -199,7 +206,7 @@ def _team_amount(
 def final_slice_estimate(
     plan: Plan,
     config: RunConfig,
-    tools: Mapping[str, Tool],
+    tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
     price_of: Callable[[str], ModelSpec.Prices | None],
 ) -> Amount:
     """
@@ -211,8 +218,9 @@ def final_slice_estimate(
         Plan supplying convergence settings and ranking judge.
     config : RunConfig
         Limits and model catalog.
-    tools : Mapping[str, Tool]
-        Built tools keyed by agent address, including converge agents.
+    tools : Mapping[str, Tool or Sequence[tuple[Tool, ToolRequest]]]
+        Built tools keyed by agent address, including converge agents. Variant
+        sequences use the componentwise maximum estimate across their requests.
     price_of : Callable[[str], ModelSpec.Prices | None]
         Synchronous model alias-price lookup.
 
@@ -253,7 +261,7 @@ def final_slice_estimate(
 def worst_case_estimate(
     plans: Sequence[Plan],
     config: RunConfig,
-    tools: Mapping[str, Tool],
+    tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
     price_of: Callable[[str], ModelSpec.Prices | None],
 ) -> Amount:
     """
@@ -265,8 +273,11 @@ def worst_case_estimate(
         Initial goal plans.
     config : RunConfig
         Limits, model catalog and reserved fraction.
-    tools : Mapping[str, Tool]
-        Built tools keyed by agent address across all plans.
+    tools : Mapping[str, Tool or Sequence[tuple[Tool, ToolRequest]]]
+        Built tools keyed by agent address across all plans. Variant sequences
+        use the componentwise maximum estimate for every repeated round. The
+        engine supplies all effective configs with round/overrides and empty
+        inputs, since future manager inputs are unknown.
     price_of : Callable[[str], ModelSpec.Prices | None]
         Synchronous model alias-price lookup.
 

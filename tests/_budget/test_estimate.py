@@ -314,3 +314,26 @@ def test_judge_cache_write_price_and_componentwise_maximum() -> None:
     )
     amount = judge_amount(_FakeLLMJudge(("j",)), 3, cfg, make_price_of(cfg.models))
     assert amount == Amount(tokens=25_000, usd=0.06)
+
+
+def test_effective_variants_use_componentwise_maximum() -> None:
+    class RequestEstimate(_FreeTool):
+        def estimate(self, request: ToolRequest) -> Estimate:
+            return Estimate(tokens=100 if request.round == 1 else 5, usd=float(request.round))
+
+    plan = _plan(rounds=2)
+    variants = [
+        (RequestEstimate(), ToolRequest(round=1)),
+        (RequestEstimate(), ToolRequest(round=2)),
+    ]
+    amount = worst_case_estimate([plan], RunConfig(), {"g1/t0/a0": variants}, lambda a: None)
+    assert amount == Amount(tokens=706, usd=14.117647)
+
+
+def test_converge_variants_apply_to_final_slice() -> None:
+    plan = _plan_with_converge_team(agents=1, max_join_attempts=1)
+    tools = {
+        address: [(tool, ToolRequest(round=4))]
+        for address, tool in _tools(plan, _FixedEstimateTool(usd=3)).items()
+    }
+    assert final_slice_estimate(plan, RunConfig(), tools, lambda a: None).usd == 18

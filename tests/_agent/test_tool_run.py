@@ -1112,3 +1112,12 @@ async def test_unusable_output_has_no_fingerprint(
     )
     assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
     assert not candidate.warnings
+
+
+async def test_tool_start_and_end_share_task_id(rt_env: RtEnv) -> None:
+    candidate = await execute_tool_run(
+        rt_env.rt, {"x": 1.0}, parents=(), replicate=None, edits=None
+    )
+    started = rt_env.events("tool_start")[-1]
+    ended = rt_env.events("tool_end")[-1]
+    assert started.task_id == ended.task_id == candidate.id
