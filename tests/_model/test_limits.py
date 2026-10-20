@@ -1,7 +1,7 @@
-import traceback
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import ValidationError
 
 from swarm_arena._model.limits import Limits
@@ -102,19 +102,18 @@ def test_limits_frozen_extra_and_reservation() -> None:
 
 
 def test_limits_errors_do_not_leak_values() -> None:
-    secret = "sentinel-secret-92845"
+    secret = "542371d6-031b-544d-8244-19c4c8a32fc3"
     with pytest.raises(ValidationError) as exc:
         Limits.model_validate({"max_rounds": secret})
-    assert secret not in "".join(traceback.format_exception(exc.value))
-    assert secret not in str(exc.value.errors())
+    assert_secret_absent(exc.value, secret)
 
 
 @pytest.mark.parametrize(
     ("values", "location"),
     [
-        ({"max_roundz": "sentinel-secret-92845"}, "max_roundz"),
+        ({"max_roundz": "542371d6-031b-544d-8244-19c4c8a32fc3"}, "max_roundz"),
         (
-            {"default_run_reservation": {"tokenz": "sentinel-secret-92845"}},
+            {"default_run_reservation": {"tokenz": "542371d6-031b-544d-8244-19c4c8a32fc3"}},
             "default_run_reservation.tokenz",
         ),
     ],
@@ -125,5 +124,4 @@ def test_limits_unknown_fields_show_identifiers_without_values(
     with pytest.raises(ValidationError) as exc:
         Limits.model_validate(values)
     assert location in str(exc.value)
-    assert "sentinel-secret-92845" not in "".join(traceback.format_exception(exc.value))
-    assert "sentinel-secret-92845" not in str(exc.value.errors())
+    assert_secret_absent(exc.value, "542371d6-031b-544d-8244-19c4c8a32fc3")

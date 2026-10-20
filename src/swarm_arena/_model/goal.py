@@ -1,15 +1,16 @@
 """Define goals, snapshotted file sets, and cross-run goal identities."""
 
-from typing import Annotated, Any, cast
+from typing import Annotated, cast
 
 from pydantic import AfterValidator, Field, model_validator
 
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._tooling.paths import check_glob, check_key
+from swarm_arena._model.data import Manifest, Sha256, TomlJsonObject
+from swarm_arena._tooling.paths import check_glob
 
 _Slug = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")]
-_Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_Sha256 = Sha256
 
 
 class FileSet(FrozenModel):
@@ -34,7 +35,7 @@ class FileSet(FrozenModel):
     """
 
     globs: list[Annotated[str, AfterValidator(check_glob)]] = []
-    manifest: dict[Annotated[str, AfterValidator(check_key)], _Sha256] = {}
+    manifest: Manifest = {}
 
     @model_validator(mode="before")
     @classmethod
@@ -93,9 +94,9 @@ class Goal(FrozenModel):
     namespace: _Slug
     title: str = ""
     description: str = ""
-    inputs: dict[str, Any] = {}
+    inputs: TomlJsonObject = {}
     files: FileSet = FileSet()
-    metadata: dict[str, Any] = {}
+    metadata: TomlJsonObject = {}
 
     def key(self) -> "GoalKey":
         """

@@ -1,4 +1,5 @@
 import json
+from types import MappingProxyType
 from typing import Any, ClassVar, get_args
 
 import pytest
@@ -20,7 +21,9 @@ from swarm_arena._model.migrate import migration
 
 @pytest.fixture(autouse=True)
 def isolated_migrations(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(migrate, "_MIGRATIONS", {})
+    functions: dict[tuple[str, int], migrate.MigrationFn] = {}
+    monkeypatch.setattr(migrate, "_migration_functions", functions)
+    monkeypatch.setattr(migrate, "_MIGRATIONS", MappingProxyType(functions))
 
 
 def test_frozen_model_rejects_extra_and_mutation() -> None:
@@ -37,7 +40,7 @@ def test_frozen_model_rejects_extra_and_mutation() -> None:
 
 
 def test_stored_model_upgrades_and_refuses_newer(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(migrate.CURRENT, "demo", 2)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "demo": 2})
 
     @migration("demo", 1)
     def one(raw: dict[str, Any]) -> dict[str, Any]:

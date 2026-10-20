@@ -31,7 +31,7 @@ def test_quoted_keys() -> None:
 
 
 def test_deterministic() -> None:
-    # C25: pin text rather than comparing the writer with itself.
+    # Pin emitted text independently of the writer.
     data = {"t": {"x": 1}, "a b": 2, "arr": [{"n": 1}, {"n": 2}], "f": 1e-05}
     assert dumps_toml(data) == (
         '"a b" = 2\nf = 1e-05\n\n[t]\nx = 1\n\n[[arr]]\nn = 1\n\n[[arr]]\nn = 2\n'

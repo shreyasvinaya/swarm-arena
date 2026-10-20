@@ -74,7 +74,7 @@ def test_build_rejects_misspelled_key() -> None:
 
 
 def test_build_config_error_omits_input_values() -> None:
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"size": secret, "sise": secret}).build(Configurable)
 
@@ -86,25 +86,25 @@ def test_build_config_error_omits_input_values() -> None:
 @pytest.mark.parametrize(
     ("annotation", "credentials", "location"),
     [
-        (dict[str, int], {"review-only-secret-sentinel": "invalid"}, "credentials.<…>"),
+        (dict[str, int], {"7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356": "invalid"}, "credentials.<…>"),
         (
             dict[str, dict[str, int]],
-            {"outer": {"review-only-secret-sentinel": "invalid"}},
+            {"outer": {"7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356": "invalid"}},
             "credentials.<…>.<…>",
         ),
-        (list[int], ["review-only-secret-sentinel"], "credentials.0"),
-        (dict[int, int], {739201: "review-only-secret-sentinel"}, "credentials.<…>"),
+        (list[int], ["7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"], "credentials.0"),
+        (dict[int, int], {"739201": "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"}, "credentials.<…>"),
         (
             list[dict[str, int]],
-            [{"review-only-secret-sentinel": "invalid"}],
+            [{"7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356": "invalid"}],
             "credentials.0.<…>",
         ),
         (
             dict[str, list[int]],
-            {"review-only-secret-sentinel": ["invalid"]},
+            {"7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356": ["invalid"]},
             "credentials.<…>.0",
         ),
-        (dict[str, int], {"size": "review-only-secret-sentinel"}, "credentials.<…>"),
+        (dict[str, int], {"size": "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"}, "credentials.<…>"),
     ],
 )
 def test_build_config_error_redacts_data_locations(
@@ -115,7 +115,7 @@ def test_build_config_error_redacts_data_locations(
 ) -> None:
     config_model = create_model("Config", __base__=Widget.Config, credentials=(annotation, ...))
     monkeypatch.setattr(Widget, "Config", config_model)
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"credentials": credentials}).build(Configurable)
 
@@ -126,7 +126,7 @@ def test_build_config_error_redacts_data_locations(
 
 
 def test_build_config_error_redacts_unknown_field_names() -> None:
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={secret: 1}).build(Configurable)
 
@@ -153,7 +153,7 @@ def test_build_config_error_redacts_nested_schema_locations(
         credentials: list[Entry] | None
 
     monkeypatch.setattr(Widget, "Config", Config)
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     entry = (
         {"counts": [secret]}
         if isinstance(alias, AliasPath)
@@ -179,7 +179,7 @@ def test_build_config_error_redacts_nested_models(
     class Entry(BaseModel):
         amount: int = Field(alias="count")
 
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     annotation: Any = Entry
     credentials: object = {"count": secret}
     if container == "mapping":
@@ -209,7 +209,7 @@ def test_build_config_error_redacts_nested_models(
 
 def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) -> None:
     class First(BaseModel):
-        kind: Literal["review-only-secret-sentinel"]
+        kind: Literal["7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"]
         amount: int
 
     class Second(BaseModel):
@@ -220,7 +220,7 @@ def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) 
         credentials: Annotated[First | Second, Field(discriminator="kind")]
 
     monkeypatch.setattr(Widget, "Config", Config)
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     with pytest.raises(ConfigError) as exc:
         Ref(
             path="_fakes.tools:Widget",
@@ -232,7 +232,7 @@ def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) 
     assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>.amount: int_parsing"
 
 
-@pytest.mark.parametrize("value", ["invalid", "review-only-secret-sentinel"])
+@pytest.mark.parametrize("value", ["invalid", "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"])
 def test_build_config_error_redacts_alias_collision(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
@@ -241,7 +241,7 @@ def test_build_config_error_redacts_alias_collision(
         lookup: dict[int, int] = Field(alias="credentials")
 
     monkeypatch.setattr(Widget, "Config", Config)
-    config = {"items": [], "credentials": {739201: value}}
+    config = {"items": [], "credentials": {"739201": value}}
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config=config).build(Configurable)
 
@@ -261,7 +261,7 @@ def test_build_config_error_preserves_top_level_alias(
         credentials: int = Field(validation_alias=alias)
 
     monkeypatch.setattr(Widget, "Config", Config)
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     value = [secret] if isinstance(alias, AliasPath) else secret
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"items": value}).build(Configurable)
@@ -293,7 +293,7 @@ def test_build_config_error_redacts_model_level_error(monkeypatch: pytest.Monkey
             raise ValueError(f"invalid config: {value}")
 
     monkeypatch.setattr(Widget, "Config", Config)
-    secret = "review-only-secret-sentinel"
+    secret = "7f3d895c-dbf6-5bd5-b3bc-c1503dcc8356"
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"label": secret}).build(Configurable)
 
@@ -480,3 +480,51 @@ def test_build_config_validation_failures_are_secret_safe(
 
     assert_secret_absent(exc.value, secret, sanitized=True)
     assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
+
+
+@pytest.mark.parametrize("method", ["object", "load", "build", "name"])
+@pytest.mark.parametrize("error_type", [ImportError, AttributeError, ValueError, RuntimeError])
+def test_import_failures_have_one_safe_boundary(
+    monkeypatch: pytest.MonkeyPatch, method: str, error_type: type[Exception]
+) -> None:
+    import swarm_arena._model.ref as module
+
+    secret = "f83b6f85-3f20-4880-a9d2-835483f36e96"
+
+    def fail(name: str) -> object:
+        raise error_type(secret)
+
+    monkeypatch.setattr(module.importlib, "import_module", fail)
+    ref = Ref(path="missing_component:Tool")
+
+    def action() -> None:
+        if method == "object":
+            module.load_object(ref.path)
+        elif method == "load":
+            ref.load()
+        elif method == "build":
+            ref.build(Configurable)
+        else:
+            ref.component_name()
+
+    with pytest.raises(ValueError, match="cannot import missing_component:Tool") as caught:
+        action()
+    assert_secret_absent(caught.value, secret, sanitized=True)
+
+
+def test_reference_of_omits_absent_typed_defaults() -> None:
+    from swarm_arena.executor import LocalExecutor
+
+    ref = Ref.of(LocalExecutor())
+    assert ref.build(LocalExecutor).config == LocalExecutor().config
+
+
+def test_reference_of_never_drops_explicit_null_with_nonnull_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Config(Widget.Config):
+        timeout_s: float | None = 600.0
+
+    monkeypatch.setattr(Widget, "Config", Config)
+    with pytest.raises(ValueError, match="null"):
+        Ref.of(Widget(Config(timeout_s=None)))

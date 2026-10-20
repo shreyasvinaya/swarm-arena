@@ -36,9 +36,51 @@ def read_toml(path: Path) -> dict[str, Any]:
     {'revision': 0}
     """
     try:
-        return tomllib.loads(path.read_text("utf-8"))
-    except tomllib.TOMLDecodeError as err:
-        raise ConfigError(f"{path}: {err}") from err
+        text = path.read_text("utf-8")
+    except (OSError, UnicodeError):
+        raise ConfigError(f"{path}: cannot read valid UTF-8 TOML") from None
+    return loads_toml(text, where=str(path))
+
+
+def loads_toml(text: str, *, where: str) -> dict[str, Any]:
+    """
+    Parse TOML without exposing snippets, preserving safe line and column numbers.
+
+    Parameters
+    ----------
+    text : str
+        TOML source text.
+    where : str
+        File path or format identifier for diagnostics.
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed TOML fields.
+
+    Raises
+    ------
+    ConfigError
+        If source encoding or syntax is invalid.
+
+    Examples
+    --------
+    >>> loads_toml('count = 2', where="config")
+    {'count': 2}
+    """
+    try:
+        text.encode("utf-8", errors="strict")
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        match = re.search(r"\(at line ([0-9]+), column ([0-9]+)\)$", str(error))
+        if match:
+            line, column = match.groups()
+        else:
+            # Python versions that report end-of-document still have a safe position.
+            line, column = str(text.count("\n") + 1), str(len(text.rsplit("\n", 1)[-1]) + 1)
+        raise ConfigError(f"{where}: invalid TOML at line {line}, column {column}") from None
+    except UnicodeError:
+        raise ConfigError(f"{where}: cannot read valid UTF-8 TOML") from None
 
 
 def _quote(value: str) -> str:

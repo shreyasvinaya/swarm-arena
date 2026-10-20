@@ -4,7 +4,8 @@ import math
 import re
 from collections.abc import Mapping
 from functools import partial
-from typing import Annotated, Any, Literal, cast
+from types import MappingProxyType
+from typing import Annotated, Any, Final, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -19,16 +20,23 @@ from pydantic import (
 from pydantic.fields import FieldInfo
 
 from swarm_arena._model.base import _SafeModel
+from swarm_arena._model.data import finite_json
 
-_BOUNDS = {
-    "minimum": "ge",
-    "maximum": "le",
-    "exclusiveMinimum": "gt",
-    "exclusiveMaximum": "lt",
-}
-_STRINGS = {"minLength": "min_length", "maxLength": "max_length", "pattern": "pattern"}
-_KEYWORDS = {"type", "enum", "items", "default", "description", *_BOUNDS, *_STRINGS}
-_TYPES = {"string": str, "integer": int, "number": float, "boolean": bool}
+_BOUNDS: Final = MappingProxyType(
+    {
+        "minimum": "ge",
+        "maximum": "le",
+        "exclusiveMinimum": "gt",
+        "exclusiveMaximum": "lt",
+    }
+)
+_STRINGS: Final = MappingProxyType(
+    {"minLength": "min_length", "maxLength": "max_length", "pattern": "pattern"}
+)
+_KEYWORDS: Final = frozenset(
+    {"type", "enum", "items", "default", "description", *_BOUNDS, *_STRINGS}
+)
+_TYPES: Final = MappingProxyType({"string": str, "integer": int, "number": float, "boolean": bool})
 
 
 class _SchemaError(ValueError):
@@ -148,6 +156,10 @@ def _compile_field_impl(path: str, schema: Mapping[str, Any]) -> tuple[Any, Fiel
     adapter = TypeAdapter(annotation, config=ConfigDict(strict=True))
     default = schema.get("default", ...)
     if "default" in schema:
+        try:
+            finite_json(default)
+        except ValueError:
+            raise _SchemaError(f"{path}: default must be finite UTF-8 JSON") from None
         try:
             default = adapter.validate_python(default)
         except ValidationError as err:

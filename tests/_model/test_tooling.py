@@ -85,12 +85,12 @@ def test_tool_request_reserved_form_is_a_reference() -> None:
         "./p/a.txt",
         "p//a.txt",
         "a\x00b",
-        "problem/\udcc5\udca1olver.py",  # a surrogateescape spelling (integration fix 3, A0)
+        "problem/\udcc5\udca1olver.py",  # a surrogateescape spelling
         "",
     ],
 )
-def test_tool_request_edit_keys_are_checked_paths(path: str) -> None:  # IF3 RC5
-    secret = "SECRET_SENTINEL_edit_content"
+def test_tool_request_edit_keys_are_checked_paths(path: str) -> None:
+    secret = "42cf8095-6b54-51af-84f8-5198d5b65e3b"
     for build in (
         lambda: ToolRequest(edits={path: secret}),
         lambda: ToolRequest.model_validate({"edits": {path: secret}}),
@@ -274,7 +274,7 @@ def test_tool_output_and_completed_run_reject_naive_times() -> None:
 @pytest.mark.parametrize("number", [float("nan"), float("inf"), -float("inf")])
 @pytest.mark.parametrize("nested", [False, True])
 def test_tool_output_rejects_nonfinite_data_without_values(number: float, nested: bool) -> None:
-    secret = "SENTINEL_TOOL_OUTPUT_DATA"
+    secret = "9bceb674-b923-57a8-b838-b8af9fc884bf"
     data = {secret: [{"loss": number, "note": secret}]} if nested else {secret: number}
     with pytest.raises(ValidationError) as caught:
         ToolOutput(status=RunStatus.OK, data=data)

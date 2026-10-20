@@ -2,6 +2,7 @@ import pickle
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import cand
 from pydantic import ValidationError
 
@@ -178,9 +179,9 @@ def test_llm_call_roundtrip_and_usage_isolation() -> None:
     "fields",
     [
         {"overlay": {"../SENTINEL_SECRET": "a" * 64}},
-        {"overlay": {"SENTINEL_SECRET": "invalid"}},
-        {"SENTINEL_SECRET": "value"},
-        {"checks": [{"check": "x", "passed": "SENTINEL_SECRET"}]},
+        {"overlay": {"1f7f7213-02d5-57ac-9da0-42a305305986": "invalid"}},
+        {"1f7f7213-02d5-57ac-9da0-42a305305986": "value"},
+        {"checks": [{"check": "x", "passed": "1f7f7213-02d5-57ac-9da0-42a305305986"}]},
         {
             "request": {
                 "parents": [
@@ -188,21 +189,21 @@ def test_llm_call_roundtrip_and_usage_isolation() -> None:
                 ]
             }
         },
-        {"output": {"status": "ok", "usage": {"SENTINEL_SECRET": 1}}},
+        {"output": {"status": "ok", "usage": {"1f7f7213-02d5-57ac-9da0-42a305305986": 1}}},
     ],
 )
 def test_candidate_errors_never_expose_values_or_mapping_keys(fields: dict[str, Any]) -> None:
     with pytest.raises(ValidationError) as caught:
         cand(**fields)
-    assert "SENTINEL_SECRET" not in str(caught.value)
+    assert_secret_absent(caught.value, "1f7f7213-02d5-57ac-9da0-42a305305986")
     assert caught.value.__cause__ is None
 
 
 @pytest.mark.parametrize(
     ("model", "fields"),
     [
-        (Score, {"key": (1.0, "SENTINEL_SECRET")}),
-        (CheckResult, {"check": "x", "passed": "SENTINEL_SECRET"}),
+        (Score, {"key": (1.0, "1f7f7213-02d5-57ac-9da0-42a305305986")}),
+        (CheckResult, {"check": "x", "passed": "1f7f7213-02d5-57ac-9da0-42a305305986"}),
         (
             Learning,
             {
@@ -222,7 +223,7 @@ def test_candidate_errors_never_expose_values_or_mapping_keys(fields: dict[str, 
                 "id": "llm",
                 "run_id": "r",
                 "goal_id": "g",
-                "role": "SENTINEL_SECRET",
+                "role": "1f7f7213-02d5-57ac-9da0-42a305305986",
                 "model": "m",
                 "provider": "p",
             },
@@ -234,7 +235,7 @@ def test_result_errors_never_expose_values(
 ) -> None:
     with pytest.raises(ValidationError) as caught:
         model.model_validate(fields)
-    assert "SENTINEL_SECRET" not in str(caught.value)
+    assert_secret_absent(caught.value, "1f7f7213-02d5-57ac-9da0-42a305305986")
     assert caught.value.__cause__ is None
 
 
@@ -253,7 +254,9 @@ def test_result_error_locations_keep_schema_fields_only() -> None:
         "<…>",
     )
     assert _safe_location(Candidate, ("overlay", 123456789, "[key]")) == ("overlay", "<…>", "<…>")
-    assert _safe_location(Candidate, ("request", "inputs", "SENTINEL_SECRET")) == (
+    assert _safe_location(
+        Candidate, ("request", "inputs", "1f7f7213-02d5-57ac-9da0-42a305305986")
+    ) == (
         "request",
         "inputs",
         "<…>",
@@ -273,10 +276,10 @@ def test_stored_results_reject_newer_schema_and_unknown_fields() -> None:
     )
     call = LLMCall(id="llm", run_id="r", goal_id="g", role="tool", model="m", provider="p")
     for record in (cand(), learning, call):
-        for update in ({"schema_version": 2}, {"SENTINEL_SECRET": "secret"}):
+        for update in ({"schema_version": 2}, {"1f7f7213-02d5-57ac-9da0-42a305305986": "secret"}):
             with pytest.raises(ValidationError) as caught:
                 type(record).model_validate({**record.model_dump(), **update})
-            assert "SENTINEL_SECRET" not in str(caught.value)
+            assert_secret_absent(caught.value, "1f7f7213-02d5-57ac-9da0-42a305305986")
         field_name = "id"
         with pytest.raises(ValidationError, match="frozen_instance"):
             setattr(record, field_name, "other")

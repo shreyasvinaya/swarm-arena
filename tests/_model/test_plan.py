@@ -1,8 +1,8 @@
-import traceback
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, Widget
 from pydantic import BaseModel, ValidationError
 
@@ -299,7 +299,7 @@ def test_spec_bounds(
     assert ConvergeSpec(max_join_attempts=0).max_join_attempts == 0
 
 
-SECRET = "sentinel-secret-92845"
+SECRET = "542371d6-031b-544d-8244-19c4c8a32fc3"
 
 
 @pytest.mark.parametrize(
@@ -323,7 +323,7 @@ def test_load_errors_do_not_leak_values_or_keys(tmp_path: Path, text: str) -> No
     for load in (lambda: Plan.load(path), lambda: Plan.loads(text, base_dir=tmp_path)):
         with pytest.raises(ConfigError) as exc:
             load()
-        assert SECRET not in "".join(traceback.format_exception(exc.value))
+        assert_secret_absent(exc.value, SECRET)
         assert exc.value.__cause__ is None
 
 
@@ -342,17 +342,19 @@ def test_ranking_errors_show_identifiers_without_config_values(duplicate: bool) 
     identifier = "judge-id" if duplicate else "unknown-ranking"
     with pytest.raises(ValueError, match=identifier) as exc:
         plan_with(judges=judges, ranking="unknown-ranking").ranking_name()
-    assert SECRET not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)
 
 
 def test_ranking_resolution_errors_do_not_leak_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail_name(self: Ref) -> str:
+    from swarm_arena._model import ref
+
+    def fail_import(name: str) -> object:
         raise ValueError(SECRET)
 
-    monkeypatch.setattr(Ref, "component_name", fail_name)
-    with pytest.raises(ValueError, match="judges") as exc:
-        plan_with().ranking_name()
-    assert SECRET not in "".join(traceback.format_exception(exc.value))
+    monkeypatch.setattr(ref.importlib, "import_module", fail_import)
+    with pytest.raises(ValueError, match="cannot import unavailable_judge:Judge") as exc:
+        plan_with(judges=[Ref(path="unavailable_judge:Judge")]).ranking_name()
+    assert_secret_absent(exc.value, SECRET)
 
 
 @pytest.mark.parametrize(
@@ -377,8 +379,7 @@ def test_unknown_plan_fields_show_identifiers_without_values(
     with pytest.raises(ValidationError) as exc:
         Plan.model_validate(data)
     assert location in str(exc.value)
-    assert SECRET not in "".join(traceback.format_exception(exc.value))
-    assert SECRET not in str(exc.value.errors())
+    assert_secret_absent(exc.value, SECRET)
     text = (
         f'{key} = "{SECRET}"\n' + SPEC_TOML
         if not table
@@ -392,7 +393,7 @@ def test_unknown_plan_fields_show_identifiers_without_values(
         with pytest.raises(ConfigError) as exc:
             load()
         assert location in str(exc.value)
-        assert SECRET not in "".join(traceback.format_exception(exc.value))
+        assert_secret_absent(exc.value, SECRET)
 
 
 def test_roundtrip_all_nested_specs() -> None:
@@ -446,8 +447,7 @@ def test_direct_validation_errors_are_sanitized(
 ) -> None:
     with pytest.raises(ValidationError) as exc:
         model.model_validate(values)
-    assert SECRET not in "".join(traceback.format_exception(exc.value))
-    assert SECRET not in str(exc.value.errors())
+    assert_secret_absent(exc.value, SECRET)
 
 
 def test_fidelity_errors_do_not_leak_values() -> None:
@@ -457,4 +457,4 @@ def test_fidelity_errors_do_not_leak_values() -> None:
 
     with pytest.raises(ValueError, match="tool_overrides") as exc:
         RoundSpec(tool_overrides={SECRET: SecretObject()}).effective_fidelity()
-    assert SECRET not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)

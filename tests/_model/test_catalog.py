@@ -1,7 +1,7 @@
-import traceback
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import BaseModel, ValidationError
 
 from swarm_arena._model.catalog import CatalogEntry, ModelCatalog, ModelSpec, PlannerCatalog
@@ -110,13 +110,13 @@ def test_settable_optional_strict_properties(
 @pytest.mark.parametrize(
     "schema",
     [
-        {"type": "SECRET_SENTINEL"},
+        {"type": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"},
         {"type": "string", "default": 123},
         {"type": "object"},
         {"type": "string", "pattern": "["},
         {"type": "string", "minimum": 1},
-        {"SECRET_SENTINEL": True},
-        "SECRET_SENTINEL",
+        {"f31a4604-550d-5b3d-b9b3-65a6a2254cd4": True},
+        "f31a4604-550d-5b3d-b9b3-65a6a2254cd4",
     ],
 )
 def test_catalog_rejects_bad_schema_at_load(schema: Any) -> None:
@@ -128,7 +128,7 @@ def test_catalog_rejects_bad_schema_at_load(schema: Any) -> None:
             description="d",
             settable={"value": schema},
         )
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
 
 def test_catalog_duplicates_and_first_match() -> None:
@@ -143,19 +143,19 @@ def test_catalog_duplicates_and_first_match() -> None:
 
 def test_catalog_import_failure_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(path: str) -> object:
-        raise RuntimeError("SECRET_SENTINEL")
+        raise RuntimeError("f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
-    monkeypatch.setattr("swarm_arena._model.catalog.load_object", fail)
+    monkeypatch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
     entry = CatalogEntry(
         name="w",
         kind="tool",
-        ref="_fakes.tools:Widget",
+        ref="unavailable_catalog:Component",
         description="d",
         settable={"label": {"type": "string"}},
     )
-    with pytest.raises(ValidationError, match="cannot load catalog component class") as caught:
+    with pytest.raises(ValidationError, match="value_error") as caught:
         PlannerCatalog(entries=[entry])
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
     assert PlannerCatalog(entries=[entry.model_copy(update={"settable": {}})]).entries
 
 
@@ -182,14 +182,36 @@ def test_model_spec_boundaries(data: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     ("model", "data"),
     [
-        (ModelSpec, {"model": "SECRET_SENTINEL", "roles": ["judge"]}),
-        (ModelSpec.Prices, {"input": "SECRET_SENTINEL", "output": 0}),
-        (ModelSpec.PromptCache, {"ttl": "SECRET_SENTINEL"}),
-        (ModelCatalog, {"SECRET_SENTINEL": {"model": "a/b", "roles": ["SECRET_SENTINEL"]}}),
-        (CatalogEntry, {"name": "w", "kind": "tool", "ref": "SECRET_SENTINEL", "description": "d"}),
+        (ModelSpec, {"model": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4", "roles": ["judge"]}),
+        (ModelSpec.Prices, {"input": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4", "output": 0}),
+        (ModelSpec.PromptCache, {"ttl": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}),
+        (
+            ModelCatalog,
+            {
+                "f31a4604-550d-5b3d-b9b3-65a6a2254cd4": {
+                    "model": "a/b",
+                    "roles": ["f31a4604-550d-5b3d-b9b3-65a6a2254cd4"],
+                }
+            },
+        ),
         (
             CatalogEntry,
-            {"name": "w", "kind": "tool", "ref": "a:B", "description": "d", "SECRET_SENTINEL": 1},
+            {
+                "name": "w",
+                "kind": "tool",
+                "ref": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4",
+                "description": "d",
+            },
+        ),
+        (
+            CatalogEntry,
+            {
+                "name": "w",
+                "kind": "tool",
+                "ref": "a:B",
+                "description": "d",
+                "f31a4604-550d-5b3d-b9b3-65a6a2254cd4": 1,
+            },
         ),
     ],
 )
@@ -199,5 +221,4 @@ def test_catalog_errors_hide_values_and_mapping_keys(
 ) -> None:
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
-    assert "SECRET_SENTINEL" not in caught.value.json()
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")

@@ -69,13 +69,13 @@ def test_goal_key_canonical_identity() -> None:
     goal = Goal(
         id="g",
         namespace="ns",
-        inputs={"z": [1, {"b": True, "a": "λ"}], "a": None},
+        inputs={"z": [1, {"b": True, "a": "λ"}], "a": False},
         files=FileSet(manifest={"b": H, "a": "b" * 64}),
     )
     reordered = Goal(
         id="g",
         namespace="ns",
-        inputs={"a": None, "z": [1, {"a": "λ", "b": True}]},
+        inputs={"a": False, "z": [1, {"a": "λ", "b": True}]},
         files=FileSet(globs=["*"], manifest={"a": "b" * 64, "b": H}),
         title="Different title",
         description="Different description",

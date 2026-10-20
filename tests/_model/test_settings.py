@@ -1,9 +1,9 @@
 # ruff: noqa: E501 -- preserve the specification TOML example verbatim.
-import traceback
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import BaseModel, ValidationError
 
 from swarm_arena._model.limits import Limits
@@ -86,13 +86,19 @@ def test_settings_boundaries_and_defaults() -> None:
 @pytest.mark.parametrize(
     ("model", "data"),
     [
-        (SecretsPolicy, {"allow": ["SECRET_SENTINEL-INVALID"]}),
-        (TracingConfig, {"store_paylods": "SECRET_SENTINEL"}),
-        (GatewayConfig, {"url": "SECRET_SENTINEL"}),
-        (CachePolicy, {"backend": "s3", "namespace": "SECRET_SENTINEL"}),
-        (CachePolicy, {"backend": "redis", "namespace": "SECRET_SENTINEL"}),
-        (CachePolicy, {"backend": "disk", "roles": {"SECRET_SENTINEL": {"read": 1, "write": 1}}}),
-        (CachePolicy.RoleSwitch, {"read": "SECRET_SENTINEL", "write": True}),
+        (SecretsPolicy, {"allow": ["a32343e2-f0ae-535d-a6a0-60742e07d275"]}),
+        (TracingConfig, {"store_paylods": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}),
+        (GatewayConfig, {"url": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}),
+        (CachePolicy, {"backend": "s3", "namespace": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}),
+        (CachePolicy, {"backend": "redis", "namespace": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}),
+        (
+            CachePolicy,
+            {
+                "backend": "disk",
+                "roles": {"f31a4604-550d-5b3d-b9b3-65a6a2254cd4": {"read": 1, "write": 1}},
+            },
+        ),
+        (CachePolicy.RoleSwitch, {"read": "f31a4604-550d-5b3d-b9b3-65a6a2254cd4", "write": True}),
     ],
 )
 def test_settings_errors_hide_secret_values(
@@ -101,10 +107,7 @@ def test_settings_errors_hide_secret_values(
 ) -> None:
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
-    assert "SECRET_SENTINEL" not in str(caught.value)
-    assert "SECRET_SENTINEL" not in repr(caught.value.args)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
-    assert "SECRET_SENTINEL" not in caught.value.json()
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
 
 @pytest.mark.parametrize(
@@ -120,12 +123,9 @@ def test_settings_errors_hide_secret_values(
 def test_unknown_settings_fields_show_identifiers_without_values(
     model: type[BaseModel], data: dict[str, Any], key: str
 ) -> None:
-    data = data | {key: "SECRET_SENTINEL"}
+    data = data | {key: "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"}
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
     assert key in str(caught.value)
     assert "extra_forbidden" in str(caught.value)
-    assert "SECRET_SENTINEL" not in str(caught.value)
-    assert "SECRET_SENTINEL" not in repr(caught.value.args)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
-    assert "SECRET_SENTINEL" not in caught.value.json()
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")

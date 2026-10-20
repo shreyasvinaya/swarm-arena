@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, StrEnum
+from typing import Final
 
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.canonical import _normalize_utc
@@ -54,7 +55,7 @@ class _Unset(Enum):
     VALUE = "unset"
 
 
-UNSET = _Unset.VALUE
+UNSET: Final = _Unset.VALUE
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

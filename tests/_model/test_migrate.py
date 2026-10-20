@@ -1,3 +1,4 @@
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -8,7 +9,9 @@ from swarm_arena._model.migrate import migration, upgrade
 
 @pytest.fixture(autouse=True)
 def isolated_migrations(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(migrate, "_MIGRATIONS", {})
+    functions: dict[tuple[str, int], migrate.MigrationFn] = {}
+    monkeypatch.setattr(migrate, "_migration_functions", functions)
+    monkeypatch.setattr(migrate, "_MIGRATIONS", MappingProxyType(functions))
 
 
 def test_current_version_is_identity() -> None:
@@ -28,7 +31,7 @@ def test_missing_version_means_one() -> None:
 def test_invalid_version_refused_before_migration(
     monkeypatch: pytest.MonkeyPatch, current: int, version: object
 ) -> None:
-    monkeypatch.setitem(migrate.CURRENT, "plan", current)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "plan": current})
 
     @migration("plan", 1)
     def step(raw: dict[str, Any]) -> dict[str, Any]:
@@ -47,7 +50,7 @@ def test_newer_version_refused() -> None:
 
 
 def test_migrations_apply_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(migrate.CURRENT, "demo", 3)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "demo": 3})
 
     @migration("demo", 1)
     def one(raw: dict[str, Any]) -> dict[str, Any]:
@@ -63,7 +66,7 @@ def test_migrations_apply_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_unknown_kind_missing_step_and_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="unknown stored-format kind 'nope'"):
         upgrade("nope", {})
-    monkeypatch.setitem(migrate.CURRENT, "demo", 2)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "demo": 2})
     with pytest.raises(RuntimeError, match="no migration for demo 1"):
         upgrade("demo", {})
 
@@ -76,7 +79,7 @@ def test_unknown_kind_missing_step_and_duplicate(monkeypatch: pytest.MonkeyPatch
 
 
 def test_upgrade_copies_input(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(migrate.CURRENT, "demo", 2)
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, "demo": 2})
 
     @migration("demo", 1)
     def step(raw: dict[str, Any]) -> dict[str, Any]:
@@ -102,3 +105,8 @@ def test_current_kinds() -> None:
         "candidate_output": 1,
         "tool_result": 1,
     }
+
+
+def test_current_registry_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        migrate.CURRENT["plan"] = 99  # ty: ignore[invalid-assignment]

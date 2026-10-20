@@ -1,4 +1,5 @@
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
 from pydantic import ValidationError
 
@@ -165,26 +166,49 @@ def test_started_uses_versioned_stored_format() -> None:
 @pytest.mark.parametrize(
     ("model", "data"),
     [
-        (Job.Stage, {"root": {"sentinel-secret": ["sentinel-secret"]}}),
+        (
+            Job.Stage,
+            {
+                "root": {
+                    "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": ["5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d"]
+                }
+            },
+        ),
         (Job.Stage, {"root": {"./sentinel-secret": "a" * 64}}),
-        (Job.Stage, {"sentinel-secret": "sentinel-secret"}),
-        (Job.CandidateFiles, {"request": {}, "output": {}, "files": {"sentinel-secret": {}}}),
-        (Job.CandidateFiles, {"request": ["sentinel-secret"], "output": {}, "files": {}}),
-        (Job.Started, {"kind": "sentinel-secret", "job_id": "x-1"}),
-        (Job.Started, {"kind": "process", "job_id": "x-1", "pid": "sentinel-secret"}),
-        (Job.Started, {"kind": "process", "job_id": "x-1", "schema_version": "sentinel-secret"}),
+        (
+            Job.Stage,
+            {"5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d"},
+        ),
+        (
+            Job.CandidateFiles,
+            {"request": {}, "output": {}, "files": {"5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": {}}},
+        ),
+        (
+            Job.CandidateFiles,
+            {"request": ["5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d"], "output": {}, "files": {}},
+        ),
+        (Job.Started, {"kind": "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d", "job_id": "x-1"}),
+        (
+            Job.Started,
+            {"kind": "process", "job_id": "x-1", "pid": "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d"},
+        ),
+        (
+            Job.Started,
+            {
+                "kind": "process",
+                "job_id": "x-1",
+                "schema_version": "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d",
+            },
+        ),
     ],
 )
 def test_validation_errors_hide_values_and_dynamic_keys(
     model: type[Job.Stage] | type[Job.CandidateFiles] | type[Job.Started], data: dict[str, object]
 ) -> None:
-    import traceback
 
     with pytest.raises(ValidationError) as exc:
         model.model_validate(data)
-    assert "sentinel-secret" not in str(exc.value)
-    assert "sentinel-secret" not in "".join(traceback.format_exception(exc.value))
-    assert "sentinel-secret" not in repr(exc.value.errors(include_input=False, include_url=False))
+    assert_secret_absent(exc.value, "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d")
 
 
 def test_executor_requires_all_abstract_operations() -> None:
@@ -195,27 +219,48 @@ def test_executor_requires_all_abstract_operations() -> None:
 @pytest.mark.parametrize(
     ("model", "data", "location"),
     [
-        (Job.Stage, {"sentinel-secret": "sentinel-value"}, ("<field>",)),
+        (Job.Stage, {"5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": "sentinel-value"}, ("<field>",)),
         (
             Job.CandidateFiles,
-            {"request": {}, "output": {}, "files": {}, "sentinel-secret": "sentinel-value"},
+            {
+                "request": {},
+                "output": {},
+                "files": {},
+                "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": "sentinel-value",
+            },
             ("<field>",),
         ),
         (
             Job.Started,
-            {"kind": "process", "job_id": "x-1", "sentinel-secret": "sentinel-value"},
+            {
+                "kind": "process",
+                "job_id": "x-1",
+                "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": "sentinel-value",
+            },
             ("<field>",),
         ),
         (
             Job.Stage,
-            {"candidate": {"request": {}, "output": {}, "files": {}, "sentinel-secret": 1}},
+            {
+                "candidate": {
+                    "request": {},
+                    "output": {},
+                    "files": {},
+                    "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": 1,
+                }
+            },
             ("candidate", "<field>"),
         ),
         (
             Job.Stage,
             {
                 "parents": [
-                    {"candidate_id": "c", "run_id": "r", "tool_identity": "t", "sentinel-secret": 1}
+                    {
+                        "candidate_id": "c",
+                        "run_id": "r",
+                        "tool_identity": "t",
+                        "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d": 1,
+                    }
                 ]
             },
             ("parents", 0, "<field>"),
@@ -227,7 +272,6 @@ def test_runtime_unknown_fields_are_hidden(
     data: dict[str, object],
     location: tuple[str | int, ...],
 ) -> None:
-    import traceback
 
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
@@ -235,11 +279,75 @@ def test_runtime_unknown_fields_are_hidden(
     assert len(errors) == 1
     assert errors[0]["loc"] == location
     assert errors[0]["type"] == "extra_forbidden"
-    for rendered in (
-        str(caught.value),
-        repr(caught.value.args),
-        repr(errors),
-        "".join(traceback.format_exception(caught.value)),
-    ):
-        assert "sentinel-secret" not in rendered
-        assert "sentinel-value" not in rendered
+    assert_secret_absent(caught.value, "5ffa46b2-639d-5f60-a2e1-f6bdfde22e3d")
+    assert_secret_absent(caught.value, "sentinel-value")
+
+
+@pytest.mark.parametrize(
+    "field", ["params", "round", "round_overrides", "replicate", "schema_version"]
+)
+def test_tool_job_refuses_disagreeing_request_json(field: str) -> None:
+    from _fakes.tools import EchoTool
+
+    from swarm_arena import Ref
+    from swarm_arena._tooling.result_file import request_json
+    from swarm_arena.tool import ToolRequest
+
+    request = ToolRequest(inputs={"x": 1}, round=2, replicate=3)
+    wire = request_json(request)
+    wire[field] = {"x": 2} if field in {"params", "round_overrides"} else 9
+    with pytest.raises(ValueError, match="request_json"):
+        make_job(
+            kind="tool",
+            command=None,
+            tool=Ref.of(EchoTool),
+            request=request,
+            stage=Job.Stage(request_json=wire),
+        )
+
+
+def test_tool_job_allows_intentional_missing_request_json() -> None:
+    from _fakes.tools import EchoTool
+
+    from swarm_arena import Ref
+    from swarm_arena.tool import ToolRequest
+
+    request = ToolRequest()
+    job = make_job(kind="tool", command=None, tool=Ref.of(EchoTool), request=request)
+    assert job.stage.request_json is None
+
+
+@pytest.mark.parametrize("wire_extra", [{"parents": ["other"]}, {"round": True}])
+def test_tool_job_compares_parent_ids_and_json_value_types(wire_extra: dict[str, object]) -> None:
+    from _fakes.tools import EchoTool
+
+    from swarm_arena import Ref
+    from swarm_arena._tooling.result_file import request_json
+    from swarm_arena.tool import ToolRequest
+
+    request = ToolRequest(round=1)
+    wire = {**request_json(request), **wire_extra}
+    with pytest.raises(ValueError, match="request_json"):
+        make_job(
+            kind="tool",
+            command=None,
+            tool=Ref.of(EchoTool),
+            request=request,
+            stage=Job.Stage(request_json=wire),
+        )
+
+
+@pytest.mark.parametrize("field", ["timeout_s", "grace_s"])
+@pytest.mark.parametrize(
+    "bad", [-1.0, float("inf"), float("nan"), "fe4fba44-46c7-4421-92d7-610ab74b7749"]
+)
+def test_job_execution_limits_are_finite_and_bounded(field: str, bad: object) -> None:
+    with pytest.raises(ValueError, match=field) as caught:
+        make_job(**{field: bad})
+    assert_secret_absent(caught.value, "fe4fba44-46c7-4421-92d7-610ab74b7749", sanitized=True)
+
+
+def test_job_timeout_is_positive_and_grace_can_be_zero() -> None:
+    with pytest.raises(ValueError, match="timeout_s"):
+        make_job(timeout_s=0)
+    assert make_job(timeout_s=None, grace_s=0).grace_s == 0

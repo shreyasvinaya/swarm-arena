@@ -3,15 +3,20 @@
 import re
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Final
 
-from pydantic import AfterValidator, Field, field_serializer, field_validator
+from pydantic import AfterValidator, Field, field_serializer
 
 from swarm_arena._model.base import FrozenModel
-from swarm_arena._model.canonical import UtcDatetime, canonical_json, sha256_hex
+from swarm_arena._model.canonical import UtcDatetime, sha256_hex
+from swarm_arena._model.data import FiniteJsonObject, Manifest, Sha256, TomlJsonObject
 from swarm_arena._tooling.paths import check_key, check_relpath
 
-_Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_Sha256 = Sha256
+TimeoutS = Annotated[float, Field(gt=0)]
+GraceS = Annotated[float, Field(ge=0)]
+EnvName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
+DEFAULT_GRACE_S: Final = 10.0
 _Relpath = Annotated[str, AfterValidator(check_relpath)]
 
 
@@ -119,13 +124,13 @@ class Usage(FrozenModel):
     15
     """
 
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-    cache_write_5m_tokens: int = 0
-    cache_write_1h_tokens: int = 0
-    usd: float | None = None
+    input_tokens: Annotated[int, Field(ge=0)] = 0
+    output_tokens: Annotated[int, Field(ge=0)] = 0
+    cache_read_tokens: Annotated[int, Field(ge=0)] = 0
+    cache_write_tokens: Annotated[int, Field(ge=0)] = 0
+    cache_write_5m_tokens: Annotated[int, Field(ge=0)] = 0
+    cache_write_1h_tokens: Annotated[int, Field(ge=0)] = 0
+    usd: Annotated[float, Field(ge=0)] | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -203,9 +208,9 @@ class Estimate(FrozenModel):
     True
     """
 
-    seconds: float | None = None
-    tokens: int | None = None
-    usd: float | None = None
+    seconds: Annotated[float, Field(ge=0)] | None = None
+    tokens: Annotated[int, Field(ge=0)] | None = None
+    usd: Annotated[float, Field(ge=0)] | None = None
 
 
 class FileRef(FrozenModel):
@@ -265,8 +270,8 @@ class ParentRef(FrozenModel):
     candidate_id: Annotated[str, AfterValidator(check_parent_id)]
     run_id: str
     tool_identity: str
-    data: dict[str, Any] = {}
-    overlay: dict[Annotated[str, AfterValidator(check_key)], _Sha256] = {}
+    data: FiniteJsonObject = {}
+    overlay: Manifest = {}
     files: list[FileRef] = []
 
 
@@ -308,11 +313,11 @@ class ToolRequest(FrozenModel):
     True
     """
 
-    inputs: dict[str, Any] = {}
+    inputs: FiniteJsonObject = {}
     parents: list[ParentRef] = []
     replicate: int = 0
     round: int = 0
-    round_overrides: dict[str, Any] = {}
+    round_overrides: TomlJsonObject = {}
     edits: dict[Annotated[str, AfterValidator(check_key)], str] = {}
 
     @field_serializer("edits")
@@ -368,23 +373,13 @@ class ToolOutput(FrozenModel):
 
     status: RunStatus
     partial: bool = False
-    data: dict[str, Any] = {}
+    data: FiniteJsonObject = {}
     files: list[FileRef] = []
     usage: Usage = Usage()
     logs_ref: str | None = None
     started_at: UtcDatetime | None = None
     ended_at: UtcDatetime | None = None
     failed_provider: str | None = None
-
-    @field_validator("data")
-    @classmethod
-    def _finite_data(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """Require finite JSON data without exposing values or dynamic keys."""
-        try:
-            canonical_json(data)
-        except (TypeError, ValueError, OverflowError, RecursionError):
-            raise ValueError("data must be finite JSON") from None
-        return data
 
 
 class Command(FrozenModel):
@@ -415,10 +410,10 @@ class Command(FrozenModel):
 
     argv: Annotated[list[str], Field(min_length=1)]
     cwd: _Relpath | None = None
-    env: list[Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]] = []
-    timeout_s: Annotated[float, Field(gt=0)] | None = None
+    env: list[EnvName] = []
+    timeout_s: TimeoutS | None = None
     python: str | None = None
-    grace_s: Annotated[float, Field(ge=0)] = 10.0
+    grace_s: GraceS = DEFAULT_GRACE_S
 
 
 class CompletedRun(FrozenModel):

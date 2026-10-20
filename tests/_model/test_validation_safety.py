@@ -1,4 +1,4 @@
-"""Exercise the shared validation boundary and retain pre-refactor diagnostics."""
+"""Exercise the shared validation boundary and stable diagnostics."""
 
 import ast
 import importlib
@@ -6,6 +6,7 @@ import json
 import pkgutil
 from pathlib import Path
 from typing import Any, LiteralString, Self, cast
+from uuid import NAMESPACE_OID, uuid5
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -28,7 +29,7 @@ from swarm_arena._model.settings import TracingConfig
 from swarm_arena._tooling.function_tool import function_input_model
 from swarm_arena._tooling.script_tool import ScriptTool
 
-# Captured at b4ed078 before any source changes. Keep historical text reviewable.
+# Stable user-visible diagnostic text.
 BASELINE_TEXT = {
     "Plan": "1 validation error for Plan\nrevision\n  int_parsing [type=int_parsing]",
     "RunConfig": (
@@ -48,12 +49,20 @@ BASELINE_TEXT = {
 }
 
 SNAPSHOT_CASES = [
-    (Plan, {"goal": GOAL, "teams": [], "judges": [], "revision": "snapshot_secret"}),
-    (RunConfig, {"reserve_fraction": "snapshot_secret"}),
-    (Limits, {"max_teams": "snapshot_secret"}),
-    (TracingConfig, {"langfuse": "snapshot_secret"}),
-    (Job.Stage, {"root": "snapshot_secret"}),
-    (CheckResult, {"check": "c", "passed": "snapshot_secret"}),
+    (
+        Plan,
+        {
+            "goal": GOAL,
+            "teams": [],
+            "judges": [],
+            "revision": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5",
+        },
+    ),
+    (RunConfig, {"reserve_fraction": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}),
+    (Limits, {"max_teams": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}),
+    (TracingConfig, {"langfuse": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}),
+    (Job.Stage, {"root": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}),
+    (CheckResult, {"check": "c", "passed": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}),
 ]
 
 
@@ -76,7 +85,9 @@ def test_validation_text_snapshot(model: type[BaseModel], data: dict[str, Any]) 
 
 def test_ref_build_text_snapshot() -> None:
     with pytest.raises(ConfigError) as caught:
-        Ref(path="_fakes.tools:Widget", config={"size": "snapshot_secret"}).build(Configurable)
+        Ref(
+            path="_fakes.tools:Widget", config={"size": "4bc403e3-1d36-5015-9b9f-9a62ef7caed5"}
+        ).build(Configurable)
     assert str(caught.value) == BASELINE_TEXT["Ref.build"]
 
 
@@ -220,7 +231,9 @@ def _validate_bad_input(model: type[BaseModel], surface: str, secret: str) -> ob
     "surface", ["bad-value", "bad-field", "extra-value", "json-invalid", "strings"]
 )
 def test_every_model_rejects_secret_safely(model: type[BaseModel], surface: str) -> None:
-    secret = "sentinel_" + model.__qualname__.replace(".", "_") + "_" + surface
+    secret = str(
+        uuid5(NAMESPACE_OID, "sentinel_" + model.__qualname__.replace(".", "_") + "_" + surface)
+    )
     if surface in {"extra-value", "strings"} and not _forbids_unknown(model):
         # A model that ignores unknown keys may accept them; it must not keep their values.
         try:
@@ -247,7 +260,7 @@ def test_unknown_key_policy(model: type[BaseModel]) -> None:
     assert getattr(model, "_unknown_fields", None) == expected_policy
     if model.__pydantic_root_model__ or not _forbids_unknown(model):
         return
-    secret = "sentinel_" + model.__qualname__ + "_unknown_value"
+    secret = str(uuid5(NAMESPACE_OID, "sentinel_" + model.__qualname__ + "_unknown_value"))
     with pytest.raises(ValidationError) as caught:
         model.model_validate({"misspelled_field": secret})
     extras = [item for item in caught.value.errors() if item["type"] == "extra_forbidden"]
@@ -262,7 +275,7 @@ def test_unknown_key_policy(model: type[BaseModel]) -> None:
 @pytest.mark.parametrize("kind", ["custom-code", "custom-builtin", "value-error", "type-error"])
 @pytest.mark.parametrize("entry", ["constructor", "python", "json", "strings"])
 def test_subclass_after_validator_is_inside_shared_boundary(kind: str, entry: str) -> None:
-    secret = "after_validator_" + kind + "_sentinel"
+    secret = str(uuid5(NAMESPACE_OID, "after_validator_" + kind + "_sentinel"))
 
     class Untrusted(_SafeModel):
         value: str
@@ -307,7 +320,7 @@ def test_shared_location_handles_aliases(alias: str | AliasChoices | AliasPath) 
     class Aliased(_SafeModel):
         count: int = Field(validation_alias=alias)
 
-    secret = "alias_" + type(alias).__name__ + "_sentinel"
+    secret = str(uuid5(NAMESPACE_OID, "alias_" + type(alias).__name__ + "_sentinel"))
     data = {"items": [secret]} if isinstance(alias, AliasPath) else {"amount": secret}
     with pytest.raises(ValidationError) as caught:
         Aliased.model_validate(data)
@@ -317,7 +330,7 @@ def test_shared_location_handles_aliases(alias: str | AliasChoices | AliasPath) 
 
 
 def test_core_is_idempotent_and_defaults_to_hidden_unknown_keys() -> None:
-    secret = "core_" + "sentinel"
+    secret = str(uuid5(NAMESPACE_OID, "core_" + "sentinel"))
     with pytest.raises(ValidationError) as caught:
         _SafeModel.model_validate(secret)
     once = _sanitize_validation_error(_SafeModel, caught.value)
@@ -328,7 +341,7 @@ def test_core_is_idempotent_and_defaults_to_hidden_unknown_keys() -> None:
 
 def test_frozen_assignment_and_deletion_are_safe() -> None:
     model = Limits()
-    secret = "assignment_" + "sentinel"
+    secret = str(uuid5(NAMESPACE_OID, "assignment_" + "sentinel"))
     field_name = "max_teams"
     with pytest.raises(ValidationError) as caught:
         setattr(model, field_name, secret)
@@ -340,7 +353,7 @@ def test_frozen_assignment_and_deletion_are_safe() -> None:
 
 
 def test_root_catalog_redacts_data_keys_colliding_with_schema_names() -> None:
-    secret = "root_" + "sentinel"
+    secret = str(uuid5(NAMESPACE_OID, "root_" + "sentinel"))
     with pytest.raises(ValidationError) as caught:
         ModelCatalog.model_validate({secret: {"model": secret}, "root": {"model": secret}})
     assert_secret_absent(caught.value, secret, sanitized=True)

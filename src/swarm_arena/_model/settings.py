@@ -93,9 +93,9 @@ class GatewayConfig(_HumanConfigModel):
     url: str = Field(pattern=r"^https?://")
     master_key_env: str = "LITELLM_MASTER_KEY"
     require_hard_cap: bool | None = None
-    request_timeout_s: float = 600.0
-    key_duration_s: float = 86_400.0
-    default_estimated_output_tokens: int = 4096
+    request_timeout_s: float = Field(default=600.0, gt=0)
+    key_duration_s: float = Field(default=86_400.0, gt=0)
+    default_estimated_output_tokens: int = Field(default=4096, ge=1)
 
     def hard_cap_required(self, limits: Limits) -> bool:
         """

@@ -1,4 +1,4 @@
-"""Pin Round 3 totality, schema-index cost, and validation-boundary ownership."""
+"""Validate sanitizer totality, schema-index cost and boundary ownership."""
 
 import json
 from collections.abc import Callable
@@ -25,11 +25,11 @@ from pydantic import (
 from pydantic.errors import PydanticImportError, PydanticUndefinedAnnotation
 
 from swarm_arena._errors import ConfigError
-from swarm_arena._model import base, ref
+from swarm_arena._model import base, locations, ref, safe
 from swarm_arena._model.base import _SafeModel
 from swarm_arena._model.ref import _validate_config
 
-SECRET = "R3_PRIVATE_SENTINEL"
+SECRET = "72637a4e-d59e-5316-bb5e-d65f326c5edf"
 
 
 def validate(model: type[BaseModel], entry: str, data: dict[str, Any]) -> BaseModel:
@@ -79,7 +79,7 @@ def test_boundary_falls_back_when_sanitizer_crashes(
     def crash(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(SECRET)
 
-    monkeypatch.setattr(base if boundary == "safe" else ref, "_sanitize_validation_error", crash)
+    monkeypatch.setattr(safe if boundary == "safe" else ref, "_sanitize_validation_error", crash)
     action = (
         (lambda: Config(**{"count": SECRET}))
         if boundary == "safe"
@@ -103,8 +103,8 @@ def test_location_walker_itself_fails_closed(monkeypatch: pytest.MonkeyPatch) ->
     def crash(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(SECRET)
 
-    monkeypatch.setattr(base, "_location_parts", crash)
-    assert base._safe_location(Config, ("count", SECRET)) == ("<…>", "<…>")
+    monkeypatch.setattr(locations, "_location_parts", crash)
+    assert locations._safe_location(Config, ("count", SECRET)) == ("<…>", "<…>")
 
 
 def test_schema_index_built_once_and_rebuilt_with_schema(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,8 +113,8 @@ def test_schema_index_built_once_and_rebuilt_with_schema(monkeypatch: pytest.Mon
 
     calls = 0
     walks = 0
-    original = base._schema_definitions
-    original_walk = base._location_parts
+    original = locations._schema_definitions
+    original_walk = locations._location_parts
 
     def walk_spy(*args: Any, **kwargs: Any) -> tuple[str | int, ...]:
         nonlocal walks
@@ -126,8 +126,8 @@ def test_schema_index_built_once_and_rebuilt_with_schema(monkeypatch: pytest.Mon
         calls += 1
         return original(schema)
 
-    monkeypatch.setattr(base, "_schema_definitions", spy)
-    monkeypatch.setattr(base, "_location_parts", walk_spy)
+    monkeypatch.setattr(locations, "_schema_definitions", spy)
+    monkeypatch.setattr(locations, "_location_parts", walk_spy)
     for _ in range(2):
         with pytest.raises(ValidationError) as caught:
             Config(items=[SECRET] * 1000)
@@ -268,20 +268,22 @@ def test_alias_name_ambiguity_does_not_reveal_integer_mapping_key() -> None:
         credentials: dict[int, int] = Field(alias="items")
         lookup: list[int] = Field(alias="credentials")
 
+    key = 739201
     with pytest.raises(ValidationError) as caught:
-        Config(credentials={739201: SECRET})
+        Config(credentials={key: SECRET})
     assert any(item["loc"] == ("credentials", "<…>") for item in caught.value.errors())
-    assert "739201" not in caught.value.json()
+    assert_secret_absent(caught.value, "739201")
 
 
 def test_same_name_union_uses_mapping_node_for_integer_keys() -> None:
     sequence = create_model("Duplicate", __base__=_SafeModel, value=(list[int], ...))
     mapping = create_model("Duplicate", __base__=_SafeModel, value=(dict[int, int], ...))
     model = create_model("UnionModel", __base__=_SafeModel, branch=(sequence | mapping, ...))
+    key = 739201
     with pytest.raises(ValidationError) as caught:
-        model(branch={"value": {739201: SECRET}})
+        model(branch={"value": {key: SECRET}})
     assert any(item["loc"] == ("branch", "<…>", "value", "<…>") for item in caught.value.errors())
-    assert "739201" not in caught.value.json()
+    assert_secret_absent(caught.value, "739201")
     assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
@@ -318,7 +320,7 @@ def test_explicit_error_preserves_field_prefix_and_redacts_mapping_key() -> None
     with pytest.raises(ValidationError) as caught:
         Outer(value=1)
     assert caught.value.errors()[0]["loc"] == ("value", "values", "<…>")
-    assert "739201" not in caught.value.json()
+    assert_secret_absent(caught.value, "739201")
     assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
@@ -350,7 +352,7 @@ def test_sanitizer_itself_is_total(monkeypatch: pytest.MonkeyPatch) -> None:
     def crash(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(SECRET)
 
-    monkeypatch.setattr(base, "_schema_index", crash)
-    safe = base._sanitize_validation_error(Config, caught.value)
-    assert safe.errors() == [{"type": "invalid", "loc": (), "msg": "invalid", "input": None}]
-    assert SECRET not in safe.json()
+    monkeypatch.setattr(safe, "_schema_index", crash)
+    sanitized = base._sanitize_validation_error(Config, caught.value)
+    assert sanitized.errors() == [{"type": "invalid", "loc": (), "msg": "invalid", "input": None}]
+    assert_secret_absent(sanitized, SECRET, sanitized=True)

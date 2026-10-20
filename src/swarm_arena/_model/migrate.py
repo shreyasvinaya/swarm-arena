@@ -1,23 +1,27 @@
 """Register and apply sequential stored-format migrations."""
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
+from typing import Any, Final
 
 MigrationFn = Callable[[dict[str, Any]], dict[str, Any]]
 
-CURRENT: dict[str, int] = {
-    "candidate": 1,
-    "learning": 1,
-    "llm_call": 1,
-    "plan": 1,
-    "run_config": 1,
-    "job_started": 1,
-    "request": 1,
-    "candidate_request": 1,
-    "candidate_output": 1,
-    "tool_result": 1,
-}
-_MIGRATIONS: dict[tuple[str, int], MigrationFn] = {}
+CURRENT: Final[Mapping[str, int]] = MappingProxyType(
+    {
+        "candidate": 1,
+        "learning": 1,
+        "llm_call": 1,
+        "plan": 1,
+        "run_config": 1,
+        "job_started": 1,
+        "request": 1,
+        "candidate_request": 1,
+        "candidate_output": 1,
+        "tool_result": 1,
+    }
+)
+_migration_functions: Final[dict[tuple[str, int], MigrationFn]] = {}
+_MIGRATIONS: Final[Mapping[tuple[str, int], MigrationFn]] = MappingProxyType(_migration_functions)
 
 
 def migration(kind: str, from_version: int) -> Callable[[MigrationFn], MigrationFn]:
@@ -52,7 +56,7 @@ def migration(kind: str, from_version: int) -> Callable[[MigrationFn], Migration
         key = (kind, from_version)
         if key in _MIGRATIONS:
             raise ValueError(f"migration for {kind} {from_version} already registered")
-        _MIGRATIONS[key] = fn
+        _migration_functions[key] = fn
         return fn
 
     return register

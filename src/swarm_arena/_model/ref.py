@@ -10,12 +10,13 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     Field,
+    field_validator,
 )
 from pydantic.errors import PydanticErrorMixin
+from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import (
-    _ERROR_CAP_REASON,
     _VALIDATION_ACTIVE,
     FrozenModel,
     _minimal_validation_error,
@@ -23,6 +24,8 @@ from swarm_arena._model.base import (
     _sanitize_validation_error,
     _ValidationOwner,
 )
+from swarm_arena._model.data import TomlJsonObject
+from swarm_arena._model.diagnostics import validation_summary
 
 
 class EmptyConfig(_SafeModel):
@@ -179,8 +182,8 @@ def load_object(path: str) -> object:
         obj: object = importlib.import_module(module)
         for part in qualname.split("."):
             obj = getattr(obj, part)
-    except (ImportError, AttributeError, ValueError) as err:
-        raise ValueError(f"cannot import {path}: {err}") from err
+    except (Exception, SystemExit):
+        raise ValueError(f"cannot import {path}") from None
     return obj
 
 
@@ -238,17 +241,7 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
         _VALIDATION_ACTIVE.reset(token)
     if safe is None:
         safe = _minimal_validation_error(model_cls)
-    summary = "; ".join(
-        (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "")
-        + (
-            item["msg"]
-            if not item["loc"]
-            and item["type"] == "invalid"
-            and _ERROR_CAP_REASON.fullmatch(item["msg"])
-            else item["type"]
-        )
-        for item in safe.errors(include_input=False, include_url=False, include_context=False)
-    )
+    summary = validation_summary(safe, codes_only=True)
     raise ConfigError(f"{where}: {summary}") from None
 
 
@@ -273,8 +266,16 @@ class Ref(FrozenModel):
     """
 
     path: str = Field(pattern=r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$")
-    config: dict[str, Any] = {}
+    config: TomlJsonObject = {}
     name: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, name: str | None) -> str | None:
+        """Keep explicit component names printable, nonempty and outside human review."""
+        if name is not None and (not name or not name.isprintable() or name.startswith("human:")):
+            raise ValueError("invalid component name")
+        return name
 
     @classmethod
     def of(cls, component: object) -> "Ref":
@@ -299,15 +300,33 @@ class Ref(FrozenModel):
         Examples
         --------
         >>> from swarm_arena import Ref
-        >>> from swarm_arena.executor import LocalExecutor  # doctest: +SKIP
-        >>> Ref.of(LocalExecutor).path  # doctest: +SKIP
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> Ref.of(LocalExecutor).path
         'swarm_arena.executor:LocalExecutor'
         """
         if isinstance(component, type):
             return cls(path=import_path(component))
         if isinstance(component, Configurable):
+            path = import_path(type(component))
+            pending: list[Any] = [component.config]
+            seen: set[int] = set()
+            while pending:
+                value = pending.pop()
+                if id(value) in seen:
+                    continue
+                seen.add(id(value))
+                if isinstance(value, BaseModel):
+                    for name, info in type(value).model_fields.items():
+                        child = getattr(value, name)
+                        if child is None and info.default is not None:
+                            raise ValueError("component config cannot discard explicit null")
+                        pending.append(child)
+                elif isinstance(value, dict):
+                    pending.extend(value.values())
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(value)
             return cls(
-                path=import_path(type(component)), config=component.config.model_dump(mode="json")
+                path=path, config=component.config.model_dump(mode="json", exclude_none=True)
             )
         raise TypeError("not a component")
 
@@ -368,15 +387,21 @@ class Ref(FrozenModel):
         Examples
         --------
         >>> from swarm_arena import Ref
-        >>> from swarm_arena.executor import LocalExecutor  # doctest: +SKIP
+        >>> from swarm_arena.executor import LocalExecutor
         >>> ref = Ref(path="swarm_arena.executor:LocalExecutor")
-        >>> executor = ref.build(LocalExecutor)  # doctest: +SKIP
+        >>> executor = ref.build(LocalExecutor)
+        >>> isinstance(executor, LocalExecutor)
+        True
         """
+        cls, validated = self._resolve_config(base)
+        return cls(validated)
+
+    def _resolve_config(self, base: type[T]) -> tuple[type[T], BaseModel]:
+        """Resolve, check and validate a component without building or rewrapping imports."""
         cls = self.load()
         if not issubclass(cls, base):
             raise TypeError(f"{self.path} is not a subclass of {base.__name__}")
-        validated = _validate_config(cls.Config, self.config, where=self.path)
-        return cls(validated)
+        return cls, _validate_config(cls.Config, self.config, where=self.path)
 
     def component_name(self) -> str:
         """
@@ -432,7 +457,18 @@ def coerce_ref(value: object) -> object:
     if isinstance(value, Configurable) or (
         isinstance(value, type) and issubclass(value, Configurable)
     ):
-        return Ref.of(value)
+        try:
+            return Ref.of(value)
+        except TypeError as error:
+            # Only these fixed importability reasons are allowed out of the boundary.
+            reason = str(error)
+            if reason not in {
+                "cannot reference a lambda",
+                "cannot reference a local object",
+                "cannot reference an object defined in __main__",
+            }:
+                reason = "component has no importable class"
+            raise PydanticCustomError("ref_not_importable", reason) from None
     return value
 
 

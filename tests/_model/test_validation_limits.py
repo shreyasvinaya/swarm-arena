@@ -1,4 +1,4 @@
-"""Close error-cap and boundary regressions from integration fix 3."""
+"""Bound validation details and preserve nested error ownership."""
 
 import subprocess
 import sys
@@ -11,11 +11,11 @@ from pydantic import BaseModel, ValidationError, create_model, field_validator
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
-from swarm_arena._model import base, ref
+from swarm_arena._model import base, locations, ref, safe
 from swarm_arena._model.base import FrozenModel, _SafeModel
 from swarm_arena._model.plan import Plan
 
-SECRET = "IF3_PRIVATE_SENTINEL"
+SECRET = "45e2f48d-adf7-5f9c-a949-55a178179b81"
 
 
 @pytest.mark.parametrize("count", [20, 21, 100_000])
@@ -112,7 +112,7 @@ def test_fallback_construction_has_no_raw_exception_context(
     def crash(*args: Any, **kwargs: Any) -> Any:
         raise RecursionError()
 
-    module = base if boundary == "safe" else ref
+    module = safe if boundary == "safe" else ref
     monkeypatch.setattr(module, "_sanitize_validation_error", crash)
     monkeypatch.setattr(module, "_minimal_validation_error", crash)
     action = (
@@ -140,8 +140,8 @@ def test_plain_constructor_uses_core_boundary(monkeypatch: pytest.MonkeyPatch) -
 def test_nested_plan_errors_reuse_schema_index(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
     walks = 0
-    original = base._schema_definitions
-    original_location = base._safe_location
+    original = locations._schema_definitions
+    original_location = locations._safe_location
 
     def spy(schema: dict[str, Any]) -> dict[str, Any]:
         nonlocal calls
@@ -154,8 +154,8 @@ def test_nested_plan_errors_reuse_schema_index(monkeypatch: pytest.MonkeyPatch) 
         return original_location(*args, **kwargs)
 
     Plan.model_rebuild(force=True)
-    monkeypatch.setattr(base, "_schema_definitions", spy)
-    monkeypatch.setattr(base, "_safe_location", location)
+    monkeypatch.setattr(locations, "_schema_definitions", spy)
+    monkeypatch.setattr(safe, "_safe_location", location)
     data = {
         "goal": {"id": "g", "namespace": "test"},
         "teams": [

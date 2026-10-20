@@ -8,6 +8,7 @@ from pydantic import Field, ValidationError
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.catalog import ModelCatalog, PlannerCatalog
+from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref, RefField
 from swarm_arena._model.settings import (
@@ -16,7 +17,7 @@ from swarm_arena._model.settings import (
     SecretsPolicy,
     TracingConfig,
 )
-from swarm_arena._model.toml_io import dumps_toml, read_toml
+from swarm_arena._model.toml_io import dumps_toml, loads_toml, read_toml
 
 
 class RunConfig(StoredModel):
@@ -85,10 +86,10 @@ class RunConfig(StoredModel):
     arena_root: str = ".swarm-arena/arena"
     artifact_root: str = ".swarm-arena/artifacts"
     secrets: SecretsPolicy = SecretsPolicy()
-    schedule_timeout_s: float = 600.0
-    sync_interval_s: float = 60.0
-    lease_ttl_s: float = 60.0
-    settle_timeout_s: float = 60.0
+    schedule_timeout_s: float = Field(default=600.0, gt=0)
+    sync_interval_s: float = Field(default=60.0, gt=0)
+    lease_ttl_s: float = Field(default=60.0, gt=0)
+    settle_timeout_s: float = Field(default=60.0, gt=0)
     tracing: TracingConfig = TracingConfig()
     llm_gateway: GatewayConfig | None = None
     models: ModelCatalog = ModelCatalog({})
@@ -124,19 +125,43 @@ class RunConfig(StoredModel):
         0.15
         """
         path = Path(path)
-        try:
-            data = read_toml(path)
-        except (ConfigError, UnicodeError, OSError):
-            raise ConfigError(f"{path}: cannot read valid UTF-8 TOML") from None
+        data = read_toml(path)
+        return cls._from_data(data, where=str(path))
+
+    @classmethod
+    def loads(cls, text: str) -> "RunConfig":
+        """
+        Parse a UTF-8 TOML run configuration with safe diagnostics.
+
+        Parameters
+        ----------
+        text : str
+            TOML configuration source.
+
+        Returns
+        -------
+        RunConfig
+            Validated run configuration.
+
+        Raises
+        ------
+        ConfigError
+            If parsing or validation fails, with identifiers and safe positions.
+
+        Examples
+        --------
+        >>> RunConfig.loads(RunConfig().dumps()) == RunConfig()
+        True
+        """
+        return cls._from_data(loads_toml(text, where="run_config"), where="run_config")
+
+    @classmethod
+    def _from_data(cls, data: object, *, where: str) -> "RunConfig":
+        """Validate parsed settings with one shared summary renderer."""
         try:
             return cls.model_validate(data)
-        except ValidationError as err:
-            errors = err.errors(include_input=False, include_url=False, include_context=False)
-            summary = "; ".join(
-                f"{'.'.join(str(part) for part in item['loc']) or 'run_config'}: {item['msg']}"
-                for item in errors
-            )
-            raise ConfigError(f"{path}: {summary}") from None
+        except ValidationError as error:
+            raise ConfigError(f"{where}: {validation_summary(error, root='run_config')}") from None
 
     def dumps(self) -> str:
         """

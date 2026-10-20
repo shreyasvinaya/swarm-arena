@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._model.protocol import (
     Artifact,
@@ -154,5 +155,7 @@ def test_protocol_record_fields_defaults_and_frozen_slots() -> None:
 
 def test_protocol_validation_errors_do_not_expose_content() -> None:
     with pytest.raises(ValueError, match="exactly one") as caught:
-        Part(text="SENTINEL_SECRET", data="SENTINEL_SECRET")
-    assert "SENTINEL_SECRET" not in str(caught.value)
+        Part(
+            text="1f7f7213-02d5-57ac-9da0-42a305305986", data="1f7f7213-02d5-57ac-9da0-42a305305986"
+        )
+    assert_secret_absent(caught.value, "1f7f7213-02d5-57ac-9da0-42a305305986")

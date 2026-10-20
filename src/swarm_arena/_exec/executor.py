@@ -3,15 +3,16 @@
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from math import isfinite
+from typing import ClassVar, Literal
 
-from pydantic import field_validator
-
-from swarm_arena._model.base import FrozenModel, StoredModel
+from swarm_arena._model.base import FrozenModel, JsonValue, StoredModel
+from swarm_arena._model.canonical import canonical_json
+from swarm_arena._model.data import FiniteJsonObject, Manifest
+from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.tooling import Command, ParentRef, ToolOutput, ToolRequest
-from swarm_arena._tooling.paths import check_key
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,9 +39,9 @@ class Job:
     stage : Job.Stage
         Driver-planned workspace contents.
     timeout_s : float or None
-        Execution timeout in seconds, or None for no timeout.
+        Finite positive execution timeout in seconds, or None for no timeout.
     grace_s : float
-        Grace period in seconds before forced termination.
+        Finite nonnegative grace period in seconds before forced termination.
     resources : Resources
         Resource request used for scheduling.
     env : Mapping[str, str]
@@ -89,7 +90,8 @@ class Job:
         candidate : Job.CandidateFiles or None, default=None
             Candidate data staged for a script check or judge.
         request_json : dict[str, Any] or None, default=None
-            Request document written to ``swarm/request.json``.
+            Request document written to ``swarm/request.json``. None intentionally
+            omits the file; tools that read it must supply a document.
 
         Examples
         --------
@@ -98,18 +100,10 @@ class Job:
         []
         """
 
-        root: dict[str, str] = {}
+        root: Manifest = {}
         parents: list[ParentRef] = []
         candidate: "Job.CandidateFiles | None" = None
-        request_json: dict[str, Any] | None = None
-
-        @field_validator("root")
-        @classmethod
-        def _check_root(cls, root: dict[str, str]) -> dict[str, str]:
-            """Require all root paths to already be in normal form."""
-            for path in root:
-                check_key(path)
-            return root
+        request_json: FiniteJsonObject | None = None
 
     class CandidateFiles(FrozenModel):
         """
@@ -131,17 +125,9 @@ class Job:
         {}
         """
 
-        request: dict[str, Any]
-        output: dict[str, Any]
-        files: dict[str, str]
-
-        @field_validator("files")
-        @classmethod
-        def _check_files(cls, files: dict[str, str]) -> dict[str, str]:
-            """Require all candidate file paths to already be in normal form."""
-            for path in files:
-                check_key(path)
-            return files
+        request: FiniteJsonObject
+        output: FiniteJsonObject
+        files: Manifest
 
     class Started(StoredModel):
         """
@@ -202,9 +188,47 @@ class Job:
     on_partial: Callable[[ToolOutput], Awaitable[None]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        """Require the payload selected by the job kind."""
+        """Require finite execution limits and a consistent payload for the job kind."""
+        for name, value, positive in (
+            ("timeout_s", self.timeout_s, True),
+            ("grace_s", self.grace_s, False),
+        ):
+            if name == "timeout_s" and value is None:
+                continue
+            try:
+                valid = (
+                    value is not None
+                    and isfinite(value)
+                    and (value > 0 if positive else value >= 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                bound = "positive" if positive else "nonnegative"
+                raise ValueError(f"Job.{name}: expected a finite {bound} duration")
         if self.kind == "tool" and (self.tool is None or self.request is None):
             raise ValueError("kind 'tool' needs tool and request")
+        if self.kind == "tool" and self.request is not None and self.stage.request_json is not None:
+            expected: dict[str, JsonValue] = {
+                "schema_version": CURRENT["request"],
+                "params": self.request.inputs,
+                "round": self.request.round,
+                "round_overrides": self.request.round_overrides,
+                "replicate": self.request.replicate,
+            }
+            # Parents are staged separately and may be named in the wire document.
+            actual = {
+                key: value for key, value in self.stage.request_json.items() if key != "parents"
+            }
+            parent_ids = self.stage.request_json.get("parents")
+            expected_parents: list[JsonValue] = [
+                parent.candidate_id for parent in self.request.parents
+            ]
+            if canonical_json(actual) != canonical_json(expected) or (
+                "parents" in self.stage.request_json
+                and canonical_json(parent_ids) != canonical_json(expected_parents)
+            ):
+                raise ValueError("tool request and Stage.request_json disagree")
         if self.kind == "command" and self.command is None:
             raise ValueError("kind 'command' needs command")
 
@@ -240,7 +264,8 @@ class Executor(Configurable, ABC):
 
         Examples
         --------
-        >>> executor.preflight()  # doctest: +SKIP
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> LocalExecutor().preflight()
         """
 
     @abstractmethod
@@ -265,7 +290,22 @@ class Executor(Configurable, ABC):
 
         Examples
         --------
-        >>> output = await executor.submit(job)  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena import Resources
+        >>> from swarm_arena.executor import Executor, Job
+        >>> from swarm_arena.tool import Command, ToolOutput
+        >>> class Memory(Executor):
+        ...     async def submit(self, job: Job) -> ToolOutput:
+        ...         return ToolOutput(status="ok", data={"job": job.id})
+        ...     async def capacity(self) -> Resources | None:
+        ...         return None
+        ...     async def aclose(self) -> None:
+        ...         pass
+        >>> job = Job(id="demo", kind="command", command=Command(argv=["true"]),
+        ...     stage=Job.Stage(), timeout_s=1, grace_s=0, resources=Resources(),
+        ...     env={}, secret_env=(), secrets_file=None, artifact_root="artifacts")
+        >>> anyio.run(Memory().submit, job).data
+        {'job': 'demo'}
         """
 
     @abstractmethod
@@ -276,11 +316,15 @@ class Executor(Configurable, ABC):
         Returns
         -------
         Resources or None
-            Resource capacity, or None when unknown.
+            Resource capacity, or None when unknown. Executors document which
+            fields they track; LocalExecutor tracks only CPUs.
 
         Examples
         --------
-        >>> capacity = await executor.capacity()  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> anyio.run(LocalExecutor().capacity).cpus >= 1
+        True
         """
 
     @abstractmethod
@@ -290,7 +334,9 @@ class Executor(Configurable, ABC):
 
         Examples
         --------
-        >>> await executor.aclose()  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import LocalExecutor
+        >>> anyio.run(LocalExecutor().aclose)
         """
 
     async def confirm_dead(self, started: Job.Started) -> bool | None:
@@ -310,7 +356,11 @@ class Executor(Configurable, ABC):
 
         Examples
         --------
-        >>> dead = await executor.confirm_dead(started)  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import Job, LocalExecutor
+        >>> started = Job.Started(kind="dispatch", job_id="demo")
+        >>> anyio.run(LocalExecutor().confirm_dead, started) is None
+        True
         """
         return None
 
@@ -331,6 +381,10 @@ class Executor(Configurable, ABC):
 
         Examples
         --------
-        >>> killed = await executor.kill_orphan(started)  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.executor import Job, LocalExecutor
+        >>> started = Job.Started(kind="dispatch", job_id="demo")
+        >>> anyio.run(LocalExecutor().kill_orphan, started)
+        False
         """
         return False

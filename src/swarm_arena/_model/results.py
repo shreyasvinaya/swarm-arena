@@ -1,18 +1,18 @@
 """Define scored candidates, learnings, and recorded model calls."""
 
 import math
-import re
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, Self
+from typing import ClassVar, Literal, Self
 
 from pydantic import (
+    Field,
     field_validator,
     model_validator,
 )
 
 from swarm_arena._model.base import CallRole, FrozenModel, StoredModel
+from swarm_arena._model.data import FiniteJsonObject, Manifest
 from swarm_arena._model.tooling import ToolOutput, ToolRequest, Usage
-from swarm_arena._tooling.paths import check_key
 
 
 def _finite_key(key: tuple[float, ...]) -> bool:
@@ -45,7 +45,7 @@ class CheckResult(FrozenModel):
     check: str
     passed: bool
     reasons: list[str] = []
-    details: dict[str, Any] = {}
+    details: FiniteJsonObject = {}
 
 
 class Score(FrozenModel):
@@ -273,26 +273,13 @@ class Candidate(StoredModel):
     output: ToolOutput
     checks: list[CheckResult] = []
     parent_ids: list[str] = []
-    overlay: dict[str, str] = {}
+    overlay: Manifest = {}
     read_ids: list[str] = []
     requested_by_call: str | None = None
     llm_call_ids: list[str] = []
     llm_calls_source: Literal["gateway", "reported", "langfuse", "none", "unknown"] = "none"
     origin: Literal["agent", "human"] = "agent"
     warnings: list[str] = []
-
-    @field_validator("overlay")
-    @classmethod
-    def _check_overlay(cls, overlay: dict[str, str]) -> dict[str, str]:
-        """Require canonical paths and lowercase SHA-256 digests."""
-        for path, digest in overlay.items():
-            try:
-                check_key(path)
-            except ValueError:
-                raise ValueError("overlay keys must be normalized workspace paths") from None
-            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-                raise ValueError("overlay values must be 64 lowercase hex characters")
-        return overlay
 
     @property
     def gated_out(self) -> bool:
@@ -517,8 +504,8 @@ class LLMCall(StoredModel):
     cache_hit: bool = False
     cached_from_call_id: str | None = None
     reservation_id: str | None = None
-    cost_usd: float = 0.0
-    latency_ms: float | None = None
+    cost_usd: float = Field(default=0.0, ge=0)
+    latency_ms: float | None = Field(default=None, ge=0)
     status: Literal["ok", "error"] = "ok"
     error: str | None = None
     trace_url: str | None = None

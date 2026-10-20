@@ -1,5 +1,4 @@
 import re
-import traceback
 from typing import Any, cast
 
 import pytest
@@ -66,8 +65,8 @@ def test_rejected_schemas(prop: dict[str, Any], match: str) -> None:
 
 
 def test_bad_property_name() -> None:
-    with pytest.raises(ValueError, match="_secret"):
-        compile_object_schema("P", {"_secret": {"type": "string"}})
+    with pytest.raises(ValueError, match="e3407e03-d7b6-5cec-b837-460bf6fa7e47"):
+        compile_object_schema("P", {"e3407e03-d7b6-5cec-b837-460bf6fa7e47": {"type": "string"}})
 
 
 def test_string_constraints_boolean_and_untyped_array() -> None:
@@ -218,8 +217,7 @@ def test_invalid_enum_member_errors_hide_secret_values_and_exception_chain() -> 
     secret = "synthetic-secret-enum-member-4827"
     with pytest.raises(ValueError, match=r"P\.p: enum member") as exc_info:
         compile_object_schema("P", {"p": {"type": "integer", "enum": [secret]}})
-    assert secret not in str(exc_info.value)
-    assert secret not in "".join(traceback.format_exception(exc_info.value))
+    assert_secret_absent(exc_info.value, secret)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__suppress_context__
 
@@ -313,17 +311,15 @@ def test_invalid_default_errors_hide_secret_values_and_exception_chain(
     schema = {"type": "array", "items": prop} if nested else prop
     with pytest.raises(ValueError, match=r"P\.p(?:\.items)?: default") as exc_info:
         compile_object_schema("P", {"p": schema})
-    rendered = "".join(traceback.format_exception(exc_info.value))
     for sensitive in (secret, allowed):
-        assert sensitive not in str(exc_info.value)
-        assert sensitive not in rendered
+        assert_secret_absent(exc_info.value, sensitive)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__suppress_context__
 
 
 @pytest.mark.parametrize("keyword", ["type", "pattern", "minimum", "default", "enum"])
 def test_compile_errors_hide_values_and_preserve_identifiers(keyword: str) -> None:
-    secret = "SECRET_SENTINEL_schema_compile"
+    secret = "e24fef9c-0e23-57f7-8bfd-9d42f6ba85c3"
     schemas = {
         "type": {"type": secret},
         "pattern": {"type": "string", "pattern": "(" + secret},
@@ -344,14 +340,14 @@ def test_compile_errors_hide_values_and_preserve_identifiers(keyword: str) -> No
 @pytest.mark.parametrize(
     "malformed",
     [
-        ["SECRET_SENTINEL_subschema"],
-        "SECRET_SENTINEL_subschema",
+        ["68850400-dbde-5977-9987-c9dd835c35b5"],
+        "68850400-dbde-5977-9987-c9dd835c35b5",
         73918462,
         [73918462],
         None,
         True,
         [],
-        ("SECRET_SENTINEL_subschema",),
+        ("68850400-dbde-5977-9987-c9dd835c35b5",),
     ],
 )
 def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, depth: int) -> None:
@@ -362,7 +358,7 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
         compile_object_schema("P", {"xs": schema})
     error = caught.value
     assert str(error) == "P.xs" + ".items" * depth + ": invalid schema"
-    assert_secret_absent(error, "SECRET_SENTINEL_subschema")
+    assert_secret_absent(error, "68850400-dbde-5977-9987-c9dd835c35b5")
     assert_secret_absent(error, "73918462")
     assert error.__cause__ is None
 
@@ -449,24 +445,36 @@ def test_reserved_names_follow_generated_model_config(
             True,
             False,
             None,
-            "SECRET_keyword",
-            ["SECRET_keyword"],
-            {"v": "SECRET_keyword"},
+            "78fd17af-3119-5e70-b465-e8698b49e79f",
+            ["78fd17af-3119-5e70-b465-e8698b49e79f"],
+            {"v": "78fd17af-3119-5e70-b465-e8698b49e79f"},
         )
     ]
     + [
         ("string", keyword, bad)
         for keyword in ("minLength", "maxLength")
-        for bad in (True, False, -1, 1.5, None, "SECRET_keyword", [], {})
+        for bad in (True, False, -1, 1.5, None, "78fd17af-3119-5e70-b465-e8698b49e79f", [], {})
     ]
     + [
         ("string", keyword, bad)
         for keyword in ("description", "pattern")
-        for bad in (True, 5, 1.5, None, ["SECRET_keyword"], {"v": "SECRET_keyword"})
+        for bad in (
+            True,
+            5,
+            1.5,
+            None,
+            ["78fd17af-3119-5e70-b465-e8698b49e79f"],
+            {"v": "78fd17af-3119-5e70-b465-e8698b49e79f"},
+        )
     ]
-    + [("string", "pattern", re.compile("SECRET_keyword"))]
-    + [("string", "enum", bad) for bad in (True, 5, None, "SECRET_keyword", (), {}, [])]
-    + [(None, "type", bad) for bad in (True, 5, None, ["SECRET_keyword"], {})],
+    + [("string", "pattern", re.compile("78fd17af-3119-5e70-b465-e8698b49e79f"))]
+    + [
+        ("string", "enum", bad)
+        for bad in (True, 5, None, "78fd17af-3119-5e70-b465-e8698b49e79f", (), {}, [])
+    ]
+    + [
+        (None, "type", bad) for bad in (True, 5, None, ["78fd17af-3119-5e70-b465-e8698b49e79f"], {})
+    ],
 )
 def test_wrong_typed_keywords_have_exact_value_free_errors(
     kind: str | None, keyword: str, bad: Any, *, nested: bool
@@ -477,7 +485,7 @@ def test_wrong_typed_keywords_have_exact_value_free_errors(
         compile_object_schema("P", {"p": schema})
     assert str(caught.value) == "P.p" + (".items" if nested else "") + f": invalid {keyword}"
     error = caught.value
-    assert_secret_absent(error, "SECRET_keyword")
+    assert_secret_absent(error, "78fd17af-3119-5e70-b465-e8698b49e79f")
     assert error.__cause__ is None
 
 
@@ -522,14 +530,14 @@ def test_large_bad_default_has_sorted_unique_bounded_reasons() -> None:
                 "xs": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 1, "maximum": 2},
-                    "default": ["SECRET_default"] * 199_998 + [0, 3],
+                    "default": ["a211c231-aa80-5134-9ed1-ea183b855c0c"] * 199_998 + [0, 3],
                 }
             },
         )
     assert str(caught.value) == (
         "P.xs: default does not match the schema (greater_than_equal, int_type, less_than_equal)"
     )
-    assert "SECRET_default" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "a211c231-aa80-5134-9ed1-ea183b855c0c")
     assert caught.value.__cause__ is None
 
 
@@ -537,7 +545,7 @@ def test_large_bad_default_has_sorted_unique_bounded_reasons() -> None:
 def test_default_reasons_show_at_most_five_types(
     monkeypatch: pytest.MonkeyPatch, count: int
 ) -> None:
-    secret = "SECRET_default"
+    secret = "a211c231-aa80-5134-9ed1-ea183b855c0c"
     codes = [
         "tuple_type",
         "string_type",
@@ -557,7 +565,7 @@ def test_default_reasons_show_at_most_five_types(
         compile_object_schema("P", {"p": {"type": "integer", "default": secret}})
     expected = sorted(set(codes))[:5] + (["…"] if count > 5 else [])
     assert str(caught.value) == f"P.p: default does not match the schema ({', '.join(expected)})"
-    assert "SECRET_default" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "a211c231-aa80-5134-9ed1-ea183b855c0c")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -611,14 +619,14 @@ def test_rust_pattern_unicode_digit() -> None:
 @pytest.mark.parametrize("keyword", ["enum", "default"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_nonfinite_nested_schema_data_is_refused(keyword: str, nested: bool) -> None:
-    value = {"private": [float("inf")]}
+    value = {"c2201efb-31a9-5858-a7cf-224276aa5601": [float("inf")]}
     prop = {"type": "array", keyword: [value]}
     schema = {"type": "array", "items": prop} if nested else prop
     path = "P.p.items" if nested else "P.p"
     with pytest.raises(_SchemaError) as caught:
         compile_object_schema("P", {"p": schema})
     assert str(caught.value) == f"{path}: invalid {keyword}"
-    assert_secret_absent(caught.value, "private")
+    assert_secret_absent(caught.value, "c2201efb-31a9-5858-a7cf-224276aa5601")
 
 
 @pytest.mark.parametrize("pattern", [r"^(?!foo)", r"^(a)\1$"])
@@ -627,3 +635,12 @@ def test_unsupported_rust_patterns_are_value_free(pattern: str) -> None:
         compile_object_schema("P", {"p": {"type": "string", "pattern": pattern}})
     assert str(caught.value) == "P.p: invalid schema (keywords: type, pattern)"
     assert_secret_absent(caught.value, pattern)
+
+
+def test_compiled_defaults_refuse_unencodable_text() -> None:
+    secret = "b0784ca9-5149-4c15-8b78-2c4e1a8a6836"
+    default = secret + "\ud800"
+    schema = {"text": {"type": "string", "default": default}}
+    with pytest.raises(ValueError, match="default") as caught:
+        compile_object_schema("Params", schema)
+    assert_secret_absent(caught.value, secret, sanitized=True)

@@ -1,8 +1,7 @@
 """Define declarative plans, component specifications, and TOML loading."""
 
-import tomllib
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Self, cast
+from typing import Annotated, Any, ClassVar, Literal, Self
 
 from pydantic import (
     Field,
@@ -13,12 +12,14 @@ from pydantic import (
 )
 
 from swarm_arena._errors import ConfigError
-from swarm_arena._model.base import JsonValue, Origin, StoredModel, _SafeModel
+from swarm_arena._model.base import Origin, StoredModel, _SafeModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.data import TomlJsonObject, finite_json
+from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal, _Slug
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref, RefField, unique_names
-from swarm_arena._model.toml_io import dumps_toml, read_toml
+from swarm_arena._model.toml_io import dumps_toml, loads_toml, read_toml
 
 _Rationale = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -175,7 +176,7 @@ class RoundSpec(_SafeModel):
 
     _unknown_fields: ClassVar[Literal["show", "hide"]] = "show"
 
-    tool_overrides: dict[str, Any] = {}
+    tool_overrides: TomlJsonObject = {}
     tool_timeout_s: float | None = Field(default=None, gt=0)
     fidelity: str | None = None
 
@@ -201,10 +202,7 @@ class RoundSpec(_SafeModel):
         """
         if self.fidelity:
             return self.fidelity
-        try:
-            encoded = canonical_json(cast(JsonValue, self.tool_overrides))
-        except (TypeError, ValueError):
-            raise ValueError("tool_overrides: expected finite JSON values") from None
+        encoded = canonical_json(finite_json(self.tool_overrides, allow_none=False))
         return sha256_hex(encoded)[:12]
 
 
@@ -375,11 +373,7 @@ class Plan(StoredModel):
         try:
             plan = cls.model_validate(data)
         except ValidationError as err:
-            errors = err.errors(include_input=False, include_url=False, include_context=False)
-            summary = "; ".join(
-                f"{'.'.join(str(part) for part in item['loc']) or 'plan'}: {item['msg']}"
-                for item in errors
-            )
+            summary = validation_summary(err, root="plan")
             raise ConfigError(summary) from None
         plan._base_dir = base_dir
         return plan
@@ -402,10 +396,8 @@ class Plan(StoredModel):
         Raises
         ------
         ConfigError
-            If TOML parsing or plan validation fails; includes the file path and
+            If reading, decoding, TOML parsing or plan validation fails; includes the file path and
             invalid field identifiers, but omits rejected values.
-        OSError
-            If the plan file cannot be read.
 
         Examples
         --------
@@ -414,13 +406,13 @@ class Plan(StoredModel):
         True
         """
         path = Path(path)
+        data = read_toml(path)
         try:
-            data = read_toml(path)
-        except ConfigError:
-            # read_toml's parser message and exception chain can contain input keys.
-            raise ConfigError(f"{path}: invalid TOML") from None
+            base_dir = path.parent.resolve()
+        except (OSError, RuntimeError):
+            raise ConfigError(f"{path}: cannot resolve plan directory") from None
         try:
-            return cls._from_data(data, base_dir=path.parent.resolve())
+            return cls._from_data(data, base_dir=base_dir)
         except ConfigError as err:
             raise ConfigError(f"{path}: {err}") from None
 
@@ -455,10 +447,7 @@ class Plan(StoredModel):
         >>> Plan.loads(text, base_dir=Path(".")).origin
         'human'
         """
-        try:
-            data = tomllib.loads(text)
-        except tomllib.TOMLDecodeError:
-            raise ConfigError("plan: invalid TOML") from None
+        data = loads_toml(text, where="plan")
         return cls._from_data(data, base_dir=base_dir)
 
     def dumps(self) -> str:
@@ -522,12 +511,7 @@ class Plan(StoredModel):
         ...      judges=[Ref(path="demo:Judge", name="score")]).ranking_name()
         'score'
         """
-        try:
-            judges = [ref.model_copy(update={"name": ref.component_name()}) for ref in self.judges]
-        except (ValueError, TypeError):
-            raise ValueError("judges: invalid component names") from None
-        # Name resolution can raise unsafe import errors; uniqueness errors contain
-        # only the already-resolved identifiers and may retain their diagnostics.
+        judges = [ref.model_copy(update={"name": ref.component_name()}) for ref in self.judges]
         names = unique_names(judges)
         if not self.ranking:
             if len(names) == 1:

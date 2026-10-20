@@ -14,6 +14,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._model.base import CatalogKind, LLMRole, _SafeModel
+from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.goal import _Slug
 from swarm_arena._model.ref import Ref, load_object
 from swarm_arena._model.schema import compile_object_schema
@@ -216,8 +217,8 @@ class CatalogEntry(_ConfigModel):
     kind: CatalogKind
     ref: str
     description: str
-    config: dict[str, Any] = {}
-    settable: dict[str, Any] = {}
+    config: TomlJsonObject = {}
+    settable: TomlJsonObject = {}
 
     @field_validator("ref")
     @classmethod
@@ -296,15 +297,10 @@ class PlannerCatalog(_ConfigModel):
         for entry in self.entries:
             if not entry.settable:
                 continue
-            try:
-                cls = load_object(entry.ref)
-                if not isinstance(cls, type):
-                    raise ValueError("catalog reference must be a class")
-                human_only = getattr(cls, "_human_only", frozenset())
-            except Exception:
-                raise PydanticCustomError(
-                    "arena_config", "cannot load catalog component class"
-                ) from None
+            cls = load_object(entry.ref)
+            if not isinstance(cls, type):
+                raise ValueError("catalog reference must be a class")
+            human_only = getattr(cls, "_human_only", frozenset())
             for key in entry.settable:
                 if key in human_only:
                     raise PydanticCustomError(

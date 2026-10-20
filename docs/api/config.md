@@ -24,6 +24,8 @@ config = RunConfig(
     ),
 )
 text = config.dumps()
+restored = RunConfig.loads(text)
+assert restored == config
 # Save text to run.toml, then load it with RunConfig.load("run.toml").
 ```
 
@@ -47,7 +49,7 @@ or pattern, and patterns use Rust regex syntax (no lookaround or backreferences;
 
 `PlannerCatalog` rejects duplicate names. For entries with settable fields it
 imports the component class during validation and rejects fields listed in that
-class's `_human_only` attribute. Entries without settable fields need no import.
+component's human-only settings. Entries without settable fields need no import.
 `match()` compares the component kind, import path, and raw fixed configuration;
 full component validation belongs to the later planning validation layer.
 
@@ -61,3 +63,32 @@ Validation diagnostics contain at most 20 error details in Pydantic order,
 followed by `and N more errors` when truncated, including in component `ConfigError`
 summaries. The omitted count includes errors hidden by explicit nested validation.
 Any segment on which matching schema paths disagree is hidden, including string identifiers.
+
+## Portable values and execution limits
+
+Free-form goal inputs, goal metadata, component configuration, round overrides,
+and tool output data accept finite JSON values with string keys and strict UTF-8
+text. TOML-bound data rejects nulls at construction so persistence cannot silently
+drop values. Tool outputs and other JSON-only payloads may contain JSON null.
+Optional typed fields, such as an unset gateway, remain optional and are omitted
+when saving. A component instance can omit typed fields whose default is
+`None`; an explicit `None` that would replace a non-null default is refused.
+
+JSON containers are limited to 100 levels of nesting. Edit text and compiled
+string parameters also reject lone Unicode surrogates before encoding a request.
+File manifests require normalized workspace paths and 64 lowercase hexadecimal
+SHA-256 digests.
+
+Budgets, usage counters, estimates, prices, and resource requests must be finite
+and nonnegative. Timeouts and synchronization intervals must be strictly positive;
+shutdown grace periods may be zero. A reported tool usage count or cost below
+zero makes its result invalid.
+
+`Plan.load()` and `RunConfig.load()` turn file, encoding, syntax, and validation
+failures into `ConfigError`. TOML syntax diagnostics retain line and column
+numbers while omitting source snippets. Component import errors name only the
+import path. Sanitized validation errors support pickling and deep copying.
+
+For a tool `Job`, a supplied `stage.request_json` must agree with its `request`.
+Setting `stage.request_json=None` intentionally omits `swarm/request.json`; tools
+that read this file must supply a request document.

@@ -1,9 +1,9 @@
 import tomllib
-import traceback
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from pydantic import ValidationError
 
 from swarm_arena._errors import ConfigError
@@ -127,15 +127,12 @@ def test_unknown_run_config_fields_show_identifiers_without_values(
     for segment in table.split(".") if table else []:
         target = target.setdefault(segment, {})
     target.update(defaults)
-    target[key] = "SECRET_SENTINEL"
+    target[key] = "f31a4604-550d-5b3d-b9b3-65a6a2254cd4"
     with pytest.raises(ValidationError) as caught:
         RunConfig.model_validate(data)
     assert location in str(caught.value)
     assert "extra_forbidden" in str(caught.value)
-    assert "SECRET_SENTINEL" not in str(caught.value)
-    assert "SECRET_SENTINEL" not in repr(caught.value.args)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
-    assert "SECRET_SENTINEL" not in caught.value.json()
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
     path = tmp_path / "typo.toml"
     path.write_text(dumps_toml(data))
@@ -143,9 +140,7 @@ def test_unknown_run_config_fields_show_identifiers_without_values(
         RunConfig.load(path)
     assert location in str(loaded.value)
     assert "extra_forbidden" in str(loaded.value)
-    assert "SECRET_SENTINEL" not in str(loaded.value)
-    assert "SECRET_SENTINEL" not in repr(loaded.value.args)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(loaded.value))
+    assert_secret_absent(loaded.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
 
 def test_run_config_refs_roots_and_defaults_are_independent(tmp_path: Path) -> None:
@@ -194,9 +189,7 @@ def test_load_errors_hide_values_and_data_keys(tmp_path: Path, text: str) -> Non
     path.write_text(text)
     with pytest.raises(ConfigError, match=r"secret\.toml") as caught:
         RunConfig.load(path)
-    assert "SECRET_SENTINEL" not in str(caught.value)
-    assert "SECRET_SENTINEL" not in repr(caught.value.args)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
     assert caught.value.__cause__ is None
     assert caught.value.__suppress_context__
 
@@ -208,7 +201,7 @@ def test_load_read_errors_are_config_errors(tmp_path: Path) -> None:
     path.write_bytes(b'key="SECRET_SENTINEL\xff"')
     with pytest.raises(ConfigError, match=r"invalid\.toml") as caught:
         RunConfig.load(path)
-    assert "SECRET_SENTINEL" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
 
 
 def test_dumps_deterministic_populated_config(tmp_path: Path) -> None:
