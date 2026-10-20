@@ -98,11 +98,43 @@ def events(config: RunConfig, type: str) -> list[Event]:
     return [e for e in all_events(config) if e.type == type]
 
 
+def _started_store(config: RunConfig) -> LocalStore | None:
+    """Treat unpublished startup state as pending; require a committed start."""
+    try:
+        store = LocalStore(run_dir(config))
+    except (FileNotFoundError, StopIteration):
+        return None
+    read = read_committed(store)
+    if read is not None and any(e.type == "tool_start" for e in read[1]):
+        return store
+    return None
+
+
 async def wait_tool_started(config: RunConfig) -> LocalStore:
+    """
+    Wait for a tool start in a committed journal snapshot.
+
+    Parameters
+    ----------
+    config : RunConfig
+        Test configuration with one run below its run root.
+
+    Returns
+    -------
+    LocalStore
+        The run store whose committed chain contains a tool start.
+
+    Notes
+    -----
+    The root, run directory and owner document may appear in separate steps.
+    Their absence is pending startup, while malformed journals still fail.
+
+    Examples
+    --------
+    >>> store = await wait_tool_started(config)  # doctest: +SKIP
+    """
     with anyio.fail_after(20):
         while True:
-            if await anyio.to_thread.run_sync(
-                Path(config.run_root).exists
-            ) and await anyio.to_thread.run_sync(events, config, "tool_start"):
-                return LocalStore(run_dir(config))
+            if (store := await anyio.to_thread.run_sync(_started_store, config)) is not None:
+                return store
             await anyio.sleep(0.02)
