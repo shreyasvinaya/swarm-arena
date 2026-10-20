@@ -69,7 +69,7 @@ def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPa
 _VALUE: contextvars.ContextVar[str] = contextvars.ContextVar("value", default="unset")
 
 
-async def test_runs_in_a_copy_of_the_callers_context() -> None:  # IF3 A3
+async def test_runs_in_a_copy_of_the_callers_context() -> None:
     def work() -> str:
         seen = _VALUE.get()
         _VALUE.set("changed in the thread")

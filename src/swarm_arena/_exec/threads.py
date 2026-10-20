@@ -4,7 +4,7 @@ import contextlib
 import contextvars
 import threading
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 
 import anyio
 import anyio.from_thread
@@ -61,24 +61,34 @@ async def run_sync_daemon(fn: Callable[..., T], *args: Any) -> T:
     >>> anyio.run(main)
     'ada'
     """
-    done = anyio.Event()
-    token = anyio.lowlevel.current_token()
-    context = contextvars.copy_context()
-    results: list[T] = []
-    errors: list[BaseException] = []
+    return await _DaemonCall(fn, *args).result()
 
-    def work() -> None:
-        try:
-            results.append(context.run(fn, *args))
-        except BaseException as exc:  # handed to the awaiting task, which re-raises it
-            errors.append(exc)
-        # RunFinishedError or RuntimeError: the loop has finished, so nobody is waiting.
-        with contextlib.suppress(Exception):
-            anyio.from_thread.run_sync(done.set, token=token)
 
-    name = f"swarm-arena-daemon-{getattr(fn, '__name__', 'work')}"
-    threading.Thread(target=work, name=name, daemon=True).start()
-    await done.wait()
-    if errors:
-        raise errors[0]
-    return results[0]
+class _DaemonCall(Generic[T]):
+    """Retain one daemon call's outcome so cancelled waiters can rejoin it."""
+
+    def __init__(self, fn: Callable[..., T], *args: Any) -> None:
+        self._done = anyio.Event()
+        self._results: list[T] = []
+        self._errors: list[BaseException] = []
+        token = anyio.lowlevel.current_token()
+        context = contextvars.copy_context()
+
+        def work() -> None:
+            try:
+                self._results.append(context.run(fn, *args))
+            except BaseException as exc:
+                self._errors.append(exc)
+            # A late result after loop shutdown is intentionally discarded.
+            with contextlib.suppress(Exception):
+                anyio.from_thread.run_sync(self._done.set, token=token)
+
+        name = f"swarm-arena-daemon-{getattr(fn, '__name__', 'work')}"
+        threading.Thread(target=work, name=name, daemon=True).start()
+
+    async def result(self) -> T:
+        """Await the original outcome without starting work again."""
+        await self._done.wait()
+        if self._errors:
+            raise self._errors[0]
+        return self._results[0]

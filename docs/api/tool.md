@@ -48,17 +48,16 @@ snapshotted or declared.
 Every read of a tool-written file is bounded. Its size is checked before it is
 read, so a larger file, even a sparse one, is refused unread:
 
-- `swarm/result.json`: at most 16 MiB (`MAX_RESULT_JSON_BYTES`).
-- The files one result declares: at most 256 MiB together
-  (`MAX_DECLARED_FILES_BYTES`). Their sizes are summed before any is read, and
-  they are hashed one at a time.
+- `swarm/result.json`: at most 16 MiB.
+- The files one result declares: at most 256 MiB together. Their sizes are
+  summed before any is read, and they are hashed one at a time.
 - `LocalExecutor` uploads the last `max_log_bytes` (default 8 MiB) of each log,
   and at most `max_output_bytes` (default 256 MiB) of declared output files per
   run (`LocalExecutor.Config`). A run whose outputs cross that cap gets status
   `error` and no files.
 
 Snapshots of human-authored goal, tool, check, and judge files are bounded too:
-at most 1 GiB per file (`MAX_SNAPSHOT_FILE_BYTES`).
+at most 1 GiB per file.
 
 A successful process requires a valid result; otherwise collection returns `error`
 and appends a sanitized reason to stderr. A valid result after timeout or
@@ -72,5 +71,13 @@ Check and judge commands use the raw JSON object rather than this tool envelope.
 
 Timeout selection uses the round override, then the tool's configured timeout,
 then the hard limit, always capped at the hard limit. Shutdown grace defaults to
-ten seconds. Result reads and diagnostic appends refuse special files such as
+ten seconds. A connector's returned `Command` can tighten these limits: execution
+uses the smaller non-`None` timeout from the Command and job, and the smaller
+shutdown grace. A `None` timeout imposes no additional bound. Local collection
+runs once per job in a daemon thread and has a 30-second bound, including after
+normal process exit. Cancellation during collection waits for the original
+collect until its existing deadline. `SystemExit` in `command` or `collect`
+becomes a job failure; KeyboardInterrupt and cancellation propagate.
+
+Result reads and diagnostic appends refuse special files such as
 FIFOs so collection cannot stall waiting for another process to open them.

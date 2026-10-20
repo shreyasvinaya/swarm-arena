@@ -1,7 +1,7 @@
-import traceback
 from pathlib import Path
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
 
 from swarm_arena._exec.env import BASE_ENV_NAMES, build_env, read_secrets_file, tool_env_vars
@@ -14,11 +14,10 @@ def test_read_secrets_file(tmp_path: Path) -> None:
 
 
 def test_bad_secrets_line_never_echoes_value(tmp_path: Path) -> None:
-    (tmp_path / "s.env").write_text("A=1\nSECRETVALUE\n")
+    (tmp_path / "s.env").write_text("A=1\n7d271c19-62ce-491c-90cb-c12c415563d1\n")
     with pytest.raises(ValueError, match="line 2") as exc:
         read_secrets_file(str(tmp_path / "s.env"))
-    assert "SECRETVALUE" not in str(exc.value)
-    assert "SECRETVALUE" not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, "7d271c19-62ce-491c-90cb-c12c415563d1")
     with pytest.raises(ValueError, match="secrets file not found"):
         read_secrets_file(str(tmp_path / "none.env"))
 
@@ -70,10 +69,10 @@ def test_build_env_layers(tmp_path: Path) -> None:
 @pytest.mark.parametrize("key", ["", "1KEY", "BAD-KEY", "BAD KEY", "é", "A\x00B"])
 def test_bad_secrets_key_is_sanitized(tmp_path: Path, key: str) -> None:
     path = tmp_path / "s.env"
-    path.write_text(f"# comment\n{key}=sentinel-secret\n")
+    path.write_text(f"# comment\n{key}=0996cfd4-7bda-48c7-938c-cda7b0dd532d\n")
     with pytest.raises(ValueError, match=r"line 2: expected KEY=VALUE") as exc:
         read_secrets_file(str(path))
-    assert "sentinel-secret" not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, "0996cfd4-7bda-48c7-938c-cda7b0dd532d")
 
 
 def test_secrets_file_preserves_values_and_last_duplicate(tmp_path: Path) -> None:
@@ -87,7 +86,13 @@ def test_secrets_file_preserves_values_and_last_duplicate(tmp_path: Path) -> Non
     }
 
 
-@pytest.mark.parametrize("error", [OSError("sentinel-secret"), UnicodeError("sentinel-secret")])
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("0996cfd4-7bda-48c7-938c-cda7b0dd532d"),
+        UnicodeError("0996cfd4-7bda-48c7-938c-cda7b0dd532d"),
+    ],
+)
 def test_unreadable_secrets_file_is_sanitized(
     monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
@@ -97,7 +102,7 @@ def test_unreadable_secrets_file_is_sanitized(
     monkeypatch.setattr(Path, "read_text", fail_read)
     with pytest.raises(ValueError, match="cannot read secrets file") as exc:
         read_secrets_file("s.env")
-    assert "sentinel-secret" not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, "0996cfd4-7bda-48c7-938c-cda7b0dd532d")
 
 
 def test_build_env_base_names_and_overrides(tmp_path: Path) -> None:

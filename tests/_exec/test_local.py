@@ -1,5 +1,3 @@
-import contextlib
-import io
 import json
 import logging
 import os
@@ -9,8 +7,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from typing import Any
 import anyio
 import pytest
 from _fakes.proc import pid_alive, reap, require_visible_proc, spawn_group, wait_until
+from _fakes.read_counts import count_reads
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
     COLLECTING,
@@ -37,15 +38,22 @@ from _fakes.tools import (
 from pydantic import ValidationError
 
 from swarm_arena._errors import NotFound, StorageError
-from swarm_arena._exec import local, supervisor
+from swarm_arena._exec import local_run, local_stage, local_workspace, supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._exec.procinfo import host_id, process_start_time
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
-from swarm_arena._model.canonical import sha256_hex
+from swarm_arena._model.canonical import sha256_hex, utc_now
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Ref
-from swarm_arena._model.tooling import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    Command,
+    CompletedRun,
+    FileRef,
+    RunStatus,
+    ToolOutput,
+    ToolRequest,
+)
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 
@@ -176,7 +184,7 @@ async def test_job_timeout_wins_and_partial_kept(
     local_executor: LocalExecutor, tmp_path: Path
 ) -> None:
     # OkCollectTool's output does not depend on how fast the tool starts, so the 1 s
-    # timeout cannot race start-up under load (IF3 A8b); the data shows partial is kept.
+    # timeout cannot race start-up under load; the data shows partial is kept.
     started = time.monotonic()
     out = await local_executor.submit(
         tool_job(
@@ -295,7 +303,7 @@ async def test_unsafe_workspace_root_refused(tmp_path: Path, mode: int) -> None:
     assert (await LocalExecutor(workspace_root=str(ws)).submit(job)).status is RunStatus.OK
 
 
-async def test_workspace_root_parent_must_be_safe(tmp_path: Path) -> None:  # M5
+async def test_workspace_root_parent_must_be_safe(tmp_path: Path) -> None:
     parent = tmp_path / "open"
     parent.mkdir()
     (parent / "ws").mkdir(mode=0o700)
@@ -311,7 +319,7 @@ async def test_workspace_root_parent_must_be_safe(tmp_path: Path) -> None:  # M5
 
 async def test_default_workspace_root_is_per_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # M6
+) -> None:
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     job = tool_job(tmp_path, WRITE.format("{'data': {}}"))
     out = await LocalExecutor(keep_workspaces=True).submit(job)
@@ -320,7 +328,7 @@ async def test_default_workspace_root_is_per_user(
     assert workspace.name.startswith("c-1-")
 
 
-async def test_job_id_is_sanitized_in_the_workspace_name(tmp_path: Path) -> None:  # M11
+async def test_job_id_is_sanitized_in_the_workspace_name(tmp_path: Path) -> None:
     root = tmp_path / "kept"
     ex = LocalExecutor(workspace_root=str(root), keep_workspaces=True)
     for job_id in ("../escaped", "x" * 100):
@@ -341,7 +349,7 @@ async def test_collect_exception_becomes_error(
     out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=BadCollectTool))
     assert out.status is RunStatus.ERROR
     assert b"collect broke" in log(tmp_path, out, 2)
-    assert out.started_at is not None  # M11: the executor stamps the run times itself
+    assert out.started_at is not None  # the executor stamps the run times itself
     assert out.ended_at is not None
     assert out.started_at <= out.ended_at
 
@@ -368,7 +376,7 @@ async def test_blocked_collect_cannot_stop_kill(
             os.mkfifo(workspace / "swarm/stderr.log")
 
     code = "import time; time.sleep(60)"
-    RELEASE.clear()  # C40: a set event from an earlier case would not block collect
+    RELEASE.clear()  # a set event from an earlier case would not block collect
     try:
         with anyio.fail_after(10):  # collect blocks for 30 s unless it is abandoned
             out = await local_executor.submit(
@@ -379,7 +387,7 @@ async def test_blocked_collect_cannot_stop_kill(
         assert wait_until(lambda: not pid_alive(pid), 5)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
-            assert b"no partial output" in log(tmp_path, out, 2)  # M11
+            assert b"no partial output" in log(tmp_path, out, 2)
             assert out.started_at is not None
             assert out.ended_at is not None
             assert out.started_at <= out.ended_at
@@ -466,7 +474,7 @@ async def test_capacity_preflight_init(tmp_path: Path, monkeypatch: pytest.Monke
     assert ex.config.max_output_bytes == 256 * 2**20
     await ex.aclose()
     ex.preflight()
-    monkeypatch.setattr(os, "name", "nt")  # C43: the last step, so no Path is built while it holds
+    monkeypatch.setattr(os, "name", "nt")  # the last step, so no Path is built while it holds
     with pytest.raises(RuntimeError, match="POSIX"):
         ex.preflight()
 
@@ -487,11 +495,11 @@ async def test_confirm_dead_and_kill_orphan(local_executor: LocalExecutor) -> No
         assert await local_executor.confirm_dead(started) is False  # alive
         assert await local_executor.kill_orphan(started) is True
         deadline = time.monotonic() + 5
-        while not await local_executor.confirm_dead(started):  # an unreaped zombie is dead (C43)
+        while not await local_executor.confirm_dead(started):  # an unreaped zombie is dead
             assert time.monotonic() < deadline, "the killed group still looks alive"
             await anyio.sleep(0.05)
         assert pid_alive(proc.pid)  # still a zombie: nothing has reaped it yet
-        await anyio.to_thread.run_sync(reap, proc)  # C41
+        await anyio.to_thread.run_sync(reap, proc)
         assert await local_executor.confirm_dead(started) is True
         assert await local_executor.kill_orphan(started) is False  # gone: nothing to kill
         other = started.model_copy(update={"host_id": "other:x"})
@@ -504,7 +512,7 @@ async def test_confirm_dead_and_kill_orphan(local_executor: LocalExecutor) -> No
 
 async def test_confirm_dead_unknown_boot_is_none(
     local_executor: LocalExecutor, monkeypatch: pytest.MonkeyPatch
-) -> None:  # M11: this host's own id ends in ':unknown', so the record matches it
+) -> None:  # this host's own id ends in ':unknown', so the record matches it
     unknown = "somehost:unknown"
     monkeypatch.setattr(local_executor, "_host_id", unknown)
     started = Job.Started(
@@ -566,8 +574,8 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     monkeypatch: pytest.MonkeyPatch,
     budget: float,
     kept: bool,
-) -> None:  # L1
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", budget)  # bounds the re-collect
+) -> None:
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", budget)  # bounds the original collect
     got: list[ToolOutput] = []
 
     async def on_partial(o: ToolOutput) -> None:
@@ -594,7 +602,7 @@ async def test_cancel_after_normal_exit_keeps_the_result(
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
 async def test_stop_facts_are_stamped_on_the_partial(
     local_executor: LocalExecutor, tmp_path: Path, stop: str
-) -> None:  # L2: OkCollectTool returns status OK and partial False whatever happened
+) -> None:  # OkCollectTool returns status OK and partial False whatever happened
     code = "open('ready', 'w'); import time; time.sleep(60)"
     if stop == "timeout":
         out = await local_executor.submit(
@@ -614,7 +622,7 @@ async def test_stop_facts_are_stamped_on_the_partial(
 
 async def test_cancel_during_staging_delivers_nothing(
     local_executor: LocalExecutor, tmp_path: Path
-) -> None:  # M8
+) -> None:
     got: list[ToolOutput] = []
 
     async def on_partial(o: ToolOutput) -> None:
@@ -637,7 +645,7 @@ async def test_cancel_during_staging_delivers_nothing(
 
 async def test_failed_cancel_path_upload_sends_no_unstored_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # M3
+) -> None:
     got: list[ToolOutput] = []
 
     async def on_partial(o: ToolOutput) -> None:
@@ -670,7 +678,7 @@ async def test_failed_cancel_path_upload_sends_no_unstored_refs(
 
 
 async def test_missing_cwd_is_a_job_error(local_executor: LocalExecutor, tmp_path: Path) -> None:
-    out = await local_executor.submit(  # M2
+    out = await local_executor.submit(
         command_job(tmp_path, Command(argv=["python", "-c", "pass"], cwd="missing/dir"))
     )
     assert (out.status, out.files) == (RunStatus.ERROR, [])
@@ -681,7 +689,7 @@ async def test_missing_cwd_is_a_job_error(local_executor: LocalExecutor, tmp_pat
 
 async def test_missing_stage_artifact_raises_and_cleans_up(
     local_executor: LocalExecutor, tmp_path: Path
-) -> None:  # M2 / Raises: a stage artifact that is not in the store
+) -> None:  # a stage artifact that is not in the store
     job = command_job(
         tmp_path, Command(argv=["true"]), stage=Job.Stage(root={"problem/in.txt": "e" * 64})
     )
@@ -691,8 +699,8 @@ async def test_missing_stage_artifact_raises_and_cleans_up(
 
 
 @pytest.mark.parametrize("entry", ["fields", "model_validate_json"])
-def test_config_errors_hide_values(entry: str) -> None:  # M1
-    secret = "SECRET_SENTINEL_local_executor"
+def test_config_errors_hide_values(entry: str) -> None:
+    secret = "81fc2389-90d2-4331-8e22-cc91703ac8ed"
 
     def build() -> object:
         if entry == "fields":
@@ -707,7 +715,7 @@ def test_config_errors_hide_values(entry: str) -> None:  # M1
     assert_secret_absent(caught.value, secret, sanitized=True)
 
 
-async def test_rlimits_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # M11
+async def test_rlimits_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[RLimits | None] = []
     original = ProcessSupervisor.run
 
@@ -731,7 +739,7 @@ async def test_rlimits_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.skipif(
     sys.platform != "linux", reason="macOS refuses RLIMIT_AS; the launcher notes it in stderr"
 )
-async def test_memory_gib_sets_the_address_space_limit(tmp_path: Path) -> None:  # M11
+async def test_memory_gib_sets_the_address_space_limit(tmp_path: Path) -> None:
     code = "import resource; " + WRITE.format("{'as': resource.getrlimit(resource.RLIMIT_AS)[0]}")
     job = command_job(
         tmp_path, Command(argv=["python", "-c", code]), resources=Resources(memory_gib=0.5)
@@ -743,7 +751,7 @@ async def test_memory_gib_sets_the_address_space_limit(tmp_path: Path) -> None: 
 async def test_sparse_log_upload_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cap = 1 << 20  # L3, K4: every driver read path is counted while submit runs
+    cap = 1 << 20  # every driver read path is counted while submit runs
     read: list[int] = []
     code = (
         WRITE.format("{'data': {}}") + "; import os; os.truncate('swarm/stdout.log', "
@@ -762,59 +770,7 @@ async def test_sparse_log_upload_is_bounded(
     assert cap <= total <= cap + 64 * 1024  # the tail and small files, never the whole 2x log
 
 
-class _CountingStream:
-    """Wrap a file object and record the size of everything read through it."""
-
-    def __init__(self, stream: Any, sink: list[int]) -> None:
-        self._stream = stream
-        self._sink = sink
-
-    def read(self, *args: Any) -> Any:
-        data = self._stream.read(*args)
-        self._sink.append(len(data))
-        return data
-
-    def __enter__(self) -> "_CountingStream":
-        self._stream.__enter__()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stream.__exit__(*exc)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-@contextlib.contextmanager
-def count_reads(monkeypatch: pytest.MonkeyPatch, sink: list[int]) -> Generator[None]:
-    """Count bytes read through os.read, os.pread, os.fdopen streams, and io.open streams."""
-    with monkeypatch.context() as patch:
-        real_read, real_pread, real_fdopen, real_open = os.read, os.pread, os.fdopen, io.open
-
-        def read(fd: int, n: int) -> bytes:
-            data = real_read(fd, n)
-            sink.append(len(data))
-            return data
-
-        def pread(fd: int, n: int, offset: int) -> bytes:
-            data = real_pread(fd, n, offset)
-            sink.append(len(data))
-            return data
-
-        def fdopen(*args: Any, **kw: Any) -> Any:
-            return _CountingStream(real_fdopen(*args, **kw), sink)
-
-        def open_(*args: Any, **kw: Any) -> Any:
-            return _CountingStream(real_open(*args, **kw), sink)
-
-        patch.setattr(os, "read", read)
-        patch.setattr(os, "pread", pread)
-        patch.setattr(os, "fdopen", fdopen)
-        patch.setattr(io, "open", open_)
-        yield
-
-
-async def test_stderr_tail_keeps_its_own_truncation_note(tmp_path: Path) -> None:  # L3
+async def test_stderr_tail_keeps_its_own_truncation_note(tmp_path: Path) -> None:
     cap = 4096
     code = "import sys; sys.stderr.write('e' * 10000); " + WRITE.format("{'data': {}}")
     ex = LocalExecutor(workspace_root=str(tmp_path / "ws"), max_log_bytes=cap)
@@ -831,7 +787,7 @@ async def test_stderr_tail_keeps_its_own_truncation_note(tmp_path: Path) -> None
     assert int(note[1]) == 10000 + len(note[0]) - cap  # exact: the note's own line counts
 
 
-async def test_outputs_over_the_cap_are_an_error(tmp_path: Path) -> None:  # L3
+async def test_outputs_over_the_cap_are_an_error(tmp_path: Path) -> None:
     code = (
         "import os; os.makedirs('out'); open('out/a.txt', 'w').write('a' * 600); "
         "open('out/b.txt', 'w').close(); os.truncate('out/b.txt', 2**30); "  # sparse 1 GiB
@@ -846,8 +802,8 @@ async def test_outputs_over_the_cap_are_an_error(tmp_path: Path) -> None:  # L3
 
 async def test_upload_reads_are_bounded_by_the_cap_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # integration fix 3, A1: collect_output_files gets max_output_bytes
-    monkeypatch.setattr(local._JobRun, "_check_output_sizes", lambda self, files: None)
+) -> None:  # collect_output_files gets max_output_bytes
+    monkeypatch.setattr(local_run._JobRun, "_check_output_sizes", lambda self, files: None)
     code = (
         "import os; os.makedirs('out'); open('out/a.txt', 'w').write('a' * 600); "
         "open('out/b.txt', 'w').close(); os.truncate('out/b.txt', 2**30); "  # sparse 1 GiB
@@ -911,7 +867,7 @@ def deep_tree_guard(tmp_path: Path) -> Iterator[None]:
 @pytest.mark.usefixtures("deep_tree_guard")
 async def test_deep_read_only_tree_is_removed(
     local_executor: LocalExecutor, tmp_path: Path
-) -> None:  # L4
+) -> None:
     code = WRITE.format("{'data': {'deep': True}}") + (
         "\nimport os\nfor _ in range(1200):\n    os.mkdir('d'); os.chdir('d')\n"
         "open('f', 'w').close(); os.chmod('.', 0o500)\n"
@@ -927,11 +883,11 @@ async def test_failed_cleanup_never_replaces_output_or_cancel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-) -> None:  # L4
+) -> None:
     def broken(path: Path) -> None:
         raise RecursionError("too deep")
 
-    monkeypatch.setattr(local, "_REMOVERS", (broken,))
+    monkeypatch.setattr(local_workspace, "_REMOVERS", (broken,))
     out = await local_executor.submit(tool_job(tmp_path, WRITE.format("{'data': {'v': 1}}")))
     assert (out.status, out.data) == (RunStatus.OK, {"v": 1})
     [left] = list((tmp_path / "ws").iterdir())
@@ -971,7 +927,7 @@ anyio.run(main)
 """
 
 
-def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> None:  # L5
+def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> None:
     tests_dir = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(tests_dir)}
     started = time.monotonic()
@@ -1001,7 +957,7 @@ def wide_tree(tmp_path: Path) -> Iterator[Path]:
 
 def test_fallback_remover_is_linear(
     wide_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # K1, K2
+) -> None:
     n = 20_000
     for i in range(n):
         os.mkdir(wide_tree / f"d{i}")
@@ -1036,7 +992,7 @@ def test_fallback_remover_is_linear(
         with monkeypatch.context() as patch:
             patch.setattr(os, "listdir", listdir)
             patch.setattr(os, "stat", stat_)
-            local._remove_tree(wide_tree)
+            local_workspace._remove_tree(wide_tree)
         assert not os.path.lexists(wide_tree)
         # Linear in the number of directories, by call counts, not by the wall clock.
         assert calls["listdir"] <= n + 2  # each directory listed exactly once
@@ -1049,7 +1005,7 @@ def test_fallback_remover_is_linear(
 
 def test_fallback_remover_unlocks_only_refused_directories(
     wide_tree: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # IF3 A8c: a chmod costs ~8 ms deep in an APFS tree, so only on EACCES/EPERM
+) -> None:  # a chmod costs ~8 ms deep in an APFS tree, so only on EACCES/EPERM
     (wide_tree / "a/b/c").mkdir(parents=True)
     for rel in ("a/f", "a/b/f", "a/b/c/f"):
         (wide_tree / rel).write_text("x")
@@ -1069,7 +1025,7 @@ def test_fallback_remover_unlocks_only_refused_directories(
         real_fchmod(fd, mode)
 
     monkeypatch.setattr(os, "fchmod", fchmod)
-    local._remove_tree(wide_tree)
+    local_workspace._remove_tree(wide_tree)
     assert not os.path.lexists(wide_tree)
     assert fchmods == [0o700, 0o700]  # files_locked and dirs_locked; never top, a, b or c
 
@@ -1078,7 +1034,7 @@ def test_fallback_remover_unlocks_only_refused_directories(
 @pytest.mark.parametrize("mode", [0o000, 0o500])
 async def test_tool_that_locks_its_own_workspace_root_is_removed(
     local_executor: LocalExecutor, tmp_path: Path, mode: int
-) -> None:  # IF3 A8c
+) -> None:
     code = "import os; os.makedirs('out/deep'); open('out/deep/f', 'w').close(); "
     code += f"os.chmod('out/deep', 0o500); os.chmod('.', {mode:#o})"
     with anyio.fail_after(30):
@@ -1088,7 +1044,7 @@ async def test_tool_that_locks_its_own_workspace_root_is_removed(
 
 def test_unlock_uses_a_no_follow_chmod_where_the_os_has_one(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:  # K2: macOS and the BSDs
+) -> None:  # macOS and the BSDs
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
     def chmod(*args: Any, **kw: Any) -> None:
@@ -1098,14 +1054,14 @@ def test_unlock_uses_a_no_follow_chmod_where_the_os_has_one(
         patch.setattr(os, "chmod", chmod)
         patch.setattr(os, "supports_follow_symlinks", {chmod})
         patch.setattr(os, "supports_dir_fd", {chmod})
-        unlocked = local._unlock_directory(7, "d")
+        unlocked = local_workspace._unlock_directory(7, "d")
     assert unlocked is True
     assert calls == [(("d", 0o700), {"dir_fd": 7, "follow_symlinks": False})]
 
 
 def test_unlock_uses_o_path_and_proc_on_linux(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:  # K2: Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) for directories
+) -> None:  # Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) for directories
     o_path = 0o10000000
     opened: list[tuple[str, int, int | None]] = []
     chmods: list[tuple[Any, ...]] = []
@@ -1121,11 +1077,11 @@ def test_unlock_uses_o_path_and_proc_on_linux(
     with monkeypatch.context() as patch:
         patch.setattr(os, "supports_follow_symlinks", set())
         patch.setattr(os, "O_PATH", o_path, raising=False)
-        patch.setattr(local, "_PROC_FD", str(tmp_path))  # stands in for /proc/self/fd
+        patch.setattr(local_workspace, "_PROC_FD", str(tmp_path))  # stands in for /proc/self/fd
         patch.setattr(os, "open", open_)
         patch.setattr(os, "chmod", chmod)
         patch.setattr(os, "close", closed.append)
-        unlocked = local._unlock_directory(7, "d")
+        unlocked = local_workspace._unlock_directory(7, "d")
     assert unlocked is True
     assert opened == [("d", o_path | os.O_NOFOLLOW | os.O_DIRECTORY, 7)]
     assert chmods == [(f"{tmp_path}/99", 0o700)]
@@ -1134,14 +1090,14 @@ def test_unlock_uses_o_path_and_proc_on_linux(
 
 def test_unlock_without_a_safe_method_skips_and_logs(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:  # K2: never fall back to a chmod that follows links
+) -> None:  # never fall back to a chmod that follows links
     chmods: list[tuple[Any, ...]] = []
     with monkeypatch.context() as patch:
         patch.setattr(os, "supports_follow_symlinks", set())
         patch.delattr(os, "O_PATH", raising=False)
         patch.setattr(os, "chmod", lambda *args, **kw: chmods.append(args))
         with caplog.at_level(logging.WARNING):
-            unlocked = local._unlock_directory(7, "d")
+            unlocked = local_workspace._unlock_directory(7, "d")
     assert unlocked is False
     assert chmods == []
     assert "cannot unlock a locked directory without following symlinks: d" in caplog.text
@@ -1165,7 +1121,7 @@ async def test_collect_must_return_a_valid_tool_output(
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
     path: str,
-) -> None:  # K3
+) -> None:
     monkeypatch.setattr(
         OkCollectTool, "collect", lambda self, request, workspace, run: _not_a_tool_output(kind)
     )
@@ -1188,7 +1144,7 @@ async def test_collect_must_return_a_valid_tool_output(
     else:
         out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=OkCollectTool))
         status = RunStatus.ERROR
-    # The collect gave no valid ToolOutput, so partial is False on every path (IF3 A8).
+    # The collect gave no valid ToolOutput, so partial is False on every path.
     assert (out.status, out.partial, out.data, out.files) == (status, False, {}, [])
     assert b"collect failed: Tool.collect() did not return a ToolOutput" in log(tmp_path, out, 2)
     assert out.started_at is not None
@@ -1295,3 +1251,239 @@ async def test_partial_stays_true_when_kept_files_are_dropped_later(
     [workspace] = list(ws.iterdir())
     note = "crosses max_output_bytes" if drop == "cap" else "uploads failed: StorageError"
     assert note in (workspace / "swarm" / "stderr.log").read_text()
+
+
+@pytest.mark.parametrize(
+    ("job_timeout", "command_timeout", "expected"),
+    [(9.0, 2.0, 2.0), (2.0, 9.0, 2.0), (None, 2.0, 2.0), (2.0, None, 2.0), (None, None, None)],
+)
+@pytest.mark.parametrize(("job_grace", "command_grace"), [(9.0, 2.0), (2.0, 9.0)])
+@pytest.mark.parametrize("kind", ["tool", "command"])
+async def test_command_limits_tighten_job_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job_timeout: float | None,
+    command_timeout: float | None,
+    expected: float | None,
+    job_grace: float,
+    command_grace: float,
+    kind: str,
+) -> None:
+    seen: list[tuple[float | None, float]] = []
+    command = Command(
+        argv=["python", "-c", "pass"], timeout_s=command_timeout, grace_s=command_grace
+    )
+    monkeypatch.setattr(PyTool, "command", lambda self, request, workspace: command)
+    original = ProcessSupervisor.run
+
+    async def record(self: ProcessSupervisor, *args: Any, **kw: Any) -> CompletedRun:
+        seen.append((kw["timeout_s"], kw["grace_s"]))
+        return await original(self, *args, **kw)
+
+    monkeypatch.setattr(ProcessSupervisor, "run", record)
+    job = tool_job(tmp_path, "pass") if kind == "tool" else command_job(tmp_path, command)
+    await LocalExecutor(workspace_root=str(tmp_path / "ws")).submit(
+        replace(job, timeout_s=job_timeout, grace_s=job_grace)
+    )
+    assert seen == [(expected, min(job_grace, command_grace))]
+
+
+@pytest.mark.parametrize("where", ["command", "collect"])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_user_system_exit_is_a_job_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+    stop: bool,
+) -> None:
+    secret = "d68e94c4-477f-4935-aaf0-70960e8b3c7f"
+
+    def exit_user(*args: Any, **kw: Any) -> Any:
+        raise SystemExit(secret)
+
+    monkeypatch.setattr(PyTool, where, exit_user)
+    job = tool_job(
+        tmp_path,
+        "import time; time.sleep(60)" if stop else "pass",
+        timeout_s=0.2 if stop else 30.0,
+        grace_s=0.0,
+    )
+    # Catch it in the test task too: a regression must fail without exiting pytest.
+    try:
+        out = await LocalExecutor(workspace_root=str(tmp_path / "ws")).submit(job)
+    except SystemExit:
+        pytest.fail("user SystemExit escaped submit")
+    assert out.status == (RunStatus.TIMEOUT if stop and where == "collect" else RunStatus.ERROR)
+    assert not out.partial
+    assert b"SystemExit" in log(tmp_path, out, 2)
+    if where == "command":
+        assert secret.encode() not in log(tmp_path, out, 2)
+
+
+@pytest.mark.parametrize("where", ["command", "collect"])
+def test_user_keyboard_interrupt_still_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    def interrupt(*args: Any, **kw: Any) -> Any:
+        raise KeyboardInterrupt
+
+    job = tool_job(tmp_path, "pass")
+    workspace, artifacts = local_workspace._open_workspace(str(tmp_path / "ws"), job)
+    monkeypatch.setattr(PyTool, where, interrupt)
+    if where == "command":
+        with pytest.raises(KeyboardInterrupt):
+            local_stage._stage(job, workspace, artifacts)
+    else:
+        staged = local_stage._stage(job, workspace, artifacts)
+        run = CompletedRun(
+            returncode=0,
+            status=RunStatus.OK,
+            stdout_path=workspace / "swarm/stdout.log",
+            stderr_path=workspace / "swarm/stderr.log",
+            started_at=utc_now(),
+            ended_at=utc_now(),
+        )
+        runner = local_run._JobRun(job, staged, workspace, artifacts, LocalExecutor.Config())
+        with pytest.raises(KeyboardInterrupt):
+            runner._collect(run)
+
+
+async def test_cancel_waits_for_the_original_collect_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls: list[RunStatus] = []
+    got: list[ToolOutput] = []
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 5.0)
+
+    def collect(*args: Any) -> ToolOutput:
+        calls.append(args[-1].status)
+        entered.set()
+        release.wait(15)
+        return ToolOutput(status=RunStatus.OK, data={"kept": 1})
+
+    async def on_partial(out: ToolOutput) -> None:
+        got.append(out)
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
+
+    async def worker(*, task_status: anyio.abc.TaskStatus[anyio.CancelScope]) -> None:
+        with anyio.CancelScope() as scope:
+            task_status.started(scope)
+            await executor.submit(tool_job(tmp_path, "pass", on_partial=on_partial))
+        assert scope.cancelled_caught
+
+    try:
+        with anyio.fail_after(20):
+            async with anyio.create_task_group() as group:
+                scope = await group.start(worker)
+                while not entered.is_set():  # noqa: ASYNC110 - waiting on a thread event
+                    await anyio.sleep(0.01)
+                scope.cancel()
+                await anyio.wait_all_tasks_blocked()
+                release.set()
+        assert calls == [RunStatus.OK]
+        assert [(o.status, o.partial, o.data) for o in got] == [
+            (RunStatus.CANCELLED, True, {"kept": 1})
+        ]
+    finally:
+        release.set()
+
+
+async def test_hung_post_exit_collect_releases_pool_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    calls = 0
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.2)
+
+    def collect(*args: Any) -> ToolOutput:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            release.wait(15)
+        return ToolOutput(status=RunStatus.OK, data={"kept": 1})
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    executor = LocalExecutor(max_concurrent=1, workspace_root=str(tmp_path / "ws"))
+    try:
+        with anyio.fail_after(5):
+            out = await executor.submit(tool_job(tmp_path, "pass"))
+            assert (out.status, out.partial, out.data) == (RunStatus.ERROR, False, {})
+            assert b"collect timed out" in log(tmp_path, out, 2)
+            assert (await executor.submit(tool_job(tmp_path, "pass"))).status == RunStatus.OK
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_files_only_collect_counts_as_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+) -> None:
+    def collect(
+        self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        (workspace / "out").mkdir(exist_ok=True)
+        (workspace / "out/x.txt").write_bytes(b"x")
+        return ToolOutput(
+            status=RunStatus.OK,
+            files=[FileRef(name="x.txt", path="out/x.txt", sha256=sha256_hex(b"x"), size=1)],
+        )
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
+    if stop == "cancel":
+        out = await _cancel_when_ready(executor, tmp_path / "ws", {}, tmp_path, "pass")
+        expected = RunStatus.CANCELLED
+    else:
+        out = await executor.submit(
+            tool_job(tmp_path, "import time; time.sleep(60)", timeout_s=0.2, grace_s=0.0)
+        )
+        expected = RunStatus.TIMEOUT
+    assert (out.status, out.partial, out.data) == (expected, True, {})
+    assert [ref.path for ref in out.files] == ["out/x.txt"]
+    assert store(tmp_path).get_bytes(out.files[0].sha256) == b"x"
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_output_total_at_the_size_cap(tmp_path: Path, extra: int) -> None:
+    code = (
+        "import os; os.makedirs('out'); open('out/a', 'wb').write(b'a' * 4); "
+        f"open('out/b', 'wb').write(b'b' * {6 + extra}); "
+        + WRITE.format("{'data': {}, 'files': ['out/a', 'out/b']}")
+    )
+    out = await LocalExecutor(workspace_root=str(tmp_path / "ws"), max_output_bytes=10).submit(
+        tool_job(tmp_path, code)
+    )
+    assert out.status == (RunStatus.ERROR if extra else RunStatus.OK)
+    assert len(out.files) == (0 if extra else 2)
+    if not extra:
+        assert [store(tmp_path).get_bytes(ref.sha256) for ref in out.files] == [b"aaaa", b"bbbbbb"]
+
+
+def test_memory_limit_overflow_is_sanitized(tmp_path: Path) -> None:
+    job = command_job(tmp_path, Command(argv=["true"]), resources=Resources(memory_gib=1e300))
+    with pytest.raises(ValueError, match="memory_gib") as caught:
+        LocalExecutor()._rlimits(job)
+    assert str(caught.value) == "memory_gib exceeds resource limit range"
+
+
+def test_memory_overflow_exception_cannot_expose_values(tmp_path: Path) -> None:
+    secret = "04c2f5db-ef64-4a48-a0df-606244b2758e"
+
+    class OverflowingMemory(float):
+        def __mul__(self, other: Any) -> float:
+            raise OverflowError(secret)
+
+    resources = Resources.model_construct(memory_gib=OverflowingMemory(1.0))
+    job = command_job(tmp_path, Command(argv=["true"]), resources=resources)
+    with pytest.raises(ValueError, match="memory_gib") as caught:
+        LocalExecutor()._rlimits(job)
+    assert_secret_absent(caught.value, secret)

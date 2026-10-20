@@ -1,7 +1,6 @@
-import traceback
-
 import anyio
 import pytest
+from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Resources
 from swarm_arena._exec.pool import ResourcePool
@@ -39,12 +38,10 @@ async def test_pool_rejects_impossible_requests() -> None:
     pool = ResourcePool(cpus=2.0, max_concurrent=4)
     assert pool.capacity == Resources(cpus=2.0)
     need = Resources(cpus=3.0)
-    # Controller secrecy ruling overrides the brief's numeric error interpolation.
     with pytest.raises(ValueError, match="job needs more cpus") as exc:
         async with pool.slot(need):
             pytest.fail("impossible request acquired a slot")
-    assert "3.0" not in "".join(traceback.format_exception(exc.value))
-    assert "2.0" not in str(exc.value)
+    assert str(exc.value) == "job needs more cpus than this executor has"
 
 
 def test_pool_constructs_without_async_backend() -> None:
@@ -54,12 +51,12 @@ def test_pool_constructs_without_async_backend() -> None:
 def test_pool_error_never_formats_capacity() -> None:
     class SecretCapacity(float):
         def __str__(self) -> str:
-            return "sentinel-secret"
+            return "dd4c657e-e627-49a8-bab5-c83fa99d8e66"
 
     pool = ResourcePool(cpus=SecretCapacity(2.0), max_concurrent=4)
     with pytest.raises(ValueError, match="job needs more cpus") as exc:
         pool.slot(Resources(cpus=3.0))
-    assert "sentinel-secret" not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, "dd4c657e-e627-49a8-bab5-c83fa99d8e66")
 
 
 async def test_pool_ignores_other_resources() -> None:
@@ -110,3 +107,21 @@ async def test_cancelled_waiter_does_not_consume_capacity() -> None:
             scope.cancel()
         async with pool.slot(Resources(cpus=2.0)):
             pass
+
+
+async def test_fractional_cpu_reservations_fit_exactly() -> None:
+    pool = ResourcePool(cpus=0.3, max_concurrent=3)
+    with anyio.fail_after(1):
+        async with pool.slot(Resources(cpus=0.1)), pool.slot(Resources(cpus=0.2)):
+            pass
+
+
+async def test_cpu_release_does_not_accumulate_rounding_error() -> None:
+    pool = ResourcePool(cpus=1.0, max_concurrent=3)
+    with anyio.fail_after(1):
+        async with pool.slot(Resources(cpus=0.66)):
+            for _ in range(20):
+                async with pool.slot(Resources(cpus=0.18)):
+                    pass
+            async with pool.slot(Resources(cpus=0.34)):
+                pass

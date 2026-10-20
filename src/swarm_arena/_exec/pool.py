@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from fractions import Fraction
 
 import anyio
 
@@ -33,9 +34,10 @@ class ResourcePool:
     def __init__(self, *, cpus: float, max_concurrent: int) -> None:
         """Store scheduling limits without creating backend-bound resources."""
         self._cpus = cpus
+        self._cpu_capacity = Fraction(str(float(cpus)))
         self._max_concurrent = max_concurrent
         self._running = 0
-        self._cpus_in_use = 0.0
+        self._cpus_in_use = Fraction(0)
         self._condition: anyio.Condition | None = None
 
     @property
@@ -92,20 +94,22 @@ class ResourcePool:
         if self._condition is None:
             self._condition = anyio.Condition()
         condition = self._condition
+        cpus = Fraction(str(need.cpus))
         async with condition:
             while (
-                self._running >= self._max_concurrent or self._cpus_in_use + need.cpus > self._cpus
+                self._running >= self._max_concurrent
+                or self._cpus_in_use + cpus > self._cpu_capacity
             ):
                 await condition.wait()
             self._running += 1
-            self._cpus_in_use += need.cpus
+            self._cpus_in_use += cpus
         try:
             yield
         finally:
             with anyio.CancelScope(shield=True):
                 async with condition:
                     self._running -= 1
-                    self._cpus_in_use -= need.cpus
+                    self._cpus_in_use -= cpus
                     if self._running == 0:
-                        self._cpus_in_use = 0.0
+                        self._cpus_in_use = Fraction(0)
                     condition.notify_all()

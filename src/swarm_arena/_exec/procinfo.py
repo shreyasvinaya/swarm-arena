@@ -105,42 +105,12 @@ def process_start_time(pid: int) -> str | None:
     return text if done.returncode == 0 and text else None
 
 
-def group_alive(pgid: int) -> bool:
-    """
-    Report whether a process group still has a member.
-
-    Parameters
-    ----------
-    pgid : int
-        Process group id to probe with signal 0.
-
-    Returns
-    -------
-    bool
-        False when no member exists. True otherwise, also when the group
-        exists but belongs to another user.
-
-    Examples
-    --------
-    >>> import os
-    >>> group_alive(os.getpgrp())
-    True
-    """
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def group_has_live_member(pgid: int) -> bool:
     """
     Report whether a process group has a member that is not a zombie.
 
-    Unlike ``group_alive``, zombie members do not count, so a group whose
-    processes have all exited but are not yet reaped reads as empty. Members
+    Zombie members do not count, so a group whose processes have all exited
+    but are not yet reaped reads as empty. Members
     of any user count. When the caller holds the group's leader unreaped (see
     ``ExitWatch``), the zombie keeps the group id reserved, so the answer is
     about that group only; otherwise the id may name a newer group.

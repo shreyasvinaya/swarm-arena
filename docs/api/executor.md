@@ -50,6 +50,11 @@ to 64 characters. The default `workspace_root` is per user:
 must be owned by you or root, and not writable by group or others unless sticky
 (like `/tmp`). The command starts only after `Job.on_started` returns.
 
+A Command returned by `Tool.command()` may tighten the job's effective limits.
+The execution timeout is the smaller non-`None` value of `Command.timeout_s`
+and `Job.timeout_s`; if both are `None`, there is no execution timeout. Shutdown
+grace is the smaller of `Command.grace_s` and `Job.grace_s`.
+
 On a timeout or a cancel, the group gets SIGTERM, then `grace_s`, then `collect`
 for the partial output, then SIGKILL. The output gets the stop status, and
 `partial=True` if and only if that collect returned a valid `ToolOutput` that
@@ -65,15 +70,23 @@ note goes to the stderr log.
 A `Tool.collect` must return a valid `ToolOutput`: anything else, or data that is
 not finite JSON, gives status `error` with a note in the stderr log (a stopped run
 keeps its stop status). A blocked `collect` delays the SIGKILL by at most
-`BEFORE_KILL_TIMEOUT_S` (30 s) after the grace period: at that deadline the
-supervisor kills the group, and the collect is abandoned and not tried again.
+30 seconds after the grace period: at that deadline the supervisor kills the
+group, and the collect is abandoned and not tried again.
 Collect runs in a daemon thread, so an abandoned one never keeps the interpreter
 from exiting. It may still write into the workspace after `submit` returned.
 
 The cancel-path output goes to `Job.on_partial`, once the start handshake was
 reached. This includes a cancel that comes after the tool exited on its own: if
-its collect had not finished, it runs once more, bounded by
-`BEFORE_KILL_TIMEOUT_S`. Logs live at `swarm/stdout.log` and `swarm/stderr.log`.
+its collect had not finished, cancellation waits for that same collect until
+its original deadline. Collection starts only once per run. After normal exit,
+collection is also bounded to 30 seconds from its start; exceeding that bound
+gives status `error`, empty output, and a diagnostic in stderr. A cancel keeps
+status `cancelled` and delivers the original collect's valid result when it
+finishes within that bound. `SystemExit` from `Tool.collect` is a collect
+failure; `SystemExit` from `Tool.command` gives an error output without starting
+the command. KeyboardInterrupt and cancellation continue to propagate.
+
+Logs live at `swarm/stdout.log` and `swarm/stderr.log`.
 The last `max_log_bytes` (8 MiB) of each are uploaded to `artifact_root`, with
 `logs_ref = "sha256:<stdout>:<stderr>"`, and a `log truncated` note in the
 stderr log. If the declared output files of a run are more than

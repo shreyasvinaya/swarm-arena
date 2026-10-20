@@ -18,7 +18,6 @@ from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.procinfo import (
     ExitWatch,
-    group_alive,
     group_has_live_member,
     host_id,
     kill_orphan,
@@ -40,20 +39,20 @@ def test_host_id_without_boot_id_is_unknown(
     assert host_id().endswith(":unknown")
 
 
-def test_process_start_time_and_group_alive() -> None:
+def test_process_start_time_and_group_liveness() -> None:
     p = subprocess.Popen(["sleep", "30"], start_new_session=True)
     st = process_start_time(p.pid)
     assert st
     assert st == process_start_time(p.pid)
-    assert group_alive(p.pid)
+    assert group_has_live_member(p.pid)
     os.killpg(p.pid, signal.SIGKILL)
     p.wait()
     assert process_start_time(p.pid) is None
-    assert wait_until(lambda: not group_alive(p.pid), 5)
+    assert wait_until(lambda: not group_has_live_member(p.pid), 5)
 
 
-def test_group_alive_counts_a_foreign_group() -> None:
-    assert group_alive(1)  # init's group: PermissionError for a normal user, still alive
+def test_group_liveness_counts_our_group() -> None:
+    assert group_has_live_member(os.getpgrp())
 
 
 def test_kill_orphan_checks_host_and_start_time() -> None:
@@ -123,9 +122,6 @@ def test_kill_orphan_refuses_unknown_host(monkeypatch: pytest.MonkeyPatch, tmp_p
         p.wait()
 
 
-# --- Fix round 1 ---
-
-
 def _is_zombie(pid: int) -> bool:
     done = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
     return done.stdout.strip().startswith("Z")
@@ -138,7 +134,7 @@ def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
         assert group_has_live_member(p.pid)
         assert wait_until(lambda: _is_zombie(p.pid), 5)  # exited, not reaped
         assert not group_has_live_member(p.pid)
-        assert group_alive(p.pid)  # group_alive keeps its meaning: a zombie counts
+        assert pid_alive(p.pid)  # the unreaped leader still anchors the group id
     finally:
         p.wait()
     assert not group_has_live_member(p.pid)

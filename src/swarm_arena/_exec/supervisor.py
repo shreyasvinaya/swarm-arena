@@ -140,13 +140,19 @@ class _Group:
         self.pgid = proc.pid  # start_new_session: the leader's pid is the group id
 
     def signal(self, sig: int) -> None:
-        """Signal the whole group; only call this before ``reap``."""
+        """Signal the whole group; only call this before ``_kill_and_reap``."""
         _signal_group(self.pgid, sig)
 
-    async def reap(self) -> int:
-        """Wait for the leader to exit, then reap it and return its exit code."""
-        await self.watch.wait()
-        return await anyio.to_thread.run_sync(self.proc.wait)  # a zombie: returns at once
+
+async def _kill_and_reap(proc: subprocess.Popen[bytes], watch: ExitWatch | None = None) -> int:
+    """Signal the anchored group before reaping its leader (caller shields)."""
+    try:
+        _signal_group(proc.pid, signal.SIGKILL)
+    finally:
+        if watch is not None:
+            await watch.wait()
+        returncode = await anyio.to_thread.run_sync(proc.wait)
+    return returncode
 
 
 async def _collect(
@@ -363,8 +369,7 @@ class ProcessSupervisor:
             for proc in procs:
                 if proc.returncode is None:  # started, but the watch could not be made
                     with anyio.CancelScope(shield=True):
-                        _signal_group(proc.pid, signal.SIGKILL)  # still unreaped, so still ours
-                        await anyio.to_thread.run_sync(proc.wait)  # never on the loop thread
+                        await _kill_and_reap(proc)
 
     async def _supervise(
         self,
@@ -396,10 +401,9 @@ class ProcessSupervisor:
         except BaseException:
             with anyio.CancelScope(shield=True):
                 try:
-                    group.signal(signal.SIGKILL)
-                    _close(fds, w)
+                    await _kill_and_reap(group.proc, group.watch)
                 finally:
-                    await group.reap()
+                    _close(fds, w)
             raise
 
         started_at = utc_now()
@@ -421,7 +425,7 @@ class ProcessSupervisor:
         finally:
             with anyio.CancelScope(shield=True):
                 if stopped is None:
-                    returncode = await self._finish(group)
+                    returncode = await _kill_and_reap(group.proc, group.watch)
                 else:
                     returncode = await self._stop(
                         group,
@@ -441,15 +445,6 @@ class ProcessSupervisor:
             started_at=started_at,
             ended_at=utc_now(),
         )
-
-    @staticmethod
-    async def _finish(group: _Group) -> int:
-        """Kill what is left of the group, then reap the leader (caller shields)."""
-        try:
-            group.signal(signal.SIGKILL)  # leftover members; the leader too after an error
-        finally:
-            returncode = await group.reap()
-        return returncode
 
     @staticmethod
     async def _stop(
@@ -484,10 +479,7 @@ class ProcessSupervisor:
                 )
                 note = await _collect(before_kill, provisional, group)
         finally:
-            try:
-                group.signal(signal.SIGKILL)
-            finally:
-                returncode = await group.reap()
+            returncode = await _kill_and_reap(group.proc, group.watch)
         if note is not None:
             await anyio.to_thread.run_sync(note_in_log, stderr, note)
         return returncode
