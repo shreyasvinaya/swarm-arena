@@ -5,12 +5,14 @@ import anyio
 import anyio.lowlevel
 import pytest
 
-from swarm_arena import Limits
+from swarm_arena import Limits, RunConfig
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._budget.tranche import Tranche
-from swarm_arena._journal.event import EventDraft
+from swarm_arena._journal.event import Event, EventDraft
+from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.ids import IdGen
 from swarm_arena.manager import LimitReached
 
@@ -58,10 +60,45 @@ async def _env(limits: Limits) -> LedgerEnv:
         journal=cast(JournalWriter, journal),
         ids=IdGen("tranche", 1),
     )
+    await journal.append_durable(
+        EventDraft(type="run_config", payload={"config": RunConfig(limits=limits).model_dump()})
+    )
     await ledger.hold_final_slices({"g1": Amount()})
+    await journal.append_durable(
+        EventDraft(type="run_started", payload={"final_slices": {"g1": Amount().model_dump()}})
+    )
     ledger.open_goal("g1")
-    ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+    await journal.append_durable(EventDraft(type="goal_started", goal_id="g1"))
+    shares = ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+    await journal.append_durable(
+        EventDraft(
+            type="round_started",
+            goal_id="g1",
+            payload={"round": 1, "shares": {h: a.model_dump() for h, a in shares.items()}},
+        )
+    )
     return LedgerEnv(ledger, journal)
+
+
+def _replay(env: LedgerEnv) -> Ledger:
+    events = [
+        Event.model_validate(
+            dict(
+                draft.model_dump(),
+                epoch=1,
+                seq=seq,
+                ts=utc_now(),
+                run_id="tranche",
+                context_id="tranche",
+            )
+        )
+        for seq, draft in enumerate(env.journal.events, 1)
+    ]
+    return Ledger.replay(
+        RunState.from_events(events),
+        journal=cast(JournalWriter, env.journal),
+        ids=IdGen("tranche", 2),
+    )
 
 
 @pytest.fixture
@@ -176,7 +213,7 @@ async def test_exact_micro_dollars_at_boundary() -> None:
     assert env.charged("g1/t/a") == Amount(usd=USD_LIMIT - 0.000001)
 
 
-@pytest.mark.parametrize("limits", [Limits(max_usd=1), Limits(max_tokens=3), Limits()])
+@pytest.mark.parametrize("limits", [Limits(max_usd=1), Limits(max_tokens=1000), Limits()])
 async def test_close_accepts_individually_valid_usage(
     limits: Limits, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -184,11 +221,11 @@ async def test_close_accepts_individually_valid_usage(
     t = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
     first = await t.reserve_call(Amount(usd=0.1))
     second = await t.reserve_call(Amount(usd=0.1))
-    await t.settle_call(first, Amount(tokens=1, usd=USD_LIMIT))
-    await t.settle_call(second, Amount(tokens=2, usd=0.000001))
+    await t.settle_call(first, Amount(usd=USD_LIMIT))
+    await t.settle_call(second, Amount(usd=0.000001))
 
     outcome = await t.close()
-    assert env.charged("g1/t/a") == Amount(tokens=3, usd=USD_LIMIT)
+    assert env.charged("g1/t/a") == Amount(usd=USD_LIMIT)
     assert outcome.overflow
     assert t.pending() == 0
     settles = env.count("settle")
@@ -198,14 +235,21 @@ async def test_close_accepts_individually_valid_usage(
     assert [r.getMessage() for r in caplog.records] == [
         "reported usage exceeds the supported range; charged as the range limit"
     ]
-    capped = limits.max_usd is not None or limits.max_tokens is not None
-    assert env.ledger.run_exhausted() is capped
-    assert env.ledger.goal_exhausted("g1") is capped
-    if capped:
-        with pytest.raises(LimitReached, match="budget"):
-            await env.ledger.reserve(
-                "g1/t/a", Amount(tokens=1, usd=0.000001), kind="call", goal_id="g1"
-            )
+    assert env.ledger.run_exhausted()
+    assert env.ledger.goal_exhausted("g1")
+    with pytest.raises(LimitReached) as exc:
+        await env.ledger.reserve("g1/t/a", Amount(tokens=1), kind="call", goal_id="g1")
+    assert exc.value.limit == "usage_overflow"
+    event = next(e for e in env.journal.events if e.type == "settle")
+    assert event.payload["usage_overflow"] is True
+    replayed = _replay(env)
+    assert replayed.run_exhausted()
+    assert replayed.goal_exhausted("g1")
+    assert replayed.remaining("g1/t/a") == env.ledger.remaining("g1/t/a") == Amount()
+    assert replayed._charges == env.ledger._charges
+    with pytest.raises(LimitReached) as exc:
+        await replayed.reserve(":run", Amount(), kind="planner", goal_id="")
+    assert exc.value.limit == "usage_overflow"
 
 
 @pytest.mark.parametrize("direct", [False, True])
@@ -213,13 +257,14 @@ async def test_close_accepts_individually_valid_usage(
 async def test_single_over_range_usage_is_explicit_and_retry_safe(
     direct: bool, usd: float, caplog: pytest.LogCaptureFixture
 ) -> None:
-    env = await _env(Limits(max_usd=1))
+    env = await _env(Limits(max_tokens=1000))
     t = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
     cid = await t.reserve_call(Amount(usd=0.5 if direct else 0.1))
     # Normal Amount construction forbids this; probe the reported-usage seam defensively.
     actual = Amount.model_construct(tokens=7, usd=usd)
     settlement = await t.settle_call(cid, actual)
     assert settlement.overflow
+    assert env.ledger.run_exhausted()
     outcome = await t.close()
     assert outcome is settlement
     assert await t.close() is outcome
@@ -227,6 +272,36 @@ async def test_single_over_range_usage_is_explicit_and_retry_safe(
     assert env.ledger.run_exhausted()
     assert env.count("settle") == 1
     assert len(caplog.records) == 1
+
+
+@pytest.mark.parametrize("direct", [False, True])
+async def test_two_overflows_and_late_settlements_are_noops(direct: bool) -> None:
+    env = await _env(Limits())
+    first = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    second = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    estimate = Amount(usd=0.5 if direct else 0.1)
+    a = await first.reserve_call(estimate)
+    b = await second.reserve_call(estimate)
+    late = await env.ledger.reserve("g1/t/a", estimate, kind="tool", goal_id="g1")
+    actual = Amount.model_construct(tokens=11, usd=USD_LIMIT + 1)
+    assert (await first.settle_call(a, actual)).overflow
+    charges = dict(env.ledger._charges)
+    count = env.count("settle")
+    assert (await second.settle_call(b, actual)).overflow
+    assert (await first.close()).overflow
+    await env.ledger.settle(late.id, Amount(usd=USD_LIMIT))
+    await env.ledger.settle(late.id, Amount())
+    assert env.ledger._charges == charges
+    assert env.count("settle") == count == 1
+    # Local room left in an existing batch must not admit more paid work.
+    with pytest.raises(LimitReached) as exc:
+        await second.reserve_call(Amount())
+    assert exc.value.limit == "usage_overflow"
+    assert (await second.close()).overflow
+    replayed = _replay(env)
+    assert replayed._charges == charges
+    await replayed.settle(late.id, Amount(usd=USD_LIMIT))
+    assert replayed._charges == charges
 
 
 async def test_pending_estimate_can_overflow_batch_at_close(
@@ -259,9 +334,9 @@ async def test_overflow_close_retries_failed_journal_once(
     env = await _env(Limits(max_usd=1))
     t = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
     first = await t.reserve_call(Amount(usd=0.1))
-    second = await t.reserve_call(Amount(usd=0.1))
+    # Leave a pending estimate so overflow is first discovered during close.
+    await t.reserve_call(Amount(usd=0.1))
     await t.settle_call(first, Amount(usd=USD_LIMIT))
-    await t.settle_call(second, Amount(usd=0.000001))
     append = env.journal.append_durable
     failed = False
 
@@ -284,3 +359,40 @@ async def test_overflow_close_retries_failed_journal_once(
     assert env.charged("g1/t/a") == Amount(usd=USD_LIMIT)
     assert env.count("settle") == 1
     assert len(caplog.records) == 1
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("retry", ["close", "report"])
+async def test_failed_overflow_report_can_be_committed_by_close(
+    direct: bool,
+    retry: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = await _env(Limits())
+    t = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    cid = await t.reserve_call(Amount(usd=0.5 if direct else 0.1))
+    append = env.journal.append_durable
+    failed = False
+
+    async def fail_once(event: EventDraft) -> None:
+        nonlocal failed
+        if event.type == "settle" and not failed:
+            failed = True
+            raise RuntimeError("journal unavailable")
+        await append(event)
+
+    monkeypatch.setattr(env.journal, "append_durable", fail_once)
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        await t.settle_call(cid, Amount.model_construct(tokens=7, usd=USD_LIMIT + 1))
+    assert env.ledger.run_exhausted()
+    with pytest.raises(LimitReached) as exc:
+        await env.ledger.reserve(":run", Amount(), kind="call", goal_id="")
+    assert exc.value.limit == "usage_overflow"
+    if retry == "report":
+        assert (
+            await t.settle_call(cid, Amount.model_construct(tokens=7, usd=USD_LIMIT + 1))
+        ).overflow
+    assert (await t.close()).overflow
+    assert env.count("settle") == 1
+    assert env.charged("g1/t/a") == Amount(tokens=7, usd=USD_LIMIT)
+    assert _replay(env).run_exhausted()

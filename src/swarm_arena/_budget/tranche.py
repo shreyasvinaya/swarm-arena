@@ -41,6 +41,7 @@ class _Batch:
     micros: int
     calls: list[str] = field(default_factory=list)
     settled: bool = False
+    overflow: bool = False
 
 
 @dataclass
@@ -50,6 +51,8 @@ class _Call:
     estimate: Amount
     batch: _Batch | None
     actual: Amount | None = None
+    overflow: bool = False
+    settled: bool = False
 
 
 class Tranche:
@@ -169,6 +172,7 @@ class Tranche:
         async with self._lock:
             if self._closed:
                 raise ValueError("tranche is closed")
+            self._ledger._check_usage_overflow()
             estimate = _nonnegative(estimate)
             if not estimate.fits_in(self._size, cap_tokens=True, cap_usd=True):
                 res = await self._ledger.reserve(
@@ -259,17 +263,59 @@ class Tranche:
                 return self._outcome
             call = self._calls[reservation_id]
             if call.actual is not None:
+                if call.batch is None:
+                    await self._settle_direct(reservation_id, call)
+                elif call.batch.overflow and not call.batch.settled:
+                    await self._settle_batch(call.batch)
                 return self._outcome
-            actual = self._reported_amount(
-                actual.tokens, actual._micro_usd, overflow=actual.usd > USD_LIMIT
-            )
+            overflow = actual.usd > USD_LIMIT
+            actual = self._reported_amount(actual.tokens, actual._micro_usd, overflow=overflow)
+            call.actual = actual
+            call.overflow = overflow
             if call.batch is None:
-                await self._ledger.settle(reservation_id, actual)
+                await self._settle_direct(reservation_id, call)
             else:
                 call.batch.tokens += call.estimate.tokens - actual.tokens
                 call.batch.micros += call.estimate._micro_usd - actual._micro_usd
-            call.actual = actual
+            if call.batch is not None:
+                batch = call.batch
+                reported_micros = sum(
+                    c.actual._micro_usd
+                    for cid in batch.calls
+                    if (c := self._calls[cid]).actual is not None
+                )
+                if overflow or reported_micros > _USD_LIMIT_MICROS:
+                    batch.overflow = True
+                    await self._settle_batch(batch)
             return self._outcome
+
+    async def _settle_direct(self, reservation_id: str, call: _Call) -> None:
+        """Retry durable direct-call settlement without forgetting reported usage."""
+        if call.settled:
+            return
+        actual = call.actual or call.estimate
+        if call.overflow:
+            await self._ledger.settle_overflow(reservation_id, actual)
+        else:
+            await self._ledger.settle(reservation_id, actual, estimated=call.actual is None)
+        call.actual = actual
+        call.settled = True
+
+    async def _settle_batch(self, batch: _Batch) -> None:
+        """Commit batch usage once, including a terminal overflow mark."""
+        if batch.settled:
+            return
+        amounts = [self._calls[c].actual or self._calls[c].estimate for c in batch.calls]
+        micros = sum(a._micro_usd for a in amounts)
+        batch.overflow = batch.overflow or micros > _USD_LIMIT_MICROS
+        actual = self._reported_amount(
+            sum(a.tokens for a in amounts), micros, overflow=batch.overflow
+        )
+        if batch.overflow:
+            await self._ledger.settle_overflow(batch.id, actual)
+        else:
+            await self._ledger.settle(batch.id, actual)
+        batch.settled = True
 
     def pending(self) -> int:
         """
@@ -304,7 +350,9 @@ class Tranche:
         Batch usage is summed in integer micro-dollars. A total above
         ``USD_LIMIT`` charges exactly that limit, preserving reported tokens
         (which have no upper bound), and flags overflow for caller journaling.
-        This exhausts a capped USD budget; uncapped units remain unlimited.
+        The journaled overflow settlement permanently exhausts the entire run,
+        including unlimited budgets. Later ledger settlements retain their
+        existing charges without further arithmetic.
 
         Examples
         --------
@@ -334,16 +382,8 @@ class Tranche:
         async with self._lock:
             self._closed = True
             for batch in self._batches:
-                if batch.settled:
-                    continue
-                amounts = [self._calls[c].actual or self._calls[c].estimate for c in batch.calls]
-                actual = self._reported_amount(
-                    sum(a.tokens for a in amounts), sum(a._micro_usd for a in amounts)
-                )
-                await self._ledger.settle(batch.id, actual)
-                batch.settled = True
+                await self._settle_batch(batch)
             for cid, call in self._calls.items():
-                if call.batch is None and call.actual is None:
-                    await self._ledger.settle(cid, call.estimate, estimated=True)
-                    call.actual = call.estimate
+                if call.batch is None:
+                    await self._settle_direct(cid, call)
             return self._outcome

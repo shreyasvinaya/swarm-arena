@@ -1797,6 +1797,11 @@ class Ledger:
     async def reserve(self, holder: str, amount: Amount, *, kind: ReservationKind, goal_id: str,
                       keep_charged: bool = False) -> Reservation: ...   # LimitReached("budget"); durable before return
     async def settle(self, reservation_id: str, actual: Amount, *, estimated: bool = False) -> None: ...  # idempotent, durable
+    async def settle_overflow(self, reservation_id: str, actual: Amount) -> None: ...
+        # Charge reported tokens and exactly USD_LIMIT; settle carries usage_overflow=True. Replay restores
+        # permanent run/goal exhaustion, even with unlimited caps. Every later reserve raises
+        # LimitReached("usage_overflow"); later settlements are no-ops retaining their existing charges.
+        # Failed durable appends retain exhaustion; the same overflow reservation may retry its write.
     async def end_goal(self, goal_id: str) -> None: ...   # unused -> goals not ended by goal_weights; none -> free()
     def run_exhausted(self) -> bool: ...             # [plan] charges, incl. open and estimated reservations, reach the work pool
     def goal_exhausted(self, goal_id: str) -> bool: ...   # [plan] the same for the goal pool

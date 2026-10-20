@@ -8,7 +8,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, Limits, Plan, RunConfig
-from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
@@ -804,3 +804,93 @@ async def test_aggregate_overspend_beyond_amount_range_stays_exact_and_exhausted
         assert ledger.remaining("g1/t/a") == Amount()
         assert sum(amount._micro_usd for amount in ledger._charges.values()) == 2 * 10**15
         assert ledger._work._micro_usd == 85 * 10**6 - 2 * 10**15
+
+
+async def test_usage_overflow_stops_all_goals_and_survives_replay(env: LedgerEnv) -> None:
+    await _setup(env)
+    reservation = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="call", goal_id="g1")
+    late = await env.ledger.reserve("g1/t/b", Amount(usd=1), kind="tool", goal_id="g1")
+    actual = Amount(tokens=13, usd=USD_LIMIT)
+    await env.ledger.settle_overflow(reservation.id, actual)
+    event = next(e for e in await env.committed() if e.type == "settle")
+    assert event.payload["usage_overflow"] is True
+    assert event.payload["actual"] == actual.model_dump()
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    for ledger in (env.ledger, replayed):
+        assert ledger.run_exhausted()
+        assert ledger.goal_exhausted("g1")
+        assert ledger.goal_exhausted("g2")
+        charges = dict(ledger._charges)
+        await ledger.settle(late.id, Amount(usd=USD_LIMIT))
+        await ledger.settle_overflow(late.id, actual)
+        assert ledger._charges == charges
+        ledger.change_limits(Limits())
+        assert ledger.run_exhausted()
+        for holder, goal_id in [("g1/t/a", "g1"), ("g2/:final", "g2"), (":run", "")]:
+            with pytest.raises(LimitReached) as exc:
+                await ledger.reserve(holder, Amount(), kind="call", goal_id=goal_id)
+            assert exc.value.limit == "usage_overflow"
+    assert await env.count("settle") == 1
+
+
+async def test_usage_overflow_blocks_work_before_durable_acknowledgement(
+    env: LedgerEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _setup(env)
+    a = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="call", goal_id="g1")
+    b = await env.ledger.reserve("g1/t/b", Amount(usd=1), kind="call", goal_id="g1")
+    committed, acknowledge = anyio.Event(), anyio.Event()
+    original = env.journal.append_durable
+
+    async def delayed_ack(draft: EventDraft) -> Event:
+        event = await original(draft)
+        if draft.payload.get("usage_overflow"):
+            committed.set()
+            await acknowledge.wait()
+        return event
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.journal, "append_durable", delayed_ack)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(env.ledger.settle_overflow, a.id, Amount(usd=USD_LIMIT))
+            await committed.wait()
+            try:
+                assert env.ledger.run_exhausted()
+                with pytest.raises(LimitReached) as exc:
+                    await env.ledger.reserve(":run", Amount(), kind="planner", goal_id="")
+                assert exc.value.limit == "usage_overflow"
+                await env.ledger.settle_overflow(b.id, Amount(usd=USD_LIMIT))
+                await env.ledger.settle(b.id, Amount())
+            finally:
+                acknowledge.set()
+    assert await env.count("settle") == 1
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert replayed._charges == env.ledger._charges
+    assert replayed.run_exhausted()
+
+
+async def test_overflow_charge_overrides_keep_charged_and_validates_limit(env: LedgerEnv) -> None:
+    await _setup(env)
+    res = await env.ledger.reserve(
+        "g1/t/a",
+        Amount(usd=1),
+        kind="tool",
+        goal_id="g1",
+        keep_charged=True,
+    )
+    with pytest.raises(ValueError, match="requires the supported USD limit"):
+        await env.ledger.settle_overflow(res.id, Amount(usd=2))
+    assert not env.ledger.run_exhausted()
+    assert await env.count("settle") == 0
+    actual = Amount(tokens=19, usd=USD_LIMIT)
+    await env.ledger.settle_overflow(res.id, actual)
+    assert env.ledger._charges[res.id] == actual
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert replayed._charges[res.id] == actual

@@ -8,7 +8,7 @@ from typing import Literal
 import anyio
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._budget.amount import Amount, _usd_from_micro_units
+from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
 from swarm_arena._budget.split import equal_shares, round_pool, weighted_shares
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.replay import RunState
@@ -123,6 +123,8 @@ class Ledger:
     Internal pool references preserve refund destinations across round and
     goal lifecycle changes.
     Uncapped units have zero available balances and are ignored at admission.
+    Journaled usage overflow permanently exhausts every goal and the run,
+    including unlimited budgets, and freezes later settlement charges.
 
     Parameters
     ----------
@@ -179,6 +181,7 @@ class Ledger:
         self._held = False
         self._entries: dict[str, _Entry] = {}
         self._charges: dict[str, Amount] = {}
+        self._overflow_reservation: str | None = None
 
     @property
     def limits(self) -> Limits:
@@ -279,9 +282,17 @@ class Ledger:
                 self._book(Reservation.model_validate(payload["reservation"]))
             case EventType.SETTLE:
                 entry = self._entries[payload["id"]]
-                if not entry.settled:
+                if not entry.settled and self._overflow_reservation is None:
                     actual = _nonnegative(Amount.model_validate(payload["actual"]))
-                    self._reconcile(entry, self._charge_for(entry, actual, payload["estimated"]))
+                    overflow = payload.get("usage_overflow", False)
+                    target = (
+                        actual
+                        if overflow
+                        else self._charge_for(entry, actual, payload["estimated"])
+                    )
+                    self._reconcile(entry, target)
+                    if overflow:
+                        self._overflow_reservation = entry.reservation.id
                     entry.settled = True
             case EventType.GOAL_FINISHED:
                 self._end(event.goal_id)
@@ -524,6 +535,8 @@ class Ledger:
         >>> ledger.remaining("g1/t/a")
         Amount(tokens=0, usd=10.625)
         """
+        if self._overflow_reservation is not None:
+            return Amount()
         if holder not in self._shares and len(holder.split("/")) == 3:
             return Amount()
         pools, share = self._sources(holder)
@@ -565,7 +578,8 @@ class Ledger:
         Raises
         ------
         LimitReached
-            If any capped unit exceeds the holder or run budget.
+            If any capped unit exceeds the holder or run budget, or usage
+            overflow has permanently exhausted the run.
         ValueError
             If the amount or holder is invalid.
 
@@ -578,6 +592,7 @@ class Ledger:
         >>> res = await ledger.reserve("g1/t/a", Amount(usd=1),
         ...                            kind="tool", goal_id="g1")  # doctest: +SKIP
         """
+        self._check_usage_overflow()
         amount = _nonnegative(amount)
         if holder != ":run" and holder.split("/", 1)[0] != goal_id:
             raise ValueError(f"holder does not belong to goal: {holder}")
@@ -641,17 +656,74 @@ class Ledger:
         Settlement is shielded after admission; a failed append restores any
         released charge conservatively. Concurrent settlements serialize by
         reservation identifier.
+        After usage overflow, later settlements are no-ops.
 
         Examples
         --------
         >>> await ledger.settle(res.id, Amount(usd=0.4))  # doctest: +SKIP
         """
+        await self._settle(reservation_id, actual, estimated=estimated)
+
+    async def settle_overflow(self, reservation_id: str, actual: Amount) -> None:
+        """
+        Journal a range-limit usage charge and permanently exhaust the run.
+
+        Parameters
+        ----------
+        reservation_id : str
+            Reservation whose usage exceeded the supported USD range.
+        actual : Amount
+            Reported tokens and exactly ``USD_LIMIT`` dollars.
+
+        Notes
+        -----
+        The settlement carries ``usage_overflow=True`` for history-only replay.
+        All later reservations raise ``LimitReached("usage_overflow")``, even
+        with unlimited caps. Later settlements are no-ops, retaining earlier
+        charges. A failed durable append retains exhaustion conservatively;
+        retrying this same overflow settlement can finish the durable write.
+
+        Examples
+        --------
+        >>> from unittest.mock import AsyncMock
+        >>> journal = AsyncMock(spec=JournalWriter)
+        >>> ledger = Ledger(Limits(), reserve_fraction=0.15, goal_weights=None,
+        ...                 journal=journal, ids=IdGen("example", 1))
+        >>> async def example() -> bool:
+        ...     res = await ledger.reserve(":run", Amount(usd=1), kind="call", goal_id="")
+        ...     await ledger.settle_overflow(res.id, Amount(tokens=7, usd=USD_LIMIT))
+        ...     return ledger.run_exhausted()
+        >>> anyio.run(example)
+        True
+        """
+        await self._settle(reservation_id, actual, usage_overflow=True)
+
+    def _check_usage_overflow(self) -> None:
+        """Reject local and durable admission after untrustworthy usage."""
+        if self._overflow_reservation is not None:
+            raise LimitReached("usage_overflow", "budget exhausted by usage overflow")
+
+    async def _settle(
+        self,
+        reservation_id: str,
+        actual: Amount,
+        *,
+        estimated: bool = False,
+        usage_overflow: bool = False,
+    ) -> None:
+        """Apply ordinary or terminal settlement with identical durable ordering."""
         entry = self._entries[reservation_id]
         async with entry.lock:
             if entry.settled:
                 return
+            if self._overflow_reservation is not None and (
+                self._overflow_reservation != reservation_id or not usage_overflow
+            ):
+                return
             actual = _nonnegative(actual)
-            target = self._charge_for(entry, actual, estimated)
+            if usage_overflow and actual.usd != USD_LIMIT:
+                raise ValueError("overflow settlement requires the supported USD limit")
+            target = actual if usage_overflow else self._charge_for(entry, actual, estimated)
             current = self._charges[reservation_id]
             overspend = _positive(actual - entry.reservation.amount)
             draft = EventDraft(
@@ -664,12 +736,17 @@ class Ledger:
                     "overspend": overspend.model_dump() if overspend != Amount() else None,
                 },
             )
+            if usage_overflow:
+                draft.payload["usage_overflow"] = True
             self._reconcile(entry, target)
+            if usage_overflow:
+                self._overflow_reservation = reservation_id
             try:
                 with anyio.CancelScope(shield=True):
                     await self._journal.append_durable(draft)
             except BaseException:
-                self._reconcile(entry, current + _positive(target - current))
+                if self._overflow_reservation in (None, reservation_id):
+                    self._reconcile(entry, current + _positive(target - current))
                 raise
             entry.settled = True
 
@@ -737,12 +814,12 @@ class Ledger:
 
     def run_exhausted(self) -> bool:
         """
-        Check whether charges have exhausted a capped work-pool unit.
+        Check capped work-pool exhaustion or terminal usage overflow.
 
         Returns
         -------
         bool
-            True if the total remaining work pool is nonpositive in a capped unit.
+            True after usage overflow or a nonpositive capped work-pool unit.
 
         Examples
         --------
@@ -753,7 +830,7 @@ class Ledger:
         >>> ledger.run_exhausted()
         False
         """
-        return self._exhausted(self._work)
+        return self._overflow_reservation is not None or self._exhausted(self._work)
 
     def goal_exhausted(self, goal_id: str) -> bool:
         """
@@ -767,7 +844,7 @@ class Ledger:
         Returns
         -------
         bool
-            True when a capped unit is nonpositive.
+            True after run-wide usage overflow or a nonpositive capped unit.
 
         Examples
         --------
@@ -780,7 +857,8 @@ class Ledger:
         >>> ledger.goal_exhausted("g1")
         False
         """
-        return self._exhausted(self._goal(goal_id).left)
+        goal = self._goal(goal_id)
+        return self._overflow_reservation is not None or self._exhausted(goal.left)
 
     def _exhausted(self, amount: _Balance) -> bool:
         """Inspect exact units, ignoring unlimited caps."""
