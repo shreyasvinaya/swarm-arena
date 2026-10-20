@@ -531,24 +531,29 @@ def _rule_fingerprints(
     return errors
 
 
-def _file_paths(value: Any) -> set[str]:
+def _file_sets(value: Any) -> Iterator[FileSet]:
     """Find typed file declarations, including defaults and nested configurations."""
     if isinstance(value, FileSet):
-        return set(value.manifest)
-    if isinstance(value, Ref):
+        yield value
+    elif isinstance(value, Ref):
         _, cfg = value._resolve_config(Configurable)
-        return _file_paths(cfg)
-    if isinstance(value, BaseModel):
-        return set().union(
-            *(_file_paths(getattr(value, field)) for field in type(value).model_fields)
-        )
-    if is_nested_ref(value):
-        return _file_paths(Ref.model_validate(value))
-    if isinstance(value, dict):
-        return set().union(*(_file_paths(v) for v in value.values()))
-    if isinstance(value, (list, tuple)):
-        return set().union(*(_file_paths(v) for v in value))
-    return set()
+        yield from _file_sets(cfg)
+    elif isinstance(value, BaseModel):
+        for field in type(value).model_fields:
+            yield from _file_sets(getattr(value, field))
+    elif is_nested_ref(value):
+        yield from _file_sets(Ref.model_validate(value))
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _file_sets(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _file_sets(child)
+
+
+def _file_paths(value: Any) -> set[str]:
+    """Collect frozen paths through the shared typed-file traversal."""
+    return {path for files in _file_sets(value) for path in files.manifest}
 
 
 def judge_private_paths(plan: Plan) -> frozenset[str]:
@@ -860,6 +865,26 @@ def _snapshot_round_refs(plan: Plan, artifacts: ArtifactStore) -> Plan:
     return plan.model_copy(update={"rounds": rounds, "converge": converge})
 
 
+def _validate_frozen_tools(plan: Plan) -> None:
+    """Refuse effective file declarations that escaped snapshot processing."""
+    refs = [(pointer, ref) for pointer, ref, _ in _round_refs(plan)]
+    for pointer, agent in _agents(plan):
+        if not plan.rounds and (
+            not pointer.startswith("/converge/") or plan.converge.round is None
+        ):
+            refs.append((pointer + "/tool", agent.tool))
+    errors: list[str] = []
+    for pointer, ref in refs:
+        try:
+            files = _safe_call(pointer, partial(list, _file_sets(ref)))
+            if any(not file_set.snapshotted for file_set in files):
+                errors.append(f"{pointer}: effective tool contains an unsnapshotted FileSet")
+        except PlanError as error:
+            errors.extend(error.errors)
+    if errors:
+        raise PlanError(errors) from None
+
+
 def admit_revision(
     plan: Plan,
     config: RunConfig,
@@ -870,6 +895,9 @@ def admit_revision(
 ) -> tuple[Plan, list[str]]:
     """
     Authorize, snapshot, and validate one revision before execution.
+
+    Refuse any effective tool configuration whose file declarations, including
+    nested references and defaults, remain unsnapshotted after admission.
 
     Parameters
     ----------
@@ -922,6 +950,8 @@ def admit_revision(
         raise
     except Exception as error:
         raise PlanError([f"/snapshot: {type(error).__name__}"]) from None
-    return frozen, validate_plan(
+    warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )
+    _validate_frozen_tools(frozen)
+    return frozen, warnings

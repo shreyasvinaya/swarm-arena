@@ -36,6 +36,7 @@ from swarm_arena._planning.validate import (
 )
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_plan
+from swarm_arena._tooling.tool import effective_tool_ref
 
 J_A = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="a")
 J_B = Ref(path="_fakes.tools:FixedJudge", config={"value": 2}, name="b")
@@ -936,6 +937,132 @@ def test_admission_validates_overrides_before_snapshot_io(
     with pytest.raises(PlanError) as error:
         admit_revision(plan, RunConfig(), artifacts)
     assert any(e.startswith("/rounds/0") for e in error.value.errors)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("converge", [False, True])
+@pytest.mark.parametrize("alias_kind", ["simple", "choices", "path"])
+def test_admission_snapshots_aliased_overrides_after_reload(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
+    converge: bool,
+    alias_kind: str,
+) -> None:
+    from _fakes.tools import AdmissionTool
+    from pydantic import AliasChoices, AliasPath, Field, create_model
+
+    from swarm_arena._model.ref import RefField
+
+    alias: str | AliasChoices | AliasPath = "sources"
+    key = "sources"
+    raw_files: Any = ["problem/run.py"]
+    if alias_kind == "choices":
+        alias = AliasChoices("sources", "legacy")
+        key = "legacy"
+    elif alias_kind == "path":
+        alias = AliasPath("payload", 0)
+        key = "payload"
+        raw_files = [raw_files]
+    schema = create_model(
+        "Config",
+        __base__=AdmissionTool.Config,
+        files=(FileSet, Field(default_factory=FileSet, validation_alias=alias)),
+        members=(list[RefField], Field(default_factory=list, validation_alias="children")),
+    )
+    monkeypatch.setattr(AdmissionTool, "Config", schema)
+    source = tmp_path / "problem/run.py"
+    source.parent.mkdir()
+    source.write_text("print(1)")
+    expected = {"problem/run.py": sha256_hex(source.read_bytes())}
+    overrides: dict[str, Any] = {key: raw_files}
+    if nested:
+        overrides = {"children": [{"path": "_fakes.tools:AdmissionTool", "config": overrides}]}
+    plan = _plan(
+        tool=Ref(path="_fakes.tools:AdmissionTool"),
+        base_dir=tmp_path,
+        rounds=[RoundSpec(tool_overrides=overrides)],
+    )
+    if converge:
+        plan = plan.model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=plan.teams[0].model_copy(update={"name": "join"})
+                )
+            }
+        )
+    admitted, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    stored = admitted.rounds[0].tool_overrides
+    files = (stored["children"][0]["config"] if nested else stored)[key]
+    if alias_kind == "path":
+        files = files[0]
+    assert files["manifest"] == expected
+    assert "files" not in stored
+    assert "members" not in stored
+    source.unlink()
+    for restored in (
+        Plan.model_validate_json(admitted.model_dump_json()),
+        Plan.loads(admitted.dumps(), base_dir=tmp_path),
+    ):
+        restored._base_dir = tmp_path
+        resumed, warnings = admit_revision(restored, RunConfig(), artifacts)
+        assert warnings == []
+        assert resumed.rounds == admitted.rounds
+        effective = effective_tool_ref(
+            resumed.teams[0].agents[0].tool, resumed.rounds[0].tool_overrides
+        ).build(AdmissionTool)
+        if nested:
+            effective = effective.config.members[0].build(AdmissionTool)
+        assert effective.config.files.snapshotted
+        assert effective._own_files() == expected
+        assert artifacts.get_bytes(expected["problem/run.py"]) == b"print(1)"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("converge", [False, True])
+def test_admission_refuses_unsnapshotted_effective_defaults(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
+    converge: bool,
+) -> None:
+    from _fakes.tools import AdmissionTool
+    from pydantic import create_model
+
+    from swarm_arena._model.ref import RefField
+
+    secret = "unfrozen-source-sentinel.py"
+    fields: dict[str, Any] = {"files": (FileSet, FileSet(globs=[secret]))}
+    if nested:
+        fields = {
+            "members": (
+                list[RefField],
+                [
+                    Ref(
+                        path="swarm_arena:ScriptTool",
+                        config={"command": ["true"], "files": [secret]},
+                    )
+                ],
+            )
+        }
+    schema = create_model("Config", __base__=AdmissionTool.Config, **fields)
+    monkeypatch.setattr(AdmissionTool, "Config", schema)
+    plan = _plan(tool=Ref(path="_fakes.tools:AdmissionTool"), base_dir=tmp_path)
+    if converge:
+        plan = _plan(base_dir=tmp_path).model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=plan.teams[0].model_copy(update={"name": "join"})
+                )
+            }
+        )
+    with pytest.raises(PlanError) as error:
+        admit_revision(plan, RunConfig(), artifacts)
+    assert any("unsnapshotted FileSet" in item for item in error.value.errors)
+    assert_secret_absent(error.value, secret)
 
 
 def test_nested_diagnostic_mapping_keys_are_not_exposed(monkeypatch: pytest.MonkeyPatch) -> None:
