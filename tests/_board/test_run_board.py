@@ -1,15 +1,11 @@
-import sys
 import threading
 from pathlib import Path
-from types import FrameType
-from typing import Any
 
 import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, PartSpec, Plan, Score
-from swarm_arena._board import run_board
 from swarm_arena._board.run_board import RunBoard
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import Head
@@ -235,27 +231,22 @@ async def test_worker_snapshot_interleaves_loop_writes(board: RunBoard) -> None:
     loop_thread = threading.get_ident()
     views: list[BoardView] = []
 
-    def trace(frame: FrameType, event: str, arg: Any) -> Any:
-        # Pause the ordinary position iterator after its first entry is obtained.
-        if (
-            event == "line"
-            and frame.f_code.co_filename == run_board.__file__
-            and frame.f_code.co_name == "<setcomp>"
-            and "position" in frame.f_locals
-            and not entered.is_set()
-        ):
-            anyio.from_thread.run_sync(entered.set)
-            if not release.wait(30):
-                raise TimeoutError("snapshot synchronization timeout")
-        return trace
+    class PausingPosition(tuple[int, int]):
+        def __le__(self, other: tuple[int, ...]) -> bool:
+            # Pause after the iterator obtains an entry, outside the capture lock.
+            # A tuple hook also works when Python inlines the set comprehension.
+            if not entered.is_set():
+                assert threading.get_ident() != loop_thread
+                anyio.from_thread.run_sync(entered.set)
+                if not release.wait(30):
+                    raise TimeoutError("snapshot synchronization timeout")
+            return super().__le__(other)
+
+    board._records.positions["L-1"] = PausingPosition((1, 1))
 
     def snapshot() -> None:
         assert threading.get_ident() != loop_thread
-        sys.settrace(trace)
-        try:
-            views.append(board.snapshot(KEY, frontier))
-        finally:
-            sys.settrace(None)
+        views.append(board.snapshot(KEY, frontier))
 
     async def take_snapshot() -> None:
         await anyio.to_thread.run_sync(snapshot)
