@@ -4,6 +4,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -352,7 +353,7 @@ class S3Store(Store):
         Returns
         -------
         list[str]
-            Sorted keys relative to this store's root.
+            Sorted root-relative keys, excluding temporary and lock basenames.
 
         Examples
         --------
@@ -365,7 +366,11 @@ class S3Store(Store):
         with self._reading("list_objects_v2"):
             while True:
                 page = self._call("list_objects_v2", **kwargs)
-                keys.extend(item["Key"][len(self._prefix) :] for item in page.get("Contents", []))
+                for item in page.get("Contents", []):
+                    key = item["Key"][len(self._prefix) :]
+                    name = PurePosixPath(key).name
+                    if ".tmp-" not in name and not name.endswith(".lock"):
+                        keys.append(key)
                 if not page.get("IsTruncated", False):
                     break
                 kwargs["ContinuationToken"] = page["NextContinuationToken"]

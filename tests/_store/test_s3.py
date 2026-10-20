@@ -630,3 +630,47 @@ def test_child_preserves_raw_key_components(s3_url: str, tmp_path: Path, prefix:
         nested.create("c", b"nested")
         assert store.read(f"{prefix}/nested?#% space/c").data == b"nested"
         assert child.list("") == ["a", "b", "nested?#% space/c"]
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_paginated_list_matches_local_basename_filter(
+    s3_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_size: int
+) -> None:
+    local = LocalStore(tmp_path / "local")
+    remote = S3Store(s3_url)
+    visible = [
+        ".tmp-parent/kept",
+        "dir.lock/kept",
+        "nested/kept",
+        "visible.json",
+        "visible.locked",
+        "visible.tmp",
+    ]
+    hidden = [
+        "00.lock",
+        "01.tmp-token",
+        "visible.lock",
+        "visible.tmp-token",
+        "nested/.lock",
+        "nested/.tmp-token",
+        "nested/visible.lock",
+        "nested/visible.tmp-token",
+    ]
+    for store in (local, remote):
+        for key in visible + hidden:
+            store.create(key, b"x")
+    real = remote._call
+    pages: list[str] = []
+
+    def call(method: str, **kwargs: Any) -> dict[str, Any]:
+        if method == "list_objects_v2":
+            kwargs["MaxKeys"] = page_size
+            pages.append(kwargs.get("ContinuationToken", ""))
+        return real(method, **kwargs)
+
+    monkeypatch.setattr(remote, "_call", call)
+    assert local.list("") == sorted(visible)
+    for prefix in ("", "nested/", "visible", "dir.lock/", ".tmp-parent/", "00"):
+        assert remote.list(prefix) == local.list(prefix)
+    assert len(pages) > len(visible)
+    assert any(pages)

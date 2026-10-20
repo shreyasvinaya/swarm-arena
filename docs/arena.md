@@ -47,3 +47,7 @@ stored state.
 
 Child-store prefixes follow the raw Store key rules: characters such as `?`,
 `#`, `%`, and spaces remain part of the key when opening nested child stores.
+
+Listings match the local Store contract: basenames containing `.tmp-` or ending
+in `.lock` are hidden, including nested objects. Filtering applies to every page
+before returning sorted keys relative to the store root.

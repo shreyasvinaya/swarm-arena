@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - Unreleased
 
-### Fixed
+### Added
+
+- Hide temporary and lock basenames consistently in local and paginated S3 listings.
 
 - Preserve valid raw key characters when opening S3 child stores.
 
