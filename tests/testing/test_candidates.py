@@ -11,7 +11,7 @@ from swarm_arena._store.base import open_store
 from swarm_arena._tooling.staging import parent_ref, tool_identity
 from swarm_arena.executor import LocalExecutor
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
-from swarm_arena.testing._conformance import _artifact_root
+from swarm_arena.testing._state import _artifact_root
 from swarm_arena.tool import FileSet, RunStatus, ToolOutput, ToolRequest
 
 

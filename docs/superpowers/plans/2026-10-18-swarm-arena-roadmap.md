@@ -375,6 +375,11 @@ Rules [plan]:
 | `ray/_submit.py` | `submit` through `JobSubmissionClient` | M4 | `tests/ray/test_submit.py` |
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
 | `testing/_conformance.py` | `check_tool`, `check_check`, `check_judge` (M1a), `check_manager` (M1b), parallel calls and `check_judge(..., config=)` (M3) | M1a +M1b +M3 | `tests/testing/test_conformance.py` |
+| `testing/_state.py` | Process-local artifact-store ownership and shared identifier source | M1a | `tests/testing/test_artifacts.py`, `tests/testing/test_candidates.py` |
+| `testing/_components.py` | Effective component configuration, snapshots, preflight, and goal matching | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_round_context.py` |
+| `testing/_execution.py` | Watched execution and non-ok stderr diagnostics | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_artifacts.py` |
+| `testing/_tool.py` | Tool job preparation and collection contract probes | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_round_context.py` |
+| `testing/_contracts.py` | Result validation and shared return-type predicates | M1a | `tests/testing/test_conformance.py` |
 | `testing/_candidates.py` | `make_candidate` | M1a | `tests/testing/test_candidates.py` |
 | `testing/_artifacts.py` | `read_output_file`, `read_logs` | M1a | `tests/testing/test_artifacts.py` |
 | `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b | `tests/testing/test_harness.py` |

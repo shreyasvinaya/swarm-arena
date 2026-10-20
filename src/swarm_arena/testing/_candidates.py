@@ -20,7 +20,8 @@ from swarm_arena._tooling.staging import (
     validate_edits,
 )
 from swarm_arena._tooling.tool import Tool
-from swarm_arena.testing._conformance import _artifacts, _effective_tool_ref, _ids
+from swarm_arena.testing._components import _effective_tool_ref
+from swarm_arena.testing._state import _artifacts, _ids
 
 
 def make_candidate(

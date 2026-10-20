@@ -1,7 +1,7 @@
 """Read verified artifacts produced by the process-local conformance kit."""
 
 from swarm_arena._model.tooling import ToolOutput, parse_logs_ref
-from swarm_arena.testing._conformance import _artifacts
+from swarm_arena.testing._state import _artifacts
 
 
 def read_output_file(output: ToolOutput, path: str) -> bytes:

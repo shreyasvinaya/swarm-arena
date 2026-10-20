@@ -11,8 +11,8 @@ from swarm_arena._errors import NotFound, StorageError
 from swarm_arena._model.tooling import format_logs_ref, parse_logs_ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena.executor import LocalExecutor
-from swarm_arena.testing import _conformance
-from swarm_arena.testing._conformance import _artifact_root, _artifacts
+from swarm_arena.testing import _execution, _state
+from swarm_arena.testing._state import _artifact_root, _artifacts
 from swarm_arena.tool import FileRef, RunStatus, ToolOutput
 
 SECRET = "47a8e694-f6b1-46ad-8519-157058fb3cdc"
@@ -20,7 +20,7 @@ SECRET = "47a8e694-f6b1-46ad-8519-157058fb3cdc"
 
 @pytest.fixture(autouse=True)
 def isolated_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_conformance, "_root", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(_state, "_root", str(tmp_path / "artifacts"))
 
 
 def output_with_artifacts() -> ToolOutput:
@@ -108,15 +108,15 @@ def test_stderr_tail_rejects_malformed_reference_before_storage(
     def forbidden() -> ArtifactStore:
         pytest.fail("malformed reference reached storage")
 
-    monkeypatch.setattr(_conformance, "_artifacts", forbidden)
+    monkeypatch.setattr(_execution, "_artifacts", forbidden)
     out = ToolOutput.model_construct(status=RunStatus.ERROR, logs_ref=value)
-    assert _conformance._stderr_tail(out) == "(no stderr log)"
+    assert _execution._stderr_tail(out) == "(no stderr log)"
 
 
 def test_stderr_tail_reads_only_stderr_and_handles_missing_log() -> None:
     stderr = _artifacts().put_bytes(b"e" * 3000)
     # Stdout is deliberately missing: diagnostic tails must never read it.
     out = ToolOutput(status=RunStatus.ERROR, logs_ref=format_logs_ref("0" * 64, stderr))
-    assert _conformance._stderr_tail(out) == "e" * 2048
+    assert _execution._stderr_tail(out) == "e" * 2048
     missing = ToolOutput(status=RunStatus.ERROR, logs_ref=format_logs_ref("0" * 64, "1" * 64))
-    assert _conformance._stderr_tail(missing) == "(the stderr log cannot be read)"
+    assert _execution._stderr_tail(missing) == "(the stderr log cannot be read)"

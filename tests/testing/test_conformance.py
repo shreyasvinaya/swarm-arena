@@ -73,7 +73,7 @@ from swarm_arena.scoring import (
     Lexicographic,
 )
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
-from swarm_arena.testing._conformance import _artifact_root
+from swarm_arena.testing._state import _artifact_root
 from swarm_arena.tool import (
     Command,
     CompletedRun,
@@ -863,7 +863,7 @@ async def test_candidate_without_score_or_error_warns() -> None:
 def test_artifact_root_is_one_per_process_and_removed_at_exit() -> None:
     code = (  # the root holds a store tree before exit, so an empty-only cleanup fails
         "import os\n"
-        "from swarm_arena.testing._conformance import _artifact_root, _artifacts\n"
+        "from swarm_arena.testing._state import _artifact_root, _artifacts\n"
         "root = _artifact_root()\n"
         "assert root == _artifact_root() and os.path.isdir(root)\n"
         "assert os.path.basename(root).startswith('swarm-arena-testing-')\n"
