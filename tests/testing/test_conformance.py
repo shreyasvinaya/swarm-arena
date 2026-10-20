@@ -71,9 +71,17 @@ from swarm_arena.scoring import (
 )
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
 from swarm_arena.testing._conformance import _artifact_root
-from swarm_arena.tool import Command, FileRef, FileSet, RunStatus, ToolOutput, ToolRequest
+from swarm_arena.tool import (
+    Command,
+    CompletedRun,
+    FileRef,
+    FileSet,
+    RunStatus,
+    ToolOutput,
+    ToolRequest,
+)
 
-SECRET = "SECRET_SENTINEL_KIT"
+SECRET = "d9be8c92-4d1c-4b85-a2c7-632b17d8499f"
 INVALID_COLLECT_NOTE = "swarm-arena: collect failed: Tool.collect() did not return a ToolOutput"
 RUN_PY = """\
 import json, os
@@ -312,7 +320,7 @@ async def test_failed_check_command_shows_its_stderr_log(
 
 
 async def test_failed_judge_command_shows_its_stderr_log(local_executor: LocalExecutor) -> None:
-    c = make_candidate(ok())
+    c = make_candidate(ok(), goal_id=GOAL.id)
     judge = BrokenJudge({"mode": "command_fails"})
     with pytest.warns(UserWarning, match=r"(?s)ended with status error.*COMMAND-DIAG"):
         [score] = await check_judge(judge, GOAL, [c], executor=local_executor)
@@ -329,8 +337,8 @@ async def test_log_tail_that_is_not_utf8_is_decoded_safely(local_executor: Local
     assert ":\n" + chr(0xFFFD) + "é" * 1023 + chr(0xFFFD) in message
 
 
-@pytest.mark.parametrize("status", [s for s in RunStatus if s != RunStatus.ERROR])
-async def test_only_status_error_gives_the_failed_run_warning(status: RunStatus) -> None:
+async def test_ok_status_has_no_failed_run_warning() -> None:
+    status = RunStatus.OK
     executor = FixedExecutor(ToolOutput(status=status))
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -352,7 +360,9 @@ async def test_contract_failure_keeps_the_failed_run_tail(local_executor: LocalE
             await check_check(check, make_candidate(ok()), executor=local_executor)
         judge = BrokenJudge({"mode": "command_then_invalid"})
         with pytest.raises(AssertionError, match="valid Scores") as judged:
-            await check_judge(judge, GOAL, [make_candidate(ok())], executor=local_executor)
+            await check_judge(
+                judge, GOAL, [make_candidate(ok(), goal_id=GOAL.id)], executor=local_executor
+            )
     for caught in (tool, checked, judged):
         text = notes_of(caught.value)
         assert "ended with status error" in text
@@ -374,7 +384,9 @@ async def test_any_error_after_a_failed_run_keeps_the_tail(local_executor: Local
             await check_check(check, make_candidate(ok()), executor=local_executor)
         judge = ResultJudge({"code": FAILING_COMMAND})
         with pytest.raises(KeyError) as judged:
-            await check_judge(judge, GOAL, [make_candidate(ok())], executor=local_executor)
+            await check_judge(
+                judge, GOAL, [make_candidate(ok(), goal_id=GOAL.id)], executor=local_executor
+            )
     for caught, method, key in [
         (tool, "fingerprint", "result"),
         (checked, "check", "passed"),
@@ -411,7 +423,9 @@ async def test_error_while_stamping_after_a_failed_command_keeps_the_tail(
     monkeypatch.setattr(BrokenJudge, "rubric_hash", rubric_hash)
     broken_judge = BrokenJudge({"mode": "command_fails"})
     with pytest.raises(OSError, match="rubric file is gone") as caught:
-        await check_judge(broken_judge, GOAL, [make_candidate(ok())], executor=local_executor)
+        await check_judge(
+            broken_judge, GOAL, [make_candidate(ok(), goal_id=GOAL.id)], executor=local_executor
+        )
     assert "COMMAND-DIAG" in notes_of(caught.value)
 
 
@@ -634,7 +648,7 @@ async def test_custom_executor_with_microsecond_times_passes() -> None:
 
 
 async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
-    # Ruling 284: the core validates a ToolOutput again in lax mode. An executor that rebuilds
+    # The core validates a ToolOutput again in lax mode. An executor that rebuilds
     # the output from its JSON form without validation holds status "ok" as a str, which
     # strict mode refuses.
     sent = ToolOutput(status=RunStatus.OK, data={"x": 1})
@@ -696,7 +710,7 @@ async def test_check_gets_the_default_or_snapshotted_goal(ws: Path) -> None:
     default = await check_check(GoalCheck(), make_candidate(ok()))
     assert default.details == {"goal": "testing/check", "files": []}
     goal = Goal(id="g", namespace="ns", files=PROBLEM)
-    given = await check_check(GoalCheck(), make_candidate(ok()), goal=goal)
+    given = await check_check(GoalCheck(), make_candidate(ok(), goal_id=goal.id), goal=goal)
     files = ["problem/a.txt", "problem/b.txt", "problem/run.py"]
     assert given.details == {"goal": "ns/g", "files": files}
 
@@ -745,8 +759,8 @@ async def test_good_checks_pass_strict_validation(check: Check) -> None:
 
 
 async def test_check_judge_stamps_and_warns(local_executor: LocalExecutor) -> None:
-    c1 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 2.0}))
-    c2 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 1.0}))
+    c1 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 2.0}), goal_id=GOAL.id)
+    c2 = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 1.0}), goal_id=GOAL.id)
     scores = await check_judge(ProgramJudge(rosen_score), GOAL, [c1, c2], executor=local_executor)
     assert [s.candidate_id for s in scores] == [c1.id, c2.id]
     assert {s.judge for s in scores} == {"program"}
@@ -758,7 +772,7 @@ async def test_check_judge_stamps_and_warns(local_executor: LocalExecutor) -> No
 
 
 async def test_judge_name_comes_from_the_ref_and_goal_files_are_snapshotted(ws: Path) -> None:
-    candidate = make_candidate(ok())
+    candidate = make_candidate(ok(), goal_id=GOAL.id)
     ref = Ref(path="_fakes.tools:FixedJudge", config={"value": 1.0}, name="x")
     [score] = await check_judge(ref, GOAL, [candidate])
     assert score.judge == "x"
@@ -768,7 +782,7 @@ async def test_judge_name_comes_from_the_ref_and_goal_files_are_snapshotted(ws: 
 
 
 async def test_check_judge_rejects_unknown_candidate(local_executor: LocalExecutor) -> None:
-    candidate = make_candidate(ok())
+    candidate = make_candidate(ok(), goal_id=GOAL.id)
     with pytest.raises(AssertionError, match="unknown candidate"):
         await check_judge(StrayJudge(), GOAL, [candidate], executor=local_executor)
 
@@ -797,7 +811,9 @@ async def test_check_judge_rejects_unknown_candidate(local_executor: LocalExecut
 )
 async def test_judge_contract_is_asserted(mode: str, match: str) -> None:
     with pytest.raises(AssertionError, match=match):
-        await check_judge(BrokenJudge({"mode": mode}), GOAL, [make_candidate(ok())])
+        await check_judge(
+            BrokenJudge({"mode": mode}), GOAL, [make_candidate(ok(), goal_id=GOAL.id)]
+        )
 
 
 @pytest.mark.parametrize(
@@ -810,7 +826,7 @@ async def test_judge_contract_is_asserted(mode: str, match: str) -> None:
     ],
 )
 async def test_good_judges_pass_strict_validation(judge: Judge) -> None:
-    c = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 0.5}))
+    c = make_candidate(ToolOutput(status=RunStatus.OK, data={"f": 0.5}), goal_id=GOAL.id)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         [score] = await check_judge(judge, GOAL, [c])
@@ -818,7 +834,7 @@ async def test_good_judges_pass_strict_validation(judge: Judge) -> None:
 
 
 async def test_non_finite_score_is_a_judge_error() -> None:
-    c = make_candidate(ok())
+    c = make_candidate(ok(), goal_id=GOAL.id)
     with pytest.warns(UserWarning, match=f"judge error for {c.id}: score key must be") as record:
         assert await check_judge(BrokenJudge({"mode": "nan"}), GOAL, [c]) == []
     assert [str(w.message) for w in record] == [
@@ -827,14 +843,14 @@ async def test_non_finite_score_is_a_judge_error() -> None:
 
 
 async def test_judge_error_without_a_score_gives_one_warning() -> None:
-    c = make_candidate(ok())
+    c = make_candidate(ok(), goal_id=GOAL.id)
     with pytest.warns(UserWarning, match=f"judge error for {c.id}") as record:
         assert await check_judge(ProgramJudge(raising_score), GOAL, [c]) == []
     assert [str(w.message).split(":")[0] for w in record] == [f"judge error for {c.id}"]
 
 
 async def test_candidate_without_score_or_error_warns() -> None:
-    c = make_candidate(ok())
+    c = make_candidate(ok(), goal_id=GOAL.id)
     with pytest.warns(UserWarning, match=f"judge gave no score and no judge error for {c.id}"):
         assert await check_judge(BrokenJudge({"mode": "drop"}), GOAL, [c]) == []
 
@@ -854,3 +870,144 @@ def test_artifact_root_is_one_per_process_and_removed_at_exit() -> None:
     root = Path(done.stdout.strip())
     assert root.name.startswith("swarm-arena-testing-")
     assert not root.exists()
+
+
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
+    stop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from swarm_arena.testing import _conformance
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    daemon: list[bool] = []
+
+    def collect(
+        self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        daemon.append(threading.current_thread().daemon)
+        entered.set()
+        try:
+            release.wait()
+            return ToolOutput(status=run.status)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    monkeypatch.setattr(_conformance, "BEFORE_KILL_TIMEOUT_S", 0.1, raising=False)
+    # A watchdog makes the regression safe even with the old non-cancellable worker.
+    watchdog = threading.Timer(2.0, release.set)
+    watchdog.start()
+    completed = False
+    errors: list[AssertionError] = []
+
+    async def run() -> None:
+        nonlocal completed
+        try:
+            await check_tool(PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(ok()))
+        except AssertionError as error:
+            errors.append(error)
+        completed = True
+
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as group:
+                group.start_soon(run)
+                assert await anyio.to_thread.run_sync(entered.wait, 2.0)
+                if stop == "cancel":
+                    group.cancel_scope.cancel()
+        assert not release.is_set(), "probe waited for its blocking collect"
+        assert daemon == [True]
+        assert (completed, bool(errors)) == ((True, True) if stop == "deadline" else (False, False))
+        if errors:
+            assert "Tool.collect() did not return" in str(errors[0])
+    finally:
+        release.set()
+        watchdog.cancel()
+        await anyio.to_thread.run_sync(finished.wait, 2.0)
+
+
+@pytest.mark.parametrize("exception", [SystemExit, KeyboardInterrupt])
+async def test_probe_system_exit_is_a_failure_but_interrupt_propagates(
+    exception: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def collect(
+        self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        raise exception(SECRET)
+
+    monkeypatch.setattr(PyTool, "collect", collect)
+    error: BaseException | None = None
+    try:
+        await check_tool(PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(ok()))
+    except BaseException as caught:
+        error = caught
+    if exception is SystemExit:
+        assert error is None
+    else:
+        assert isinstance(error, KeyboardInterrupt)
+
+
+@pytest.mark.parametrize("status", list(RunStatus))
+@pytest.mark.parametrize("kind", ["tool", "check", "judge"])
+async def test_returned_non_ok_runs_warn_with_stderr_tail(status: RunStatus, kind: str) -> None:
+    executor = FixedExecutor(with_stderr(status, "discarded-head\n" + "x" * 2048 + "RUN-TAIL"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if kind == "tool":
+            await check_tool(PyTool(PyTool.Config(code="pass")), {}, executor=executor)
+        elif kind == "check":
+            await check_check(
+                CommandCheck({"code": "pass"}), make_candidate(ok()), executor=executor
+            )
+        else:
+            await check_judge(
+                BrokenJudge({"mode": "command_fails"}),
+                GOAL,
+                [make_candidate(ok(), goal_id=GOAL.id)],
+                executor=executor,
+            )
+    if status == RunStatus.OK:
+        assert caught == []
+    else:
+        [warning] = caught
+        text = str(warning.message)
+        assert f"ended with status {status.value}" in text
+        assert text.endswith("RUN-TAIL")
+        assert "discarded-head" not in text
+        assert len(text.split("stderr log:\n")[1].encode()) == 2048
+
+
+@pytest.mark.parametrize(
+    ("configured", "cap", "expected"), [(0.25, 60, 0.25), (120, 30, 30), (None, 60, 60)]
+)
+async def test_kit_timeout_uses_smaller_tool_setting(
+    configured: float | None, cap: float, expected: float
+) -> None:
+    executor = FixedExecutor(ok())
+    await check_tool(
+        PyTool(PyTool.Config(code="pass", timeout_s=configured)),
+        {},
+        timeout_s=cap,
+        executor=executor,
+    )
+    assert executor.jobs[0].timeout_s == expected
+
+
+@pytest.mark.parametrize("kind", ["check", "default-check", "judge"])
+async def test_candidate_goal_mismatch_is_refused_before_component_runs(kind: str) -> None:
+    candidate = make_candidate(ok(), goal_id="another")
+    executor = RecordingExecutor()
+    if kind == "judge":
+        call = check_judge(BrokenJudge({"mode": "preflight"}), GOAL, [candidate], executor=executor)
+    else:
+        call = check_check(
+            PreflightFailsCheck(),
+            candidate,
+            goal=None if kind == "default-check" else GOAL,
+            executor=executor,
+        )
+    with pytest.raises(ValueError, match=r"goal_id another does not match goal (g|check)"):
+        await call
+    assert executor.jobs == []

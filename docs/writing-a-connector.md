@@ -282,15 +282,24 @@ breaks its contract:
   and does not change with `logs_ref` or the run times, that
   `is_deterministic()` returns a `bool`, and that `estimate()` returns `None` or
   an `Estimate`. It also calls `collect()` once on an empty workspace after a
-  failed run: `collect()` may raise there, but it must not report `ok`. A
-  refused edit raises a `ValueError` that names the path and the reason; a
+  failed run: `collect()` may raise there, but it must not report `ok`.
+  The probe runs in a cancellable daemon thread and fails the contract if it
+  takes more than 30 seconds. A blocked probe cannot hold up interpreter exit.
+  The run uses the smaller of the kit's `timeout_s` (60 seconds by default)
+  and the tool's configured `timeout_s`; an unset tool timeout uses the kit
+  cap. The probe's deadline is separate from the run timeout. A refused edit raises a `ValueError` that names the path and the reason; a
   refused base-parent overlay gives a `UserWarning`.
 - `check_check(check, candidate, *, goal, executor)` runs one check and returns
   its `CheckResult`. `feedback` must be `"pass_fail"` or `"reasons"`. The
   result is validated again in strict mode, so a value that only lax
   validation would repair, such as `passed="no"`, is an `AssertionError`.
+  The goal id must equal `candidate.goal_id`, or the kit raises `ValueError`
+  before running the check. Omitting `goal` selects the kit's `check` goal,
+  which is valid only for candidates with `goal_id="check"`.
 - `check_judge(judge, goal, candidates, *, executor)` judges one batch and
-  returns the stamped scores. Each score is validated again in strict mode, as
+  returns the stamped scores. Every candidate's `goal_id` must match the
+  supplied goal id, or the kit raises `ValueError` before running the judge.
+  Each score is validated again in strict mode, as
   for a check result. The judge identity must be
   stable: `rubric_hash()` gives the same nonempty `str` on two calls and on a
   second build, and `panel_hash()` the same `str`. `anchor_count()` must return
@@ -299,12 +308,27 @@ breaks its contract:
   `"judge error for <id>: <reason>"`, and a candidate with neither a score nor
   a judge error gives a `UserWarning` too. A score for a candidate that is not
   in the batch, or two scores for one candidate, raise `AssertionError`.
-- `make_candidate(output, *, request, tool, **fields)` makes a `Candidate` with
-  local defaults. With `tool=`, it gets that tool's identity, so `check_tool`
-  applies its overlay when it is the first parent.
+- `make_candidate(output, *, request, tool, parents=(), goal=None, **fields)`
+  makes a `Candidate` with local defaults. Pass the same `tool` and `goal` as
+  to `check_tool`. It computes the full effective overlay from the accepted
+  first parent plus the new edits, and fills `parent_ids` and `request.parents`.
+  Existing request parent references are used when `parents` is omitted;
+  supplying both requires them to agree. Later parents contribute read-only
+  references. Identity, editable-path, protection and layout checks are the
+  same as for the tool run; refused base overlays warn and are excluded.
+  With no `tool`, inherited overlays are refused. `goal` supplies the default
+  `goal_id`; explicit candidate fields still replace defaults.
+- `read_output_file(output, path)` reads a declared output file by its exact
+  workspace-relative path and returns verified bytes.
+- `read_logs(output)` returns `(stdout_bytes, stderr_bytes)` for that run,
+  verified against their stored hashes. These are the complete logs retained
+  by the executor, subject to its configured log limit. Missing or malformed
+  log references raise `ValueError`; missing or corrupt stored artifacts
+  raise a storage error. Both readers work after workspace cleanup and until
+  this Python process exits. They read the kit's process-local artifact store.
 
 Install the connector in the interpreter that runs the tool, for example with
-`uv sync` or `pip install -e .`. The program runs with the workspace as its
+`uv sync`. The program runs with the workspace as its
 working directory and a fresh environment without `PYTHONPATH`, so the
 `pythonpath` setting of pytest or a source checkout is not enough: the driver
 imports your package, but `python -m my_connector.route` fails.
@@ -333,19 +357,19 @@ async def test_tool_runs_and_follows_the_contract() -> None:
 
 
 async def test_check_passes_a_route_and_fails_an_empty_one() -> None:
-    route = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["step 1"]}))
-    empty = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": []}))
+    route = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["step 1"]}), goal=GOAL)
+    empty = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": []}), goal=GOAL)
     assert (await check_check(RouteIsValid(), route, goal=GOAL)).passed
     result = await check_check(RouteIsValid(), empty, goal=GOAL)
     assert (result.passed, result.reasons) == (False, ["the route has no steps"])
 
 
 async def test_judge_prefers_the_shorter_route_and_reports_bad_output() -> None:
-    short = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["a"]}))
-    long = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["a", "b"]}))
+    short = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["a"]}), goal=GOAL)
+    long = make_candidate(ToolOutput(status=RunStatus.OK, data={"steps": ["a", "b"]}), goal=GOAL)
     scores = await check_judge(FewestSteps(), GOAL, [short, long])
     assert max(scores, key=lambda score: score.key).candidate_id == short.id
-    broken = make_candidate(ToolOutput(status=RunStatus.OK, data={}))
+    broken = make_candidate(ToolOutput(status=RunStatus.OK, data={}), goal=GOAL)
     with pytest.warns(UserWarning, match=f"judge error for {broken.id}"):
         assert await check_judge(FewestSteps(), GOAL, [broken]) == []
 ```
@@ -361,34 +385,52 @@ how a plan names it.
 
 The kit shows the last 2 KB of a run's stderr log for a tool run, or a command
 that a check or judge runs, that does not end with status `ok`. If the kit call
-then returns, each run with status `error` gives a `UserWarning` with that text.
+then returns, each run whose status is not `ok` gives a `UserWarning` with that text.
 If the call raises an error instead (a failed contract assert, or an error from
 your own code that the kit passes on, such as a `KeyError` in `fingerprint()`,
 `check()`, or `judge()`), the kit adds the tail of each run whose status is not
 `ok` (`error`, `timeout`, `cancelled`, and so on) to that error as a note and
-raises the error unchanged. To keep the whole workspace, with its logs, pass
-your own executor:
+raises the error unchanged. Read the stored logs without retaining a workspace:
 
 ```python
 # tests/test_logs.py
-from pathlib import Path
-
 import pytest
-from swarm_arena.executor import LocalExecutor
-from swarm_arena.testing import check_tool
+from swarm_arena.testing import check_tool, read_logs
 from swarm_arena.tool import RunStatus
 
 from my_connector.tools import RouteTool
 
 
-def stderr_log(root: Path) -> str:
-    # Each workspace is root/<job id>-<random>/, and its log is swarm/stderr.log.
-    return next(root.glob("*/swarm/stderr.log")).read_text()
-
-
 @pytest.mark.anyio
-async def test_tool_with_kept_workspace(tmp_path: Path) -> None:
-    executor = LocalExecutor(workspace_root=str(tmp_path), keep_workspaces=True)
-    out = await check_tool(RouteTool(), {"target": "CCO"}, executor=executor)
-    assert out.status == RunStatus.OK, stderr_log(tmp_path)
+async def test_tool_logs() -> None:
+    out = await check_tool(RouteTool(), {"target": "CCO"})
+    stdout, stderr = read_logs(out)
+    assert out.status == RunStatus.OK, stderr.decode(errors="replace")
 ```
+
+For a declared file, use its path from `out.files`, for example
+`read_output_file(out, "out/route.json")`. A file's display name may not be
+unique; the path selects the file. No text decoding is implicit.
+
+### Testing an edit chain
+
+Use the same goal and tool for the run and candidate construction. For example,
+with an existing goal and a tool whose editable globs include `problem/*.txt`:
+
+```python
+from swarm_arena import Goal
+from swarm_arena.board import Candidate
+from swarm_arena.testing import check_tool, make_candidate
+from swarm_arena.tool import Tool, ToolRequest
+
+
+async def edit_child(tool: Tool, goal: Goal, parent: Candidate) -> Candidate:
+    request = ToolRequest(edits={"problem/b.txt": "3"})
+    output = await check_tool(tool, {}, goal=goal, parents=[parent], edits=request.edits)
+    return make_candidate(output, request=request, tool=tool, goal=goal, parents=[parent])
+```
+
+The child's overlay retains the accepted parent's edits, with the child's new
+edits taking precedence at the same path. Passing that child as the next base
+parent preserves the chain. Checks and judges supplied with the same goal see
+the same effective files, without a manual overlay merge.

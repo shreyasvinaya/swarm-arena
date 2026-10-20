@@ -20,6 +20,8 @@ from pydantic import BaseModel
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import _NOT_AN_OUTPUT, LocalExecutor
+from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import _sanitize_validation_error
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
@@ -95,6 +97,16 @@ def _build(component: _C | Ref, base: type[_C], goal: Goal | None) -> tuple[Ref,
     goal = _DEFAULT_GOAL if goal is None else goal
     files = snapshot_fileset(goal.files, base_dir, artifacts)
     return ref, built, goal.model_copy(update={"files": files})
+
+
+def _check_goal(goal: Goal, candidates: Sequence[Candidate]) -> None:
+    """Reject a mismatched goal before building or running a scoring component."""
+    for candidate in candidates:
+        if candidate.goal_id != goal.id:
+            raise ValueError(
+                f"candidate {candidate.id} goal_id {candidate.goal_id} "
+                f"does not match goal {goal.id}"
+            )
 
 
 class _Watched(Executor):
@@ -173,7 +185,7 @@ def _has_invalid_collect_note(tail: str) -> bool:
 
 
 def _failed_runs(
-    outputs: Sequence[tuple[str, object]], statuses: Sequence[RunStatus] = (RunStatus.ERROR,)
+    outputs: Sequence[tuple[str, object]], statuses: Sequence[RunStatus] = _NOT_OK
 ) -> list[str]:
     """Describe each run with one of ``statuses`` and the end of its log (the tool's own text)."""
     notes = []
@@ -320,7 +332,7 @@ def _probe_collect(tool: Tool, request: ToolRequest) -> None:
         )
         try:
             out = tool.collect(request, workspace, run)
-        except Exception:  # a raise is a valid failure: the executor gives status error
+        except (Exception, SystemExit):  # a raise is a valid failure; interrupts propagate
             return
     if not isinstance(out, ToolOutput):
         raise _fail("Tool.collect() must return a ToolOutput")
@@ -361,7 +373,6 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     estimate = tool.estimate(request)
     if not (estimate is None or isinstance(estimate, Estimate)):
         raise _fail("Tool.estimate() must return None or an Estimate")
-    _probe_collect(tool, request)
     return out
 
 
@@ -441,7 +452,7 @@ async def check_tool(
     identity and every overlay path is editable. A refused overlay gives a
     ``UserWarning``, as the core gives a soft warning. The job runs on
     ``executor`` with the run identity ``local`` and the goal's id in its
-    environment. A run that ends with status ``error`` gives a ``UserWarning``
+    environment. A run with any status other than ``ok`` gives a ``UserWarning``
     with the last 2 KB of its stderr log. If the call raises an error instead
     (a failed contract assert, or an error from the tool's own methods), a run
     with any status but ``ok`` (``error``, ``timeout``, ``cancelled``, ...)
@@ -458,7 +469,9 @@ async def check_tool(
     ``fingerprint()`` must give the same nonempty str twice and must not
     depend on ``logs_ref`` or the run times. ``collect()`` is also called once
     on an empty workspace with a failed run: it may raise, but it must not
-    report ``ok``.
+    report ``ok``. This probe runs in a cancellable daemon thread with a
+    30-second deadline; exceeding it is a contract failure. If abandoned,
+    its workspace is removed when the thread eventually returns.
 
     Parameters
     ----------
@@ -479,7 +492,9 @@ async def check_tool(
         Executor that runs the job; None makes a ``LocalExecutor`` and closes
         it afterwards.
     timeout_s : float, default=60.0
-        Hard cap on the tool's run time in seconds.
+        Hard cap on the tool's run time in seconds. A smaller configured
+        tool ``timeout_s`` is preserved; an unset tool timeout uses this cap.
+        The failed-run collection probe has a separate 30-second deadline.
 
     Returns
     -------
@@ -534,6 +549,10 @@ async def check_tool(
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         out = await runner.submit(job)
         checked = await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
+        with anyio.move_on_after(BEFORE_KILL_TIMEOUT_S) as probe_scope:
+            await run_sync_daemon(_probe_collect, plan.tool, plan.request)
+        if probe_scope.cancel_called:
+            raise _fail("Tool.collect() did not return before the failed-run probe deadline")
     for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return checked
@@ -554,7 +573,7 @@ async def check_check(
     with a ``CheckContext`` whose commands go to ``executor``. The result must
     be valid in strict mode as it is: a value that a lax validation would
     repair, such as ``passed="no"``, is a contract failure. A command that ends
-    with status ``error`` gives a ``UserWarning`` with the last 2 KB of its
+    with any status other than ``ok`` gives a ``UserWarning`` with the last 2 KB of its
     stderr log. If the call raises an error instead (a failed contract assert,
     or an error from ``check()`` itself), each command with any status but
     ``ok`` adds that text as a note to the error, which is otherwise passed on
@@ -567,8 +586,10 @@ async def check_check(
     candidate : Candidate
         Candidate to check, for example from ``make_candidate``.
     goal : Goal or None, default=None
-        Goal whose files the check sees under ``candidate/files/``; None selects
-        ``Goal(id="check", namespace="testing")``.
+        Goal whose files the check sees under ``candidate/files/``. Its id
+        must match ``candidate.goal_id``. None selects
+        ``Goal(id="check", namespace="testing")`` and is refused for a
+        candidate belonging to any other goal.
     executor : Executor or None, default=None
         Executor for ``ctx.execute``; None makes a ``LocalExecutor`` and closes
         it afterwards.
@@ -585,7 +606,8 @@ async def check_check(
         If ``feedback`` is not ``"pass_fail"`` or ``"reasons"``, or ``check()``
         does not return a valid ``CheckResult``.
     ValueError
-        If a file glob matches no file or the check cannot be built.
+        If the candidate goal_id does not match the goal id, a file glob
+        matches no file, or the check cannot be built.
 
     Examples
     --------
@@ -599,6 +621,7 @@ async def check_check(
     >>> (result.check, result.passed)  # doctest: +SKIP
     ('script-check', True)
     """
+    _check_goal(_DEFAULT_GOAL if goal is None else goal, [candidate])
     ref, built, goal = await anyio.to_thread.run_sync(_build, check, Check, goal)
     if built.feedback not in ("pass_fail", "reasons"):
         raise _fail("Check.feedback must be 'pass_fail' or 'reasons'")
@@ -630,7 +653,7 @@ async def check_judge(
     candidate that got neither a score nor a judge error. A score with a
     non-finite key is dropped as a judge error, as the core rejects it. Every
     other score must be valid in strict mode as it is. A command that ends with
-    status ``error`` gives a ``UserWarning`` with the last 2 KB of its stderr
+    any status other than ``ok`` gives a ``UserWarning`` with the last 2 KB of its stderr
     log. If the call raises an error instead (a failed contract assert, or an
     error from ``judge()`` itself), each command with any status but ``ok``
     adds that text as a note to the error, which is otherwise passed on
@@ -641,7 +664,7 @@ async def check_judge(
     judge : Judge or Ref
         Judge instance or reference to run.
     goal : Goal
-        Goal passed to the judge.
+        Goal passed to the judge; its id must match every candidate goal_id.
     candidates : Sequence[Candidate]
         Batch to judge, for example from ``make_candidate``.
     executor : Executor or None, default=None
@@ -662,7 +685,8 @@ async def check_judge(
         ``Score`` objects, returns a score for an unknown candidate, or two
         scores for one candidate.
     ValueError
-        If a file glob matches no file or the judge cannot be built.
+        If any candidate goal_id does not match the goal id, a file glob
+        matches no file, or the judge cannot be built.
 
     Examples
     --------
@@ -672,6 +696,7 @@ async def check_judge(
     >>> anyio.run(check_judge, ProgramJudge("builtins:max"), Goal(id="g", namespace="demo"), [])
     []
     """
+    _check_goal(goal, candidates)
     ref, built, goal = await anyio.to_thread.run_sync(_build, judge, Judge, goal)
     await anyio.to_thread.run_sync(_check_judge_methods, ref, built)
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
