@@ -2136,9 +2136,12 @@ def diff_revision(parent: Plan | None, child: Plan, *, parent_human: Mapping[str
     # agents by stable address; checks, judges, parts by name
 def check_catalog(site: RefSite, catalog: PlannerCatalog, *, overrides: Mapping[str, Any]) -> list[str]: ...
     # Compares catalog_form(site config minus settable keys) with catalog_form(entry.config) using shared json_equal.
-    # _planning/catalog_check.find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog) -> CatalogEntry | None
-    # returns the first same-kind/path canonical fixed-config match without imports or schema construction. The round
-    # runner uses this lookup for every admitted base tool ref, including human refs. check_catalog retains same-kind/path
+    # _planning/catalog_check.find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog, *, raw: bool = False,
+    # defer_defaults: bool = False) -> CatalogEntry | None returns the first same-kind/path canonical fixed-config match.
+    # raw=True is import-free and used only by raw authorization (defer_defaults collects extra fixed fields for the
+    # typed default check before snapshotting). The default mode also accepts an extra FileSet field equal to its
+    # omitted Config default, loading only an already matched human catalog path; the round runner, manifest and
+    # staging use it for every admitted base tool ref, including human refs. check_catalog retains same-kind/path
     # candidates and diagnoses fixed-field differences against the first candidate when no fixed config matches.
     # Settable/override values use _validate_config(entry.settable_model(), ..., where=site.pointer); unknown planner
     # keys render as <field>, and every diagnostic starts with the site's pointer followed by ": ".
