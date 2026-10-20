@@ -354,23 +354,29 @@ async def test_blocked_collect_cannot_stop_kill(
     fifo_stderr: bool,
 ) -> None:
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
-    fifo = (
-        "import os; os.remove('swarm/stderr.log'); os.mkfifo('swarm/stderr.log'); "
-        if fifo_stderr
-        else ""
-    )
-    pid_file = str(tmp_path / "pid")
-    code = (
-        fifo + f"import os, time; open({pid_file!r}, 'w').write(str(os.getpid())); time.sleep(60)"
-    )
+    pids: list[int] = []
+
+    async def ready(started: Job.Started) -> None:
+        # Everything the test needs is in place before "go", so before the timeout clock
+        # starts: the launcher execs the tool in place, so its pid is the tool's pid, and
+        # the stderr log is swapped for a FIFO here instead of by the tool after start-up.
+        assert started.pid is not None
+        pids.append(started.pid)
+        if fifo_stderr:
+            [workspace] = list((tmp_path / "ws").iterdir())
+            (workspace / "swarm/stderr.log").unlink()
+            os.mkfifo(workspace / "swarm/stderr.log")
+
+    code = "import time; time.sleep(60)"
     RELEASE.clear()  # C40: a set event from an earlier case would not block collect
     try:
         with anyio.fail_after(10):  # collect blocks for 30 s unless it is abandoned
             out = await local_executor.submit(
-                blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2)
+                blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2, on_started=ready)
             )
         assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
-        assert wait_until(lambda: not pid_alive(int((tmp_path / "pid").read_text())), 5)
+        [pid] = pids
+        assert wait_until(lambda: not pid_alive(pid), 5)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
             assert b"no partial output" in log(tmp_path, out, 2)  # M11
@@ -1045,13 +1051,11 @@ def test_fallback_remover_is_linear(
         with monkeypatch.context() as patch:
             patch.setattr(os, "listdir", listdir)
             patch.setattr(os, "stat", stat_)
-            started = time.monotonic()
             local._remove_tree(wide_tree)
-            elapsed = time.monotonic() - started
         assert not os.path.lexists(wide_tree)
+        # Linear in the number of directories, by call counts, not by the wall clock.
         assert calls["listdir"] <= n + 2  # each directory listed exactly once
         assert calls["stat"] <= 2 * (n + 10)
-        assert elapsed < 20
         assert (outside / "keep").read_text() == "k"
         assert stat.S_IMODE(outside.stat().st_mode) == 0o500
     finally:
