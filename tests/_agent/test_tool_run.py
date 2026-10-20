@@ -378,12 +378,13 @@ async def test_stage_refusal_before_count_and_reserve_releases_replicate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import swarm_arena._agent.tool_run as pipeline
+    from swarm_arena._errors import _core_signal
 
     original = pipeline.plan_tool_stage
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
 
     def refuse(**kwargs: Any) -> Any:
-        raise SoftError("stage refused")
+        raise _core_signal(SoftError("stage refused"))
 
     monkeypatch.setattr(pipeline, "plan_tool_stage", refuse)
     with pytest.raises(SoftError, match="stage refused"):
@@ -1657,3 +1658,161 @@ async def test_round_rejects_transferred_core_signal(rt_env: RtEnv) -> None:
     assert result.reasons["t/a"] == "manager error: LimitReached"
     await rt_env.rt.journal.commit()
     assert secret not in str(rt_env.events("agent_status")[-1].payload)
+
+
+@pytest.mark.parametrize("fail_on", [1, 2], ids=["settings", "plan"])
+@pytest.mark.parametrize("registered", [True, False], ids=["core", "connector"])
+@pytest.mark.parametrize("kind", [SoftError, LimitReached])
+async def test_staging_container_errors_rebuild_safe_signals(
+    rt_env: RtEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_on: int,
+    registered: bool,
+    kind: type[SoftError] | type[LimitReached],
+) -> None:
+    import traceback
+    from collections.abc import Iterator
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._agent.context import AgentContext
+
+    ctx = AgentContext(rt_env.rt)
+    secret = str(uuid4())
+    if registered:
+        if kind is SoftError:
+            with pytest.raises(SoftError) as missing:
+                ctx.get_candidate("c-absent")
+            original: SoftError | LimitReached = missing.value
+        else:
+            rt_env.rt.counters.tool_runs = rt_env.rt.limits.max_tool_runs_per_round
+            with pytest.raises(LimitReached) as exhausted:
+                await ctx.run_tool({"x": 1})
+            original = exhausted.value
+            rt_env.rt.counters.tool_runs = 0
+        safe_args = original.args
+        safe_limit = original.limit if isinstance(original, LimitReached) else None
+    else:
+        original = SoftError(secret) if kind is SoftError else LimitReached(secret, secret)
+        safe_args = (f"invalid tool stage: {kind.__name__}",)
+        safe_limit = None
+    original.args = (secret,)
+    original.add_note(secret)
+    original.__cause__ = RuntimeError(secret)
+    if isinstance(original, LimitReached):
+        original.limit = secret
+    iterations = 0
+
+    class Globs(list[str]):
+        def __iter__(self) -> Iterator[str]:
+            nonlocal iterations
+            iterations += 1
+            if iterations == fail_on:
+                raise original
+            return super().__iter__()
+
+    monkeypatch.setattr(rt_env.rt.tool, "editable", lambda: Globs(["**"]))
+    with pytest.raises((SoftError, LimitReached)) as caught:
+        await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
+    error = caught.value
+    assert iterations == fail_on
+    assert_secret_absent(error, secret, sanitized=True)
+    surfaces = {
+        "str": str(error),
+        "repr": repr(error),
+        "args": repr(error.args),
+        "notes": repr(getattr(error, "__notes__", ())),
+        "cause": repr(error.__cause__),
+        "traceback": "".join(traceback.format_exception(error)),
+    }
+    assert {name: secret in value for name, value in surfaces.items()} == dict.fromkeys(
+        surfaces, False
+    )
+    assert error is not original
+    assert type(error) is (kind if registered else SoftError)
+    assert error.args == safe_args
+    assert getattr(error, "limit", None) == safe_limit
+    assert rt_env.rt.counters.tool_runs == 0
+    assert not rt_env.events("reserve")
+
+
+@pytest.mark.parametrize("fail_on", [1, 2], ids=["settings", "plan"])
+async def test_staging_container_fencing_propagates(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, fail_on: int
+) -> None:
+    from collections.abc import Iterator
+
+    from swarm_arena._agent.context import AgentContext
+
+    fenced = Fenced("run ownership lost")
+    iterations = 0
+
+    class Globs(list[str]):
+        def __iter__(self) -> Iterator[str]:
+            nonlocal iterations
+            iterations += 1
+            if iterations == fail_on:
+                raise fenced
+            return super().__iter__()
+
+    monkeypatch.setattr(rt_env.rt.tool, "editable", lambda: Globs(["**"]))
+    with pytest.raises(Fenced) as caught:
+        await AgentContext(rt_env.rt).run_tool({"x": 1}, edits={"p/a.txt": "x"})
+    assert caught.value is fenced
+    assert iterations == fail_on
+    assert rt_env.rt.counters.tool_runs == 0
+    assert not rt_env.events("reserve")
+
+
+async def test_staging_refusal_keeps_safe_diagnostic_directly(rt_env: RtEnv) -> None:
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._agent.context import AgentContext
+
+    secret = str(uuid4())
+    rt = rt_env.with_script_tool(editable=["problem/*.phyk"])
+    with pytest.raises(SoftError) as caught:
+        await AgentContext(rt).run_tool({}, edits={"problem/run.py": secret})
+    assert str(caught.value) == "problem/run.py: protected"
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert rt.counters.tool_runs == 0
+    assert not rt_env.events("reserve")
+
+
+async def test_unmarked_stage_refusal_is_sanitized_and_releases_replicate(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import traceback
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    import swarm_arena._agent.tool_run as pipeline
+    from swarm_arena._agent.context import AgentContext
+
+    original = pipeline.plan_tool_stage
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
+    ctx = AgentContext(rt)
+    secret = str(uuid4())
+    unmarked = SoftError(secret)
+    unmarked.add_note(secret)
+    unmarked.__cause__ = RuntimeError(secret)
+
+    def refuse(**kwargs: Any) -> Any:
+        raise unmarked
+
+    monkeypatch.setattr(pipeline, "plan_tool_stage", refuse)
+    with pytest.raises(SoftError) as caught:
+        await ctx.run_tool({"x": 1})
+    assert str(caught.value) == "invalid tool stage: SoftError"
+    assert caught.value is not unmarked
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert secret not in "".join(traceback.format_exception(caught.value))
+    assert rt.counters.tool_runs == 0
+    assert not rt_env.events("reserve")
+    monkeypatch.setattr(pipeline, "plan_tool_stage", original)
+    candidate = await ctx.run_tool({"x": 1})
+    assert candidate.request.replicate == 0

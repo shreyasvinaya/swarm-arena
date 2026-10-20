@@ -327,7 +327,7 @@ def _stage_settings(
     rt: AgentRuntime,
     request: ToolRequest,
 ) -> tuple[dict[str, str], Sequence[str], frozenset[str]]:
-    """Validate root and edit permissions before allocating a replicate."""
+    """Validate root and edit permissions, rebuilding core refusal snapshots."""
     try:
         files = _request_hook(rt.tool._own_files)
         root = tool_root(rt.goal.files.manifest, files)
@@ -341,9 +341,12 @@ def _stage_settings(
             max_edit_bytes=rt.limits.max_edit_bytes,
         )
         return files, editable, protected
-    except (SoftError, Fenced):
+    except Fenced:
         raise
     except Exception as error:
+        rebuilt = _rebuild_core_signal(error)
+        if rebuilt is not None:
+            raise rebuilt from None
         raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
 
@@ -352,7 +355,7 @@ def _stage(
     request: ToolRequest,
     settings: tuple[dict[str, str], Sequence[str], frozenset[str]],
 ) -> tuple[Job.Stage, dict[str, str], list[str]]:
-    """Plan with the final request before counting or reserving the run."""
+    """Plan before count/reserve and expose only fresh core refusal snapshots."""
     files, editable, protected = settings
     try:
         return plan_tool_stage(
@@ -366,9 +369,12 @@ def _stage(
             edits=request.edits,
             request_json=request_json(request),
         )
-    except (SoftError, Fenced):
+    except Fenced:
         raise
     except Exception as error:
+        rebuilt = _rebuild_core_signal(error)
+        if rebuilt is not None:
+            raise rebuilt from None
         raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
 
