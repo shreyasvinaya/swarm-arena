@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 import anyio
 
-from swarm_arena._errors import AlreadyExists, PreconditionFailed
+from swarm_arena._errors import AlreadyExists, PreconditionFailed, _core_error
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._journal.writer import JournalWriter
@@ -216,7 +216,7 @@ class ViewWriter:
             head = _validated_head(source.model_dump())
             source_index = committed.index(head.segment)
         except (ValueError, TypeError, OverflowError, RecursionError):
-            raise RuntimeError("source head is not committed") from None
+            raise _core_error(RuntimeError, "source head is not committed") from None
         fmt = _FORMATS.get(PurePosixPath(key).suffix)
         if fmt is None:
             raise ValueError("view key requires .json, .toml, or .md suffix") from None

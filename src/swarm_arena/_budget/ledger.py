@@ -10,7 +10,7 @@ import anyio
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
 from swarm_arena._budget.split import equal_shares, round_pool, weighted_shares
-from swarm_arena._errors import _core_signal
+from swarm_arena._errors import _core_error, _core_signal
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
@@ -112,7 +112,7 @@ def _nonnegative(amount: Amount) -> Amount:
     """Validate accounting inputs without exposing rejected values."""
     amount = Amount.model_validate(amount.model_dump())
     if amount.tokens < 0 or amount._micro_usd < 0:
-        raise ValueError("budget amount must be nonnegative")
+        raise _core_error(ValueError, "budget amount must be nonnegative")
     return amount
 
 
@@ -246,7 +246,7 @@ class Ledger:
         events = sorted(state.ledger_events, key=lambda event: event.seq)
         try:
             if not events or events[0].type != EventType.RUN_CONFIG:
-                raise ValueError("missing original run_config")
+                raise _core_error(ValueError, "missing original run_config")
             config = RunConfig.model_validate(events[0].payload["config"])
             ledger = cls(
                 config.limits,
@@ -258,7 +258,7 @@ class Ledger:
             for event in events[1:]:
                 ledger._replay_event(event)
         except (ValueError, TypeError, KeyError, AttributeError):
-            raise ValueError("invalid ledger replay payload") from None
+            raise _core_error(ValueError, "invalid ledger replay payload") from None
         return ledger
 
     def _replay_event(self, event: Event) -> None:
@@ -331,13 +331,13 @@ class Ledger:
     def _hold(self, slices: Mapping[str, Amount]) -> None:
         """Initialize pools without an await, including during replay."""
         if self._held:
-            raise ValueError("final reserve slices already held")
+            raise _core_error(ValueError, "final reserve slices already held")
         validated = {g: self._capped(_nonnegative(a)) for g, a in slices.items()}
         # Compare incrementally so an excessive sum cannot exceed Amount's range.
         left = self._reserve_pool.left
         for amount in validated.values():
             if not self._fits(amount, _positive(left)):
-                raise ValueError("final slices exceed the reserve")
+                raise _core_error(ValueError, "final slices exceed the reserve")
             left -= amount
         self._goals = {g: _Pool(work=True) for g in validated}
         self._slices = {g: _Pool(a) for g, a in validated.items()}
@@ -375,11 +375,11 @@ class Ledger:
         current = self._goal(goal_id)
         if pool is None:
             if current.ended:
-                raise ValueError(f"continued goal requires a pool: {goal_id}")
+                raise _core_error(ValueError, f"continued goal requires a pool: {goal_id}")
         else:
             amount = self._capped(_nonnegative(pool))
             if not current.ended or not self._fits(amount, self._free):
-                raise ValueError(f"goal cannot reopen from free pool: {goal_id}")
+                raise _core_error(ValueError, f"goal cannot reopen from free pool: {goal_id}")
             self._free -= amount
             self._goals[goal_id] = _Pool(amount, work=True)
         self._opened.add(goal_id)
@@ -434,7 +434,7 @@ class Ledger:
         for name in ("max_tokens", "max_usd"):
             old, new = getattr(self._limits, name), getattr(limits, name)
             if new is not None and (old is None or new < old):
-                raise ValueError(f"budget cap may only increase: {name}")
+                raise _core_error(ValueError, f"budget cap may only increase: {name}")
         added = Amount(
             tokens=0
             if limits.max_tokens is None
@@ -492,7 +492,7 @@ class Ledger:
         """
         goal = self._goal(goal_id)
         if goal_id not in self._opened or goal.ended or round < 1:
-            raise ValueError(f"goal has no active round: {goal_id}")
+            raise _core_error(ValueError, f"goal has no active round: {goal_id}")
         shares = equal_shares(round_pool(_positive(goal.left), rounds_left), holders)
         self._restore_shares(goal_id, shares)
         return {holder: self._capped(amount) for holder, amount in shares.items()}
@@ -503,7 +503,7 @@ class Ledger:
         validated: dict[str, _Pool] = {}
         for holder, amount in shares.items():
             if not holder.startswith(f"{goal_id}/") or len(holder.split("/")) != 3:
-                raise ValueError(f"invalid agent holder: {holder}")
+                raise _core_error(ValueError, f"invalid agent holder: {holder}")
             validated[holder] = _Pool(self._capped(_nonnegative(amount)))
         self._shares = {h: p for h, p in self._shares.items() if self._holder_goals[h] != goal_id}
         self._shares.update(validated)
@@ -640,7 +640,7 @@ class Ledger:
         self._check_usage_overflow()
         amount = _nonnegative(amount)
         if holder != ":run" and holder.split("/", 1)[0] != goal_id:
-            raise ValueError(f"holder does not belong to goal: {holder}")
+            raise _core_error(ValueError, f"holder does not belong to goal: {holder}")
         if not self._fits(amount, self.remaining(holder)):
             raise _core_signal(LimitReached("budget", f"budget used up for {holder}"))
         reservation = Reservation(
@@ -670,7 +670,7 @@ class Ledger:
     def _book(self, reservation: Reservation) -> None:
         """Debit recorded funding without live admission checks during replay."""
         if reservation.id in self._entries:
-            raise ValueError("reservation identifier already used")
+            raise _core_error(ValueError, "reservation identifier already used")
         amount = self._capped(_nonnegative(reservation.amount))
         pools, share = self._sources(reservation.holder)
         funding: list[tuple[_Pool, Amount]] = []
@@ -779,7 +779,9 @@ class Ledger:
                 return
             actual = _nonnegative(actual)
             if usage_overflow and actual.usd != USD_LIMIT:
-                raise ValueError("overflow settlement requires the supported USD limit")
+                raise _core_error(
+                    ValueError, "overflow settlement requires the supported USD limit"
+                )
             target = actual if usage_overflow else self._charge_for(entry, actual, estimated)
             current = self._charges[reservation_id]
             overspend = _positive(actual - entry.reservation.amount)
@@ -950,7 +952,7 @@ class Ledger:
     def _goal(self, goal_id: str) -> _Pool:
         """Look up a registered work pool with an identifier-only failure."""
         if goal_id not in self._goals:
-            raise ValueError(f"unknown goal: {goal_id}")
+            raise _core_error(ValueError, f"unknown goal: {goal_id}")
         return self._goals[goal_id]
 
     def _sources(self, holder: str) -> tuple[list[_Pool], _Pool | None]:
@@ -965,7 +967,7 @@ class Ledger:
             return [self._reserve_pool, goal], None
         if holder in self._shares and not goal.ended:
             return [goal], self._shares[holder]
-        raise ValueError(f"unknown budget holder: {holder}")
+        raise _core_error(ValueError, f"unknown budget holder: {holder}")
 
     def _debit(self, pool: _Pool, amount: Amount) -> None:
         """Apply a signed charge and redistribute any late refund to ended work."""

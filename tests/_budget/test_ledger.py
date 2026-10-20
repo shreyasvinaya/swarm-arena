@@ -10,6 +10,7 @@ from _fakes.secrecy import assert_secret_absent
 from swarm_arena import Goal, Limits, Plan, RunConfig
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
+from swarm_arena._errors import ConfigError, _rebuild_core_signal
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_committed
@@ -434,6 +435,12 @@ async def test_replay_invalid_payload_does_not_expose_values(env: LedgerEnv) -> 
     with pytest.raises(ValueError, match="replay payload") as exc:
         Ledger.replay(state, journal=env.journal, ids=env.ids)
     assert_secret_absent(exc.value, sentinel)
+    exc.value.args = (sentinel,)
+    rebuilt = _rebuild_core_signal(exc.value)
+    assert isinstance(rebuilt, ValueError)
+    assert not isinstance(rebuilt, ConfigError)
+    assert str(rebuilt) == "invalid ledger replay payload"
+    assert_secret_absent(rebuilt, sentinel, sanitized=True)
 
 
 async def test_mixed_units_fund_and_refund_in_source_order(env: LedgerEnv) -> None:

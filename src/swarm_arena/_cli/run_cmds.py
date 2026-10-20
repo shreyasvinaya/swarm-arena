@@ -4,13 +4,15 @@ For example, ``swarm-arena run --yes run.toml plans/`` loads sorted TOML
 plans. Without ``--yes``, approval requires a terminal and accepts only y/yes.
 Declining approval leaves the run and artifact roots unwritten. Resume uses
 ``RUN_DIR/run.toml`` unless ``--config`` supplies an override, and always
-selects the run root from RUN_DIR's parent.
+selects the run root from RUN_DIR's resolved parent. Ctrl-C exits 130 after
+cancellation cleanup and prints ``interrupted`` without a traceback.
 """
 
 import argparse
 import sys
 from collections.abc import Sequence
 from functools import partial
+from os import read
 from pathlib import Path
 
 import anyio
@@ -66,11 +68,14 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 
 def _prompt() -> bool:
-    """Accept only an explicit y/yes, with EOF treated as a refusal."""
-    try:
-        return input("Start the run? [y/N] ").strip().lower() in {"y", "yes"}
-    except EOFError:
-        return False
+    """Read without holding buffered stdin's lock in an abandoned daemon."""
+    answer = bytearray()
+    fd = sys.stdin.fileno()
+    while chunk := read(fd, 1):
+        if chunk == b"\n":
+            break
+        answer.extend(chunk)
+    return bytes(answer).strip().lower() in {b"y", b"yes"}
 
 
 def _summaries(run_root: str, run_id: str, goal_ids: Sequence[str]) -> list[str]:
@@ -118,6 +123,8 @@ async def _run_async(args: argparse.Namespace) -> None:
         print(f"worst-case estimate: {tokens} tokens, {usd}")
         for warning in warnings:
             print(f"warning: {warning}")
+        if not args.yes:
+            print("Start the run? [y/N] ", end="", flush=True)
         accepted = args.yes or await run_sync_daemon(_prompt)
         if accepted:
             print(f"run {run_id} at {Path(config.run_root) / run_id}", flush=True)
@@ -143,14 +150,15 @@ async def _status_async(run_dir: Path) -> None:
 
 def _status(args: argparse.Namespace) -> int:
     """Dispatch status using the asyncio backend."""
-    anyio.run(_status_async, args.run_dir, backend="asyncio")
+    anyio.run(_status_async, args.run_dir.resolve(), backend="asyncio")
     return 0
 
 
 def _stop(args: argparse.Namespace) -> int:
     """Request the selected run's current epoch stop key."""
+    run_dir = args.run_dir.resolve()
     anyio.run(
-        partial(request_stop, str(args.run_dir.parent), args.run_dir.name, now=args.now),
+        partial(request_stop, str(run_dir.parent), run_dir.name, now=args.now),
         backend="asyncio",
     )
     return 0
@@ -168,5 +176,6 @@ async def _resume_async(args: argparse.Namespace) -> None:
 
 def _resume(args: argparse.Namespace) -> int:
     """Dispatch resume using the asyncio backend."""
+    args.run_dir = args.run_dir.resolve()
     anyio.run(_resume_async, args, backend="asyncio")
     return 0

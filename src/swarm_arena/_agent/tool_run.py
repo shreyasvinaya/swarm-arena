@@ -12,7 +12,14 @@ from swarm_arena._agent.repeats import _is_deterministic
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
+from swarm_arena._errors import (
+    ConfigError,
+    Fenced,
+    SoftError,
+    _core_error,
+    _core_signal,
+    _rebuild_core_signal,
+)
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
@@ -345,7 +352,7 @@ def _stage_settings(
         raise
     except Exception as error:
         rebuilt = _rebuild_core_signal(error)
-        if rebuilt is not None:
+        if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
         raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
@@ -373,7 +380,7 @@ def _stage(
         raise
     except Exception as error:
         rebuilt = _rebuild_core_signal(error)
-        if rebuilt is not None:
+        if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
         raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
@@ -507,7 +514,7 @@ async def _run(
     id = rt.ids.next("c")
     inflight = _inflight.get()
     if inflight is None:
-        raise RuntimeError("tool run requires track_inflight")
+        raise _core_error(RuntimeError, "tool run requires track_inflight")
     started = False
     admission_refusal: LimitReached | None = None
     partial: list[ToolOutput] = []
@@ -609,7 +616,7 @@ async def _run(
     await anyio.lowlevel.checkpoint()
     with anyio.CancelScope(shield=True):
         if rt.journal.fenced.is_set():
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
         try:
             if not isinstance(output, ToolOutput):
                 raise TypeError("invalid tool output")
@@ -667,7 +674,7 @@ async def _run(
             warnings.append(f"fingerprint error: {type(error).__name__}")
     with anyio.CancelScope(shield=True):
         if rt.journal.fenced.is_set():
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
         candidate = Candidate(
             id=id,
             run_id=rt.repeats.run_id,

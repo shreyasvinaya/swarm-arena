@@ -1,11 +1,8 @@
 """Define user-visible plan, configuration, action, and storage errors."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, TypeVar
+from typing import Any, TypeVar, cast
 from weakref import WeakKeyDictionary
-
-if TYPE_CHECKING:
-    from swarm_arena._agent.manager import LimitReached
 
 
 class PlanError(ValueError):
@@ -152,10 +149,27 @@ class LeaseHeld(RuntimeError):
     """
 
 
+class _CoreRuntimeError(RuntimeError):
+    """Allow core runtime errors to be weakly registered."""
+
+
+class _CoreValueError(ValueError):
+    """Allow core value errors to be weakly registered."""
+
+
 _CORE_SIGNALS: WeakKeyDictionary[
-    BaseException, tuple[type[BaseException], tuple[str, ...], str | None]
+    Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None]
 ] = WeakKeyDictionary()
-_SignalT = TypeVar("_SignalT", SoftError, "LimitReached")
+_SignalT = TypeVar("_SignalT", bound=Exception)
+
+
+def _core_error(cls: type[_SignalT], *args: Any) -> _SignalT:
+    """Construct and register one vetted error, including weak runtime errors."""
+    if cls is RuntimeError:
+        return cast(_SignalT, _core_signal(_CoreRuntimeError(*args)))
+    if cls is ValueError:
+        return cast(_SignalT, _core_signal(_CoreValueError(*args)))
+    return _core_signal(cls(*args))
 
 
 def _core_signal(error: _SignalT) -> _SignalT:
@@ -168,34 +182,58 @@ def _core_signal(error: _SignalT) -> _SignalT:
     """
     from swarm_arena._agent.manager import LimitReached
 
-    if type(error) is not SoftError and type(error) is not LimitReached:
-        raise TypeError("expected an action control signal")
+    kinds = (
+        SoftError,
+        LimitReached,
+        PlanError,
+        ConfigError,
+        LeaseHeld,
+        Fenced,
+        _CoreRuntimeError,
+        _CoreValueError,
+    )
+    if not any(type(error) is kind for kind in kinds):
+        raise TypeError("expected a core error")
     if error not in _CORE_SIGNALS:
         _CORE_SIGNALS[error] = (
             type(error),
             error.args,
             error.limit if isinstance(error, LimitReached) else None,
+            tuple(error.errors) if isinstance(error, PlanError) else None,
         )
     return error
 
 
-def _rebuild_core_signal(error: BaseException) -> "SoftError | LimitReached | None":
+def _rebuild_core_signal(error: BaseException) -> Exception | None:
     """Reconstruct a registered signal from its snapshot, never user changes.
 
-    Only the exact public core exception types may be registry keys: subclasses
+    Only the exact supported core exception types may be registry keys: subclasses
     cannot supply custom equality or hashing to impersonate a registered key.
     The fresh result has no notes or exception chain and is registered so
     nested action boundaries preserve the same vetted payload.
     """
     from swarm_arena._agent.manager import LimitReached
 
-    if type(error) is not SoftError and type(error) is not LimitReached:
+    kinds = (
+        SoftError,
+        LimitReached,
+        PlanError,
+        ConfigError,
+        LeaseHeld,
+        Fenced,
+        _CoreRuntimeError,
+        _CoreValueError,
+    )
+    if not any(type(error) is kind for kind in kinds):
         return None
-    payload = _CORE_SIGNALS.get(error)
+    payload = _CORE_SIGNALS.get(cast(Exception, error))
     if payload is None:
         return None
-    kind, args, limit = payload
-    if kind is SoftError:
-        return _core_signal(SoftError(*args))
-    assert limit is not None
-    return _core_signal(LimitReached(limit, args[0]))
+    kind, args, limit, errors = payload
+    if kind is LimitReached:
+        assert limit is not None
+        return _core_error(LimitReached, limit, args[0])
+    if kind is PlanError:
+        assert errors is not None
+        return _core_error(PlanError, errors)
+    return _core_error(kind, *args)

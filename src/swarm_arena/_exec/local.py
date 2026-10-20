@@ -7,6 +7,7 @@ from typing import Annotated, Any, Final, cast
 import anyio
 from pydantic import ConfigDict, Field
 
+from swarm_arena._errors import _core_error
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local_run import _NOT_AN_OUTPUT as _NOT_AN_OUTPUT
@@ -181,7 +182,7 @@ class LocalExecutor(Executor):
         >>> LocalExecutor().preflight()
         """
         if os.name != "posix":
-            raise RuntimeError("LocalExecutor needs a POSIX system")
+            raise _core_error(RuntimeError, "LocalExecutor needs a POSIX system")
 
     async def capacity(self) -> Resources:
         """

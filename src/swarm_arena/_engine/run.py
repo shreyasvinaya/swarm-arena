@@ -25,7 +25,7 @@ from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
-from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import EventDraft, EventType
@@ -56,7 +56,7 @@ def _require_asyncio() -> None:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        raise RuntimeError("swarm-arena runs on the asyncio backend only") from None
+        raise _core_error(RuntimeError, "swarm-arena runs on the asyncio backend only") from None
 
 
 def _build_executor(config: RunConfig) -> Executor:
@@ -95,7 +95,7 @@ def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[s
             p.goal.id: final_slice_estimate(p, config, tools, price_of) for p in plans
         }
     except Exception as exc:
-        raise RuntimeError(f"estimate failed: {type(exc).__name__}") from None
+        raise _core_error(RuntimeError, f"estimate failed: {type(exc).__name__}") from None
 
 
 def _exceeds_limit(amount: Amount, config: RunConfig, fraction: Fraction = Fraction(1)) -> bool:
@@ -165,7 +165,9 @@ async def _start_executor(config: RunConfig) -> Executor:
     except Exception as exc:
         if _has_fenced(exc):
             raise
-        raise RuntimeError(f"executor construction failed: {type(exc).__name__}") from None
+        raise _core_error(
+            RuntimeError, f"executor construction failed: {type(exc).__name__}"
+        ) from None
 
 
 async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool) -> None:
@@ -176,8 +178,10 @@ async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool
         except Exception as exc:
             if not failed and not shutdown.cancel_called:
                 if _has_fenced(exc):
-                    raise Fenced() from None
-                raise RuntimeError(f"executor shutdown failed: {type(exc).__name__}") from None
+                    raise _core_error(Fenced) from None
+                raise _core_error(
+                    RuntimeError, f"executor shutdown failed: {type(exc).__name__}"
+                ) from None
 
 
 def _promote(stage: Path, artifacts: ArtifactStore) -> None:
@@ -264,7 +268,7 @@ class RunRunner:
         if self.resumed is not None:
             services = self.resumed._services
             if services.closed or self._used:
-                raise RuntimeError("resumed runner is closed or already used")
+                raise _core_error(RuntimeError, "resumed runner is closed or already used")
             self._used = True
             assert services.deps is not None
             failed = False
@@ -273,14 +277,14 @@ class RunRunner:
             except BaseException as error:
                 failed = True
                 if _has_fenced(error):
-                    raise Fenced() from None
+                    raise _core_error(Fenced) from None
                 raise
             finally:
                 await services._aclose(failed=failed)
         seen: set[str] = set()
         for plan in self.plans:
             if plan.goal.id in seen:
-                raise PlanError([f"duplicate goal id '{plan.goal.id}'"])
+                raise _core_error(PlanError, [f"duplicate goal id '{plan.goal.id}'"])
             seen.add(plan.goal.id)
         artifacts = ArtifactStore(open_store(self.config.artifact_root))
         executor: Executor | None = None
@@ -307,10 +311,12 @@ class RunRunner:
                 self.plans = admitted
                 estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
                 if _exceeds_limit(estimate, self.config):
-                    raise RuntimeError("worst-case estimate exceeds the configured run limit")
+                    raise _core_error(
+                        RuntimeError, "worst-case estimate exceeds the configured run limit"
+                    )
                 total = sum(slices.values(), Amount())
                 if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
-                    raise RuntimeError("reserve cannot hold the final slices")
+                    raise _core_error(RuntimeError, "reserve cannot hold the final slices")
                 executor = await _start_executor(self.config)
                 try:
                     capacity = await executor.capacity()
@@ -320,10 +326,12 @@ class RunRunner:
                 except Exception as exc:
                     if _has_fenced(exc):
                         raise
-                    raise RuntimeError(f"executor capacity failed: {type(exc).__name__}") from None
+                    raise _core_error(
+                        RuntimeError, f"executor capacity failed: {type(exc).__name__}"
+                    ) from None
                 if invalid_capacity:
-                    raise RuntimeError(
-                        f"executor capacity failed: {type(capacity).__name__}"
+                    raise _core_error(
+                        RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
                     ) from None
                 if self.approve is not None:
                     try:
@@ -331,11 +339,15 @@ class RunRunner:
                     except Exception as exc:
                         if _has_fenced(exc):
                             raise
-                        raise RuntimeError(f"approval failed: {type(exc).__name__}") from None
+                        raise _core_error(
+                            RuntimeError, f"approval failed: {type(exc).__name__}"
+                        ) from None
                     if type(approved) is not bool:
-                        raise RuntimeError(f"approval failed: {type(approved).__name__}") from None
+                        raise _core_error(
+                            RuntimeError, f"approval failed: {type(approved).__name__}"
+                        ) from None
                     if not approved:
-                        raise RuntimeError("run not approved")
+                        raise _core_error(RuntimeError, "run not approved")
                 await run_preflight(admitted, self.config, executor)
                 self.run_id = self.run_id or new_run_id(utc_now())
                 manifest = await build_manifest_async(
@@ -346,7 +358,7 @@ class RunRunner:
         except BaseException as exc:
             failed = True
             if _has_fenced(exc):
-                raise Fenced() from None
+                raise _core_error(Fenced) from None
             raise
         finally:
             if executor is not None:
@@ -487,7 +499,7 @@ class RunRunner:
                 await self._record_stops(deps)
                 watchers.cancel_scope.cancel()
         if deps.journal.fenced.is_set():
-            raise Fenced()
+            raise _core_error(Fenced)
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:

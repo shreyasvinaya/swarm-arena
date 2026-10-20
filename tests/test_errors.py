@@ -1,3 +1,6 @@
+import pytest
+from _fakes.secrecy import assert_secret_absent
+
 from swarm_arena._errors import (
     AlreadyExists,
     ChainError,
@@ -106,3 +109,47 @@ def test_core_signal_registry_rejects_user_equality() -> None:
             return hash(original)
 
     assert _rebuild_core_signal(ForgedLimit("budget", "forged")) is None
+
+
+@pytest.mark.parametrize(
+    "kind", [PlanError, ConfigError, LeaseHeld, Fenced, RuntimeError, ValueError]
+)
+def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
+    kind: type[Exception],
+) -> None:
+    import gc
+    import weakref
+
+    from swarm_arena._errors import _core_error, _core_signal, _rebuild_core_signal
+
+    secret = "MUTATED-CORE-SECRET"
+    original = _core_error(
+        kind, ["field: invalid", "team: missing"] if kind is PlanError else "safe"
+    )
+    expected = str(original)
+    original.args = (secret,)
+    original.add_note(secret)
+    original.__cause__ = ValueError(secret)
+    if isinstance(original, PlanError):
+        original.errors[:] = [secret]
+    assert _core_signal(original) is original
+    rebuilt = _rebuild_core_signal(original)
+    assert rebuilt is not None
+    assert rebuilt is not original
+    assert isinstance(rebuilt, kind)
+    if kind is ValueError:
+        assert not isinstance(rebuilt, ConfigError)
+    assert str(rebuilt) == expected
+    assert_secret_absent(rebuilt, secret, sanitized=True)
+    if isinstance(rebuilt, PlanError):
+        assert rebuilt.errors == ["field: invalid", "team: missing"]
+    forged = type(original)([secret] if kind is PlanError else secret)
+    forged.__dict__.update(original.__dict__)
+    assert _rebuild_core_signal(forged) is None
+    again = _rebuild_core_signal(rebuilt)
+    assert again is not None
+    assert str(again) == expected
+    reference = weakref.ref(rebuilt)
+    del rebuilt
+    gc.collect()
+    assert reference() is None

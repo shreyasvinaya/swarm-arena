@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Final, TypeVar
 
+from swarm_arena._errors import _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
@@ -50,9 +51,9 @@ def _workspace_root(configured: str | None) -> Path:
         root = root.resolve(strict=True)
         safe = all(_only_owner_can_change(os.stat(path)) for path in (root, *root.parents))
     except OSError:
-        raise RuntimeError("cannot create the workspace root") from None
+        raise _core_error(RuntimeError, "cannot create the workspace root") from None
     if not safe:
-        raise RuntimeError(_UNSAFE_ROOT)
+        raise _core_error(RuntimeError, _UNSAFE_ROOT)
     return root
 
 

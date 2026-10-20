@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from typing import ClassVar
 
-from swarm_arena._errors import Fenced, LeaseHeld, NotFound, PreconditionFailed
+from swarm_arena._errors import Fenced, LeaseHeld, NotFound, PreconditionFailed, _core_error
 from swarm_arena._model.base import FrozenModel, StoredModel
 from swarm_arena._model.canonical import UtcDatetime, canonical_json, utc_now
 from swarm_arena._store.base import Store
@@ -246,9 +246,9 @@ class Lease:
             raise NotFound("run owner not found")
         doc, etag = owner
         if expect_epoch is not None and doc.epoch != expect_epoch:
-            raise Fenced(f"another owner took the run (epoch {doc.epoch})")
+            raise _core_error(Fenced, f"another owner took the run (epoch {doc.epoch})")
         if not force and not cls.expired(doc):
-            raise LeaseHeld(f"run lease is held by {doc.owner_id} (epoch {doc.epoch})")
+            raise _core_error(LeaseHeld, f"run lease is held by {doc.owner_id} (epoch {doc.epoch})")
         proposed = OwnerDoc.model_validate(
             {
                 **doc.model_dump(),
@@ -356,7 +356,7 @@ class Lease:
                 OWNER_KEY, canonical_json(doc.model_dump(mode="json")), if_match=self.etag
             )
         except PreconditionFailed:
-            raise Fenced("another owner changed the lease") from None
+            raise _core_error(Fenced, "another owner changed the lease") from None
         self._adopt(doc, etag)
 
     def _adopt(self, doc: OwnerDoc, etag: str) -> None:

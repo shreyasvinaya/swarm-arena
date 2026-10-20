@@ -16,6 +16,7 @@ from swarm_arena._errors import (
     NotFound,
     StorageError,
     WriteOutcomeUnknown,
+    _core_error,
 )
 from swarm_arena._journal.event import WRITE_THROUGH, Event, EventDraft
 from swarm_arena._journal.lease import Head, Lease, read_owner
@@ -108,7 +109,7 @@ class JournalWriter:
     async def __aenter__(self) -> "JournalWriter":
         """Load the inherited chain and start the sole publication task."""
         if self._entered or self._closing:
-            raise RuntimeError("journal writer context cannot be reused")
+            raise _core_error(RuntimeError, "journal writer context cannot be reused")
         if self._head is not None:
             try:
                 chain = await self._retry(partial(read_chain, self._store, self._head))
@@ -296,7 +297,7 @@ class JournalWriter:
         """Reject failed and inactive writers before admission or waiting."""
         self._raise_if_fenced()
         if not self._entered or self._closing:
-            raise RuntimeError("journal writer is not active")
+            raise _core_error(RuntimeError, "journal writer is not active")
 
     def _request_group(self) -> None:
         """Start a group window only on the first outstanding durable request."""
@@ -335,7 +336,7 @@ class JournalWriter:
         if self.fenced.is_set():
             error = self._failure
             cause = error if isinstance(error, StorageError) else None
-            raise Fenced(f"journal writer failed: {type(error).__name__}") from cause
+            raise _core_error(Fenced, f"journal writer failed: {type(error).__name__}") from cause
 
     def _remaining(self) -> float:
         """Compute lifetime using only the last confirmed owner document."""
@@ -346,7 +347,7 @@ class JournalWriter:
         while True:
             self._raise_if_fenced()
             if self._remaining() <= 0:
-                raise Fenced("journal lease expired")
+                raise _core_error(Fenced, "journal lease expired")
             try:
                 return await anyio.to_thread.run_sync(operation)
             except ChainError:
@@ -378,10 +379,10 @@ class JournalWriter:
                     uncertain = True
             owner = read_owner(self._store)
             if owner is None:
-                raise Fenced("journal owner disappeared")
+                raise _core_error(Fenced, "journal owner disappeared")
             doc, etag = owner
             if (doc.epoch, doc.owner_id) != (old.epoch, old.owner_id):
-                raise Fenced("journal owner changed")
+                raise _core_error(Fenced, "journal owner changed")
             if doc.head != old.head and doc.head != expected:
                 raise ChainError("unexpected journal head during recovery")
             self._lease._adopt(doc, etag)
@@ -430,7 +431,7 @@ class JournalWriter:
                 while not self.fenced.is_set():
                     remaining = self._remaining()
                     if remaining <= 0:
-                        raise Fenced("journal lease expired")
+                        raise _core_error(Fenced, "journal lease expired")
                     now = anyio.current_time()
                     deadlines = [
                         value for value in (self._group_at, self._sync_at) if value is not None

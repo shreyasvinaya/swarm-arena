@@ -15,7 +15,7 @@ from pydantic import (
     create_model,
 )
 
-from swarm_arena._errors import ConfigError, SoftError, _core_signal
+from swarm_arena._errors import ConfigError, SoftError, _core_error, _core_signal
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
@@ -339,7 +339,7 @@ class ScriptTool(Tool):
             try:
                 compiled = compile_object_schema(name, self.config.params)
             except _SchemaError as error:
-                raise ConfigError(str(error)) from None
+                raise _core_error(ConfigError, str(error)) from None
             self._input_model = create_model(name, __base__=(compiled, _ConfigInputModel))
         return self._input_model
 

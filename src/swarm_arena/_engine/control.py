@@ -6,7 +6,7 @@ from typing import Literal
 import anyio
 
 from swarm_arena._budget.amount import Amount
-from swarm_arena._errors import AlreadyExists
+from swarm_arena._errors import AlreadyExists, _core_error
 from swarm_arena._journal.event import EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -119,18 +119,19 @@ def _request_stop(run_root: str, run_id: str, now: bool) -> int:
     store = open_store(run_root).child(run_id)
     first = read_owner(store)
     if first is None or Lease.expired(first[0]):
-        raise RuntimeError(f"run {run_id}: no live owner")
+        raise _core_error(RuntimeError, f"run {run_id}: no live owner")
     epoch = first[0].epoch
     with suppress(AlreadyExists):
         store.create(stop_key(epoch, now=now), b"")
     second = read_owner(store)
     if second is not None and second[0].epoch != epoch:
-        raise RuntimeError(
+        raise _core_error(
+            RuntimeError,
             f"run {run_id}: the epoch changed from {epoch} to {second[0].epoch} "
-            "during stop; run stop again"
+            "during stop; run stop again",
         )
     if second is None or Lease.expired(second[0]):
-        raise RuntimeError(f"run {run_id}: no live owner")
+        raise _core_error(RuntimeError, f"run {run_id}: no live owner")
     return epoch
 
 
@@ -209,7 +210,7 @@ def _read_status(run_root: str, run_id: str) -> StatusReport:
     store = open_store(run_root).child(run_id)
     owner = read_owner(store)
     if owner is None:
-        raise RuntimeError(f"run {run_id}: no run")
+        raise _core_error(RuntimeError, f"run {run_id}: no run")
     doc, _ = owner
     chain = read_chain(store, doc.head) if doc.head is not None else []
     state = RunState.from_events(event for _, events in chain for event in events)

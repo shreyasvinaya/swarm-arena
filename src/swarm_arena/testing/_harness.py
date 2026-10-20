@@ -22,7 +22,7 @@ from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
@@ -356,7 +356,7 @@ class OfflineHarness:
                 raise
             except Exception as error:
                 if rt.journal.fenced.is_set():
-                    raise Fenced("run ownership lost") from None
+                    raise _core_error(Fenced, "run ownership lost") from None
                 self.manager_errors.append(error)
                 manager_error = error
                 report = RoundReport()

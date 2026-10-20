@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable, Sequence
 
 from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.run import RunRunner
+from swarm_arena._errors import _core_error
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.run_config import RunConfig
@@ -195,5 +196,5 @@ class Swarm:
         >>> await swarm.stop()  # doctest: +SKIP
         """
         if self.run_id is None:
-            raise RuntimeError("no run has started")
+            raise _core_error(RuntimeError, "no run has started")
         await request_stop(self.config.run_root, self.run_id, now=now)

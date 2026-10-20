@@ -4,6 +4,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from swarm_arena._agent.manager import Manager
+from swarm_arena._errors import _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
@@ -98,4 +99,4 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     except Exception as exc:
         failures.append(f"- {config.executor.path}: {type(exc).__name__}")
     if failures:
-        raise RuntimeError("preflight failed:\n" + "\n".join(failures)) from None
+        raise _core_error(RuntimeError, "preflight failed:\n" + "\n".join(failures)) from None

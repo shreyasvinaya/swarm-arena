@@ -17,7 +17,7 @@ from pydantic import (
 from pydantic.errors import PydanticErrorMixin
 from pydantic_core import PydanticCustomError
 
-from swarm_arena._errors import ConfigError
+from swarm_arena._errors import ConfigError, _core_error
 from swarm_arena._model.base import (
     _VALIDATION_ACTIVE,
     FrozenModel,
@@ -244,7 +244,7 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     if safe is None:
         safe = _minimal_validation_error(model_cls)
     summary = validation_summary(safe, codes_only=True)
-    raise ConfigError(f"{where}: {summary}") from None
+    raise _core_error(ConfigError, f"{where}: {summary}") from None
 
 
 class Ref(FrozenModel):

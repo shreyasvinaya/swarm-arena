@@ -5,7 +5,7 @@ from typing import Annotated, ClassVar, Literal
 
 from pydantic import Field, ValidationError
 
-from swarm_arena._errors import ConfigError
+from swarm_arena._errors import ConfigError, _core_error
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.catalog import ModelCatalog, PlannerCatalog
 from swarm_arena._model.diagnostics import validation_summary
@@ -161,7 +161,9 @@ class RunConfig(StoredModel):
         try:
             return cls.model_validate(data)
         except ValidationError as error:
-            raise ConfigError(f"{where}: {validation_summary(error, root='run_config')}") from None
+            raise _core_error(
+                ConfigError, f"{where}: {validation_summary(error, root='run_config')}"
+            ) from None
 
     def dumps(self) -> str:
         """

@@ -218,7 +218,7 @@ async def test_startup_errors_are_type_only_and_write_nothing(
         )
     assert_secret_absent(caught.value, SECRET, sanitized=True)
     assert SECRET not in "".join(traceback.format_exception(caught.value))
-    assert type(caught.value) is RuntimeError
+    assert isinstance(caught.value, RuntimeError)
     assert str(caught.value) == expected
     assert not await anyio.to_thread.run_sync(Path(cfg.run_root).exists)
     assert not await anyio.to_thread.run_sync(Path(cfg.artifact_root).exists)

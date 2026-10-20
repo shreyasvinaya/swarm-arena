@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from pathlib import PurePosixPath
 from typing import Any
 
-from swarm_arena._errors import ConfigError, SoftError, _core_signal
+from swarm_arena._errors import ConfigError, SoftError, _core_error, _core_signal
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry
@@ -357,14 +357,15 @@ def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> d
     for layer, files in (("goal", goal_files), ("tool", tool_files)):
         if conflicts := fold_conflicts(files):
             first, second = conflicts[0]
-            raise ConfigError(f"{layer} files conflict: {first} and {second}")
+            raise _core_error(ConfigError, f"{layer} files conflict: {first} and {second}")
     root = {**goal_files, **tool_files}
     if conflicts := fold_conflicts(root):
         first, second = conflicts[0]
         hint = "; spell a replaced goal file exactly as the goal does"
-        raise ConfigError(
+        raise _core_error(
+            ConfigError,
             f"tool files do not fit the goal files: conflicting workspace path: {first} and "
-            f"{second}{hint if _respelled(first, second) else ''}"
+            f"{second}{hint if _respelled(first, second) else ''}",
         )
     return root
 
@@ -461,10 +462,10 @@ def plan_tool_stage(
     root = tool_root(goal_files, tool_files)
     for path in root:
         if fold_key(path) in private_paths:
-            raise RuntimeError(f"private path in tool root: {path}")
+            raise _core_error(RuntimeError, f"private path in tool root: {path}")
     for path in edits:
         if not editable_here(path):
-            raise RuntimeError(f"edit path not editable here: {path}")
+            raise _core_error(RuntimeError, f"edit path not editable here: {path}")
     overlay: dict[str, str] = {}
     warnings: list[str] = []
     if parents and parents[0].overlay:

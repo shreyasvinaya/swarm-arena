@@ -927,7 +927,7 @@ class AgentContext:
             raise
         except Exception as error:
             rebuilt = _rebuild_core_signal(error)
-            if rebuilt is not None:
+            if isinstance(rebuilt, (SoftError, LimitReached)):
                 raise rebuilt from None
             raise _core_signal(SoftError(f"action failed: {type(error).__name__}")) from None
         finally:

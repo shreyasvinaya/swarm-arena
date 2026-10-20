@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from swarm_arena._cli.run_cmds import register
-from swarm_arena._errors import ConfigError, Fenced, LeaseHeld, PlanError, StorageError
+from swarm_arena._errors import _rebuild_core_signal
 from swarm_arena._version import __version__
 
 
@@ -13,6 +13,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="swarm-arena",
         description="Run a swarm of agents on hard goals.",
+        epilog="Exit codes: 0 success, 1 error, 2 usage, 130 interrupted (Ctrl-C).",
     )
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     register(parser.add_subparsers(dest="command"))
@@ -21,28 +22,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def _error_message(error: Exception) -> str:
     """Retain sanitized core diagnostics, hiding unforeseen exception values."""
-    trace = error.__traceback__
-    while trace is not None and trace.tb_next is not None:
-        trace = trace.tb_next
-    origin = trace.tb_frame.f_globals.get("__name__", "") if trace is not None else ""
-    if (
-        isinstance(error, (PlanError, ConfigError, StorageError, Fenced, LeaseHeld))
-        and isinstance(origin, str)
-        and origin.startswith("swarm_arena._")
-    ):
-        return str(error) or type(error).__name__
-    # These core producers sanitize their plain ValueError/RuntimeError messages.
-    safe_producers = {
-        "swarm_arena._engine.control",
-        "swarm_arena._engine.run",
-        "swarm_arena._engine.resume",
-        "swarm_arena._engine.preflight",
-        "swarm_arena._budget.ledger",
-        "swarm_arena._journal.lease",
-    }
-    if type(error) in (ValueError, RuntimeError) and origin in safe_producers:
-        return str(error) or type(error).__name__
-    return type(error).__name__
+    rebuilt = _rebuild_core_signal(error)
+    return str(rebuilt) if rebuilt is not None else type(error).__name__
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -61,7 +42,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     -------
     int
         Zero for a returned run or successful control command, one for a runtime
-        error, or two when run needs a terminal or explicit ``--yes``.
+        error, two when run needs a terminal or explicit ``--yes``, or 130 after
+        Ctrl-C cancellation cleanup.
 
     Examples
     --------
@@ -76,6 +58,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     try:
         return args.handler(args)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     except Exception as error:
         print(_error_message(error), file=sys.stderr)
         return 1

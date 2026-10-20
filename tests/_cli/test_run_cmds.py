@@ -81,8 +81,8 @@ class _Stdin:
     def isatty(self) -> bool:
         return self._tty
 
-    def readline(self) -> str:
-        return ""
+    def fileno(self) -> int:
+        return 0
 
 
 def test_run_yes_prints_estimate_and_run_dir(
@@ -106,7 +106,8 @@ def test_run_without_tty_or_yes_exits_2_and_writes_nothing(
 
 def test_run_prompt_declined_exits_1(example: Example, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
-    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    answer = iter(b"n\n")
+    monkeypatch.setattr(run_cmds, "read", lambda fd, size: bytes([next(answer)]))
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
     assert not example.run_root.exists()
     assert not example.artifact_root.exists()
@@ -159,19 +160,20 @@ def test_terminal_approval(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    reply = iter((answer + "\n").encode())
 
-    def respond(prompt: str) -> str:
-        assert prompt == "Start the run? [y/N] "
+    def respond(fd: int, size: int) -> bytes:
+        assert (fd, size) == (0, 1)
         assert threading.current_thread().daemon
         assert not example.run_root.exists()
         assert not example.artifact_root.exists()
-        return answer
+        return bytes([next(reply)])
 
-    monkeypatch.setattr("builtins.input", respond)
+    monkeypatch.setattr(run_cmds, "read", respond)
     accepted = answer.lower() in {"y", "yes"}
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == (0 if accepted else 1)
     captured = capsys.readouterr()
-    assert ("\nrun " in captured.out) == accepted
+    assert bool(re.search(r"run \S+ at \S+", captured.out)) == accepted
     if not accepted:
         assert captured.err == "run not approved\n"
         assert not example.run_root.exists()
@@ -184,6 +186,7 @@ def test_terminal_eof_declines(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    monkeypatch.setattr(run_cmds, "read", lambda fd, size: b"")
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
     assert "Start the run? [y/N] " in capsys.readouterr().out
     assert not example.run_root.exists()
@@ -329,7 +332,7 @@ def test_stop_targets_live_epoch(tmp_path: Path, now: bool) -> None:
 
 
 @pytest.mark.parametrize("command", ["run", "status", "stop", "resume"])
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
 def test_unforeseen_errors_hide_values(
     example: Example,
     monkeypatch: pytest.MonkeyPatch,
@@ -393,12 +396,14 @@ def test_loader_errors_hide_values(
 
 @pytest.mark.parametrize("override", [False, True])
 @pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("spelling", ["absolute", "relative", ".", "..", "symlink"])
 def test_resume_forwards_saved_or_override_config_and_directory_root(
     example: Example,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     override: bool,
     force: bool,
+    spelling: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     run_dir = tmp_path / "moved-runs" / "r"
@@ -422,7 +427,7 @@ def test_resume_forwards_saved_or_override_config_and_directory_root(
         return {"b": [], "a": []}
 
     monkeypatch.setattr(Swarm, "resume", resume, raising=False)
-    argv = ["resume", str(run_dir)]
+    argv = ["resume", _directory_spelling(run_dir, spelling, monkeypatch)]
     if override:
         argv.extend(["--config", str(override_path)])
     if force:
@@ -436,6 +441,44 @@ def test_resume_forwards_saved_or_override_config_and_directory_root(
         "no result: b no passing candidates",
         "unjoined: a 1 parts",
     ]
+
+
+def _directory_spelling(run_dir: Path, spelling: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    if spelling == "absolute":
+        return str(run_dir)
+    if spelling == "relative":
+        monkeypatch.chdir(run_dir.parent)
+        return run_dir.name
+    if spelling == ".":
+        monkeypatch.chdir(run_dir)
+        return "."
+    if spelling == "symlink":
+        link = run_dir.parent / "alias"
+        link.symlink_to(run_dir, target_is_directory=True)
+        return str(link)
+    child = run_dir / "child"
+    child.mkdir()
+    monkeypatch.chdir(child)
+    return ".."
+
+
+@pytest.mark.parametrize("command", ["status", "stop"])
+@pytest.mark.parametrize("spelling", ["absolute", "relative", ".", "..", "symlink"])
+def test_control_normalizes_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    spelling: str,
+) -> None:
+    run_dir = tmp_path / "runs" / "r"
+    store = LocalStore(run_dir)
+    Lease.acquire_new(store, owner_id="owner", host="host", ttl_s=60)
+    assert main([command, _directory_spelling(run_dir, spelling, monkeypatch)]) == 0
+    if command == "status":
+        assert capsys.readouterr().out.startswith("run r ")
+    else:
+        assert store.exists("control/stop-e1")
 
 
 @pytest.mark.parametrize("override", [False, True])

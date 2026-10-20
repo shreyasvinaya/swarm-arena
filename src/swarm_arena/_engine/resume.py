@@ -19,7 +19,7 @@ from swarm_arena._engine import run as run_module
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
@@ -70,7 +70,7 @@ class ResumeState:
 
 def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
     if doc.head is None:
-        raise ValueError("run has no committed journal")
+        raise _core_error(ValueError, "run has no committed journal")
     events = [event for _, batch in read_chain(store, doc.head) for event in batch]
     return events, RunState.from_events(events)
 
@@ -80,7 +80,7 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
     for name in ("max_tokens", "max_usd"):
         old, new = getattr(state.config.limits, name), getattr(config.limits, name)
         if new is not None and (old is None or new < old):
-            raise ValueError(f"budget cap may only increase: {name}")
+            raise _core_error(ValueError, f"budget cap may only increase: {name}")
     continued = [g for g in state.plans if continues_on_resume(state, g, config.limits)]
     errors: list[str] = []
     for goal_id in state.plans:
@@ -94,7 +94,7 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
                     for error in _rule_max_agents_total(plan, config, (), other_active_agents=0)
                 )
     if errors:
-        raise PlanError(errors)
+        raise _core_error(PlanError, errors)
     return continued
 
 
@@ -191,8 +191,8 @@ class _ResumeServices:
                             except Fenced:
                                 raise
                             except Exception as error:
-                                raise RuntimeError(
-                                    f"orphan recovery failed: {type(error).__name__}"
+                                raise _core_error(
+                                    RuntimeError, f"orphan recovery failed: {type(error).__name__}"
                                 ) from None
                             source = index[id]
                             payload = (
@@ -274,8 +274,8 @@ class _ResumeServices:
                         await anyio.to_thread.run_sync(lease.release)
                 except Exception as error:
                     if self.failure is None:
-                        self.failure = RuntimeError(
-                            f"resume cleanup failed: {type(error).__name__}"
+                        self.failure = _core_error(
+                            RuntimeError, f"resume cleanup failed: {type(error).__name__}"
                         )
                 if executor is not None:
                     try:
@@ -304,7 +304,7 @@ class _ResumeServices:
                 await asyncio.shield(self.task)
         if self.failure is not None and not failed:
             if run_module._has_fenced(self.failure):
-                raise Fenced() from None
+                raise _core_error(Fenced) from None
             raise self.failure
 
 
@@ -352,7 +352,7 @@ async def resume_run(
     while True:
         owner = await anyio.to_thread.run_sync(read_owner, store)
         if owner is None:
-            raise ValueError("run has no committed owner")
+            raise _core_error(ValueError, "run has no committed owner")
         doc, _ = owner
         _, state = await anyio.to_thread.run_sync(_read, store, doc)
         _check(state, config)
@@ -372,7 +372,9 @@ async def resume_run(
         except Fenced:
             current = await anyio.to_thread.run_sync(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:
-                raise Fenced(f"run {run_id}: a concurrent resume took the run") from None
+                raise _core_error(
+                    Fenced, f"run {run_id}: a concurrent resume took the run"
+                ) from None
     services = _ResumeServices(config, run_id, store, lease, force=force)
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:

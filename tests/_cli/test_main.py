@@ -35,3 +35,4 @@ def test_help_lists_commands(capsys: pytest.CaptureFixture[str]) -> None:
         main(["--help"])
     out = capsys.readouterr().out
     assert all(c in out for c in ("run", "status", "stop", "resume"))
+    assert "130 interrupted (Ctrl-C)" in out

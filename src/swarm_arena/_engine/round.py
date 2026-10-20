@@ -22,7 +22,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline
-from swarm_arena._errors import Fenced, _rebuild_core_signal
+from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
@@ -578,7 +578,7 @@ class RoundRunner:
         while True:
             self._refresh_budget()
             if self.deps.journal.fenced.is_set():
-                raise Fenced("run ownership lost")
+                raise _core_error(Fenced, "run ownership lost")
             now = anyio.current_time()
             stops = self.deps.stops
             if self.deps.clock.left(self.deps.config.limits.run_timeout_s) <= 0:
@@ -802,7 +802,7 @@ class RoundRunner:
                 if self.deps.journal.fenced.is_set() or (
                     isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None
                 ):
-                    raise Fenced("run ownership lost") from None
+                    raise _core_error(Fenced, "run ownership lost") from None
                 if contexts[index] is None:
                     reasons[key] = f"agent error: {type(error).__name__}"
                 else:
@@ -831,10 +831,10 @@ class RoundRunner:
                 tasks.cancel_scope.cancel()
         except BaseExceptionGroup as errors:
             if self.deps.journal.fenced.is_set() or errors.subgroup(Fenced) is not None:
-                raise Fenced("run ownership lost") from None
+                raise _core_error(Fenced, "run ownership lost") from None
             raise
         if self.deps.journal.fenced.is_set():
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
         with anyio.move_on_after(self.deps.config.settle_timeout_s):
             while any(rt.tranche.pending() for rt in runtimes if rt is not None):  # noqa: ASYNC110 - external call settlement
                 await anyio.sleep(0.05)

@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 
 import anyio
 
-from swarm_arena._errors import PlanError
+from swarm_arena._errors import PlanError, _core_error
 
 
 class RunAdmission:
@@ -70,7 +70,9 @@ class RunAdmission:
         async with self._lock:
             others = sum(value for key, value in self._peaks.items() if key != goal_id)
             if others + peak > self.max_agents_total:
-                raise PlanError([f"max_agents_total: goal {goal_id} exceeds available capacity"])
+                raise _core_error(
+                    PlanError, [f"max_agents_total: goal {goal_id} exceeds available capacity"]
+                )
             with anyio.CancelScope(shield=True):
                 if publish is not None:
                     await publish()

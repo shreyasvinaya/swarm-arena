@@ -4,6 +4,7 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from swarm_arena._errors import _core_error
 from swarm_arena._model.base import StoredModel, _sanitize_validation_error
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.diagnostics import validation_summary
@@ -62,7 +63,7 @@ class _CheckResultFile(StoredModel):
 def _preflight_files(name: str, files: FileSet) -> None:
     """Reject unresolved globs before a script is executed."""
     if not files.snapshotted:
-        raise RuntimeError(f"{name}: files are not snapshotted")
+        raise _core_error(RuntimeError, f"{name}: files are not snapshotted")
 
 
 def _result_error(kind: str, model: type[BaseModel], error: Exception) -> str:

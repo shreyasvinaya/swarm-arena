@@ -8,7 +8,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
-from swarm_arena._errors import ChainError
+from swarm_arena._errors import ChainError, _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._model.base import FrozenModel, Origin
@@ -268,7 +268,7 @@ class RunState:
             try:
                 state._apply(deepcopy(event))
             except (ValueError, TypeError, KeyError):
-                raise ValueError("invalid journal replay payload") from None
+                raise _core_error(ValueError, "invalid journal replay payload") from None
         return state
 
     def _apply(self, event: Event) -> None:
@@ -296,7 +296,7 @@ class RunState:
                 revisions = self.plans.setdefault(event.goal_id, [])
                 origin = payload["origin"]
                 if origin not in get_args(Origin):
-                    raise ValueError("invalid plan origin")
+                    raise _core_error(ValueError, "invalid plan origin")
                 if revisions:
                     plan = Plan._from_data(payload["plan"], base_dir=revisions[0][0].base_dir)
                 elif payload.get("base_dir") is not None:
@@ -334,7 +334,7 @@ class RunState:
                 self.candidates[candidate.id] = candidate
                 fingerprint = payload.get("fingerprint")
                 if fingerprint is not None and not isinstance(fingerprint, str):
-                    raise ValueError("invalid fingerprint")
+                    raise _core_error(ValueError, "invalid fingerprint")
                 self.fingerprints[candidate.id] = fingerprint
                 self.positions[candidate.id] = (event.epoch, event.seq)
                 self.started.pop(candidate.id, None)
@@ -419,7 +419,7 @@ class RunState:
                     max(goal.round, goal.rounds_closed) + 1 if self.plans.get(event.goal_id) else 1,
                 )
                 if type(first_round) is not int or first_round < 1:
-                    raise ValueError("invalid revision first_round")
+                    raise _core_error(ValueError, "invalid revision first_round")
                 updates["replanned_rounds"] = [*goal.replanned_rounds, first_round]
                 if goal.pending_replan == first_round:
                     updates["pending_replan"] = None

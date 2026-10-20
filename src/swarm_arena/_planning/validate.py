@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import ConfigError, PlanError
+from swarm_arena._errors import ConfigError, PlanError, _core_error
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
 from swarm_arena._model.data import json_equal
@@ -82,10 +82,10 @@ def _authorize(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> Plan:
     if errors:
         # Retired addresses are also import-free, so report them even when a
         # restored agent has already lost its inherited catalog authority.
-        raise PlanError([*errors, *_rule_addresses(plan, config, history)]) from None
+        raise _core_error(PlanError, [*errors, *_rule_addresses(plan, config, history)]) from None
     default_errors = _safe_call("/refs", partial(_check_catalog_defaults, deferred))
     if default_errors:
-        raise PlanError(default_errors) from None
+        raise _core_error(PlanError, default_errors) from None
     if projected is not plan:
         authorized = authorized.model_copy(
             update={"converge": authorized.converge.model_copy(update={"round": None})}
@@ -98,7 +98,7 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     try:
         return action()
     except Exception as error:
-        raise PlanError([f"{pointer}: {type(error).__name__}"]) from None
+        raise _core_error(PlanError, [f"{pointer}: {type(error).__name__}"]) from None
 
 
 def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
@@ -612,7 +612,7 @@ def judge_private_paths(plan: Plan) -> frozenset[str]:
             except PlanError as error:
                 errors.extend(error.errors)
     if errors:
-        raise PlanError(errors) from None
+        raise _core_error(PlanError, errors) from None
     return frozenset(paths)
 
 
@@ -784,7 +784,7 @@ def validate_plan(
         except PlanError as error:
             errors.extend(error.errors)
     if errors:
-        raise PlanError(errors) from None
+        raise _core_error(PlanError, errors) from None
     return warnings
 
 
@@ -811,8 +811,9 @@ def _resolve_revision(child: Plan, r0: Plan, artifacts: ArtifactStore) -> Plan:
         if not files.snapshotted:
             for glob in files.globs:
                 if not any(matches(path, [glob]) for path in main.manifest):
-                    raise PlanError(
-                        [f"part {part.name!r}: glob {glob!r} matches no file of the main goal"]
+                    raise _core_error(
+                        PlanError,
+                        [f"part {part.name!r}: glob {glob!r} matches no file of the main goal"],
                     ) from None
             files = FileSet(
                 globs=files.globs,
@@ -850,7 +851,7 @@ def _validate_round_refs(plan: Plan) -> None:
         except Exception as error:
             errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
     if errors:
-        raise PlanError(errors) from None
+        raise _core_error(PlanError, errors) from None
 
 
 def _snapshot_round_refs(plan: Plan, artifacts: ArtifactStore) -> Plan:
@@ -860,7 +861,9 @@ def _snapshot_round_refs(plan: Plan, artifacts: ArtifactStore) -> Plan:
         frozen = snapshot_ref(effective_tool_ref(ref, overrides), plan.base_dir, artifacts)
         values = {key: frozen.config[key] for key in overrides}
         if pointer in updates and not json_equal(updates[pointer], values):
-            raise PlanError([f"{pointer}: inconsistent snapshots across effective tools"])
+            raise _core_error(
+                PlanError, [f"{pointer}: inconsistent snapshots across effective tools"]
+            )
         updates[pointer] = values
     rounds = [
         round_spec.model_copy(
@@ -906,7 +909,7 @@ def _validate_frozen_files(plan: Plan) -> None:
         except PlanError as error:
             errors.extend(error.errors)
     if errors:
-        raise PlanError(errors) from None
+        raise _core_error(PlanError, errors) from None
 
 
 def admit_revision(
@@ -977,7 +980,7 @@ def admit_revision(
     except PlanError:
         raise
     except Exception as error:
-        raise PlanError([f"/snapshot: {type(error).__name__}"]) from None
+        raise _core_error(PlanError, [f"/snapshot: {type(error).__name__}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )

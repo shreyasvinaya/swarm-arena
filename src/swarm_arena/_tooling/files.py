@@ -10,7 +10,7 @@ from typing import Any, Final, cast
 from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic_core import PydanticUndefined
 
-from swarm_arena._errors import PlanError
+from swarm_arena._errors import PlanError, _core_error
 from swarm_arena._model.compat import _alias_paths
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
@@ -245,7 +245,7 @@ def _snapshot_value(
     """
     if isinstance(value, (FileSet, Ref)):
         if shape_error is not None:
-            raise PlanError([shape_error]) from None
+            raise _core_error(PlanError, [shape_error]) from None
         if isinstance(value, FileSet):
             return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
         return snapshot_ref(value, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
