@@ -27,6 +27,7 @@ PUBLIC: dict[str, list[str]] = {
         "swarm_arena.testing",
     )
 }
+PUBLIC["swarm_arena"] += ["Chain", "KeepTopTeams", "Patience", "SuccessiveHalving"]
 PUBLIC["swarm_arena"] += ["Ref"]
 PUBLIC["swarm_arena"] += ["Goal"]
 PUBLIC["swarm_arena"] += [
@@ -39,7 +40,7 @@ PUBLIC["swarm_arena"] += [
     "Limits",
     "Resources",
 ]
-PUBLIC["swarm_arena.planning"] += ["Decision", "FlowSpec", "History", "RoundState"]
+PUBLIC["swarm_arena.planning"] += ["Decision", "FlowSpec", "History", "Policy", "RoundState"]
 PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",

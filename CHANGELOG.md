@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Checks, scoring, and records
 
+- `Policy`, `KeepTopTeams`, `SuccessiveHalving`, `Patience`, and `Chain` provide
+  configurable per-group pruning with starved-agent and last-team protection.
+
 - `Decision`, `RoundState`, and `History` describe policy decisions and planning
   evidence, with ranking isolated by group, judge identity, and newest fidelity.
   `Frontier`, `Row`, and `LineageGraph` describe board snapshots and result ancestry.
