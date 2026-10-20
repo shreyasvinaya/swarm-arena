@@ -2020,7 +2020,7 @@ async def judge_round(goal_id: str, judges: Sequence[tuple[Ref, Judge]], candida
     # [plan] M3: a judge that raises ProviderFailed gets JudgeOutcome.provider_failed[judge name] = provider, with no
     # judge_error events and no scores; the other judges still run (§6.4: ranking-judge pause, panel drop)
 async def final_judge(goal_id: str, ranking: tuple[Ref, Judge], finalists: Sequence[Candidate],
-                      ctx: JudgeContext) -> list[Candidate]: ...     # one batch; read_cache=False
+                      ctx: JudgeContext) -> tuple[list[Candidate], JudgeOutcome]: ...     # one batch; read_cache=False; returns (order, outcome); scores stamped with ctx.ids
     # [plan] M3: re-raises ProviderFailed, so the goal writes NO_RESULT with reason provider_failed (§6.4)
 # [plan] Fenced (from a command job's on_started) propagates out of run_checks, judge_round and final_judge; it is never
 # a failed CheckResult or a judge_error.
