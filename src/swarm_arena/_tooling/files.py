@@ -1,6 +1,7 @@
 """Snapshot goal and component files into immutable, content-addressed manifests."""
 
 from pathlib import Path
+from typing import Final
 
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
@@ -8,6 +9,9 @@ from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import check_relpath, fold_conflicts, fold_key, matches
 from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
+
+MAX_SNAPSHOT_FILE_BYTES: Final = 2**30
+"""Most bytes of one snapshotted goal, tool, check, or judge file (1 GiB)."""
 
 
 def _listed_path(base: Path, relative: str, listings: dict[Path, dict[str, list[str]]]) -> str:
@@ -86,7 +90,9 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     ``problem/RUN.py`` for a listed ``run.py``, is recorded once with the
     listed spelling. Names that both appear in a directory listing are two
     entries, even when they are hard links to one file, so a folded pair of
-    them is refused. Each directory is listed once per snapshot.
+    them is refused. Each directory is listed once per snapshot. Each file
+    may be at most ``MAX_SNAPSHOT_FILE_BYTES`` (1 GiB); a larger one is
+    refused by its size, unread, with an error that names its path.
 
     Parameters
     ----------
@@ -105,9 +111,10 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     Raises
     ------
     ValueError
-        If a glob matches no regular file, a selected path is reserved or
-        symlinked, two selected names conflict after folding, or the source
-        cannot be read.
+        If a glob matches no regular file, a selected path is reserved, not
+        valid UTF-8, or symlinked, two selected names conflict after folding,
+        a file is larger than ``MAX_SNAPSHOT_FILE_BYTES``
+        (``<path> crosses the size cap``), or the source cannot be read.
 
     Examples
     --------
@@ -153,7 +160,10 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     if conflicts:
         first, second = conflicts[0]
         raise ValueError(f"conflicting snapshot paths: {first} and {second}")
-    manifest = {rel: artifacts.put_bytes(read_regular_file(base_dir, rel)) for rel in paths}
+    manifest: dict[str, str] = {}
+    for rel in paths:  # one file at a time, each refused by its size when over the cap
+        data = read_regular_file(base_dir, rel, max_bytes=MAX_SNAPSHOT_FILE_BYTES)
+        manifest[rel] = artifacts.put_bytes(data)
     return fs.model_copy(update={"manifest": manifest})
 
 

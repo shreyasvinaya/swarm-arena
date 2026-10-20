@@ -7,7 +7,6 @@ import json
 import math
 import os
 import stat
-import sys
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Final, NoReturn
@@ -174,7 +173,7 @@ def open_regular_file(workspace: Path, rel: str) -> int:
     return fd
 
 
-def _chunks(fd: int, rel: str, max_bytes: int | None, *, step: int | None) -> Iterator[bytes]:
+def _chunks(fd: int, rel: str, max_bytes: int, *, step: int | None) -> Iterator[bytes]:
     """
     Yield a file's bytes, refusing it unread when ``fstat`` shows it is over the cap.
 
@@ -183,23 +182,22 @@ def _chunks(fd: int, rel: str, max_bytes: int | None, *, step: int | None) -> It
     whole file usually arrives in one buffer. A file that grows past the cap
     after the first check is refused when the cap is reached.
     """
-    limit = sys.maxsize if max_bytes is None else max_bytes
     size = os.fstat(fd).st_size
-    if size > limit:
+    if size > max_bytes:
         raise ValueError(f"{rel} crosses the size cap")
     total = 0
-    while total < limit:
+    while total < max_bytes:
         want = step if step is not None else max(size - total, _CHUNK)
-        chunk = os.read(fd, min(want, limit - total, _MAX_READ))
+        chunk = os.read(fd, min(want, max_bytes - total, _MAX_READ))
         if not chunk:
             return
         total += len(chunk)
         yield chunk
-    if os.fstat(fd).st_size > limit:
+    if os.fstat(fd).st_size > max_bytes:
         raise ValueError(f"{rel} crosses the size cap")
 
 
-def read_regular_file(workspace: Path, rel: str, *, max_bytes: int | None = None) -> bytes:
+def read_regular_file(workspace: Path, rel: str, *, max_bytes: int) -> bytes:
     """
     Read a regular workspace file without following any symlink component.
 
@@ -214,9 +212,9 @@ def read_regular_file(workspace: Path, rel: str, *, max_bytes: int | None = None
         Trusted workspace root.
     rel : str
         Relative path, including internal paths such as ``swarm/result.json``.
-    max_bytes : int or None, optional
-        Most bytes to read. Every read of a tool-written file passes a cap;
-        None reads the whole file, for human-authored sources only.
+    max_bytes : int
+        Most bytes to read. Required: every caller passes its cap, such as
+        ``MAX_RESULT_JSON_BYTES``, an output budget, or ``MAX_SNAPSHOT_FILE_BYTES``.
 
     Returns
     -------

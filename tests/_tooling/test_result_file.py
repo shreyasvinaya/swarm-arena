@@ -376,7 +376,7 @@ def test_json_decode_errors_are_sanitized(tmp_path: Path) -> None:
 def test_read_helpers_and_model(tmp_path: Path) -> None:
     write_result(tmp_path, {"data": {}})
     assert read_result_json(tmp_path) == {"data": {}}
-    assert read_regular_file(tmp_path, "swarm/result.json") == b'{"data": {}}'
+    assert read_regular_file(tmp_path, "swarm/result.json", max_bytes=64) == b'{"data": {}}'
     assert symlinked_component(tmp_path, "swarm/result.json") is None
     (tmp_path / "link").symlink_to(tmp_path / "swarm", target_is_directory=True)
     assert symlinked_component(tmp_path, "link/result.json") == "link"
@@ -395,7 +395,7 @@ def test_read_helpers_and_model(tmp_path: Path) -> None:
 def test_read_regular_file_refuses_unsafe_or_nonregular(tmp_path: Path, rel: str) -> None:
     (tmp_path / "swarm").mkdir()
     with pytest.raises(ValueError, match="not a regular file"):
-        read_regular_file(tmp_path, rel)
+        read_regular_file(tmp_path, rel, max_bytes=CAP)
 
 
 @pytest.mark.parametrize("kind", ["fifo", "symlink", "symlinked_swarm_dir"])
@@ -464,7 +464,7 @@ def test_read_refuses_parent_replaced_after_component_check(
 
     monkeypatch.setattr(result_file, "symlinked_component", swap)
     with pytest.raises(ValueError, match="not a regular file"):
-        read_regular_file(workspace, "out/data")
+        read_regular_file(workspace, "out/data", max_bytes=CAP)
 
 
 @pytest.mark.parametrize("existing", [True, False])
@@ -786,3 +786,11 @@ def test_declared_files_are_hashed_one_at_a_time_within_the_cap(
     r = run(tmp_path, RunStatus.OK, 0)
     assert tool_output_from_result(tmp_path, r).status == RunStatus.ERROR
     assert "out/b crosses MAX_DECLARED_FILES_BYTES" in r.stderr_path.read_text()
+
+
+def test_every_read_regular_file_caller_passes_a_cap() -> None:  # integration fix 3, RC1
+    import inspect
+
+    parameter = inspect.signature(read_regular_file).parameters["max_bytes"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty  # required: no unbounded default

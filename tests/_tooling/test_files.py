@@ -473,7 +473,7 @@ def test_snapshot_folded_alias_identity(
         else:
             yield from original_iterdir(self)
 
-    def read(base: Path, rel: str) -> bytes:
+    def read(base: Path, rel: str, *, max_bytes: int) -> bytes:
         return b"x"
 
     monkeypatch.setattr(Path, "stat", stat_path)
@@ -521,3 +521,24 @@ def test_snapshot_lists_each_directory_once(
     snapshot = snapshot_fileset(FileSet(globs=["data/*", "data/**/*.txt"]), tmp_path, artifacts)
     assert len(snapshot.manifest) == 41
     assert sorted(listed) == [tmp_path, tmp_path / "data", tmp_path / "data/sub"]
+
+
+def test_snapshot_refuses_a_file_over_its_cap_unread(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    bytes_read: list[int],
+    sparse: Any,
+) -> None:  # integration fix 3, RC1
+    from swarm_arena._tooling import files as files_module
+
+    assert files_module.MAX_SNAPSHOT_FILE_BYTES == 2**30  # 1 GiB per goal or tool file
+    monkeypatch.setattr(files_module, "MAX_SNAPSHOT_FILE_BYTES", 1024)
+    sparse(tmp_path / "data/fits.bin", 1024)
+    sparse(tmp_path / "data/big.bin", 2 * 1024)
+    bytes_read.clear()
+    with pytest.raises(ValueError, match=r"^data/big\.bin crosses the size cap$"):
+        snapshot_fileset(FileSet(globs=["data/*"]), tmp_path, artifacts)
+    assert sum(bytes_read) <= 1024  # data/fits.bin at most; the big file is refused by its size
+    snapshot = snapshot_fileset(FileSet(globs=["data/fits.bin"]), tmp_path, artifacts)
+    assert snapshot.manifest == {"data/fits.bin": sha256_hex(bytes(1024))}
