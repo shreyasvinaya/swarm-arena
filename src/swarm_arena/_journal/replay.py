@@ -85,6 +85,10 @@ class GoalState(FrozenModel):
         Part selections, populated by the converge pipeline's fold.
     join_attempts : int, default=0
         Failed joins, populated by the converge pipeline's fold.
+    join_retries : int, default=0
+        Committed retry proposals, counted independently of failed joins.
+    join_phase : {'converge', 'replan', 'rounds'}, default='converge'
+        Owed join transition, retained across ordinary-round closure.
     join_failures : list[str], default=[]
         Ordered failure reasons in this lifecycle and partition.
     select_only : bool, default=False
@@ -126,6 +130,8 @@ class GoalState(FrozenModel):
     final_parts: dict[str, str | None] | None = None
     kept_parts: dict[str, str] = {}
     join_attempts: int = 0
+    join_retries: int = 0
+    join_phase: Literal["converge", "replan", "rounds"] = "converge"
     join_failures: list[str] = []
     select_only: bool = False
     converge_started: bool = False
@@ -399,7 +405,13 @@ class RunState:
                 updates["finished"] = False
                 if event.goal_id in self._finished_goals:
                     updates.update(_reset_converge())
-                    updates.update(kept_parts={}, join_attempts=0, join_failures=[])
+                    updates.update(
+                        kept_parts={},
+                        join_attempts=0,
+                        join_failures=[],
+                        join_retries=0,
+                        join_phase="converge",
+                    )
                     updates["end_reason"] = None
                     updates["pending_replan"] = None
                     self._finished_goals.remove(event.goal_id)
@@ -439,6 +451,24 @@ class RunState:
                 if payload.get("preflight_only", False):
                     self.goals[event.goal_id] = goal.model_copy(update=updates)
                     return
+                if "rejected_revision" in payload and goal.join_phase == "rounds":
+                    updates["join_phase"] = "replan"
+                retry = payload.get("join_retry")
+                if (
+                    retry is None
+                    and goal.join_phase == "replan"
+                    and "rejected_revision" not in payload
+                ):
+                    # Older v1 journals identify this transition by event order.
+                    retry = goal.join_retries + 1
+                if retry is not None:
+                    updates["join_retries"] = retry
+                    updates["join_phase"] = (
+                        "rounds" if event.type == EventType.PLAN_REVISION else "replan"
+                    )
+                    updates["converge_round"] = None
+                    if event.type == EventType.PLAN_REVISION:
+                        updates["converge_started"] = False
                 first_round = payload.get(
                     "first_round",
                     max(goal.round, goal.rounds_closed) + 1 if self.plans.get(event.goal_id) else 1,
@@ -478,9 +508,13 @@ class RunState:
                     payload["part"]: payload["candidate_id"],
                 }
             case EventType.JOIN_FAILED:
+                updates["join_phase"] = "replan"
+                updates["converge_round"] = None
+                updates["counters"] = {}
                 updates["join_attempts"] = payload["attempt"]
                 updates["join_failures"] = [*goal.join_failures, *payload["reasons"]]
             case EventType.CONVERGE_STARTED:
+                updates["join_phase"] = "converge"
                 updates["converge_started"] = True
                 updates["select_only"] = payload["select_only"]
                 updates["pending_reason"] = payload.get("reason")

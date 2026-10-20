@@ -65,14 +65,64 @@ def select_finalists(
     return finalists
 
 
+async def _retry_join(goal: "GoalRunner") -> bool:
+    """Complete the durable retry transition before another convergence pass."""
+    while (
+        goal.join_retries < goal.plan.converge.max_join_attempts
+        and goal.rounds_closed < goal.deps.config.limits.max_rounds
+        and goal.replanner is not None
+        and not goal._stop()
+    ):
+        goal._join_retry_number = goal.join_retries + 1
+        try:
+            accepted = await goal._replan()
+        finally:
+            goal._join_retry_number = None
+        await goal._refresh()
+        restored = goal.recorded.goals[goal.goal_id]
+        goal.join_retries, goal.join_phase = restored.join_retries, restored.join_phase
+        if not accepted:
+            continue
+        goal._frontier = None
+        goal._recovering_converge = False
+        await goal._run_rounds()
+        if goal.status == "no_result":
+            return False
+        goal.join_phase = "converge"
+        goal.deps.journal.append(
+            goal._draft(
+                EventType.CONVERGE_STARTED, select_only=goal.select_only, reason=goal.reason
+            )
+        )
+        await goal.deps.journal.commit()
+        return True
+    goal._stop()
+    if goal.select_only:
+        goal.join_phase = "converge"
+        return True
+    reasons = next(
+        (
+            event.payload["reasons"]
+            for event in reversed(goal._events)
+            if event.goal_id == goal.goal_id and event.type == EventType.JOIN_FAILED
+        ),
+        goal.join_failures,
+    )
+    goal.status, goal.reason = "no_result", "; ".join(reasons)
+    return False
+
+
 async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
     """
     Select or join candidates and obtain one uncached final ranking.
 
     Parts stopped in select-only mode are retained independently in
     ``goal.final_parts``. Join failures may replan and run remaining rounds.
-    An immediate stop or deadline during a join retains the best parts before
-    join-failure handling. Fingerprints come only from committed records.
+    Failed joins owe a durable retry proposal; accepted retries owe ordinary
+    rounds before another converge pass. Refused proposals consume retry
+    allowance independently of the failed-join count. An immediate stop or
+    deadline during a join retains the best parts before join-failure handling.
+    Fingerprints come only from committed records.
 
     Parameters
     ----------
@@ -90,9 +140,9 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
     --------
     >>> finalists = await converge(runner, select_only=True)  # doctest: +SKIP
     """
-    retries = 0
-    retry_limit = max(0, goal.plan.converge.max_join_attempts - goal.join_attempts)
     while True:
+        if goal.join_phase == "replan" and not await _retry_join(goal):
+            return []
         goal._stop()
         select_only |= goal.select_only
         state = goal._round_state()
@@ -181,30 +231,8 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
                     )
                 )
                 await goal._refresh()
-                if (
-                    retries < retry_limit
-                    and goal.rounds_closed < goal.deps.config.limits.max_rounds
-                    and not goal.deps.ledger.goal_exhausted(goal.goal_id)
-                    and not goal._stop()
-                    and await goal._replan()
-                    and goal.rounds_closed < goal.plan.rounds_total(goal.deps.config.limits)
-                ):
-                    retries += 1
-                    await goal._run_rounds()
-                    if goal.status == "no_result":
-                        return []
-                    select_only = goal.select_only
-                    goal.deps.journal.append(
-                        goal._draft(EventType.CONVERGE_STARTED, select_only=select_only)
-                    )
-                    await goal.deps.journal.commit()
-                    continue
-                goal._stop()
-                select_only |= goal.select_only
-                if select_only:
-                    continue
-                goal.status, goal.reason = "no_result", "; ".join(reasons)
-                return []
+                goal.join_phase = "replan"
+                continue
             if not goal.plan.parts:
                 pool.extend(survivors)
             fidelity = newest_fidelity(pool)

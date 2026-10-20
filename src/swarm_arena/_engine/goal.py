@@ -173,6 +173,9 @@ class GoalRunner:
         self.rounds_closed = self.state.rounds_closed
         self.select_only = self.state.select_only
         self.join_attempts = self.state.join_attempts
+        self.join_retries = self.state.join_retries
+        self.join_phase = self.state.join_phase
+        self._join_retry_number: int | None = None
         self.join_failures = list(self.state.join_failures)
         self.kept_parts = dict(self.state.kept_parts)
         self.repeat_entries: list[tuple[str, Candidate]] = []
@@ -228,6 +231,11 @@ class GoalRunner:
         return max(main, len(conv.team.agents) if conv.mode == "team" and conv.team else 0)
 
     def _draft(self, type: EventType, *, round_no: int | None = None, **payload: Any) -> EventDraft:
+        if self._join_retry_number is not None and type in {
+            EventType.PLAN_REVISION,
+            EventType.PLAN_REJECTED,
+        }:
+            payload["join_retry"] = self._join_retry_number
         return EventDraft(
             type=type,
             goal_id=self.goal_id,
@@ -856,6 +864,11 @@ class GoalRunner:
                         other_active_agents=0,
                     )
                 )
+                if (
+                    self._join_retry_number is not None
+                    and admitted.rounds_total(self.deps.config.limits) <= self.rounds_closed
+                ):
+                    raise PlanError(["join retry has no remaining ordinary rounds"])
                 await self._preflight(admitted)
                 return admitted
 
@@ -931,6 +944,7 @@ class GoalRunner:
                 if self.plan.revision == 0:
                     self.status, self.reason = "no_result", "preflight failed"
                     return False
+                self.join_phase = self.recorded.goals[self.goal_id].join_phase
                 self.history = [p for p, _ in self.recorded.plans[self.goal_id]]
                 self.plan = self.recorded.plan_for_round(self.goal_id, self.rounds_closed + 1)
                 await self.admission.update(self.goal_id, self.active_agents())
@@ -1167,17 +1181,19 @@ class GoalRunner:
         self._restore_repeats()
         if self.status != "no_result" and await self._ensure_preflight():
             self.agents = await self._slots(self.plan.teams, reuse=False)
-            if not self.state.converge_started:
+            if not self.state.converge_started and self.join_phase != "replan":
                 await self._run_rounds()
         finalists: list[Candidate] = []
         if self.status != "no_result":
             self._stop()
-            self.deps.journal.append(
-                self._draft(
-                    EventType.CONVERGE_STARTED, select_only=self.select_only, reason=self.reason
+            if self.join_phase != "replan":
+                self.join_phase = "converge"
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.CONVERGE_STARTED, select_only=self.select_only, reason=self.reason
+                    )
                 )
-            )
-            await self.deps.journal.commit()
+                await self.deps.journal.commit()
             finalists = await converge(self, select_only=self.select_only)
         self._stop()
         if not finalists and not (self.final_parts and any(self.final_parts.values())):
