@@ -1754,6 +1754,25 @@ These three fields reset on a continued lifecycle or a changed partition,
 not on an ordinary round. Candidates, repeat keys, and fingerprints survive
 continuation. `plan_rejected` never adds a plan revision.
 
+Optional payload keys added in M1b fix rounds (journal v1 is unreleased, so no
+schema_version bump): `plan_revision.preflight_complete: bool` is true only after
+the shared component preflight succeeded for that revision (startup revisions carry
+true); `plan_revision.preflight_only: bool` marks a recovery checkpoint that
+completes preflight for an existing revision without adding a revision or moving its
+first round; `plan_rejected.rejected_revision: int` refuses, on recovery, an accepted
+revision that never completed preflight (a nonzero revision leaves the effective
+history and dispatch resumes from the previous admitted revision; refusing revision 0
+ends the goal without dispatch). `plan_revision.join_retry` and
+`plan_rejected.join_retry` count completed retry proposals (one-based, independent of
+`join_failed.attempt`; accepted and refused proposals both use the allowance).
+`GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
+owed join-retry transition; `preflight_revisions` replays preflight completion.
+Every engine-run event may carry `run_elapsed_s: float`, the accumulated active-driver
+checkpoint; replay folds the maximum over all events and excludes downtime.
+`RunState.candidate_goal_keys` maps each candidate to the GoalKey of the part that
+produced it (derived from revision and `tool_end` order, no new stored field); part
+rankings, snapshots and join parents use only candidates of the current part key.
+
 #### R4.13.5 Ids — M1a (R2.7 item 7)
 
 ```python
