@@ -2049,23 +2049,31 @@ def ref_sites(plan: Plan) -> list[RefSite]: ...      # every Ref at any depth, i
 def diff_revision(parent: Plan | None, child: Plan, *, parent_human: Mapping[str, bool]) -> list[RefSite]: ...
     # agents by stable address; checks, judges, parts by name
 def check_catalog(site: RefSite, catalog: PlannerCatalog, *, overrides: Mapping[str, Any]) -> list[str]: ...
-    # [plan] compares catalog_form(site config minus settable keys) == catalog_form(entry.config); settable keys and
-    # override keys validate with entry.settable_model(); PlannerCatalog.match compares Ref.path to entry.ref as strings
-    # and never imports
+    # Compares catalog_form(site config minus settable keys) with catalog_form(entry.config) using shared json_equal.
+    # _planning/catalog_check.find_entry(ref: Ref, kind: CatalogKind, catalog: PlannerCatalog) -> CatalogEntry | None
+    # returns the first same-kind/path canonical fixed-config match without imports or schema construction. The round
+    # runner uses this lookup for every admitted base tool ref, including human refs. check_catalog retains same-kind/path
+    # candidates and diagnoses fixed-field differences against the first candidate when no fixed config matches.
+    # Settable/override values use _validate_config(entry.settable_model(), ..., where=site.pointer); unknown planner
+    # keys render as <field>, and every diagnostic starts with the site's pointer followed by ": ".
 def catalog_form(config: Mapping[str, Any]) -> dict[str, Any]: ...
     # [plan] _planning/catalog_check.py. No import. Two rules apply at any depth and on both sides. (1) A dumped FileSet
     # {"globs": g, "manifest": m} becomes g. (2) A nested-ref dict becomes {"path": p, "config": catalog_form(config or
     # {}), "name": name or None}. A nested-ref dict is a dict with a `path` in "module:qualname" form and no keys other
     # than path, config, and name (the M1b Task 14 nested-ref rule). So a site that the core snapshotted, a journaled
     # revision, and a later unchanged revision still equal the raw catalog entry. A changed nested path, config value,
-    # or name still differs.
+    # or name still differs. Shared json_equal preserves bool/int/float distinctions recursively after normalization.
 def authorize_revision(plan: Plan, config: RunConfig, *, history: Sequence[Plan] = ()) -> tuple[Plan, list[str]]: ...
     # [plan] _planning/catalog_check.py. No import, no I/O. Human origin -> (plan, []). Non-human: check_catalog on every
     # site with carried_human False. In each such site, a dumped FileSet keeps its manifest only when a revision in
     # `history` (the admitted revisions, as journaled) holds a FileSet with equal globs and an equal manifest, at any
     # site and any depth. Every other dumped FileSet loses its manifest and becomes its globs list. So the core computes
     # the manifest of every new or changed planner-written component, and an unchanged or copied component keeps its
-    # frozen files with no disk read, also after a resume. Returns (that plan, errors).
+    # frozen files with no disk read, also after a resume. Returns (that plan, errors). The shared
+    # _planning/catalog_check.parent_human(history: Sequence[Plan]) -> dict[str, bool] walker grants all sites of human
+    # revisions authority and folds later revisions through diff_revision; validation reuses it. Effective-site authority
+    # also requires unchanged raw overrides, even when an override edit leaves the merged Ref unchanged. Diagnostic
+    # pointers retain configured nested keys and list indices while rendering planner-invented mapping keys as <field>.
 def admit_revision(plan: Plan, config: RunConfig, artifacts: ArtifactStore, *, history: Sequence[Plan] = (),
                    other_active_agents: int = 0) -> tuple[Plan, list[str]]: ...
     # [plan] _planning/validate.py. The one entry point for r0 (RunRunner), replanner and join-failure revisions
