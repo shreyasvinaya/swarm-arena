@@ -1698,13 +1698,18 @@ class RunState:                                      # pure fold of committed ev
     @classmethod
     def from_events(cls, events: Iterable[Event]) -> "RunState": ...
     run_id: str
+    run_elapsed_s: float                            # maximum journaled active elapsed time
+    epoch: int                                      # latest committed ownership epoch
+    lost: set[str]                                  # candidate ids recorded by run_lost
     config: RunConfig                                # [plan] the journaled run_config with limits from the last
                                                      # limits_changed.new
     plans: dict[str, list[tuple[Plan, Origin]]]      # goal → revisions; origin from the journal only
     goals: dict[str, GoalState]                      # status, round, agents, decisions, frontier per round; [plan]
                                                      # GoalState.status "stopped" when goal_finished.reason is a stop reason (R4.14);
                                                      # a goal_started after a goal_finished (a continuation) sets status
-                                                     # running and starts a new lifecycle
+                                                     # running and starts a new lifecycle; converge-team round_started
+                                                     # preserves ordinary round/rounds_closed and finalization state,
+                                                     # recording its own converge_round and frontier (converge=true)
     candidates: dict[str, Candidate]
     scores: dict[str, Score]
     learnings: dict[str, Learning]
@@ -2268,7 +2273,7 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
 
 ### R4.14 Journal event types — M1b (additions noted)
 
-`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a replanner revision rejected by `validate_plan`; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
 
 ### R4.15 Stored formats and `schema_version`
 
@@ -2393,3 +2398,5 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 16. **Judge reservations [plan]:** `Amount()` for `ProgramJudge`, for LLM judges (non-empty `models()`; their calls reserve through the `<goal>/:judges` or `<goal>/:final` tranche), and for judges without `providers()`; `n × default_run_reservation`, settled `estimated`, for judges with `providers()`. `judge_amount` (R4.13.6) holds the rule, and its `llm=True` form prices LLM judges for estimates and final slices.
 17. **Deviation from §4.9** ("the run's current `rubric_hash` and `panel_hash`"): with no score of its own yet, a run's `best`/`leaderboard` judge identity is the newest identity for that judge name in the namespace, because `ArenaBoard` sees identities only through scores (M2).
 18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses only the allowlist that the driver can read before dispatch (a `ScriptTool` `Config.env`). A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
+
+19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.

@@ -36,6 +36,7 @@ def test_event_types_are_exact() -> None:
         "goal_started",
         "goal_finished",
         "plan_revision",
+        "plan_rejected",
         "frontier",
         "round_started",
         "agent_status",

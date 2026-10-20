@@ -29,6 +29,7 @@ class EventType(StrEnum):
     GOAL_STARTED = "goal_started"
     GOAL_FINISHED = "goal_finished"
     PLAN_REVISION = "plan_revision"
+    PLAN_REJECTED = "plan_rejected"
     FRONTIER = "frontier"
     ROUND_STARTED = "round_started"
     AGENT_STATUS = "agent_status"
