@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Checks, scoring, and records
 
+- `Board` and `BoardView` define journal-backed indexing and fixed snapshot reads;
+  an in-memory run board provides ranked results, namespace learning search,
+  lineage, deterministic frontiers, and digests with a strict UTF-8 byte cap.
+
 - `Policy`, `KeepTopTeams`, `SuccessiveHalving`, `Patience`, and `Chain` provide
   configurable per-group pruning with starved-agent and last-team protection.
 - `Planner` ABC (`swarm_arena.planning`).
