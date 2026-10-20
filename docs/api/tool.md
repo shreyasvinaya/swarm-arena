@@ -38,10 +38,34 @@ including overflowing numeric literals, invalidate the result. Declared files mu
 exist, avoid reserved workspace names, and be regular files without symlinked
 components. The collector hashes their bytes locally.
 
+Every workspace path, such as a declared file, an edit key, or a manifest key, is
+relative, in normal form, and strict UTF-8. A name with a lone surrogate, such as
+the `surrogateescape` spelling of a non-ASCII name, is refused as
+`not valid UTF-8`: it names the same file on disk as the real name, but compares
+as another path. So a file whose name on disk is not valid UTF-8 cannot be
+snapshotted or declared.
+
+Every read of a tool-written file is bounded. Its size is checked before it is
+read, so a larger file, even a sparse one, is refused unread:
+
+- `swarm/result.json`: at most 16 MiB (`MAX_RESULT_JSON_BYTES`).
+- The files one result declares: at most 256 MiB together
+  (`MAX_DECLARED_FILES_BYTES`). Their sizes are summed before any is read, and
+  they are hashed one at a time.
+- `LocalExecutor` uploads the last `max_log_bytes` (default 8 MiB) of each log,
+  and at most `max_output_bytes` (default 256 MiB) of declared output files per
+  run (`LocalExecutor.Config`). A run whose outputs cross that cap gets status
+  `error` and no files.
+
+Snapshots of human-authored goal, tool, check, and judge files are bounded too:
+at most 1 GiB per file (`MAX_SNAPSHOT_FILE_BYTES`).
+
 A successful process requires a valid result; otherwise collection returns `error`
 and appends a sanitized reason to stderr. A valid result after timeout or
-cancellation keeps data and artifacts with `partial=True`. Error and out-of-memory
-runs retain only valid reported usage. For successful or error runs,
+cancellation, even `{"data": {}}`, keeps data and artifacts with `partial=True`.
+Without a valid result, a stopped run keeps empty data with `partial=False`, and
+the reason, such as `swarm/result.json is missing`, is appended to stderr. Error
+and out-of-memory runs retain only valid reported usage. For successful or error runs,
 `failed_provider` produces `provider_failed` with usage but no data or artifacts;
 timeout, cancellation, and out-of-memory status take precedence over this field.
 Check and judge commands use the raw JSON object rather than this tool envelope.
