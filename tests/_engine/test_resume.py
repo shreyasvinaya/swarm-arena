@@ -1571,3 +1571,443 @@ async def test_resume_shutdown_bound_and_primary_failure(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+class _CrashBoundary(BaseException):
+    """Interrupt orchestration after an explicitly committed checkpoint."""
+
+
+@pytest.mark.parametrize("reason", ["stop", "stop --now", "run_timeout_s", None])
+async def test_pending_selection_preserves_lifecycle_reason(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str | None,
+) -> None:
+    c = await _crash(tmp_path, run_config, recorders, plans=[_plan(rounds=3)], lost=())
+    real_stop = GoalRunner._stop
+    real_durable = JournalWriter.append_durable
+
+    def stop_after_first_round(self: GoalRunner) -> bool:
+        if self.rounds_closed >= 1:
+            if reason == "stop":
+                self.deps.stops.stop = True
+            elif reason == "stop --now":
+                self.deps.stops.stop_now = True
+            elif reason == "run_timeout_s":
+                self.deps.stops.run_timeout = True
+        return real_stop(self)
+
+    async def crash_before_finish(self: JournalWriter, draft: EventDraft) -> Event:
+        if draft.type == "goal_finished":
+            await self.commit()
+            raise _CrashBoundary()
+        return await real_durable(self, draft)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GoalRunner, "_stop", stop_after_first_round)
+        patch.setattr(JournalWriter, "append_durable", crash_before_finish)
+        with pytest.raises(BaseExceptionGroup) as error:
+            await Swarm(c.config).resume(c.run_id)
+        assert error.value.subgroup(_CrashBoundary) is not None
+    selected = RunState.from_events(_events(c)).goals["g"]
+    assert selected.selection_recorded
+    assert not selected.finished
+    await Swarm(c.config).resume(c.run_id)
+    ended = RunState.from_events(_events(c)).goals["g"]
+    assert ended.end_reason == reason
+    assert ended.status == ("stopped" if reason else "finished")
+    assert _events(c, "converge_started")[-1].payload["reason"] == reason
+    assert _events(c, "final_order")[-1].payload["reason"] == reason
+    before = len(_events(c, "round_started"))
+    await Swarm(c.config).resume(c.run_id)
+    later = _events(c, "round_started")[before:]
+    assert [e.round for e in later] == ([2, 3] if reason in {"stop", "stop --now"} else [])
+    if reason == "run_timeout_s":
+        cfg = with_limits(c.config, run_timeout_s=c.config.limits.run_timeout_s + 1)
+        await Swarm(cfg).resume(c.run_id)
+        assert [e.round for e in _events(c, "round_started")[before:]] == [2, 3]
+        assert len(_events(c, "limits_changed")) == 1
+
+
+@pytest.mark.parametrize("boundary", ["policy", "closed", "revision"])
+async def test_round_revision_crash_boundaries_match_uninterrupted_run(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from _fakes.planners import AddAgentPlanner
+
+    from swarm_arena._model.catalog import CatalogEntry, PlannerCatalog
+    from swarm_arena._planning.provenance import ref_sites
+
+    plan = _plan(agents=("a",), rounds=2)
+    entries = [
+        CatalogEntry(
+            name=f"entry-{i}",
+            kind=s.kind,
+            ref=s.ref.path,
+            config=s.ref.config,
+            description="Approved",
+        )
+        for i, s in enumerate(ref_sites(plan))
+    ]
+    tool = plan.teams[0].agents[0].tool
+    entries.append(
+        CatalogEntry(
+            name="catalog-agent",
+            kind="tool",
+            ref=tool.path,
+            config=tool.config,
+            description="Approved",
+        )
+    )
+
+    async def exercise(crash: bool) -> tuple[tuple[Any, ...], tuple[Event, Event]]:
+        root = tmp_path / ("crash" if crash else "control")
+        config = run_config.model_copy(
+            update={
+                "run_root": str(root / "runs"),
+                "planner_catalog": PlannerCatalog(entries=entries),
+            }
+        )
+        c = await _crash(root, config, recorders, plans=[plan], lost=())
+        managers: list[tuple[str, int]] = []
+        barriers: list[int] = []
+        replans: list[int] = []
+        manage = _Recorder.run_round
+        barrier = GoalRunner._barrier
+        replan = GoalRunner._replan
+        durable = JournalWriter.append_durable
+        armed = crash
+
+        async def manager_spy(self: _Recorder, ctx: AgentContext) -> RoundReport:
+            managers.append((ctx.spec.name, ctx.round))
+            return await manage(self, ctx)
+
+        async def barrier_spy(self: GoalRunner, candidates: Any, round: int) -> bool:
+            barriers.append(round)
+            return await barrier(self, candidates, round)
+
+        async def replan_spy(self: GoalRunner) -> bool:
+            nonlocal armed
+            replans.append(self.rounds_closed)
+            result = await replan(self)
+            if armed and boundary == "revision" and result:
+                armed = False
+                raise _CrashBoundary()
+            return result
+
+        async def durable_spy(self: JournalWriter, draft: EventDraft) -> Event:
+            nonlocal armed
+            if armed and draft.type == "round_closed" and draft.round == 1:
+                if boundary == "policy":
+                    armed = False
+                    await self.commit()
+                    raise _CrashBoundary()
+                if boundary == "closed":
+                    armed = False
+                    await durable(self, draft)
+                    raise _CrashBoundary()
+            return await durable(self, draft)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_Recorder, "run_round", manager_spy)
+            patch.setattr(GoalRunner, "_barrier", barrier_spy)
+            patch.setattr(GoalRunner, "_replan", replan_spy)
+            patch.setattr(JournalWriter, "append_durable", durable_spy)
+            if crash:
+                with pytest.raises(BaseExceptionGroup) as error:
+                    await Swarm(c.config, replanner=AddAgentPlanner("catalog-agent")).resume(
+                        c.run_id
+                    )
+                assert error.value.subgroup(_CrashBoundary) is not None
+            await Swarm(c.config, replanner=AddAgentPlanner("catalog-agent")).resume(c.run_id)
+        events = _events(c)
+        history = (
+            sorted(managers, key=lambda item: (item[1], item[0])),
+            barriers,
+            replans,
+            [
+                (e.type, e.round)
+                for e in events
+                if e.type in {"round_started", "decision", "round_closed"}
+            ],
+            [e.payload["shares"] for e in events if e.type == "round_started"],
+            sorted(
+                (e.agent, e.round, e.payload["status"]) for e in events if e.type == "agent_status"
+            ),
+        )
+        revision = _events(c, "plan_revision")[-1]
+        closed = _events(c, "round_closed")[0]
+        return history, (closed, revision)
+
+    control, control_publication = await exercise(False)
+    recovered, recovered_publication = await exercise(True)
+    histories = [control, recovered]
+    publications = [control_publication, recovered_publication]
+    assert histories[1] == histories[0]
+    for closed, revision in publications:
+        assert closed.seq < revision.seq
+        assert revision.payload["first_round"] == 2
+    assert histories[1][0] == [("a", 1), ("a", 2), ("new-1", 2)]
+    assert histories[1][1] == [1, 2]
+    assert histories[1][2] == [1]
+
+
+async def test_committed_replan_rejection_is_not_repeated_on_resume(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.planners import RaisingPlanner
+
+    c = await _crash(tmp_path, run_config, recorders, plans=[_plan(agents=("a",))], lost=())
+    replan = GoalRunner._replan
+    attempts: list[int] = []
+    armed = True
+
+    async def crash_after_rejection(self: GoalRunner) -> bool:
+        nonlocal armed
+        attempts.append(self.rounds_closed)
+        result = await replan(self)
+        assert not result
+        await self.deps.journal.commit()
+        if armed:
+            armed = False
+            raise _CrashBoundary()
+        return result
+
+    monkeypatch.setattr(GoalRunner, "_replan", crash_after_rejection)
+    with pytest.raises(BaseExceptionGroup) as error:
+        await Swarm(c.config, replanner=RaisingPlanner()).resume(c.run_id)
+    assert error.value.subgroup(_CrashBoundary) is not None
+    await Swarm(c.config, replanner=RaisingPlanner()).resume(c.run_id)
+    assert attempts == [1]
+    assert [e.round for e in _events(c, "round_started")] == [1, 2]
+    rejected = _events(c, "plan_rejected")
+    assert len(rejected) == 1
+    assert rejected[0].payload["first_round"] == 2
+
+
+async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lease(
+    crashed: Crashed,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    from swarm_arena._engine import run as run_module
+
+    entered, release = threading.Event(), threading.Event()
+    deadlines: list[anyio.CancelScope] = []
+    real = run_module._build_executor
+    config = crashed.config.model_copy(update={"settle_timeout_s": 0.05, "lease_ttl_s": 0.3})
+
+    def blocked(config: RunConfig) -> Executor:
+        entered.set()
+        release.wait()
+        return real(config)
+
+    async def prepare() -> None:
+        with anyio.fail_after(10) as deadline:
+            deadlines.append(deadline)
+            await Swarm(config).resume(crashed.run_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_module, "_build_executor", blocked)
+        task = asyncio.create_task(prepare())
+        try:
+            with anyio.fail_after(5):
+                while not entered.is_set():  # noqa: ASYNC110 - daemon entry signal
+                    await anyio.sleep(0.01)
+            deadlines[0].deadline = anyio.current_time() + 0.01
+            done, _ = await asyncio.wait([task], timeout=0.5)
+            completed_without_release = bool(done)
+        finally:
+            release.set()
+            result = await asyncio.gather(task, return_exceptions=True)
+    assert completed_without_release, "caller cancellation waited for the constructor"
+    assert isinstance(result[0], TimeoutError)
+    owner = read_owner(crashed.store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    await anyio.sleep(0.35)
+    assert read_owner(crashed.store) == owner
+    await Swarm(crashed.config).resume(crashed.run_id)
+    next_owner = read_owner(crashed.store)
+    assert next_owner is not None
+    assert next_owner[0].epoch == owner[0].epoch + 1
+
+
+async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
+    """Produce real journals in a subprocess, optionally dying after head publication."""
+    import os
+    import signal
+
+    from swarm_arena._model.planning_types import Decision, RoundState
+    from swarm_arena._model.tooling import CompletedRun, Usage
+    from swarm_arena._planning.policy import Policy
+
+    config = with_executor(
+        RunConfig(run_root=str(root / "runs"), artifact_root=str(root / "artifacts")),
+        workspace_root=str(root / "ws"),
+    )
+    config = with_limits(config, max_usd=1000, max_tokens=None)
+    swarm = Swarm(config)
+    store = LocalStore(Path(config.run_root) / "published")
+    recorder = _Recorder()
+    build, collect = Ref.build, FunctionTool.collect
+    replace, append = LocalStore.replace, JournalWriter.append
+
+    class TerminalPolicy(Policy):
+        def after_round(self, state: RoundState) -> Decision:
+            return Decision(no_result="policy terminal") if state.round == 1 else Decision()
+
+    class StopRecorder(_Recorder):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            result = await super().run_round(ctx)
+            if ctx.round == 1:
+                await swarm.stop(now=mode == "stop --now")
+                while True:
+                    committed = read_committed(store)
+                    if committed and RunState.from_events(committed[1]).stop != "none":
+                        break
+                    await anyio.sleep(0.01)
+            return result
+
+    if mode != "policy":
+        recorder = StopRecorder()
+
+    def build_hook(self: Ref, expected: type[_T]) -> _T:
+        if expected is Manager:
+            return cast(_T, recorder)
+        if expected is Policy and mode == "policy":
+            return cast(_T, TerminalPolicy())
+        return build(self, expected)
+
+    def paid_collect(
+        self: FunctionTool,
+        request: ToolRequest,
+        workspace: Path,
+        run: CompletedRun,
+    ) -> ToolOutput:
+        output = collect(self, request, workspace, run)
+        return output.model_copy(update={"usage": Usage(input_tokens=3, usd=0.000003)})
+
+    def append_hook(self: JournalWriter, draft: EventDraft) -> Event:
+        if mode == "policy" and draft.type == "round_closed":
+            # The committed Decision is sufficient even without an optional reason checkpoint.
+            draft = draft.model_copy(
+                update={"payload": {k: v for k, v in draft.payload.items() if k != "reason"}}
+            )
+        return append(self, draft)
+
+    def replace_hook(self: LocalStore, key: str, data: bytes, *, if_match: str) -> str:
+        result = replace(self, key, data, if_match=if_match)
+        if crash and key == "control/owner.json":
+            head = json.loads(data).get("head")
+            if head:
+                lines = self.read(head["segment"]).data.splitlines()[1:]
+                batch = [json.loads(line) for line in lines]
+                target = "round_closed" if mode == "policy" else "converge_started"
+                if any(e["type"] == target for e in batch):
+                    os.kill(os.getpid(), signal.SIGKILL)
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Ref, "build", build_hook)
+        patch.setattr(FunctionTool, "collect", paid_collect)
+        patch.setattr(LocalStore, "replace", replace_hook)
+        patch.setattr(JournalWriter, "append", append_hook)
+        await swarm.run(_plan(agents=("a",), rounds=3), run_id="published")
+
+
+async def _published_crash_case(root: Path, mode: str, *, crash: bool) -> tuple[RunConfig, Crashed]:
+    import os
+    import signal
+    import sys
+
+    await anyio.to_thread.run_sync(partial(root.mkdir, parents=True))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).parent),
+            str(Path(__file__).parents[1]),
+            str(Path(__file__).parents[2] / "src"),
+            env.get("PYTHONPATH", ""),
+        ]
+    )
+    code = (
+        "import sys, anyio; from pathlib import Path; "
+        "from test_resume import _run_published_crash_case; "
+        "anyio.run(_run_published_crash_case, Path(sys.argv[1]), sys.argv[2], sys.argv[3]=='1')"
+    )
+    with anyio.fail_after(30):
+        result = await anyio.run_process(
+            [sys.executable, "-c", code, str(root), mode, str(int(crash))],
+            env=env,
+            check=False,
+        )
+    assert result.returncode == (-signal.SIGKILL if crash else 0), result.stderr.decode()
+    config = RunConfig.load(root / "runs" / "published" / "run.toml")
+    store = LocalStore(Path(config.run_root) / "published")
+    return config, Crashed(config, "published", store, cast(Lease, None), 0, Frontier(), {})
+
+
+@pytest.mark.parametrize("reason", ["stop", "stop --now"])
+async def test_real_crash_at_stopped_convergence_preserves_second_resume(
+    tmp_path: Path,
+    recorders: dict[str, _Recorder],
+    reason: str,
+) -> None:
+    config, c = await _published_crash_case(tmp_path / "stopped", reason, crash=True)
+    before = RunState.from_events(_events(c)).goals["g"]
+    assert before.converge_started
+    assert not before.finished
+    assert before.rounds_closed == 1
+    recorders["a"] = _Recorder()
+    await Swarm(config).resume(c.run_id, force=True)
+    first = RunState.from_events(_events(c)).goals["g"]
+    assert first.status == "stopped"
+    assert first.end_reason == reason
+    assert first.rounds_closed == 1
+    await Swarm(config).resume(c.run_id)
+    assert [e.round for e in _events(c, "round_closed")] == [1, 2, 3]
+    assert _goal_status(c, "g") == "finished"
+
+
+async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
+    tmp_path: Path,
+    recorders: dict[str, _Recorder],
+) -> None:
+    _, control = await _published_crash_case(tmp_path / "control", "policy", crash=False)
+    config, c = await _published_crash_case(tmp_path / "crash", "policy", crash=True)
+    boundary = _events(c)[-1].seq
+    recorders["a"] = _Recorder()
+    result = await Swarm(config).resume(c.run_id, force=True)
+    later = [e for e in _events(c) if e.seq > boundary]
+    assert not [
+        e
+        for e in later
+        if e.type
+        in {
+            "round_started",
+            "tool_start",
+            "command_start",
+            "score",
+            "reserve",
+            "converge_started",
+        }
+    ]
+    assert result == {"g": []}
+    state = RunState.from_events(_events(c))
+    assert state.goals["g"].status == "no_result"
+    assert state.goals["g"].no_result_reason == "policy terminal"
+    assert state.goals["g"].rounds_closed == 1
+    for type in ("reserve", "settle"):
+        assert [e.payload for e in _events(c, type)] == [e.payload for e in _events(control, type)]

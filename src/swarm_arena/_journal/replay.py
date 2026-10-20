@@ -65,6 +65,12 @@ class GoalState(FrozenModel):
         Latest goal_finished reason.
     no_result_reason : str or None, default=None
         Latest no_result reason, separate from the goal_finished reason.
+    pending_reason : str or None, default=None
+        Lifecycle termination reason retained through takeover before completion.
+    pending_replan : int or None, default=None
+        First round awaiting the replan recorded by its preceding round closure.
+    replanned_rounds : list[int], default=[]
+        Round boundaries with an already committed revision or rejection.
     notes : dict[str, str], default={}
         Most recent saved notes by team/agent.
     repeat_keys : dict[str, str], default={}
@@ -108,6 +114,9 @@ class GoalState(FrozenModel):
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
     no_result_reason: str | None = None
+    pending_reason: str | None = None
+    pending_replan: int | None = None
+    replanned_rounds: list[int] = []
     notes: dict[str, str] = {}
     repeat_keys: dict[str, str] = {}
     final_order: list[str] = []
@@ -167,6 +176,7 @@ class RunState:
     manifest: dict[str, Any] = field(default_factory=dict)
     config: RunConfig = field(default_factory=RunConfig)
     plans: dict[str, list[tuple[Plan, Origin]]] = field(default_factory=dict)
+    plan_first_rounds: dict[str, list[int]] = field(default_factory=dict)
     goals: dict[str, GoalState] = field(default_factory=dict)
     candidates: dict[str, Candidate] = field(default_factory=dict)
     fingerprints: dict[str, str | None] = field(default_factory=dict)
@@ -184,6 +194,41 @@ class RunState:
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
     _finished_goals: set[str] = field(default_factory=set, repr=False, compare=False)
+
+    def plan_for_round(self, goal_id: str, round: int) -> Plan:
+        """
+        Select the latest committed revision applicable to an ordinary round.
+
+        Parameters
+        ----------
+        goal_id : str
+            Goal with recorded revisions.
+        round : int
+            One-based round about to execute.
+
+        Returns
+        -------
+        Plan
+            Latest applicable revision, or the initial revision.
+
+        Examples
+        --------
+        >>> from swarm_arena import Goal, Plan
+        >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+        >>> state = RunState(plans={"g": [(plan, "human")]})
+        >>> state.plan_for_round("g", 1) == plan
+        True
+        """
+        revisions = self.plans[goal_id]
+        starts = self.plan_first_rounds.get(goal_id, [1] * len(revisions))
+        return next(
+            (
+                plan
+                for (plan, _), start in reversed(list(zip(revisions, starts, strict=True)))
+                if start <= round
+            ),
+            revisions[0][0],
+        )
 
     @classmethod
     def from_events(cls, events: Iterable[Event]) -> "RunState":
@@ -263,6 +308,12 @@ class RunState:
                         update={"kept_parts": {}, "join_attempts": 0, "join_failures": []}
                     )
                 revisions.append((plan, cast(Origin, origin)))
+                goal = self.goals[event.goal_id]
+                first_round = payload.get(
+                    "first_round",
+                    1 if len(revisions) == 1 else max(goal.round, goal.rounds_closed) + 1,
+                )
+                self.plan_first_rounds.setdefault(event.goal_id, []).append(first_round)
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
                 self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
@@ -333,6 +384,7 @@ class RunState:
                     updates.update(_reset_converge())
                     updates.update(kept_parts={}, join_attempts=0, join_failures=[])
                     updates["end_reason"] = None
+                    updates["pending_replan"] = None
                     self._finished_goals.remove(event.goal_id)
             case EventType.GOAL_FINISHED:
                 reason = payload.get("reason")
@@ -345,6 +397,7 @@ class RunState:
                 updates["selection_recorded"] = True
                 updates["status"] = "no_result"
                 updates["no_result_reason"] = payload.get("reason")
+                updates["pending_reason"] = payload.get("reason")
             case EventType.ROUND_STARTED:
                 updates["counters"] = {}
                 if payload.get("converge", False):
@@ -356,6 +409,20 @@ class RunState:
                 updates["rounds_closed"] = max(
                     goal.rounds_closed, payload.get("round", event.round or goal.round)
                 )
+                first_round = updates["rounds_closed"] + 1
+                if payload.get("replan", False) and first_round not in goal.replanned_rounds:
+                    updates["pending_replan"] = first_round
+                updates["pending_reason"] = payload.get("reason", goal.pending_reason)
+            case EventType.PLAN_REVISION | EventType.PLAN_REJECTED:
+                first_round = payload.get(
+                    "first_round",
+                    max(goal.round, goal.rounds_closed) + 1 if self.plans.get(event.goal_id) else 1,
+                )
+                if type(first_round) is not int or first_round < 1:
+                    raise ValueError("invalid revision first_round")
+                updates["replanned_rounds"] = [*goal.replanned_rounds, first_round]
+                if goal.pending_replan == first_round:
+                    updates["pending_replan"] = None
             case EventType.FRONTIER:
                 updates["frontiers"] = {
                     **goal.frontiers,
@@ -391,12 +458,14 @@ class RunState:
             case EventType.CONVERGE_STARTED:
                 updates["converge_started"] = True
                 updates["select_only"] = payload["select_only"]
+                updates["pending_reason"] = payload.get("reason")
             case EventType.RESERVE_EXHAUSTED:
                 updates["select_only"] = True
             case EventType.FINAL_ORDER:
                 updates["selection_recorded"] = True
                 updates["final_order"] = payload["candidate_ids"]
                 updates["final_parts"] = payload["parts"]
+                updates["pending_reason"] = payload.get("reason")
         if updates:
             self.goals[event.goal_id] = goal.model_copy(update=updates)
 
@@ -421,6 +490,7 @@ def _reset_converge() -> dict[str, Any]:
     return {
         "selection_recorded": False,
         "no_result_reason": None,
+        "pending_reason": None,
         "converge_started": False,
         "converge_round": None,
         "select_only": False,

@@ -189,6 +189,7 @@ async def test_pending_replan_is_abandoned(
         assert env.events("plan_rejected")[-1].payload == {
             "origin": "autonomous",
             "errors": ["planner stopped"],
+            "first_round": 2,
         }
         assert [e.payload["round"] for e in env.events("round_closed")] == [1]
         assert not runner.admission._peaks

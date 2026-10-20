@@ -797,3 +797,85 @@ def test_goal_queue_lifecycle_and_stopped_no_result() -> None:
         _ev(3, "goal_finished", {"reason": "stopped"}, goal_id="g"),
     ]
     assert RunState.from_events(queued).goals["g"].status == "no_result"
+
+
+@pytest.mark.parametrize(
+    "reason", [None, "stop", "stop --now", "run_timeout_s", "reserve_exhausted"]
+)
+def test_pending_termination_reason_survives_takeover_and_clears_on_continuation(
+    reason: str | None,
+) -> None:
+    events = [
+        *_PRE,
+        _ev(3, "goal_started", {}, goal_id="g"),
+        _ev(4, "converge_started", {"select_only": True, "reason": reason}, goal_id="g"),
+        _ev(5, "takeover", {"force": True}, epoch=2),
+        _ev(
+            6,
+            "final_order",
+            {"candidate_ids": [], "parts": {}, "reason": reason},
+            goal_id="g",
+            epoch=2,
+        ),
+    ]
+    # These additive keys remain inside Event's existing finite-JSON payload.
+    events = [Event.model_validate_json(e.model_dump_json()) for e in events]
+    state = RunState.from_events(events)
+    assert state.stop == "none"
+    assert state.goals["g"].pending_reason == reason
+    assert state.goals["g"].end_reason is None
+    ended = _ev(7, "goal_finished", {"reason": reason}, goal_id="g", epoch=2)
+    state = RunState.from_events([*events, ended, _ev(8, "goal_started", {}, goal_id="g", epoch=3)])
+    assert state.goals["g"].pending_reason is None
+
+
+@pytest.mark.parametrize("now", [False, True])
+def test_absent_termination_reason_is_natural_despite_old_stop_flags(now: bool) -> None:
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(3, "stop_requested", {"now": now}),
+            _ev(4, "final_order", {"candidate_ids": [], "parts": None}, goal_id="g"),
+            _ev(5, "takeover", {"force": True}, epoch=2),
+        ]
+    )
+    assert state.goals["g"].pending_reason is None
+    assert state.stop == "none"
+
+
+@pytest.mark.parametrize("outcome", ["plan_revision", "plan_rejected"])
+def test_round_closure_retains_pending_replan_until_committed_outcome(outcome: str) -> None:
+    closed = _ev(3, "round_closed", {"round": 1, "replan": True}, goal_id="g")
+    events = [*_PRE, closed]
+    state = RunState.from_events(events)
+    assert state.goals["g"].pending_replan == 2
+    revision = _plan().model_copy(update={"revision": 1})
+    payload = (
+        {"plan": revision.model_dump(mode="json"), "origin": "autonomous", "first_round": 2}
+        if outcome == "plan_revision"
+        else {"errors": ["invalid proposal"], "origin": "autonomous", "first_round": 2}
+    )
+    event = _ev(4, outcome, payload, goal_id="g")
+    state = RunState.from_events([*events, Event.model_validate_json(event.model_dump_json())])
+    assert state.goals["g"].pending_replan is None
+    assert state.plan_for_round("g", 1).revision == 0
+    assert state.plan_for_round("g", 2).revision == (1 if outcome == "plan_revision" else 0)
+
+
+def test_legacy_revision_before_closure_applies_to_successor_round() -> None:
+    revision = _plan().model_copy(update={"revision": 1})
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(3, "round_started", {"round": 1}, goal_id="g"),
+            _ev(
+                4,
+                "plan_revision",
+                {"plan": revision.model_dump(mode="json"), "origin": "autonomous"},
+                goal_id="g",
+            ),
+        ]
+    )
+    assert state.plan_for_round("g", 1).revision == 0
+    assert state.plan_for_round("g", 2).revision == 1
+    assert state.goals["g"].replanned_rounds == [1, 2]

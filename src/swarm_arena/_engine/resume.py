@@ -83,15 +83,16 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
             raise ValueError(f"budget cap may only increase: {name}")
     continued = [g for g in state.plans if continues_on_resume(state, g, config.limits)]
     errors: list[str] = []
-    for goal_id, revisions in state.plans.items():
+    for goal_id in state.plans:
         goal = state.goals[goal_id]
         if not goal.finished or goal_id in continued:
-            errors.extend(
-                f"goal '{goal_id}': {error}"
-                for error in _rule_max_agents_total(
-                    revisions[-1][0], config, (), other_active_agents=0
+            active = state.plan_for_round(goal_id, goal.rounds_closed + 1)
+            latest = state.plans[goal_id][-1][0]
+            for plan in [active, latest] if active != latest else [active]:
+                errors.extend(
+                    f"goal '{goal_id}': {error}"
+                    for error in _rule_max_agents_total(plan, config, (), other_active_agents=0)
                 )
-            )
     if errors:
         raise PlanError(errors)
     return continued
@@ -113,8 +114,19 @@ class _ResumeServices:
         self.task: asyncio.Task[None] | None = None
         self.closed = False
         self.run_failed = False
+        self.preparation_scope: anyio.CancelScope | None = None
+        self.cancel_preparation = False
 
     async def _serve(self) -> None:
+        """Let a cancelled preparing caller interrupt abandonable user hooks."""
+        with anyio.CancelScope() as scope:
+            self.preparation_scope = scope
+            if self.cancel_preparation:
+                scope.cancel()
+            await self._serve_owned()
+
+    async def _serve_owned(self) -> None:
+        """Own entered services and shield their existing bounded cleanup paths."""
         executor: Executor | None = None
         board: RunBoard | None = None
         entered = False
@@ -281,9 +293,15 @@ class _ResumeServices:
     async def _aclose(self, *, failed: bool = False) -> None:
         self.run_failed = self.run_failed or failed
         self.close.set()
+        if failed and self.resumed is None:
+            self.cancel_preparation = True
+            if self.preparation_scope is not None:
+                self.preparation_scope.cancel()
         if self.task is not None:
-            with anyio.CancelScope(shield=True):
-                await self.task
+            with anyio.move_on_after(self.config.settle_timeout_s, shield=True):
+                # Timeout bounds the caller without injecting asyncio cancellation
+                # into the owner's shielded writer/lease/executor cleanup.
+                await asyncio.shield(self.task)
         if self.failure is not None and not failed:
             if run_module._has_fenced(self.failure):
                 raise Fenced() from None
@@ -365,7 +383,7 @@ async def resume_run(
         state = services.resumed.state
         return run_module.RunRunner(
             config,
-            [v[-1][0] for v in state.plans.values()],
+            [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
             run_id=run_id,
             approve=None,
             replanner=replanner,

@@ -28,7 +28,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
-from swarm_arena._journal.replay import GoalState, RunState
+from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
@@ -112,6 +112,7 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "origin": plan.origin,
             "base_dir": str(base_dir),
             "planner_call_ids": [],
+            "first_round": 1,
         },
     )
 
@@ -127,7 +128,7 @@ class GoalRunner:
     goal_id : str
         Main goal id, also used for part budgets.
     plan : Plan
-        Latest admitted plan revision.
+        Admitted revision applicable to the next unfinished round.
     replanner : Planner or None
         Optional autonomous revision producer.
     history : Sequence[Plan], optional
@@ -176,8 +177,14 @@ class GoalRunner:
         self.agents: list[AgentSlot] = []
         self.recorded = RunState()
         self._events: list[Event] = []
-        self.status: Literal["finished", "stopped", "no_result"] = "finished"
-        self.reason: str | None = None
+        self.status: Literal["finished", "stopped", "no_result"] = (
+            "stopped"
+            if self.state.pending_reason in STOP_REASONS
+            else "no_result"
+            if self.state.pending_reason is not None
+            else "finished"
+        )
+        self.reason: str | None = self.state.pending_reason
         self.final_parts: dict[str, str | None] | None = None
         self._resumed: dict[str, list[tuple[str, Candidate]]] = {}
         self._frontier = (
@@ -307,9 +314,7 @@ class GoalRunner:
     async def _finish_recovered(self) -> GoalOutcome:
         """Finish a committed selection without repeating agents or final judges."""
         goal = self.recorded.goals[self.goal_id]
-        reason = goal.end_reason or goal.no_result_reason
-        if reason is None and self.recorded.stop != "none":
-            reason = "stop --now" if self.recorded.stop == "stop-now" else "stop"
+        reason = goal.pending_reason
         with anyio.CancelScope(shield=True):
             self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=reason))
             await self.deps.journal.commit()
@@ -334,6 +339,27 @@ class GoalRunner:
             [self.recorded.candidates[id] for id in goal.final_order],
             reason,
         )
+
+    def _restore_terminal_decision(self) -> None:
+        """Apply the latest closed-round policy in this lifecycle and revision."""
+        latest: tuple[int, Decision] | None = None
+        for event in self._events:
+            if event.goal_id != self.goal_id:
+                continue
+            if event.type == EventType.GOAL_STARTED or (
+                event.type == EventType.PLAN_REVISION
+                and event.payload["plan"]["revision"] == self.plan.revision
+            ):
+                latest = None
+            elif event.type == EventType.DECISION:
+                latest = (
+                    event.payload["round"],
+                    Decision.model_validate(event.payload["decision"]),
+                )
+        if latest is not None:
+            round, decision = latest
+            if round <= self.rounds_closed and decision.no_result:
+                self.status, self.reason = "no_result", decision.no_result
 
     def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
         seen = {candidate.id for _, candidate in self.repeat_entries}
@@ -761,13 +787,17 @@ class GoalRunner:
                     EventType.PLAN_REJECTED,
                     errors=[f"planner error: {type(error).__name__}"],
                     origin="autonomous",
+                    first_round=self.rounds_closed + 1,
                 )
             )
             return False
         if not completed or self._stop():
             self.deps.journal.append(
                 self._draft(
-                    EventType.PLAN_REJECTED, errors=["planner stopped"], origin="autonomous"
+                    EventType.PLAN_REJECTED,
+                    errors=["planner stopped"],
+                    origin="autonomous",
+                    first_round=self.rounds_closed + 1,
                 )
             )
             return False
@@ -798,6 +828,7 @@ class GoalRunner:
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
                         planner_call_ids=list(scope.call_ids),
+                        first_round=self.rounds_closed + 1,
                     )
                 )
                 await self.deps.journal.commit()
@@ -809,7 +840,12 @@ class GoalRunner:
             await self.admission.update(self.goal_id, peak, publish=publish)
         except PlanError as error:
             self.deps.journal.append(
-                self._draft(EventType.PLAN_REJECTED, errors=error.errors, origin="autonomous")
+                self._draft(
+                    EventType.PLAN_REJECTED,
+                    errors=error.errors,
+                    origin="autonomous",
+                    first_round=self.rounds_closed + 1,
+                )
             )
             return False
         self.agents = await self._slots(self.plan.teams, reuse=True)
@@ -845,93 +881,137 @@ class GoalRunner:
             self.select_only |= stops.stop_now or stops.run_timeout
         return reason is not None
 
+    async def _round_decision(self, round: int) -> Decision:
+        """Publish policy and its synchronous effects as one recoverable checkpoint."""
+        state = self._round_state()
+        try:
+            policy = await run_sync_daemon(self.plan.policy.build, Policy)
+            decision = guard(await run_sync_daemon(policy.after_round, state), state)
+        except Fenced:
+            raise
+        except Exception as error:
+            decision = guard(Decision(policy=f"policy error: {type(error).__name__}"), state)
+        event = self.deps.journal.append(
+            self._draft(
+                EventType.DECISION,
+                **{"round": round, "decision": decision.model_dump(mode="json")},
+            )
+        )
+        self._decisions.append((round, decision))
+        self.deps.board.put_decision(
+            self.goal_id, round, decision, epoch=event.epoch, seq=event.seq
+        )
+        for slot in self.agents:
+            key = f"{slot.team.name}/{slot.spec.name}"
+            reason = decision.prune.get(key, decision.prune.get(slot.team.name))
+            if reason is not None:
+                slot.status = AgentStatus.PRUNED
+                self.deps.journal.append(
+                    EventDraft(
+                        type=EventType.AGENT_STATUS,
+                        task_id=agent_task_id(slot.address, round),
+                        goal_id=self.goal_id,
+                        team=slot.team.name,
+                        agent=slot.spec.name,
+                        round=round,
+                        payload={"status": "pruned", "reason": reason},
+                    )
+                )
+        for part in self.plan.parts:
+            if not any(s.part == part.name and s.status not in _INACTIVE for s in self.agents):
+                best = kept_best(state, part.name)
+                if best is not None and self.kept_parts.get(part.name) != best.id:
+                    self.kept_parts[part.name] = best.id
+                    self.deps.journal.append(
+                        self._draft(EventType.PART_KEPT, part=part.name, candidate_id=best.id)
+                    )
+        return decision
+
+    async def _complete_replan(self) -> None:
+        """Run a closed round's unpublished replan before any successor managers."""
+        await self._refresh()
+        goal = self.recorded.goals[self.goal_id]
+        if goal.pending_replan is not None and not self._stop():
+            if self.replanner is None:
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.PLAN_REJECTED,
+                        errors=["replanner unavailable"],
+                        origin="autonomous",
+                        first_round=goal.pending_replan,
+                    )
+                )
+            else:
+                await self._replan()
+            # Rejections also complete a boundary and must survive another crash.
+            await self._refresh()
+        plan = self.recorded.plan_for_round(self.goal_id, self.rounds_closed + 1)
+        if plan != self.plan:
+            self.plan = plan
+            await self.admission.update(self.goal_id, self.active_agents())
+            self.agents = await self._slots(self.plan.teams, reuse=True)
+
     async def _run_rounds(self) -> None:
+        # A crash after closure must not silently skip the pending replanner.
+        await self._complete_replan()
         while self.rounds_closed < self.plan.rounds_total(self.deps.config.limits):
-            if self._stop():
+            if self._stop() or self.reason is not None:
                 self._merge_repeats([pair for pairs in self._resumed.values() for pair in pairs])
                 self._resumed = {}
                 break
             round = self.rounds_closed + 1
-            spec = self.plan.rounds[round - 1] if self.plan.rounds else RoundSpec()
-            recovered = [c for pairs in self._resumed.values() for _, c in pairs]
-            out = await RoundRunner(
-                self.deps,
-                goal_id=self.goal_id,
-                plan=self.plan,
-                agents=self.agents,
-                round_spec=spec,
-                rounds_left=self.plan.rounds_total(self.deps.config.limits) - self.rounds_closed,
-                resumed=self._resumed,
-                repeat_entries=self.repeat_entries,
-                frontier=self._frontier,
-            ).run(round)
+            decision = next((d for r, d in self._decisions if r == round), None)
+            funded = True
+            if decision is None:
+                spec = self.plan.rounds[round - 1] if self.plan.rounds else RoundSpec()
+                recovered = [c for pairs in self._resumed.values() for _, c in pairs]
+                out = await RoundRunner(
+                    self.deps,
+                    goal_id=self.goal_id,
+                    plan=self.plan,
+                    agents=self.agents,
+                    round_spec=spec,
+                    rounds_left=self.plan.rounds_total(self.deps.config.limits)
+                    - self.rounds_closed,
+                    resumed=self._resumed,
+                    repeat_entries=self.repeat_entries,
+                    frontier=self._frontier,
+                ).run(round)
+                self._merge_repeats(out.repeat_entries)
+                await self._refresh()
+                funded = await self._barrier([*recovered, *out.candidates], round)
+                self.rounds_closed = round
+                if funded:
+                    decision = await self._round_decision(round)
+            else:
+                # Its policy checkpoint proves managers and barrier already completed.
+                self._merge_repeats([pair for pairs in self._resumed.values() for pair in pairs])
+                self.rounds_closed = round
             self._resumed, self._frontier = {}, None
-            self._merge_repeats(out.repeat_entries)
-            await self._refresh()
-            funded = await self._barrier([*recovered, *out.candidates], round)
-            self.rounds_closed = round
-            if funded:
-                state = self._round_state()
-                try:
-                    policy = await run_sync_daemon(self.plan.policy.build, Policy)
-                    decision = guard(await run_sync_daemon(policy.after_round, state), state)
-                except Fenced:
-                    raise
-                except Exception as error:
-                    decision = guard(
-                        Decision(policy=f"policy error: {type(error).__name__}"), state
-                    )
-                event = self.deps.journal.append(
-                    self._draft(
-                        EventType.DECISION,
-                        **{"round": round, "decision": decision.model_dump(mode="json")},
-                    )
-                )
-                self._decisions.append((round, decision))
-                self.deps.board.put_decision(
-                    self.goal_id, round, decision, epoch=event.epoch, seq=event.seq
-                )
-                for slot in self.agents:
-                    key = f"{slot.team.name}/{slot.spec.name}"
-                    reason = decision.prune.get(key, decision.prune.get(slot.team.name))
-                    if reason is not None:
-                        slot.status = AgentStatus.PRUNED
-                        self.deps.journal.append(
-                            EventDraft(
-                                type=EventType.AGENT_STATUS,
-                                task_id=agent_task_id(slot.address, round),
-                                goal_id=self.goal_id,
-                                team=slot.team.name,
-                                agent=slot.spec.name,
-                                round=round,
-                                payload={"status": "pruned", "reason": reason},
-                            )
-                        )
-                for part in self.plan.parts:
-                    if not any(
-                        s.part == part.name and s.status not in _INACTIVE for s in self.agents
-                    ):
-                        best = kept_best(state, part.name)
-                        if best is not None and self.kept_parts.get(part.name) != best.id:
-                            self.kept_parts[part.name] = best.id
-                            self.deps.journal.append(
-                                self._draft(
-                                    EventType.PART_KEPT, part=part.name, candidate_id=best.id
-                                )
-                            )
-                if decision.no_result:
-                    self.status, self.reason = "no_result", decision.no_result
-                elif round < self.plan.rounds_total(self.deps.config.limits) and not self._stop():
-                    await self._replan()
-                await self.admission.update(self.goal_id, self.active_agents())
+            if decision is not None and decision.no_result:
+                self.status, self.reason = "no_result", decision.no_result
+            await self.admission.update(self.goal_id, self.active_agents())
+            replan = (
+                funded
+                and self.status != "no_result"
+                and round < self.plan.rounds_total(self.deps.config.limits)
+                and not self._stop()
+                and self.replanner is not None
+            )
             await self.deps.journal.append_durable(
                 self._draft(
                     EventType.ROUND_CLOSED,
-                    **{"round": round, "run_elapsed_s": self.deps.clock.elapsed()},
+                    **{
+                        "round": round,
+                        "run_elapsed_s": self.deps.clock.elapsed(),
+                        "replan": replan,
+                        "reason": self.reason,
+                    },
                 )
             )
             if not funded or self.status == "no_result":
                 break
+            await self._complete_replan()
         await self._refresh()
 
     async def run(self) -> GoalOutcome:
@@ -942,6 +1022,11 @@ class GoalRunner:
         Pending replans are abandoned on any stop. After an immediate stop or
         run deadline, final judging has ``settle_timeout_s`` to finish; on
         timeout, selection uses only previously journaled ranking scores.
+        Policy checkpoints complete an unfinished round without repeating its
+        managers or barrier. Round closure commits before replanning; revisions
+        and rejections identify the first round to which they apply. Recovery
+        completes a pending replan before starting that round. Final selection
+        records its lifecycle reason independently of the live stop flags.
 
         Returns
         -------
@@ -962,15 +1047,19 @@ class GoalRunner:
             return await self._finish_recovered()
         if not self.history:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
+        self._restore_terminal_decision()
         self._restore_repeats()
-        self.agents = await self._slots(self.plan.teams, reuse=False)
-        if not self.state.converge_started:
-            await self._run_rounds()
+        if self.status != "no_result":
+            self.agents = await self._slots(self.plan.teams, reuse=False)
+            if not self.state.converge_started:
+                await self._run_rounds()
         finalists: list[Candidate] = []
         if self.status != "no_result":
             self._stop()
             self.deps.journal.append(
-                self._draft(EventType.CONVERGE_STARTED, select_only=self.select_only)
+                self._draft(
+                    EventType.CONVERGE_STARTED, select_only=self.select_only, reason=self.reason
+                )
             )
             await self.deps.journal.commit()
             finalists = await converge(self, select_only=self.select_only)
@@ -985,6 +1074,7 @@ class GoalRunner:
                     EventType.FINAL_ORDER,
                     candidate_ids=[c.id for c in finalists],
                     parts=self.final_parts,
+                    reason=self.reason,
                 )
             )
         # Replay returns the pool at goal_finished; do not suspend before applying it live.
