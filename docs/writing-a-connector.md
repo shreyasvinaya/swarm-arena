@@ -268,7 +268,8 @@ that candidate.
 and raises `AssertionError` (with the name of the method) when a component
 breaks its contract:
 
-- `check_tool(tool, inputs, *, goal, parents, edits, executor, timeout_s)`
+- `check_tool(tool, inputs, *, goal, parents, edits, round=0, round_overrides=None,
+  replicate=0, executor, timeout_s)`
   snapshots the tool's and the goal's files from the current working directory,
   calls `preflight()`, validates `inputs` with `get_input_model()` (an invalid
   input raises a `pydantic.ValidationError` without the input values), applies
@@ -289,6 +290,14 @@ breaks its contract:
   and the tool's configured `timeout_s`; an unset tool timeout uses the kit
   cap. The probe's deadline is separate from the run timeout. A refused edit raises a `ValueError` that names the path and the reason; a
   refused base-parent overlay gives a `UserWarning`.
+  Round overrides replace matching top-level config settings; nested values
+  are replaced as a whole. The merged config is validated by the tool's own
+  config model before file snapshots, preflight, input validation, staging,
+  timeout selection, and overlay identity comparison. Human-only settings,
+  including their validation aliases, cannot be overridden. For `ScriptTool`
+  these are `command`, `python`, `files`, `env`, and `editable`.
+  `command()` and `collect()` receive the same round, original overrides,
+  and replicate as `swarm/request.json`; `SWARM_ARENA_ROUND` carries that round.
 - `check_check(check, candidate, *, goal, executor)` runs one check and returns
   its `CheckResult`. `feedback` must be `"pass_fail"` or `"reasons"`. The
   result is validated again in strict mode, so a value that only lax
@@ -317,7 +326,10 @@ breaks its contract:
   references. Identity, editable-path, protection and layout checks are the
   same as for the tool run; refused base overlays warn and are excluded.
   With no `tool`, inherited overlays are refused. `goal` supplies the default
-  `goal_id`; explicit candidate fields still replace defaults.
+  `goal_id`; the request supplies the default round. The request's round
+  overrides are applied to `tool` before computing identity and overlay
+  eligibility, just as in `check_tool`. Explicit candidate fields still
+  replace defaults.
 - `read_output_file(output, path)` reads a declared output file by its exact
   workspace-relative path and returns verified bytes.
 - `read_logs(output)` returns `(stdout_bytes, stderr_bytes)` for that run,
@@ -380,6 +392,39 @@ are relative to the plan file. A tool, check, or judge can be given as an
 instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
+
+### Testing a round override
+
+Pass round context explicitly to exercise a later round or replicate. Keep
+the same base tool and request overrides when making a candidate from the
+result:
+
+```python
+from swarm_arena import Goal
+from swarm_arena.board import Candidate
+from swarm_arena.testing import check_tool, make_candidate
+from swarm_arena.tool import Tool, ToolRequest
+
+
+async def run_round(tool: Tool, goal: Goal) -> Candidate:
+    request = ToolRequest(inputs={}, round=3, round_overrides={"timeout_s": 10.0}, replicate=2)
+    output = await check_tool(
+        tool,
+        request.inputs,
+        goal=goal,
+        round=request.round,
+        round_overrides=request.round_overrides,
+        replicate=request.replicate,
+    )
+    return make_candidate(output, tool=tool, goal=goal, request=request)
+```
+
+This example requires a tool whose config accepts `timeout_s` and whose input
+model accepts empty inputs. A scalar setting such as `epochs` can be supplied
+the same way when the connector's config declares it. The kit's timeout cap
+still applies to an overridden timeout. Base overlays are accepted only when
+their tool identity matches the effective config, with defaults expanded.
+The kit runs one job; these arguments do not schedule additional rounds.
 
 ### When a run does not end with status `ok`
 

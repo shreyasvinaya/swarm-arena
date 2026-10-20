@@ -20,7 +20,7 @@ from swarm_arena._tooling.staging import (
     validate_edits,
 )
 from swarm_arena._tooling.tool import Tool
-from swarm_arena.testing._conformance import _artifacts, _ids
+from swarm_arena.testing._conformance import _artifacts, _effective_tool_ref, _ids
 
 
 def make_candidate(
@@ -53,7 +53,9 @@ def make_candidate(
     output : ToolOutput
         Output of the tool run that made the candidate.
     request : ToolRequest or None, default=None
-        Request of that run; None selects ``ToolRequest()``.
+        Request of that run; None selects ``ToolRequest()``. Its round
+        overrides are merged into the tool config as in ``check_tool``.
+        Its round becomes the candidate's default round.
     tool : Tool or Ref or None, default=None
         Tool that made the candidate; None leaves ``tool_identity`` empty.
     parents : Sequence[Candidate], default=()
@@ -68,7 +70,7 @@ def make_candidate(
     **fields : Any
         ``Candidate`` fields that replace the defaults: ``id`` (a new id),
         ``run_id="local"``, ``goal_id="check"``, ``team="team"``,
-        ``agent="agent"``, ``round=0``, ``overlay``, and ``tool_identity``.
+        ``agent="agent"``, ``round=request.round``, ``overlay``, and ``tool_identity``.
 
     Returns
     -------
@@ -113,13 +115,13 @@ def make_candidate(
         "parent_ids": [parent.candidate_id for parent in request.parents],
         "team": "team",
         "agent": "agent",
-        "round": 0,
+        "round": request.round,
         "request": request,
         "output": output,
     }
     built: Tool | None = None
     if tool is not None:
-        ref = tool if isinstance(tool, Ref) else Ref.of(tool)
+        ref = _effective_tool_ref(tool, request.round_overrides)
         ref = snapshot_ref(ref, Path.cwd(), _artifacts())
         built = ref.build(Tool)
         values["tool_identity"] = tool_identity(ref, None)

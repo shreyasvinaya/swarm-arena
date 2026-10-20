@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Final, TypeVar
 
 import anyio
-from pydantic import BaseModel
+from pydantic import AliasChoices, AliasPath, BaseModel
 
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
@@ -97,6 +97,31 @@ def _build(component: _C | Ref, base: type[_C], goal: Goal | None) -> tuple[Ref,
     goal = _DEFAULT_GOAL if goal is None else goal
     files = snapshot_fileset(goal.files, base_dir, artifacts)
     return ref, built, goal.model_copy(update={"files": files})
+
+
+def _effective_tool_ref(tool: Tool | Ref, overrides: Mapping[str, Any]) -> Ref:
+    """Merge round settings before snapshot validation, preserving human-only fields."""
+    ref = tool if isinstance(tool, Ref) else Ref.of(tool)
+    if not overrides:
+        return ref
+    cls = ref.load()
+    if not issubclass(cls, Tool):
+        raise TypeError(f"{ref.path} is not a subclass of Tool")
+    for name in getattr(cls, "_human_only", frozenset()):
+        keys = {name}
+        field = cls.Config.model_fields.get(name)
+        if field is not None:
+            alias = field.validation_alias
+            if isinstance(alias, str):
+                keys.add(alias)
+            elif isinstance(alias, AliasPath):
+                keys.add(alias.path[0])
+            elif isinstance(alias, AliasChoices):
+                keys.update(path[0] for path in alias.convert_to_aliases())
+        if keys.intersection(overrides):
+            raise ValueError(f"round_overrides: human-only field {name} cannot be overridden")
+    # snapshot_ref validates this merged config through cls.Config before reading files.
+    return ref.model_copy(update={"config": {**ref.config, **overrides}})
 
 
 def _check_goal(goal: Goal, candidates: Sequence[Candidate]) -> None:
@@ -274,9 +299,15 @@ def _plan_tool(
     goal: Goal | None,
     parents: Sequence[Candidate],
     edits: Mapping[str, str] | None,
+    round: int,
+    round_overrides: Mapping[str, Any] | None,
+    replicate: int,
 ) -> _ToolPlan:
     """Build the tool and plan its stage with the core's edit and overlay rules."""
-    ref, built, goal = _build(tool, Tool, goal)
+    context = ToolRequest(
+        round=round, round_overrides=dict(round_overrides or {}), replicate=replicate
+    )
+    ref, built, goal = _build(_effective_tool_ref(tool, context.round_overrides), Tool, goal)
     _check_tool_methods(built)
     model = built.get_input_model()
     try:
@@ -287,6 +318,9 @@ def _plan_tool(
         inputs=params,
         parents=[parent_ref(parent) for parent in parents],
         edits=dict(edits or {}),
+        round=context.round,
+        round_overrides=context.round_overrides,
+        replicate=context.replicate,
     )
     goal_files, tool_files = goal.files.manifest, built._own_files()
     root = tool_root(goal_files, tool_files)  # the core's rule: a respelled file is refused
@@ -438,6 +472,9 @@ async def check_tool(
     goal: Goal | None = None,
     parents: Sequence[Candidate] = (),
     edits: Mapping[str, str] | None = None,
+    round: int = 0,
+    round_overrides: Mapping[str, Any] | None = None,
+    replicate: int = 0,
     executor: Executor | None = None,
     timeout_s: float = 60.0,
 ) -> ToolOutput:
@@ -488,6 +525,17 @@ async def check_tool(
         ``make_candidate(..., tool=tool)`` to test overlay inheritance.
     edits : Mapping[str, str] or None, default=None
         Workspace paths mapped to new UTF-8 text, as a manager supplies them.
+    round : int, default=0
+        Round index passed to command and collect, staged in
+        ``swarm/request.json``, and exported as ``SWARM_ARENA_ROUND``.
+    round_overrides : Mapping[str, Any] or None, default=None
+        Top-level settings merged into the tool config before config and input
+        validation, snapshotting, preflight, staging, timeout selection, and
+        overlay identity comparison. Nested values replace rather than merge.
+        Human-only fields (including their validation aliases) cannot be
+        overridden. The supplied overrides are also recorded in the request.
+    replicate : int, default=0
+        Replicate index passed to command and collect and staged in the request.
     executor : Executor or None, default=None
         Executor that runs the job; None makes a ``LocalExecutor`` and closes
         it afterwards.
@@ -512,7 +560,8 @@ async def check_tool(
         If an edit is refused (a ``SoftError``, one line per path with its
         reason), a file glob matches no file, a tool file is a goal file with
         another spelling (a ``ConfigError``, as in the core), or the tool
-        cannot be built.
+        cannot be built, an override fails config validation, or a human-only
+        field is overridden. Override errors omit configuration values.
 
     Examples
     --------
@@ -525,7 +574,17 @@ async def check_tool(
     <RunStatus.OK: 'ok'>
     """
     plan = await anyio.to_thread.run_sync(
-        partial(_plan_tool, tool, inputs, goal=goal, parents=parents, edits=edits)
+        partial(
+            _plan_tool,
+            tool,
+            inputs,
+            goal=goal,
+            parents=parents,
+            edits=edits,
+            round=round,
+            round_overrides=round_overrides,
+            replicate=replicate,
+        )
     )
     for note in plan.warnings:
         warnings.warn(note, UserWarning, stacklevel=2)
@@ -540,7 +599,12 @@ async def check_tool(
         grace_s=tool_grace(plan.tool),
         resources=Resources(),
         env=tool_env_vars(
-            run_id="local", goal_id=plan.goal.id, candidate_id=job_id, team="", agent="", round=0
+            run_id="local",
+            goal_id=plan.goal.id,
+            candidate_id=job_id,
+            team="",
+            agent="",
+            round=plan.request.round,
         ),
         secret_env=(),
         secrets_file=None,
@@ -690,11 +754,27 @@ async def check_judge(
 
     Examples
     --------
-    >>> import anyio
-    >>> from swarm_arena import Goal, ProgramJudge
-    >>> from swarm_arena.testing import check_judge
-    >>> anyio.run(check_judge, ProgramJudge("builtins:max"), Goal(id="g", namespace="demo"), [])
-    []
+    >>> import anyio, sys, types, uuid
+    >>> from swarm_arena import Goal, ProgramJudge, Score
+    >>> from swarm_arena.board import Candidate
+    >>> from swarm_arena.testing import check_judge, make_candidate
+    >>> from swarm_arena.tool import RunStatus, ToolOutput
+    >>> def quality(goal: Goal, candidate: Candidate) -> Score:
+    ...     return Score.minimize(candidate.output.data["loss"])
+    >>> module = types.ModuleType("kit_judge_example_" + uuid.uuid4().hex)
+    >>> module.quality = quality
+    >>> sys.modules[module.__name__] = module
+    >>> goal = Goal(id="g", namespace="demo")
+    >>> candidate = make_candidate(
+    ...     ToolOutput(status=RunStatus.OK, data={"loss": 2.5}), goal=goal)
+    >>> try:
+    ...     scores = anyio.run(check_judge, ProgramJudge(module.__name__ + ":quality"),
+    ...                        goal, [candidate])
+    ...     assert len(scores) == 1
+    ...     assert scores[0].candidate_id == candidate.id
+    ...     assert scores[0].key == (-2.5,)
+    ... finally:
+    ...     del sys.modules[module.__name__]
     """
     _check_goal(goal, candidates)
     ref, built, goal = await anyio.to_thread.run_sync(_build, judge, Judge, goal)

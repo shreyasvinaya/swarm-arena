@@ -366,6 +366,7 @@ Rules [plan]:
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
 | `testing/_conformance.py` | `check_tool`, `check_check`, `check_judge` (M1a), `check_manager` (M1b), parallel calls and `check_judge(..., config=)` (M3) | M1a +M1b +M3 | `tests/testing/test_conformance.py` |
 | `testing/_candidates.py` | `make_candidate` | M1a | `tests/testing/test_candidates.py` |
+| `testing/_artifacts.py` | `read_output_file`, `read_logs` | M1a | `tests/testing/test_artifacts.py` |
 | `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b | `tests/testing/test_harness.py` |
 | `testing/_fake_model.py` | `FakeModel`, `FakeTurn` (imports `agents` lazily) | M3 | `tests/testing/test_fake_model.py` |
 
@@ -1473,8 +1474,13 @@ Frozen dataclasses (`slots=True, kw_only=True`) mirroring A2A v1.0.1 field for f
 # testing/_conformance.py
 async def check_tool(tool: Tool | Ref, inputs: Mapping[str, Any], *, goal: Goal | None = None,
                      parents: Sequence[Candidate] = (), edits: Mapping[str, str] | None = None,
+                     round: int = 0, round_overrides: Mapping[str, Any] | None = None, replicate: int = 0,
                      executor: Executor | None = None, timeout_s: float = 60.0) -> ToolOutput: ...      # M1a
     # each parent becomes a ParentRef with its Candidate.tool_identity, so the overlay rule runs as in a swarm;
+    # round overrides replace top-level tool config settings, validated before snapshots/input/staging/timeout/identity;
+    # human-only settings and their validation aliases cannot be overridden;
+    # command/collect and swarm/request.json share round, round_overrides, replicate; SWARM_ARENA_ROUND shares round;
+    # the smaller of the effective tool timeout and the kit timeout_s cap wins;
     # any Executor works, so M4 runs it with RayExecutor and changes no code here
 async def check_check(check: Check | Ref, candidate: Candidate, *, goal: Goal | None = None,
                       executor: Executor | None = None) -> CheckResult: ...                            # M1a
@@ -1486,7 +1492,13 @@ async def check_manager(manager: Manager | Ref, *, goal: Goal, tool: Tool | Ref,
                         limits: Limits | None = None, config: RunConfig | None = None) -> list[RoundReport]: ...  # M1b (+M3 parallel calls)
 # testing/_candidates.py — M1a
 def make_candidate(output: ToolOutput, *, request: ToolRequest | None = None, tool: Tool | Ref | None = None,
+                   parents: Sequence[Candidate] = (), goal: Goal | None = None,
                    **fields: Any) -> Candidate: ...   # tool → sets tool_identity (no catalog entry), for overlay tests
+    # request.round_overrides select effective config/identity; request.round supplies the default round;
+    # accepted base overlays chain, goal supplies default goal_id, and parents populate request.parents and parent_ids
+# testing/_artifacts.py — M1a
+def read_output_file(output: ToolOutput, path: str) -> bytes: ...
+def read_logs(output: ToolOutput) -> tuple[bytes, bytes]: ...   # stdout, stderr; verified stored bytes
 # testing/_fake_model.py — M3 (lazy import of `agents`)
 @dataclass(frozen=True, kw_only=True)
 class FakeTurn:
@@ -1498,7 +1510,7 @@ class FakeModel:                                # implements agents.models.inter
     def register(self, name: str) -> None: ...  # makes ModelSpec(model="fake/<name>") resolve to this model
 ```
 
-`testing.__all__` [plan] = `check_tool`, `check_check`, `check_judge`, `check_manager`, `make_candidate`, `FakeModel`, `FakeTurn`. `FakeModel` calls emit `LLMCall` records through the same core `record_call` function as the LiteLLM logger (R4.13.19), so the ledger and journal path is the same below the LiteLLM boundary.
+`testing.__all__` [plan] = `check_tool`, `check_check`, `check_judge`, `check_manager`, `make_candidate`, `read_output_file`, `read_logs`, `FakeModel`, `FakeTurn`. `FakeModel` calls emit `LLMCall` records through the same core `record_call` function as the LiteLLM logger (R4.13.19), so the ledger and journal path is the same below the LiteLLM boundary.
 
 ### R4.13 Internal seams (private, binding across milestones)
 
