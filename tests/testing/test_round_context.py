@@ -165,9 +165,11 @@ async def test_custom_human_only_field_and_alias_are_refused(field: str) -> None
     assert_secret_absent(caught.value, SECRET)
 
 
-@pytest.mark.parametrize(("parent_effort", "accepted"), [(5, True), (6, False)])
-async def test_overlay_identity_uses_effective_config(
-    parent_effort: int, accepted: bool, local_executor: LocalExecutor
+@pytest.mark.parametrize(
+    ("parent_base", "parent_effort", "accepted"), [(1, 5, True), (1, 6, True), (2, 5, False)]
+)
+async def test_overlay_identity_uses_snapshotted_base_config(
+    parent_base: int, parent_effort: int, accepted: bool, local_executor: LocalExecutor
 ) -> None:
     tool = ContextTool()
     request = ToolRequest(
@@ -176,9 +178,11 @@ async def test_overlay_identity_uses_effective_config(
         replicate=2,
         edits={"problem/a.txt": "inherited"},
     )
-    parent = make_candidate(ToolOutput(status=RunStatus.OK), tool=tool, request=request)
+    parent = make_candidate(
+        ToolOutput(status=RunStatus.OK), tool=ContextTool({"effort": parent_base}), request=request
+    )
     equivalent = make_candidate(
-        ToolOutput(status=RunStatus.OK), tool=ContextTool({"effort": parent_effort})
+        ToolOutput(status=RunStatus.OK), tool=ContextTool({"effort": parent_base})
     )
     assert parent.tool_identity == equivalent.tool_identity
     assert parent.round == request.round
@@ -210,3 +214,47 @@ async def test_custom_config_rejects_invalid_scalar_override() -> None:
         await check_tool(ContextTool(), {}, round_overrides={"effort": SECRET}, executor=executor)
     assert_secret_absent(caught.value, SECRET)
     assert executor.jobs == []
+
+
+async def test_effective_editability_still_refuses_base_overlay(
+    local_executor: LocalExecutor,
+) -> None:
+    tool = ContextTool()
+    parent = make_candidate(
+        ToolOutput(status=RunStatus.OK),
+        tool=tool,
+        request=ToolRequest(round_overrides={"effort": 5}, edits={"problem/a.txt": "inherited"}),
+    )
+    with pytest.warns(UserWarning, match="not overlaid"):
+        out = await check_tool(
+            tool, {}, parents=[parent], round_overrides={"effort": 1}, executor=local_executor
+        )
+    assert out.data["edit"] == "absent"
+
+
+async def test_effective_protection_survives_base_identity(
+    monkeypatch: pytest.MonkeyPatch, local_executor: LocalExecutor
+) -> None:
+    from collections.abc import Set
+
+    def protected(self: ContextTool, root: Set[str]) -> frozenset[str]:
+        return frozenset({"problem/a.txt"}) if self.config.effort == 5 else frozenset()
+
+    monkeypatch.setattr(ContextTool, "_protected", protected)
+    tool = ContextTool()
+    parent = make_candidate(
+        ToolOutput(status=RunStatus.OK),
+        tool=tool,
+        request=ToolRequest(round_overrides={"effort": 6}, edits={"problem/a.txt": "parent"}),
+    )
+    with pytest.warns(UserWarning, match="not overlaid"):
+        out = await check_tool(
+            tool, {}, parents=[parent], round_overrides={"effort": 5}, executor=local_executor
+        )
+    assert out.data["edit"] == "absent"
+    with pytest.raises(ValueError, match="protected"):
+        make_candidate(
+            out,
+            tool=tool,
+            request=ToolRequest(round_overrides={"effort": 5}, edits={"problem/a.txt": "new"}),
+        )

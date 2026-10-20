@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Goals, files, and configuration
 
+- `validate_plan` checks limits, component configurations, planner provenance,
+  frozen goals and scoring, stable addresses, duplicate agents, private files,
+  and requested environment names before admitting a revision.
+
 - `Goal` describes a problem and `GoalKey` identifies its inputs and file
   snapshot by SHA-256. `FileSet` snapshots globs and `FileRef` describes an
   output artifact. Each source file is limited to 1 GiB.

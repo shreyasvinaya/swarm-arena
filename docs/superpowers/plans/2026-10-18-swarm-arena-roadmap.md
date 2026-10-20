@@ -245,7 +245,7 @@ Rules [plan]:
 | `_store/artifacts.py` | `ArtifactStore`: content-addressed put, get, fetch | M1a | `tests/_store/test_artifacts.py` |
 | `_store/s3.py` | `S3Store` on s3fs with conditional writes | M2 | `tests/_store/test_s3.py` (marker `s3`) |
 | `_tooling/__init__.py` | Empty | M1a | — |
-| `_tooling/tool.py` | `Tool` ABC, `Action` | M1a | `tests/_tooling/test_tool.py` |
+| `_tooling/tool.py` | `Tool` ABC, `Action`, shared effective tool configuration | M1a +M1b | `tests/_tooling/test_tool.py` |
 | `_tooling/function_tool.py` | `FunctionTool`; input model from the function signature | M1a | `tests/_tooling/test_function_tool.py` |
 | `_tooling/script_tool.py` | `ScriptTool`; `list_files` and `read_file` actions | M1a | `tests/_tooling/test_script_tool.py` |
 | `_tooling/shadowing.py` | Editable-glob Python import-shadowing witnesses | M1a | `tests/_tooling/test_script_tool.py` |
@@ -376,7 +376,7 @@ Rules [plan]:
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
 | `testing/_conformance.py` | `check_tool`, `check_check`, `check_judge` (M1a), `check_manager` (M1b), parallel calls and `check_judge(..., config=)` (M3) | M1a +M1b +M3 | `tests/testing/test_conformance.py` |
 | `testing/_state.py` | Process-local artifact-store ownership and shared identifier source | M1a | `tests/testing/test_artifacts.py`, `tests/testing/test_candidates.py` |
-| `testing/_components.py` | Effective component configuration, snapshots, preflight, and goal matching | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_round_context.py` |
+| `testing/_components.py` | Component snapshots, preflight, and goal matching | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_round_context.py` |
 | `testing/_execution.py` | Watched execution and non-ok stderr diagnostics | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_artifacts.py` |
 | `testing/_tool.py` | Tool job preparation and collection contract probes | M1a | `tests/testing/test_conformance.py`, `tests/testing/test_round_context.py` |
 | `testing/_contracts.py` | Result validation and shared return-type predicates | M1a | `tests/testing/test_conformance.py` |
@@ -1501,7 +1501,8 @@ async def check_tool(tool: Tool | Ref, inputs: Mapping[str, Any], *, goal: Goal 
                      round: int = 0, round_overrides: Mapping[str, Any] | None = None, replicate: int = 0,
                      executor: Executor | None = None, timeout_s: float = 60.0) -> ToolOutput: ...      # M1a
     # each parent becomes a ParentRef with its Candidate.tool_identity, so the overlay rule runs as in a swarm;
-    # round overrides replace top-level tool config settings, validated before snapshots/input/staging/timeout/identity;
+    # round overrides replace top-level tool config settings, validated before snapshots/input/staging/timeout;
+    # identity hashes the snapshotted base ref (entry=None), without overrides; effective tools enforce protection;
     # human-only settings and their validation aliases cannot be overridden;
     # command/collect and swarm/request.json share round, round_overrides, replicate; SWARM_ARENA_ROUND shares round;
     # the smaller of the effective tool timeout and the kit timeout_s cap wins;
@@ -1518,7 +1519,8 @@ async def check_manager(manager: Manager | Ref, *, goal: Goal, tool: Tool | Ref,
 def make_candidate(output: ToolOutput, *, request: ToolRequest | None = None, tool: Tool | Ref | None = None,
                    parents: Sequence[Candidate] = (), goal: Goal | None = None,
                    **fields: Any) -> Candidate: ...   # tool → sets tool_identity (no catalog entry), for overlay tests
-    # request.round_overrides select effective config/identity; request.round supplies the default round;
+    # request.round_overrides select effective behavior; identity hashes the snapshotted base ref (entry=None);
+    # request.round supplies the default round;
     # accepted base overlays chain, goal supplies default goal_id, and parents populate request.parents and parent_ids
 # testing/_artifacts.py — M1a
 def read_output_file(output: ToolOutput, path: str) -> bytes: ...
@@ -1913,6 +1915,11 @@ def kill_orphan(started: Job.Started) -> bool: ...   # only if host_id and start
 
 ```python
 # _tooling/tool.py
+def effective_tool_ref(tool: Tool | Ref, overrides: Mapping[str, Any]) -> Ref: ...
+    # One core shallow-merge helper for admission, round execution, and both kit paths. Call only after raw
+    # non-human authorization. Reject declared human-only fields and their validation aliases; validate through
+    # Ref and the tool's Config before snapshots; retain raw types, omitted defaults, and frozen manifests.
+    # The effective ref supplies execution settings. The snapshotted base ref supplies tool identity.
 # The only tool timeout and grace computation; M1b passes round_spec.tool_timeout_s and limits.tool_timeout_s.
 def effective_tool_timeout(tool: Tool, *, round_timeout_s: float | None, limit_s: float) -> float: ...
 def tool_grace(tool: Tool) -> float: ...

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from swarm_arena import Goal
 from swarm_arena._agent.context import AgentContext
@@ -735,3 +735,83 @@ class ProviderJudge(Judge):
             Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
             for c in candidates
         ]
+class AliasedEnvTool(Tool):
+    _human_only: ClassVar[frozenset[str]] = frozenset({"env"})
+
+    class Config(EchoTool.Config):
+        model_config = ConfigDict(
+            extra="forbid", frozen=True, hide_input_in_errors=True, populate_by_name=True
+        )
+        env: list[str] = Field(
+            default_factory=list,
+            validation_alias=AliasChoices(
+                "env_alias",
+                AliasPath("env_path", "names"),
+                "env_choice",
+                AliasPath("env_choice_path", "names"),
+            ),
+        )
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(status=run.status)
+
+
+class AdmissionTool(Tool):
+    """Expose nested refs and controlled hook failures without running processes."""
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        members: list[RefField] = []
+        files: FileSet = FileSet()
+        text: str = ""
+        fail_at: str = ""
+        deterministic: bool = False
+
+    def __init__(self, config: BaseModel | dict[str, Any] | None = None, /) -> None:
+        super().__init__(config)
+        self._fail("constructor")
+
+    @property
+    def config(self) -> Config:
+        return cast(AdmissionTool.Config, super().config)
+
+    def _fail(self, site: str) -> None:
+        if self.config.fail_at == site:
+            raise RuntimeError(self.config.text)
+
+    def is_deterministic(self, request: ToolRequest) -> bool:
+        self._fail("determinism")
+        return self.config.deterministic
+
+    def _own_files(self) -> dict[str, str]:
+        self._fail("files")
+        return self.config.files.manifest
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(status=run.status)
+
+
+class AdmissionManager(Manager):
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        instructions: str = ""
+        fail: bool = False
+        models: list[str] = []
+
+    @property
+    def config(self) -> Config:
+        return cast(AdmissionManager.Config, super().config)
+
+    def models(self) -> tuple[str, ...]:
+        if self.config.fail:
+            raise RuntimeError(self.config.instructions)
+        return tuple(self.config.models)
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        return RoundReport()

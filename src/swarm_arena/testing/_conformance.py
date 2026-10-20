@@ -92,8 +92,9 @@ async def check_tool(
         ``swarm/request.json``, and exported as ``SWARM_ARENA_ROUND``.
     round_overrides : Mapping[str, Any] or None, default=None
         Top-level settings merged into the tool config before config and input
-        validation, snapshotting, preflight, staging, timeout selection, and
-        overlay identity comparison. Nested values replace rather than merge.
+        validation, snapshotting, preflight, staging, and timeout selection.
+        Overlay identity uses the snapshotted base config without overrides.
+        Nested values replace rather than merge.
         Human-only fields (including their validation aliases) cannot be
         overridden. The supplied overrides are also recorded in the request.
     replicate : int, default=0

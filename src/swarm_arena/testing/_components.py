@@ -1,10 +1,8 @@
-"""Prepare effective component settings, snapshots, and matching goals."""
+"""Prepare component snapshots, preflight, and matching goals."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Final, TypeVar
-
-from pydantic import AliasChoices, AliasPath
+from typing import Final, TypeVar
 
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref
@@ -29,31 +27,6 @@ def _build(component: _C | Ref, base: type[_C], goal: Goal | None) -> tuple[Ref,
     goal = _DEFAULT_GOAL if goal is None else goal
     files = snapshot_fileset(goal.files, base_dir, artifacts)
     return ref, built, goal.model_copy(update={"files": files})
-
-
-def _effective_tool_ref(tool: Tool | Ref, overrides: Mapping[str, Any]) -> Ref:
-    """Merge round settings before snapshot validation, preserving human-only fields."""
-    ref = tool if isinstance(tool, Ref) else Ref.of(tool)
-    if not overrides:
-        return ref
-    cls = ref.load()
-    if not issubclass(cls, Tool):
-        raise TypeError(f"{ref.path} is not a subclass of Tool")
-    for name in getattr(cls, "_human_only", frozenset()):
-        keys = {name}
-        field = cls.Config.model_fields.get(name)
-        if field is not None:
-            alias = field.validation_alias
-            if isinstance(alias, str):
-                keys.add(alias)
-            elif isinstance(alias, AliasPath):
-                keys.add(alias.path[0])
-            elif isinstance(alias, AliasChoices):
-                keys.update(path[0] for path in alias.convert_to_aliases())
-        if keys.intersection(overrides):
-            raise ValueError(f"round_overrides: human-only field {name} cannot be overridden")
-    # snapshot_ref validates this merged config through cls.Config before reading files.
-    return ref.model_copy(update={"config": {**ref.config, **overrides}})
 
 
 def _check_goal(goal: Goal, candidates: Sequence[Candidate]) -> None:

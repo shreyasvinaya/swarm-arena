@@ -24,6 +24,7 @@ from swarm_arena._model.tooling import (
     ToolRequest,
 )
 from swarm_arena._store.base import open_store
+from swarm_arena._tooling.files import snapshot_ref
 from swarm_arena._tooling.result_file import NOTE_PREFIX, request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
@@ -33,8 +34,8 @@ from swarm_arena._tooling.staging import (
     tool_root,
     validate_edits,
 )
-from swarm_arena._tooling.tool import Action, Tool
-from swarm_arena.testing._components import _build, _effective_tool_ref
+from swarm_arena._tooling.tool import Action, Tool, effective_tool_ref
+from swarm_arena.testing._components import _build
 from swarm_arena.testing._contracts import _fail, _is_sequence_of, _is_set_of_str
 from swarm_arena.testing._execution import _stderr_tail
 from swarm_arena.testing._state import _artifact_root, _artifacts
@@ -107,7 +108,10 @@ def _plan_tool(
     context = ToolRequest(
         round=round, round_overrides=dict(round_overrides or {}), replicate=replicate
     )
-    ref, built, goal = _build(_effective_tool_ref(tool, context.round_overrides), Tool, goal)
+    base = tool if isinstance(tool, Ref) else Ref.of(tool)
+    effective_tool_ref(base, context.round_overrides)  # reject invalid overrides before file I/O
+    base = snapshot_ref(base, Path.cwd(), _artifacts())
+    ref, built, goal = _build(effective_tool_ref(base, context.round_overrides), Tool, goal)
     _check_tool_methods(built)
     model = built.get_input_model()
     try:
@@ -140,7 +144,7 @@ def _plan_tool(
         protected=protected,
         private_paths=frozenset(),
         parents=request.parents,
-        receiving_identity=tool_identity(ref, None),
+        receiving_identity=tool_identity(base, None),
         edits=request.edits,
         request_json=request_json(request),
     )

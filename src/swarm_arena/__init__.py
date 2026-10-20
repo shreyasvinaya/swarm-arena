@@ -21,6 +21,7 @@ from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.policies import Chain, KeepTopTeams, Patience, SuccessiveHalving
+from swarm_arena._planning.validate import validate_plan
 from swarm_arena._scoring.program_judge import ProgramJudge
 from swarm_arena._scoring.script_check import ScriptCheck
 from swarm_arena._scoring.script_judge import ScriptJudge
@@ -50,6 +51,7 @@ __all__: list[str] = [
     "ScriptTool",
     "SuccessiveHalving",
     "TeamSpec",
+    "validate_plan",
 ]
 
 _publish(__name__, __all__)

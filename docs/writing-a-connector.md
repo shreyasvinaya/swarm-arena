@@ -304,7 +304,8 @@ breaks its contract:
   Round overrides replace matching top-level config settings; nested values
   are replaced as a whole. The merged config is validated by the tool's own
   config model before file snapshots, preflight, input validation, staging,
-  timeout selection, and overlay identity comparison. Human-only settings,
+  and timeout selection. Overlay identity uses the snapshotted base tool
+  configuration with defaults expanded, without round overrides. Human-only settings,
   including their validation aliases, cannot be overridden. For `ScriptTool`
   these are `command`, `python`, `files`, `env`, and `editable`.
   `command()` and `collect()` receive the same round, original overrides,
@@ -338,8 +339,10 @@ breaks its contract:
   same as for the tool run; refused base overlays warn and are excluded.
   With no `tool`, inherited overlays are refused. `goal` supplies the default
   `goal_id`; the request supplies the default round. The request's round
-  overrides are applied to `tool` before computing identity and overlay
-  eligibility, just as in `check_tool`. Explicit candidate fields still
+  overrides are applied to `tool` before checking overlay eligibility, just as
+  in `check_tool`. Identity uses the snapshotted base configuration, so different
+  overrides for the same base retain one identity; effective settings still
+  enforce editable paths and protection. Explicit candidate fields still
   replace defaults.
 - `read_output_file(output, path)` reads a declared output file by its exact
   workspace-relative path and returns verified bytes.
@@ -434,7 +437,7 @@ This example requires a tool whose config accepts `timeout_s` and whose input
 model accepts empty inputs. A scalar setting such as `epochs` can be supplied
 the same way when the connector's config declares it. The kit's timeout cap
 still applies to an overridden timeout. Base overlays are accepted only when
-their tool identity matches the effective config, with defaults expanded.
+their tool identity matches the snapshotted base config, with defaults expanded.
 The kit runs one job; these arguments do not schedule additional rounds.
 
 ### When a run does not end with status `ok`

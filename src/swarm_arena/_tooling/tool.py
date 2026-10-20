@@ -1,17 +1,17 @@
 """Define tool connectors, typed manager actions, and shared timeout rules."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Generic, Literal, TypeVar
 
-from pydantic import BaseModel
+from pydantic import AliasChoices, AliasPath, BaseModel
 
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._model.ref import Configurable
+from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.tooling import (
     DEFAULT_GRACE_S,
     Command,
@@ -345,6 +345,59 @@ class Tool(Configurable, ABC):
     def _protected(self, root: AbstractSet[str]) -> frozenset[str]:
         """Return protected tool paths; the driver unions these with private paths."""
         return frozenset()
+
+
+def effective_tool_ref(tool: Tool | Ref, overrides: Mapping[str, Any]) -> Ref:
+    """
+    Validate a shallow override merge while preserving raw tool settings.
+
+    Parameters
+    ----------
+    tool : Tool or Ref
+        Base tool configuration. Call only after raw planner authorization.
+    overrides : Mapping[str, Any]
+        Top-level replacements; human-only fields and validation aliases are
+        forbidden even when their values are unchanged.
+
+    Returns
+    -------
+    Ref
+        Independent reference validated through Ref and the tool's Config.
+        Raw scalar types, omitted defaults, and frozen manifests are retained.
+
+    Raises
+    ------
+    ValueError
+        If overrides change human-only fields or configuration is invalid.
+    TypeError
+        If the reference does not select a Tool subclass.
+
+    Examples
+    --------
+    >>> ref = Ref(path="swarm_arena:ScriptTool", config={"command": ["run"]})
+    >>> effective_tool_ref(ref, {"timeout_s": 12}).config
+    {'command': ['run'], 'timeout_s': 12}
+    """
+    ref = tool if isinstance(tool, Ref) else Ref.of(tool)
+    cls = ref.load()
+    if not issubclass(cls, Tool):
+        raise TypeError(f"{ref.path} is not a subclass of Tool")
+    for name in getattr(cls, "_human_only", frozenset()):
+        keys = {name}
+        field = cls.Config.model_fields.get(name)
+        if field is not None:
+            alias = field.validation_alias
+            if isinstance(alias, str):
+                keys.add(alias)
+            elif isinstance(alias, AliasPath):
+                keys.add(alias.path[0])
+            elif isinstance(alias, AliasChoices):
+                keys.update(path[0] for path in alias.convert_to_aliases())
+        if keys.intersection(overrides):
+            raise ValueError(f"round_overrides: human-only field {name} cannot be overridden")
+    effective = Ref(path=ref.path, name=ref.name, config={**ref.config, **overrides})
+    effective._resolve_config(Tool)
+    return effective.model_copy(deep=True)
 
 
 def cap_timeout(configured: float | None, limit_s: float) -> float:

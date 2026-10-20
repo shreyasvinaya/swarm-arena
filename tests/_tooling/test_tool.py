@@ -155,3 +155,62 @@ def test_fakes_contract(tmp_path: Path) -> None:
     for cls in (PyTool.Config, EchoTool.Config):
         with pytest.raises(ValidationError, match="extra_forbidden"):
             cls.model_validate({"unknown": "value"})
+
+
+@pytest.mark.parametrize("overrides", [{}, {"timeout_s": 12}])
+def test_effective_tool_ref_preserves_raw_config(overrides: dict[str, Any]) -> None:
+    from swarm_arena import Ref
+    from swarm_arena._tooling.tool import effective_tool_ref
+
+    ref = Ref(
+        path="swarm_arena:ScriptTool",
+        config={"command": ["run"], "params": {"n": {"type": "integer", "default": 1}}},
+    )
+    effective = effective_tool_ref(ref, overrides)
+    assert effective.config == {**ref.config, **overrides}
+    assert "env" not in effective.config
+    if overrides:
+        assert type(effective.config["timeout_s"]) is int
+    effective.config["command"].append("other")
+    assert ref.config["command"] == ["run"]
+    assert overrides == ({} if not overrides else {"timeout_s": 12})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"timeout_s": "SECRET_VALUE"}, {"unknown": "SECRET_VALUE"}, {"params": {"bad": float("nan")}}],
+)
+def test_effective_tool_ref_validates_before_snapshots(overrides: dict[str, Any]) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena import Ref
+    from swarm_arena._tooling.tool import effective_tool_ref
+
+    ref = Ref(path="swarm_arena:ScriptTool", config={"command": ["run"], "files": ["missing.py"]})
+    with pytest.raises(ValueError, match=r"(invalid|forbidden|parsing|finite JSON)") as error:
+        effective_tool_ref(ref, overrides)
+    assert_secret_absent(error.value, "SECRET_VALUE")
+    assert "missing.py" not in str(error.value)
+
+
+@pytest.mark.parametrize("alias", ["env_alias", "env_path", "env_choice", "env_choice_path", "env"])
+def test_effective_tool_ref_refuses_all_human_aliases(alias: str) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena import Ref
+    from swarm_arena._tooling.tool import effective_tool_ref
+
+    secret = "SECRET_VALUE"
+    with pytest.raises(ValueError, match="human-only field env") as error:
+        effective_tool_ref(Ref(path="_fakes.tools:AliasedEnvTool"), {alias: secret})
+    assert_secret_absent(error.value, "SECRET_VALUE")
+
+
+def test_effective_tool_ref_validates_empty_overrides_and_role() -> None:
+    from swarm_arena import Ref
+    from swarm_arena._tooling.tool import effective_tool_ref
+
+    with pytest.raises(ValueError, match="timeout_s"):
+        effective_tool_ref(Ref(path="swarm_arena:ScriptTool", config={"timeout_s": "invalid"}), {})
+    with pytest.raises(TypeError, match="Tool"):
+        effective_tool_ref(Ref(path="_fakes.tools:Widget"), {})
