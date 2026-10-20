@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only missing events, and discard uncommitted state after rollback.
 - Learning search tokenizes literal text safely and ranks by frontier-local FTS5
   relevance, curation flags, goal identity, verification, matching tags, and time.
+- Arena leaderboard helpers rank one recorded judge identity per selected goal
+  group, preserve commit-order ties, and resolve offline judges without plugins.
 
 - Arena cache reads use exact recorded frontiers, immutable producing keys, and
   named human review and curation objects for reproducible snapshot membership.

@@ -1,6 +1,6 @@
 """Own group membership, fidelity selection, and deterministic score ranking."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.results import Candidate, Score
@@ -81,7 +81,7 @@ def newest_fidelity(candidates: Iterable[Candidate]) -> str | None:
     Returns
     -------
     str or None
-        Fidelity of the first candidate at the highest round, or None when empty.
+        Fidelity of the last candidate at the highest round, or None when empty.
         Eligibility and score availability do not change the selected fidelity.
 
     Examples
@@ -89,7 +89,10 @@ def newest_fidelity(candidates: Iterable[Candidate]) -> str | None:
     >>> newest_fidelity([]) is None
     True
     """
-    newest = max(candidates, key=lambda candidate: candidate.round, default=None)
+    newest: Candidate | None = None
+    for candidate in candidates:
+        if newest is None or candidate.round >= newest.round:
+            newest = candidate
     return newest.fidelity if newest is not None else None
 
 
@@ -148,4 +151,64 @@ def ranked(
     ]
     result.sort(key=lambda pair: (pair[0].round, _id_counter(pair[0]), pair[0].id))
     result.sort(key=lambda pair: pair[1].key, reverse=True)
+    return result
+
+
+def ranked_groups(
+    candidates: Sequence[Candidate],
+    scores: Iterable[Score],
+    *,
+    identity: Mapping[str | None, tuple[str, str, str]],
+    fidelity: str | None,
+    every_fidelity: bool = False,
+) -> dict[str | None, list[tuple[Candidate, Score]]]:
+    """
+    Rank selected candidates per part, breaking equal keys by input order.
+
+    Parameters
+    ----------
+    candidates : Sequence[Candidate]
+        Candidates already selected by current or historical producing GoalKey.
+        Their order is the tie order, normally committed Position order.
+    scores : Iterable[Score]
+        Recorded scores in replacement order; the last matching score wins.
+    identity : Mapping[str or None, tuple[str, str, str]]
+        One exact judge identity per group; absent groups are omitted.
+    fidelity : str or None
+        Requested fidelity, or the group's highest-round fidelity when None.
+    every_fidelity : bool, default=False
+        Rank every fidelity together, overriding ``fidelity`` for human reviews.
+
+    Returns
+    -------
+    dict[str or None, list[tuple[Candidate, Score]]]
+        Nonempty groups with eligible pairs ordered by descending key and then
+        input order. The engine's ``ranked`` round/ID tie rule is unchanged.
+
+    Examples
+    --------
+    >>> ranked_groups([], [], identity={}, fidelity=None)
+    {}
+    """
+    by_group: dict[str | None, list[Candidate]] = {}
+    for candidate in candidates:
+        by_group.setdefault(candidate.part, []).append(candidate)
+    recorded = list(scores)
+    result: dict[str | None, list[tuple[Candidate, Score]]] = {}
+    for part, pool in by_group.items():
+        if part not in identity:
+            continue
+        fidelities = list(dict.fromkeys(c.fidelity for c in pool)) if every_fidelity else [fidelity]
+        pairs = [
+            pair
+            for selected in fidelities
+            for pair in ranked(
+                pool, recorded, identity=identity[part], fidelity=selected, allow_partial=False
+            )
+        ]
+        order = {candidate.id: index for index, candidate in enumerate(pool)}
+        pairs.sort(key=lambda pair: order[pair[0].id])
+        pairs.sort(key=lambda pair: pair[1].key, reverse=True)
+        if pairs:
+            result[part] = pairs
     return result

@@ -5,7 +5,7 @@ import pytest
 from swarm_arena import ConvergeSpec, Goal, PartSpec, Plan, TeamSpec
 from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
-from swarm_arena._scoring.ranking import group_of, groups, newest_fidelity, ranked
+from swarm_arena._scoring.ranking import group_of, groups, newest_fidelity, ranked, ranked_groups
 
 ID = ("program", "rh", "")
 
@@ -148,3 +148,44 @@ def test_groups_main_first_then_parts() -> None:
         with pytest.raises(ValueError, match="team"):
             group_of(plan, name)
     assert groups(Plan(goal=plan.goal, teams=[], judges=[])) == {None: []}
+
+
+def test_ranked_groups_by_part() -> None:
+    cs = [
+        _cand("main"),
+        _cand("a").model_copy(update={"part": "a"}),
+        _cand("b").model_copy(update={"part": "b"}),
+    ]
+    scores = [_score(c, i, judge=j) for i, c in enumerate(cs) for j in ("program", "other")]
+    result = ranked_groups(
+        cs, iter(scores), identity={None: ID, "a": ("other", "rh", "")}, fidelity=None
+    )
+    assert set(result) == {None, "a"}
+    assert result[None][0][1].judge == "program"
+    assert result["a"][0][1].judge == "other"
+    assert ranked_groups(cs, [], identity={None: ID}, fidelity=None) == {}
+
+
+def test_ranked_groups_ties_follow_input_order() -> None:
+    cs = [_cand("c-99", round=3), _cand("c-1", round=1)]
+    scores = [_score(c, 1) for c in cs]
+    assert [
+        c.id for c, _ in ranked_groups(cs, scores, identity={None: ID}, fidelity=None)[None]
+    ] == ["c-99", "c-1"]
+    assert [c.id for c, _ in _rank(cs, scores)] == ["c-1", "c-99"]
+
+
+def test_ranked_groups_every_fidelity() -> None:
+    cs = [_cand("c-3", fid="a"), _cand("c-2", fid="b"), _cand("c-1", fid="a")]
+    scores = [_score(c, 1) for c in cs]
+    result = ranked_groups(
+        cs, iter(scores), identity={None: ID}, fidelity=None, every_fidelity=True
+    )
+    assert [c.id for c, _ in result[None]] == ["c-3", "c-2", "c-1"]
+
+
+def test_newest_fidelity_round_tie_goes_to_last() -> None:
+    a = _cand("c-a", round=2, fid="a")
+    b = _cand("c-b", round=2, fid="b").model_copy(update={"run_id": "other"})
+    assert newest_fidelity(iter([a, _cand("low", round=1), b])) == "b"
+    assert newest_fidelity([b, a]) == "a"
