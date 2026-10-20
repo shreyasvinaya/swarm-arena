@@ -910,6 +910,8 @@ class FailingPreflightTool(PyTool):
 
     def preflight(self) -> None:
         raise RuntimeError("no license")
+
+
 def join_sum() -> dict[str, float]:
     """Sum the assigned parents' value fields from their staged data files."""
     return {
