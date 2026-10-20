@@ -139,8 +139,13 @@ class Ledger:
 
     Examples
     --------
+    The inert journal below makes accidental journal access fail. Construction
+    and pool allocation need no storage.
+
+    >>> from typing import cast
     >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
-    ...                 goal_weights=None, journal=journal, ids=ids)  # doctest: +SKIP
+    ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+    ...                 ids=IdGen("example", 1))
     """
 
     def __init__(
@@ -187,7 +192,11 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.limits.max_usd  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> ledger.limits.max_usd
         100.0
         """
         return self._limits
@@ -218,7 +227,16 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger = Ledger.replay(state, journal=journal, ids=ids)  # doctest: +SKIP
+        >>> from typing import cast
+        >>> from swarm_arena._model.canonical import utc_now
+        >>> config = RunConfig(limits=Limits(max_usd=100))
+        >>> event = Event(type="run_config", payload={"config": config.model_dump(mode="json")},
+        ...               epoch=1, seq=1, ts=utc_now(), run_id="example", context_id="example")
+        >>> state = RunState.from_events([event])
+        >>> ledger = Ledger.replay(state, journal=cast(JournalWriter, object()),
+        ...                        ids=IdGen("example", 1))
+        >>> ledger.limits.max_usd
+        100.0
         """
         events = sorted(state.ledger_events, key=lambda event: event.seq)
         try:
@@ -286,7 +304,14 @@ class Ledger:
 
         Examples
         --------
-        >>> await ledger.hold_final_slices({"g1": Amount(usd=5)})  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.remaining("g1/:final")
+        Amount(tokens=0, usd=52.5)
         """
         self._hold(slices)
 
@@ -326,7 +351,13 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.open_goal("g1")  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.open_goal("g1")
         """
         current = self._goal(goal_id)
         if pool is None:
@@ -351,7 +382,13 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.free()  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.free()
         Amount(tokens=0, usd=0.0)
         """
         return self._free
@@ -372,7 +409,13 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.change_limits(Limits(max_usd=200))  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> ledger.change_limits(Limits(max_usd=200))
+        >>> ledger.limits.max_usd
+        200.0
         """
         limits = Limits.model_validate(limits.model_dump())
         for name in ("max_tokens", "max_usd"):
@@ -400,7 +443,7 @@ class Ledger:
 
     def open_round(
         self, goal_id: str, round: int, holders: Sequence[str], rounds_left: int
-    ) -> None:
+    ) -> dict[str, Amount]:
         """
         Allocate equal agent shares of this round's available work pool.
 
@@ -415,15 +458,31 @@ class Ledger:
         rounds_left : int
             Remaining rounds including this one.
 
+        Returns
+        -------
+        dict[str, Amount]
+            Exact retained grants to journal as ``round_started.shares``.
+            These are not clipped by the current global run balance.
+            ``remaining(holder)`` computes the currently spendable balance.
+
         Examples
         --------
-        >>> ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=2)  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.open_goal("g1")
+        >>> ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=2)
+        {'g1/t/a': Amount(tokens=0, usd=21.25)}
         """
         goal = self._goal(goal_id)
         if goal_id not in self._opened or goal.ended or round < 1:
             raise ValueError(f"goal has no active round: {goal_id}")
         shares = equal_shares(round_pool(_positive(goal.left), rounds_left), holders)
         self._restore_shares(goal_id, shares)
+        return {holder: self._capped(amount) for holder, amount in shares.items()}
 
     def _restore_shares(self, goal_id: str, shares: Mapping[str, Amount]) -> None:
         """Replace round grants exactly, without recomputing journaled shares."""
@@ -454,7 +513,15 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.remaining("g1/t/a")  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.open_goal("g1")
+        >>> grants = ledger.open_round("g1", 1, ["g1/t/a", "g1/t/b"], rounds_left=2)
+        >>> ledger.remaining("g1/t/a")
         Amount(tokens=0, usd=10.625)
         """
         if holder not in self._shares and len(holder.split("/")) == 3:
@@ -643,7 +710,17 @@ class Ledger:
 
         Examples
         --------
-        >>> await ledger.end_goal("g1")  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.open_goal("g1")
+        >>> anyio.run(ledger.end_goal, "g1")
+        >>> anyio.run(ledger.end_goal, "g2")
+        >>> ledger.free()
+        Amount(tokens=0, usd=85.0)
         """
         self._end(goal_id)
 
@@ -669,7 +746,11 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.run_exhausted()  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> ledger.run_exhausted()
         False
         """
         return self._exhausted(self._work)
@@ -690,7 +771,13 @@ class Ledger:
 
         Examples
         --------
-        >>> ledger.goal_exhausted("g1")  # doctest: +SKIP
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...                 goal_weights=None, journal=cast(JournalWriter, object()),
+        ...                 ids=IdGen("example", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g1": Amount(usd=5), "g2": Amount(usd=5)})
+        >>> ledger.goal_exhausted("g1")
         False
         """
         return self._exhausted(self._goal(goal_id).left)

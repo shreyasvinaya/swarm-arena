@@ -1787,7 +1787,10 @@ class Ledger:
                                                      # not ended, minus re-opens)
     def change_limits(self, limits: Limits) -> None: ...   # [plan] a raised cap: added work pool split by goal_weights over
                                                            # goals not ended (none -> free), added reserve to the reserve
-    def open_round(self, goal_id: str, round: int, holders: Sequence[str], rounds_left: int) -> None: ...
+    def open_round(self, goal_id: str, round: int, holders: Sequence[str], rounds_left: int) -> dict[str, Amount]: ...
+        # Return the exact retained grants; the caller journals this mapping as round_started.shares.
+        # Replay restores those grants exactly. Never journal remaining(holder): its read-time view clips
+        # the grant left by the current global run balance, which a later refund or cap raise can increase.
     def remaining(self, holder: str) -> Amount: ...
     async def reserve(self, holder: str, amount: Amount, *, kind: ReservationKind, goal_id: str,
                       keep_charged: bool = False) -> Reservation: ...   # LimitReached("budget"); durable before return

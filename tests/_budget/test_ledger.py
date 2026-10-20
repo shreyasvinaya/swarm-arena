@@ -76,10 +76,10 @@ class LedgerEnv:
     async def round(
         self, goal_id: str, round: int, holders: Sequence[str], rounds_left: int
     ) -> None:
-        self.ledger.open_round(goal_id, round, holders, rounds_left=rounds_left)
+        grants = self.ledger.open_round(goal_id, round, holders, rounds_left=rounds_left)
         await self.emit(
             "round_started",
-            {"round": round, "shares": {h: self.ledger.remaining(h).model_dump() for h in holders}},
+            {"round": round, "shares": {h: amount.model_dump() for h, amount in grants.items()}},
             goal_id,
         )
 
@@ -145,6 +145,47 @@ async def test_round_and_agent_shares(ledger: Ledger) -> None:
     ledger.open_goal("g1")
     ledger.open_round("g1", 1, ["g1/t/a", "g1/t/b"], rounds_left=2)
     assert ledger.remaining("g1/t/a") == Amount(usd=10.625)
+
+
+@pytest.mark.parametrize("recovery", ["refund", "cap_raise"])
+async def test_clipped_round_grants_survive_replay(env: LedgerEnv, recovery: str) -> None:
+    await env.start()
+    await env.goal("g1")
+    await env.goal("g2")
+    await env.round("g1", 1, ["g1/t/a"], rounds_left=1)
+    await env.spend("g1/t/a", Amount(usd=1), Amount(usd=70))
+    reservation = await env.ledger.reserve(":run", Amount(usd=5), kind="planner", goal_id="")
+    await env.round("g2", 1, ["g2/t/a"], rounds_left=1)
+    assert not env.ledger.run_exhausted()
+    assert env.ledger.remaining("g2/t/a") == Amount(usd=25)
+
+    prefix = await env.committed()
+    if recovery == "refund":
+        await env.ledger.settle(reservation.id, Amount())
+    else:
+        raised = Limits(max_usd=105)
+        env.ledger.change_limits(raised)
+        await env.emit(
+            "limits_changed", {"old": env.limits.model_dump(), "new": raised.model_dump()}
+        )
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert env.ledger.remaining("g2/t/a") == Amount(usd=30)
+    assert replayed.remaining("g2/t/a") == env.ledger.remaining("g2/t/a")
+    for ledger in (
+        env.ledger,
+        replayed,
+        Ledger.replay(RunState.from_events(prefix), journal=env.journal, ids=env.ids),
+    ):
+        assert ledger._shares["g2/t/a"].left._micro_usd == 42_500_000
+    event = next(e for e in reversed(prefix) if e.type == "round_started")
+    assert event.payload["shares"] == {"g2/t/a": Amount(usd=42.5).model_dump()}
+    # Either ledger admits the newly available budget, then refuses one micro-dollar more.
+    for ledger in (env.ledger, replayed):
+        await ledger.reserve("g2/t/a", Amount(usd=30), kind="tool", goal_id="g2")
+        with pytest.raises(LimitReached, match="budget"):
+            await ledger.reserve("g2/t/a", Amount(usd=0.000001), kind="tool", goal_id="g2")
 
 
 async def test_reserve_is_durable_and_refuses_overdraw(

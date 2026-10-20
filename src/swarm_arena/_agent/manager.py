@@ -105,6 +105,13 @@ class Manager(Configurable, ABC):
 
         Examples
         --------
-        >>> report = await manager.run_round(ctx)  # doctest: +SKIP
+        >>> import anyio
+        >>> from swarm_arena.manager import Manager, RoundReport
+        >>> class QuietManager(Manager):
+        ...     async def run_round(self, ctx: object) -> RoundReport:
+        ...         return RoundReport(summary="done")
+        >>> report = anyio.run(QuietManager().run_round, object())
+        >>> report.summary
+        'done'
         """
         raise NotImplementedError
