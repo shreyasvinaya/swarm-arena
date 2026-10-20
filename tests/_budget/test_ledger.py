@@ -95,8 +95,10 @@ class LedgerEnv:
 
 
 @pytest.fixture
-async def env(store: LocalStore, tmp_path: Path, run_config: RunConfig) -> AsyncIterator[LedgerEnv]:
-    limits = Limits(max_usd=100.0)
+async def env(
+    store: LocalStore, tmp_path: Path, run_config: RunConfig, request: pytest.FixtureRequest
+) -> AsyncIterator[LedgerEnv]:
+    limits = getattr(request, "param", Limits(max_usd=100.0))
     config = run_config.model_copy(update={"limits": limits})
     lease = Lease.acquire_new(store, owner_id="ledger", host="local", ttl_s=60)
     ids = IdGen("ledger-run", 1)
@@ -558,6 +560,99 @@ async def test_reserve_on_admit_retains_debit_after_unknown_durability(
         RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
     )
     assert _balances(env.ledger) == _balances(replay)
+
+
+def _exact_balances(ledger: Ledger) -> dict[str, tuple[int, int]]:
+    balances = {
+        "total": ledger._total,
+        "work": ledger._work,
+        "free": ledger._free,
+        "reserve": ledger._reserve_pool.left,
+        **{f"goal:{key}": pool.left for key, pool in ledger._goals.items()},
+        **{f"slice:{key}": pool.left for key, pool in ledger._slices.items()},
+        **{f"share:{key}": pool.left for key, pool in ledger._shares.items()},
+        **{f"charge:{key}": amount for key, amount in ledger._charges.items()},
+    }
+    return {key: (amount.tokens, amount._micro_usd) for key, amount in balances.items()}
+
+
+@pytest.mark.parametrize("env", [Limits(max_tokens=103, max_usd=100.000003)], indirect=True)
+@pytest.mark.parametrize("holder", ["g1/:final", "g1/:judges", "g1/t/a", ":run"])
+@pytest.mark.parametrize("retain_id", [False, True])
+@pytest.mark.parametrize("error_type", [RuntimeError, BaseException])
+async def test_reserve_on_admit_failure_unwinds_booking(
+    env: LedgerEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    holder: str,
+    retain_id: bool,
+    error_type: type[BaseException],
+) -> None:
+    await env.start({"g1": Amount(tokens=7, usd=5.000001), "g2": Amount(tokens=3, usd=5)})
+    await env.goal("g1")
+    await env.round("g1", 1, ["g1/t/a", "g1/t/b"], rounds_left=2)
+    ledger = env.ledger
+    before = _exact_balances(ledger)
+    events_before = await env.committed()
+    entries_before = dict(ledger._entries)
+    amount = ledger.remaining(holder)
+    goal_id = "" if holder == ":run" else "g1"
+    retained: list[str] = []
+    failure = error_type("callback failed")
+
+    def on_admit(reservation: Reservation) -> None:
+        assert ledger._total.tokens == before["total"][0] - amount.tokens
+        assert ledger._total._micro_usd == before["total"][1] - amount._micro_usd
+        if retain_id:
+            retained.append(reservation.id)
+        raise failure
+
+    async def unexpected_append(draft: EventDraft) -> Event:
+        pytest.fail("callback failure or unknown settlement reached journal admission")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.journal, "append_durable", unexpected_append)
+        with pytest.raises(error_type) as caught:
+            await ledger.reserve(
+                holder,
+                amount,
+                kind="call",
+                goal_id=goal_id,
+                keep_charged=True,
+                on_admit=on_admit,
+            )
+        assert caught.value is failure
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        if retain_id:
+            with pytest.raises(KeyError, match=retained[0]):
+                await ledger.settle(retained[0], Amount())
+            with pytest.raises(KeyError, match=retained[0]):
+                await ledger.settle_overflow(retained[0], Amount(usd=USD_LIMIT))
+    assert _exact_balances(ledger) == before
+    assert ledger._entries == entries_before
+    await env.journal.commit()
+    assert await env.committed() == events_before
+    replay = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _exact_balances(replay) == before
+    assert replay._entries == entries_before
+
+    reservation = await ledger.reserve(holder, amount, kind="call", goal_id=goal_id)
+    assert ledger._total.tokens == before["total"][0] - amount.tokens
+    assert ledger._total._micro_usd == before["total"][1] - amount._micro_usd
+    assert ledger._charges == {reservation.id: amount}
+    with pytest.raises(LimitReached, match="budget"):
+        await ledger.reserve(holder, amount, kind="call", goal_id=goal_id)
+    assert await env.count("reserve") == 1
+    await ledger.settle(reservation.id, Amount())
+    await ledger.settle(reservation.id, Amount())
+    assert await env.count("settle") == 1
+    assert _exact_balances(ledger) == {**before, f"charge:{reservation.id}": (0, 0)}
+    replay = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _exact_balances(replay) == _exact_balances(ledger)
 
 
 async def test_failed_settle_does_not_release_budget(

@@ -610,8 +610,10 @@ class Ledger:
         on_admit : Callable[[Reservation], None] or None, default=None
             Synchronous ownership callback, called immediately after the debit
             and before awaiting durability. Callers retain the reservation for
-            cleanup even if cancelled during that wait. The callback must
-            return normally; it does not authorize dispatch before durability.
+            cleanup even if cancelled during that wait. If the callback raises,
+            the booking is fully undone without journaling and its exception
+            propagates unchanged; the reservation identifier is then unknown.
+            The callback does not authorize dispatch before durability.
 
         Returns
         -------
@@ -651,7 +653,11 @@ class Ledger:
         )
         self._book(reservation)
         if on_admit is not None:
-            on_admit(reservation)
+            try:
+                on_admit(reservation)
+            except BaseException:
+                self._unbook(reservation.id)
+                raise
         await self._journal.append_durable(
             EventDraft(
                 type=EventType.RESERVE,
@@ -679,6 +685,12 @@ class Ledger:
         self._total -= amount
         self._entries[reservation.id] = _Entry(reservation, funding, share)
         self._charges[reservation.id] = reservation.amount
+
+    def _unbook(self, reservation_id: str) -> None:
+        """Undo recorded funding and forget a booking before journal admission."""
+        self._reconcile(self._entries[reservation_id], Amount())
+        del self._entries[reservation_id]
+        del self._charges[reservation_id]
 
     async def settle(self, reservation_id: str, actual: Amount, *, estimated: bool = False) -> None:
         """
