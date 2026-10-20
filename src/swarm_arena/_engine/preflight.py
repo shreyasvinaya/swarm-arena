@@ -3,8 +3,10 @@
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+import anyio
+
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import _core_error
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
@@ -78,7 +80,8 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     RuntimeError
         If construction, configuration or hooks fail. All failures are collected
         as reference paths and exception types, without exception messages.
-        Synchronous user work runs in a cancellable daemon thread.
+        Synchronous user work runs in a cancellable daemon thread. Each hook,
+        including construction, is bounded by ``config.settle_timeout_s``.
 
     Examples
     --------
@@ -91,11 +94,17 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     failures: list[str] = []
     for ref, base, overrides in _sites(plans):
         try:
-            await run_sync_daemon(_run_hook, ref, base, overrides, seen)
+            with anyio.fail_after(config.settle_timeout_s):
+                await run_sync_daemon(_run_hook, ref, base, overrides, seen)
+        except Fenced:
+            raise
         except Exception as exc:
             failures.append(f"- {ref.path}: {type(exc).__name__}")
     try:
-        await run_sync_daemon(executor.preflight)
+        with anyio.fail_after(config.settle_timeout_s):
+            await run_sync_daemon(executor.preflight)
+    except Fenced:
+        raise
     except Exception as exc:
         failures.append(f"- {config.executor.path}: {type(exc).__name__}")
     if failures:

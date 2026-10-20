@@ -219,3 +219,17 @@ async def test_part_overrides_and_executor_failures_are_collected(
         await run_preflight([plan], RunConfig(), _executor())
     assert "swarm_arena.executor:LocalExecutor: LookupError" in str(caught.value)
     assert_secret_absent(caught.value, "EXECUTOR_SECRET", sanitized=True)
+
+
+async def test_shared_preflight_has_its_own_hook_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = threading.Event()
+
+    def block(self: object) -> None:
+        release.wait()
+
+    monkeypatch.setattr(CountingTool, "preflight", block)
+    try:
+        with pytest.raises(RuntimeError, match="CountingTool: TimeoutError"):
+            await run_preflight([_plan()], RunConfig(settle_timeout_s=0.02), _executor())
+    finally:
+        release.set()

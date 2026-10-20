@@ -69,6 +69,8 @@ class GoalState(FrozenModel):
         Lifecycle termination reason retained through takeover before completion.
     pending_replan : int or None, default=None
         First round awaiting the replan recorded by its preceding round closure.
+    preflight_revisions : list[int], default=[]
+        Revisions with durably completed prerequisite checks.
     replanned_rounds : list[int], default=[]
         Round boundaries with an already committed revision or rejection.
     notes : dict[str, str], default={}
@@ -116,6 +118,7 @@ class GoalState(FrozenModel):
     no_result_reason: str | None = None
     pending_reason: str | None = None
     pending_replan: int | None = None
+    preflight_revisions: list[int] = []
     replanned_rounds: list[int] = []
     notes: dict[str, str] = {}
     repeat_keys: dict[str, str] = {}
@@ -293,6 +296,8 @@ class RunState:
                 limits = Limits.model_validate(payload["new"])
                 self.config = self.config.model_copy(update={"limits": limits})
             case EventType.PLAN_REVISION:
+                if payload.get("preflight_only", False):
+                    return
                 revisions = self.plans.setdefault(event.goal_id, [])
                 origin = payload["origin"]
                 if origin not in get_args(Origin):
@@ -314,6 +319,18 @@ class RunState:
                     1 if len(revisions) == 1 else max(goal.round, goal.rounds_closed) + 1,
                 )
                 self.plan_first_rounds.setdefault(event.goal_id, []).append(first_round)
+            case EventType.PLAN_REJECTED:
+                rejected = payload.get("rejected_revision")
+                if rejected is not None and rejected != 0:
+                    revisions = self.plans[event.goal_id]
+                    starts = self.plan_first_rounds[event.goal_id]
+                    keep = [
+                        (p, start)
+                        for p, start in zip(revisions, starts, strict=True)
+                        if p[0].revision != rejected
+                    ]
+                    self.plans[event.goal_id] = [p for p, _ in keep]
+                    self.plan_first_rounds[event.goal_id] = [start for _, start in keep]
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
                 self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
@@ -414,6 +431,14 @@ class RunState:
                     updates["pending_replan"] = first_round
                 updates["pending_reason"] = payload.get("reason", goal.pending_reason)
             case EventType.PLAN_REVISION | EventType.PLAN_REJECTED:
+                if payload.get("preflight_complete", False):
+                    updates["preflight_revisions"] = [
+                        *goal.preflight_revisions,
+                        payload["plan"]["revision"],
+                    ]
+                if payload.get("preflight_only", False):
+                    self.goals[event.goal_id] = goal.model_copy(update=updates)
+                    return
                 first_round = payload.get(
                     "first_round",
                     max(goal.round, goal.rounds_closed) + 1 if self.plans.get(event.goal_id) else 1,

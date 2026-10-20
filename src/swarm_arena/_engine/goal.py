@@ -21,6 +21,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.converge import converge
 from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
+from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._errors import Fenced, PlanError
@@ -113,6 +114,7 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "base_dir": str(base_dir),
             "planner_call_ids": [],
             "first_round": 1,
+            "preflight_complete": True,
         },
     )
 
@@ -842,16 +844,24 @@ class GoalRunner:
         assert proposed is not None
         try:
             revision = stamp(proposed, origin="autonomous", parent=self.plan)
-            admitted, _ = await anyio.to_thread.run_sync(
-                partial(
-                    admit_revision,
-                    revision,
-                    self.deps.config,
-                    self.deps.artifacts,
-                    history=self.history,
-                    other_active_agents=0,
+
+            async def prepare() -> Plan:
+                admitted, _ = await anyio.to_thread.run_sync(
+                    partial(
+                        admit_revision,
+                        revision,
+                        self.deps.config,
+                        self.deps.artifacts,
+                        history=self.history,
+                        other_active_agents=0,
+                    )
                 )
-            )
+                await self._preflight(admitted)
+                return admitted
+
+            completed, admitted = await self._supervised_step(prepare, final=False)
+            if not completed or admitted is None or self._stop():
+                raise PlanError(["revision preparation stopped"])
             peak = max(
                 sum(len(t.agents) for t in admitted.teams),
                 len(admitted.converge.team.agents)
@@ -866,6 +876,7 @@ class GoalRunner:
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
                         planner_call_ids=list(scope.call_ids),
+                        preflight_complete=True,
                         first_round=self.rounds_closed + 1,
                     )
                 )
@@ -888,6 +899,54 @@ class GoalRunner:
             return False
         self.agents = await self._slots(self.plan.teams, reuse=True)
         await self._plan_view()
+        return True
+
+    async def _preflight(self, plan: Plan) -> None:
+        """Convert shared prerequisite failures to an admission refusal."""
+        try:
+            await run_preflight([plan], self.deps.config, self.deps.executor)
+        except Fenced:
+            raise
+        except Exception as error:
+            raise PlanError([f"preflight failed: {type(error).__name__}"]) from None
+
+    async def _ensure_preflight(self) -> bool:
+        """Check older accepted revisions lacking a durable completion marker."""
+        while self.plan.revision not in self.recorded.goals[self.goal_id].preflight_revisions:
+            try:
+                completed, _ = await self._supervised_step(
+                    partial(self._preflight, self.plan), final=False
+                )
+            except PlanError as error:
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.PLAN_REJECTED,
+                        errors=error.errors,
+                        origin=self.plan.origin,
+                        first_round=self.rounds_closed + 1,
+                        rejected_revision=self.plan.revision,
+                    )
+                )
+                await self._refresh()
+                if self.plan.revision == 0:
+                    self.status, self.reason = "no_result", "preflight failed"
+                    return False
+                self.history = [p for p, _ in self.recorded.plans[self.goal_id]]
+                self.plan = self.recorded.plan_for_round(self.goal_id, self.rounds_closed + 1)
+                await self.admission.update(self.goal_id, self.active_agents())
+                continue
+            if not completed:
+                return False
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PLAN_REVISION,
+                    plan=self.plan.model_dump(mode="json"),
+                    origin=self.plan.origin,
+                    preflight_complete=True,
+                    preflight_only=True,
+                )
+            )
+            await self._refresh()
         return True
 
     def _stop(self) -> bool:
@@ -1080,7 +1139,10 @@ class GoalRunner:
         completes a pending replan before starting that round. Final selection
         records its lifecycle reason independently of the live stop flags.
         A terminal policy checkpoint restores its effect and completes any
-        owed round closure before constructing managers or judges.
+        owed round closure before constructing managers or judges. New revisions
+        pass bounded preflight before publication. Recovery checks revisions
+        lacking a completion marker and durably refuses failures, restoring
+        the previous admitted revision before dispatch.
 
         Returns
         -------
@@ -1103,7 +1165,7 @@ class GoalRunner:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
         await self._restore_terminal_decision()
         self._restore_repeats()
-        if self.status != "no_result":
+        if self.status != "no_result" and await self._ensure_preflight():
             self.agents = await self._slots(self.plan.teams, reuse=False)
             if not self.state.converge_started:
                 await self._run_rounds()
