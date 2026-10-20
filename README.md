@@ -44,9 +44,6 @@ Contributors can clone the source and set up its environment:
 git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync
 ```
 
-This quickstart needs `Swarm` and the `run` CLI. Until those reach GitHub's default
-branch, use a development checkout containing them.
-
 From a source checkout (Python 3.11+, POSIX), run the Rosenbrock swarm without an
 API key or model provider:
 

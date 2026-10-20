@@ -35,9 +35,6 @@ Contributors can clone the source and set up its environment:
 git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync
 ```
 
-This quickstart needs `Swarm` and the `run` CLI. Until those reach GitHub's default
-branch, use a development checkout containing them.
-
 To run the bundled example from a source checkout, use these two commands in the
 repository root:
 
