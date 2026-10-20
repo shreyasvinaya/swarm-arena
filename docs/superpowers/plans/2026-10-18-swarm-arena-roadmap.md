@@ -415,7 +415,7 @@ Rules [plan]:
 | `pyproject.toml`, `uv.lock`, `.python-version` (`3.11`), `LICENSE`, `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.gitignore`, `.github/workflows/ci.yml` | M1a |
 | `docs/conf.py`, `docs/index.md`, `docs/<page>.md` (12 pages of §11), `docs/api/<module>.md` | M1a (filled per milestone, complete in M5) |
 | `examples/rosenbrock/{rosen.py,plan.toml,run.toml,README.md}` (refs `rosen:<name>`, importable through `Plan.base_dir`, R4.1) | M1b (+M3: `plan_llm.toml`) |
-| `examples/own_script/{problem/model_a.txt,problem/model_b.txt,problem/run.py,checks/check.py,judge/score.py,judge/hidden/points.csv,plan.toml,run.toml,README.md}` | M1b |
+| `examples/own_script/{problem/model_a.txt,problem/model_b.txt,problem/points.txt,problem/run.py,checks/check.py,judge/score.py,judge/hidden/points.csv,plan.toml,run.toml,README.md}` | M1b |
 | `.readthedocs.yaml`, `.github/workflows/release.yml`, `.github/workflows/upstream.yml`, `upstream-overrides.txt`, `RELEASING.md` | M5 |
 
 ## R4. Interface registry (binding)

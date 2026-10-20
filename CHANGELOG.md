@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Goals, files, and configuration
 
+- Bring-your-own-script example fits a line across rounds with inherited edits,
+  protected public training points, and private judge data.
 - `validate_plan` checks limits, component configurations, planner provenance,
   frozen goals and scoring, stable addresses, duplicate agents, private files,
   and requested environment names before admitting a revision.

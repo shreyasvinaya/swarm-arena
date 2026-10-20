@@ -98,6 +98,7 @@ for custom components, or
 [the end-to-end test](tests/e2e/test_single_run.py) for file edits, parent overlays,
 and lexicographic scoring with private judge data.
 
+Example: [Bring your own files and script](examples/own_script/README.md) demonstrates two-round edits, inherited overlays, and private scoring data.
 ## License
 
 MIT. See [LICENSE](LICENSE).
