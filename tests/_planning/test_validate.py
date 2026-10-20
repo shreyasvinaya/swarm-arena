@@ -1725,8 +1725,9 @@ def test_script_command_alias_protected_at_every_depth(
     assert_secret_absent(error.value, BOUNDARY_SECRET)
 
 
+@pytest.mark.parametrize("source_state", ["unchanged", "modified", "deleted"])
 def test_catalog_omitted_fileset_default_is_frozen_and_private(
-    tmp_path: Path, artifacts: ArtifactStore
+    source_state: str, tmp_path: Path, artifacts: ArtifactStore
 ) -> None:
     source = tmp_path / "judge.py"
     source.write_text("private judge source")
@@ -1755,22 +1756,74 @@ def test_catalog_omitted_fileset_default_is_frozen_and_private(
     )
     with pytest.raises(PlanError, match="private to a check or judge"):
         validate_plan(overlap, config)
-    source.unlink()
+    if source_state == "modified":
+        source.write_text("updated human judge source")
+    elif source_state == "deleted":
+        source.unlink()
     for restored in (
         Plan.model_validate_json(frozen.model_dump_json()),
         Plan.loads(frozen.dumps(), base_dir=tmp_path),
     ):
         restored._base_dir = tmp_path
         assert validate_plan(restored, config) == []
-        readmitted, warnings = admit_revision(restored, config, artifacts)
-        assert warnings == []
-        assert readmitted.judges == frozen.judges
-        assert judge_private_paths(readmitted) == frozenset({"judge.py"})
-        revision = stamp(readmitted, origin="autonomous", parent=readmitted)
-        carried, warnings = admit_revision(revision, config, artifacts, history=[readmitted])
+        if source_state == "deleted":
+            with pytest.raises(PlanError) as error:
+                admit_revision(restored, config, artifacts)
+            assert error.value.errors == ["/snapshot: ValueError"]
+            human = stamp(restored, origin="human", parent=None)
+            vouched, warnings = admit_revision(human, config, artifacts)
+            assert warnings == []
+            assert vouched.judges == frozen.judges
+        else:
+            readmitted, warnings = admit_revision(restored, config, artifacts)
+            assert warnings == []
+            assert readmitted.judges[0].config["files"] == {
+                "globs": ["judge.py"],
+                "manifest": {"judge.py": sha256_hex(source.read_bytes())},
+            }
+            assert judge_private_paths(readmitted) == frozenset({"judge.py"})
+        revision = stamp(restored, origin="autonomous", parent=restored)
+        carried, warnings = admit_revision(revision, config, artifacts, history=[restored])
         assert warnings == []
         assert carried.judges == frozen.judges
         assert judge_private_paths(carried) == frozenset({"judge.py"})
+
+
+@pytest.mark.parametrize("source_exists", [False, True])
+@pytest.mark.parametrize("origin", ["llm", "autonomous"])
+def test_catalog_default_forged_manifest_uses_only_human_source(
+    source_exists: bool, origin: Origin, tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    source = tmp_path / "judge.py"
+    if source_exists:
+        source.write_bytes(b"real human judge source")
+    forged_sha = artifacts.put_bytes(BOUNDARY_SECRET.encode())
+    judge = Ref(
+        path="_fakes.admission:DefaultScriptJudge",
+        config={"command": ["python", "judge.py"]},
+        name="score",
+    )
+    raw = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False).model_copy(update={"judges": [judge]})
+    raw._base_dir = tmp_path
+    config = _boundary_catalog(raw, {})
+    forged_files = {"globs": ["judge.py"], "manifest": {"judge.py": forged_sha}}
+    forged = judge.model_copy(update={"config": {**judge.config, "files": forged_files}})
+    plan = stamp(raw.model_copy(update={"judges": [forged]}), origin=origin, parent=None)
+    if source_exists:
+        admitted, warnings = admit_revision(plan, config, artifacts)
+        assert warnings == []
+        manifest = admitted.judges[0].config["files"]["manifest"]
+        assert manifest == {"judge.py": sha256_hex(source.read_bytes())}
+        assert manifest["judge.py"] != forged_sha
+        assert artifacts.get_bytes(manifest["judge.py"]) == source.read_bytes()
+        assert validate_plan(admitted, config) == []
+    else:
+        with pytest.raises(PlanError) as error:
+            admit_revision(plan, config, artifacts)
+        assert error.value.errors == ["/snapshot: ValueError"]
+        assert_secret_absent(error.value, BOUNDARY_SECRET)
+        assert_secret_absent(error.value, forged_sha)
+    assert plan.judges[0].config["files"] == forged_files
 
 
 @pytest.mark.parametrize("field", ["files", "unrelated"])

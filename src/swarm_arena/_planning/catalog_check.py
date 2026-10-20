@@ -79,15 +79,13 @@ def catalog_form(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _check_catalog_defaults(
     deferred: Sequence[tuple[RefSite, CatalogEntry, tuple[str, ...]]],
-) -> tuple[list[str], set[_ManifestPair]]:
+) -> list[str]:
     """Decide raw deferrals using only matched human Configs, without file I/O.
 
-    A matching default declaration also preserves its supplied frozen manifest
-    on reload, independently of revision history. All other manifests retain
-    the ordinary history-based trust rule.
+    A matching default authorizes only the declaration. Supplied manifests
+    retain the ordinary history-based trust rule.
     """
     errors: list[str] = []
-    trusted: set[_ManifestPair] = set()
     for site, entry, fields in deferred:
         try:
             component = Ref(path=entry.ref).load()
@@ -116,9 +114,7 @@ def _check_catalog_defaults(
                 accepted = False
             if not accepted:
                 errors.append(f"{site.pointer}: field '<field>' is not in the planner catalog")
-            elif _is_fileset(raw):
-                trusted.add(_manifest_pair(raw))
-    return errors, trusted
+    return errors
 
 
 def find_entry(
@@ -181,7 +177,7 @@ def find_entry(
             if raw or not extra:
                 return entry
             site = RefSite(pointer="/ref", kind=kind, ref=ref)
-            if not _check_catalog_defaults([(site, entry, extra)])[0]:
+            if not _check_catalog_defaults([(site, entry, extra)]):
                 return entry
     return None
 
@@ -427,7 +423,6 @@ def authorize_revision(
     *,
     history: Sequence[Plan] = (),
     deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] | None = None,
-    _default_pairs: frozenset[_ManifestPair] = frozenset(),
 ) -> tuple[Plan, list[str]]:
     """
     Authorize a revision's raw references and discard untrusted frozen manifests.
@@ -441,21 +436,20 @@ def authorize_revision(
     history : Sequence[Plan], default=()
         Previously admitted revisions in chronological order.
     deferred : list or None, default=None
-        Collector for extra fields omitted by a matching catalog entry. Both
-        admission and validation must decide these with the shared typed check
-        after rejecting raw errors, before any resolution or snapshotting.
-    _default_pairs : frozenset, default=frozenset()
-        Frozen pairs approved by that typed default check for this invocation.
-        Only the admission boundary supplies these on its second raw pass.
+        Optional collector for extra fields omitted by a matching catalog entry.
+        Without a collector these fields are errors. With a collector, callers
+        must decide them with the shared typed check after rejecting raw errors,
+        before any resolution or snapshotting.
 
     Returns
     -------
     tuple[Plan, list[str]]
         Human input unchanged, or a deep copy with untrusted manifests replaced
         by globs in non-carried sites, plus catalog errors. Trusted pairs may
-        come from any historical Ref site at any depth or from the typed default
-        decision. No components are imported or built, and no files are read.
-        Extra fields are deferred, not authorized, until the typed check passes.
+        come from any historical Ref site at any depth. Matching a Config
+        default does not establish manifest trust. No components are imported
+        or built, and no files are read. Collected extra fields are deferred,
+        not authorized, until the typed check passes.
         Diagnostic pointers redact
         unconfigured nested mapping keys as ``<field>``. Callers must reject
         errors before resolving components or snapshotting files.
@@ -472,8 +466,7 @@ def authorize_revision(
         return plan, []
     sites = _revision_sites(history[-1] if history else None, plan, parent_human(history))
     pointers = _diagnostic_pointers(sites, config.planner_catalog)
-    trusted = _trusted_pairs(history) | _default_pairs
-    deferred = [] if deferred is None else deferred
+    trusted = _trusted_pairs(history)
     result = plan.model_copy(deep=True)
     errors: list[str] = []
     for site in sites:

@@ -83,24 +83,9 @@ def _authorize(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> Plan:
         # Retired addresses are also import-free, so report them even when a
         # restored agent has already lost its inherited catalog authority.
         raise PlanError([*errors, *_rule_addresses(plan, config, history)]) from None
-    default_errors, default_pairs = _safe_call("/refs", partial(_check_catalog_defaults, deferred))
+    default_errors = _safe_call("/refs", partial(_check_catalog_defaults, deferred))
     if default_errors:
         raise PlanError(default_errors) from None
-    if default_pairs:
-        # Reapply the unchanged raw checks/manifest cleanup with only the frozen
-        # default declarations approved above added to this invocation's trust.
-        authorized, errors = _safe_call(
-            "/refs",
-            partial(
-                authorize_revision,
-                projected,
-                config,
-                history=projected_history,
-                _default_pairs=frozenset(default_pairs),
-            ),
-        )
-        if errors:
-            raise PlanError(errors) from None
     if projected is not plan:
         authorized = authorized.model_copy(
             update={"converge": authorized.converge.model_copy(update={"round": None})}
@@ -964,6 +949,10 @@ def admit_revision(
     Notes
     -----
     This synchronous boundary performs file I/O; async callers offload it.
+    Non-human component manifests are retained only through admitted history.
+    Without history, even catalog-default files are snapshotted again from the
+    human source directory; missing sources fail admission. A human may vouch
+    for a saved snapshot by marking its origin as ``"human"``.
 
     Examples
     --------

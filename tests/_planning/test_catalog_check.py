@@ -719,7 +719,59 @@ def _with_default_decision(
     errors = check_catalog(site, catalog, overrides=overrides or {}, deferred=deferred)
     if errors:
         return errors
-    return _check_catalog_defaults(deferred)[0]
+    return _check_catalog_defaults(deferred)
+
+
+def test_authorize_revision_requires_explicit_default_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = CatalogEntry(
+        name="judge",
+        kind="judge",
+        ref="_fakes.admission:DefaultScriptJudge",
+        description="d",
+        config={"command": ["python", "judge.py"]},
+    )
+    files = {"globs": ["judge.py"], "manifest": {"judge.py": "ab" * 32}}
+    plan = stamp(
+        Plan(
+            goal=Goal(id="g", namespace="demo"),
+            teams=[],
+            judges=[Ref(path=entry.ref, config={**entry.config, "files": files}, name="score")],
+        ),
+        origin="llm",
+        parent=None,
+    )
+    config = _cfg(
+        PlannerCatalog(
+            entries=[
+                entry,
+                CatalogEntry(
+                    name="policy",
+                    kind="policy",
+                    ref=plan.policy.path,
+                    config=plan.policy.config,
+                    description="d",
+                ),
+            ]
+        )
+    )
+    deferred: list[tuple[RefSite, CatalogEntry, tuple[str, ...]]] = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("raw authorization loaded a component")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Ref, "load", forbidden)
+        _, errors = authorize_revision(plan, config)
+        assert errors == ["/judges/0: field '<field>' is not in the planner catalog"]
+        assert authorize_revision(plan, config, deferred=None)[1] == errors
+        cleaned, errors = authorize_revision(plan, config, deferred=deferred)
+    assert errors == []
+    assert len(deferred) == 1
+    assert _check_catalog_defaults(deferred) == []
+    assert cleaned.judges[0].config["files"] == ["judge.py"]
+    assert plan.judges[0].config["files"] == files
 
 
 @pytest.mark.parametrize("path", ["DefaultScriptJudge", "AliasedDefaultScriptJudge"])
