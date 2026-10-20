@@ -16,6 +16,9 @@ class FileSet(FrozenModel):
     """
     Describe workspace files with globs and a snapshotted manifest.
 
+    Snapshotting stores each matched regular file by SHA-256; a file larger
+    than 1 GiB is refused by its size and named in the error.
+
     Parameters
     ----------
     globs : list[str], default=[]

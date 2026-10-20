@@ -14,7 +14,9 @@ files = ["problem/*.txt", "problem/run.py"]
 ```
 
 Snapshotting stores each selected regular file by SHA-256 and records a sorted
-`path → sha256` manifest while keeping the original globs. A glob spelling that
+`path → sha256` manifest while keeping the original globs. Each snapshotted file
+(goal, tool, check, or judge) may be at most 1 GiB; a larger file is refused by
+its size, unread, with an error that names its path. A glob spelling that
 only a case-insensitive lookup resolves (an alias of the same device/inode) is
 recorded once with the directory listing's spelling, including ancestor names.
 Names that both appear in a directory listing are separate entries, even as
