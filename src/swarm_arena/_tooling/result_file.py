@@ -14,6 +14,7 @@ from typing import Any, ClassVar, Final, NoReturn
 from pydantic import Field, ValidationError
 
 from swarm_arena._model.base import StoredModel
+from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.tooling import (
     CompletedRun,
@@ -346,12 +347,7 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
 
 def _validation_reason(exc: ValidationError) -> str:
     """Format locations already sanitized by the shared model boundary."""
-    reasons = [
-        (".".join(str(part) for part in error["loc"]) + ": " if error["loc"] else "")
-        + error["type"]
-        for error in exc.errors(include_input=False, include_url=False, include_context=False)
-    ]
-    return f"{_RESULT}: " + "; ".join(reasons)
+    return f"{_RESULT}: " + validation_summary(exc)
 
 
 def _load_result(workspace: Path) -> tuple[ToolResultFile, list[FileRef]]:

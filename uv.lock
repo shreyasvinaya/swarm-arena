@@ -927,8 +927,8 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.15,<5" },
-    { name = "pydantic", specifier = ">=2.11,<3" },
-    { name = "typing-extensions", specifier = ">=4.12" },
+    { name = "pydantic", specifier = ">=2.14.0,<3" },
+    { name = "typing-extensions", specifier = ">=4.16.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -939,7 +939,7 @@ dev = [
     { name = "ty", specifier = "==0.0.89" },
 ]
 docs = [
-    { name = "myst-parser", specifier = ">=4" },
+    { name = "myst-parser", specifier = ">=5.0.0" },
     { name = "numpydoc", specifier = ">=1.11" },
     { name = "sphinx", specifier = ">=9.0,<10" },
     { name = "sphinx-rtd-theme", specifier = ">=3.1" },
