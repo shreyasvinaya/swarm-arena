@@ -183,9 +183,18 @@ async def test_fenced_cancels_inflight_and_raises(run_config: RunConfig) -> None
         {"agent_status"},
     ],
 )
-async def test_every_event_has_context_and_task_ids(run_config: RunConfig, types: set[str]) -> None:
-    await Swarm(run_config).run(plan())
+@pytest.mark.parametrize("agents", [1, 2])
+async def test_every_event_has_context_and_task_ids(
+    run_config: RunConfig, types: set[str], agents: int
+) -> None:
+    await Swarm(run_config).run(plan(agents=agents))
     recorded = all_events(run_config)
+    if agents == 2:
+        pruned = [
+            e for e in recorded if e.type == "agent_status" and e.payload["status"] == "pruned"
+        ]
+        assert [(e.goal_id, e.team, e.agent, e.round) for e in pruned] == [("g", "t0", "a1", 1)]
+        assert all(e.task_id == f"{e.goal_id}/{e.team}/{e.agent}#r{e.round}" for e in pruned)
     assert all(e.context_id == e.run_id for e in recorded)
     assert all(e.task_id for e in recorded if e.type in types)
 

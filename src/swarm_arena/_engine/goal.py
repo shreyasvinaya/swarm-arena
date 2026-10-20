@@ -1,10 +1,11 @@
 """Run one goal through barriers, revisions, convergence, and durable results."""
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
+from inspect import isawaitable, iscoroutinefunction
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import anyio
 
@@ -14,6 +15,7 @@ from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import judge_amount, make_price_of
+from swarm_arena._budget.ledger import Reservation
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
@@ -23,6 +25,7 @@ from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._errors import Fenced, PlanError
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import GoalState, RunState
@@ -37,6 +40,7 @@ from swarm_arena._planning.policy import Policy, guard
 from swarm_arena._planning.provenance import stamp
 from swarm_arena._planning.validate import admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
+from swarm_arena._scoring.ranking import ranked
 from swarm_arena._scoring.runner import (
     JudgeError,
     JudgeOutcome,
@@ -46,6 +50,7 @@ from swarm_arena._scoring.runner import (
 )
 
 _INACTIVE = {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -365,6 +370,53 @@ class GoalRunner:
         # Charges and overflow are already authoritative in the ledger/journal.
         await tranche.close()
 
+    async def _supervised_step(
+        self, operation: Callable[[], Awaitable[_T]], *, final: bool
+    ) -> tuple[bool, _T | None]:
+        """Abandon replans on stops; give final judging a bounded stop grace."""
+        results: list[_T] = []
+        errors: list[BaseException] = []
+        async with anyio.create_task_group() as group:
+
+            async def invoke() -> None:
+                try:
+                    results.append(await operation())
+                except BaseException as error:
+                    if not (
+                        isinstance(error, anyio.get_cancelled_exc_class())
+                        and group.cancel_scope.cancel_called
+                    ):
+                        errors.append(error)
+                finally:
+                    group.cancel_scope.cancel()
+
+            group.start_soon(invoke)
+            grace_until: float | None = None
+            try:
+                while True:
+                    stopped = self._stop()
+                    if stopped and not final:
+                        break
+                    delay = 0.05
+                    if final and (self.deps.stops.stop_now or self.deps.stops.run_timeout):
+                        if grace_until is None:
+                            grace_until = anyio.current_time() + self.deps.config.settle_timeout_s
+                        left = grace_until - anyio.current_time()
+                        if left <= 0:
+                            break
+                        delay = min(delay, left)
+                    else:
+                        left = self.deps.clock.left(self.deps.config.limits.run_timeout_s)
+                        if left > 0:
+                            delay = min(delay, left)
+                    await anyio.sleep(delay)
+            finally:
+                group.cancel_scope.cancel()
+        # Reraise outside the task group so fencing keeps its original type.
+        if errors:
+            raise errors[0]
+        return (True, results[0]) if results else (False, None)
+
     def _judge_context(
         self, ref: Ref, batch: Sequence[Candidate], round: int, *, final: bool = False
     ) -> JudgeContext:
@@ -495,71 +547,94 @@ class GoalRunner:
             await self._close(tranche)
 
     async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
+        """Rescore within stop grace, falling back only to committed rankings."""
         if not finalists:
             return []
         name = self._ranking_name(None)
         ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
         tranche = self._tranche("final")
         scope = self._scope("judge", 0, tranche, final=True)
-        try:
+        reservation: Reservation | None = None
+        amount = Amount()
+
+        async def invoke() -> tuple[list[Candidate], JudgeOutcome]:
+            nonlocal reservation, amount
             with llm_scope(scope):
-                try:
-                    judge = await run_sync_daemon(ref.build, Judge)
-                    amount = await run_sync_daemon(
-                        partial(
-                            judge_amount,
-                            judge,
-                            len(finalists),
-                            self.deps.config,
-                            make_price_of(self.deps.config.models),
-                            llm=False,
-                        )
+                judge = await run_sync_daemon(ref.build, Judge)
+                amount = await run_sync_daemon(
+                    partial(
+                        judge_amount,
+                        judge,
+                        len(finalists),
+                        self.deps.config,
+                        make_price_of(self.deps.config.models),
+                        llm=False,
                     )
-                except Fenced:
-                    raise
-                except Exception as error:
-                    self._publish_scores(
-                        JudgeOutcome(
-                            scores=[],
-                            errors=[
-                                JudgeError(
-                                    candidate_id=c.id,
-                                    judge=name,
-                                    reason=f"judge error: {type(error).__name__}",
-                                )
-                                for c in finalists
-                            ],
-                        ),
-                        scope,
-                        0,
+                )
+                reservation = (
+                    await self.deps.ledger.reserve(
+                        f"{self.goal_id}/:final", amount, kind="final", goal_id=self.goal_id
                     )
-                    return []
-                try:
-                    reservation = (
-                        await self.deps.ledger.reserve(
-                            f"{self.goal_id}/:final", amount, kind="final", goal_id=self.goal_id
-                        )
-                        if amount != Amount()
-                        else None
-                    )
-                except LimitReached:
-                    self.status, self.reason = "no_result", "final slice used up"
-                    return []
-                order, outcome = await final_judge(
+                    if amount != Amount()
+                    else None
+                )
+                return await final_judge(
                     self.goal_id,
                     (ref, judge),
                     finalists,
                     self._judge_context(ref, finalists, 0, final=True),
                 )
-                if reservation is not None:
-                    await self.deps.ledger.settle(reservation.id, amount, estimated=True)
-                self._publish_scores(outcome, scope, 0)
-                return order
+
+        try:
+            order: list[Candidate] = []
+            try:
+                completed, result = await self._supervised_step(invoke, final=True)
+                if completed:
+                    assert result is not None
+                    order, outcome = result
+                else:
+                    await self._refresh()
+                    state = self._round_state()
+                    identity = state.ranking_identity.get(None)
+                    if identity is not None:
+                        order = [
+                            c
+                            for c, _ in ranked(
+                                finalists,
+                                state.scores,
+                                identity=identity,
+                                fidelity=None,
+                                allow_partial=self.plan.converge.allow_partial,
+                            )
+                        ]
+                    raise TimeoutError
+            except Fenced:
+                raise
+            except LimitReached:
+                self.status, self.reason = "no_result", "final slice used up"
+                return []
+            except Exception as error:
+                outcome = JudgeOutcome(
+                    scores=[],
+                    errors=[
+                        JudgeError(
+                            candidate_id=c.id,
+                            judge=name,
+                            reason=f"judge error: {type(error).__name__}",
+                        )
+                        for c in finalists
+                    ],
+                )
+            self._publish_scores(outcome, scope, 0)
+            return order
         finally:
+            if reservation is not None:
+                await self.deps.ledger.settle(reservation.id, amount, estimated=True)
             await self._close(tranche)
+            self._stop()
 
     async def _replan(self) -> bool:
-        """Prepare off-lock, then atomically recheck capacity and publish."""
+        """Supervise the proposal, then atomically recheck capacity and publish."""
         if self.replanner is None:
             return False
         tranche = self._tranche("planner")
@@ -577,12 +652,25 @@ class GoalRunner:
             rounds_done=self.rounds_closed,
             join_failures=self.join_failures,
         )
+
+        async def propose() -> Plan:
+            assert self.replanner is not None
+            with llm_scope(scope):
+                hook = self.replanner.plan
+                proposed = (
+                    hook(self.plan.goal, self.deps.config, history)
+                    if iscoroutinefunction(hook)
+                    else await run_sync_daemon(hook, self.plan.goal, self.deps.config, history)
+                )
+                if isawaitable(proposed):
+                    proposed = await proposed
+                if not isinstance(proposed, Plan):
+                    raise TypeError("invalid planner result")
+                return proposed
+
         try:
             try:
-                with llm_scope(scope):
-                    proposed = await self.replanner.plan(self.plan.goal, self.deps.config, history)
-                    if not isinstance(proposed, Plan):
-                        raise TypeError("invalid planner result")
+                completed, proposed = await self._supervised_step(propose, final=False)
             finally:
                 await self._close(tranche)
         except Fenced:
@@ -596,6 +684,14 @@ class GoalRunner:
                 )
             )
             return False
+        if not completed or self._stop():
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PLAN_REJECTED, errors=["planner stopped"], origin="autonomous"
+                )
+            )
+            return False
+        assert proposed is not None
         try:
             revision = stamp(proposed, origin="autonomous", parent=self.plan)
             admitted, _ = await anyio.to_thread.run_sync(
@@ -642,6 +738,10 @@ class GoalRunner:
 
     def _stop(self) -> bool:
         stops = self.deps.stops
+        if self.deps.ledger.run_exhausted():
+            stops.run_budget = True
+        if self.deps.ledger.goal_exhausted(self.goal_id):
+            stops.goal_budget.add(self.goal_id)
         if self.deps.clock.left(self.deps.config.limits.run_timeout_s) <= 0:
             stops.run_timeout = True
         reason = (
@@ -658,7 +758,9 @@ class GoalRunner:
             else None
         )
         if reason is not None:
-            if self.reason != "reserve_exhausted":
+            if self.status != "no_result" and not (
+                self.reason == "reserve_exhausted" and reason in {"run budget", "goal budget"}
+            ):
                 self.status, self.reason = "stopped", reason
             self.select_only |= stops.stop_now or stops.run_timeout
         return reason is not None
@@ -717,6 +819,7 @@ class GoalRunner:
                         self.deps.journal.append(
                             EventDraft(
                                 type=EventType.AGENT_STATUS,
+                                task_id=agent_task_id(slot.address, round),
                                 goal_id=self.goal_id,
                                 team=slot.team.name,
                                 agent=slot.spec.name,
@@ -755,6 +858,11 @@ class GoalRunner:
         """
         Execute rounds and publish a result after its terminal journal commit.
 
+        Stop reasons are refreshed through convergence and final judging.
+        Pending replans are abandoned on any stop. After an immediate stop or
+        run deadline, final judging has ``settle_timeout_s`` to finish; on
+        timeout, selection uses only previously journaled ranking scores.
+
         Returns
         -------
         GoalOutcome
@@ -783,6 +891,7 @@ class GoalRunner:
             )
             await self.deps.journal.commit()
             finalists = await converge(self, select_only=self.select_only)
+        self._stop()
         if not finalists and not (self.final_parts and any(self.final_parts.values())):
             if self.status != "no_result":
                 self.status, self.reason = "no_result", "no passing candidate"
@@ -795,7 +904,12 @@ class GoalRunner:
                     parts=self.final_parts,
                 )
             )
-        self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=self.reason))
+        # Replay returns the pool at goal_finished; do not suspend before applying it live.
+        with anyio.CancelScope(shield=True):
+            await self.deps.journal.append_durable(
+                self._draft(EventType.GOAL_FINISHED, reason=self.reason)
+            )
+            await self.deps.ledger.end_goal(self.goal_id)
         await self._refresh()
         head = self.deps.journal.head
         assert head is not None
@@ -804,6 +918,5 @@ class GoalRunner:
             solution_view(self.recorded, self.goal_id, head),
             source=head,
         )
-        await self.deps.ledger.end_goal(self.goal_id)
         await self.admission.release(self.goal_id)
         return GoalOutcome(self.goal_id, self.status, finalists, self.reason)

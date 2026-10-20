@@ -71,7 +71,8 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
 
     Parts stopped in select-only mode are retained independently in
     ``goal.final_parts``. Join failures may replan and run remaining rounds.
-    Fingerprints come exclusively from committed producer records.
+    An immediate stop or deadline during a join retains the best parts before
+    join-failure handling. Fingerprints come only from committed records.
 
     Parameters
     ----------
@@ -92,6 +93,8 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
     retries = 0
     retry_limit = max(0, goal.plan.converge.max_join_attempts - goal.join_attempts)
     while True:
+        goal._stop()
+        select_only |= goal.select_only
         state = goal._round_state()
         spec = goal.plan.converge
         if goal.plan.parts and select_only:
@@ -142,7 +145,15 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
             ).run(goal.rounds_closed + 1)
             goal._merge_repeats(out.repeat_entries)
             await goal._refresh()
+            goal._stop()
+            select_only |= goal.select_only
+            if goal.plan.parts and select_only:
+                continue
             funded = await goal._barrier(out.candidates, goal.rounds_closed + 1)
+            goal._stop()
+            select_only |= goal.select_only
+            if goal.plan.parts and select_only:
+                continue
             pool = [
                 c
                 for c in out.candidates
@@ -187,6 +198,10 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
                         goal._draft(EventType.CONVERGE_STARTED, select_only=select_only)
                     )
                     await goal.deps.journal.commit()
+                    continue
+                goal._stop()
+                select_only |= goal.select_only
+                if select_only:
                     continue
                 goal.status, goal.reason = "no_result", "; ".join(reasons)
                 return []
