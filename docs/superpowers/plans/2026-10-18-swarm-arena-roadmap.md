@@ -993,6 +993,8 @@ class AgentContext:
     # Bytes of a file in the agent's view only; ScriptTool's list_files/read_file handlers
     # use it through _tooling/script_tool.py:FileViewContext.
     def best(self, k: int, *, part: str | None = None) -> list[Row]: ...
+    # M1b: own group only (None or this agent's part); the round runner fills its ranking name.
+    # [M2] Cross-part leaderboard reads arrive with multi-goal board views.
     async def post_learning(self, title: str, text: str, evidence: Sequence[str], *, tags: Sequence[str] = (),
                             refines: Sequence[str] = (), duplicate_reason: str | None = None) -> Learning: ...
     async def save_notes(self, text: str) -> None: ...
@@ -2003,6 +2005,9 @@ class AgentRuntime:
     repeats: RepeatIndex; watchdog: Watchdog
     journal: JournalWriter; board: Board; executor: Executor; artifacts: ArtifactStore; ids: IdGen
     config: RunConfig; resumed: tuple[Candidate, ...]
+    rankings: Mapping[str, str] = field(default_factory=dict)
+        # Group key (empty for main, part name otherwise) to ranking judge; the round runner
+        # fills the own group from Plan.ranking_name() or the part ranking.
     private_paths: frozenset[str] = frozenset()      # [plan] every check and judge file path of the revision (R4.13.9)
     stops: ProviderStops                             # [plan] M3: the run's one ProviderStops, shared by every goal round
                                                      # (EngineDeps.provider_stops, R4.13.13)
@@ -2017,7 +2022,10 @@ class ProviderStops:                                 # _engine/stops.py — M3 [
     def stopped(self) -> dict[str, frozenset[str]]: ...                    # address → failed providers
 
 async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, parents: Sequence[str],
-                           replicate: int | None, edits: Mapping[str, str] | None) -> Candidate: ...
+                           replicate: int | None, edits: Mapping[str, str] | None,
+                           read_ids: Sequence[str] = ()) -> Candidate: ...
+    # Snapshot read_ids at action entry and stamp new candidates before journaling/indexing.
+    # Repeat-linked and resumed results retain their original journaled read_ids.
     # validate inputs, edits (validate_edits), and parents (including root/protection and duplicates)
     # → repeat rules and replicate allocation → plan the stage → count the tool run → reserve (durable) → put_edits
     # → Job(on_started = durable start event) → executor.submit (refused when the round's admission is closed:

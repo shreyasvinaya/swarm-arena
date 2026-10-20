@@ -67,7 +67,13 @@ PUBLIC["swarm_arena.tool"] += [
 PUBLIC["swarm_arena"] += ["Score"]
 PUBLIC["swarm_arena.scoring"] += ["CheckResult"]
 PUBLIC["swarm_arena.board"] += ["Candidate", "Learning", "LLMCall"]
-PUBLIC["swarm_arena.manager"] += ["AgentStatus", "LimitReached", "Manager", "RoundReport"]
+PUBLIC["swarm_arena.manager"] += [
+    "AgentContext",
+    "AgentStatus",
+    "LimitReached",
+    "Manager",
+    "RoundReport",
+]
 PUBLIC["swarm_arena.protocol"] += [
     "Message",
     "Part",

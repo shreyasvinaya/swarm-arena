@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from _fakes.engine import RtEnv
+from _fakes.engine import CtxEnv, RtEnv
 from _fakes.tools import RecordingExecutor
 
 from swarm_arena import AgentSpec, FunctionTool, Goal, Limits, Ref, RoundSpec, RunConfig, TeamSpec
@@ -120,3 +120,8 @@ async def rt_env(
                 yield RtEnv(rt, store, board, tmp_path / "marker", RecordingExecutor(), registry)
             finally:
                 await executor.aclose()
+
+
+@pytest.fixture
+async def ctx_env(rt_env: RtEnv) -> CtxEnv:
+    return CtxEnv(rt_env)

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from swarm_arena._agent.repeats import RepeatIndex
     from swarm_arena._agent.watchdog import Watchdog
@@ -138,6 +138,9 @@ class AgentRuntime:
         Run configuration.
     resumed : tuple[Candidate, ...]
         Own committed candidates of a restarted round.
+    rankings : Mapping[str, str], optional
+        Group to ranking judge name; the round runner fills the own group from
+        Plan.ranking_name() or the part ranking. The main group key is empty.
     private_paths : frozenset[str], default=frozenset()
         Every check and judge file path of the current revision.
 
@@ -146,7 +149,7 @@ class AgentRuntime:
     >>> from dataclasses import fields, MISSING
     >>> from unittest.mock import Mock
     >>> services = {f.name: Mock(name=f.name) for f in fields(AgentRuntime)
-    ...             if f.default is MISSING}
+    ...             if f.default is MISSING and f.default_factory is MISSING}
     >>> services.update(address="g/t/a", holder="g/:final")
     >>> rt = AgentRuntime(**services)
     >>> rt.holder, rt.private_paths
@@ -187,3 +190,4 @@ class AgentRuntime:
     config: RunConfig
     resumed: tuple[Candidate, ...]
     private_paths: frozenset[str] = frozenset()
+    rankings: Mapping[str, str] = field(default_factory=dict)

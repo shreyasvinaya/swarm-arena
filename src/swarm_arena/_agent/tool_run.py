@@ -365,6 +365,7 @@ async def execute_tool_run(
     parents: Sequence[str],
     replicate: int | None,
     edits: Mapping[str, str] | None,
+    read_ids: Sequence[str] = (),
 ) -> Candidate:
     """
     Execute one validated request with durable reservation and completion.
@@ -386,6 +387,10 @@ async def execute_tool_run(
         Requested nondeterministic replicate, or automatic allocation.
     edits : Mapping[str, str] or None
         Live editable-file contents.
+    read_ids : Sequence[str], default=()
+        Read identifiers snapshotted at action entry, stamped before journaling
+        and indexing. Linked results retain their original read_ids unchanged;
+        resumed results keep their journaled provenance.
 
     Returns
     -------
@@ -435,7 +440,7 @@ async def execute_tool_run(
         if rt.counters.tool_runs >= rt.limits.max_tool_runs_per_round:
             raise LimitReached("max_tool_runs_per_round", "tool runs used up for this round")
         rt.counters.tool_runs += 1
-        return await _run(rt, request, key, stage, overlay, warnings)
+        return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
     finally:
         if index is not None:
             rt.repeats.release(rt, request, index)
@@ -448,6 +453,7 @@ async def _run(
     stage: Job.Stage,
     overlay: dict[str, str],
     warnings: list[str],
+    read_ids: Sequence[str],
 ) -> Candidate:
     """Own reservation, executor lifecycle, and the shielded completion sequence."""
     id = rt.ids.next("c")
@@ -595,6 +601,7 @@ async def _run(
             parent_ids=[parent.candidate_id for parent in request.parents],
             overlay=overlay,
             requested_by_call=current_requesting_call(),
+            read_ids=list(read_ids),
             warnings=warnings,
         )
         checks = []

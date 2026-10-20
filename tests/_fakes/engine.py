@@ -10,6 +10,7 @@ import anyio
 from _fakes.tools import RecordingExecutor
 
 from swarm_arena import ScriptTool
+from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight
@@ -179,3 +180,67 @@ class RtEnv:
 
     def cancel_inflight(self) -> None:
         self.inflight.cancel_all()
+
+
+class CtxEnv:
+    """Build independent contexts over shared real journal and budget services."""
+
+    def __init__(self, env: RtEnv) -> None:
+        self.env = env
+        self.rt = env.rt
+        self.counters = env.rt.counters
+        self.artifacts = env.rt.artifacts
+        self.address = env.rt.address
+        self._events: list[Event] = []
+        append = env.rt.journal.append
+
+        def record(draft: EventDraft) -> Event:
+            event = append(draft)
+            self._events.append(event)
+            return event
+
+        cast(Any, env.rt.journal).append = record
+
+    def ctx(self, **rt_fields: Any) -> AgentContext:
+        gate = rt_fields.pop("gate", lambda: None)
+        agent = rt_fields.pop("agent", "a")
+        tool_runs = rt_fields.pop("tool_runs_used", 0)
+        learnings = rt_fields.pop("learnings_used", 0)
+        replicates = rt_fields.pop("replicates", 1)
+        base = self.env.rt
+        if "tool" in rt_fields:
+            base = self.env.with_tool(rt_fields.pop("tool"))
+        limits = rt_fields.get("limits", base.limits)
+        self.rt = replace(
+            base,
+            **{
+                "address": f"g/t/{agent}",
+                "holder": f"g/t/{agent}",
+                "spec": base.spec.model_copy(update={"name": agent, "replicates": replicates}),
+                "counters": AgentCounters(tool_runs=tool_runs, learnings=learnings),
+                "watchdog": Watchdog(limits),
+                "own": [],
+                "repeats": RepeatIndex(base.repeats.run_id),
+                **rt_fields,
+            },
+        )
+        self.counters, self.address = self.rt.counters, self.rt.address
+        return AgentContext(self.rt, gate=gate)
+
+    def script_ctx(self) -> AgentContext:
+        files = {
+            "problem/a.phyk": self.artifacts.put_bytes(b"a = 1\n"),
+            "problem/run.py": self.artifacts.put_bytes(b"print(1)\n"),
+        }
+        goal = self.env.rt.goal.model_copy(update={"files": FileSet(manifest=files)})
+        self.env.board.register_goal(goal.key(), goal.id, None)
+        view = self.env.board.snapshot(goal.key(), self.env.board.frontier())
+        return self.ctx(
+            tool=ScriptTool(command=["python", "problem/run.py"], editable=["problem/a.phyk"]),
+            goal=goal,
+            goal_key=goal.key(),
+            view=view,
+        )
+
+    def events(self, type: str) -> list[Event]:
+        return [event for event in self._events if event.type == type]

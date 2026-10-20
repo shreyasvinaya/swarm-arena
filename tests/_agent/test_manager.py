@@ -1,3 +1,4 @@
+from _fakes.engine import CtxEnv
 from _fakes.tools import NoopManager
 
 from swarm_arena import Ref
@@ -26,7 +27,7 @@ def test_limit_reached() -> None:
     assert str(err) == "goal budget used up"
 
 
-async def test_round_reports() -> None:
-    assert await _M().run_round(AgentContext()) == RoundReport(summary="ok")
-    assert await NoopManager().run_round(AgentContext()) == RoundReport()
+async def test_round_reports(ctx_env: CtxEnv) -> None:
+    assert await _M().run_round(ctx_env.ctx()) == RoundReport(summary="ok")
+    assert await NoopManager().run_round(ctx_env.ctx()) == RoundReport()
     assert RoundReport().summary == ""

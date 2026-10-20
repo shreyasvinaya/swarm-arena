@@ -54,3 +54,12 @@ def test_runtime_is_keyword_only_and_requires_holder_and_execution_ref() -> None
 def test_runtime_accepts_private_paths() -> None:
     runtime = AgentRuntime(**_values(), private_paths=frozenset({"judge/secret.txt"}))
     assert runtime.private_paths == frozenset({"judge/secret.txt"})
+
+
+def test_runtime_rankings_default_is_independent_and_accepts_own_group() -> None:
+    first = AgentRuntime(**_values())
+    second = AgentRuntime(**_values())
+    assert first.rankings == {}
+    assert first.rankings is not second.rankings
+    part = AgentRuntime(**_values(), rankings={"part": "quality"})
+    assert part.rankings == {"part": "quality"}

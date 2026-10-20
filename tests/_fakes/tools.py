@@ -5,15 +5,16 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from swarm_arena import Goal
 from swarm_arena._agent.context import AgentContext
 from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
@@ -855,3 +856,22 @@ class ContextTool(PyTool):
 
     def is_deterministic(self, request: ToolRequest) -> bool:
         return False
+
+
+class AlwaysFailCheck(Check):
+    name = "always-fail"
+
+    class Config(FrozenModel):
+        reason: str = "always fails"
+        feedback: Literal["pass_fail", "reasons"] = "reasons"
+
+    @property
+    def config(self) -> Config:
+        return cast(AlwaysFailCheck.Config, super().config)
+
+    def __init__(self, config: BaseModel | Mapping[str, Any] | None = None) -> None:
+        super().__init__(config)
+        self.feedback = self.config.feedback
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(check=self.name, passed=False, reasons=[self.config.reason])
