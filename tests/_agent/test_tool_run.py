@@ -787,11 +787,9 @@ async def test_tool_usage_overflow_is_terminal(rt_env: RtEnv) -> None:
 
 
 @pytest.mark.parametrize("fail_call", [2, 3])
-async def test_replicate_allocation_hook_failure_is_sanitized(
+async def test_replicate_admission_does_not_reenter_determinism_hook(
     rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, fail_call: int
 ) -> None:
-    from _fakes.secrecy import assert_secret_absent
-
     from swarm_arena._model.tooling import ToolRequest
 
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
@@ -806,12 +804,11 @@ async def test_replicate_allocation_hook_failure_is_sanitized(
         return False
 
     monkeypatch.setattr(rt.tool, "is_deterministic", deterministic)
-    with pytest.raises(SoftError) as caught:
-        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
-    assert_secret_absent(caught.value, secret)
-    assert str(caught.value) == "invalid tool request: RuntimeError"
+    candidate = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert calls == 1
     assert not rt.repeats._pending
-    assert not rt_env.events("reserve")
+    assert len(rt_env.events("reserve")) == 1
 
 
 async def test_release_hook_cannot_replace_success(
@@ -1182,9 +1179,8 @@ async def test_connector_limit_is_a_safe_error_candidate(
 
 
 @pytest.mark.parametrize("bad", ["truth", "integer", "string", "none"])
-@pytest.mark.parametrize("fail_call", [1, 2, 3])
-async def test_determinism_return_is_contained_on_every_read(
-    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, bad: str, fail_call: int
+async def test_determinism_return_is_contained(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, bad: str
 ) -> None:
     from uuid import uuid4
 
@@ -1204,7 +1200,7 @@ async def test_determinism_return_is_contained_on_every_read(
     def deterministic(request: ToolRequest) -> Any:
         nonlocal calls
         calls += 1
-        if calls == fail_call:
+        if calls == 1:
             return {"truth": BadTruth(), "integer": 1, "string": "yes", "none": None}[bad]
         return False
 
@@ -1216,12 +1212,12 @@ async def test_determinism_return_is_contained_on_every_read(
     assert str(caught.value) == "invalid tool request: TypeError"
     assert not rt_env.events("reserve")
     assert rt_env.rt.counters.tool_runs == 0
+    assert calls == 1
     assert not rt_env.rt.repeats._pending
 
 
-@pytest.mark.parametrize("fail_call", [1, 2, 3])
 async def test_determinism_fence_keeps_control_meaning(
-    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, fail_call: int
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from swarm_arena._model.tooling import ToolRequest
 
@@ -1230,7 +1226,7 @@ async def test_determinism_fence_keeps_control_meaning(
     def deterministic(request: ToolRequest) -> bool:
         nonlocal calls
         calls += 1
-        if calls == fail_call:
+        if calls == 1:
             raise Fenced("run ownership lost")
         return False
 
@@ -1238,6 +1234,7 @@ async def test_determinism_fence_keeps_control_meaning(
     with pytest.raises(Fenced):
         await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
     assert not rt_env.events("reserve")
+    assert calls == 1
     assert not rt_env.rt.repeats._pending
 
 
@@ -1536,7 +1533,10 @@ async def test_core_tool_limits_survive_extra_actions_and_round_classification(
     with pytest.raises(LimitReached) as caught:
         await call
     assert caught.value.limit == limit
-    if case in {"closed_admission", "queued_start"}:
+    if case == "closed_admission":
+        assert not rt_env.events("reserve")
+        assert not rt_env.events("tool_start")
+    if case == "queued_start":
         assert len(rt_env.events("reserve")) == len(rt_env.events("settle")) == 1
         assert not rt_env.events("tool_start")
         reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
@@ -1663,7 +1663,7 @@ async def test_round_rejects_transferred_core_signal(rt_env: RtEnv) -> None:
 @pytest.mark.parametrize("fail_on", [1, 2], ids=["settings", "plan"])
 @pytest.mark.parametrize("registered", [True, False], ids=["core", "connector"])
 @pytest.mark.parametrize("kind", [SoftError, LimitReached])
-async def test_staging_container_errors_rebuild_safe_signals(
+async def test_staging_containers_are_detached_or_errors_rebuilt(
     rt_env: RtEnv,
     monkeypatch: pytest.MonkeyPatch,
     fail_on: int,
@@ -1713,6 +1713,11 @@ async def test_staging_container_errors_rebuild_safe_signals(
             return super().__iter__()
 
     monkeypatch.setattr(rt_env.rt.tool, "editable", lambda: Globs(["**"]))
+    if fail_on == 2:
+        candidate = await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
+        assert candidate.output.status == RunStatus.OK
+        assert iterations == 1
+        return
     with pytest.raises((SoftError, LimitReached)) as caught:
         await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
     error = caught.value
@@ -1745,6 +1750,7 @@ async def test_staging_container_fencing_propagates(
 
     from swarm_arena._agent.context import AgentContext
 
+    ctx = AgentContext(rt_env.rt)
     fenced = Fenced("run ownership lost")
     iterations = 0
 
@@ -1757,8 +1763,13 @@ async def test_staging_container_fencing_propagates(
             return super().__iter__()
 
     monkeypatch.setattr(rt_env.rt.tool, "editable", lambda: Globs(["**"]))
+    if fail_on == 2:
+        candidate = await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
+        assert candidate.output.status == RunStatus.OK
+        assert iterations == 1
+        return
     with pytest.raises(Fenced) as caught:
-        await AgentContext(rt_env.rt).run_tool({"x": 1}, edits={"p/a.txt": "x"})
+        await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
     assert caught.value is fenced
     assert iterations == fail_on
     assert rt_env.rt.counters.tool_runs == 0
@@ -1816,3 +1827,26 @@ async def test_unmarked_stage_refusal_is_sanitized_and_releases_replicate(
     monkeypatch.setattr(pipeline, "plan_tool_stage", original)
     candidate = await ctx.run_tool({"x": 1})
     assert candidate.request.replicate == 0
+
+
+@pytest.mark.parametrize("hook", ["effective_tool_ref", "find_entry", "tool_identity"])
+async def test_runtime_config_and_identity_evaluation_use_daemon(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, hook: str
+) -> None:
+    import threading
+
+    from swarm_arena._engine import round as round_module
+
+    runner = _fingerprint_round(rt_env)
+    observed: list[threading.Thread] = []
+    original = getattr(round_module, hook)
+
+    def wrapped(*args: Any) -> Any:
+        observed.append(threading.current_thread())
+        return original(*args)
+
+    monkeypatch.setattr(round_module, hook, wrapped)
+    result = await runner.run(2)
+    assert len(result.candidates) == 1
+    assert observed
+    assert all(thread is not threading.main_thread() and thread.daemon for thread in observed)

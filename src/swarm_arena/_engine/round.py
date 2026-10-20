@@ -7,7 +7,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.context import AgentContext, _prepare_metadata, _ToolMetadata
-from swarm_arena._agent.manager import LimitReached, Manager
+from swarm_arena._agent.manager import LimitReached, Manager, RoundReport
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
@@ -34,6 +34,7 @@ from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.data import finite_json
 from swarm_arena._model.goal import Goal, GoalKey
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
@@ -427,9 +428,13 @@ class RoundRunner:
             ranking = self.plan.ranking_name()
         elif not ranking and len(judges) == 1:
             ranking = judges[0].component_name()
-        execution_ref = effective_tool_ref(slot.tool_ref, self.round_spec.tool_overrides)
+        execution_ref = await run_sync_daemon(
+            effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
+        )
         tool = await run_sync_daemon(execution_ref.build, Tool)
-        entry = find_entry(slot.tool_ref, "tool", deps.config.planner_catalog)
+        entry = await run_sync_daemon(
+            find_entry, slot.tool_ref, "tool", deps.config.planner_catalog
+        )
         holder = f"{self.goal_id}/:final" if self.converge else slot.address
         key = f"{slot.team.name}/{slot.spec.name}"
         pairs = self.resumed.get(key, ())
@@ -448,7 +453,7 @@ class RoundRunner:
             tool=tool,
             tool_ref=slot.tool_ref,
             execution_ref=execution_ref,
-            tool_identity=tool_identity(slot.tool_ref, entry),
+            tool_identity=await run_sync_daemon(tool_identity, slot.tool_ref, entry),
             catalog_entry=entry,
             checks=[
                 (ref.component_name(), await run_sync_daemon(ref.build, Check)) for ref in checks
@@ -795,7 +800,11 @@ class RoundRunner:
                         )
                     ):
                         report = await slot.manager.run_round(ctx)
-                        summaries[key] = report.summary
+                        if not isinstance(report, RoundReport) or not isinstance(
+                            report.summary, str
+                        ):
+                            raise TypeError("invalid manager report")
+                        summaries[key] = finite_json(report.summary)
             except Fenced:
                 raise
             except Exception as error:

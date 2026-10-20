@@ -5,6 +5,8 @@ from typing import ClassVar, cast
 
 from pydantic import Field, JsonValue
 
+from swarm_arena._errors import Fenced
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel
@@ -173,6 +175,8 @@ class Lexicographic(Judge):
                     ]
                 )
             )
+        except Fenced:
+            raise
         except Exception:
             raise ValueError("cannot encode lexicographic rubric") from None
 
@@ -340,7 +344,7 @@ class Lexicographic(Judge):
         (0.9, -2.0)
         >>> del sys.modules['lex_judge_demo']
         """
-        members = self._get_members()
+        members = await run_sync_daemon(self._get_members)
         by_member: list[dict[str, Score]] = []
         for ref, member in zip(self.config.judges, members, strict=True):
             name = ref.name if ref.name is not None else member.name
@@ -368,12 +372,30 @@ class Lexicographic(Judge):
             for candidate_id, reason in errors.items():
                 ctx.judge_error(candidate_id, reason)
             by_member.append(valid)
+        scores, errors = await run_sync_daemon(self._combine_scores, candidates, by_member, members)
+        for candidate_id, reason in errors.items():
+            ctx.judge_error(candidate_id, reason)
+        return scores
+
+    @staticmethod
+    def _combine_scores(
+        candidates: Sequence[Candidate],
+        by_member: Sequence[dict[str, Score]],
+        members: Sequence[Judge],
+    ) -> tuple[list[Score], dict[str, str]]:
+        """Combine member data and panel hooks without mutating the loop's context."""
         scores: list[Score] = []
+        errors: dict[str, str] = {}
         for candidate in candidates:
             if any(candidate.id not in batch for batch in by_member):
                 continue
             try:
-                parts = [batch[candidate.id] for batch in by_member]
+                parts = [
+                    Score.model_validate(
+                        batch[candidate.id].model_dump(mode="python", warnings=False)
+                    )
+                    for batch in by_member
+                ]
                 scores.append(
                     Score(
                         candidate_id=candidate.id,
@@ -392,8 +414,8 @@ class Lexicographic(Judge):
                         ),
                     )
                 )
+            except Fenced:
+                raise
             except Exception as error:
-                ctx.judge_error(
-                    candidate.id, f"{type(error).__name__}: cannot combine member scores"
-                )
-        return scores
+                errors[candidate.id] = f"{type(error).__name__}: cannot combine member scores"
+        return scores, errors

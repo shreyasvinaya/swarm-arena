@@ -4,11 +4,18 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
 from swarm_arena._errors import Fenced
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._scoring.check import Check, CheckContext
-from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score, stamp_scores
+from swarm_arena._scoring.judge import (
+    Judge,
+    JudgeContext,
+    _prepare_score_stamps,
+    _stamp_score_ids,
+    is_finite_score,
+)
 
 
 class JudgeError(FrozenModel):
@@ -164,6 +171,36 @@ def prepare_judge_batch(
     return batch, frozenset(anchor.id for anchor in anchors)
 
 
+def _prepare_judge_result(
+    scores: object,
+    members: set[str],
+    failed: set[str],
+    judge: Judge,
+    name: str,
+    batch_id: str,
+) -> tuple[list[Score], set[str], set[str]]:
+    """Detach and validate connector scores and metadata in a cancellable worker."""
+    if (
+        not isinstance(scores, Sequence)
+        or isinstance(scores, (str, bytes, bytearray))
+        or any(not isinstance(score, Score) for score in scores)
+    ):
+        raise TypeError("invalid judge result")
+    seen: set[str] = set()
+    nonfinite: set[str] = set()
+    accepted: list[Score] = []
+    for score in scores:
+        if score.candidate_id not in members or score.candidate_id in seen:
+            continue
+        seen.add(score.candidate_id)
+        if not is_finite_score(score):
+            nonfinite.add(score.candidate_id)
+        elif score.candidate_id not in failed:
+            accepted.append(score)
+    prepared = _prepare_score_stamps(accepted, judge, name, batch_id) if accepted else []
+    return prepared, seen, nonfinite
+
+
 async def _judge_batch(
     ref: Ref,
     judge: Judge,
@@ -179,29 +216,18 @@ async def _judge_batch(
     nonfinite: set[str] = set()
     try:
         if leaders is not None:
-            batch, ctx.anchors = prepare_judge_batch(judge, batch, leaders)
+            batch, ctx.anchors = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
         scores = await judge.judge(ctx.goal, batch, ctx)
-        if (
-            not isinstance(scores, Sequence)
-            or isinstance(scores, (str, bytes, bytearray))
-            or any(not isinstance(score, Score) for score in scores)
-        ):
-            raise TypeError("invalid judge result")
-        members = {candidate.id for candidate in batch}
-        accepted: list[Score] = []
-        for score in scores:
-            if score.candidate_id not in members or score.candidate_id in seen:
-                continue
-            seen.add(score.candidate_id)
-            if not is_finite_score(score):
-                nonfinite.add(score.candidate_id)
-            elif score.candidate_id not in ctx.errors:
-                accepted.append(score)
-        stamped = (
-            stamp_scores(accepted, judge=judge, judge_name=name, ids=ctx.ids, batch_id=ctx.batch_id)
-            if accepted
-            else []
+        prepared, seen, nonfinite = await run_sync_daemon(
+            _prepare_judge_result,
+            scores,
+            {candidate.id for candidate in batch},
+            set(ctx.errors),
+            judge,
+            name,
+            ctx.batch_id,
         )
+        stamped = _stamp_score_ids(prepared, ctx.ids)
     except Fenced:
         raise
     except Exception as error:
@@ -241,6 +267,8 @@ async def judge_round(
     gets one fresh context from ``ctx_for``; its batch and anchor ids are set on
     that supplied context. Hook failures and malformed returns fail the whole
     invocation with type-only errors; fencing and cancellation propagate.
+    Complete scores are validated from Python data before publication. Synchronous
+    metadata and serialization run in abandonable daemon threads; ids stay on the loop.
 
     Parameters
     ----------

@@ -382,16 +382,27 @@ def stamp_scores(
     >>> (score.judge, score.candidate_id, score.batch_id, bool(score.id), raw.id)
     ('quality', 'c1', 'b1', True, '')
     """
+    prepared = _prepare_score_stamps(scores, judge, judge_name, batch_id)
+    return _stamp_score_ids(prepared, ids)
+
+
+def _prepare_score_stamps(
+    scores: Sequence[Score], judge: Judge, judge_name: str, batch_id: str
+) -> list[Score]:
+    """Validate complete Python payloads and prepare provenance without allocating ids."""
+    validated = [
+        Score.model_validate(score.model_dump(mode="python", warnings=False)) for score in scores
+    ]
     rubric_hash = judge.rubric_hash()
     panel_hash: str | None = None
-    stamped = []
-    for score in scores:
+    prepared = []
+    for score in validated:
         if not score.panel_hash and panel_hash is None:
             panel_hash = judge.panel_hash()
-        stamped.append(
-            score.model_copy(
-                update={
-                    "id": ids.next("s"),
+        prepared.append(
+            Score.model_validate(
+                {
+                    **score.model_dump(mode="python"),
                     "judge": judge_name,
                     "rubric_hash": rubric_hash,
                     "panel_hash": score.panel_hash or panel_hash,
@@ -399,4 +410,9 @@ def stamp_scores(
                 }
             )
         )
-    return stamped
+    return prepared
+
+
+def _stamp_score_ids(scores: Sequence[Score], ids: IdGen) -> list[Score]:
+    """Allocate loop-owned ids only after abandonable preparation has completed."""
+    return [score.model_copy(update={"id": ids.next("s")}) for score in scores]

@@ -292,10 +292,11 @@ async def test_collect_probe_accepts_error_status_and_raising(
         await check_tool(
             OkCollectTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor
         )
-    with pytest.warns(UserWarning, match="RuntimeError: collect broke"):  # collect raises
+    with pytest.warns(UserWarning, match="collect failed: RuntimeError") as captured:
         out = await check_tool(
             BadCollectTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor
         )
+    assert all("collect broke" not in str(warning.message) for warning in captured)
     assert out.status == RunStatus.ERROR
     out = await check_tool(PyTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor)
     assert out.status == RunStatus.OK

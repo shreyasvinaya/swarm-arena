@@ -1,7 +1,6 @@
 """Supervise one local job, collect its result once, and upload bounded outputs."""
 
 import os
-import traceback
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -174,8 +173,8 @@ class _JobRun:
                 output = self._staged.tool.collect(self._staged.request, self._workspace, run)
             else:
                 output = command_output_from_result(self._workspace, run)
-        except (Exception, SystemExit):
-            note_in_log(run.stderr_path, "collect failed: " + traceback.format_exc())
+        except (Exception, SystemExit) as error:
+            note_in_log(run.stderr_path, f"collect failed: {type(error).__name__}")
             return None
         finally:
             _OUTPUT_BYTE_LIMIT.reset(token)

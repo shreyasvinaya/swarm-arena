@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 import anyio
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._agent.repeats import _is_deterministic
+from swarm_arena._agent.repeats import _is_deterministic, repeat_key
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import current_requesting_call
@@ -30,7 +30,7 @@ from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.data import check_utf8
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
-from swarm_arena._model.results import Candidate
+from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
 from swarm_arena._scoring.check import CheckContext
 from swarm_arena._scoring.runner import run_checks
@@ -69,6 +69,7 @@ class Inflight:
     def __init__(self) -> None:
         """Start with open admission and no submissions."""
         self.closed = False
+        self._cancel_generation = 0
         self._scopes: dict[anyio.CancelScope, float] = {}
 
     def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
@@ -160,8 +161,16 @@ class Inflight:
         >>> registry.closed
         False
         """
+        self._cancel_generation += 1
         for scope in tuple(self._scopes):
             scope.cancel()
+
+    def _add_completion(self, scope: anyio.CancelScope, *, grace_s: float, generation: int) -> bool:
+        """Supervise completion checks even after a graceful admission close."""
+        if generation != self._cancel_generation:
+            return False
+        self._scopes[scope] = grace_s
+        return True
 
 
 _inflight: ContextVar[Inflight | None] = ContextVar("tool_inflight", default=None)
@@ -292,14 +301,24 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
         raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
-def _request(
-    rt: AgentRuntime,
-    inputs: Mapping[str, Any],
-    parents: Sequence[str],
-    replicate: int | None,
-    edits: Mapping[str, str] | None,
-) -> ToolRequest:
-    """Validate inputs and visible parents before any budget or count change."""
+async def _prepare_sync(hook: Callable[..., _T], *args: Any) -> _T:
+    """Abandon synchronous extension preparation when the round stops."""
+    inflight = _inflight.get()
+    with anyio.CancelScope() as scope:
+        if inflight is not None:
+            inflight.add(scope, grace_s=0)
+        try:
+            result = await run_sync_daemon(hook, *args)
+        finally:
+            if inflight is not None:
+                inflight.discard(scope)
+    if scope.cancelled_caught:
+        raise _core_signal(LimitReached("stop", "the round is stopping"))
+    return result
+
+
+def _parents(rt: AgentRuntime, parents: Sequence[str]) -> list[Candidate]:
+    """Resolve visible parents exclusively on the board's owning loop."""
     resolved: list[Candidate] = []
     if len(set(parents)) != len(parents):
         raise _core_signal(SoftError("duplicate parent ids"))
@@ -310,13 +329,24 @@ def _request(
                 candidate = rt.view.get_candidate(id)
             except (KeyError, ValueError):
                 raise _core_signal(SoftError(f"unknown parent: {id}")) from None
-        resolved.append(candidate)
+        resolved.append(candidate.model_copy(deep=True))
+    return resolved
+
+
+def _request(
+    rt: AgentRuntime,
+    inputs: Mapping[str, Any],
+    parents: Sequence[Candidate],
+    replicate: int | None,
+    edits: Mapping[str, str] | None,
+) -> ToolRequest:
+    """Validate inputs and visible parents before any budget or count change."""
     model = _request_hook(rt.tool.get_input_model)
     try:
         validated = _validate_config(model, dict(inputs), where="tool inputs")
         return ToolRequest(
             inputs=validated.model_dump(mode="json"),
-            parents=[parent_ref(c) for c in resolved],
+            parents=[parent_ref(c) for c in parents],
             round=rt.round,
             round_overrides=rt.round_spec.tool_overrides,
             replicate=0 if replicate is None else replicate,
@@ -336,10 +366,16 @@ def _stage_settings(
 ) -> tuple[dict[str, str], Sequence[str], frozenset[str]]:
     """Validate root and edit permissions, rebuilding core refusal snapshots."""
     try:
-        files = _request_hook(rt.tool._own_files)
+        files = dict(_request_hook(rt.tool._own_files))
         root = tool_root(rt.goal.files.manifest, files)
-        protected = _request_hook(rt.tool._protected, root.keys()) | rt.private_paths
-        editable = _request_hook(rt.tool.editable)
+        protected = frozenset(_request_hook(rt.tool._protected, root.keys())) | rt.private_paths
+        editable = tuple(_request_hook(rt.tool.editable))
+        if (
+            any(type(path) is not str or type(digest) is not str for path, digest in files.items())
+            or any(type(path) is not str for path in protected)
+            or any(type(path) is not str for path in editable)
+        ):
+            raise TypeError("invalid stage settings")
         validate_edits(
             request.edits,
             editable=editable,
@@ -355,6 +391,20 @@ def _stage_settings(
         if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
         raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
+
+
+def _prepare_request(
+    rt: AgentRuntime,
+    inputs: Mapping[str, Any],
+    parents: Sequence[Candidate],
+    replicate: int | None,
+    edits: Mapping[str, str] | None,
+) -> tuple[ToolRequest, tuple[dict[str, str], Sequence[str], frozenset[str]], bool]:
+    """Return core request data and detached settings from synchronous user hooks."""
+    request = _request(rt, inputs, parents, replicate, edits)
+    settings = _stage_settings(rt, request)
+    deterministic = _request_hook(_is_deterministic, rt.tool, request.model_copy(deep=True))
+    return request, settings, deterministic
 
 
 def _stage(
@@ -408,7 +458,8 @@ async def execute_tool_run(
     """
     Execute one validated request with durable reservation and completion.
 
-    Input, stage, repeat, and run-count admission occur without an await.
+    User hooks, validators, and serializers run in abandonable daemon threads.
+    Detached preparation precedes atomic repeat and run-count admission.
     Internal round cancellation retains partial output; outer cancellation
     before completion propagates. Optional fingerprinting receives a deep copy
     and waits at most ten seconds outside the completion shield. Interrupted
@@ -454,17 +505,19 @@ async def execute_tool_run(
     ...     replicate=None, edits=None)  # doctest: +SKIP
     """
     parents = tuple(dict.fromkeys((*rt.seed_parents, *parents)))
-    request = _request(rt, inputs, parents, replicate, edits)
+    request, settings, deterministic = await _prepare_sync(
+        _prepare_request, rt, inputs, _parents(rt, parents), replicate, edits
+    )
     allocation_request = request
-    settings = _stage_settings(rt, request)
     index: int | None = None
     try:
-        deterministic = _request_hook(_is_deterministic, rt.tool, request)
         if not deterministic:
             index = rt.repeats.next_replicate(rt, request, requested=replicate)
             request = request.model_copy(update={"replicate": index})
         stage, overlay, warnings = _stage(rt, request, settings)
-        key = _request_hook(rt.repeats.key, rt, request)
+        key = repeat_key(
+            goal_key=rt.goal_key, tool_ref=rt.tool_ref, request=request, deterministic=deterministic
+        )
         outcome = rt.repeats.lookup(
             key,
             agent=f"{rt.team.name}/{rt.spec.name}",
@@ -515,6 +568,7 @@ async def _run(
     inflight = _inflight.get()
     if inflight is None:
         raise _core_error(RuntimeError, "tool run requires track_inflight")
+    generation = inflight._cancel_generation
     started = False
     admission_refusal: LimitReached | None = None
     partial: list[ToolOutput] = []
@@ -672,49 +726,67 @@ async def _run(
             warnings.append(f"fingerprint error: {type(error).__name__}")
         except Exception as error:
             warnings.append(f"fingerprint error: {type(error).__name__}")
+    if rt.journal.fenced.is_set():
+        raise _core_error(Fenced, "run ownership lost")
+    candidate = Candidate(
+        id=id,
+        run_id=rt.repeats.run_id,
+        goal_id=rt.goal_id,
+        part=rt.part,
+        team=rt.team.name,
+        agent=rt.spec.name,
+        round=rt.round,
+        fidelity=rt.fidelity,
+        tool_identity=rt.tool_identity,
+        request=request,
+        output=output,
+        parent_ids=[parent.candidate_id for parent in request.parents],
+        overlay=overlay,
+        requested_by_call=current_requesting_call(),
+        read_ids=list(read_ids),
+        warnings=warnings,
+    )
+    checks = []
+    checks_to_run = () if not started and output.status == RunStatus.CANCELLED else rt.checks
+    for name, check in checks_to_run:
+        executor, on_command_started = command_journal(
+            rt.journal,
+            rt.executor,
+            candidate_id=id,
+            component=name,
+        )
+        context = CheckContext(
+            goal=rt.goal,
+            executor=executor,
+            artifact_root=rt.config.artifact_root,
+            run_id=rt.repeats.run_id,
+            round=rt.round,
+            part=rt.part,
+            on_started=on_command_started,
+            secrets_file=rt.config.secrets.file,
+            ids=rt.ids,
+            tool_timeout_s=rt.limits.tool_timeout_s,
+        )
+        interrupted = False
+        try:
+            with anyio.CancelScope() as check_scope:
+                if not inflight._add_completion(
+                    check_scope, grace_s=tool_grace(rt.tool), generation=generation
+                ):
+                    interrupted = True
+                else:
+                    try:
+                        checks.extend(await run_checks(candidate, [(name, check)], context))
+                    finally:
+                        inflight.discard(check_scope)
+            interrupted |= check_scope.cancelled_caught
+        except anyio.get_cancelled_exc_class():
+            interrupted = True
+        if interrupted:
+            checks.append(CheckResult(check=name, passed=False, reasons=["check interrupted"]))
     with anyio.CancelScope(shield=True):
         if rt.journal.fenced.is_set():
             raise _core_error(Fenced, "run ownership lost")
-        candidate = Candidate(
-            id=id,
-            run_id=rt.repeats.run_id,
-            goal_id=rt.goal_id,
-            part=rt.part,
-            team=rt.team.name,
-            agent=rt.spec.name,
-            round=rt.round,
-            fidelity=rt.fidelity,
-            tool_identity=rt.tool_identity,
-            request=request,
-            output=output,
-            parent_ids=[parent.candidate_id for parent in request.parents],
-            overlay=overlay,
-            requested_by_call=current_requesting_call(),
-            read_ids=list(read_ids),
-            warnings=warnings,
-        )
-        checks = []
-        checks_to_run = () if not started and output.status == RunStatus.CANCELLED else rt.checks
-        for name, check in checks_to_run:
-            executor, on_command_started = command_journal(
-                rt.journal,
-                rt.executor,
-                candidate_id=id,
-                component=name,
-            )
-            context = CheckContext(
-                goal=rt.goal,
-                executor=executor,
-                artifact_root=rt.config.artifact_root,
-                run_id=rt.repeats.run_id,
-                round=rt.round,
-                part=rt.part,
-                on_started=on_command_started,
-                secrets_file=rt.config.secrets.file,
-                ids=rt.ids,
-                tool_timeout_s=rt.limits.tool_timeout_s,
-            )
-            checks.extend(await run_checks(candidate, [(name, check)], context))
         candidate = candidate.model_copy(update={"checks": checks})
         # Python-form validation sees non-finite data before JSON could turn it into null.
         Candidate.model_validate(candidate.model_dump(mode="python", warnings=False))

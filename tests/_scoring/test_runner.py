@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -783,3 +783,88 @@ def test_for_manager_unknown_policy_hides_feedback(policy: dict[str, str]) -> No
     assert filtered.checks[0].details == {}
     assert original.checks[0].reasons == [SECRET]
     assert original.checks[0].details == {"private": SECRET}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("llm_call_ids", [object()]),
+        ("notes", {"private": BOUNDARY_SECRET}),
+        ("notes", "\ud800"),
+        ("value", float("nan")),
+        ("value", float("inf")),
+        ("panel_hash", {"private": BOUNDARY_SECRET}),
+    ],
+)
+async def test_complete_score_validation_contains_invalid_metadata(field: str, value: Any) -> None:
+    class Malformed(_RecordingJudge):
+        async def judge(
+            self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            return [
+                score.model_copy(update={field: value})
+                for score in await super().judge(goal, candidates, ctx)
+            ]
+
+    bad, good = Malformed(), _RecordingJudge()
+    refs = [Ref.of(_RecordingJudge()).model_copy(update={"name": "bad"}), Ref.of(good)]
+    out = await judge_round(
+        "g", list(zip(refs, [bad, good], strict=True)), [_cand()], [], lambda _: _judge_ctx()
+    )
+    assert len(out.scores) == len(out.errors) == 1
+    assert out.scores[0].judge == "recording"
+    assert out.errors[0].judge == "bad"
+    assert out.errors[0].reason == "ValidationError: judge raised"
+    assert BOUNDARY_SECRET not in out.model_dump_json()
+
+
+async def test_score_serializer_failure_is_contained() -> None:
+    from pydantic import model_serializer
+
+    class BadDump(Score):
+        @model_serializer
+        def serialize(self) -> dict[str, Any]:
+            error = RuntimeError(BOUNDARY_SECRET)
+            error.add_note(BOUNDARY_SECRET)
+            raise error from ValueError(BOUNDARY_SECRET)
+
+    class Malformed(_RecordingJudge):
+        async def judge(
+            self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            return [BadDump(candidate_id=c.id, key=(1.0,)) for c in candidates]
+
+    judge = Malformed()
+    out = await judge_round(
+        "g", [(Ref.of(_RecordingJudge()), judge)], [_cand()], [], lambda _: _judge_ctx()
+    )
+    assert out.scores == []
+    assert [e.reason for e in out.errors] == ["PydanticSerializationError: judge raised"]
+    assert BOUNDARY_SECRET not in out.model_dump_json()
+
+
+async def test_metadata_runs_off_loop_but_score_ids_stay_on_loop() -> None:
+    import threading
+
+    observed: list[threading.Thread] = []
+
+    class Metadata(_RecordingJudge):
+        def rubric_hash(self) -> str:
+            observed.append(threading.current_thread())
+            return "rubric"
+
+        def panel_hash(self) -> str:
+            observed.append(threading.current_thread())
+            return "panel"
+
+    class LoopIds(IdGen):
+        def next(self, prefix: Literal["c", "L", "s", "r", "llm", "x", "k"]) -> str:
+            assert threading.current_thread() is threading.main_thread()
+            return super().next(prefix)
+
+    judge = Metadata()
+    ctx = _judge_ctx(ids=LoopIds("r", 1))
+    out = await judge_round("g", [(Ref.of(_RecordingJudge()), judge)], [_cand()], [], lambda _: ctx)
+    assert len(out.scores) == 1
+    assert len(observed) == 2
+    assert all(t is not threading.main_thread() and t.daemon for t in observed)

@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
-from swarm_arena._agent.tool_run import execute_tool_run
+from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
 from swarm_arena._journal.a2a import agent_task_id
@@ -916,7 +916,11 @@ class AgentContext:
         if action is None:
             raise _core_signal(SoftError(f"unknown action: {name}"))
         try:
-            validated = _validate_config(action.input_model, dict(args), where="action arguments")
+
+            def validate() -> BaseModel:
+                return _validate_config(action.input_model, dict(args), where="action arguments")
+
+            validated = await _prepare_sync(validate)
         except ConfigError as error:
             raise _core_signal(SoftError(str(error))) from None
         lifetime = _ActionLifetime(self)

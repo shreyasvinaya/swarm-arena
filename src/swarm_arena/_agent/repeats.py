@@ -303,6 +303,9 @@ class RepeatIndex:
         """
         Reserve an unused replicate by key, ignoring request.replicate.
 
+        The caller has already validated nondeterminism. Allocation uses only
+        core-owned request data and never calls a tool hook.
+
         Parameters
         ----------
         rt : AgentRuntime
@@ -347,7 +350,12 @@ class RepeatIndex:
         matched: Candidate | None = None
         for index in range(n) if requested is None else (requested,):
             try:
-                key = self.key(rt, request.model_copy(update={"replicate": index}))
+                key = repeat_key(
+                    goal_key=rt.goal_key,
+                    tool_ref=rt.tool_ref,
+                    request=request.model_copy(update={"replicate": index}),
+                    deterministic=False,
+                )
             except Fenced:
                 raise
             except Exception as error:
