@@ -26,6 +26,7 @@ from swarm_arena._tooling.paths import (
     matches,
     parent_data_conflicts,
 )
+from swarm_arena._tooling.result_file import CandidateOutputFile, CandidateRequestFile
 from swarm_arena._tooling.result_file import request_json as _request_json
 
 
@@ -549,19 +550,21 @@ def plan_script_stage(
     return Job.Stage(
         root=dict(own_files),
         candidate=Job.CandidateFiles(
-            request={
-                **_request_json(candidate.request),
-                "schema_version": CURRENT["candidate_request"],
-                "parents": candidate.parent_ids,
-            },
-            output={
-                "schema_version": CURRENT["candidate_output"],
-                "status": output.status.value,
-                "partial": output.partial,
-                "data": output.data,
-                "usage": output.usage.model_dump(mode="json"),
-                "files": [file.path for file in output.files],
-            },
+            request=CandidateRequestFile.model_validate(
+                {
+                    **_request_json(candidate.request),
+                    "schema_version": CURRENT["candidate_request"],
+                    "parents": candidate.parent_ids,
+                }
+            ).model_dump(mode="json"),
+            output=CandidateOutputFile(
+                schema_version=CURRENT["candidate_output"],
+                status=output.status,
+                partial=output.partial,
+                data=output.data,
+                usage=output.usage,
+                files=[file.path for file in output.files],
+            ).model_dump(mode="json"),
             files=fold_merge(
                 effective_files,
                 {file.path: file.sha256 for file in output.files},

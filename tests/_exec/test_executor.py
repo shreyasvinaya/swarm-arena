@@ -8,6 +8,25 @@ from swarm_arena._exec.executor import Executor, Job
 from swarm_arena.tool import ParentRef, RunStatus, ToolOutput
 
 
+@pytest.mark.parametrize("envelope", ["request", "candidate_request", "candidate_output"])
+def test_workspace_envelopes_refuse_newer_versions(envelope: str) -> None:
+    secret = "a464d9fa-secret-envelope"
+    raw = {"schema_version": 99, "params": {secret: secret}}
+    model = Job.Stage if envelope == "request" else Job.CandidateFiles
+    data = (
+        {"request_json": raw}
+        if envelope == "request"
+        else {
+            "request": raw if envelope == "candidate_request" else {},
+            "output": raw if envelope == "candidate_output" else {},
+            "files": {},
+        }
+    )
+    with pytest.raises(ValueError, match="newer") as caught:
+        model.model_validate(data)
+    assert_secret_absent(caught.value, secret)
+
+
 def test_kind_rules() -> None:
     with pytest.raises(ValueError, match="kind 'tool' needs tool and request"):
         make_job(kind="tool", command=None)
@@ -136,7 +155,7 @@ def test_stage_and_candidate_keys_must_be_in_normal_form(path: str) -> None:
 def test_stage_roundtrip_and_frozen_nested_models() -> None:
     candidate = Job.CandidateFiles(request={"schema_version": 1}, output={}, files={"a": "a" * 64})
     stage = Job.Stage(
-        root={"problem/input": "b" * 64}, candidate=candidate, request_json={"id": "x"}
+        root={"problem/input": "b" * 64}, candidate=candidate, request_json={"params": {"id": "x"}}
     )
     assert Job.Stage.model_validate_json(stage.model_dump_json()) == stage
     for model, field in (

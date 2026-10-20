@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,7 +14,13 @@ from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.tooling import FileRef, ParentRef, RunStatus, ToolOutput, ToolRequest, Usage
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.result_file import request_json
+from swarm_arena._tooling.materialize import materialize
+from swarm_arena._tooling.result_file import (
+    CandidateOutputFile,
+    CandidateRequestFile,
+    RequestFile,
+    request_json,
+)
 from swarm_arena._tooling.staging import (
     edit_hashes,
     effective_files,
@@ -27,6 +35,53 @@ from swarm_arena._tooling.staging import (
 
 # tests/_tooling/test_staging.py
 H1, H2, H3 = "1" * 64, "2" * 64, "3" * 64
+
+
+def test_workspace_envelope_bytes_and_roundtrips(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    request = ToolRequest(
+        inputs={"null": None, "typed": [True, 1, 1.0], "text": "caf\u00e9"},
+        round=2,
+        replicate=3,
+        round_overrides={"temperature": 0.25},
+    )
+    candidate = cand(
+        request=request,
+        parent_ids=["c0"],
+        output=ToolOutput(status="error", partial=True, data={"null": None}),
+    )
+    wire = {
+        "schema_version": 1,
+        "params": request.inputs,
+        "round": 2,
+        "round_overrides": {"temperature": 0.25},
+        "replicate": 3,
+    }
+    output = {
+        "schema_version": 1,
+        "status": "error",
+        "partial": True,
+        "data": {"null": None},
+        "usage": Usage().model_dump(mode="json"),
+        "files": [],
+    }
+    staged = plan_script_stage(own_files={}, candidate=candidate, effective_files={})
+    combined = Job.Stage(candidate=staged.candidate, request_json=request_json(request))
+    materialize(combined, tmp_path / "ws", artifacts)
+    for rel, expected, model in (
+        ("swarm/request.json", wire, RequestFile),
+        ("candidate/request.json", {**wire, "parents": ["c0"]}, CandidateRequestFile),
+        ("candidate/output.json", output, CandidateOutputFile),
+    ):
+        data = (tmp_path / "ws" / rel).read_bytes()
+        assert data == json.dumps(expected, indent=2, sort_keys=True, allow_nan=False).encode()
+        loaded = model.model_validate_json(data)
+        assert loaded.model_dump(mode="json", exclude_unset=True) == expected
+        assert model.model_validate_json(loaded.model_dump_json()) == loaded
+
+
+def test_tool_staging_refuses_newer_request() -> None:
+    with pytest.raises(ValueError, match="newer"):
+        stage(request_json={"schema_version": 99, "params": {}})
 
 
 def test_tool_identity_ignores_spelling() -> None:

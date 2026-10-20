@@ -14,7 +14,7 @@ from typing import Any, ClassVar, Final
 from pydantic import Field, ValidationError
 
 from swarm_arena._model.base import StoredModel
-from swarm_arena._model.data import FiniteJsonObject, finite_json
+from swarm_arena._model.data import FiniteJsonObject, TomlJsonObject, finite_json
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.tooling import (
@@ -69,6 +69,101 @@ class ToolResultFile(StoredModel):
     failed_provider: str | None = Field(default=None, min_length=1)
 
 
+class RequestFile(StoredModel):
+    """
+    Load the versioned ``swarm/request.json`` envelope before running a tool.
+
+    Missing fields retain the defaults of a ToolRequest. Writers explicitly
+    supply the five standard fields; optional parent ids are preserved only
+    when supplied. Older versions use the registered migration path.
+
+    Parameters
+    ----------
+    params : dict[str, Any], default={}
+        Finite JSON tool inputs.
+    round : int, default=0
+        Round index.
+    round_overrides : dict[str, Any], default={}
+        TOML-compatible tool configuration overrides.
+    replicate : int, default=0
+        Replicate index.
+    parents : list[str], default=[]
+        Optional parent candidate identifiers.
+
+    Examples
+    --------
+    >>> RequestFile.model_validate({"params": {"x": None}}).schema_version
+    1
+    """
+
+    schema_kind: ClassVar[str] = "request"
+    schema_version: int = CURRENT["request"]
+    params: FiniteJsonObject = {}
+    round: int = Field(default=0, strict=True)
+    round_overrides: TomlJsonObject = {}
+    replicate: int = Field(default=0, strict=True)
+    parents: list[str] = []
+
+
+class CandidateRequestFile(RequestFile):
+    """
+    Load the versioned ``candidate/request.json`` envelope for a check or judge.
+
+    Fields follow RequestFile; writers always include the parent identifiers.
+
+    Examples
+    --------
+    >>> CandidateRequestFile(params={"x": 2}, parents=["c1"]).schema_kind
+    'candidate_request'
+    """
+
+    schema_kind: ClassVar[str] = "candidate_request"
+    schema_version: int = CURRENT["candidate_request"]
+
+
+class CandidateOutputFile(StoredModel):
+    """
+    Load the versioned ``candidate/output.json`` envelope for a check or judge.
+
+    Parameters
+    ----------
+    status : RunStatus, default=RunStatus.OK
+        Tool execution status.
+    partial : bool, default=False
+        Whether the output is partial.
+    data : dict[str, Any], default={}
+        Finite JSON result data.
+    usage : Usage, default=Usage()
+        Reported token and cost usage.
+    files : list[str], default=[]
+        Output paths relative to the candidate workspace.
+
+    Examples
+    --------
+    >>> CandidateOutputFile(data={"x": None}).model_dump(mode="json")["status"]
+    'ok'
+    """
+
+    schema_kind: ClassVar[str] = "candidate_output"
+    schema_version: int = CURRENT["candidate_output"]
+    status: RunStatus = RunStatus.OK
+    partial: bool = Field(default=False, strict=True)
+    data: FiniteJsonObject = {}
+    usage: Usage = Usage()
+    files: list[str] = []
+
+
+def _workspace_envelope(model: type[StoredModel], raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate and upgrade a wire object, preserving omitted version-one defaults."""
+    loaded = model.model_validate(raw)
+    result = loaded.model_dump(mode="json", exclude_unset=True)
+    # Existing partial version-one documents may omit the version. Migration
+    # results must retain their new version so a subsequent reader cannot repeat it.
+    if "schema_version" not in raw and loaded.schema_version == 1:
+        result.pop("schema_version", None)
+    return result
+
+
 def request_json(request: ToolRequest) -> dict[str, Any]:
     """
     Build the script request object with tool inputs under ``params``.
@@ -89,13 +184,13 @@ def request_json(request: ToolRequest) -> dict[str, Any]:
     >>> request_json(ToolRequest(inputs={"n": 2}))["params"]
     {'n': 2}
     """
-    return {
-        "schema_version": CURRENT["request"],
-        "params": request.inputs,
-        "round": request.round,
-        "round_overrides": request.round_overrides,
-        "replicate": request.replicate,
-    }
+    return RequestFile(
+        schema_version=CURRENT["request"],
+        params=request.inputs,
+        round=request.round,
+        round_overrides=request.round_overrides,
+        replicate=request.replicate,
+    ).model_dump(mode="json", exclude={"parents"})
 
 
 @contextlib.contextmanager

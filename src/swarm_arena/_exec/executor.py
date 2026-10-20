@@ -4,7 +4,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
+
+from pydantic import field_validator
 
 from swarm_arena._model.base import FrozenModel, JsonValue, StoredModel
 from swarm_arena._model.canonical import canonical_json
@@ -13,6 +15,12 @@ from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.tooling import Command, ParentRef, ToolOutput, ToolRequest
+from swarm_arena._tooling.result_file import (
+    CandidateOutputFile,
+    CandidateRequestFile,
+    RequestFile,
+    _workspace_envelope,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -105,6 +113,12 @@ class Job:
         candidate: "Job.CandidateFiles | None" = None
         request_json: FiniteJsonObject | None = None
 
+        @field_validator("request_json")
+        @classmethod
+        def _request_envelope(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+            """Load the stored request before an executor prepares user code."""
+            return None if value is None else _workspace_envelope(RequestFile, value)
+
     class CandidateFiles(FrozenModel):
         """
         Describe the candidate directory for a script check or judge.
@@ -128,6 +142,18 @@ class Job:
         request: FiniteJsonObject
         output: FiniteJsonObject
         files: Manifest
+
+        @field_validator("request")
+        @classmethod
+        def _request_envelope(cls, value: dict[str, Any]) -> dict[str, Any]:
+            """Load candidate request data through its registered stored model."""
+            return _workspace_envelope(CandidateRequestFile, value)
+
+        @field_validator("output")
+        @classmethod
+        def _output_envelope(cls, value: dict[str, Any]) -> dict[str, Any]:
+            """Load candidate output data through its registered stored model."""
+            return _workspace_envelope(CandidateOutputFile, value)
 
     class Started(StoredModel):
         """

@@ -55,6 +55,47 @@ def test_writes_result(tmp_path: Path) -> None:
     assert sorted(p.name for p in (tmp_path / "swarm").iterdir()) == ["request.json", "result.json"]
 
 
+@pytest.mark.parametrize("function", ["_fakes.tools:add", "version_canary:solve"])
+def test_newer_request_refused_before_user_import(tmp_path: Path, function: str) -> None:
+    (tmp_path / "swarm").mkdir()
+    wire = request_json(ToolRequest(inputs={"a": 2, "b": 3}))
+    wire["schema_version"] = 99
+    (tmp_path / "swarm/request.json").write_text(json.dumps(wire))
+    root = tmp_path / "imports"
+    root.mkdir()
+    (root / "version_canary.py").write_text(
+        "from pathlib import Path\n"
+        "Path('imported').touch()\n"
+        "def solve(a: int, b: int) -> dict[str, int]:\n"
+        "    Path('called').touch()\n"
+        "    return {'sum': a + b}\n"
+    )
+    import_root = (
+        Path(fake_tools.__file__).resolve().parents[1] if function == "_fakes.tools:add" else root
+    )
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-P",
+            "-m",
+            "swarm_arena.run_function",
+            "--import-root",
+            str(import_root),
+            function,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert done.returncode == 1, done.stderr
+    assert "newer" in done.stderr
+    assert not (tmp_path / "swarm/result.json").exists()
+    assert not (tmp_path / "imported").exists()
+    assert not (tmp_path / "called").exists()
+
+
 def test_cwd_files_do_not_shadow_imports(tmp_path: Path) -> None:
     (tmp_path / "swarm_arena").mkdir()
     (tmp_path / "swarm_arena/__init__.py").write_text("open('shadow', 'w')")
