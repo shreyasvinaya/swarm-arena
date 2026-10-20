@@ -5,8 +5,7 @@ import stat
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
-from types import UnionType
-from typing import Annotated, Any, Final, Union, cast, get_args, get_origin
+from typing import Any, Final, cast
 
 from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic_core import PydanticUndefined
@@ -230,88 +229,74 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     return fs.model_copy(update={"manifest": manifest})
 
 
-def _contains_file_ref(annotation: Any, seen: frozenset[type] = frozenset()) -> bool:
-    """Recognize only schemas capable of carrying files or component references."""
-    if get_origin(annotation) is Annotated:
-        return _contains_file_ref(get_args(annotation)[0], seen)
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        if issubclass(annotation, (FileSet, Ref)):
-            return True
-        if annotation in seen:
-            return False
-        return any(
-            _contains_file_ref(field.annotation, seen | {annotation})
-            for field in annotation.model_fields.values()
-        )
-    return any(_contains_file_ref(item, seen) for item in get_args(annotation))
-
-
 def _snapshot_value(
     value: Any,
     raw: Any,
     base_dir: Path,
     artifacts: ArtifactStore,
     *,
-    annotation: Any,
     field: str,
+    shape_error: str | None = None,
 ) -> Any:
-    """Freeze file/ref-bearing schemas while retaining all unrelated raw values."""
-    if not _contains_file_ref(annotation):
-        return raw
-    origin = get_origin(annotation)
-    arguments = get_args(annotation)
-    if origin is Annotated:
-        return _snapshot_value(
-            value, raw, base_dir, artifacts, annotation=arguments[0], field=field
-        )
-    if origin in (Union, UnionType):
-        for branch in arguments:
-            candidate = branch
-            while get_origin(candidate) is Annotated:
-                candidate = get_args(candidate)[0]
-            kind = get_origin(candidate) or candidate
-            if isinstance(kind, type) and isinstance(value, kind) and _contains_file_ref(branch):
-                return _snapshot_value(
-                    value, raw, base_dir, artifacts, annotation=branch, field=field
-                )
-        return raw
-    if isinstance(value, FileSet):
-        return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
-    if isinstance(value, Ref):
+    """Visit validated values once, preserving raw data outside file/ref leaves.
+
+    Carry a changed ancestor shape to its leaves. It matters only if a typed
+    FileSet or Ref is encountered, and then fails before reading its files.
+    """
+    if isinstance(value, (FileSet, Ref)):
+        if shape_error is not None:
+            raise PlanError([shape_error]) from None
+        if isinstance(value, FileSet):
+            return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
         return snapshot_ref(value, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
-    if isinstance(value, BaseModel) and isinstance(raw, dict):
-        return _snapshot_config(value, raw, base_dir, artifacts)
-    if isinstance(value, Mapping):
-        if not isinstance(raw, dict) or value.keys() != raw.keys():
-            raise PlanError(
-                [f"field {field!r}: validation changed the shape of a file or reference mapping"]
-            ) from None
-        return {
-            key: _snapshot_value(
-                value[key], child, base_dir, artifacts, annotation=arguments[1], field=field
+    if isinstance(value, BaseModel):
+        error = shape_error
+        if not isinstance(raw, dict):
+            error = error or (
+                f"field {field!r}: validation changed the shape of a file or reference mapping"
             )
-            for key, child in raw.items()
-        }
-    if isinstance(value, (list, tuple)):
-        if not isinstance(raw, list) or len(value) != len(raw):
-            raise PlanError(
-                [f"field {field!r}: validation changed the shape of a file or reference list"]
-            ) from None
-        return [
-            _snapshot_value(
+        result = _snapshot_config(
+            value, raw if isinstance(raw, dict) else {}, base_dir, artifacts, shape_error=error
+        )
+        return raw if error else result
+    if isinstance(value, Mapping):
+        same_shape = isinstance(raw, dict) and value.keys() == raw.keys()
+        error = shape_error or (
+            None
+            if same_shape
+            else f"field {field!r}: validation changed the shape of a file or reference mapping"
+        )
+        result = {
+            key: _snapshot_value(
                 item,
-                child,
+                raw[key] if same_shape else None,
                 base_dir,
                 artifacts,
-                annotation=(
-                    arguments[index]
-                    if origin is tuple and arguments[-1] is not Ellipsis
-                    else arguments[0]
-                ),
                 field=field,
+                shape_error=error,
             )
-            for index, (item, child) in enumerate(zip(value, raw, strict=True))
+            for key, item in value.items()
+        }
+        return result if same_shape else raw
+    if isinstance(value, (list, tuple)):
+        same_shape = isinstance(raw, list) and len(value) == len(raw)
+        error = shape_error or (
+            None
+            if same_shape
+            else f"field {field!r}: validation changed the shape of a file or reference list"
+        )
+        result = [
+            _snapshot_value(
+                item,
+                raw[index] if same_shape else None,
+                base_dir,
+                artifacts,
+                field=field,
+                shape_error=error,
+            )
+            for index, item in enumerate(value)
         ]
+        return result if same_shape else raw
     return raw
 
 
@@ -323,7 +308,8 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     written back; nonempty FileSet defaults are frozen under their canonical
     field names. Empty FileSet defaults and other defaults stay omitted.
     Typed reference mappings retain their keys and unrelated values stay raw.
-    Only annotations that can hold FileSets or Refs are traversed. Validation
+    Descent follows validated FileSet and Ref instances, including those in
+    unions with identical outer container types. Validation
     may normalize unrelated lists and mappings without changing their stored
     raw values; shape changes in file/reference containers are refused.
     Validation aliases retain their original input paths and precedence.
@@ -377,14 +363,17 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
 
 
 def _snapshot_config(
-    config: BaseModel, raw: dict[str, Any], base_dir: Path, artifacts: ArtifactStore
+    config: BaseModel,
+    raw: dict[str, Any],
+    base_dir: Path,
+    artifacts: ArtifactStore,
+    *,
+    shape_error: str | None = None,
 ) -> dict[str, Any]:
     """Write frozen typed values back along their supplying raw input paths."""
     updated = deepcopy(raw)
     settings = type(config).model_config
     for key, field in type(config).model_fields.items():
-        if not _contains_file_ref(field.annotation):
-            continue
         alias = field.validation_alias
         paths = (
             _alias_paths(
@@ -411,6 +400,11 @@ def _snapshot_config(
         )
         value = getattr(config, key)
         if path is None:
+            if shape_error is not None:
+                _snapshot_value(
+                    value, None, base_dir, artifacts, field=key, shape_error=shape_error
+                )
+                continue
             if not isinstance(value, FileSet) or not value.globs:
                 continue
             path = (key,)
@@ -422,8 +416,8 @@ def _snapshot_config(
             target.get(path[-1]) if isinstance(target, dict) else target[path[-1]],
             base_dir,
             artifacts,
-            annotation=field.annotation,
             field=key,
+            shape_error=shape_error,
         )
     return updated
 

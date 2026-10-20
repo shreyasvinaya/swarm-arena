@@ -735,9 +735,10 @@ def test_frozen_catalog_allows_only_omitted_fileset_defaults(path: str) -> None:
     frozen = {"globs": ["judge.py"], "manifest": {"judge.py": "ab" * 32}}
     site = _site({**entry.config, "files": frozen}, path=entry.ref, kind="judge")
     assert check_catalog(site, catalog, overrides={})
-    assert find_entry(site.ref, "judge", catalog) is None
+    assert find_entry(site.ref, "judge", catalog, raw=True) is None
+    assert find_entry(site.ref, "judge", catalog) is entry
     assert _with_default_decision(site, catalog) == []
-    assert find_entry(site.ref, "judge", catalog, defer_defaults=True) is entry
+    assert find_entry(site.ref, "judge", catalog, raw=True, defer_defaults=True) is entry
     assert site.ref.config["files"] == frozen
     assert entry.config == {"command": ["python", "judge.py"]}
     for extra in (
@@ -750,6 +751,7 @@ def test_frozen_catalog_allows_only_omitted_fileset_defaults(path: str) -> None:
         changed = _site({**entry.config, **extra}, path=entry.ref, kind="judge")
         errors = _with_default_decision(changed, catalog)
         assert errors
+        assert find_entry(changed.ref, "judge", catalog) is None
         assert_secret_absent(PlanError(errors), "SECRET_VALUE")
         assert_secret_absent(PlanError(errors), "SECRET_KEY")
     assert _with_default_decision(site, catalog, overrides={"files": frozen})
@@ -801,12 +803,17 @@ def test_default_resolution_requires_matching_human_catalog_path(
 
     monkeypatch.setattr(Ref, "load", tracked)
     assert check_catalog(_site(config, path=entry.ref, kind="judge"), catalog, overrides={})
+    ref = Ref(path=entry.ref, config=config)
+    assert find_entry(ref, "judge", catalog, raw=True) is None
+    assert find_entry(ref, "judge", catalog, raw=True, defer_defaults=True) is entry
     assert calls == []
     for path, kind in [("_fakes.import_canary:Tool", "judge"), (entry.ref, "tool")]:
         site = _site(config, path=path, kind=kind)  # ty: ignore[invalid-argument-type]
         assert _with_default_decision(site, catalog)
+        assert find_entry(site.ref, site.kind, catalog) is None
     assert calls == []
     assert _with_default_decision(_site(config, path=entry.ref, kind="judge"), catalog) == []
+    assert find_entry(ref, "judge", catalog) is entry
     assert calls
     assert set(calls) == {entry.ref}
 
@@ -844,7 +851,7 @@ def test_frozen_default_lookup_retains_first_fixed_match() -> None:
     duplicate = second.model_copy(update={"name": "duplicate"})
     catalog = PlannerCatalog(entries=[first, second, duplicate])
     ref = Ref(path=first.ref, config={**second.config, "files": ["judge.py"]})
-    assert find_entry(ref, "judge", catalog, defer_defaults=True) is second
+    assert find_entry(ref, "judge", catalog) is second
 
 
 def test_default_decision_needs_no_component_construction_or_required_settable_value(

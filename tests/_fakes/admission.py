@@ -122,3 +122,14 @@ class ShrinkingRefsTool(ProbeTool):
         @classmethod
         def first_only(cls, value: list[Any]) -> list[Any]:
             return value[:1]
+
+
+class DefaultFilesTool(ScriptTool):
+    class Config(ScriptTool.Config):  # ty: ignore[invalid-attribute-override]
+        files: FileSet = Field(default_factory=lambda: FileSet(globs=["tool.py"]))
+        tuning: int = 1
+
+
+class UnionRefsTool(ProbeTool):
+    class Config(ProbeTool.Config):  # ty: ignore[invalid-attribute-override]
+        payload: tuple[RefField, str] | tuple[str, RefField]

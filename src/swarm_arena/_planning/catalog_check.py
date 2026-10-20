@@ -122,10 +122,15 @@ def _check_catalog_defaults(
 
 
 def find_entry(
-    ref: Ref, kind: CatalogKind, catalog: PlannerCatalog, *, defer_defaults: bool = False
+    ref: Ref,
+    kind: CatalogKind,
+    catalog: PlannerCatalog,
+    *,
+    raw: bool = False,
+    defer_defaults: bool = False,
 ) -> CatalogEntry | None:
     """
-    Find the first canonical fixed-config match without importing components.
+    Find the first fixed-config match, including approved FileSet defaults.
 
     Parameters
     ----------
@@ -135,9 +140,14 @@ def find_entry(
         Required component role.
     catalog : PlannerCatalog
         Human-approved catalog, searched in configured order.
+    raw : bool, default=False
+        Use import-free comparison for raw authorization only. Otherwise extra
+        fields must match their omitted typed FileSet defaults, using the same
+        decision as admission. Only already matched human paths may be loaded.
     defer_defaults : bool, default=False
-        Ignore extra fixed fields for candidate selection only. The caller must
-        collect them with ``check_catalog`` and check their typed defaults.
+        In raw mode, ignore extra fixed fields for candidate selection only.
+        The caller must collect them with ``check_catalog`` and check their
+        typed defaults before resolving or snapshotting references.
 
     Returns
     -------
@@ -145,6 +155,7 @@ def find_entry(
         First same-kind/path entry whose fixed configuration matches after
         normalization and removal of that entry's top-level settable keys
         from the reference. Matching preserves scalar types at every depth.
+        Other extra fields are never ignored in the default mode.
 
     Examples
     --------
@@ -156,13 +167,21 @@ def find_entry(
     for entry in catalog.entries:
         if entry.kind == kind and entry.ref == ref.path:
             fixed = catalog_form(
-                {
-                    key: value
-                    for key, value in ref.config.items()
-                    if key not in entry.settable and (not defer_defaults or key in entry.config)
-                }
+                {key: value for key, value in ref.config.items() if key not in entry.settable}
             )
-            if json_equal(fixed, catalog_form(entry.config)):
+            expected = catalog_form(entry.config)
+            extra = tuple(sorted(fixed.keys() - expected.keys()))
+            compared = (
+                {key: value for key, value in fixed.items() if key in expected}
+                if not raw or defer_defaults
+                else fixed
+            )
+            if not json_equal(compared, expected):
+                continue
+            if raw or not extra:
+                return entry
+            site = RefSite(pointer="/ref", kind=kind, ref=ref)
+            if not _check_catalog_defaults([(site, entry, extra)])[0]:
                 return entry
     return None
 
@@ -202,7 +221,7 @@ def check_catalog(
     >>> check_catalog(site, PlannerCatalog(), overrides={})
     ["/policy: demo:Policy is not in the planner catalog for kind 'policy'"]
     """
-    entry = find_entry(site.ref, site.kind, catalog, defer_defaults=deferred is not None)
+    entry = find_entry(site.ref, site.kind, catalog, raw=True, defer_defaults=deferred is not None)
     if entry is None:
         entry = next(
             (e for e in catalog.entries if e.kind == site.kind and e.ref == site.ref.path),
@@ -374,7 +393,7 @@ def _diagnostic_pointers(sites: Sequence[RefSite], catalog: PlannerCatalog) -> d
         if parent is None:
             pointers[site.pointer] = site.pointer
             continue
-        entry = find_entry(parent.ref, parent.kind, catalog) or next(
+        entry = find_entry(parent.ref, parent.kind, catalog, raw=True) or next(
             (e for e in catalog.entries if e.ref == parent.ref.path and e.kind == parent.kind),
             None,
         )

@@ -1918,3 +1918,144 @@ def test_snapshot_refuses_shape_change_in_reference_mapping(
         "field 'children': validation changed the shape of a file or reference mapping"
     ]
     assert_secret_absent(caught.value, BOUNDARY_SECRET)
+
+
+@pytest.mark.parametrize("position", [0, 1])
+def test_snapshot_union_ref_positions_survive_deleted_source(
+    position: int, tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    source = tmp_path / "judge.py"
+    source.write_text("private")
+    child = {"path": "_fakes.admission:DefaultScriptJudge", "config": {"command": ["score"]}}
+    payload: list[Any] = ["label", "label"]
+    payload[position] = child
+    ref = Ref(path="_fakes.admission:UnionRefsTool", config={"payload": payload})
+    frozen_ref = snapshot_ref(ref, tmp_path, artifacts)
+    expected = {"globs": ["judge.py"], "manifest": {"judge.py": sha256_hex(b"private")}}
+    assert frozen_ref.config["payload"][position]["config"]["files"] == expected
+    assert frozen_ref.config["payload"][1 - position] == "label"
+    plan = _boundary_plan(ref, 0, False)
+    plan._base_dir = tmp_path
+    admitted, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    assert admitted.teams[0].agents[0].tool == frozen_ref
+    source.unlink()
+    for restored in (
+        Plan.model_validate_json(admitted.model_dump_json()),
+        Plan.loads(admitted.dumps(), base_dir=tmp_path),
+    ):
+        restored._base_dir = tmp_path
+        readmitted, warnings = admit_revision(restored, RunConfig(), artifacts)
+        assert warnings == []
+        assert readmitted.teams[0].agents[0].tool == frozen_ref
+
+
+@pytest.mark.anyio
+async def test_admitted_default_tool_retains_identity_at_consumers(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from dataclasses import fields
+    from unittest.mock import MagicMock
+
+    from swarm_arena._agent.manager import Manager
+    from swarm_arena._agent.watchdog import Watchdog
+    from swarm_arena._board.base import BoardView
+    from swarm_arena._engine.manifest import build_manifest
+    from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
+    from swarm_arena._model.board_types import Frontier
+    from swarm_arena._model.results import AgentStatus
+    from swarm_arena._model.tooling import ParentRef
+    from swarm_arena._planning.catalog_check import find_entry
+    from swarm_arena._tooling.staging import fixed_config, plan_tool_stage, tool_identity
+
+    (tmp_path / "tool.py").write_text("tool source")
+    ref = Ref(
+        path="_fakes.admission:DefaultFilesTool",
+        config={"command": ["python", "tool.py"], "editable": ["work.txt"]},
+    )
+    raw = _boundary_plan(ref, 0, False)
+    config = _boundary_catalog(raw, {})
+    entries = [
+        entry.model_copy(update={"settable": {"tuning": {"type": "integer"}}})
+        if entry.ref == ref.path
+        else entry
+        for entry in config.planner_catalog.entries
+    ]
+    config = config.model_copy(update={"planner_catalog": PlannerCatalog(entries=entries)})
+    entry = next(entry for entry in entries if entry.ref == ref.path)
+    plans: list[Plan] = []
+    runtimes = []
+    for tuning in (1, 2):
+        variant = Ref(path=ref.path, config={**ref.config, "tuning": tuning})
+        plan = stamp(_boundary_plan(variant, 0, False), origin="llm", parent=None)
+        plan._base_dir = tmp_path
+        admitted, warnings = admit_revision(plan, config, artifacts)
+        assert warnings == []
+        plans.append(admitted)
+        team = admitted.teams[0]
+        spec = team.agents[0]
+        assert find_entry(spec.tool, "tool", config.planner_catalog) is entry
+        assert "tuning" not in fixed_config(spec.tool, entry)
+        slot = AgentSlot(
+            address=f"{admitted.goal.id}/{team.name}/{spec.name}",
+            team=team,
+            spec=spec,
+            manager=spec.manager.build(Manager),
+            tool_ref=spec.tool,
+            goal=admitted.goal,
+            goal_key=admitted.goal.key(),
+            part=None,
+            notes="",
+            watchdog=Watchdog(config.limits),
+            status=AgentStatus.ACTIVE,
+        )
+        frontier = Frontier()
+        view = MagicMock(spec=BoardView)
+        view.goal = slot.goal_key
+        view.frontier = frontier
+        view.leaderboard.return_value = []
+        view.learnings.return_value = []
+        deps = MagicMock(
+            spec=EngineDeps, **{field.name: MagicMock() for field in fields(EngineDeps)}
+        )
+        deps.config = config
+        deps.run_id = "identity-run"
+        deps.board.snapshot.return_value = view
+        runner = RoundRunner(
+            deps,
+            goal_id=admitted.goal.id,
+            plan=admitted,
+            agents=[slot],
+            round_spec=RoundSpec(),
+            rounds_left=1,
+        )
+        runtime = await runner._runtime(slot, 1, frontier, frozenset(), {})
+        assert runtime.catalog_entry is entry
+        assert runtime.tool_identity == tool_identity(spec.tool, entry)
+        runtimes.append(runtime)
+    assert runtimes[0].tool_identity == runtimes[1].tool_identity
+    manifest = build_manifest(run_id="identity-run", config=config, plans=plans, capacity=None)
+    assert len(manifest["tools"]) == 1
+    assert manifest["tools"][0]["identity"] == runtimes[0].tool_identity
+    digest = artifacts.put_bytes(b"parent edit")
+    stage, overlay, warnings = plan_tool_stage(
+        goal_files={},
+        tool_files=runtimes[1].tool._own_files(),
+        editable=["work.txt"],
+        protected=frozenset({"tool.py"}),
+        private_paths=frozenset(),
+        parents=[
+            ParentRef(
+                candidate_id="c1",
+                run_id="identity-run",
+                tool_identity=runtimes[0].tool_identity,
+                overlay={"work.txt": digest},
+            )
+        ],
+        receiving_identity=runtimes[1].tool_identity,
+        edits={},
+        request_json=None,
+    )
+    assert warnings == []
+    assert overlay == {"work.txt": digest}
+    assert stage.root["work.txt"] == digest
