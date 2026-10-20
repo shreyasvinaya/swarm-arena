@@ -172,7 +172,19 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> view.get_learning("L-1").title  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Learning
+        >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+        ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+        >>> board.put_learning(learning, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.get_learning("L-1").title
         'Use the baseline'
         """
 
@@ -200,7 +212,20 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> view.get_candidate("c-1").id  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.get_candidate("c-1").id
         'c-1'
         """
 
@@ -228,7 +253,20 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> view.scores("c-1")  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.scores("c-1")
         []
         """
 
@@ -256,7 +294,20 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> view.lineage("c-1").parents("c-1")  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.lineage("c-1").parents("c-1")
         []
         """
 
@@ -284,7 +335,13 @@ class _Reads(ABC):
 
         Examples
         --------
-        >>> view.leaderboard(view.goal, judge="program")  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena import Goal
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.leaderboard(view.goal, judge="program")
         []
         """
 
@@ -350,7 +407,14 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.open("r", "/runs", ["demo"])  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+
+        >>> board.open("r", "/runs", ["demo"])
         """
 
     def close(self) -> None:
@@ -359,7 +423,14 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.close()  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+
+        >>> board.close()
         """
 
     @abstractmethod
@@ -378,7 +449,18 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.put_candidate(candidate, epoch=1, seq=4)  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+            >>> from swarm_arena.board import Candidate
+            >>> from swarm_arena.tool import ToolOutput, ToolRequest
+            >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+            ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+
+        >>> board.put_candidate(candidate, epoch=1, seq=4)
         """
 
     @abstractmethod
@@ -397,7 +479,17 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.put_score(score, epoch=1, seq=5)  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+            >>> from swarm_arena import Score
+            >>> score = Score(id="s-1", candidate_id="c-1", judge="program",
+            ...     rubric_hash="r", panel_hash="p", key=(1.0,))
+
+        >>> board.put_score(score, epoch=1, seq=5)
         """
 
     @abstractmethod
@@ -416,7 +508,17 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.put_learning(learning, epoch=1, seq=6)  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+            >>> from swarm_arena.board import Learning
+            >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+            ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+
+        >>> board.put_learning(learning, epoch=1, seq=6)
         """
 
     @abstractmethod
@@ -447,7 +549,16 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.put_decision("g", 1, decision, epoch=1, seq=7)  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+            >>> from swarm_arena.planning import Decision
+            >>> decision = Decision(prune={"search/a": "stalled"}, policy="patience")
+
+        >>> board.put_decision("g", 1, decision, epoch=1, seq=7)
         """
 
     @abstractmethod
@@ -462,7 +573,14 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.frontier().marks  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+
+        >>> board.frontier().marks
         []
         """
 
@@ -490,6 +608,16 @@ class Board(Configurable, _Reads):
 
         Examples
         --------
-        >>> board.snapshot(key, board.frontier()).goal == key  # doctest: +SKIP
+        With a board supplied by the run engine:
+
+        .. Standalone in-memory setup for the executable example.
+
+            >>> from swarm_arena._board.run_board import RunBoard
+            >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+            >>> from swarm_arena import Goal
+            >>> key = Goal(id="g", namespace="n").key()
+            >>> board.register_goal(key, "g", None)
+
+        >>> board.snapshot(key, board.frontier()).goal == key
         True
         """

@@ -1,14 +1,20 @@
+import sys
+import threading
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
+import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, PartSpec, Plan, Score
+from swarm_arena._board import run_board
 from swarm_arena._board.run_board import RunBoard
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
-from swarm_arena.board import Candidate, Frontier, Learning
+from swarm_arena.board import BoardView, Candidate, Frontier, Learning
 from swarm_arena.planning import Decision
 from swarm_arena.tool import ToolOutput, ToolRequest
 
@@ -186,6 +192,79 @@ def test_search_is_case_insensitive_substring_newest_first(board: RunBoard) -> N
     assert board.search_learnings("other", "log") == []
 
 
+@pytest.mark.parametrize("snapshot", [False, True], ids=["live", "view"])
+def test_search_filters_goal_before_limit(board: RunBoard, snapshot: bool) -> None:
+    key = Goal(id="alias", namespace="n").key()
+    board.register_goal(key, "g", None)
+    board.put_learning(_learning("L-own", title="Baseline"), epoch=1, seq=1)
+    board.put_learning(_learning("L-other", goal_id="g2", title="Baseline"), epoch=1, seq=2)
+    reader = board.snapshot(key, _frontier()) if snapshot else board
+    assert [x.id for x in reader.search_learnings("n", "baseline", goal=key, limit=1)] == ["L-own"]
+    assert [x.id for x in reader.search_learnings("n", "baseline", limit=1)] == ["L-other"]
+
+
+async def test_worker_snapshot_interleaves_loop_writes(board: RunBoard) -> None:
+    board.put_learning(_learning("L-1"), epoch=1, seq=1)
+    board.put_learning(_learning("L-2"), epoch=1, seq=2)
+    board.put_candidate(_c("c-1", parent_ids=["original"]), epoch=1, seq=3)
+    board.put_score(_score("s-1", "c-1", 1), epoch=1, seq=4)
+    frontier = board.frontier()
+    entered, release = anyio.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    views: list[BoardView] = []
+
+    def trace(frame: FrameType, event: str, arg: Any) -> Any:
+        # Pause the ordinary position iterator after its first entry is obtained.
+        if (
+            event == "line"
+            and frame.f_code.co_filename == run_board.__file__
+            and frame.f_code.co_name == "<setcomp>"
+            and "position" in frame.f_locals
+            and not entered.is_set()
+        ):
+            anyio.from_thread.run_sync(entered.set)
+            if not release.wait(30):
+                raise TimeoutError("snapshot synchronization timeout")
+        return trace
+
+    def snapshot() -> None:
+        assert threading.get_ident() != loop_thread
+        sys.settrace(trace)
+        try:
+            views.append(board.snapshot(KEY, frontier))
+        finally:
+            sys.settrace(None)
+
+    async def take_snapshot() -> None:
+        await anyio.to_thread.run_sync(snapshot)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(take_snapshot)
+        try:
+            with anyio.fail_after(30):
+                await entered.wait()
+            assert threading.get_ident() == loop_thread
+            board.put_learning(_learning("L-3", goal_id="g2"), epoch=1, seq=5)
+            board.put_candidate(_c("c-2"), epoch=1, seq=6)
+            board.put_candidate(_c("c-1", parent_ids=["replacement"]), epoch=1, seq=7)
+            board.put_score(_score("s-1", "c-1", 2), epoch=1, seq=8)
+            board.register_goal(Goal(id="later", namespace="n").key(), "later", None)
+            board.put_decision("g", 1, Decision(policy="keep"), epoch=1, seq=9)
+        finally:
+            release.set()
+    view = views[0]
+    assert [x.id for x in view.learnings("n")] == ["L-2", "L-1"]
+    assert view.get_candidate("c-1").parent_ids == ["original"]
+    assert view.scores("c-1")[0].key == (1.0,)
+    with pytest.raises(KeyError):
+        view.get_candidate("c-2")
+    assert board.get_candidate("c-1").parent_ids == ["replacement"]
+    assert board.get_learning("L-3").goal_id == "g2"
+    later = board.snapshot(KEY, frontier)
+    assert later.get_candidate("c-2").id == "c-2"
+    assert later.scores("c-1")[0].key == (2.0,)
+
+
 def test_learnings_relevance_order(board: RunBoard) -> None:
     for seq, (id, changes) in enumerate(
         [
@@ -283,6 +362,10 @@ def test_from_state_equals_fed_board(tmp_path: Path) -> None:
         judges=[],
         parts=[PartSpec(name="p", goal=Goal(id="sub", namespace="n"))],
     )
+    decisions = [
+        Decision(policy="keep", prune={"search/a": "stalled"}),
+        Decision(policy="stop", prune={"search/b": "done"}, no_result="exhausted"),
+    ]
     payloads = [
         ("plan_revision", {"plan": plan.model_dump(mode="json"), "origin": "human"}),
         ("tool_end", {"candidate": _c("c-1").model_dump(mode="json")}),
@@ -290,7 +373,10 @@ def test_from_state_equals_fed_board(tmp_path: Path) -> None:
         ("score", {"score": _score("s-1", "c-1", 2).model_dump(mode="json")}),
         ("score", {"score": _score("s-2", "c-part", 3).model_dump(mode="json")}),
         ("learning", {"learning": _learning("L-1").model_dump(mode="json")}),
-        ("decision", {"round": 1, "decision": Decision(policy="keep").model_dump(mode="json")}),
+        *[
+            ("decision", {"round": round, "decision": decision.model_dump(mode="json")})
+            for round, decision in enumerate(decisions, 1)
+        ],
     ]
     events = [
         Event(
@@ -321,7 +407,20 @@ def test_from_state_equals_fed_board(tmp_path: Path) -> None:
     for learning in state.learnings.values():
         epoch, seq = state.positions[learning.id]
         fed.put_learning(learning, epoch=epoch, seq=seq)
-    fed.put_decision("g", 1, Decision(policy="keep"), epoch=1, seq=7)
+    for round, decision in enumerate(decisions, 1):
+        fed.put_decision("g", round, decision, epoch=1, seq=6 + round)
+    expected = list(enumerate(decisions, 1))
+    assert fed._decisions == {"g": expected}
+    assert rebuilt._decisions == fed._decisions
+    decisions[0].prune.clear()
+    state.goals["g"].decisions[1][1].prune.clear()
+    assert fed._decisions["g"][0][1].prune == {"search/a": "stalled"}
+    assert rebuilt._decisions["g"][1][1].prune == {"search/b": "done"}
+    fed._decisions["g"][0][1].prune.clear()
+    assert rebuilt._decisions["g"][0][1].prune == {"search/a": "stalled"}
+    state.goals["g"].decisions.clear()
+    fed._decisions["g"].pop()
+    assert [round for round, _ in rebuilt._decisions["g"]] == [1, 2]
     for key in (KEY, PART_KEY):
         for seq in (2, 4, 9):
             left, right = [b.snapshot(key, _frontier(seq, root=root)) for b in (fed, rebuilt)]

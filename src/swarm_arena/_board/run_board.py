@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from threading import Lock
 
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.frontier import build_frontier
@@ -112,7 +113,12 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> board.best(key, 5, judge="program")  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena import Goal
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> board.best(key, 5, judge="program")
         []
         """
         pairs = self._pairs(goal, judge=judge, run_id=run_id, part=part, fidelity=fidelity)
@@ -202,15 +208,19 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> board.search_learnings("n", "baseline", tags=["fit"])  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> board.search_learnings("n", "baseline", tags=["fit"])
         []
         """
         self._namespace(namespace, goal)
         query, wanted = query.casefold(), set(tags)
+        goal_id = self._group(goal)[0] if goal is not None else None
         items = [
             item
             for item in self._records.learnings.values()
             if item.namespace == namespace
+            and (goal is None or item.goal_id == goal_id)
             and not item.hidden
             and wanted.issubset(item.tags)
             and (query in item.title.casefold() or query in item.text.casefold())
@@ -241,7 +251,19 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> view.get_learning("L-1").id  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Learning
+        >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+        ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+        >>> board.put_learning(learning, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.get_learning("L-1").id
         'L-1'
         """
         item = self._records.learnings[id]
@@ -273,7 +295,20 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> view.get_candidate("c-1").id  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.get_candidate("c-1").id
         'c-1'
         """
         candidate = self._records.candidates[id]
@@ -299,7 +334,20 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> view.scores("c-1")  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.scores("c-1")
         []
         """
         self.get_candidate(candidate_id)
@@ -323,7 +371,20 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> view.lineage("c-1").root  # doctest: +SKIP
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> from swarm_arena._journal.lease import Head
+        >>> head = Head(epoch=1, seq=9, segment="journal/e1-9.jsonl")
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.lineage("c-1").root
         'c-1'
         """
         root = self.get_candidate(candidate_id)
@@ -363,7 +424,13 @@ class _MemoryReads:
 
         Examples
         --------
-        >>> view.leaderboard(view.goal, judge="program")  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena import Goal
+        >>> key = Goal(id="g", namespace="n").key()
+        >>> board.register_goal(key, "g", None)
+        >>> view = board.snapshot(key, board.frontier())
+        >>> view.leaderboard(view.goal, judge="program")
         []
         """
         return [
@@ -402,6 +469,10 @@ class RunBoard(_MemoryReads, Board):
     """
     Index one run's journaled records in memory without writing storage.
 
+    Registration and index publication share a lock with worker snapshot capture.
+    Snapshots filter and deep-copy the captured records after releasing the lock;
+    indexed records are owned copies that writers replace rather than mutate.
+
     Parameters
     ----------
     run_id : str
@@ -423,6 +494,7 @@ class RunBoard(_MemoryReads, Board):
         self._run_id = run_id
         self._run_root = run_root
         self._head = head
+        self._lock = Lock()
         self._records = _Records()
         self._decisions: dict[str, list[tuple[int, Decision]]] = {}
 
@@ -445,7 +517,8 @@ class RunBoard(_MemoryReads, Board):
         >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
         >>> board.register_goal(Goal(id="g", namespace="n").key(), "g", None)
         """
-        self._records.goals[key] = (goal_id, part)
+        with self._lock:
+            self._records.goals[key] = (goal_id, part)
 
     def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:
         """
@@ -462,10 +535,18 @@ class RunBoard(_MemoryReads, Board):
 
         Examples
         --------
-        >>> board.put_candidate(candidate, epoch=1, seq=1)  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="search",
+        ...     agent="a", round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> board.put_candidate(candidate, epoch=1, seq=1)
         """
-        self._records.candidates[candidate.id] = deepcopy(candidate)
-        self._records.positions[candidate.id] = (epoch, seq)
+        copied = deepcopy(candidate)
+        with self._lock:
+            self._records.candidates[candidate.id] = copied
+            self._records.positions[candidate.id] = (epoch, seq)
 
     def put_score(self, score: Score, *, epoch: int, seq: int) -> None:
         """
@@ -482,11 +563,18 @@ class RunBoard(_MemoryReads, Board):
 
         Examples
         --------
-        >>> board.put_score(score, epoch=1, seq=2)  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena import Score
+        >>> score = Score(id="s-1", candidate_id="c-1", judge="program",
+        ...     rubric_hash="r", panel_hash="p", key=(1.0,))
+        >>> board.put_score(score, epoch=1, seq=2)
         """
-        self._records.scores.pop(score.id, None)
-        self._records.scores[score.id] = deepcopy(score)
-        self._records.positions[score.id] = (epoch, seq)
+        copied = deepcopy(score)
+        with self._lock:
+            self._records.scores.pop(score.id, None)
+            self._records.scores[score.id] = copied
+            self._records.positions[score.id] = (epoch, seq)
 
     def put_learning(self, learning: Learning, *, epoch: int, seq: int) -> None:
         """
@@ -503,10 +591,17 @@ class RunBoard(_MemoryReads, Board):
 
         Examples
         --------
-        >>> board.put_learning(learning, epoch=1, seq=3)  # doctest: +SKIP
+        >>> from swarm_arena._board.run_board import RunBoard
+        >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
+        >>> from swarm_arena.board import Learning
+        >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
+        ...     round=1, author="human:a", title="Use the baseline", text="Start here")
+        >>> board.put_learning(learning, epoch=1, seq=3)
         """
-        self._records.learnings[learning.id] = deepcopy(learning)
-        self._records.positions[learning.id] = (epoch, seq)
+        copied = deepcopy(learning)
+        with self._lock:
+            self._records.learnings[learning.id] = copied
+            self._records.positions[learning.id] = (epoch, seq)
 
     def put_decision(
         self,
@@ -538,7 +633,9 @@ class RunBoard(_MemoryReads, Board):
         >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
         >>> board.put_decision("g", 1, Decision(), epoch=1, seq=4)
         """
-        self._decisions.setdefault(goal_id, []).append((round, deepcopy(decision)))
+        copied = deepcopy(decision)
+        with self._lock:
+            self._decisions.setdefault(goal_id, []).append((round, copied))
 
     def frontier(self) -> Frontier:
         """
@@ -554,7 +651,8 @@ class RunBoard(_MemoryReads, Board):
         >>> RunBoard(run_id="r", run_root="/runs", head=lambda: None).frontier().marks
         []
         """
-        head = self._head()
+        with self._lock:
+            head = self._head()
         return build_frontier(
             [] if head is None else [(self._run_id, self._run_root, head)], [], []
         )
@@ -589,7 +687,15 @@ class RunBoard(_MemoryReads, Board):
         >>> board.snapshot(key, board.frontier()).best(key, 1, judge="program")
         []
         """
-        self._group(goal)
+        with self._lock:
+            self._group(goal)
+            records = _Records(
+                goals=self._records.goals.copy(),
+                candidates=self._records.candidates.copy(),
+                scores=self._records.scores.copy(),
+                learnings=self._records.learnings.copy(),
+                positions=self._records.positions.copy(),
+            )
         mark = next(
             (
                 mark
@@ -598,21 +704,20 @@ class RunBoard(_MemoryReads, Board):
             ),
             None,
         )
-        records = _Records(goals=self._records.goals.copy())
         if mark is not None:
             visible = {
                 id
-                for id, position in self._records.positions.items()
+                for id, position in records.positions.items()
                 if position <= (mark.epoch, mark.seq)
             }
-            records.candidates = {
-                id: c for id, c in self._records.candidates.items() if id in visible
-            }
-            records.scores = {id: s for id, s in self._records.scores.items() if id in visible}
+            records.candidates = {id: c for id, c in records.candidates.items() if id in visible}
+            records.scores = {id: s for id, s in records.scores.items() if id in visible}
             records.learnings = {
-                id: item for id, item in self._records.learnings.items() if id in visible
+                id: item for id, item in records.learnings.items() if id in visible
             }
-            records.positions = {id: self._records.positions[id] for id in visible}
+            records.positions = {id: records.positions[id] for id in visible}
+        else:
+            records = _Records(goals=records.goals)
         return _RunView(goal, frontier, deepcopy(records))
 
     @classmethod
@@ -665,7 +770,7 @@ class RunBoard(_MemoryReads, Board):
         for learning in sorted(state.learnings.values(), key=lambda item: state.positions[item.id]):
             epoch, seq = state.positions[learning.id]
             board.put_learning(learning, epoch=epoch, seq=seq)
-        board._decisions = {
-            goal_id: deepcopy(goal.decisions) for goal_id, goal in state.goals.items()
-        }
+        decisions = {goal_id: deepcopy(goal.decisions) for goal_id, goal in state.goals.items()}
+        with board._lock:
+            board._decisions = decisions
         return board

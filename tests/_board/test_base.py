@@ -1,8 +1,12 @@
+import doctest
 from abc import ABC
 from collections.abc import Sequence
+from types import ModuleType
 
 import pytest
 
+from swarm_arena import board as board_facade
+from swarm_arena._board import base, run_board
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.run_board import RunBoard
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
@@ -10,6 +14,17 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.planning_types import Decision
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate, Learning, Score
+
+
+@pytest.mark.parametrize("module", [base, run_board, board_facade])
+def test_in_memory_examples_are_not_skipped(module: ModuleType) -> None:
+    skipped = [
+        test.name
+        for test in doctest.DocTestFinder().find(module)
+        for example in test.examples
+        if example.options.get(doctest.SKIP)
+    ]
+    assert skipped == []
 
 
 def test_abstract_methods_are_required() -> None:
