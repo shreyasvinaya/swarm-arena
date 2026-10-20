@@ -989,3 +989,73 @@ class FailLaterRoundCheck(Check):
             passed=candidate.round == 1,
             reasons=[] if candidate.round == 1 else ["later round failed"],
         )
+
+
+def line_value(a: float) -> dict[str, float]:
+    """
+    Return a line evaluation using the joiner's value key.
+
+    Parameters
+    ----------
+    a : float
+        Value to evaluate.
+
+    Returns
+    -------
+    dict[str, float]
+        Numeric output suitable for scoring and joining.
+
+    Examples
+    --------
+    >>> line_value(3.0)
+    {'value': 3.0}
+    """
+    return {"value": a}
+
+
+def part_value(part: str, v: float) -> dict[str, float]:
+    """
+    Return one part's value for a later sum join.
+
+    Parameters
+    ----------
+    part : str
+        Part identifier retained in the recorded request.
+    v : float
+        Numeric value contributed by this part.
+
+    Returns
+    -------
+    dict[str, float]
+        Part output using the same key as the joined result.
+
+    Examples
+    --------
+    >>> part_value('a', 12.0)
+    {'value': 12.0}
+    """
+    return {"value": v}
+
+
+def score_value(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Prefer candidates with larger values, for either a part or the main goal.
+
+    Parameters
+    ----------
+    goal : Goal
+        Main or part goal being scored.
+    candidate : Candidate
+        Candidate whose output contains a numeric value.
+
+    Returns
+    -------
+    Score
+        Maximization score on the shared value scale.
+
+    Examples
+    --------
+    >>> score_value(GOAL, cand(data={'value': 12.0})).key
+    (12.0,)
+    """
+    return Score.maximize(candidate.output.data["value"])
