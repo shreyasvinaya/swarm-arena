@@ -1,17 +1,21 @@
 import dataclasses
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import anyio
 import pytest
 from _fakes.engine import EngineEnv, take_over_retrying
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, write_then_sleep
 
 from swarm_arena import (
     AgentSpec,
     FunctionTool,
     Goal,
+    PartSpec,
     Plan,
     Ref,
     RoundSpec,
@@ -24,6 +28,7 @@ from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+from swarm_arena._engine import round as round_module
 from swarm_arena._engine.round import AgentSlot, RoundRunner
 from swarm_arena._errors import Fenced
 from swarm_arena._model.board_types import Frontier
@@ -32,6 +37,8 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.results import AgentStatus
 from swarm_arena._model.tooling import Estimate, RunStatus, ToolOutput
+from swarm_arena._scoring.check import Check
+from swarm_arena._tooling.tool import Tool
 from swarm_arena.executor import Executor, Job
 
 PLAN = Plan(
@@ -68,20 +75,54 @@ def _runner(name: str) -> AgentSlot:
     return _scripted(name, [{"inputs": {"x": 1.0}}])
 
 
-class _Sleeper(Manager):
-    def __init__(self, spans: list[tuple[float, float]]) -> None:
+class _BarrierManager(Manager):
+    def __init__(
+        self, starts: list[float], spans: list[tuple[float, float]], both_entered: anyio.Event
+    ) -> None:
         super().__init__()
-        self.spans = spans
+        self.starts, self.spans, self.both_entered = starts, spans, both_entered
 
     async def run_round(self, ctx: AgentContext) -> RoundReport:
         start = anyio.current_time()
-        await anyio.sleep(0.5)
+        self.starts.append(start)
+        if len(self.starts) == 2:
+            self.both_entered.set()
+        await self.both_entered.wait()
         self.spans.append((start, anyio.current_time()))
         return RoundReport(summary="")
 
 
-def _sleeper(name: str, spans: list[tuple[float, float]]) -> AgentSlot:
-    return _with_manager(name, _Sleeper(spans))
+class _RoundTime:
+    """Advance only the runner's clock, leaving executor and journal timing real."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.offset = 0.0
+        self.changed = anyio.Event()
+        self.ticked = anyio.Event()
+        self.last_tick = float("-inf")
+        monkeypatch.setattr(round_module, "anyio", self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(anyio, name)
+
+    def current_time(self) -> float:
+        return anyio.current_time() + self.offset
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+        self.changed.set()
+        self.changed = anyio.Event()
+
+    async def sleep_until(self, deadline: float) -> None:
+        self.last_tick = self.current_time()
+        self.ticked.set()
+        self.ticked = anyio.Event()
+        with anyio.move_on_after(max(0, deadline - self.current_time())):
+            await self.changed.wait()
+
+    async def wait_past(self, deadline: float) -> None:
+        while self.last_tick < deadline:
+            await self.ticked.wait()
 
 
 class _Raiser(Manager):
@@ -146,6 +187,153 @@ def _round(env: EngineEnv, agents: Sequence[AgentSlot], **kw: Any) -> RoundRunne
     )
 
 
+def _construction_round(
+    env: EngineEnv, component: type[Tool] | type[Check], agents: Sequence[AgentSlot]
+) -> RoundRunner:
+    slot = agents[0]
+    plan = PLAN
+    if component is Tool:
+        slot.tool_ref = slot.tool_ref.model_copy(update={"name": "faulty"})
+    else:
+        part = PartSpec(
+            name="p",
+            goal=Goal(id="sub", namespace="n"),
+            checks=[Ref(path="_fakes.tools:AlwaysPass", name="faulty")],
+        )
+        plan = PLAN.model_copy(update={"parts": [part]})
+        slot.team = slot.team.model_copy(update={"part": "p"})
+        slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
+    return RoundRunner(
+        env.deps, goal_id="g", plan=plan, agents=agents, round_spec=RoundSpec(), rounds_left=1
+    )
+
+
+@pytest.mark.parametrize("component", [Tool, Check], ids=["tool", "check"])
+@pytest.mark.parametrize("stop", ["deadline", "stop_now", "fenced"])
+async def test_runtime_constructor_is_supervised(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, component: type[Tool] | type[Check], stop: str
+) -> None:
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    peer_ran = anyio.Event()
+    manager_calls: list[str] = []
+    original = Ref.build
+
+    def blocked(self: Ref, base: type[Any]) -> Any:
+        if self.name == "faulty" and base is component:
+            entered.set()
+            # The safety bound also releases the old synchronous check build on RED.
+            release.wait(3)
+            returned.set()
+        return original(self, base)
+
+    class Probe(Manager):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            manager_calls.append(self.name)
+            peer_ran.set()
+            return RoundReport(summary="peer ran")
+
+    e = env.with_limits(round_timeout_s=0.5 if stop == "deadline" else 60.0)
+    runner = _construction_round(
+        e, component, [_with_manager("a", Probe("a")), _with_manager("b", Probe("b"))]
+    )
+    monkeypatch.setattr(Ref, "build", blocked)
+
+    async def trigger() -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 1)
+        await peer_ran.wait()
+        if stop == "stop_now":
+            e.deps.stops.stop_now = True
+        elif stop == "fenced":
+            e.deps.journal.fenced.set()
+
+    try:
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(trigger)
+                if stop == "fenced":
+                    with pytest.raises(Fenced):
+                        await runner.run(1)
+                else:
+                    out = await runner.run(1)
+                    assert out.statuses == {
+                        "t/a": AgentStatus.FINISHED,
+                        "t/b": AgentStatus.FINISHED,
+                    }
+                    assert out.reasons["t/a"] == "runtime preparation cancelled"
+                    assert len(e.events("agent_status")) == 2
+        assert manager_calls == ["b"]
+        assert not returned.is_set()
+        before = e.event_types()
+        release.set()
+        assert await anyio.to_thread.run_sync(returned.wait, 1)
+        await anyio.lowlevel.checkpoint()
+        assert manager_calls == ["b"]
+        assert e.event_types() == before
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("component", [Tool, Check], ids=["tool", "check"])
+async def test_runtime_constructor_error_is_private_to_slot(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, component: type[Tool] | type[Check]
+) -> None:
+    secret = str(uuid4())
+    original = Ref.build
+
+    def raising(self: Ref, base: type[Any]) -> Any:
+        if self.name == "faulty" and base is component:
+            error = RuntimeError(secret)
+            error.add_note(secret)
+            raise error from ValueError(secret)
+        return original(self, base)
+
+    runner = _construction_round(env, component, [_runner("a"), _runner("b")])
+    monkeypatch.setattr(Ref, "build", raising)
+    try:
+        out = await runner.run(1)
+    except Exception as error:
+        assert_secret_absent(error, secret, sanitized=True)
+        raise
+    assert out.statuses == {"t/a": AgentStatus.FINISHED, "t/b": AgentStatus.FINISHED}
+    assert out.reasons == {"t/a": "agent error: RuntimeError", "t/b": ""}
+    assert [candidate.agent for candidate in out.candidates] == ["b"]
+    assert [event.agent for event in env.events("tool_start")] == ["b"]
+    assert_secret_absent(RuntimeError(repr(out)), secret)
+    assert_secret_absent(
+        RuntimeError("".join(event.model_dump_json() for event in env.events("agent_status"))),
+        secret,
+    )
+
+
+@pytest.mark.parametrize("component", [Tool, Check], ids=["tool", "check"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_runtime_constructor_fenced_propagates_bare(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    component: type[Tool] | type[Check],
+    nested: bool,
+) -> None:
+    original = Ref.build
+
+    def fenced(self: Ref, base: type[Any]) -> Any:
+        if self.name == "faulty" and base is component:
+            error = Fenced("run ownership lost")
+            if nested:
+                raise ExceptionGroup("construction failed", [error])
+            raise error
+        return original(self, base)
+
+    runner = _construction_round(env, component, [_runner("a")])
+    monkeypatch.setattr(Ref, "build", fenced)
+    with pytest.raises(Fenced):
+        await runner.run(1)
+    assert not env.events("agent_status")
+
+
 async def test_frontier_committed_before_any_tool_start(env: EngineEnv) -> None:
     await _round(env, [_runner("a"), _runner("b")]).run(1)
     types = env.event_types()
@@ -170,9 +358,17 @@ async def test_round_started_commits_with_its_frontier(
 
 
 async def test_managers_run_in_parallel(env: EngineEnv) -> None:
+    starts: list[float] = []
     spans: list[tuple[float, float]] = []
+    both_entered = anyio.Event()
     with anyio.fail_after(5):  # default round_timeout_s 14,400: the watchers must end
-        await _round(env, [_sleeper("a", spans), _sleeper("b", spans)]).run(1)
+        await _round(
+            env,
+            [
+                _with_manager(name, _BarrierManager(starts, spans, both_entered))
+                for name in ("a", "b")
+            ],
+        ).run(1)
     assert max(s for s, _ in spans) < min(e for _, e in spans)  # the two sleeps overlap
 
 
@@ -229,12 +425,21 @@ async def test_restarted_round_hands_on_its_resumed_entries_at_its_end(env: Engi
     assert out.repeat_entries == [(key, cx), (key, cb)]  # a's private pair joins at the round's end
 
 
-async def test_round_timeout_cancels_with_partial(env: EngineEnv, tmp_path: Path) -> None:
-    e = env.with_limits(
-        round_timeout_s=5.0
-    )  # frontier, reserve, and start commits take about 0.6 s
-    with anyio.fail_after(30):  # the tool sleeps 600 s; only the timeout ends it
-        out = await _round(e, [_slow_script("a", tmp_path / "m")]).run(1)
+async def test_round_timeout_cancels_with_partial(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _RoundTime(monkeypatch)
+    marker = tmp_path / "m"
+    e = env.with_limits(round_timeout_s=5.0)
+
+    async def expire_after_start() -> None:
+        await e.wait_for(marker)
+        clock.advance(5.0)
+
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(expire_after_start)
+            out = await _round(e, [_slow_script("a", marker)]).run(1)
     assert out.candidates[0].output.status == RunStatus.CANCELLED
     assert out.candidates[0].output.partial
     assert out.candidates[0].round == 1
@@ -242,15 +447,17 @@ async def test_round_timeout_cancels_with_partial(env: EngineEnv, tmp_path: Path
 
 async def test_run_budget_drains_then_cancels_inflight(env: EngineEnv, tmp_path: Path) -> None:
     marker = tmp_path / "m"
+    slot = _slow_script("a", marker)
+    slot.tool_ref = Ref.of(PyTool({"code": write_then_sleep(marker), "grace_s": 0.1}))
 
     async def budget_when_marker() -> None:
         await env.wait_for(marker)
         env.deps.stops.run_budget = True
 
-    with anyio.fail_after(40):
+    with anyio.fail_after(10):
         async with anyio.create_task_group() as tg:
             tg.start_soon(budget_when_marker)
-            out = await _round(env, [_slow_script("a", marker)]).run(1)
+            out = await _round(env, [slot]).run(1)
     c = out.candidates[0]
     assert c.output.status == RunStatus.CANCELLED
     assert c.output.partial is True
@@ -259,10 +466,7 @@ async def test_run_budget_drains_then_cancels_inflight(env: EngineEnv, tmp_path:
 
 async def test_run_budget_flag_is_never_cleared(env: EngineEnv) -> None:
     env.deps.stops.run_budget = True  # the ledger is not exhausted
-    spans: list[tuple[float, float]] = []
-    out = await _round(env, [_runner("a"), _sleeper("b", spans)]).run(
-        1
-    )  # the sleeper makes the watch tick
+    out = await _round(env, [_runner("a"), _scripted("b", [])]).run(1)
     assert out.candidates == []
     assert env.deps.stops.run_budget is True
 
@@ -306,11 +510,43 @@ async def test_queued_job_never_starts_after_admission_closes(
     assert Amount.model_validate(settle_b.payload["actual"]) == Amount()
 
 
-async def test_starved_agent(env: EngineEnv, tmp_path: Path) -> None:
+async def test_starved_agent(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _RoundTime(monkeypatch)
     e = env.with_executor(max_concurrent=1).with_limits(round_timeout_s=5.0)
-    out = await _round(
-        e, [_slow_script("a", tmp_path / "ma"), _slow_script("b", tmp_path / "mb")]
-    ).run(1)
+    started = anyio.Event()
+    both_submitted = anyio.Event()
+    submissions = 0
+    original = e.deps.executor.submit
+
+    async def submit(job: Job) -> ToolOutput:
+        nonlocal submissions
+        submissions += 1
+        if submissions == 2:
+            both_submitted.set()
+        return await original(job)
+
+    monkeypatch.setattr(e.deps.executor, "submit", submit)
+
+    async def observe(marker: Path) -> None:
+        await e.wait_for(marker)
+        started.set()
+
+    async def expire_after_start() -> None:
+        await started.wait()
+        await both_submitted.wait()
+        clock.advance(5.0)
+
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(observe, tmp_path / "ma")
+            tasks.start_soon(observe, tmp_path / "mb")
+            tasks.start_soon(expire_after_start)
+            out = await _round(
+                e, [_slow_script("a", tmp_path / "ma"), _slow_script("b", tmp_path / "mb")]
+            ).run(1)
+            tasks.cancel_scope.cancel()
     assert sorted(out.statuses.values()) == [AgentStatus.FINISHED, AgentStatus.STARVED]
     assert sum(p.exists() for p in (tmp_path / "ma", tmp_path / "mb")) == 1
 
@@ -355,6 +591,7 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
 
     errors: list[LimitReached] = []
     second_started = anyio.Event()
+    third_refused = anyio.Event()
 
     class PaidExecutor(_GateExecutor):
         async def submit(self, job: Job) -> ToolOutput:
@@ -363,7 +600,7 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
             assert job.request is not None
             if job.request.inputs["x"] == 2:
                 second_started.set()
-                await anyio.sleep(0.7)
+                await third_refused.wait()
             else:
                 await second_started.wait()
             return ToolOutput(status=RunStatus.OK, usage=Usage(usd=0.85))
@@ -376,6 +613,7 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
                     await ctx.run_tool({"x": 3})
                 except LimitReached as error:
                     errors.append(error)
+                    third_refused.set()
 
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(first_then_third)
@@ -401,6 +639,16 @@ async def test_agent_round_task_journaled(env: EngineEnv) -> None:
         "g/t/a#r1",
         "g/t/b#r1",
     ]
+
+
+async def test_agent_status_has_round_task_id(env: EngineEnv) -> None:
+    await _round(env, [_runner("a"), _raiser("b")]).run(2)
+    events = env.events("agent_status")
+    assert len(events) == 2
+    for event in events:
+        assert event.context_id == env.deps.run_id
+        assert event.task_id
+        assert event.task_id == event.payload["a2a"]["id"] == f"g/t/{event.agent}#r2"
 
 
 async def test_manager_round_runs_inside_its_llm_scope(env: EngineEnv) -> None:
@@ -451,7 +699,7 @@ async def test_fenced_manager_raises_bare_fenced(env: EngineEnv) -> None:
             raise Fenced("run ownership lost")
 
     with pytest.raises(Fenced):
-        await _round(env, [_with_manager("a", FencedManager()), _sleeper("b", [])]).run(1)
+        await _round(env, [_with_manager("a", FencedManager()), _scripted("b", [])]).run(1)
     assert env.events("agent_status") == []
 
 
@@ -688,7 +936,10 @@ async def test_budget_drain_uses_only_inflight_job_grace(
     assert out.candidates[0].output.status == RunStatus.CANCELLED
 
 
-async def test_cancellation_allows_executor_collection_after_grace(env: EngineEnv) -> None:
+async def test_cancellation_allows_executor_collection_after_grace(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _RoundTime(monkeypatch)
     entered = anyio.Event()
     delivered = anyio.Event()
 
@@ -702,7 +953,9 @@ async def test_cancellation_allows_executor_collection_after_grace(env: EngineEn
                 await anyio.sleep_forever()
             except anyio.get_cancelled_exc_class():
                 with anyio.CancelScope(shield=True):
-                    await anyio.sleep(5.5)
+                    after_grace = clock.current_time() + 5.5
+                    clock.advance(5.5)
+                    await clock.wait_past(after_grace)
                     await job.on_partial(
                         ToolOutput(
                             status=RunStatus.CANCELLED, partial=True, data={"collected": True}
@@ -857,15 +1110,36 @@ async def test_nested_fenced_manager_raises_bare_fenced(env: EngineEnv) -> None:
     assert env.events("agent_status") == []
 
 
-async def test_idle_manager_cancelled_without_collection_allowance(env: EngineEnv) -> None:
+async def test_idle_manager_cancelled_without_collection_allowance(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _RoundTime(monkeypatch)
+    entered, cancelled = anyio.Event(), anyio.Event()
+    original = Inflight.cancel_all
+
+    def signal_cancel(self: Inflight) -> None:
+        original(self)
+        cancelled.set()
+
+    monkeypatch.setattr(Inflight, "cancel_all", signal_cancel)
+
     class IdleManager(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
+            entered.set()
             await anyio.sleep_forever()
             return RoundReport(summary="")
 
-    e = env.with_limits(round_timeout_s=0.05)
-    with anyio.fail_after(8):
-        out = await _round(e, [_with_manager("a", IdleManager())]).run(1)
+    async def expire() -> None:
+        await entered.wait()
+        clock.advance(1.0)
+        await cancelled.wait()
+        clock.advance(5.0)
+
+    e = env.with_limits(round_timeout_s=1.0)
+    with anyio.fail_after(3):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(expire)
+            out = await _round(e, [_with_manager("a", IdleManager())]).run(1)
     assert out.statuses == {"t/a": AgentStatus.FINISHED}
 
 

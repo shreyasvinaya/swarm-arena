@@ -1,19 +1,50 @@
-import anyio
+from types import SimpleNamespace
 
+import anyio
+import pytest
+
+from swarm_arena._engine import stops as stops_module
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline, watch_stop_files
 from swarm_arena._store.local import LocalStore
 
 
-# tests/_engine/test_stops.py
-async def test_poll_reads_only_own_epoch(store: LocalStore) -> None:
+async def test_poll_reads_only_own_epoch(
+    store: LocalStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_poll, second_poll, next_poll = anyio.Event(), anyio.Event(), anyio.Event()
+    polls = 0
+
+    async def after_poll(interval_s: float) -> None:
+        nonlocal polls
+        assert interval_s == 0.05
+        polls += 1
+        if polls == 1:
+            first_poll.set()
+            await next_poll.wait()
+        else:
+            second_poll.set()
+            await anyio.sleep_forever()
+
+    monkeypatch.setattr(
+        stops_module, "anyio", SimpleNamespace(to_thread=anyio.to_thread, sleep=after_poll)
+    )
     store.create("control/stop-e1", b"")
+    store.create("control/stop-now-e1", b"")
     st = StopState()
-    with anyio.move_on_after(0.3):
-        await watch_stop_files(store, 2, st, interval_s=0.05)
-    assert not st.stop
-    store.create("control/stop-now-e2", b"")
-    with anyio.move_on_after(0.3):
-        await watch_stop_files(store, 2, st, interval_s=0.05)
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+
+            async def poll() -> None:
+                await watch_stop_files(store, 2, st, interval_s=0.05)
+
+            tasks.start_soon(poll)
+            await first_poll.wait()
+            assert not st.stop
+            assert not st.stop_now
+            store.create("control/stop-now-e2", b"")
+            next_poll.set()
+            await second_poll.wait()
+            tasks.cancel_scope.cancel()
     assert st.stop_now
     assert st.stop
 

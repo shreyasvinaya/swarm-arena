@@ -26,7 +26,7 @@ from swarm_arena._errors import Fenced
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._journal.a2a import agent_round_task, task_to_json
+from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.views import ViewWriter
@@ -290,6 +290,10 @@ class RoundRunner:
     """
     Run independent manager tasks against one committed round frontier.
 
+    Each slot prepares its components under live stop and deadline supervision.
+    A failed or abandoned preparation ends only that slot; its manager never
+    starts. User constructors run in abandonable daemon workers.
+
     Parameters
     ----------
     deps : EngineDeps
@@ -439,7 +443,9 @@ class RoundRunner:
             execution_ref=execution_ref,
             tool_identity=tool_identity(slot.tool_ref, entry),
             catalog_entry=entry,
-            checks=[(ref.component_name(), ref.build(Check)) for ref in checks],
+            checks=[
+                (ref.component_name(), await run_sync_daemon(ref.build, Check)) for ref in checks
+            ],
             view=view,
             own=[candidate for _, candidate in pairs],
             digest=build_digest(
@@ -497,7 +503,7 @@ class RoundRunner:
         self,
         inflight: Inflight,
         scopes: Sequence[anyio.CancelScope],
-        contexts: Sequence[_RoundContext],
+        contexts: Sequence[_RoundContext | None],
         deadline: float,
     ) -> None:
         drain_until: float | None = None
@@ -525,9 +531,17 @@ class RoundRunner:
                 # Collection is owned by the executor and may outlive process grace.
                 cancel_until = now + inflight.max_grace_s() + 5.0
                 inflight.cancel_all()
+            if cancel_until is not None:
+                for scope, ctx in zip(scopes, contexts, strict=True):
+                    if ctx is None:
+                        scope.cancel()
             if cancel_until is not None and now >= cancel_until:
                 for scope, ctx in zip(scopes, contexts, strict=True):
-                    if not ctx._running_tools or now >= cancel_until + BEFORE_KILL_TIMEOUT_S:
+                    if (
+                        ctx is None
+                        or not ctx._running_tools
+                        or now >= cancel_until + BEFORE_KILL_TIMEOUT_S
+                    ):
                         scope.cancel()
                 if now >= cancel_until + BEFORE_KILL_TIMEOUT_S:
                     return
@@ -599,29 +613,27 @@ class RoundRunner:
             self.started_runs = {**restored, **self.started_runs}
         private_paths = judge_private_paths(self.plan)
         parents = await self._parent_views(frontier)
-        runtimes = [
-            await self._runtime(slot, round, frontier, private_paths, parents) for slot in agents
-        ]
+        runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]
-        contexts = [
-            _RoundContext(rt, gate=self._gate, refresh=self._refresh_budget) for rt in runtimes
-        ]
+        contexts: list[_RoundContext | None] = [None for _ in agents]
         reasons: dict[str, str] = {}
         summaries: dict[str, str] = {}
         done = anyio.Event()
         remaining = len(agents)
 
-        async def manage(
-            slot: AgentSlot, rt: AgentRuntime, scope: anyio.CancelScope, ctx: _RoundContext
-        ) -> None:
+        async def manage(index: int, slot: AgentSlot) -> None:
             nonlocal remaining
             key = f"{slot.team.name}/{slot.spec.name}"
+            rt: AgentRuntime | None = None
             try:
-                with (
-                    scope,
-                    track_inflight(inflight),
-                    llm_scope(
+                with scopes[index], track_inflight(inflight):
+                    await anyio.lowlevel.checkpoint()
+                    rt = await self._runtime(slot, round, frontier, private_paths, parents)
+                    runtimes[index] = rt
+                    ctx = _RoundContext(rt, gate=self._gate, refresh=self._refresh_budget)
+                    contexts[index] = ctx
+                    with llm_scope(
                         LLMScope(
                             role="manager",
                             run_id=self.deps.run_id,
@@ -637,10 +649,9 @@ class RoundRunner:
                             tracing=self.deps.config.tracing,
                             cache=self.deps.config.cache,
                         )
-                    ),
-                ):
-                    report = await slot.manager.run_round(ctx)
-                    summaries[key] = report.summary
+                    ):
+                        report = await slot.manager.run_round(ctx)
+                        summaries[key] = report.summary
             except Fenced:
                 raise
             except Exception as error:
@@ -648,13 +659,19 @@ class RoundRunner:
                     isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None
                 ):
                     raise Fenced("run ownership lost") from None
-                reasons[key] = (
-                    "limit reached"
-                    if isinstance(error, LimitReached)
-                    else f"manager error: {type(error).__name__}"
-                )
+                if rt is None:
+                    reasons[key] = f"agent error: {type(error).__name__}"
+                else:
+                    reasons[key] = (
+                        "limit reached"
+                        if isinstance(error, LimitReached)
+                        else f"manager error: {type(error).__name__}"
+                    )
             finally:
-                slot.notes = rt.notes
+                if rt is None:
+                    reasons.setdefault(key, "runtime preparation cancelled")
+                else:
+                    slot.notes = rt.notes
                 remaining -= 1
                 if remaining == 0:
                     done.set()
@@ -664,8 +681,8 @@ class RoundRunner:
         try:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(self._watch, inflight, scopes, contexts, deadline)
-                for slot, rt, scope, ctx in zip(agents, runtimes, scopes, contexts, strict=True):
-                    tasks.start_soon(manage, slot, rt, scope, ctx)
+                for index, slot in enumerate(agents):
+                    tasks.start_soon(manage, index, slot)
                 await done.wait()
                 tasks.cancel_scope.cancel()
         except BaseExceptionGroup as errors:
@@ -675,34 +692,37 @@ class RoundRunner:
         if self.deps.journal.fenced.is_set():
             raise Fenced("run ownership lost")
         with anyio.move_on_after(self.deps.config.settle_timeout_s):
-            while any(rt.tranche.pending() for rt in runtimes):  # noqa: ASYNC110 - external call settlement
+            while any(rt.tranche.pending() for rt in runtimes if rt is not None):  # noqa: ASYNC110 - external call settlement
                 await anyio.sleep(0.05)
         for rt in runtimes:
-            await rt.tranche.close()
+            if rt is not None:
+                await rt.tranche.close()
         self._refresh_budget()
         candidates: list[Candidate] = []
         learnings: list[Learning] = []
         statuses: dict[str, AgentStatus] = {}
         for slot, rt in zip(agents, runtimes, strict=True):
             key = f"{slot.team.name}/{slot.spec.name}"
-            own_learnings = [item for item in rt.own if isinstance(item, Learning)]
-            recovered_ids = {candidate.id for candidate in rt.resumed}
-            candidates.extend(
-                item
-                for item in rt.own
-                if isinstance(item, Candidate) and item.id not in recovered_ids
-            )
-            learnings.extend(own_learnings)
-            reason = rt.watchdog.end_round(ran=rt.started_runs > 0)
+            own_learnings: list[Learning] = []
             slot.status = AgentStatus.FINISHED
-            if rt.counters.tool_runs and not rt.started_runs:
-                slot.status = AgentStatus.STARVED
-            if reason is not None:
-                slot.status = AgentStatus.WATCHDOG_STOPPED
-                reasons[key] = reason
-                self.deps.journal.append(
-                    self._agent_draft(slot, EventType.WATCHDOG, round, reason=reason)
+            if rt is not None:
+                own_learnings = [item for item in rt.own if isinstance(item, Learning)]
+                recovered_ids = {candidate.id for candidate in rt.resumed}
+                candidates.extend(
+                    item
+                    for item in rt.own
+                    if isinstance(item, Candidate) and item.id not in recovered_ids
                 )
+                learnings.extend(own_learnings)
+                reason = rt.watchdog.end_round(ran=rt.started_runs > 0)
+                if rt.counters.tool_runs and not rt.started_runs:
+                    slot.status = AgentStatus.STARVED
+                if reason is not None:
+                    slot.status = AgentStatus.WATCHDOG_STOPPED
+                    reasons[key] = reason
+                    self.deps.journal.append(
+                        self._agent_draft(slot, EventType.WATCHDOG, round, reason=reason)
+                    )
             statuses[key] = slot.status
             reasons.setdefault(key, "")
             a2a = agent_round_task(
@@ -727,7 +747,7 @@ class RoundRunner:
         entries: dict[str, tuple[str, Candidate]] = {}
         for pair in [
             *(pair for pairs in self.resumed.values() for pair in pairs),
-            *(pair for rt in runtimes for pair in rt.repeats.added),
+            *(pair for rt in runtimes if rt is not None for pair in rt.repeats.added),
         ]:
             entries.setdefault(pair[1].id, pair)
         return RoundOutcome(round, candidates, learnings, statuses, reasons, list(entries.values()))
@@ -737,6 +757,7 @@ class RoundRunner:
     ) -> EventDraft:
         return EventDraft(
             type=type,
+            task_id=agent_task_id(slot.address, round),
             goal_id=self.goal_id,
             team=slot.team.name,
             agent=slot.spec.name,
