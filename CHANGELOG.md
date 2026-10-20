@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Swarm.resume` continues committed runs with auditable lease takeover,
   conservative lost-run accounting, restored round state, and repaired result views.
 
+- CLI `run`, `status`, `stop`, and `resume` commands support terminal approval,
+  sorted plan directories, committed status, epoch-scoped stops, and saved or
+  override resume configuration. Use `swarm-arena run --yes run.toml plans/`
+  for unattended runs or `swarm-arena resume runs/<run-id> --force` for takeover.
+
 - `Swarm.run` approves estimates before publishing snapshots, runs queued goals
   with shared budgets and capacity, and returns durable finalists; `Swarm.stop`
   requests graceful or immediate stops, with journaled stop modes and fencing.
