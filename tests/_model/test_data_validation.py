@@ -2,6 +2,7 @@
 
 import json
 import random
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -213,3 +214,14 @@ def test_shared_json_helper_refuses_cycles_and_preserves_values() -> None:
         finite_json(cycle)
     value = {"ok": [None, 2.5, "λ"]}
     assert finite_json(value) is value
+
+
+def test_json_data_rejects_integers_the_encoder_cannot_write() -> None:
+    limit = sys.get_int_max_str_digits()
+    if limit == 0:
+        pytest.skip("integer encoding has no digit bound")
+    huge = 10**limit
+    with pytest.raises(ValidationError):
+        ToolOutput(status="ok", data={"count": huge})
+    with pytest.raises(ValidationError):
+        Goal(id="g", namespace="n", inputs={"count": huge})

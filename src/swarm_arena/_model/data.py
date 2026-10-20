@@ -5,6 +5,7 @@ from typing import Annotated, Any, Final
 
 from pydantic import AfterValidator, Field
 
+from swarm_arena._model.canonical import canonical_json
 from swarm_arena._tooling.paths import check_key
 
 MAX_JSON_DEPTH: Final = 100
@@ -107,6 +108,10 @@ def finite_json(value: Any, *, allow_none: bool = True) -> Any:
             pending.extend((child, depth + 1) for child in item)
         else:
             raise ValueError("data must be finite JSON")
+    try:
+        canonical_json(value)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise ValueError("data must be finite JSON") from None
     return value
 
 

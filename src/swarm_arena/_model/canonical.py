@@ -5,9 +5,7 @@ import json
 from datetime import UTC, datetime
 from typing import Annotated
 
-from pydantic import AfterValidator, PlainSerializer
-
-from swarm_arena._model.base import JsonValue
+from pydantic import AfterValidator, JsonValue, PlainSerializer
 
 
 def canonical_json(value: JsonValue) -> bytes:
