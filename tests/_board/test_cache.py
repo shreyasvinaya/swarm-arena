@@ -627,3 +627,79 @@ def test_incremental_replay_discards_uncommitted_state_on_rollback(
         assert candidate_ids(cache) == ["new", "old"]
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_segment_extrema_use_sequence_index(tmp_path: Path, existing: bool) -> None:
+    path = tmp_path / "toy.sqlite"
+    if existing:
+        original = ArenaCache(path)
+        # Simulate a version-1 database created before the supporting index.
+        original._conn.execute("DROP INDEX IF EXISTS segments_run_last_seq")
+        original.close()
+    cache = ArenaCache(path)
+    try:
+        for sql in (
+            "SELECT epoch,last_seq FROM segments WHERE run_id=? ORDER BY last_seq DESC LIMIT 1",
+            "SELECT name FROM segments WHERE run_id=? ORDER BY last_seq DESC LIMIT 1",
+            "SELECT max(last_seq) FROM segments WHERE run_id=?",
+        ):
+            plan = cache._conn.execute("EXPLAIN QUERY PLAN " + sql, ("r",)).fetchall()
+            details = " ".join(row[3] for row in plan)
+            assert "segments_run_last_seq" in details, details
+            assert "TEMP B-TREE" not in details, details
+    finally:
+        cache.close()
+
+
+def test_bulk_ingest_sql_work_grows_linearly(tmp_path: Path) -> None:
+    from _fakes.journals import START
+
+    from swarm_arena._journal.event import Event, EventType
+
+    work: list[int] = []
+    sizes = (500, 1000, 2000)
+    for size in sizes:
+        cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
+        ticks = 0
+        junctions = 0
+
+        def progress() -> int:
+            nonlocal ticks
+            ticks += 1
+            return 0
+
+        def trace(sql: str) -> None:
+            nonlocal junctions
+            if sql.startswith("SELECT epoch, last_seq FROM segments"):
+                junctions += 1
+
+        segments = [
+            (
+                f"journal/e1-{seq}.jsonl",
+                [
+                    Event(
+                        type=EventType.TAKEOVER,
+                        run_id="r",
+                        context_id="r",
+                        epoch=1,
+                        seq=seq,
+                        ts=START,
+                        payload={},
+                    )
+                ],
+            )
+            for seq in range(1, size + 1)
+        ]
+        try:
+            cache._conn.set_progress_handler(progress, 1000)
+            cache._conn.set_trace_callback(trace)
+            cache.ingest("r", str(tmp_path), segments)
+            cache._conn.set_progress_handler(None, 0)
+            cache._conn.set_trace_callback(None)
+            assert junctions == size
+            work.append(ticks * 1000)
+        finally:
+            cache.close()
+    assert work[1] <= work[0] * 2.5, (sizes, work)
+    assert work[2] <= work[1] * 2.5, (sizes, work)

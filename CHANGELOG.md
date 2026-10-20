@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Arena cache sequence indexing keeps junction and newest-segment queries bounded
+  as committed history grows, including existing version-1 cache files.
+
 - Open arena caches retain committed replay checkpoints across refreshes, fold
   only missing events, and discard uncommitted state after rollback.
 

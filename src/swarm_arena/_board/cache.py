@@ -132,8 +132,9 @@ class ArenaCache:
     transaction. A shared flock on the persistent ``<path>.lock`` file protects
     the database lifetime against reindex. Downloads belong outside this lock.
     Ingest retains a core replay checkpoint per run, advances only missing events,
-    and discards mutated state after rollback. Private ``_replay`` and
-    ``_plan_for_round`` lookups accept a committed prefix
+    and discards mutated state after rollback. A per-run sequence index supports
+    segment junction and newest-head lookups without scanning prior segments.
+    Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
 
     Parameters
@@ -181,6 +182,10 @@ class ArenaCache:
                         for table in _SCHEMA:
                             conn.execute("CREATE TABLE IF NOT EXISTS " + table)
                         conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS segments_run_last_seq "
+                        "ON segments(run_id, last_seq)"
+                    )
                     conn.execute("COMMIT")
                 except BaseException:
                     conn.execute("ROLLBACK")
