@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from _fakes.tools import RecordingExecutor
@@ -30,6 +30,10 @@ from swarm_arena._store.base import Store
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+if TYPE_CHECKING:
+    from swarm_arena._engine.round import EngineDeps
+    from swarm_arena._model.run_config import RunConfig
 
 
 def take_over_retrying(store: Store, *, owner_id: str = "intruder") -> Lease:
@@ -246,3 +250,97 @@ class CtxEnv:
 
     def events(self, type: str) -> list[Event]:
         return [event for event in self._events if event.type == type]
+
+
+def with_limits(cfg: "RunConfig", **limits: Any) -> "RunConfig":
+    return cfg.model_copy(update={"limits": cfg.limits.model_copy(update=limits)})
+
+
+def with_executor(cfg: "RunConfig", **fields: Any) -> "RunConfig":
+    return cfg.model_copy(
+        update={
+            "executor": cfg.executor.model_copy(
+                update={"config": {**cfg.executor.config, **fields}}
+            )
+        }
+    )
+
+
+@dataclass
+class EngineEnv:
+    deps: "EngineDeps"
+    store: LocalStore
+
+    def _events(self) -> list[Event]:
+        return [
+            Event.model_validate_json(line)
+            for line in self.deps.journal._local_path.read_bytes().splitlines()
+        ]
+
+    def events(self, type: str) -> list[Event]:
+        return [event for event in self._events() if event.type == type]
+
+    def event_types(self) -> list[str]:
+        return [event.type.value for event in self._events()]
+
+    def is_durable(self, type: str) -> bool:
+        first = self.events(type)[0]
+        head = self.deps.journal.head
+        return head is not None and first.seq <= head.seq
+
+    def candidate(self, id: str) -> Candidate:
+        return self.deps.board.get_candidate(id)
+
+    def candidates(self) -> list[Candidate]:
+        return [Candidate.model_validate(ev.payload["candidate"]) for ev in self.events("tool_end")]
+
+    def segment_index(self, seq: int) -> int:
+        from swarm_arena._journal.reader import read_chain
+
+        head = self.deps.journal.head
+        assert head is not None
+        return next(
+            i
+            for i, (_, events) in enumerate(read_chain(self.store, head))
+            if any(event.seq == seq for event in events)
+        )
+
+    def on_commit(self, type: str, fn: Callable[[Event], None]) -> None:
+        append = self.deps.journal.append_durable
+
+        async def wrapped(draft: EventDraft) -> Event:
+            event = await append(draft)
+            if event.type == type:
+                fn(event)
+            return event
+
+        cast(Any, self.deps.journal).append_durable = wrapped
+
+    async def wait_for(self, path: Path) -> None:
+        while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
+            await anyio.sleep(0.01)
+
+    def _configured(self, config: "RunConfig") -> "EngineEnv":
+        from swarm_arena._budget.ledger import Ledger
+
+        events = [
+            event.model_copy(update={"payload": {"config": config.model_dump(mode="json")}})
+            if event.type == EventType.RUN_CONFIG
+            else event
+            for event in self._events()
+        ]
+        ledger = Ledger.replay(
+            RunState.from_events(events), journal=self.deps.journal, ids=self.deps.ids
+        )
+        return replace(self, deps=replace(self.deps, config=config, ledger=ledger))
+
+    def with_limits(self, **limits: Any) -> "EngineEnv":
+        return self._configured(with_limits(self.deps.config, **limits))
+
+    def with_executor(self, **fields: Any) -> "EngineEnv":
+        from swarm_arena._exec.local import LocalExecutor
+
+        env = self._configured(with_executor(self.deps.config, **fields))
+        return replace(
+            env, deps=replace(env.deps, executor=env.deps.config.executor.build(LocalExecutor))
+        )
