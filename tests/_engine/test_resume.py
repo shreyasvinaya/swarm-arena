@@ -1,6 +1,7 @@
 """Recover deliberately incomplete, committed run journals."""
 
 import json
+import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -34,11 +35,18 @@ from swarm_arena._agent.repeats import repeat_key
 from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
+from swarm_arena._engine import resume
 from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
 from swarm_arena._engine.round import RoundOutcome, RoundRunner
-from swarm_arena._errors import Fenced, LeaseHeld, PlanError, SoftError
+from swarm_arena._errors import (
+    ConditionalWritesUnsupported,
+    Fenced,
+    LeaseHeld,
+    PlanError,
+    SoftError,
+)
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import Event, EventDraft
@@ -2075,3 +2083,25 @@ async def test_real_crash_after_terminal_policy_starts_no_more_paid_work(
         assert [without_clock(e) for e in _events(c, event_type)] == [
             without_clock(e) for e in _events(control, event_type)
         ]
+
+
+async def test_resume_checks_storage_before_takeover(
+    crashed: Crashed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[RunConfig] = []
+    loop_thread = threading.get_ident()
+
+    def spy(config: RunConfig) -> None:
+        assert threading.get_ident() != loop_thread
+        calls.append(config)
+        raise ConditionalWritesUnsupported("create did not behave conditionally")
+
+    monkeypatch.setattr(resume, "check_storage", spy)
+    before = crashed.store.read("control/owner.json").data
+    with pytest.raises(ConditionalWritesUnsupported):
+        await Swarm(crashed.config).resume(crashed.run_id, force=True)
+    assert calls == [crashed.config]
+    assert crashed.store.read("control/owner.json").data == before
+    owner = read_owner(crashed.store)
+    assert owner is not None
+    assert owner[0].epoch == 1

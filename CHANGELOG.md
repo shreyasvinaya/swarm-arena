@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local arena caches incrementally index committed run chains, preserve producing
   part identities across replans, and validate historical frontier coverage.
 
+- Conditional S3 storage with uncached listings, per-root storage probes, and
+  validation before preflight and resume takeover.
+
 - Write-once arena run pointers and validated human review/curation objects,
   with versioned loading, deterministic JSONL bytes, and fixed application order.
 

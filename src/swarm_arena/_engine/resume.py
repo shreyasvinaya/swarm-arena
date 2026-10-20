@@ -17,6 +17,7 @@ from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.split import weighted_shares
 from swarm_arena._engine import run as run_module
 from swarm_arena._engine.admission import RunAdmission
+from swarm_arena._engine.preflight import check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._errors import Fenced, PlanError, _core_error
@@ -348,6 +349,7 @@ async def resume_run(
     >>> runner = await resume_run(config, "run-id", force=False, replanner=None)  # doctest: +SKIP
     >>> results = await runner.run()  # doctest: +SKIP
     """
+    await anyio.to_thread.run_sync(check_storage, config)
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
     while True:

@@ -41,6 +41,7 @@ jobs:
       - run: uv sync --all-extras --all-groups
       - run: uv run ty check
       - run: uv run pytest
+      - run: uv run pytest -m s3 -v
 
   docs:
     runs-on: ubuntu-latest

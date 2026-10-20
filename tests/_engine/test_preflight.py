@@ -23,7 +23,9 @@ from swarm_arena import (
     RunConfig,
     TeamSpec,
 )
-from swarm_arena._engine.preflight import run_preflight
+from swarm_arena._engine import preflight
+from swarm_arena._engine.preflight import check_storage, run_preflight
+from swarm_arena._errors import ConditionalWritesUnsupported
 from swarm_arena._exec.executor import Executor
 
 
@@ -233,3 +235,56 @@ async def test_shared_preflight_has_its_own_hook_deadline(monkeypatch: pytest.Mo
             await run_preflight([_plan()], RunConfig(settle_timeout_s=0.02), _executor())
     finally:
         release.set()
+
+
+class RecordingStore:
+    def __init__(self, url: str, probed: list[str], *, fail: bool = False) -> None:
+        self.url, self.probed, self.fail = url, probed, fail
+
+    def probe_conditional_writes(self) -> None:
+        self.probed.append(self.url)
+        if self.fail:
+            raise ConditionalWritesUnsupported("create did not behave conditionally")
+
+
+def test_local_run_root_with_s3_arena_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_open(url: str) -> None:
+        pytest.fail("invalid root combination reached storage")
+
+    monkeypatch.setattr(preflight, "open_store", no_open)
+    with pytest.raises(ValueError, match="run_root"):
+        check_storage(RunConfig(run_root="./runs", arena_root="s3://b/arena"))
+
+
+def test_probe_runs_once_per_distinct_s3_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    probed: list[str] = []
+    monkeypatch.setattr(preflight, "open_store", lambda url: RecordingStore(url, probed))
+    check_storage(RunConfig(run_root="s3://b/x", arena_root="s3://b/x", artifact_root="s3://b/x"))
+    assert probed == ["s3://b/x"]
+    probed.clear()
+    check_storage(RunConfig())
+    assert probed == []
+    check_storage(RunConfig(run_root="s3://b/r", arena_root="s3://b/a", artifact_root="s3://b/f"))
+    assert probed == ["s3://b/r", "s3://b/a", "s3://b/f"]
+
+
+def test_probe_failure_stops_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    probed: list[str] = []
+    monkeypatch.setattr(preflight, "open_store", lambda url: RecordingStore(url, probed, fail=True))
+    with pytest.raises(ConditionalWritesUnsupported):
+        check_storage(RunConfig(run_root="s3://b/r", arena_root="s3://b/a"))
+    assert probed == ["s3://b/r"]
+
+
+async def test_storage_checked_first_in_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop_thread = threading.get_ident()
+    CountingTool.calls = 0
+
+    def fail(config: RunConfig) -> None:
+        assert threading.get_ident() != loop_thread
+        raise ConditionalWritesUnsupported("storage unavailable")
+
+    monkeypatch.setattr(preflight, "check_storage", fail)
+    with pytest.raises(ConditionalWritesUnsupported):
+        await run_preflight([_plan()], RunConfig(), _executor())
+    assert CountingTool.calls == 0
