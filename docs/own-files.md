@@ -424,7 +424,11 @@ can do the same. Protecting existing helpers does not prevent these additions.
 The risk applies anywhere on the program's import path, including the working
 directory for `python -m` or `python -c`. Prefer globs that exclude code, such
 as `editable=["problem/*.physk"]`, and keep trusted scripts and helpers outside
-the editable set.
+the editable set. `ScriptTool` warns at construction when editable globs can
+create Python modules beside a protected script, including protected `.py`
+manifest files and the working directory for `python -m run`. It also warns
+when rebuilt after snapshotting. The warning leaves execution and edit
+permissions unchanged.
 
 Check and judge private paths and the core's reserved paths are also excluded
 from edits and overlays. Protected names use canonical caseless folding;
@@ -645,6 +649,11 @@ larger data as output artifacts. At most 4096 output files may be declared,
 including empty files, within `LocalExecutor.Config.max_output_bytes`.
 Workspace paths have at most 1024 UTF-8 bytes, 255 bytes per component and 32
 components. Code points unassigned in the running Python are refused.
+The same limits apply to `FileSet.globs` and `ScriptTool.editable`, including
+wildcard components; glob syntax counts towards the byte limits. For example,
+`FileSet(globs=["problem/**/*.txt"])` selects nested text files. Snapshotting
+supports the full 1024-byte relative-path boundary with literal and recursive
+globs, even below a long source directory.
 
 `FunctionTool` is data-only, including timeout and cancellation checkpoints.
 Use `ScriptTool` or a custom `Tool` when a function's files must become output

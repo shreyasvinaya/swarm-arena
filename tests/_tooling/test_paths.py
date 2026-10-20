@@ -378,3 +378,55 @@ def test_portable_path_boundaries() -> None:
 
 def test_question_mark_cannot_cross_segment() -> None:
     assert not matches("p/a/b", ["p/a?b"])
+
+
+@pytest.mark.parametrize("entrypoint", ["glob", "fileset", "editable"])
+@pytest.mark.parametrize("wildcard", [False, True], ids=["literal", "wildcard"])
+@pytest.mark.parametrize(
+    ("pattern", "accepted"),
+    [
+        ("a" * 255, True),
+        ("a" * 256, False),
+        ("é" * 127 + "a", True),
+        ("é" * 128, False),
+        ("/".join(["a" * 255] * 3 + ["a" * 254, "x"]), True),
+        ("/".join(["a" * 255] * 3 + ["a" * 254, "xx"]), False),
+        ("/".join(["a"] * 32), True),
+        ("/".join(["a"] * 33), False),
+        ("p/\u0378.txt", False),
+        ("p/\ud800.txt", False),
+    ],
+    ids=[
+        "component-limit",
+        "component-over",
+        "utf8-limit",
+        "utf8-over",
+        "total-limit",
+        "total-over",
+        "depth-limit",
+        "depth-over",
+        "unassigned",
+        "surrogate",
+    ],
+)
+def test_glob_portable_policy(
+    entrypoint: str, wildcard: bool, pattern: str, accepted: bool
+) -> None:
+    from swarm_arena import ScriptTool
+    from swarm_arena.tool import FileSet
+
+    if wildcard:
+        pattern = pattern[:-1] + "*" * len(pattern[-1].encode())
+
+    def validate() -> object:
+        if entrypoint == "glob":
+            return check_glob(pattern)
+        if entrypoint == "fileset":
+            return FileSet(globs=[pattern])
+        return ScriptTool(command=["true"], editable=[pattern])
+
+    if accepted:
+        validate()
+    else:
+        with pytest.raises(ValueError, match=r"glob|globs|editable"):
+            validate()

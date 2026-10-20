@@ -1,7 +1,9 @@
 """Snapshot goal and component files into immutable, content-addressed manifests."""
 
 import os
-from pathlib import Path
+import stat
+from collections.abc import Iterator
+from pathlib import Path, PurePosixPath
 from typing import Final
 
 from swarm_arena._model.goal import FileSet
@@ -13,7 +15,6 @@ from swarm_arena._tooling.result_file import (
     _directory_fd,
     _inspect_path,
     read_regular_file,
-    symlinked_component,
 )
 
 MAX_SNAPSHOT_FILE_BYTES: Final = 2**30
@@ -92,6 +93,58 @@ def _identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+def _glob_files(
+    base: Path, pattern: str, listings: dict[Path, dict[str, list[str]]]
+) -> Iterator[str]:
+    """Expand glob segments using the shared descriptor inspection/listing helpers."""
+    parts = PurePosixPath(pattern).parts
+    if not parts:
+        return
+    base = base.resolve()
+    pending = [("", 0)]
+    seen: set[tuple[str, int]] = set()
+    while pending:
+        parent, index = pending.pop()
+        if (parent, index) in seen:
+            continue
+        seen.add((parent, index))
+        segment = parts[index]
+        recursive = segment == "**"
+        if recursive and index + 1 < len(parts):
+            pending.append((parent, index + 1))
+        if any(char in segment for char in "*?["):
+            directory = base / parent
+            if (names := listings.get(directory)) is None:
+                names = listings[directory] = _listing(directory)
+            children = [
+                name
+                for spellings in names.values()
+                for name in spellings
+                if recursive or matches(name, [segment])
+            ]
+        else:
+            # A literal can resolve through a filesystem lookup alias. Wildcards
+            # use actual listed spellings and stay case sensitive.
+            children = [segment]
+        for name in sorted(children):
+            relative = f"{parent}/{name}" if parent else name
+            link, info = _inspect_path(base, relative)
+            if link is not None:
+                raise ValueError(f"symlink not allowed: {link}")
+            if info is None:
+                continue
+            listed = _listed_path(base, relative, listings)
+            if stat.S_ISDIR(info.st_mode):
+                if recursive:
+                    pending.append((listed, index))
+                elif index + 1 < len(parts):
+                    pending.append((listed, index + 1))
+            elif (
+                stat.S_ISREG(info.st_mode) and index == len(parts) - 1 and not pattern.endswith("/")
+            ):
+                yield check_relpath(listed)
+
+
 def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> FileSet:
     """Store matching regular files and return a sorted path-to-hash manifest.
 
@@ -149,19 +202,10 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     for glob in fs.globs:
         found = False
         try:
-            for path in sorted(base_dir.glob(glob)):
-                relative = path.relative_to(base_dir).as_posix()
-                if not matches(relative, [glob]):
-                    continue
-                if (link := symlinked_component(base_dir, relative)) is not None:
-                    raise ValueError(f"symlink not allowed: {link}")
-                if not path.is_file():
-                    continue
-                check_relpath(relative)
-                # A lookup alias resolves to its listed name, so it dedupes with
-                # it. Two listed names stay two entries, even as hard links, and
-                # the shared layout checker below refuses a folded pair.
-                selected[check_relpath(_listed_path(base_dir, relative, listings))] = None
+            for relative in _glob_files(base_dir, glob, listings):
+                # Actual listed names stay distinct, even as hard links, while
+                # lookup aliases dedupe through the shared spelling helper.
+                selected[relative] = None
                 found = True
         except OSError:
             raise ValueError(f"cannot snapshot glob {glob!r}") from None

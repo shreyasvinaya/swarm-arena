@@ -683,3 +683,68 @@ def test_exact_protected_script_glob_has_no_shadowing_warning() -> None:
         warnings.simplefilter("always")
         ScriptTool(command=["python", "problem/run.py"], editable=["problem/run.py"])
     assert seen == []
+
+
+@pytest.mark.parametrize("entrypoint", ["fileset", "editable", "config"])
+def test_glob_validation_errors_hide_values(entrypoint: str) -> None:
+    pattern = SECRET + "\x00"
+
+    def validate() -> object:
+        if entrypoint == "fileset":
+            return FileSet(globs=[pattern])
+        if entrypoint == "config":
+            return ScriptTool.Config(command=["true"], editable=[pattern])
+        return ScriptTool(command=["true"], editable=[pattern])
+
+    with pytest.raises(ValidationError) as caught:
+        validate()
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
+
+
+@pytest.mark.parametrize("module", [False, True], ids=["manifest", "module"])
+def test_protected_manifest_python_warns_before_and_after_snapshot(
+    tmp_path: Path, artifacts: ArtifactStore, module: bool
+) -> None:
+    from swarm_arena._tooling.files import snapshot_ref
+    from swarm_arena.tool import Tool
+
+    (tmp_path / "run.py").write_text("print('hello')")
+    command = ["python", "-m", "run"] if module else ["runner"]
+    files = FileSet(globs=["run.py"]) if module else FileSet(manifest={"run.py": HA})
+    with pytest.warns(UserWarning, match="import shadowing"):
+        tool = ScriptTool(command=command, files=files, editable=["*.py"])
+    with pytest.warns(UserWarning, match="import shadowing"):
+        snapshot_ref(Ref.of(tool), tmp_path, artifacts).build(Tool)
+
+
+@pytest.mark.anyio
+async def test_module_import_shadowing_warning_preserves_behavior(tmp_path: Path) -> None:
+    from swarm_arena._tooling.files import snapshot_ref
+    from swarm_arena.executor import LocalExecutor
+    from swarm_arena.testing import check_tool
+    from swarm_arena.testing._conformance import _artifacts
+    from swarm_arena.tool import Tool
+
+    (tmp_path / "run.py").write_text(
+        "import fractions, json, os\n"
+        'with open(os.environ["SWARM_ARENA_RESULT"], "w") as result:\n'
+        '    json.dump({"data": {"value": float(fractions.Fraction(1, 2))}}, result)\n'
+    )
+    with pytest.warns(UserWarning, match="import shadowing"):
+        tool = ScriptTool(command=["python", "-m", "run"], files=["run.py"], editable=["*.py"])
+    with pytest.warns(UserWarning, match="import shadowing"):
+        frozen = snapshot_ref(Ref.of(tool), tmp_path, _artifacts()).build(Tool)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "workspaces"))
+    try:
+        baseline = await check_tool(frozen, {}, executor=executor)
+        edited = await check_tool(
+            frozen,
+            {},
+            edits={"fractions.py": "def Fraction(*args): return 17\n"},
+            executor=executor,
+        )
+    finally:
+        await executor.aclose()
+    assert baseline.status == edited.status == RunStatus.OK
+    assert baseline.data == {"value": 0.5}
+    assert edited.data == {"value": 17.0}

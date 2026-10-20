@@ -8,6 +8,7 @@ from typing import Annotated, Any, ClassVar, Protocol, cast
 
 import anyio
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -30,7 +31,7 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
-from swarm_arena._tooling.paths import check_relpath, fold_key
+from swarm_arena._tooling.paths import check_glob, check_relpath, fold_key
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.shadowing import _can_create_python
 from swarm_arena._tooling.staging import effective_files
@@ -252,7 +253,7 @@ class ScriptTool(Tool):
         command: Annotated[list[str], Field(min_length=1)]
         python: str | None = None
         files: FileSet = FileSet()
-        editable: list[str] = []
+        editable: list[Annotated[str, AfterValidator(check_glob)]] = []
         params: dict[str, dict[str, Any]] = {}
         timeout_s: TimeoutS | None = None
         grace_s: GraceS = DEFAULT_GRACE_S
@@ -265,14 +266,22 @@ class ScriptTool(Tool):
         """Validate configuration without inspecting or importing the script."""
         super().__init__(config_or_fields(config, fields))
         self._input_model: type[BaseModel] | None = None
-        for argument in self.config.command[1:]:
-            script = _as_relpath(argument)
-            if script is None or not fold_key(script).endswith(".py"):
-                continue
-            parent = Path(script).parent.as_posix()
-            protected = {*self.config.files.manifest, script}
+        scripts = set(self.config.files.manifest)
+        scripts.update(
+            script
+            for argument in self.config.command[1:]
+            if (script := _as_relpath(argument)) is not None
+        )
+        directories = {
+            Path(script).parent.as_posix() for script in scripts if fold_key(script).endswith(".py")
+        }
+        if "-m" in self.config.command[1:]:
+            # Module execution puts the working directory on Python's import path,
+            # including before a FileSet's source globs have been snapshotted.
+            directories.add(".")
+        for directory in sorted(directories):
             if any(
-                _can_create_python(pattern, parent, protected) for pattern in self.config.editable
+                _can_create_python(pattern, directory, scripts) for pattern in self.config.editable
             ):
                 warnings.warn(
                     "editable glob permits Python import shadowing next to a protected script",

@@ -83,10 +83,12 @@ def test_already_snapshotted_reads_no_disk(
     fs = snapshot_fileset(FileSet(globs=["problem/*"]), tmp_path, artifacts)
     path.unlink()
 
-    def forbid_glob(self: Path, pattern: str) -> Iterator[Path]:
+    from swarm_arena._tooling import files as files_module
+
+    def forbid_glob(base: Path, pattern: str, listings: object) -> Iterator[str]:
         raise AssertionError("snapshotted sets must not expand globs")
 
-    monkeypatch.setattr(Path, "glob", forbid_glob)
+    monkeypatch.setattr(files_module, "_glob_files", forbid_glob)
     assert snapshot_fileset(fs, tmp_path, artifacts) is fs
     empty = FileSet()
     assert snapshot_fileset(empty, tmp_path, artifacts) is empty
@@ -120,26 +122,35 @@ def test_reserved_directory_is_not_a_selected_file(
     assert list(fs.manifest) == ["input.txt"]
 
 
-def test_path_glob_hits_use_shared_dialect(
-    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("data/*.txt", ["data/a.txt"]),
+        ("data/**/*.txt", ["data/a.txt", "data/sub/b.txt"]),
+        ("data/**/**", ["data/a.txt", "data/sub/b.txt"]),
+        ("data/[a-z].t?t", ["data/a.txt"]),
+        ("data/*/b.txt", ["data/sub/b.txt"]),
+    ],
+)
+def test_snapshot_globs_use_shared_dialect(
+    tmp_path: Path, artifacts: ArtifactStore, pattern: str, expected: list[str]
 ) -> None:
-    paths = [_write(tmp_path, rel) for rel in ["data/a.txt", "data/sub/b.txt"]]
-
-    def broad_glob(self: Path, pattern: str) -> Iterator[Path]:
-        return iter(paths)
-
-    monkeypatch.setattr(Path, "glob", broad_glob)
-    fs = snapshot_fileset(FileSet(globs=["data/*.txt"]), tmp_path, artifacts)
-    assert list(fs.manifest) == ["data/a.txt"]
+    for rel in ["data/a.txt", "data/sub/b.txt"]:
+        _write(tmp_path, rel)
+    fs = snapshot_fileset(FileSet(globs=[pattern]), tmp_path, artifacts)
+    assert list(fs.manifest) == expected
 
 
 def test_snapshot_fileset_sanitizes_io_errors(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_glob(self: Path, pattern: str) -> Iterator[Path]:
+    from swarm_arena._tooling import files as files_module
+
+    def fail_listing(directory: Path) -> dict[str, list[str]]:
         raise OSError("fa89d1a4ebc7ed804e52ad2b3cdc0c7b")
 
-    monkeypatch.setattr(Path, "glob", fail_glob)
+    monkeypatch.setattr(files_module, "_listing", fail_listing)
+    (tmp_path / "data").mkdir()
     with pytest.raises(ValueError, match="cannot snapshot glob") as exc:
         snapshot_fileset(FileSet(globs=["data/*"]), tmp_path, artifacts)
     assert_secret_absent(exc.value, "fa89d1a4ebc7ed804e52ad2b3cdc0c7b", sanitized=True)
@@ -390,19 +401,22 @@ class _ValidatorFailure(Exception):
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (TypeError("validator_secret_sentinel"), "invalid"),
-        (ValueError("validator_secret_sentinel"), "size: value_error"),
-        (AssertionError("validator_secret_sentinel"), "size: assertion_error"),
-        (_ValidatorFailure("validator_secret_sentinel"), "invalid"),
+        (TypeError("982fa6f15da245419f1f479d3e60a8cd"), "invalid"),
+        (ValueError("982fa6f15da245419f1f479d3e60a8cd"), "size: value_error"),
+        (AssertionError("982fa6f15da245419f1f479d3e60a8cd"), "size: assertion_error"),
+        (_ValidatorFailure("982fa6f15da245419f1f479d3e60a8cd"), "invalid"),
         (
             PydanticCustomError(
-                "validator_secret_sentinel",
+                "982fa6f15da245419f1f479d3e60a8cd",
                 "bad input: {value}",
-                {"value": "validator_secret_sentinel"},
+                {"value": "982fa6f15da245419f1f479d3e60a8cd"},
             ),
             "size: invalid",
         ),
-        (PydanticCustomError("unregistered_type", "validator_secret_sentinel"), "size: invalid"),
+        (
+            PydanticCustomError("unregistered_type", "982fa6f15da245419f1f479d3e60a8cd"),
+            "size: invalid",
+        ),
         (None, "size: int_parsing"),
     ],
 )
@@ -422,7 +436,7 @@ def test_snapshot_ref_config_validation_failures_are_secret_safe(
             return value
 
     monkeypatch.setattr(Widget, "Config", Config)
-    secret = "validator_secret_sentinel"
+    secret = "982fa6f15da245419f1f479d3e60a8cd"
     ref = Ref(path="_fakes.tools:Widget", config={"size": secret})
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(ref, tmp_path, artifacts)
@@ -452,18 +466,14 @@ def test_snapshot_folded_alias_identity(
     import swarm_arena._tooling.files as files_module
 
     lower, upper = tmp_path / "run.py", tmp_path / "RUN.py"
-    original_stat = Path.stat
+    original_inspect = files_module._inspect_path
     original_listing = files_module._listing
 
-    def stat_path(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self in (lower, upper):
-            inode = 1 if self == lower or same_inode else 2
-            return os.stat_result((stat.S_IFREG | 0o644, inode, 1, 1, 0, 0, 1, 0, 0, 0))
-        return original_stat(self, follow_symlinks=follow_symlinks)
-
-    def glob(self: Path, pattern: str) -> Iterator[Path]:
-        assert self == tmp_path
-        yield from [lower, upper]
+    def inspect(base: Path, rel: str) -> tuple[str | None, os.stat_result | None]:
+        if base / rel in (lower, upper):
+            inode = 1 if base / rel == lower or same_inode else 2
+            return None, os.stat_result((stat.S_IFREG | 0o644, inode, 1, 1, 0, 0, 1, 0, 0, 0))
+        return original_inspect(base, rel)
 
     def listing(directory: Path) -> dict[str, list[str]]:
         if directory == tmp_path:
@@ -471,20 +481,22 @@ def test_snapshot_folded_alias_identity(
         return original_listing(directory)
 
     def identity(path: Path) -> tuple[int, int]:
-        info = stat_path(path, follow_symlinks=False)
+        _, info = inspect(path.parent, path.name)
+        assert info is not None
         return info.st_dev, info.st_ino
 
     def read(base: Path, rel: str, *, max_bytes: int) -> bytes:
         return b"x"
 
-    monkeypatch.setattr(Path, "stat", stat_path)
-    monkeypatch.setattr(Path, "glob", glob)
+    monkeypatch.setattr(files_module, "_inspect_path", inspect)
     monkeypatch.setattr(files_module, "_listing", listing)
     monkeypatch.setattr(files_module, "_identity", identity)
     monkeypatch.setattr(files_module, "read_regular_file", read)
     if not upper_listed:
         snapshot = snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
         assert snapshot.manifest == {"run.py": sha256_hex(b"x")}
+        alias = snapshot_fileset(FileSet(globs=["RUN.py"]), tmp_path, artifacts)
+        assert alias.manifest == snapshot.manifest
     else:
         with pytest.raises(ValueError, match=r"conflicting.*path") as exc:
             snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
@@ -550,3 +562,30 @@ def test_unmatched_glob_names_its_base(tmp_path: Path, artifacts: ArtifactStore)
     with pytest.raises(ValueError, match="matched no file under") as caught:
         snapshot_fileset(FileSet(globs=["*.physk"]), tmp_path, artifacts)
     assert str(tmp_path) in str(caught.value)
+
+
+@pytest.mark.parametrize("recursive", [False, True], ids=["literal", "recursive"])
+def test_snapshot_maximum_length_path(
+    tmp_path: Path, artifacts: ArtifactStore, recursive: bool
+) -> None:
+    relative = "/".join(["a" * 255] * 3 + ["a" * 254, "x"])
+    assert len(relative.encode()) == 1024
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.split("/")[:-1]:
+            os.mkdir(part, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        leaf = os.open("x", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+        try:
+            os.write(leaf, b"hi")
+        finally:
+            os.close(leaf)
+    finally:
+        os.close(fd)
+    snapshot = snapshot_fileset(
+        FileSet(globs=["**/*" if recursive else relative]), tmp_path, artifacts
+    )
+    assert snapshot.manifest == {relative: sha256_hex(b"hi")}
+    assert artifacts.get_bytes(snapshot.manifest[relative]) == b"hi"

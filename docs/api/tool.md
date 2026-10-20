@@ -61,7 +61,17 @@ read, so a larger file, even a sparse one, is refused unread:
   `error` and no files.
 
 Snapshots of human-authored goal, tool, check, and judge files are bounded too:
-at most 1 GiB per file.
+at most 1 GiB per file. Snapshot selection supports these path limits even
+when the source root makes the full absolute name longer than the operating
+system's path limit. Both literal globs and recursive patterns such as `**/*`
+can select a file at the 1024-byte relative-path boundary.
+
+`FileSet.globs` and `ScriptTool.editable` apply the same strict UTF-8, byte,
+component-count and assigned-character rules to patterns. Glob syntax counts
+towards the byte limits; wildcards such as `*`, `?` and `[ab]` remain supported.
+For example, `FileSet(globs=["problem/**/*.txt"])` selects text files recursively,
+and `ScriptTool(command=["python", "run.py"], editable=["problem/*.txt"])`
+permits text edits in one directory.
 
 A successful process requires a valid result; otherwise collection returns `error`
 and appends a sanitized reason to stderr. A valid result after timeout or
@@ -108,5 +118,8 @@ Built-in component constructors report invalid settings as a sanitized Pydantic
 `ValidationError`; reference configuration validation reports `ConfigError`.
 
 `ScriptTool` emits a `UserWarning` at construction when an editable glob can
-create a Python module beside a protected Python script. Such modules can
-shadow imports. Restrict edits to data formats such as `problem/*.physk`.
+create a Python module beside a protected Python script, including `.py` files
+in its snapshotted `files` manifest. The warning also covers `python -m run`
+and its working directory, before and after snapshotting. Such modules can
+shadow imports; the warning does not change which edits are accepted. Restrict
+edits to data formats such as `problem/*.physk`.

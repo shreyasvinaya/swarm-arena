@@ -285,6 +285,21 @@ def _is_utf8(text: str) -> bool:
     return True
 
 
+def _portable_path_reason(path: str, parts: tuple[str, ...]) -> str | None:
+    """Return the shared UTF-8, size, depth or Unicode portability failure."""
+    if not _is_utf8(path):
+        return "not valid UTF-8"
+    if len(path.encode("utf-8")) > 1024:
+        return "exceeds 1024 UTF-8 bytes"
+    if any(len(part.encode("utf-8")) > 255 for part in parts):
+        return "component exceeds 255 UTF-8 bytes"
+    if len(parts) > 32:
+        return "exceeds 32 components"
+    if any(unicodedata.category(char) == "Cn" for char in path):
+        return "contains an unassigned Unicode code point"
+    return None
+
+
 def check_relpath(path: str) -> str:
     r"""Validate and normalize a relative POSIX workspace path.
 
@@ -328,18 +343,10 @@ def check_relpath(path: str) -> str:
         reason = "contains '..'"
     elif "\x00" in path:
         reason = "contains NUL"
-    elif not _is_utf8(path):
-        reason = "not valid UTF-8"
-    elif len(path.encode("utf-8")) > 1024:
-        reason = "exceeds 1024 UTF-8 bytes"
-    elif any(len(part.encode("utf-8")) > 255 for part in parts):
-        reason = "component exceeds 255 UTF-8 bytes"
-    elif len(parts) > 32:
-        reason = "exceeds 32 components"
-    elif any(unicodedata.category(char) == "Cn" for char in path):
-        reason = "contains an unassigned Unicode code point"
-    elif fold_key(parts[0]) in RESERVED:
-        reason = f"uses the reserved name {parts[0]!r}"
+    else:
+        reason = _portable_path_reason(path, parts)
+        if reason is None and fold_key(parts[0]) in RESERVED:
+            reason = f"uses the reserved name {parts[0]!r}"
     if reason is not None:
         raise ValueError(f"path {path!r}: {reason}")
     return PurePosixPath(path).as_posix()
@@ -390,7 +397,11 @@ def check_glob(pattern: str) -> str:
     Raises
     ------
     ValueError
-        If the glob is empty, absolute, contains a parent segment or NUL.
+        If the glob is empty, absolute, contains a parent segment or NUL,
+        is not strict UTF-8, or exceeds the concrete path limits: 1024 UTF-8
+        bytes total, 255 per component and 32 components. Literal and wildcard
+        components both refuse unassigned Unicode code points. Glob syntax
+        counts towards the byte limits; reserved names remain permitted.
 
     Examples
     --------
@@ -406,6 +417,8 @@ def check_glob(pattern: str) -> str:
         reason = "contains '..'"
     elif "\x00" in pattern:
         reason = "contains NUL"
+    else:
+        reason = _portable_path_reason(pattern, PurePosixPath(pattern).parts)
     if reason is not None:
         raise ValueError(f"glob {pattern!r}: {reason}")
     return pattern
