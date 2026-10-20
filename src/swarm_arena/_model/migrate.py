@@ -28,6 +28,8 @@ CURRENT: Final[Mapping[str, int]] = MappingProxyType(
         "frontier": 1,
         "manifest": 1,
         "solution": 1,
+        "run_pointer": 1,
+        "human_object": 1,
     }
 )
 _migration_functions: Final[dict[tuple[str, int], MigrationFn]] = {}

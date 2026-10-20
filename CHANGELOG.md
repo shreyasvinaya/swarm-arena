@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Write-once arena run pointers and validated human review/curation objects,
+  with versioned loading, deterministic JSONL bytes, and fixed application order.
+
 - Offline Rosenbrock swarm example with a Getting started guide and README quickstart.
 
 - `Swarm.resume` continues committed runs with auditable lease takeover,

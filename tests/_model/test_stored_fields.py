@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from swarm_arena import Plan, RunConfig
+from swarm_arena._board.human_objects import HumanObject
+from swarm_arena._board.pointers import RunPointer
 from swarm_arena._engine.manifest import RunManifest, build_manifest
 from swarm_arena._engine.solution import SolutionDocument
 from swarm_arena._exec.executor import Job
@@ -33,6 +35,8 @@ from swarm_arena._tooling.result_file import (
 from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
+    ("human_object", 1): "31bace63e96bd4af455f20385d1f22643640dffc672fe0d047d0330337a812be",
+    ("run_pointer", 1): "4505b29fdc14a4b2eacd9558c7518f4d0784f21a8573ad56b808ede57eabc01f",
     ("request", 1): "9e0727fd1588041cb6f5f28c1f41d72031aecd71edc393856d184bcd11924e97",
     ("candidate_request", 1): "9e0727fd1588041cb6f5f28c1f41d72031aecd71edc393856d184bcd11924e97",
     ("candidate_output", 1): "71060b6a928593fec41a4c0c5b316e670225549db0f650d324f6c8cf22de4e39",
@@ -57,6 +61,8 @@ FIELD_SETS = {
 @pytest.mark.parametrize(
     "model",
     [
+        RunPointer,
+        HumanObject,
         Candidate,
         Learning,
         LLMCall,

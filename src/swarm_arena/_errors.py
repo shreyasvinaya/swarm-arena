@@ -189,6 +189,7 @@ def _core_signal(error: _SignalT) -> _SignalT:
         ConfigError,
         LeaseHeld,
         Fenced,
+        StorageError,
         _CoreRuntimeError,
         _CoreValueError,
     )
@@ -221,6 +222,7 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
         ConfigError,
         LeaseHeld,
         Fenced,
+        StorageError,
         _CoreRuntimeError,
         _CoreValueError,
     )

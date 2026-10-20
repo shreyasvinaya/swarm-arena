@@ -112,7 +112,7 @@ def test_core_signal_registry_rejects_user_equality() -> None:
 
 
 @pytest.mark.parametrize(
-    "kind", [PlanError, ConfigError, LeaseHeld, Fenced, RuntimeError, ValueError]
+    "kind", [PlanError, ConfigError, LeaseHeld, Fenced, RuntimeError, ValueError, StorageError]
 )
 def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     kind: type[Exception],
@@ -153,3 +153,16 @@ def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     del rebuilt
     gc.collect()
     assert reference() is None
+
+
+def test_storage_registry_accepts_only_exact_storage_error() -> None:
+    from swarm_arena._errors import _core_error, _rebuild_core_signal
+
+    class UserStorageError(StorageError):
+        pass
+
+    for error in (StorageError("unregistered"), UserStorageError("impostor")):
+        assert _rebuild_core_signal(error) is None
+    for kind in (AlreadyExists, NotFound, UserStorageError):
+        with pytest.raises(TypeError, match="expected a core error"):
+            _core_error(kind, "not supported")
