@@ -2,19 +2,26 @@
 
 import hashlib
 import json
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
 from swarm_arena import Plan, RunConfig
 from swarm_arena._exec.executor import Job
+from swarm_arena._journal.event import Event, EventType
+from swarm_arena._journal.segment import SegmentLink
+from swarm_arena._model import migrate
 from swarm_arena._model.base import StoredModel
-from swarm_arena._model.migrate import CURRENT
+from swarm_arena._model.migrate import CURRENT, migration
 from swarm_arena._model.results import Candidate, Learning, LLMCall
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
 from swarm_arena._tooling.result_file import ToolResultFile, request_json
 from swarm_arena._tooling.staging import plan_script_stage
 
 FIELD_SETS = {
+    ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
+    ("segment", 1): "24a9c075f402a838718212851482617251b3bab08bafa51018f9e4e6d0426f09",
     ("candidate", 1): "5cd32e071d3d68671ff5389518f120123539420ec264eca3e27c8f81ecadbc25",
     ("learning", 1): "c5e234505180affe880f7822eb49708b48bd501ff90903528fc4eb0b7bb478b1",
     ("llm_call", 1): "a1173597b9e95c35e761ccdf608c93809cb0d8164767effc5dba90e58c297c3f",
@@ -26,7 +33,18 @@ FIELD_SETS = {
 
 
 @pytest.mark.parametrize(
-    "model", [Candidate, Learning, LLMCall, Plan, RunConfig, Job.Started, ToolResultFile]
+    "model",
+    [
+        Candidate,
+        Learning,
+        LLMCall,
+        Plan,
+        RunConfig,
+        Job.Started,
+        ToolResultFile,
+        Event,
+        SegmentLink,
+    ],
 )
 def test_stored_field_sets_require_a_version_bump(model: type[StoredModel]) -> None:
     schema = model.model_json_schema()
@@ -77,3 +95,41 @@ def test_workspace_request_field_sets_require_a_version_bump() -> None:
         ("candidate_output", stage.candidate.output),
     ):
         assert set(actual) == snapshots[(kind, CURRENT[kind])]
+
+
+@pytest.mark.usefixtures("isolated_migrations")
+@pytest.mark.parametrize("model", [Event, SegmentLink])
+def test_journal_stored_models_apply_registered_migration(
+    monkeypatch: pytest.MonkeyPatch, model: type[Event] | type[SegmentLink]
+) -> None:
+    raw: dict[str, Any]
+    if model is Event:
+        raw = Event(
+            epoch=1,
+            seq=1,
+            ts=datetime(2026, 10, 18, tzinfo=UTC),
+            run_id="r",
+            context_id="r",
+            type=EventType.RUN_STARTED,
+        ).model_dump(mode="json")
+    else:
+        raw = {"schema_version": 1, "link": None}
+    kind = model.schema_kind
+    monkeypatch.setattr(migrate, "CURRENT", {**migrate.CURRENT, kind: 2})
+    calls: list[dict[str, Any]] = []
+
+    @migration(kind, 1)
+    def step(data: dict[str, Any]) -> dict[str, Any]:
+        calls.append(data.copy())
+        if kind == "event":
+            return {**data, "payload": {"migrated": True}}
+        return {**data, "link": "journal/e1-1.jsonl"}
+
+    upgraded = model.model_validate_json(json.dumps(raw))
+    assert upgraded.schema_version == 2
+    assert calls == [raw]
+    if isinstance(upgraded, Event):
+        assert upgraded.payload == {"migrated": True}
+    else:
+        assert upgraded.link == "journal/e1-1.jsonl"
+    assert raw["schema_version"] == 1
