@@ -1025,6 +1025,67 @@ class _RaisingManager(Manager):
         raise RuntimeError("manager-secret-sentinel")
 
 
+async def test_check_manager_reports_failure_after_later_rounds_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena.testing import _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    secret = "manager-conformance-isolation-sentinel"
+    failure = RuntimeError(secret)
+    seen: list[int] = []
+    harness = OfflineHarness()
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        await ctx.run_tool({"x": float(ctx.round)})
+        if ctx.round == 2:
+            raise failure
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+    with pytest.raises(AssertionError, match="manager raised RuntimeError") as caught:
+        await check_manager(
+            NoopManager(),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+            rounds=3,
+        )
+    assert seen == [1, 2, 3]
+    assert caught.value.__cause__ is failure
+    assert str(failure) == secret  # The kit explicitly permits the original connector cause.
+    diagnostic = AssertionError(*caught.value.args)
+    for note in getattr(caught.value, "__notes__", ()):
+        diagnostic.add_note(note)
+    assert_secret_absent(diagnostic, secret)
+    committed = read_committed(harness.store)
+    assert committed is not None
+    assert [event.round for event in committed[1] if event.type == "round_closed"] == [1, 2, 3]
+    assert [candidate.round for candidate in harness.candidates] == [1, 2, 3]
+    for event in committed[1]:
+        assert_secret_absent(RuntimeError(event.model_dump_json()), secret)
+
+
+async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import Fenced
+
+    failure = Fenced("ownership lost")
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    with pytest.raises(Fenced) as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert caught.value is failure
+
+
 async def test_check_manager_surfaces_manager_exception() -> None:
     with pytest.raises(AssertionError, match="raised RuntimeError") as caught:
         await check_manager(_RaisingManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))

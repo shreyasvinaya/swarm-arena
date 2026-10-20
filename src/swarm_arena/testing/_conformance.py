@@ -9,6 +9,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import LimitReached, Manager
+from swarm_arena._errors import Fenced
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
@@ -388,8 +389,10 @@ async def check_manager(
     ``LimitReached`` ends a round normally, supplying an empty ``RoundReport``;
     later rounds still run with fresh action counters. Every returned report
     must already be valid in strict mode, and original report objects are
-    returned. A manager exception becomes a type-only ``AssertionError`` with
-    the original cause and failed-run stderr notes retained for debugging.
+    returned. Ordinary manager exceptions end only their round; judging and
+    closure complete and later rounds run before the first failure becomes a
+    type-only ``AssertionError`` with its original cause and failed-run stderr
+    notes retained for debugging. Cancellation and fencing propagate.
     Successful calls warn with the stderr tail of every non-OK tool run.
 
     Parameters
@@ -437,8 +440,9 @@ async def check_manager(
     _, built_tool, goal = await anyio.to_thread.run_sync(_build, tool, Tool, goal)
     config = RunConfig() if config is None else config
     limits = config.limits if limits is None else limits
+    harness = OfflineHarness()
     try:
-        return await OfflineHarness().run_rounds(
+        reports = await harness.run_rounds(
             built_manager,
             goal=goal,
             tool=built_tool,
@@ -446,7 +450,10 @@ async def check_manager(
             limits=limits,
             config=config,
         )
-    except LimitReached:
+        if harness.manager_errors:
+            raise harness.manager_errors[0]
+        return reports
+    except (LimitReached, Fenced):
         raise
     except Exception as error:
         raise AssertionError(f"manager raised {type(error).__name__}") from error

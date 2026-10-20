@@ -1,6 +1,8 @@
 import sys
 
+import anyio
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, NoopManager
 
 from swarm_arena import (
@@ -12,6 +14,7 @@ from swarm_arena import (
     ScriptedManager,
     ScriptJudge,
 )
+from swarm_arena._errors import Fenced
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.reader import read_committed
 from swarm_arena.executor import Job, LocalExecutor
@@ -20,6 +23,132 @@ from swarm_arena.testing._harness import OfflineHarness
 from swarm_arena.tool import ToolOutput
 
 SQUARE = FunctionTool("_fakes.tools:square")
+
+
+async def test_manager_error_closes_and_judges_round_before_continuing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "manager-round-isolation-sentinel"
+    failure = RuntimeError(secret)
+    seen: list[int] = []
+    scored: list[str] = []
+    harness = OfflineHarness()
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        if ctx.round == 3:
+            scored.extend(score.candidate_id for score in ctx.scores_of(harness.candidates[1].id))
+        rows = ctx.best(1)
+        await ctx.run_tool({"x": float(ctx.round)}, parents=[rows[0].candidate_id] if rows else [])
+        if ctx.round == 2:
+            raise failure
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    reports = await harness.run_rounds(
+        NoopManager(),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=3,
+        limits=Limits(),
+        config=RunConfig(),
+        judges=[Ref.of(ProgramJudge("_fakes.tools:score_min_y"))],
+    )
+    assert seen == [1, 2, 3]
+    assert reports == [RoundReport(summary="done"), RoundReport(), RoundReport(summary="done")]
+    assert harness.manager_errors == [failure]
+    assert [event.round for event in _events(harness, "score")] == [1, 2, 3]
+    assert [event.round for event in _events(harness, "round_closed")] == [1, 2, 3]
+    assert scored == [harness.candidates[1].id]
+    assert [c.read_ids for c in harness.candidates] == [
+        [],
+        [harness.candidates[0].id],
+        [harness.candidates[1].id, harness.candidates[0].id],
+    ]
+    (error,) = _events(harness, "agent_status")
+    assert (error.round, error.team, error.agent, error.task_id) == (
+        2,
+        "team",
+        "agent",
+        "g/team/agent#r2",
+    )
+    assert error.payload["status"] == "finished"
+    assert error.payload["reason"] == "manager error: RuntimeError"
+    assert error.payload["a2a"]["id"] == error.task_id
+    assert error.seq < _events(harness, "score")[1].seq < _events(harness, "round_closed")[1].seq
+    assert _events(harness, "round_closed")[1].seq < _events(harness, "frontier")[2].seq
+    committed = read_committed(harness.store)
+    assert committed is not None
+    assert [event.payload["candidate"]["read_ids"] for event in _events(harness, "tool_end")] == [
+        candidate.read_ids for candidate in harness.candidates
+    ]
+    for event in committed[1]:
+        assert_secret_absent(RuntimeError(event.model_dump_json()), secret)
+
+
+async def test_harness_retains_each_failure_and_resets_them_for_a_new_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failures = [RuntimeError("first"), ValueError("second")]
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise failures[ctx.round - 1]
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    harness = OfflineHarness()
+    reports = await harness.run_rounds(
+        NoopManager(),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=2,
+        limits=Limits(),
+        config=RunConfig(),
+    )
+    assert reports == [RoundReport(), RoundReport()]
+    assert harness.manager_errors == failures
+    assert [event.payload["reason"] for event in _events(harness, "agent_status")] == [
+        "manager error: RuntimeError",
+        "manager error: ValueError",
+    ]
+    await harness.run_rounds(
+        ScriptedManager([]),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=1,
+        limits=Limits(),
+        config=RunConfig(),
+    )
+    assert harness.manager_errors == []
+    assert _events(harness, "agent_status") == []
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_manager_control_flow_propagates_without_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+    fenced: bool,
+) -> None:
+    failure = Fenced("ownership lost") if fenced else anyio.get_cancelled_exc_class()()
+    seen: list[int] = []
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    harness = OfflineHarness()
+    with pytest.raises(type(failure)) as caught:
+        await harness.run_rounds(
+            NoopManager(),
+            goal=GOAL,
+            tool=SQUARE,
+            rounds=3,
+            limits=Limits(),
+            config=RunConfig(),
+        )
+    assert caught.value is failure
+    assert seen == [1]
+    assert _events(harness, "agent_status") == []
+    assert _events(harness, "round_closed") == []
 
 
 def _events(harness: OfflineHarness, type: str) -> list[Event]:

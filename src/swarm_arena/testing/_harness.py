@@ -22,16 +22,19 @@ from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
+from swarm_arena._errors import Fenced
+from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
-from swarm_arena._model.results import Candidate, Learning
+from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
@@ -60,6 +63,8 @@ class OfflineHarness:
         Tool candidates made in the most recent run.
     learnings : list[Learning]
         Learnings posted in the most recent run.
+    manager_errors : list[Exception]
+        Original manager failures in round order, with failed-run log notes.
     store : LocalStore
         Readable run journal after ``run_rounds`` has returned.
 
@@ -74,6 +79,7 @@ class OfflineHarness:
         """Initialize empty observations without allocating a run folder."""
         self.candidates: list[Candidate] = []
         self.learnings: list[Learning] = []
+        self.manager_errors: list[Exception] = []
         self.store: LocalStore
 
     async def run_rounds(
@@ -93,8 +99,11 @@ class OfflineHarness:
         Each round captures a committed frontier and fixed snapshot. Its new
         gated-in candidates are judged and scores indexed before the following
         frontier. ``LimitReached`` ends only that manager round, returning an
-        empty report for it. Other exceptions propagate with failed-run log
-        notes. Returned reports pass strict validation and retain their identity.
+        empty report for it. Ordinary manager exceptions are retained in
+        ``manager_errors`` with failed-run log notes and journaled by type only;
+        their rounds still receive barrier judging and closure, return empty
+        reports, and do not prevent later rounds. Cancellation and fencing
+        propagate. Returned reports pass strict validation and retain their identity.
         Tranche outcomes may be ignored here: durable ``settle.usage_overflow``
         and ledger exhaustion remain authoritative for subsequent admission.
 
@@ -133,6 +142,7 @@ class OfflineHarness:
         if rounds < 1:
             raise ValueError("rounds must be positive")
         self.candidates, self.learnings = [], []
+        self.manager_errors = []
         root = await anyio.to_thread.run_sync(self._run_folder)
         self.store = LocalStore(root / "local")
         config = config.model_copy(
@@ -256,8 +266,14 @@ class OfflineHarness:
             )
             with track_inflight(Inflight()):
                 reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
-        for note in await anyio.to_thread.run_sync(_failed_runs, executor.outputs):
-            warnings.warn(note, UserWarning, stacklevel=2)
+        notes = await anyio.to_thread.run_sync(_failed_runs, executor.outputs)
+        if self.manager_errors:
+            for error in self.manager_errors:
+                for note in notes:
+                    error.add_note(note)
+        else:
+            for note in notes:
+                warnings.warn(note, UserWarning, stacklevel=2)
         return reports
 
     @staticmethod
@@ -331,15 +347,53 @@ class OfflineHarness:
                     cap_tokens=rt.limits.digest_tokens,
                 ),
             )
+            manager_error: Exception | None = None
             try:
                 report = await manager.run_round(AgentContext(rt, gate=lambda: None))
             except LimitReached:
+                report = RoundReport()
+            except Fenced:
+                raise
+            except Exception as error:
+                if rt.journal.fenced.is_set():
+                    raise Fenced("run ownership lost") from None
+                self.manager_errors.append(error)
+                manager_error = error
                 report = RoundReport()
             finally:
                 self.candidates.extend(c for c in rt.own if isinstance(c, Candidate))
                 self.learnings.extend(item for item in rt.own if isinstance(item, Learning))
                 with anyio.CancelScope(shield=True):
                     await rt.tranche.close()
+            if manager_error is not None:
+                reason = f"manager error: {type(manager_error).__name__}"
+                rt.journal.append(
+                    EventDraft(
+                        type=EventType.AGENT_STATUS,
+                        goal_id=rt.goal_id,
+                        team=rt.team.name,
+                        agent=rt.spec.name,
+                        round=number,
+                        task_id=agent_task_id(rt.address, number),
+                        payload={
+                            "status": AgentStatus.FINISHED.value,
+                            "reason": reason,
+                            "a2a": task_to_json(
+                                agent_round_task(
+                                    context_id="local",
+                                    address=rt.address,
+                                    round=number,
+                                    learnings=[
+                                        item for item in rt.own if isinstance(item, Learning)
+                                    ],
+                                    status=AgentStatus.FINISHED,
+                                    summary=reason,
+                                    at=utc_now(),
+                                )
+                            ),
+                        },
+                    )
+                )
             if not isinstance(report, RoundReport):
                 raise _fail("Manager.run_round() must return a RoundReport")
             if _strict_copy(RoundReport, report) is None:
