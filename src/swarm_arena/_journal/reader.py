@@ -87,7 +87,7 @@ def read_chain(
         chain.append((name, events))
         first_seq = events[0].seq
         if link is None:
-            if stop_after is None and first_seq != 1:
+            if first_seq != 1:
                 raise ChainError("seq gap: first segment must start at seq 1")
             break
         epoch, last_seq = _parse_name(link, "link")

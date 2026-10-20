@@ -1074,3 +1074,55 @@ async def test_goal_remaining_excludes_service_reserve_and_final_slice(env: Ledg
     assert env.ledger.goal_remaining("g1").usd == 40.5
     await env.ledger.settle(reservation.id, Amount(usd=1))
     assert env.ledger.goal_remaining("g1").usd == 41.5
+
+
+@pytest.mark.parametrize("path", ["ordinary", "overflow", "batch_close", "direct_close"])
+async def test_native_cancelled_settlement_is_final_at_admission(
+    env: LedgerEnv, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    import asyncio
+
+    from swarm_arena._budget.tranche import Tranche
+
+    await _setup(env)
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=1))
+    if path.endswith("close"):
+        cid = await tranche.reserve_call(Amount(usd=2 if path == "direct_close" else 0.5))
+        if path == "batch_close":
+            await tranche.settle_call(cid, Amount(usd=0.000003))
+        reservation = await env.last_reservation()
+    else:
+        reservation = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="tool", goal_id="g1")
+    admitted: list[bool] = []
+    wait = env.journal._wait_for
+
+    async def cancel_wait(seq: int) -> None:
+        admitted.append(env.ledger._entries[reservation.id].settled)
+        task = asyncio.current_task()
+        assert task is not None
+        asyncio.get_running_loop().call_soon(task.cancel)
+        await wait(seq)
+
+    async def settle() -> None:
+        if path.endswith("close"):
+            await tranche.close()
+        elif path == "overflow":
+            await env.ledger.settle_overflow(reservation.id, Amount(usd=USD_LIMIT))
+        else:
+            await env.ledger.settle(reservation.id, Amount(usd=0.000003))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.journal, "_wait_for", cancel_wait)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(settle())
+    await env.journal.commit()
+    assert admitted == [True]
+    assert env.ledger._entries[reservation.id].settled
+    replay = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _exact_balances(env.ledger) == _exact_balances(replay)
+    before = env.journal._next_seq
+    await settle()
+    assert env.journal._next_seq == before
+    assert await env.count("settle") == 1

@@ -710,9 +710,11 @@ class Ledger:
         Bookkeeping precedes the writer's synchronous queue admission, so live
         funding follows journal order even during concurrent calls. Any later
         reservation waits for a head covering both events before returning.
-        Settlement is shielded after admission; a failed append restores any
-        released charge conservatively. Concurrent settlements serialize by
-        reservation identifier.
+        Settlement is final at admission, before the durability wait. Caller
+        cancellation never rolls back an admitted charge or permits a second
+        event. A writer failure restores any released charge conservatively;
+        the committed journal remains authoritative for recovery. Concurrent
+        settlements serialize by reservation identifier.
         After usage overflow, later settlements are no-ops.
 
         Examples
@@ -800,14 +802,20 @@ class Ledger:
             self._reconcile(entry, target)
             if usage_overflow:
                 self._overflow_reservation = reservation_id
+            # Booking and append_durable's queue admission have no checkpoint
+            # between them. Finalize before its first await, the durability wait.
+            entry.settled = True
             try:
                 with anyio.CancelScope(shield=True):
                     await self._journal.append_durable(draft)
+            except anyio.get_cancelled_exc_class():
+                # The independent writer still owns publication of this event.
+                raise
             except BaseException:
+                entry.settled = False
                 if self._overflow_reservation in (None, reservation_id):
                     self._reconcile(entry, current + _positive(target - current))
                 raise
-            entry.settled = True
 
     def _charge_for(self, entry: _Entry, actual: Amount, estimated: bool) -> Amount:
         """Choose the authoritative charged amount independently of reporting."""

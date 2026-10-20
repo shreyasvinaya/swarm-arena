@@ -391,3 +391,15 @@ def test_invalid_owner_head_is_not_read(store: LocalStore, reads: list[str]) -> 
         read_committed(store)
     assert_secret_absent(caught.value, _SECRET, sanitized=True)
     assert reads == [OWNER_KEY]
+
+
+@pytest.mark.parametrize("first_seq", [1, 4])
+def test_unreachable_boundary_validates_null_link_root(store: LocalStore, first_seq: int) -> None:
+    _put(store, None, [first_seq])
+    head = Head(epoch=1, seq=first_seq, segment=f"journal/e1-{first_seq}.jsonl")
+    if first_seq == 4:
+        with pytest.raises(ChainError, match="first segment must start at seq 1"):
+            read_chain(store, head, stop_after="journal/e2-1.jsonl")
+    else:
+        chain = read_chain(store, head, stop_after="journal/e2-1.jsonl")
+        assert [event.seq for _, batch in chain for event in batch] == [1]

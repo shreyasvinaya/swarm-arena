@@ -73,6 +73,28 @@ class GoalStatus(FrozenModel):
     best: float | None
 
 
+class SpendTotal(FrozenModel):
+    """
+    Store aggregate charges as unbounded integer tokens and micro-dollars.
+
+    Parameters
+    ----------
+    tokens : int, default=0
+        Total charged tokens.
+    micro_usd : int, default=0
+        Total charged micro-dollars. Unlike an individual ``Amount``, this
+        aggregate may exceed ``USD_LIMIT`` and never converts to float dollars.
+
+    Examples
+    --------
+    >>> SpendTotal(tokens=7, micro_usd=1_000_000_000_000_001).micro_usd
+    1000000000000001
+    """
+
+    tokens: int = 0
+    micro_usd: int = 0
+
+
 class StatusReport(FrozenModel):
     """
     Describe a single authority snapshot and its committed replay state.
@@ -91,15 +113,16 @@ class StatusReport(FrozenModel):
         Journaled stop state, independent of pending control files.
     goals : dict[str, GoalStatus]
         Goal summaries in replay order.
-    spent : Amount
-        Charged reservations, including conservative and overflow settlements.
+    spent : SpendTotal
+        Charged reservations, including conservative and overflow settlements,
+        stored as unbounded integer ``tokens`` and ``micro_usd`` totals.
     lost : int
         Number of distinct lost tool runs.
 
     Examples
     --------
     >>> report = StatusReport(run_id="r", epoch=1, owner_live=True, head_seq=0,
-    ...     stop="none", goals={}, spent=Amount(), lost=0)
+    ...     stop="none", goals={}, spent=SpendTotal(), lost=0)
     >>> report.head_seq
     0
     """
@@ -110,7 +133,7 @@ class StatusReport(FrozenModel):
     head_seq: int
     stop: Literal["none", "stop", "stop-now"]
     goals: dict[str, GoalStatus]
-    spent: Amount
+    spent: SpendTotal
     lost: int
 
 
@@ -188,21 +211,23 @@ def _best(state: RunState, plan: Plan, candidates: list[Candidate]) -> float | N
     return pairs[0][1].value if pairs else None
 
 
-def _spent(state: RunState) -> Amount:
+def _spent(state: RunState) -> SpendTotal:
     """Reproduce authoritative reservation charges, retaining overflow actuals."""
     overflow = {
         event.payload["id"]
         for event in state.ledger_events
         if event.type == EventType.SETTLE and event.payload.get("usage_overflow", False)
     }
-    spent = Amount()
+    tokens = micros = 0
     for id, entry in state.reservations.items():
         conservative = entry.state in ("open", "estimated") or entry.reservation.get(
             "keep_charged", False
         )
         raw = entry.actual if id in overflow or not conservative else entry.reservation["amount"]
-        spent += Amount.model_validate(raw)
-    return spent
+        amount = Amount.model_validate(raw)
+        tokens += amount.tokens
+        micros += amount._micro_usd
+    return SpendTotal(tokens=tokens, micro_usd=micros)
 
 
 def _read_status(run_root: str, run_id: str) -> StatusReport:
@@ -286,11 +311,14 @@ def format_status(report: StatusReport) -> str:
     -------
     str
         Header, one line per goal and a final spend line, without a trailing newline.
+        Dollars are formatted directly from integer micro-dollars with two to
+        six fractional digits, preserving exact spend above the individual
+        ``Amount`` range.
 
     Examples
     --------
     >>> report = StatusReport(run_id="r", epoch=1, owner_live=False, head_seq=0,
-    ...     stop="none", goals={}, spent=Amount(), lost=0)
+    ...     stop="none", goals={}, spent=SpendTotal(), lost=0)
     >>> format_status(report).splitlines()[0]
     'run r  epoch 1  owner expired  head 0  stop none'
     """
@@ -304,5 +332,10 @@ def format_status(report: StatusReport) -> str:
             f"goal {goal_id}  {goal.status}  round {goal.round}/{goal.rounds_total}  "
             f"candidates {goal.candidates}  best {goal.best if goal.best is not None else '-'}"
         )
-    lines.append(f"spent {report.spent.tokens} tokens, ${report.spent.usd:.2f}  lost {report.lost}")
+    whole, fraction = divmod(abs(report.spent.micro_usd), 1_000_000)
+    sign = "-" if report.spent.micro_usd < 0 else ""
+    decimals = f"{fraction:06d}".rstrip("0").ljust(2, "0")
+    lines.append(
+        f"spent {report.spent.tokens} tokens, ${sign}{whole}.{decimals}  lost {report.lost}"
+    )
     return "\n".join(lines)

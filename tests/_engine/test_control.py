@@ -7,10 +7,10 @@ import pytest
 from _fakes.tools import cand
 
 from swarm_arena import Goal, Plan, Ref
-from swarm_arena._budget.amount import Amount
 from swarm_arena._engine import control as control_mod
 from swarm_arena._engine.control import (
     GoalStatus,
+    SpendTotal,
     StatusReport,
     format_status,
     read_status,
@@ -261,7 +261,7 @@ async def test_status_spent_lost_and_stop_from_replay(run_root: Path) -> None:
     events.append(_event(len(events) + 1, "stop_requested", {"now": True}))
     _commit(store, events)
     rep = await read_status(str(run_root), "r1")
-    assert rep.spent == Amount(tokens=34, usd=3.4)
+    assert rep.spent == SpendTotal(tokens=34, micro_usd=3_400_000)
     assert rep.lost == 1
     assert rep.stop == "stop-now"
 
@@ -291,12 +291,12 @@ def test_status_models_frozen_and_format_missing_best() -> None:
         head_seq=0,
         stop="stop",
         goals={"g": goal},
-        spent=Amount(tokens=42, usd=1.256),
+        spent=SpendTotal(tokens=42, micro_usd=1_256_000),
         lost=2,
     )
     assert format_status(rep).splitlines()[1:] == [
         "goal g  queued  round 0/3  candidates 0  best -",
-        "spent 42 tokens, $1.26  lost 2",
+        "spent 42 tokens, $1.256  lost 2",
     ]
     field_name = "round"
     with pytest.raises(ValueError, match="frozen"):
@@ -370,3 +370,30 @@ async def test_status_unjoined_parts_have_no_combined_main_best(run_root: Path) 
     events.append(_event(6, "final_order", {"candidate_ids": [], "parts": {"p": None}}))
     _commit(store, events)
     assert (await read_status(str(run_root), "r1")).goals["g"].best is None
+
+
+async def test_status_aggregate_integer_totals_and_json_above_individual_range(
+    run_root: Path,
+) -> None:
+    store = _live_run(run_root, "r1")
+    tokens = 2**100 + 1
+    events = [
+        _event(
+            i,
+            "reserve",
+            {"reservation": {"id": f"r{i}", "amount": {"tokens": tokens, "usd": 1_000_000_000}}},
+        )
+        for i in (1, 2)
+    ]
+    _commit(store, events)
+    report = await read_status(str(run_root), "r1")
+    assert report.spent == SpendTotal(tokens=2 * tokens, micro_usd=2 * 10**15)
+    assert report.model_dump(mode="json")["spent"] == {
+        "tokens": 2 * tokens,
+        "micro_usd": 2 * 10**15,
+    }
+    restored = StatusReport.model_validate_json(report.model_dump_json())
+    assert restored.spent == report.spent
+    assert format_status(restored).splitlines()[-1] == (
+        f"spent {2 * tokens} tokens, $2000000000.00  lost 0"
+    )

@@ -532,3 +532,56 @@ def test_newer_solution_version_is_rejected(
     err = capsys.readouterr().err
     assert "CLI-SECRET" not in err
     assert "Traceback" not in err
+
+
+def test_status_cli_exact_total_after_real_overflow_run(
+    run_config: RunConfig, tmp_path: Path
+) -> None:
+    import subprocess
+
+    import anyio
+    from _fakes.run import all_events
+    from _fakes.tools import PyTool
+
+    from swarm_arena import Limits, Ref
+    from swarm_arena._budget.amount import USD_LIMIT
+
+    config = run_config.model_copy(
+        update={
+            "limits": Limits(
+                max_usd=10,
+                max_concurrent_goals=1,
+                default_run_reservation={"usd": 1, "tokens": 1},
+            ),
+            "executor": Ref(
+                path="swarm_arena.executor:LocalExecutor",
+                config={"workspace_root": str(tmp_path / "workspaces")},
+            ),
+        }
+    )
+    plans = []
+    for goal, usd in [("normal", 0.000001), ("overflow", USD_LIMIT + 1)]:
+        code = (
+            f"import json,os;json.dump({{'data':{{'y':1.0}},'usage':{{'usd':{usd!r}}}}},"
+            "open(os.environ['SWARM_ARENA_RESULT'],'w'))"
+        )
+        plans.append(plan(goal_id=goal, rounds=1, tool=PyTool({"code": code, "grace_s": 0})))
+    swarm = Swarm(config)
+    assert sorted(anyio.run(swarm.run, plans)) == ["normal", "overflow"]
+    settlements = [e for e in all_events(config) if e.type == "settle"]
+    assert [e.payload["actual"]["usd"] for e in settlements] == [0.000001, USD_LIMIT]
+    assert settlements[-1].payload["usage_overflow"] is True
+    assert swarm.run_id is not None
+    result = subprocess.run(
+        [
+            str(Path(sys.executable).with_name("swarm-arena")),
+            "status",
+            str(Path(config.run_root) / swarm.run_id),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "$1000000000.000001" in result.stdout
+    assert result.stderr == ""
