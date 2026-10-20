@@ -1059,6 +1059,8 @@ def score_value(goal: Goal, candidate: Candidate) -> Score:
     (12.0,)
     """
     return Score.maximize(candidate.output.data["value"])
+
+
 class FeedbackCheck(AlwaysFailCheck):
     """Return passing feedback under a configurable visibility policy."""
 
