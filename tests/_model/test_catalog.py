@@ -331,3 +331,30 @@ def test_catalog_match_uses_shared_json_equal_and_first_typed_match() -> None:
         Ref(path="demo:Tool", config={"x": [{"value": 1}]}), "tool"
     )
     assert matched is entries[1]
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("_fakes.admission:AliasScriptTool", "argv"),
+        ("_fakes.admission:ProbeTool", "command"),
+        ("_fakes.admission:ProbeTool", "command_alias"),
+        ("_fakes.admission:ProbeTool", "command_path"),
+    ],
+)
+def test_catalog_refuses_every_human_only_input_spelling(path: str, key: str) -> None:
+    entry = CatalogEntry(
+        name="component",
+        kind="tool",
+        ref=path,
+        config={"text": "catalog-secret-value"},
+        settable={key: {"type": "string"}},
+        description="component",
+    )
+    with pytest.raises(ValidationError, match="human-only field 'command'") as error:
+        PlannerCatalog(entries=[entry])
+    assert "component" in str(error.value)
+    assert_secret_absent(error.value, "catalog-secret-value")
+    assert PlannerCatalog(
+        entries=[entry.model_copy(update={"settable": {"tune_alias": {"type": "integer"}}})]
+    ).entries

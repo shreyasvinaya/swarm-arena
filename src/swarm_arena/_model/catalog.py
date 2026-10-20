@@ -3,6 +3,8 @@
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
+    AliasChoices,
+    AliasPath,
     BaseModel,
     ConfigDict,
     Field,
@@ -11,14 +13,35 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.fields import FieldInfo
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._model.base import CatalogKind, LLMRole, _SafeModel
+from swarm_arena._model.compat import _alias_paths
 from swarm_arena._model.data import TomlJsonObject, json_equal
 from swarm_arena._model.goal import _Slug
 from swarm_arena._model.ref import Ref, load_object
 from swarm_arena._model.schema import compile_object_schema
 from swarm_arena._model.settings import _ConfigModel
+
+
+def _field_input_keys(name: str, field: FieldInfo | None) -> set[str]:
+    """Return canonical and declared alias heads through shared normalization."""
+    alias = None if field is None else field.validation_alias
+    paths = _alias_paths(
+        alias.convert_to_aliases() if isinstance(alias, (AliasChoices, AliasPath)) else alias
+    )
+    return {name, *(path[0] for path in paths if path and isinstance(path[0], str))}
+
+
+def _human_only_inputs(cls: type[Any]) -> dict[str, str]:
+    """Map every protected input spelling to its canonical field identifier."""
+    fields = getattr(getattr(cls, "Config", None), "model_fields", {})
+    return {
+        key: name
+        for name in getattr(cls, "_human_only", ())
+        for key in _field_input_keys(name, fields.get(name))
+    }
 
 
 class ModelSpec(_ConfigModel):
@@ -278,7 +301,8 @@ class PlannerCatalog(_ConfigModel):
     ----------
     entries : list[CatalogEntry], default=[]
         Entries with unique names. Entries exposing settable fields import their
-        component class during validation to inspect its human-only field names.
+        component class during validation to inspect its human-only field names
+        and every validation alias, including choices and path heads.
 
     Examples
     --------
@@ -300,13 +324,13 @@ class PlannerCatalog(_ConfigModel):
             cls = load_object(entry.ref)
             if not isinstance(cls, type):
                 raise ValueError("catalog reference must be a class")
-            human_only = getattr(cls, "_human_only", frozenset())
+            human_only = _human_only_inputs(cls)
             for key in entry.settable:
                 if key in human_only:
                     raise PydanticCustomError(
                         "arena_config",
                         "catalog entry '{entry}': human-only field '{field}' cannot be settable",
-                        {"entry": entry.name, "field": key},
+                        {"entry": entry.name, "field": human_only[key]},
                     )
         return self
 

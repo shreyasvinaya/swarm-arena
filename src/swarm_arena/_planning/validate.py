@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from swarm_arena._agent.manager import Manager
 from swarm_arena._errors import ConfigError, PlanError
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.catalog import _human_only_inputs
 from swarm_arena._model.data import json_equal
 from swarm_arena._model.goal import FileSet, Goal, GoalKey
 from swarm_arena._model.locations import _safe_location
@@ -361,6 +362,16 @@ def _rule_configs(
         base = Configurable if "/config/" in site.pointer else _BASES[site.kind]
         ref = site.ref
         try:
+            cls = ref.load()
+            if plan.origin != "human":
+                protected = _human_only_inputs(cls)
+                for entry in config.planner_catalog.entries:
+                    if entry.kind == site.kind and entry.ref == ref.path:
+                        for key in entry.settable.keys() & ref.config.keys() & protected.keys():
+                            errors.append(
+                                f"{pointer}: {ref.path}: human-only field "
+                                f"{protected[key]} cannot be settable"
+                            )
             if base is Tool:
                 ref = effective_tool_ref(ref, _overrides(plan, site))
             else:
@@ -743,6 +754,10 @@ def validate_plan(
     )
     built: dict[str, Configurable] = {}
     errors.extend(_rule_configs(plan, config, history, built=built))
+    try:
+        _validate_frozen_files(plan)
+    except PlanError as error:
+        errors.extend(error.errors)
     for rule in (_rule_env, _rule_replicates, _rule_fingerprints):
         try:
             errors.extend(rule(plan, config, history, built=built))
@@ -865,20 +880,21 @@ def _snapshot_round_refs(plan: Plan, artifacts: ArtifactStore) -> Plan:
     return plan.model_copy(update={"rounds": rounds, "converge": converge})
 
 
-def _validate_frozen_tools(plan: Plan) -> None:
-    """Refuse effective file declarations that escaped snapshot processing."""
-    refs = [(pointer, ref) for pointer, ref, _ in _round_refs(plan)]
-    for pointer, agent in _agents(plan):
-        if not plan.rounds and (
-            not pointer.startswith("/converge/") or plan.converge.round is None
-        ):
-            refs.append((pointer + "/tool", agent.tool))
+def _validate_frozen_files(plan: Plan) -> None:
+    """Refuse unfrozen files in every goal, component root and effective tool."""
+    roots: list[tuple[str, Any]] = [("/goal/files", plan.goal.files)]
+    roots.extend((f"/parts/{i}/goal/files", part.goal.files) for i, part in enumerate(plan.parts))
+    roots.extend(
+        (site.pointer, site.ref)
+        for site in ref_sites(_inherited_converge(plan))
+        if "/config/" not in site.pointer
+    )
     errors: list[str] = []
-    for pointer, ref in refs:
+    for pointer, value in roots:
         try:
-            files = _safe_call(pointer, partial(list, _file_sets(ref)))
+            files = _safe_call(pointer, partial(list, _file_sets(value)))
             if any(not file_set.snapshotted for file_set in files):
-                errors.append(f"{pointer}: effective tool contains an unsnapshotted FileSet")
+                errors.append(f"{pointer}: contains an unsnapshotted FileSet")
         except PlanError as error:
             errors.extend(error.errors)
     if errors:
@@ -896,7 +912,7 @@ def admit_revision(
     """
     Authorize, snapshot, and validate one revision before execution.
 
-    Refuse any effective tool configuration whose file declarations, including
+    Refuse any goal or component configuration whose file declarations, including
     nested references and defaults, remain unsnapshotted after admission.
 
     Parameters
@@ -953,5 +969,4 @@ def admit_revision(
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )
-    _validate_frozen_tools(frozen)
     return frozen, warnings

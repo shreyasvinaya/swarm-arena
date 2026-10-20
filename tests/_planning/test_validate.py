@@ -1,10 +1,12 @@
 """Exercise plan admission, revision authority, and frozen file boundaries."""
 
 import sys
+import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from _fakes.admission import SENTINEL as BOUNDARY_SECRET
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import (
@@ -21,9 +23,11 @@ from swarm_arena import (
 )
 from swarm_arena._agent.manager import Manager
 from swarm_arena._errors import PlanError
+from swarm_arena._model.base import Origin
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, PlannerCatalog
 from swarm_arena._model.goal import FileSet
+from swarm_arena._model.ref import Configurable
 from swarm_arena._model.run_config import SecretsPolicy
 from swarm_arena._planning import validate as validation
 from swarm_arena._planning.provenance import ref_sites, stamp
@@ -35,6 +39,7 @@ from swarm_arena._planning.validate import (
     validate_plan,
 )
 from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_plan
 from swarm_arena._tooling.tool import effective_tool_ref
 
@@ -412,9 +417,14 @@ def test_frozen_main_goal_key() -> None:
     assert any("main goal" in e for e in errs(r1, RunConfig(), history=[r0]))
 
 
-def test_non_human_noncatalog_ref_rejected_and_carried_human_accepted() -> None:
+def test_non_human_noncatalog_ref_rejected_and_carried_human_accepted(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
     r0 = _script_judge_plan()
-    ok = stamp(_add_catalog_agent(r0), origin="autonomous", parent=r0)
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/run.py").write_text("pass")
+    r0._base_dir = tmp_path
+    ok = stamp(snapshot_plan(_add_catalog_agent(r0), artifacts), origin="autonomous", parent=r0)
     bad = stamp(_add_agent(r0, path="_fakes.tools:EchoTool"), origin="autonomous", parent=r0)
     assert validate_plan(ok, CFG_WITH_CATALOG, history=[r0]) == []
     assert any("not in the planner catalog" in e for e in errs(bad, CFG_WITH_CATALOG, history=[r0]))
@@ -547,14 +557,17 @@ def test_ever_present_checks_kept() -> None:
     assert errs(changed, CFG_WITH_CATALOG, history=[r0, r1])
 
 
-def test_new_part_must_leave_scoring_unset() -> None:
+def test_new_part_must_leave_scoring_unset(tmp_path: Path, artifacts: ArtifactStore) -> None:
     r0 = _parts_plan(parts=["a"])
     bad = stamp(_with_part(r0, "b", judges=[CATALOG_JUDGE]), origin="autonomous", parent=r0)
     assert any(
         e.startswith("/parts/1/judges") and "new part" in e
         for e in errs(bad, CFG_WITH_CATALOG, history=[r0])
     )
-    ok = stamp(_with_part(r0, "b"), origin="autonomous", parent=r0)
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/run.py").write_text("pass")
+    r0._base_dir = tmp_path
+    ok = stamp(snapshot_plan(_with_part(r0, "b"), artifacts), origin="autonomous", parent=r0)
     assert validate_plan(ok, CFG_WITH_CATALOG, history=[r0]) == []
 
 
@@ -648,7 +661,7 @@ def test_nested_tool_env_checked_after_overrides(depth: int, round_override: boo
         )
     plan = _plan(tool=ref)
     if round_override:
-        plan = _plan(tool=Ref(path=ref.path), rounds=[RoundSpec(tool_overrides=ref.config)])
+        plan = _plan(tool=ref, rounds=[RoundSpec(tool_overrides={"text": "round"})])
     assert any("API_TOKEN" in e and "/config/members/0" in e for e in errs(plan, RunConfig()))
     assert validate_plan(plan, RunConfig(secrets=SecretsPolicy(allow=["API_TOKEN"]))) == []
 
@@ -1061,7 +1074,8 @@ def test_admission_refuses_unsnapshotted_effective_defaults(
         )
     with pytest.raises(PlanError) as error:
         admit_revision(plan, RunConfig(), artifacts)
-    assert any("unsnapshotted FileSet" in item for item in error.value.errors)
+    needle = "unsnapshotted FileSet" if nested else "/snapshot: ValueError"
+    assert any(needle in item for item in error.value.errors)
     assert_secret_absent(error.value, secret)
 
 
@@ -1132,3 +1146,578 @@ def test_nested_diagnostic_validation_alias_is_retained(monkeypatch: pytest.Monk
         e.startswith("/teams/0/agents/0/tool/config/children/0:")
         for e in errs(_plan(tool=ref), RunConfig())
     )
+
+
+BOUNDARY_LEAF = "_fakes.admission:ProbeTool"
+BOUNDARY_WRAP = "_fakes.admission:Wrapper"
+BOUNDARY_MANAGER = Ref(path="_fakes.tools:NoopManager")
+BOUNDARY_JUDGE = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="score")
+
+
+def _boundary_nested(ref: Ref, depth: int) -> Ref:
+    for _ in range(depth):
+        ref = Ref(path=BOUNDARY_WRAP, config={"members": [ref.model_dump(exclude_none=True)]})
+    return ref
+
+
+def _boundary_plan(ref: Ref, depth: int, merged: bool) -> Plan:
+    root = _boundary_nested(ref, depth)
+    tool = Ref(path=root.path) if merged else root
+    return Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[
+            TeamSpec(
+                name="t",
+                rationale="Explore",
+                agents=[
+                    AgentSpec(name="a", rationale="Explore", tool=tool, manager=BOUNDARY_MANAGER)
+                ],
+            )
+        ],
+        judges=[BOUNDARY_JUDGE],
+        rounds=[RoundSpec(tool_overrides=root.config)] if merged else [],
+    )
+
+
+def _boundary_catalog(
+    plan: Plan, leaf_config: dict[str, Any], *, alias_settable: bool = False, allow_env: bool = True
+) -> RunConfig:
+    entries: list[CatalogEntry] = []
+    seen: set[tuple[str, str]] = set()
+    for site in ref_sites(plan):
+        if site.ref.path in (BOUNDARY_LEAF, "_fakes.admission:OtherTool"):
+            continue
+        key = (site.kind, site.ref.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        settings = {"members": {"type": "array"}} if site.ref.path == BOUNDARY_WRAP else {}
+        fixed = {} if site.ref.path == BOUNDARY_WRAP else site.ref.config
+        entries.append(
+            CatalogEntry(
+                name=f"e{len(entries)}",
+                kind=site.kind,
+                ref=site.ref.path,
+                config=fixed,
+                settable=settings,
+                description="admission fixture",
+            )
+        )
+    settable: dict[str, Any] = {"tune_alias": {"type": "integer", "minimum": 0, "maximum": 10}}
+    if alias_settable:
+        settable["command_alias"] = {"type": "string"}
+        settable["command_path"] = {"type": "array", "items": {"type": "string"}}
+    entries.append(
+        CatalogEntry(
+            name="leaf",
+            kind="tool",
+            ref=BOUNDARY_LEAF,
+            config=leaf_config,
+            settable=settable,
+            description="leaf",
+        )
+    )
+    if alias_settable:
+        # Simulate a copied catalog that bypassed its loader's invariant.
+        catalog = PlannerCatalog().model_copy(update={"entries": entries})
+        return RunConfig(
+            secrets=SecretsPolicy(allow=["REVIEW_TOKEN"] if allow_env else [])
+        ).model_copy(update={"planner_catalog": catalog})
+    return RunConfig(
+        planner_catalog=PlannerCatalog(entries=entries),
+        secrets=SecretsPolicy(allow=["REVIEW_TOKEN"] if allow_env else []),
+    )
+
+
+def _boundary_reject(
+    plan: Plan, config: RunConfig, needle: str, *, history: list[Plan] | None = None
+) -> None:
+    with pytest.raises(PlanError) as caught:
+        validate_plan(plan, config, history=history or [])
+    assert any(needle in e for e in caught.value.errors), caught.value.errors
+    assert_secret_absent(caught.value, BOUNDARY_SECRET)
+    assert BOUNDARY_SECRET not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize(
+    "rule", ["noncatalog", "fixed", "human_only", "alias_schema", "env", "files"]
+)
+def test_paired_rule_matrix(depth: int, merged: bool, rule: str) -> None:
+    good_cfg: dict[str, Any] = {}
+    bad_cfg: dict[str, Any] = {}
+    bad_path = BOUNDARY_LEAF
+    needle = "catalog"
+    if rule == "noncatalog":
+        bad_path = "_fakes.admission:OtherTool"
+    elif rule == "fixed":
+        good_cfg = {"text": "fixed"}
+        bad_cfg = {"text": BOUNDARY_SECRET}
+    elif rule == "human_only":
+        bad_cfg = {"command": BOUNDARY_SECRET}
+    elif rule == "alias_schema":
+        good_cfg = {"tune_alias": 3}
+        bad_cfg = {"tune_alias": BOUNDARY_SECRET}
+        needle = "tune_alias"
+    elif rule == "env":
+        good_cfg = bad_cfg = {"env": ["REVIEW_TOKEN"]}
+        needle = "secrets.allow"
+    elif rule == "files":
+        good_cfg = {"files": {"globs": [BOUNDARY_SECRET], "manifest": {BOUNDARY_SECRET: "aa" * 32}}}
+        bad_cfg = {"files": [BOUNDARY_SECRET]}
+        needle = "snapshott"
+    good = _boundary_plan(Ref(path=BOUNDARY_LEAF, config=good_cfg), depth, merged)
+    bad = _boundary_plan(Ref(path=bad_path, config=bad_cfg), depth, merged)
+    if rule == "env" and merged:
+        good = _boundary_plan(Ref(path=BOUNDARY_LEAF, config=good_cfg), depth, False).model_copy(
+            update={"rounds": [RoundSpec(tool_overrides={"tune_alias": 3})]}
+        )
+        bad = good
+    if rule == "files":
+        assert validate_plan(good, RunConfig()) == []
+        _boundary_reject(bad, RunConfig(), "snapshott")
+        return
+    cfg_fixed = {k: v for k, v in good_cfg.items() if k != "tune_alias"}
+    cfg = _boundary_catalog(good, cfg_fixed)
+    if merged and (rule == "env" or (depth == 0 and rule in ("files", "fixed"))):
+        history = [good]
+        good = stamp(good, origin="autonomous", parent=history[0])
+        bad = stamp(bad, origin="autonomous", parent=history[0])
+    else:
+        history = []
+        good = stamp(good, origin="llm", parent=None)
+        bad = stamp(bad, origin="llm", parent=None)
+    assert validate_plan(good, cfg, history=history) == []
+    if rule == "env":
+        cfg = cfg.model_copy(update={"secrets": SecretsPolicy()})
+    _boundary_reject(bad, cfg, needle, history=history)
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("alias", ["command_alias", "command_path"])
+def test_human_only_alias_cannot_be_planner_settable(depth: int, merged: bool, alias: str) -> None:
+    good = stamp(_boundary_plan(Ref(path=BOUNDARY_LEAF), depth, merged), origin="llm", parent=None)
+    cfg = _boundary_catalog(good, {}, alias_settable=True)
+    assert validate_plan(good, cfg) == []
+    value: Any = BOUNDARY_SECRET if alias == "command_alias" else [BOUNDARY_SECRET]
+    bad = stamp(
+        _boundary_plan(Ref(path=BOUNDARY_LEAF, config={alias: value}), depth, merged),
+        origin="llm",
+        parent=None,
+    )
+    with pytest.raises(PlanError):
+        validate_plan(bad, cfg)
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+def test_mixed_human_then_planner_provenance(depth: int, merged: bool) -> None:
+    human = _boundary_plan(
+        Ref(path="_fakes.admission:OtherTool", config={"text": "human"}), depth, merged
+    )
+    cfg = _boundary_catalog(human, {})
+    assert validate_plan(human, cfg) == []
+    one = stamp(human, origin="autonomous", parent=human)
+    two = stamp(one, origin="autonomous", parent=one)
+    assert validate_plan(one, cfg, history=[human]) == []
+    assert validate_plan(two, cfg, history=[human, one]) == []
+    bad = stamp(
+        _boundary_plan(
+            Ref(path="_fakes.admission:OtherTool", config={"text": BOUNDARY_SECRET}), depth, merged
+        ),
+        origin="autonomous",
+        parent=two,
+    )
+    _boundary_reject(bad, cfg, "catalog", history=[human, one, two])
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+def test_validator_requires_frozen_tool_files(depth: int, merged: bool) -> None:
+    good = _boundary_plan(
+        Ref(
+            path=BOUNDARY_LEAF,
+            config={
+                "files": {"globs": [BOUNDARY_SECRET], "manifest": {BOUNDARY_SECRET: "aa" * 32}}
+            },
+        ),
+        depth,
+        merged,
+    )
+    assert validate_plan(good, RunConfig()) == []
+    bad = _boundary_plan(
+        Ref(path=BOUNDARY_LEAF, config={"files": [BOUNDARY_SECRET]}), depth, merged
+    )
+    _boundary_reject(bad, RunConfig(), "snapshott")
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("fail_at", ["constructor", "files"])
+def test_secrecy_of_connector_exception_surfaces(depth: int, merged: bool, fail_at: str) -> None:
+    ref = Ref(path=BOUNDARY_LEAF, config={"text": BOUNDARY_SECRET, "fail_at": fail_at})
+    plan = _boundary_plan(ref, depth, merged)
+    with pytest.raises(PlanError) as caught:
+        validate_plan(plan, RunConfig())
+    assert_secret_absent(caught.value, BOUNDARY_SECRET)
+    assert BOUNDARY_SECRET not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("depth", range(4))
+def test_admission_snapshots_judge_defaults(depth: int, tmp_path: Path) -> None:
+    leaf = Ref(path="_fakes.admission:FileJudge", config={"value": 1}, name="score")
+    for _ in range(depth):
+        leaf = Ref(
+            path="swarm_arena.scoring:Lexicographic",
+            config={"judges": [leaf.model_dump(exclude_none=True)]},
+            name="score",
+        )
+    plan = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False).model_copy(update={"judges": [leaf]})
+    plan._base_dir = tmp_path
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    good_leaf = Ref(
+        path="_fakes.admission:FileJudge", config={"value": 1, "files": []}, name="score"
+    )
+    for _ in range(depth):
+        good_leaf = Ref(
+            path="swarm_arena.scoring:Lexicographic",
+            config={"judges": [good_leaf.model_dump(exclude_none=True)]},
+            name="score",
+        )
+    good = plan.model_copy(update={"judges": [good_leaf]})
+    assert admit_revision(good, RunConfig(), artifacts)[1] == []
+    _boundary_reject(plan, RunConfig(), "unsnapshotted")
+    source = tmp_path / BOUNDARY_SECRET
+    source.write_text("judge source")
+    frozen, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    assert judge_private_paths(frozen) == frozenset({BOUNDARY_SECRET})
+    source.unlink()
+    for restored in (
+        Plan.model_validate_json(frozen.model_dump_json()),
+        Plan.loads(frozen.dumps(), base_dir=tmp_path),
+    ):
+        restored._base_dir = tmp_path
+        assert admit_revision(restored, RunConfig(), artifacts)[1] == []
+        assert judge_private_paths(restored) == frozenset({BOUNDARY_SECRET})
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+def test_explicit_snapshot_pair(depth: int, merged: bool, tmp_path: Path) -> None:
+    source = tmp_path / "data.txt"
+    source.write_text(BOUNDARY_SECRET)
+    plan = _boundary_plan(Ref(path=BOUNDARY_LEAF, config={"files": ["data.txt"]}), depth, merged)
+    plan._base_dir = tmp_path
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    frozen, warnings = admit_revision(plan, RunConfig(), artifacts)
+    assert warnings == []
+    source.unlink()
+    for resumed in [
+        Plan.model_validate_json(frozen.model_dump_json()),
+        Plan.loads(frozen.dumps(), base_dir=tmp_path),
+    ]:
+        resumed._base_dir = tmp_path
+        assert admit_revision(resumed, RunConfig(), artifacts)[1] == []
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("origin", ["llm", "autonomous"])
+def test_admission_refuses_human_only_alias_changes(
+    depth: int, merged: bool, origin: Origin, tmp_path: Path
+) -> None:
+    human = _boundary_plan(Ref(path=BOUNDARY_LEAF), depth, merged)
+    human._base_dir = tmp_path
+    cfg = _boundary_catalog(human, {}, alias_settable=True)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    human, _ = admit_revision(human, cfg, artifacts)
+    history = [human] if origin == "autonomous" else []
+    parent = human if history else None
+    good = stamp(human, origin=origin, parent=parent)
+    assert admit_revision(good, cfg, artifacts, history=history)[1] == []
+    bad = _boundary_plan(
+        Ref(path=BOUNDARY_LEAF, config={"command_alias": BOUNDARY_SECRET}), depth, merged
+    )
+    bad._base_dir = tmp_path
+    bad = stamp(bad, origin=origin, parent=parent)
+    with pytest.raises(PlanError):
+        admit_revision(bad, cfg, artifacts, history=history)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_admission_snapshots_judge_refs_inside_mappings(depth: int, tmp_path: Path) -> None:
+    source = tmp_path / "judge.py"
+    source.write_text(BOUNDARY_SECRET)
+    raw = Ref(
+        path="swarm_arena:ScriptJudge",
+        config={"command": ["python", "judge.py"], "files": ["judge.py"]},
+    )
+    frozen_leaf = raw.model_copy(
+        update={
+            "config": {
+                **raw.config,
+                "files": {"globs": ["judge.py"], "manifest": {"judge.py": "aa" * 32}},
+            }
+        }
+    )
+
+    def wrap(ref: Ref) -> Ref:
+        for _ in range(depth):
+            ref = Ref(
+                path="_fakes.admission:MapJudge",
+                config={"value": 1, "children": {"named": ref.model_dump(exclude_none=True)}},
+                name="score",
+            )
+        return ref
+
+    base = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False)
+    base._base_dir = tmp_path
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    assert (
+        admit_revision(
+            base.model_copy(update={"judges": [wrap(frozen_leaf)]}), RunConfig(), artifacts
+        )[1]
+        == []
+    )
+    admitted, warnings = admit_revision(
+        base.model_copy(update={"judges": [wrap(raw)]}), RunConfig(), artifacts
+    )
+    assert warnings == []
+    ref = admitted.judges[0]
+    for _ in range(depth):
+        _, cfg = ref._resolve_config(Configurable)
+        ref = cast(Any, cfg).children["named"]
+    _, cfg = ref._resolve_config(Configurable)
+    assert cast(Any, cfg).files.snapshotted, (
+        "admission returned a raw FileSet nested under a judge mapping"
+    )
+    assert cast(Any, cfg).files.manifest == {"judge.py": sha256_hex(source.read_bytes())}
+    assert judge_private_paths(admitted) == frozenset({"judge.py"})
+    overlap = admitted.model_copy(
+        update={"goal": admitted.goal.model_copy(update={"files": cast(Any, cfg).files})}
+    )
+    with pytest.raises(PlanError, match="private to a check or judge"):
+        admit_revision(overlap, RunConfig(), artifacts)
+    source.unlink()
+    for restored in (
+        Plan.model_validate_json(admitted.model_dump_json()),
+        Plan.loads(admitted.dumps(), base_dir=tmp_path),
+    ):
+        restored._base_dir = tmp_path
+        frozen_again, warnings = admit_revision(restored, RunConfig(), artifacts)
+        assert warnings == []
+        assert frozen_again.judges == admitted.judges
+        assert judge_private_paths(frozen_again) == frozenset({"judge.py"})
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_determinism_failure_secrecy(merged: bool) -> None:
+    p = _boundary_plan(
+        Ref(path=BOUNDARY_LEAF, config={"text": BOUNDARY_SECRET, "fail_at": "determinism"}),
+        0,
+        merged,
+    )
+    p.teams[0].agents[0] = p.teams[0].agents[0].model_copy(update={"replicates": 2})
+    with pytest.raises(PlanError) as caught:
+        validate_plan(p, RunConfig())
+    assert_secret_absent(caught.value, BOUNDARY_SECRET)
+    assert BOUNDARY_SECRET not in "".join(traceback.format_exception(caught.value))
+
+
+def test_omitted_judge_files_do_not_lose_private_protection(tmp_path: Path) -> None:
+    (tmp_path / "judge.py").write_text(BOUNDARY_SECRET)
+    judge = Ref(
+        path="_fakes.admission:DefaultScriptJudge",
+        config={"command": ["python", "judge.py"]},
+        name="score",
+    )
+    plan = _boundary_plan(Ref(path=BOUNDARY_LEAF), 0, False).model_copy(
+        update={
+            "judges": [judge],
+            "goal": Goal(id="g", namespace="n", files=FileSet(globs=["judge.py"])),
+        }
+    )
+    plan._base_dir = tmp_path
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    explicit = judge.model_copy(update={"config": {**judge.config, "files": ["judge.py"]}})
+    with pytest.raises(PlanError, match="private to a check or judge"):
+        admit_revision(plan.model_copy(update={"judges": [explicit]}), RunConfig(), artifacts)
+    with pytest.raises(PlanError):
+        admit_revision(plan, RunConfig(), artifacts)
+
+
+def test_real_script_tool_command_alias_is_human_only(tmp_path: Path) -> None:
+    human = _boundary_plan(Ref(path="_fakes.admission:AliasScriptTool"), 0, False)
+    human._base_dir = tmp_path
+    cfg = RunConfig().model_copy(
+        update={
+            "planner_catalog": PlannerCatalog().model_copy(
+                update={
+                    "entries": [
+                        CatalogEntry(
+                            name="script",
+                            kind="tool",
+                            ref="_fakes.admission:AliasScriptTool",
+                            settable={"argv": {"type": "array", "items": {"type": "string"}}},
+                            description="script",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    human, _ = admit_revision(human, cfg, artifacts)
+    assert (
+        admit_revision(
+            stamp(human, origin="autonomous", parent=human), cfg, artifacts, history=[human]
+        )[1]
+        == []
+    )
+    bad = human.model_copy(deep=True)
+    bad.teams[0].agents[0] = (
+        bad.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "tool": Ref(
+                    path="_fakes.admission:AliasScriptTool",
+                    config={"argv": ["echo", BOUNDARY_SECRET]},
+                )
+            }
+        )
+    )
+    with pytest.raises(PlanError):
+        admit_revision(
+            stamp(bad, origin="autonomous", parent=human), cfg, artifacts, history=[human]
+        )
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "tool",
+        "manager",
+        "check",
+        "judge",
+        "policy",
+        "part-check",
+        "part-judge",
+        "converge-tool",
+        "converge-manager",
+    ],
+)
+@pytest.mark.parametrize("default", [False, True])
+def test_frozen_files_required_at_every_component_root(
+    root: str,
+    default: bool,
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import create_model
+
+    from swarm_arena._model.ref import RefField
+
+    plan = _parts_plan()
+    owner: Any = plan
+    field = "policy"
+    if root in ("tool", "manager"):
+        owner = plan.teams[0].agents[0]
+        field = root
+    elif root.startswith("converge-"):
+        assert plan.converge.team is not None
+        owner = plan.converge.team.agents[0]
+        field = root.removeprefix("converge-")
+    elif root == "part-judge":
+        owner = plan.parts[0]
+        field = "judges"
+    elif root == "part-check":
+        owner = plan.parts[0]
+        field = "checks"
+    elif root in ("check", "judge"):
+        field = root + "s"
+    refs = getattr(owner, field)
+    if field == "checks":
+        ref = Ref(path="_fakes.tools:AlwaysPass", name="check")
+    elif field == "judges":
+        ref = J_A
+    else:
+        ref = refs
+    cls = ref.load()
+    assert issubclass(cls, Configurable)
+    if default:
+        # Non-FileSet defaults stay omitted, so their nested unfrozen files
+        # must be caught by the final shared admission check.
+        child = Ref(path="_fakes.admission:FileJudge", config={"value": 1})
+        schema = create_model("Config", __base__=cls.Config, hidden=(RefField, child))
+    else:
+        schema = create_model("Config", __base__=cls.Config, files=(FileSet, FileSet()))
+        ref = ref.model_copy(update={"config": {**ref.config, "files": [BOUNDARY_SECRET]}})
+    monkeypatch.setattr(cls, "Config", schema)
+    object.__setattr__(owner, field, [ref] if field in ("judges", "checks") else ref)
+    plan._base_dir = tmp_path
+    _boundary_reject(plan, RunConfig(), "unsnapshotted")
+    if default:
+        with pytest.raises(PlanError, match="unsnapshotted") as error:
+            admit_revision(plan, RunConfig(), artifacts)
+        assert_secret_absent(error.value, BOUNDARY_SECRET)
+    else:
+        source = tmp_path / BOUNDARY_SECRET
+        source.write_text("frozen source")
+        frozen, warnings = admit_revision(plan, RunConfig(), artifacts)
+        assert warnings == []
+        source.unlink()
+        for restored in (
+            Plan.model_validate_json(frozen.model_dump_json()),
+            Plan.loads(frozen.dumps(), base_dir=tmp_path),
+        ):
+            restored._base_dir = tmp_path
+            assert validate_plan(restored, RunConfig()) == []
+            assert admit_revision(restored, RunConfig(), artifacts)[1] == []
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("origin", ["llm", "autonomous"])
+def test_script_command_alias_protected_at_every_depth(
+    depth: int,
+    merged: bool,
+    origin: Origin,
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+) -> None:
+    path = "_fakes.admission:AliasScriptTool"
+    human = _boundary_plan(Ref(path=path), depth, merged)
+    human._base_dir = tmp_path
+    config = _boundary_catalog(human, {})
+    human, _ = admit_revision(human, config, artifacts)
+    history = [human] if origin == "autonomous" else []
+    parent = human if history else None
+    good = stamp(human, origin=origin, parent=parent)
+    assert admit_revision(good, config, artifacts, history=history)[1] == []
+    # Exercise admission independently of the catalog loader, which now refuses
+    # this unsafe schema before a planner can run.
+    entries = [
+        entry.model_copy(
+            update={"settable": {"argv": {"type": "array", "items": {"type": "string"}}}}
+        )
+        if entry.ref == path
+        else entry
+        for entry in config.planner_catalog.entries
+    ]
+    unsafe = config.model_copy(
+        update={"planner_catalog": config.planner_catalog.model_copy(update={"entries": entries})}
+    )
+    bad = _boundary_plan(Ref(path=path, config={"argv": ["echo", BOUNDARY_SECRET]}), depth, merged)
+    bad._base_dir = tmp_path
+    bad = stamp(bad, origin=origin, parent=parent)
+    with pytest.raises(PlanError) as error:
+        validate_plan(bad, unsafe, history=history)
+    assert_secret_absent(error.value, BOUNDARY_SECRET)
+    with pytest.raises(PlanError) as error:
+        admit_revision(bad, unsafe, artifacts, history=history)
+    assert_secret_absent(error.value, BOUNDARY_SECRET)

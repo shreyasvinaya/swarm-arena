@@ -2,12 +2,12 @@
 
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 
-from pydantic import AliasChoices, AliasPath
+from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic_core import PydanticUndefined
 
 from swarm_arena._model.compat import _alias_paths
@@ -228,12 +228,35 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     return fs.model_copy(update={"manifest": manifest})
 
 
+def _snapshot_value(value: Any, raw: Any, base_dir: Path, artifacts: ArtifactStore) -> Any:
+    """Freeze typed files and refs inside containers without coercing raw scalars."""
+    if isinstance(value, FileSet):
+        return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
+    if isinstance(value, Ref):
+        return snapshot_ref(value, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
+    if isinstance(value, BaseModel) and isinstance(raw, dict):
+        return _snapshot_config(value, raw, base_dir, artifacts)
+    if isinstance(value, Mapping) and isinstance(raw, dict):
+        return {
+            key: _snapshot_value(value[key], child, base_dir, artifacts) if key in value else child
+            for key, child in raw.items()
+        }
+    if isinstance(value, (list, tuple)) and isinstance(raw, list):
+        return [
+            _snapshot_value(item, child, base_dir, artifacts)
+            for item, child in zip(value, raw, strict=True)
+        ]
+    return raw
+
+
 def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     """Snapshot explicit file sets and nested component references in a config.
 
     Validate against the referenced component's Config without constructing the
     component. Only file-set and reference fields present in the raw config are
-    written back; omitted defaults stay omitted and other values stay raw.
+    written back; nonempty FileSet defaults are frozen under their canonical
+    field names. Empty FileSet defaults and other defaults stay omitted.
+    Typed reference mappings retain their keys and unrelated values stay raw.
     Validation aliases retain their original input paths and precedence.
     Nested references omit absent model fields, and the returned reference is
     validated so its configuration remains reloadable from JSON and TOML.
@@ -277,7 +300,15 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     True
     """
     _, config = ref._resolve_config(Configurable)
-    updated = deepcopy(ref.config)
+    updated = _snapshot_config(config, ref.config, base_dir, artifacts)
+    return Ref(path=ref.path, config=updated, name=ref.name)
+
+
+def _snapshot_config(
+    config: BaseModel, raw: dict[str, Any], base_dir: Path, artifacts: ArtifactStore
+) -> dict[str, Any]:
+    """Write frozen typed values back along their supplying raw input paths."""
+    updated = deepcopy(raw)
     settings = type(config).model_config
     for key, field in type(config).model_fields.items():
         alias = field.validation_alias
@@ -299,32 +330,26 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
             (
                 path
                 for path in paths
-                if AliasPath(cast(str, path[0]), *path[1:]).search_dict_for_path(ref.config)
+                if AliasPath(cast(str, path[0]), *path[1:]).search_dict_for_path(raw)
                 is not PydanticUndefined
             ),
             None,
         )
-        if path is None:
-            continue
         value = getattr(config, key)
-        if isinstance(value, FileSet):
-            frozen: Any = snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
-        elif isinstance(value, Ref):
-            frozen = snapshot_ref(value, base_dir, artifacts).model_dump(
-                mode="json", exclude_none=True
-            )
-        elif isinstance(value, list) and value and all(isinstance(item, Ref) for item in value):
-            frozen = [
-                snapshot_ref(item, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
-                for item in value
-            ]
-        else:
-            continue
+        if path is None:
+            if not isinstance(value, FileSet) or not value.globs:
+                continue
+            path = (key,)
         target: Any = updated
         for part in path[:-1]:
             target = target[part]
-        target[path[-1]] = frozen
-    return Ref(path=ref.path, config=updated, name=ref.name)
+        target[path[-1]] = _snapshot_value(
+            value,
+            target.get(path[-1]) if isinstance(target, dict) else target[path[-1]],
+            base_dir,
+            artifacts,
+        )
+    return updated
 
 
 def _snapshot_team(team: TeamSpec, base_dir: Path, artifacts: ArtifactStore) -> TeamSpec:

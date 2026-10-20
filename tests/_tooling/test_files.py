@@ -4,7 +4,7 @@ import types
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -384,7 +384,7 @@ def test_snapshot_ref_single_ref_and_omitted_defaults(
         "Config",
         __base__=FilesWidget.Config,
         member=(RefField, Ref(path="no_such_mod:OmittedDefault")),
-        files=(FileSet, FileSet(globs=["missing-default/*"])),
+        files=(FileSet, FileSet()),
         size=(int, 1),
     )
     monkeypatch.setattr(FilesWidget, "Config", config)
@@ -777,3 +777,94 @@ def test_snapshot_maximum_length_path(
     )
     assert snapshot.manifest == {relative: sha256_hex(b"hi")}
     assert artifacts.get_bytes(snapshot.manifest[relative]) == b"hi"
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("shape", ["dict", "mapping", "lists"])
+@pytest.mark.parametrize("alias_kind", ["canonical", "alias", "choices", "path"])
+def test_snapshot_typed_ref_mappings_preserve_raw_values(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    depth: int,
+    shape: str,
+    alias_kind: str,
+) -> None:
+    from collections.abc import Mapping
+
+    from _fakes.admission import MapJudge
+
+    annotation = dict[str, RefField] if shape == "dict" else Mapping[str, RefField]
+    if shape == "lists":
+        annotation = dict[str, list[RefField]]
+    alias: Any = None
+    key = "children"
+    if alias_kind == "alias":
+        alias = key = "members"
+    elif alias_kind == "choices":
+        alias = AliasChoices("members", "legacy")
+        key = "legacy"
+    elif alias_kind == "path":
+        alias = AliasPath("payload", 0)
+        key = "payload"
+    schema = create_model(
+        "Config",
+        __base__=MapJudge.Config,
+        children=(annotation, Field(default_factory=dict, validation_alias=alias)),
+    )
+    monkeypatch.setattr(MapJudge, "Config", schema)
+    source = _write(tmp_path, "judge.py", b"judge source")
+    leaf = Ref(path="_fakes.admission:DefaultScriptJudge", config={"command": ["score"]})
+    for _ in range(depth):
+        child: Any = leaf.model_dump(exclude_none=True)
+        if shape == "lists":
+            child = [child]
+        children: Any = {"raw/key~name": child}
+        if alias_kind == "path":
+            children = [children]
+        leaf = Ref(path="_fakes.admission:MapJudge", config={"value": 1, key: children})
+    original = leaf.model_dump(mode="json")
+    frozen = snapshot_ref(leaf, tmp_path, artifacts)
+    assert leaf.model_dump(mode="json") == original
+    current = frozen
+    for _ in range(depth):
+        assert type(current.config["value"]) is int
+        assert ("children" in current.config) == (alias_kind == "canonical")
+        _, cfg = current._resolve_config(Configurable)
+        current = cast(Any, cfg).children["raw/key~name"]
+        if shape == "lists":
+            current = current[0]
+    files = current.config["files"]
+    assert files["manifest"] == {"judge.py": sha256_hex(b"judge source")}
+    assert "env" not in current.config
+    assert "name" not in current.model_dump(exclude_none=True)
+    source.unlink()
+    restored = Ref.model_validate_json(frozen.model_dump_json())
+    assert snapshot_ref(restored, tmp_path, artifacts) == frozen
+
+
+def test_snapshot_materializes_only_nonempty_file_defaults(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.admission import DefaultScriptJudge
+
+    schema = create_model(
+        "Config",
+        __base__=DefaultScriptJudge.Config,
+        empty=(FileSet, FileSet()),
+        label=(str, "omitted"),
+    )
+    monkeypatch.setattr(DefaultScriptJudge, "Config", schema)
+    source = _write(tmp_path, "judge.py", b"score")
+    raw = Ref(path="_fakes.admission:DefaultScriptJudge", config={"command": ["score"]})
+    frozen = snapshot_ref(raw, tmp_path, artifacts)
+    assert frozen.config == {
+        "command": ["score"],
+        "files": {"globs": ["judge.py"], "manifest": {"judge.py": sha256_hex(b"score")}},
+    }
+    source.unlink()
+    assert snapshot_ref(frozen, tmp_path, artifacts) == frozen
+    explicit_empty = raw.model_copy(update={"config": {**raw.config, "files": []}})
+    assert snapshot_ref(explicit_empty, tmp_path, artifacts).config["files"]["manifest"] == {}

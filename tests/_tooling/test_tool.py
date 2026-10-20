@@ -214,3 +214,34 @@ def test_effective_tool_ref_validates_empty_overrides_and_role() -> None:
         effective_tool_ref(Ref(path="swarm_arena:ScriptTool", config={"timeout_s": "invalid"}), {})
     with pytest.raises(TypeError, match="Tool"):
         effective_tool_ref(Ref(path="_fakes.tools:Widget"), {})
+
+
+@pytest.mark.parametrize("depth", range(4))
+@pytest.mark.parametrize("key", ["command", "command_alias", "command_path", "argv"])
+def test_effective_tool_ref_protects_nested_human_only_fields(depth: int, key: str) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena import Ref
+    from swarm_arena._tooling.tool import effective_tool_ref
+
+    secret = "nested-command-secret"
+    leaf_path = (
+        "_fakes.admission:AliasScriptTool" if key == "argv" else "_fakes.admission:ProbeTool"
+    )
+    value: Any = [secret] if key in ("command_path", "argv") else secret
+    bad = Ref(path=leaf_path, config={key: value})
+    good = Ref(path=leaf_path, config={"timeout_s": 3} if key == "argv" else {"tune_alias": 3})
+    for _ in range(depth):
+        bad = Ref(
+            path="_fakes.admission:Wrapper", config={"members": [bad.model_dump(exclude_none=True)]}
+        )
+        good = Ref(
+            path="_fakes.admission:Wrapper",
+            config={"members": [good.model_dump(exclude_none=True)]},
+        )
+    assert effective_tool_ref(Ref(path=good.path), good.config).config == good.config
+    # Human base declarations remain valid when no override supplies them.
+    assert effective_tool_ref(bad, {}).config == bad.config
+    with pytest.raises(ValueError, match="human-only field command") as error:
+        effective_tool_ref(Ref(path=bad.path), bad.config)
+    assert_secret_absent(error.value, secret)
