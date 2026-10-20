@@ -12,6 +12,7 @@ from typing import Any
 
 import anyio
 import pytest
+from pydantic import model_serializer
 
 from swarm_arena import (
     AgentSpec,
@@ -28,14 +29,61 @@ from swarm_arena import (
     Swarm,
     TeamSpec,
 )
-from swarm_arena.executor import LocalExecutor
+from swarm_arena.executor import Job, LocalExecutor
 from swarm_arena.manager import Manager, RoundReport
-from swarm_arena.scoring import Check, Judge, JudgeContext, Lexicographic
+from swarm_arena.scoring import Check, CheckResult, Judge, JudgeContext, Lexicographic
+from swarm_arena.tool import RunStatus, ToolOutput
 
 _HOOK_ENTERED = threading.Event()
 _JUDGE_ENTERED = threading.Event()
 _JUDGE_RENEWED = threading.Event()
 _REPORT_KIND = "object"
+_SERIALIZER_ENTERED = threading.Event()
+_PARTIAL_READY = threading.Event()
+
+
+def _block_serializer() -> dict[str, Any]:
+    print(f"SERIALIZER_THREAD {threading.current_thread().name}", flush=True)
+    _SERIALIZER_ENTERED.set()
+    threading.Event().wait()
+    return {}
+
+
+class BlockingCheckResult(CheckResult):
+    @model_serializer
+    def serialize(self) -> dict[str, Any]:
+        return _block_serializer()
+
+
+class SerializingCheck(Check):
+    name = "serialized"
+
+    async def check(self, candidate: Any, ctx: Any) -> CheckResult:
+        return BlockingCheckResult(check=self.name, passed=True)
+
+
+class BlockingToolOutput(ToolOutput):
+    @model_serializer
+    def serialize(self) -> dict[str, Any]:
+        return _block_serializer()
+
+
+class SerializingExecutor(LocalExecutor):
+    async def submit(self, job: Job) -> ToolOutput:
+        output = await super().submit(job)
+        return BlockingToolOutput.model_validate(output.model_dump(mode="python"))
+
+
+class PartialSerializingExecutor(LocalExecutor):
+    async def submit(self, job: Job) -> ToolOutput:
+        await super().submit(job)
+        assert job.on_partial is not None
+        await job.on_partial(BlockingToolOutput(status=RunStatus.CANCELLED, partial=True))
+        # Exercise the partial-output fallback once the round interrupts submit.
+        print("PARTIAL_READY", flush=True)
+        _PARTIAL_READY.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
 
 
 class BlockingHookTool(ScriptTool):
@@ -156,7 +204,11 @@ async def _worker(mode: str, root: Path) -> None:
         teams=[TeamSpec(name="t", rationale="test", agents=agents)],
         judges=[Ref.of(ProgramJudge(f"{module}:score"))],
         rounds=[RoundSpec()],
-        checks=[Ref(path=f"{module}:BlockingCheck")] if mode == "check" else [],
+        checks=[Ref(path=f"{module}:BlockingCheck")]
+        if mode == "check"
+        else [Ref(path=f"{module}:SerializingCheck")]
+        if mode == "check-serializer"
+        else [],
     )
     plans = [plan]
     if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
@@ -180,10 +232,22 @@ async def _worker(mode: str, root: Path) -> None:
         run_root=str(root / "runs"),
         artifact_root=str(root / "artifacts"),
         arena_root=str(root / "arena"),
-        executor=Ref.of(LocalExecutor(workspace_root=str(root / "ws"))),
+        executor=Ref.of(
+            (
+                SerializingExecutor
+                if mode == "output-serializer"
+                else PartialSerializingExecutor
+                if mode == "partial-serializer"
+                else LocalExecutor
+            )(workspace_root=str(root / "ws"))
+        ),
         limits=Limits(
-            round_timeout_s=1.5,
-            run_timeout_s=3 if mode in {"rubric", "panel", "lex-rubric", "lex-panel"} else 8,
+            round_timeout_s=20 if variant == "stop" and mode.endswith("serializer") else 1.5,
+            run_timeout_s=30
+            if variant == "stop" and mode.endswith("serializer")
+            else 3
+            if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}
+            else 8,
             tool_timeout_s=1,
         ),
         lease_ttl_s=1.5,
@@ -192,7 +256,24 @@ async def _worker(mode: str, root: Path) -> None:
     started = time.monotonic()
     swarm = Swarm(config)
 
-    if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
+    if mode in {"check-serializer", "output-serializer", "partial-serializer"}:
+
+        async def stop_on_serializer() -> None:
+            if mode == "partial-serializer" and variant == "stop":
+                assert await anyio.to_thread.run_sync(_PARTIAL_READY.wait, 5)
+                await swarm.stop(now=True)
+            assert await anyio.to_thread.run_sync(_SERIALIZER_ENTERED.wait, 5)
+            # This heartbeat cannot advance while a serializer owns the event loop.
+            await anyio.sleep(0.02)
+            print("LOOP_RESPONSIVE", flush=True)
+            if variant == "stop" and mode != "partial-serializer":
+                await swarm.stop(now=True)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(stop_on_serializer)
+            result = await swarm.run(plans, run_id="boundary-run")
+            tasks.cancel_scope.cancel()
+    elif mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
         # Lifecycle termination belongs to the separate barrier-supervision fix.
         # This probe owns only thread isolation and live loop/lease/stop progress.
         async def run() -> None:
@@ -217,7 +298,8 @@ async def _worker(mode: str, root: Path) -> None:
             print(json.dumps({"renewed": True, "stop_recorded": stop_recorded}), flush=True)
             tasks.cancel_scope.cancel()
         return
-    result = await swarm.run(plans, run_id="boundary-run")
+    else:
+        result = await swarm.run(plans, run_id="boundary-run")
     store = LocalStore(root / "runs" / "boundary-run")
     committed = read_committed(store)
     assert committed is not None
@@ -276,6 +358,39 @@ def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> No
     ]
     assert any(e["type"] == "settle" and e["seq"] > ends[0]["seq"] for e in data["events"])
     assert any(e["type"] == "goal_finished" for e in data["events"])
+
+
+@pytest.mark.parametrize("mode", ["check-serializer", "output-serializer", "partial-serializer"])
+@pytest.mark.parametrize("stop", [False, True], ids=["deadline", "stop-now"])
+def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str, stop: bool) -> None:
+    data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
+    assert "SERIALIZER_THREAD swarm-arena-daemon-" in stdout
+    assert "SERIALIZER_THREAD MainThread" not in stdout
+    assert "LOOP_RESPONSIVE" in stdout
+    assert data["elapsed"] < 7
+    events = data["events"]
+    ends = [event for event in events if event["type"] == "tool_end"]
+    assert len(ends) == 1
+    candidate = ends[0]["payload"]["candidate"]
+    if mode == "check-serializer":
+        assert candidate["output"]["status"] == "ok"
+        assert candidate["output"]["data"] == {"value": 1}
+        assert candidate["checks"] == [
+            {
+                "check": "serialized",
+                "passed": False,
+                "reasons": ["check interrupted"],
+                "details": {},
+            }
+        ]
+    else:
+        assert candidate["output"]["status"] == "error"
+        assert candidate["output"]["data"] == {}
+        assert candidate["warnings"] == ["tool error: CancelledError"]
+    assert any(e["type"] == "settle" and e["seq"] > ends[0]["seq"] for e in events)
+    assert any(e["type"] == "goal_finished" for e in events)
+    if stop:
+        assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in events)
 
 
 def test_collect_diagnostic_never_publishes_exception_values(tmp_path: Path) -> None:

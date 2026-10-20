@@ -5,11 +5,70 @@ from typing import Any
 
 import pytest
 from _fakes.engine import CtxEnv, RtEnv
-from pydantic import BaseModel, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    SerializerFunctionWrapHandler,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
-from swarm_arena._agent.tool_run import execute_tool_run
+from swarm_arena._agent.tool_run import command_journal, execute_tool_run
 from swarm_arena._model.base import FrozenModel
-from swarm_arena.tool import Action
+from swarm_arena.executor import Job
+from swarm_arena.tool import Action, RunStatus, ToolOutput
+
+
+@pytest.mark.parametrize("kind", ["tool", "command"])
+async def test_executor_started_serializer_runs_in_daemon(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    observed: list[threading.Thread] = []
+
+    class Started(Job.Started):
+        @model_serializer(mode="wrap")
+        def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+            observed.append(threading.current_thread())
+            return handler(self)
+
+    if kind == "tool":
+
+        async def submit(job: Job) -> ToolOutput:
+            assert job.on_started is not None
+            await job.on_started(Started(kind="dispatch", job_id=job.id))
+            return ToolOutput(status=RunStatus.OK)
+
+        monkeypatch.setattr(rt_env.rt.executor, "submit", submit)
+        await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    else:
+        _, on_started = command_journal(
+            rt_env.rt.journal, rt_env.rt.executor, candidate_id="c1", component="check"
+        )
+        await on_started(Started(kind="dispatch", job_id="cmd1"))
+    assert observed
+    assert all(thread is not threading.main_thread() and thread.daemon for thread in observed)
+
+
+async def test_graceful_stop_allows_started_callback_for_running_check(rt_env: RtEnv) -> None:
+    _, on_started = command_journal(
+        rt_env.rt.journal, rt_env.rt.executor, candidate_id="c1", component="check"
+    )
+    rt_env.inflight.close()
+    await on_started(Job.Started(kind="dispatch", job_id="cmd1"))
+    assert rt_env.events("command_start")[-1].payload["job_id"] == "cmd1"
+
+
+async def test_immediate_stop_rejects_started_callback_for_running_check(rt_env: RtEnv) -> None:
+    from swarm_arena.manager import LimitReached
+
+    _, on_started = command_journal(
+        rt_env.rt.journal, rt_env.rt.executor, candidate_id="c1", component="check"
+    )
+    rt_env.inflight.close()
+    rt_env.inflight.cancel_all()
+    with pytest.raises(LimitReached):
+        await on_started(Job.Started(kind="dispatch", job_id="cmd1"))
+    assert not rt_env.events("command_start")
 
 
 @pytest.mark.parametrize(

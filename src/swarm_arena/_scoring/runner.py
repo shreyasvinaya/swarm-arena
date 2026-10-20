@@ -63,6 +63,13 @@ class JudgeOutcome(FrozenModel):
     errors: list[JudgeError]
 
 
+def _prepare_check_result(result: object) -> CheckResult:
+    """Detach subclass serializers and validate the complete Python-mode result."""
+    if not isinstance(result, CheckResult):
+        raise TypeError("invalid check result")
+    return CheckResult.model_validate(result.model_dump(mode="python", warnings=False))
+
+
 async def run_checks(
     candidate: Candidate, checks: Sequence[tuple[str, Check]], ctx: CheckContext
 ) -> list[CheckResult]:
@@ -72,6 +79,8 @@ async def run_checks(
     Each check receives its own shallow context copy, sharing the executor and
     id source. Invalid results fail closed after lax model revalidation. Check
     exceptions expose only their types, while fencing always propagates.
+    Returned-model serializers and validation run in a cancellable daemon;
+    callers retain control of the check's deadline and interruption result.
 
     Parameters
     ----------
@@ -119,9 +128,7 @@ async def run_checks(
             )
             continue
         try:
-            if not isinstance(result, CheckResult):
-                raise TypeError("invalid check result")
-            valid = CheckResult.model_validate(result.model_dump(warnings=False))
+            valid = await run_sync_daemon(_prepare_check_result, result)
         except Fenced:
             raise
         except Exception:

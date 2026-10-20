@@ -258,8 +258,11 @@ def command_journal(
     >>> isinstance(wrapped, Executor), callable(started)
     (True, True)
     """
+    inflight = _inflight.get()
+    generation = None if inflight is None else inflight._cancel_generation
 
     async def on_started(started: Job.Started) -> None:
+        started = await _prepare_sync(_prepare_started, started, generation=generation)
         await journal.append_durable(
             EventDraft(
                 type=EventType.COMMAND_START,
@@ -288,6 +291,20 @@ def _draft(rt: AgentRuntime, type: EventType, **payload: Any) -> EventDraft:
     )
 
 
+def _prepare_started(value: object) -> Job.Started:
+    """Detach executor start-event serializers before touching the journal."""
+    if not isinstance(value, Job.Started):
+        raise TypeError("invalid started event")
+    return Job.Started.model_validate(value.model_dump(mode="python", warnings=False))
+
+
+def _prepare_output(value: object) -> ToolOutput:
+    """Detach executor output serializers and validate before core completion."""
+    if not isinstance(value, ToolOutput):
+        raise TypeError("invalid tool output")
+    return ToolOutput.model_validate(value.model_dump(mode="python", warnings=False))
+
+
 _T = TypeVar("_T")
 
 
@@ -301,12 +318,15 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
         raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
-async def _prepare_sync(hook: Callable[..., _T], *args: Any) -> _T:
-    """Abandon synchronous extension preparation when the round stops."""
+async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | None = None) -> _T:
+    """Supervise preparation; admitted commands may finish during graceful stop."""
     inflight = _inflight.get()
     with anyio.CancelScope() as scope:
         if inflight is not None:
-            inflight.add(scope, grace_s=0)
+            if generation is None:
+                inflight.add(scope, grace_s=0)
+            elif not inflight._add_completion(scope, grace_s=0, generation=generation):
+                raise _core_signal(LimitReached("stop", "the round is stopping"))
         try:
             result = await run_sync_daemon(hook, *args)
         finally:
@@ -466,6 +486,9 @@ async def execute_tool_run(
     fingerprinting records null and completes settlement while still owner.
     Fencing prevents completion and settlement. Connector failures become
     error candidates with type-only warnings.
+    Executor outputs are detached under round supervision before completion.
+    Partial output delivered after cancellation gets at most the configured
+    settlement allowance for detachment; interruption produces a safe error.
 
     Parameters
     ----------
@@ -595,6 +618,11 @@ async def _run(
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
+        try:
+            event = await _prepare_sync(_prepare_started, event)
+        except LimitReached as error:
+            admission_refusal = error
+            raise
         if inflight.closed:
             admission_refusal = _core_signal(LimitReached("stop", "the round is stopping"))
             raise admission_refusal
@@ -666,20 +694,33 @@ async def _run(
         warnings.append(f"tool error: {type(error).__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
 
-    # Deliver an outer cancellation before entering the completion shield.
-    await anyio.lowlevel.checkpoint()
-    with anyio.CancelScope(shield=True):
-        if rt.journal.fenced.is_set():
-            raise _core_error(Fenced, "run ownership lost")
+    # A stopped executor may still deliver partial output during collection.
+    # Give that data a bounded detachment phase, outside all completion shields.
+    deadline = (
+        anyio.current_time() + rt.config.settle_timeout_s
+        if generation != inflight._cancel_generation
+        else float("inf")
+    )
+    with anyio.CancelScope(deadline=deadline) as output_scope:
+        inflight._add_completion(output_scope, grace_s=0, generation=inflight._cancel_generation)
         try:
-            if not isinstance(output, ToolOutput):
-                raise TypeError("invalid tool output")
-            output = ToolOutput.model_validate(output.model_dump(warnings=False))
+            output = await run_sync_daemon(_prepare_output, output)
         except Fenced:
             raise
         except Exception:
             warnings.append("tool error: invalid output")
             output = ToolOutput(status=RunStatus.ERROR)
+        finally:
+            inflight.discard(output_scope)
+    if output_scope.cancelled_caught:
+        warnings.append(f"tool error: {anyio.get_cancelled_exc_class().__name__}")
+        output = ToolOutput(status=RunStatus.ERROR)
+
+    # Deliver an outer cancellation before entering the core-only completion shield.
+    await anyio.lowlevel.checkpoint()
+    with anyio.CancelScope(shield=True):
+        if rt.journal.fenced.is_set():
+            raise _core_error(Fenced, "run ownership lost")
         actual = Amount()
         estimated = False
         usage = output.usage
