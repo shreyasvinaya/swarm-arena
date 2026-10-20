@@ -518,3 +518,112 @@ def test_cache_diagnostics_keep_registered_cli_guidance(
         assert "reindex" not in expected
     elif failure == "schema":
         assert "swarm-arena reindex" in expected
+
+
+@pytest.mark.parametrize("size", [50, 100, 200])
+def test_incremental_ingest_folds_each_event_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    from swarm_arena._journal.event import Event
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, run.commit(run.plan()))
+    folded: list[int] = []
+    original = RunState._apply
+
+    def apply(state: RunState, event: Event) -> None:
+        folded.append(event.seq)
+        original(state, event)
+
+    monkeypatch.setattr(RunState, "_apply", apply)
+    try:
+        for i in range(size):
+            head = run.commit(run.candidate(f"c-{i}"))
+            assert ingest_run(cache, run.store, "r1", run.run_root, head) == 1
+        assert folded == list(range(2, size + 2))
+    finally:
+        cache.close()
+
+
+def test_incremental_replay_catches_up_only_other_connection_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal.event import Event
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    path = tmp_path / "toy.sqlite"
+    cache, other = ArenaCache(path), ArenaCache(path)
+    try:
+        initial = run.commit(run.plan(parts=["a"]), run.candidate("old", part="a"))
+        ingest_run(cache, run.store, "r1", run.run_root, initial)
+        revision = run.plan(revision=1, parts=["a"], first_round=2)
+        revision.payload["plan"]["parts"][0]["goal"]["inputs"] = {"changed": True}
+        middle = run.commit(revision, run.candidate("middle", part="a", round=2))
+        ingest_run(other, run.store, "r1", run.run_root, middle)
+        # A cached-head hit need not refresh the private replay checkpoint.
+        assert ingest_run(cache, run.store, "r1", run.run_root, middle) == 0
+        head = run.commit(run.candidate("new", part="a", round=2))
+        folded: list[int] = []
+        original = RunState._apply
+
+        def apply(state: RunState, event: Event) -> None:
+            folded.append(event.seq)
+            original(state, event)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(RunState, "_apply", apply)
+            assert ingest_run(cache, run.store, "r1", run.run_root, head) == 1
+        assert folded == [3, 4, 5]
+        expected = RunState.from_events(e for _, es in read_chain(run.store, head) for e in es)
+        rows = cache._conn.execute("SELECT id, part_key FROM candidates ORDER BY id").fetchall()
+        assert rows == sorted(
+            (cid, goal_key_digest(key)) for cid, key in expected.candidate_goal_keys.items()
+        )
+        # Historical lookups remain independent from the retained ingest state.
+        snapshot = cache._replay("r1")
+        snapshot.plans.clear()
+        head = run.commit(run.candidate("next", part="a", round=2))
+        assert ingest_run(cache, run.store, "r1", run.run_root, head) == 1
+    finally:
+        cache.close()
+        other.close()
+
+
+def test_incremental_replay_discards_uncommitted_state_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal.event import Event, EventType
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    initial = run.commit(run.plan(parts=["a"]), run.candidate("old", part="a"))
+    ingest_run(cache, run.store, "r1", run.run_root, initial)
+    head = run.commit(
+        run.plan(revision=1, parts=["a"], first_round=2),
+        run.candidate("new", part="a", round=2),
+    )
+    original = cache._index
+    fail = True
+    revisions: list[list[int]] = []
+
+    def index(event: Event, state: RunState, pending: list[str]) -> None:
+        if event.type == EventType.TOOL_END:
+            revisions.append([p.revision for p, _ in state.plans["g1"]])
+            if fail:
+                raise RuntimeError("injected transaction failure")
+        original(event, state, pending)
+
+    monkeypatch.setattr(cache, "_index", index)
+    try:
+        with pytest.raises(RuntimeError, match="injected transaction failure"):
+            ingest_run(cache, run.store, "r1", run.run_root, head)
+        assert not cache._conn.in_transaction
+        assert cache.newest_segment("r1") == initial.segment
+        assert candidate_ids(cache) == ["old"]
+        fail = False
+        assert ingest_run(cache, run.store, "r1", run.run_root, head) == 2
+        assert revisions == [[0, 1], [0, 1]]
+        assert candidate_ids(cache) == ["new", "old"]
+    finally:
+        cache.close()

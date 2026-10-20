@@ -131,7 +131,9 @@ class ArenaCache:
     Every public operation holds one reentrant lock through its entire query or
     transaction. A shared flock on the persistent ``<path>.lock`` file protects
     the database lifetime against reindex. Downloads belong outside this lock.
-    Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
+    Ingest retains a core replay checkpoint per run, advances only missing events,
+    and discards mutated state after rollback. Private ``_replay`` and
+    ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
 
     Parameters
@@ -152,6 +154,7 @@ class ArenaCache:
         self.warnings: list[str] = []
         self._lock = RLock()
         self._closed = False
+        self._ingest_states: dict[str, tuple[str, int, RunState]] = {}
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         conn: sqlite3.Connection | None = None
@@ -203,6 +206,7 @@ class ArenaCache:
                 finally:
                     os.close(self._lock_fd)
                     self._closed = True
+                    self._ingest_states.clear()
 
     def newest_segment(self, run_id: str) -> str | None:
         """
@@ -314,6 +318,35 @@ class ArenaCache:
             except (ValueError, TypeError, KeyError):
                 raise _core_error(ChainError, "invalid journal replay payload") from None
 
+    def _ingest_state(self, run_id: str, through_seq: int) -> RunState:
+        """Consume a valid checkpoint and catch up under the write transaction.
+
+        Taking the checkpoint out before mutation ensures a failed fold or
+        transaction cannot leave uncommitted state available to the next call.
+        Only COMMIT publishes it again. External appenders require only a suffix
+        fold; a missing or rewound checkpoint requires independent reconstruction.
+        """
+        checkpoint = self._ingest_states.pop(run_id, None)
+        if checkpoint is None:
+            return self._replay(run_id, through_seq=through_seq)
+        name, seq, state = checkpoint
+        row = self._conn.execute(
+            "SELECT last_seq FROM segments WHERE run_id=? AND name=?", (run_id, name)
+        ).fetchone()
+        if seq > through_seq or row != (seq,):
+            return self._replay(run_id, through_seq=through_seq)
+        if seq < through_seq:
+            rows = self._conn.execute(
+                "SELECT json FROM _events WHERE run_id=? AND seq>? AND seq<=? ORDER BY seq",
+                (run_id, seq, through_seq),
+            ).fetchall()
+            try:
+                for row in rows:
+                    state._apply(Event.model_validate_json(row[0]))
+            except (ValueError, TypeError, KeyError):
+                raise _core_error(ChainError, "invalid journal replay payload") from None
+        return state
+
     def _plan_for_round(self, run_id: str, goal_id: str, round: int, *, through_seq: int) -> Plan:
         """Select an executed revision using core replay within the supplied prefix."""
         with self._lock:
@@ -355,8 +388,6 @@ class ArenaCache:
         """Return the actual event count inserted by this connection's transactions."""
         with self._lock:
             count = 0
-            state: RunState | None = None
-            state_seq = 0
             for name, events in segments:
                 pending: list[str] = []
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -364,8 +395,7 @@ class ArenaCache:
                     if self._segment(run_id, name, events):
                         self._conn.execute("COMMIT")
                         continue
-                    if state is None or state_seq != events[0].seq - 1:
-                        state = self._replay(run_id)
+                    state = self._ingest_state(run_id, events[0].seq - 1)
                     for event in events:
                         try:
                             state._apply(deepcopy(event))
@@ -391,7 +421,7 @@ class ArenaCache:
                 except BaseException:
                     self._conn.execute("ROLLBACK")
                     raise
-                state_seq = events[-1].seq
+                self._ingest_states[run_id] = (name, events[-1].seq, state)
                 count += len(events)
                 self.warnings.extend(pending)
                 for warning in pending:
