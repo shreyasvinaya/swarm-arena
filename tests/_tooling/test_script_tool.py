@@ -1,11 +1,11 @@
 import json
-import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import get_ident
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import cand
 from pydantic import AliasChoices, AliasPath, BaseModel, Field, ValidationError
 
@@ -29,35 +29,11 @@ HA, HA2, HR, HN = (digit * 64 for digit in ("a", "b", "c", "d"))
 SECRET = "SECRET_SENTINEL_script_tool"
 
 
-def _assert_secret_safe(error: BaseException, secret: str) -> None:
-    pending = [error]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        for diagnostic in (
-            str(current),
-            repr(current),
-            repr(current.args),
-            repr(getattr(current, "__notes__", ())),
-            "".join(traceback.format_exception(current)),
-        ):
-            assert secret not in diagnostic
-        if isinstance(current, ValidationError):
-            assert secret not in repr(current.errors())
-            assert secret not in current.json()
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-
-
 def test_constructor_timeout_error_is_secret_safe() -> None:
     secret = "SECRET_SENTINEL_constructor_timeout"
     with pytest.raises(ValidationError, match="timeout_s") as caught:
         ScriptTool(command=["x"], timeout_s=secret)
-    _assert_secret_safe(caught.value, secret)
-    assert caught.value.__cause__ is None
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 @pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
@@ -80,8 +56,7 @@ def _check_model_error(
 
     with pytest.raises(ValidationError, match=field) as caught:
         validate()
-    _assert_secret_safe(caught.value, secret)
-    assert caught.value.__cause__ is None
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 @pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
@@ -111,15 +86,14 @@ def test_schema_type_error_is_secret_safe(nested: bool) -> None:
     tool = ScriptTool(command=["x"], params={"count": schema})
     with pytest.raises(ValueError, match=r"script_params\.count.*unsupported type") as caught:
         tool.get_input_model()
-    _assert_secret_safe(caught.value, secret)
-    assert caught.value.__cause__ is None
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 def test_config_nested_location_is_secret_safe() -> None:
     secret = "SECRET_SENTINEL_config_location"
     with pytest.raises(ValidationError, match="params") as caught:
         ScriptTool.Config(command=["x"], params={secret: secret})  # ty: ignore[invalid-argument-type]
-    _assert_secret_safe(caught.value, secret)
+    assert_secret_absent(caught.value, secret)
     assert caught.value.errors()[0]["loc"] == ("params", "<…>")
 
 
@@ -454,9 +428,7 @@ async def test_list_and_read_files() -> None:
         await read_file.handler(context, ReadFileArgs(path="nope"))
     with pytest.raises(SoftError, match="not UTF-8 text") as caught:
         await read_file.handler(context, ReadFileArgs(path="problem/new.txt", candidate="c1"))
-    assert SECRET not in "".join(traceback.format_exception(caught.value))
-    assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
     assert view.reads == [HA2, HA, HN]
 
 
@@ -513,7 +485,7 @@ def test_malformed_json_hides_input_on_all_error_surfaces(model_kind: str) -> No
     model = models[model_kind]
     with pytest.raises(ValidationError, match="json_invalid") as caught:
         model.model_validate_json('{"count": "' + SECRET)
-    _assert_secret_safe(caught.value, SECRET)
+    assert_secret_absent(caught.value, SECRET)
     assert model.model_config["hide_input_in_errors"] is True
 
 
@@ -534,7 +506,7 @@ def test_config_sanitizer_preserves_aliases(alias: str | AliasChoices | AliasPat
         AliasedConfig.model_validate(data)
     expected = ("count", 0) if isinstance(alias, AliasPath) else ("count",)
     assert caught.value.errors()[0]["loc"] == expected
-    _assert_secret_safe(caught.value, SECRET)
+    assert_secret_absent(caught.value, SECRET)
 
 
 @pytest.mark.parametrize("entrypoint", ["tool", "config", "ref"])
@@ -562,9 +534,9 @@ def test_command_constraints_fail_at_config_time(
     error_type = ConfigError if entrypoint == "ref" else ValidationError
     with pytest.raises(error_type, match=code) as caught:
         validate()
-    _assert_secret_safe(caught.value, SECRET)
+    assert_secret_absent(caught.value, SECRET)
     if isinstance(value, float):
-        _assert_secret_safe(caught.value, str(value))
+        assert_secret_absent(caught.value, str(value))
 
 
 @pytest.mark.parametrize(
@@ -590,7 +562,7 @@ def test_schema_diagnostics_keep_identifiers_and_hide_values(
         tool.get_input_model()
     assert "script_params.lr" + (".items" if nested else "") in str(caught.value)
     assert diagnostic in str(caught.value)
-    _assert_secret_safe(caught.value, SECRET)
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_unknown_constructor_keys_use_sanitized_validation_error() -> None:
@@ -598,7 +570,7 @@ def test_unknown_constructor_keys_use_sanitized_validation_error() -> None:
         ScriptTool(command=["x"], **{SECRET: SECRET})
     assert caught.value.errors()[0]["loc"] == ("<field>",)
     assert caught.value.errors()[0]["type"] == "extra_forbidden"
-    _assert_secret_safe(caught.value, SECRET)
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_command_accepts_config_boundary_values() -> None:
@@ -620,9 +592,8 @@ def test_non_mapping_subschemas_are_rejected_without_values(malformed: Any, dept
     with pytest.raises(ConfigError) as caught:
         tool.get_input_model()
     assert str(caught.value) == "script_params.xs" + ".items" * depth + ": invalid schema"
-    _assert_secret_safe(caught.value, SECRET)
-    _assert_secret_safe(caught.value, "73918462")
-    assert caught.value.__cause__ is None
+    assert_secret_absent(caught.value, SECRET)
+    assert_secret_absent(caught.value, "73918462", sanitized=True)
 
 
 @pytest.mark.filterwarnings("error")
@@ -656,8 +627,7 @@ def test_reserved_property_names_raise_config_error(prop: str) -> None:
     with pytest.raises(ConfigError) as caught:
         tool.get_input_model()
     assert str(caught.value) == f"script_params.{prop}: invalid property name"
-    _assert_secret_safe(caught.value, SECRET)
-    assert caught.value.__cause__ is None
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 def test_nonreserved_parameter_names_remain_usable() -> None:

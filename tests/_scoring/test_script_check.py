@@ -1,10 +1,10 @@
-import traceback
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, WRITE, RecordingExecutor, cand
 from pydantic import ValidationError
 
@@ -133,21 +133,6 @@ def test_catalog_refuses_settable_script_fields(ref: str, kind: str, field: str)
     )
 
 
-def assert_secret_absent(error: BaseException) -> None:
-    surfaces = [
-        str(error),
-        repr(error),
-        repr(error.args),
-        repr(getattr(error, "__notes__", [])),
-        "".join(traceback.format_exception(error)),
-    ]
-    if isinstance(error, ValidationError):
-        surfaces += [repr(error.errors()), error.json()]
-    assert all(SECRET not in value for value in surfaces)
-    if error.__cause__ is not None:
-        assert_secret_absent(error.__cause__)
-
-
 @pytest.mark.parametrize("cls", [ScriptCheck, ScriptJudge])
 @pytest.mark.parametrize(
     "fields",
@@ -167,7 +152,7 @@ def test_config_errors_hide_secrets(
 ) -> None:
     with pytest.raises(ValidationError) as caught:
         cls(**{"command": ["x"], **fields})
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 @pytest.mark.parametrize(
@@ -176,7 +161,7 @@ def test_config_errors_hide_secrets(
 def test_malformed_json_hides_secret(model: Any) -> None:
     with pytest.raises(ValidationError) as caught:
         model.model_validate_json(SECRET)
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
     assert model.model_config["hide_input_in_errors"] is True
 
 

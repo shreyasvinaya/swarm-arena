@@ -38,6 +38,7 @@ _NEWER_VERSION_REASON = re.compile(
     r"Value error, [a-z_]+ schema_version [0-9]+ "
     r"is newer than this swarm-arena supports \([0-9]+\)"
 )
+_ERROR_CAP_REASON = re.compile(r"and ([1-9][0-9]*) more errors")
 _VALIDATION_BY_ALIAS: ContextVar[bool | None] = ContextVar(
     "swarm_arena_validation_by_alias", default=None
 )
@@ -319,6 +320,7 @@ def _sanitize_validation_error(
         Error containing only schema locations, built-in codes (or ``invalid``),
         fixed messages, and ``input=None`` without context. At most 20 original
         details survive, followed by ``and N more errors`` when truncated.
+        Counts include errors omitted by explicit nested validation boundaries.
         Raise it ``from None``.
 
     Examples
@@ -347,7 +349,22 @@ def _sanitize_validation_error(
                 list[dict[str, Any]],
                 error.errors(include_input=False, include_url=False, include_context=False),
             )
-            omitted = max(0, len(items) - 20)
+            omitted = 0
+            if known:
+                original_items = []
+                for item in items:
+                    # Only a trailer registered by an explicit safe boundary
+                    # represents omitted errors; validator text is untrusted.
+                    if (
+                        item["type"] == "invalid"
+                        and ((), "invalid", item["msg"]) in known
+                        and (match := _ERROR_CAP_REASON.fullmatch(item["msg"]))
+                    ):
+                        omitted += int(match[1])
+                    else:
+                        original_items.append(item)
+                items = original_items
+            omitted += max(0, len(items) - 20)
             items = items[:20]
             previous: tuple[str, str] | None = None
             safe_type: PydanticCustomError | None = None

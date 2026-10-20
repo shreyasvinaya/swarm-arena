@@ -1,6 +1,5 @@
 import importlib
 from collections.abc import Mapping
-from traceback import format_exception
 from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, Literal
 
@@ -79,9 +78,7 @@ def test_build_config_error_omits_input_values() -> None:
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"size": secret, "sise": secret}).build(Configurable)
 
-    assert secret not in str(exc.value)
-    assert secret not in repr(exc.value.args)
-    assert secret not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
     for detail in ("_fakes.tools:Widget", "size", "<field>", "int_parsing", "extra_forbidden"):
         assert detail in str(exc.value)
 
@@ -122,12 +119,10 @@ def test_build_config_error_redacts_data_locations(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"credentials": credentials}).build(Configurable)
 
-    assert_secret_absent(exc.value, secret)
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "739201" not in diagnostic
-        assert "credentials" in diagnostic
+    assert_secret_absent(exc.value, secret, sanitized=True)
+    assert_secret_absent(exc.value, "739201", sanitized=True)
+    assert "credentials" in str(exc.value)
     assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
-    assert exc.value.__suppress_context__
 
 
 def test_build_config_error_redacts_unknown_field_names() -> None:
@@ -168,8 +163,7 @@ def test_build_config_error_redacts_nested_schema_locations(
         Ref(path="_fakes.tools:Widget", config={"credentials": [entry]}).build(Configurable)
 
     assert_secret_absent(exc.value, secret)
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "credentials" in diagnostic
+    assert "credentials" in str(exc.value)
     location = (
         "counts.0"
         if isinstance(alias, AliasPath)
@@ -203,8 +197,7 @@ def test_build_config_error_redacts_nested_models(
         Ref(path="_fakes.tools:Widget", config={"credentials": credentials}).build(Configurable)
 
     assert_secret_absent(exc.value, secret)
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "credentials" in diagnostic
+    assert "credentials" in str(exc.value)
     location = {
         "model": "count",
         "mapping": "<…>.count",
@@ -235,8 +228,7 @@ def test_build_config_error_redacts_union_tags(monkeypatch: pytest.MonkeyPatch) 
         ).build(Configurable)
 
     assert_secret_absent(exc.value, secret)
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "credentials" in diagnostic
+    assert "credentials" in str(exc.value)
     assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>.amount: int_parsing"
 
 
@@ -253,12 +245,10 @@ def test_build_config_error_redacts_alias_collision(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config=config).build(Configurable)
 
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "739201" not in diagnostic
-        assert value not in diagnostic
-        assert "credentials" in diagnostic
+    assert_secret_absent(exc.value, "739201", sanitized=True)
+    assert_secret_absent(exc.value, value, sanitized=True)
+    assert "credentials" in str(exc.value)
     assert str(exc.value) == "_fakes.tools:Widget: credentials.<…>: int_parsing"
-    assert exc.value.__suppress_context__
 
 
 @pytest.mark.parametrize(
@@ -277,8 +267,7 @@ def test_build_config_error_preserves_top_level_alias(
         Ref(path="_fakes.tools:Widget", config={"items": value}).build(Configurable)
 
     assert_secret_absent(exc.value, secret)
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert "items" in diagnostic
+    assert "items" in str(exc.value)
     location = "items.0" if isinstance(alias, AliasPath) else "items"
     assert str(exc.value) == f"_fakes.tools:Widget: {location}: int_parsing"
 
@@ -308,9 +297,8 @@ def test_build_config_error_redacts_model_level_error(monkeypatch: pytest.Monkey
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"label": secret}).build(Configurable)
 
-    assert_secret_absent(exc.value, secret)
+    assert_secret_absent(exc.value, secret, sanitized=True)
     assert str(exc.value) == "_fakes.tools:Widget: value_error"
-    assert exc.value.__suppress_context__
 
 
 def test_build_config_error_omits_validator_message_and_context(
@@ -327,9 +315,7 @@ def test_build_config_error_omits_validator_message_and_context(
     with pytest.raises(ConfigError) as exc:
         Ref(path="_fakes.tools:Widget", config={"size": secret}).build(Configurable)
 
-    assert secret not in str(exc.value)
-    assert secret not in repr(exc.value.args)
-    assert secret not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
     for detail in ("_fakes.tools:Widget", "size", "value_error"):
         assert detail in str(exc.value)
 
@@ -492,7 +478,5 @@ def test_build_config_validation_failures_are_secret_safe(
     with pytest.raises(ConfigError) as exc:
         ref.build(Configurable)
 
-    assert_secret_absent(exc.value, secret)
+    assert_secret_absent(exc.value, secret, sanitized=True)
     assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
-    assert exc.value.__suppress_context__
-    assert exc.value.__cause__ is None

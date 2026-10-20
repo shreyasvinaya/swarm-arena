@@ -3,6 +3,7 @@
 import importlib
 from collections.abc import Mapping, Sequence
 from functools import cache
+from threading import get_ident
 from typing import Annotated, Any, TypeVar
 
 from pydantic import (
@@ -14,10 +15,13 @@ from pydantic.errors import PydanticErrorMixin
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.base import (
+    _ERROR_CAP_REASON,
+    _VALIDATION_ACTIVE,
     FrozenModel,
     _minimal_validation_error,
     _SafeModel,
     _sanitize_validation_error,
+    _ValidationOwner,
 )
 
 
@@ -205,7 +209,9 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     ------
     ConfigError
         If input validation fails. Custom error types become ``invalid``;
-        input, messages, context, and original exception chains are suppressed.
+        input, untrusted messages, context, and original exception chains are
+        suppressed. At most 20 details are shown, followed by ``and N more errors``
+        when truncated, including errors omitted by explicit nested validation.
         Pydantic developer errors propagate unchanged with their fix-it hints.
 
     Examples
@@ -213,19 +219,34 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     >>> _validate_config(EmptyConfig, {}, where="example:Component").model_dump()
     {}
     """
+    # Track explicit safe boundaries so a second sanitization retains their
+    # schema locations and counts without trusting arbitrary validator messages.
+    owner = _ValidationOwner(get_ident())
+    token = _VALIDATION_ACTIVE.set(owner)
     try:
-        return model_cls.model_validate(data)
-    except Exception as error:
-        if isinstance(error, PydanticErrorMixin):
-            raise
         try:
-            safe = _sanitize_validation_error(model_cls, error)
-        except Exception:
-            safe = None
+            return model_cls.model_validate(data)
+        except Exception as error:
+            if isinstance(error, PydanticErrorMixin):
+                raise
+            try:
+                safe = _sanitize_validation_error(model_cls, error)
+            except Exception:
+                safe = None
+    finally:
+        owner.thread_id = None
+        _VALIDATION_ACTIVE.reset(token)
     if safe is None:
         safe = _minimal_validation_error(model_cls)
     summary = "; ".join(
-        (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "") + item["type"]
+        (".".join(str(part) for part in item["loc"]) + ": " if item["loc"] else "")
+        + (
+            item["msg"]
+            if not item["loc"]
+            and item["type"] == "invalid"
+            and _ERROR_CAP_REASON.fullmatch(item["msg"])
+            else item["type"]
+        )
         for item in safe.errors(include_input=False, include_url=False, include_context=False)
     )
     raise ConfigError(f"{where}: {summary}") from None

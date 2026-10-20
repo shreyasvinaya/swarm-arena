@@ -40,10 +40,10 @@ Schemas are checked when the entry is validated. `settable_model()` produces a
 strict, frozen override model that rejects unknown keys. Omitted fields default
 to `None`, including fields whose schema specifies a default. Explicitly supplied
 values must satisfy their property schemas. The supported subset and reserved
-parameter names are described in [ScriptTool parameters](../own-files.md):
-numeric values must be finite, integer float bounds must be integral int64
-values, enum cannot be combined with bounds or pattern, and patterns use Rust
-regex syntax (no lookaround or backreferences; `\d` is Unicode-aware).
+parameter names are described in {ref}`ScriptTool parameters <scripttool-parameters>`:
+`number` inputs must be finite; an array without `items` is untyped. Integer float
+bounds must be integral int64 values, enum cannot be combined with numeric bounds
+or pattern, and patterns use Rust regex syntax (no lookaround or backreferences; `\d` is Unicode-aware).
 
 `PlannerCatalog` rejects duplicate names. For entries with settable fields it
 imports the component class during validation and rejects fields listed in that
@@ -58,5 +58,6 @@ values, schema defaults, import exception contents, and data-derived mapping key
 are omitted from diagnostics.
 
 Validation diagnostics contain at most 20 error details in Pydantic order,
-followed by `and N more errors` when truncated. Any segment on which matching
-schema paths disagree is hidden, including string identifiers.
+followed by `and N more errors` when truncated, including in component `ConfigError`
+summaries. The omitted count includes errors hidden by explicit nested validation.
+Any segment on which matching schema paths disagree is hidden, including string identifiers.

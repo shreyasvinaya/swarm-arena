@@ -276,7 +276,9 @@ class ScriptTool(Tool):
         """
         Compile and cache this instance's script parameter model.
 
-        Input errors retain only top-level field names and built-in error codes.
+        Input errors keep schema field names, aliases and list indices with
+        built-in error codes; data-derived mapping and Any segments are hidden,
+        as are rejected values.
         Schema errors retain property paths and keyword names, hiding configured
         values and suppressing original exception chains.
 

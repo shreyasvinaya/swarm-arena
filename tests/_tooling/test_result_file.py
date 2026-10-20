@@ -617,9 +617,6 @@ def test_folded_output_duplicates_fail_producing_run(
     assert secret not in diagnostic
 
 
-# --- Task 15 fix round 1: the shared log opener ---
-
-
 def test_open_log_truncates_or_appends_and_returns_a_blocking_fd(tmp_path: Path) -> None:
     p = tmp_path / "log"
     p.write_text("old content")

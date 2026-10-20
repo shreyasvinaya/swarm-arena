@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors retain their original type and fix-it hint at every entry point. If
   sanitization itself fails, diagnostics fall back to an empty location with
   type and message `invalid`, without exposing the original failure. Diagnostic
-  details are capped at 20 in Pydantic order, plus `and N more errors` when truncated.
+  details are capped at 20 in Pydantic order, plus `and N more errors` when truncated,
+  including component `ConfigError` summaries; the omitted count includes errors
+  hidden by explicit nested validation.
 - `ToolOutput.data` and script-check `details` must be finite JSON, with fixed
   `data must be finite JSON` / `details must be finite JSON` validation messages;
   invalid connector output is reported as an execution error.
@@ -56,11 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is at most 16 MiB, the files one result declares at most 256 MiB together
   (summed before any is hashed; hashed one at a time), and the executor's
   upload reads stay within `max_output_bytes`.
-- A stopped run's output has `partial=True` whenever its collect returned a
-  valid `ToolOutput`, even an empty one, also when its files are dropped later
-  by `max_output_bytes` or a failed upload; a failed, timed-out or invalid
-  collect gives `partial=False` and a note. `tool_output_from_result` notes why
-  a stopped run kept no result.
+- A stopped run's output has `partial=True` when its collect returns a valid
+  `ToolOutput` that marks itself partial or contains data or files. A valid
+  `result.json` marks the output partial even if empty. If declared files exceed
+  `max_output_bytes` or fail to upload, they are dropped and status becomes
+  `error`, while `partial` stays true. A valid empty collect without its own
+  partial flag, or a failed, timed-out or invalid collect, gives `partial=False`;
+  failed, timed-out or invalid collection also adds a note.
+  `tool_output_from_result` notes why a stopped run kept no result.
 - `LocalExecutor` removes a workspace whose tool locked the workspace root, and
   its fallback remover changes a directory's mode only when an open, unlink or
   rmdir in it is refused.
@@ -82,9 +87,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ScriptTool`: bring your own files and script, with `list_files` and `read_file` actions.
   ScriptTool parameters and catalog `settable` schemas use a strict, frozen subset
   compiler with validated defaults, bounded value-free diagnostics, explicit
-  protected namespaces, and non-clashing names such as `model_name`. Numeric
-  inputs, bounds, enum members and defaults must be finite; integer float bounds
-  must be integral int64 values. Enum cannot be combined with bounds or pattern.
+  protected namespaces, and non-clashing names such as `model_name`. `number`
+  inputs, numeric bounds, enum members and defaults must be finite; an array
+  without `items` is untyped. Integer float bounds must be integral int64 values.
+  Enum cannot be combined with numeric bounds or pattern.
   Patterns use Rust regex syntax (no lookaround or backreferences; Unicode-aware
   `\d`).
 - `RunConfig` and the `swarm_arena.config` models, with load-time catalog rules.

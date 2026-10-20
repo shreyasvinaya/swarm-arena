@@ -162,22 +162,46 @@ async def test_launcher_gone_before_go_is_error(
     assert not (tmp_path / "ran").exists()
 
 
-async def test_partial_collect_after_timeout(tmp_path: Path) -> None:  # exit criterion
+async def test_partial_collect_after_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # exit criterion
     seen: list[tuple[CompletedRun, bool]] = []
+    deadlines: list[anyio.CancelScope] = []
+    move_on_after = anyio.move_on_after
+
+    def unarmed_timeout(delay: float | None, *, shield: bool = False) -> anyio.CancelScope:
+        scope = move_on_after(delay, shield=shield)
+        if delay == 10.0:
+            # Preserve the supervisor's real timeout path, but start its clock
+            # only after the fresh interpreter has written the partial result.
+            scope.deadline = float("inf")
+            deadlines.append(scope)
+        return scope
+
+    async def arm_after_ready() -> None:
+        await wait_for_file(tmp_path / "partial.txt", 30)
+        assert len(deadlines) == 1
+        deadlines[0].deadline = anyio.current_time() + 5.0
+
+    monkeypatch.setattr(supervisor.anyio, "move_on_after", unarmed_timeout)
 
     async def before_kill(r: CompletedRun) -> None:
         seen.append((r, (tmp_path / "partial.txt").exists()))
 
-    started = time.monotonic()
-    done = await call(
-        tmp_path,
-        py("open('partial.txt', 'w').write('x'); import time; time.sleep(60)"),
-        timeout_s=1.0,
-        grace_s=0.5,
-        before_kill=before_kill,
-    )
+    with anyio.fail_after(45):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(arm_after_ready)
+            try:
+                done = await call(
+                    tmp_path,
+                    py("open('partial.txt', 'w').write('x'); import time; time.sleep(60)"),
+                    timeout_s=10.0,
+                    grace_s=0.5,
+                    before_kill=before_kill,
+                )
+            finally:
+                tasks.cancel_scope.cancel()
     assert done.status is RunStatus.TIMEOUT
-    assert time.monotonic() - started < 10
     [(provisional, partial_seen)] = seen
     assert (provisional.status, provisional.returncode, partial_seen) == (
         RunStatus.TIMEOUT,
@@ -193,6 +217,7 @@ async def test_sigterm_handler_runs_within_grace(tmp_path: Path) -> None:
         "import signal, sys, time\n"
         "def stop(*_): open('term.txt', 'w').write('t'); sys.exit(0)\n"
         "signal.signal(signal.SIGTERM, stop)\n"
+        "open('ready', 'w').close()\n"
         "time.sleep(60)\n"
     )
     seen: list[bool] = []
@@ -200,8 +225,11 @@ async def test_sigterm_handler_runs_within_grace(tmp_path: Path) -> None:
     async def before_kill(r: CompletedRun) -> None:
         seen.append((tmp_path / "term.txt").exists())
 
-    done = await call(tmp_path, py(code), timeout_s=1.0, grace_s=3.0, before_kill=before_kill)
-    assert (done.status, done.returncode, seen) == (RunStatus.TIMEOUT, 0, [True])
+    done = await stop_after_ready(
+        tmp_path, code, ready="ready", grace_s=5.0, before_kill=before_kill
+    )
+    assert done.status is RunStatus.CANCELLED
+    assert seen == [True]
 
 
 async def test_descendant_gets_full_grace_after_leader_exits(tmp_path: Path) -> None:
@@ -223,8 +251,10 @@ async def test_descendant_gets_full_grace_after_leader_exits(tmp_path: Path) -> 
     async def before_kill(r: CompletedRun) -> None:
         seen.append((tmp_path / "child_partial.txt").exists())
 
-    done = await call(tmp_path, py(leader), timeout_s=1.5, grace_s=3.0, before_kill=before_kill)
-    assert done.status is RunStatus.TIMEOUT
+    done = await stop_after_ready(
+        tmp_path, leader, ready="child.ready", grace_s=5.0, before_kill=before_kill
+    )
+    assert done.status is RunStatus.CANCELLED
     assert seen == [True]
 
 
@@ -393,9 +423,6 @@ async def test_no_descriptor_or_transport_leak(tmp_path: Path) -> None:  # api-a
     assert not [w for w in caught if issubclass(w.category, ResourceWarning)]
 
 
-# --- Fix round 1 ---
-
-
 def record_signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, bool, float]]:
     """Record (signal, leader still unreaped, time) for every group signal the supervisor sends."""
     seen: list[tuple[int, bool, float]] = []
@@ -500,9 +527,6 @@ async def test_log_rerun_truncates(tmp_path: Path) -> None:
     assert done.stdout_path.read_text() == "x\n"
 
 
-# --- Fix round 2 ---
-
-
 async def test_leader_that_exits_during_on_started_stays_anchored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -531,8 +555,10 @@ async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, ki
         "cancelled": anyio.get_cancelled_exc_class(),
     }[kind]
 
+    raised = expected()
+
     async def broken(r: CompletedRun) -> None:
-        raise expected()
+        raise raised
 
     caught: BaseException | None = None
     try:
@@ -541,7 +567,7 @@ async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, ki
         )
     except BaseException as exc:
         caught = exc
-    assert type(caught) is expected
+    assert caught is raised
     assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
 
 

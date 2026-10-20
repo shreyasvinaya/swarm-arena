@@ -3,7 +3,6 @@ import importlib.machinery
 import os
 import py_compile
 import sys
-import traceback
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Annotated, Any, Literal
 
 import pytest
 from _fakes import tools as fake_tools
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import add, gradient_descent, make_job
 from pydantic import BaseModel, BeforeValidator, ValidationError
 from pydantic_core import PydanticCustomError
@@ -37,20 +37,6 @@ def function_job(tmp_path: Path, tool: FunctionTool, req: ToolRequest) -> Job:
         artifact_root=str(tmp_path / "artifacts"),
         timeout_s=30.0,
     )
-
-
-def assert_secret_absent(exc: BaseException) -> None:
-    surfaces = [
-        str(exc),
-        repr(exc),
-        repr(exc.args),
-        repr(getattr(exc, "__notes__", [])),
-        repr(exc.__cause__),
-        "".join(traceback.format_exception(exc)),
-    ]
-    if isinstance(exc, ValidationError):
-        surfaces.extend([repr(exc.errors()), exc.json()])
-    assert all(SECRET not in value for value in surfaces)
 
 
 def test_init_forms_and_flags() -> None:
@@ -145,21 +131,21 @@ def test_command_argv() -> None:
 def test_config_errors_hide_values(fields: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="FunctionTool") as caught:
         FunctionTool(add, **fields)
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
     with pytest.raises(ValidationError) as direct:
         FunctionTool.Config(function="_fakes.tools:add", **fields)
-    assert_secret_absent(direct.value)
+    assert_secret_absent(direct.value, SECRET)
 
 
 def test_input_errors_hide_values_and_mapping_keys() -> None:
     model = function_input_model(fake_tools.nested_input)
     with pytest.raises(ValidationError) as caught:
         model.model_validate({"values": {SECRET: SECRET}})
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
     assert caught.value.errors()[0]["loc"] == ("values", "<…>")
     with pytest.raises(ValidationError) as extra:
         model.model_validate({"values": {}, SECRET: SECRET})
-    assert_secret_absent(extra.value)
+    assert_secret_absent(extra.value, SECRET)
 
 
 def test_import_and_annotation_failures_hide_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,11 +156,11 @@ def test_import_and_annotation_failures_hide_values(monkeypatch: pytest.MonkeyPa
         patch.setattr("swarm_arena._tooling.function_tool.load_object", fail)
         with pytest.raises(ValueError, match="cannot import") as caught:
             FunctionTool(add).get_input_model()
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
     monkeypatch.setattr(add, "__annotations__", {"a": SECRET})
     with pytest.raises(TypeError, match="FunctionTool") as annotation:
         function_input_model(add)
-    assert_secret_absent(annotation.value)
+    assert_secret_absent(annotation.value, SECRET)
 
 
 async def test_runs_on_local_executor(local_executor: LocalExecutor, tmp_path: Path) -> None:
@@ -199,7 +185,7 @@ def test_custom_and_literal_validation_errors_hide_values(
     model = function_input_model(add)
     with pytest.raises(ValidationError) as caught:
         model.model_validate({"a": 1 if custom else "wrong"})
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_import_root_rejects_modules_without_a_file() -> None:
@@ -216,7 +202,7 @@ def test_direct_model_json_errors_hide_input_text(model_cls: type[BaseModel]) ->
         model_cls.model_validate_json(f"{{{SECRET}")
     assert caught.value.errors()[0]["type"] == "json_invalid"
     assert model_cls.model_config["hide_input_in_errors"]
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 @pytest.mark.parametrize(
@@ -227,7 +213,7 @@ def test_duplicate_function_keyword_is_rejected(
 ) -> None:
     with pytest.raises(TypeError, match="function") as caught:
         FunctionTool(function, function=SECRET)
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_command_uses_configured_module_for_reexport(
@@ -256,7 +242,7 @@ def test_preflight_rejects_stdlib_module_alias() -> None:
     with pytest.raises(TypeError, match="is an alias of") as caught:
         FunctionTool("os.path:basename").preflight()
     assert str(caught.value) == expected
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
     assert import_root("os.path") == str(Path(os.path.__file__).resolve().parent)
 
 
@@ -279,7 +265,7 @@ def test_preflight_rejects_package_module_alias(
             "FunctionTool task18_alias:solve: task18_alias is an alias of "
             "task18_defining; use the defining module"
         )
-        assert_secret_absent(caught.value)
+        assert_secret_absent(caught.value, SECRET)
         assert import_root("task18_alias") == str(tmp_path)
         FunctionTool("task18_defining:solve").preflight()
     finally:
@@ -296,7 +282,7 @@ def test_preflight_import_failure_hides_values(
     with pytest.raises(ValueError, match="cannot import task18_import_error:solve") as caught:
         FunctionTool("task18_import_error:solve").preflight()
     assert str(caught.value) == "cannot import task18_import_error:solve"
-    assert_secret_absent(caught.value)
+    assert_secret_absent(caught.value, SECRET)
 
 
 # --- Aliases and import roots (integration fix 3, A2) ---
@@ -330,7 +316,7 @@ def test_sys_modules_entry_without_a_spec_is_refused(
         with pytest.raises(TypeError) as caught:
             call()
         assert str(caught.value) == expected
-        assert_secret_absent(caught.value)
+        assert_secret_absent(caught.value, SECRET)
 
 
 def test_import_root_finds_a_sourceless_package(

@@ -143,7 +143,9 @@ indices, while each free-form mapping or `Any` segment becomes `<…>`. Commands
 argument, `env` contains variable names such as `API_KEY` (matching
 `[A-Za-z_][A-Za-z0-9_]*`), `timeout_s` is positive when set, and `grace_s` is
 nonnegative. These constraints are checked when the config is constructed.
-Parameter schemas are checked on the first `get_input_model()` call.
+Each top-level property schema must be a table when the config is constructed.
+Parameter names, keywords, and nested `items` schemas are checked on the first
+`get_input_model()` call.
 Snapshots are prepared separately before staging.
 
 Configuration, parameter, and file-action input errors hide rejected values,
@@ -151,6 +153,9 @@ including malformed JSON in `model_validate_json()` and the resulting
 `ValidationError.errors()` / `.json()` details. For example,
 `ScriptTool(command=["x"], timeout_s=-1)` reports the `timeout_s` field and the
 `greater_than` error code without the rejected timeout.
+
+(scripttool-parameters)=
+### ScriptTool parameters
 
 Parameter names must match `[A-Za-z][A-Za-z0-9_]*`. Names that shadow `pydantic.BaseModel`
 members (for example, `schema`, `dict`, `copy`, or `model_fields`), `Config`, and names
@@ -163,9 +168,11 @@ and JSON Schema boolean sub-schemas are unsupported. Numeric bounds must be inte
 floats; on integer properties, float bounds must be integral and within the int64 range. Length
 bounds must be nonnegative integers, and neither numeric nor length bounds accept booleans;
 `description` and `pattern` must be strings. Non-finite numbers are refused in enum members and
-defaults, and `number` inputs must be finite. An `enum` cannot be combined with numeric bounds
+defaults, and `number` inputs must be finite. An array without `items` is untyped;
+its elements do not undergo numeric validation. An `enum` cannot be combined with numeric bounds
 or `pattern`. Patterns use the Rust regex dialect, with no lookaround or backreferences; `\d`
-is Unicode-aware. Invalid parameter schemas raise `ConfigError` on the first
+is Unicode-aware. After the config accepts the top-level property tables, invalid
+parameter names, keywords, or nested schemas raise `ConfigError` on the first
 `get_input_model()` call, with the property path and keyword identifiers while hiding
 configured values.
 
@@ -282,9 +289,9 @@ A tool starts in a fresh workspace with this layout:
   swarm/stderr.log
 ```
 
-See [Workspace staging](#workspace-staging) for the staging order, folded-path
-replacement rule, and overlay acceptance rules. For example, a parent from
-another tool remains available under `parents/c1/` but does not replace
+See [Workspace staging](#workspace-staging) for the staging order, exact-spelling
+replacement rule, respelling refusal, and overlay acceptance rules. For example,
+a parent from another tool remains available under `parents/c1/` but does not replace
 `problem/ns_solver.phyk` at the root. A matching parent's editable change can
 be inherited and then replaced by the current edit.
 
@@ -350,10 +357,15 @@ OOM, which takes precedence.
 
 On timeout or cancellation the process group gets SIGTERM, a `grace_s` wait,
 partial collection, and SIGKILL. A valid result written before collection is
-kept with `partial=true` and status `timeout` or `cancelled`, even if empty or
-its files are dropped later by a size cap or upload failure. Failed, timed-out,
-or invalid collection gets empty data, `partial=false`, and a note. Write partial
-results atomically so collection never sees half a JSON document:
+kept with `partial=true` and status `timeout` or `cancelled`, even if its data
+is empty. If its declared files are then over `max_output_bytes` or fail to
+upload, they are dropped and the status becomes `error`; `partial` stays true.
+For a stopped run, a valid collect output is partial if it marks itself partial
+or contains data or files. A valid but empty collect output that does not itself
+mark partial gives `partial=false`, including a ScriptTool or PyTool with no
+valid `result.json`. Failed, timed-out, or invalid collection gives empty data,
+`partial=false`, and a note. Write partial results atomically so collection never
+sees half a JSON document:
 
 ```python
 import json
@@ -416,7 +428,8 @@ into tool workspaces. If a check or judge runs candidate code, see the
 ```
 
 `candidate/files/` exists even when empty. Its files and the candidate metadata
-are read-only. Outputs win at overlapping effective-file paths. For example,
+are read-only. An output replaces an effective file only at the exact same
+path; an output that respells one fails the producing run. For example,
 `json.load(open("candidate/output.json"))["data"]` reads the candidate's output,
 and `open("candidate/files/problem/ns_solver.phyk").read()` reads its effective
 solver file.

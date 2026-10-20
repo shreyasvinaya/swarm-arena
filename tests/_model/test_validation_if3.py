@@ -7,8 +7,10 @@ from typing import Any
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
-from pydantic import BaseModel, ValidationError, create_model
+from pydantic import BaseModel, ValidationError, create_model, field_validator
+from pydantic_core import PydanticCustomError
 
+from swarm_arena._errors import ConfigError
 from swarm_arena._model import base, ref
 from swarm_arena._model.base import FrozenModel, _SafeModel
 from swarm_arena._model.plan import Plan
@@ -34,6 +36,69 @@ def test_error_detail_cap_preserves_order_and_secrecy(count: int) -> None:
             "input": None,
         }
     assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("safe", [False, True])
+def test_config_summary_preserves_error_cap_count(safe: bool) -> None:
+    model = create_model(
+        "Config", __base__=_SafeModel if safe else BaseModel, items=(list[int], ...)
+    )
+    with pytest.raises(ConfigError) as caught:
+        ref._validate_config(model, {"items": [SECRET] * 25}, where="m:T")
+    assert str(caught.value) == "m:T: " + "; ".join(
+        [*(f"items.{index}: int_parsing" for index in range(20)), "and 5 more errors"]
+    )
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
+
+
+@pytest.mark.parametrize("count", [21, 25, 47])
+@pytest.mark.parametrize("config_boundary", [False, True])
+def test_explicit_nested_cap_counts_all_omitted_errors(count: int, config_boundary: bool) -> None:
+    class Inner(_SafeModel):
+        items: list[int]
+
+    class Outer(_SafeModel):
+        nested: Any
+        later: list[int]
+
+        @field_validator("nested")
+        @classmethod
+        def validate_nested(cls, value: Any) -> Inner:
+            return Inner.model_validate(value)
+
+    data = {"nested": {"items": [SECRET] * count}, "later": [SECRET] * 3}
+    if config_boundary:
+        with pytest.raises(ConfigError) as config_error:
+            ref._validate_config(Outer, data, where="m:T")
+        assert str(config_error.value).endswith(f"; and {count + 3 - 20} more errors")
+        assert_secret_absent(config_error.value, SECRET, sanitized=True)
+    else:
+        with pytest.raises(ValidationError) as caught:
+            Outer.model_validate(data)
+        details = caught.value.errors()
+        assert len(details) == 21
+        assert [item["loc"] for item in details[:20]] == [
+            ("nested", "items", index) for index in range(20)
+        ]
+        assert details[-1]["msg"] == f"and {count + 3 - 20} more errors"
+        assert_secret_absent(caught.value, SECRET, sanitized=True)
+
+
+def test_untrusted_cap_message_is_not_preserved_or_counted() -> None:
+    class Input(_SafeModel):
+        items: list[int]
+
+        @field_validator("items", mode="before")
+        @classmethod
+        def forged_trailer(cls, value: Any) -> Any:
+            raise PydanticCustomError("invalid", "and 937 more errors")
+
+    with pytest.raises(ValidationError) as caught:
+        Input(items=[SECRET])
+    assert caught.value.errors() == [
+        {"type": "invalid", "loc": ("items",), "msg": "invalid", "input": None}
+    ]
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
 
 
 @pytest.mark.parametrize("boundary", ["safe", "config"])
