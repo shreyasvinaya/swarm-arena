@@ -1,9 +1,13 @@
+import json
+import math
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from pydantic import ValidationError
 
+from swarm_arena._budget import amount as amount_module
 from swarm_arena._model.limits import Limits
 
 
@@ -125,3 +129,29 @@ def test_limits_unknown_fields_show_identifiers_without_values(
         Limits.model_validate(values)
     assert location in str(exc.value)
     assert_secret_absent(exc.value, "542371d6-031b-544d-8244-19c4c8a32fc3")
+
+
+def test_max_usd_bound_matches_amount_range() -> None:
+    schema = Limits.model_json_schema()["properties"]["max_usd"]
+    numeric = next(branch for branch in schema["anyOf"] if branch["type"] == "number")
+    assert numeric["maximum"] == amount_module.USD_LIMIT == 1_000_000_000
+    assert Limits(max_usd=1_000_000_000).max_usd == 1_000_000_000
+    assert Limits(max_usd=None).max_usd is None
+
+
+@pytest.mark.parametrize("usd", [math.nextafter(1_000_000_000.0, math.inf), 1e10, 1e12])
+@pytest.mark.parametrize(
+    "validate",
+    [
+        pytest.param(lambda usd: Limits(max_usd=usd), id="constructor"),
+        pytest.param(lambda usd: Limits.model_validate({"max_usd": usd}), id="model_validate"),
+        pytest.param(
+            lambda usd: Limits.model_validate_json(json.dumps({"max_usd": usd})),
+            id="model_validate_json",
+        ),
+    ],
+)
+def test_max_usd_rejects_unsupported_pool(usd: float, validate: Callable[[float], Limits]) -> None:
+    with pytest.raises(ValidationError, match="max_usd") as caught:
+        validate(usd)
+    assert_secret_absent(caught.value, str(usd), sanitized=True)

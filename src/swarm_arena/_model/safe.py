@@ -47,6 +47,7 @@ _VALIDATION_ACTIVE: Final[ContextVar[_ValidationOwner | None]] = ContextVar(
 )
 _SAFE_MESSAGES: Final = frozenset(
     {
+        "amount exceeds the supported USD range",
         "Value error, Plan.flows is reserved for v2 messaging and must be empty",
         "Value error, duplicate part names",
         "Value error, duplicate team names",

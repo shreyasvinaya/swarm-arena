@@ -8,12 +8,20 @@ from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.tooling import Estimate
 
 MICRO_USD = 1e-6
+USD_LIMIT = 1_000_000_000
 _MICROS_PER_USD = 1_000_000
 
 
 def _micro_units(usd: float) -> int:
     """Round decimal dollars to micro-dollars, with ties going to the even integer."""
     return round(Fraction(str(usd)) * _MICROS_PER_USD)
+
+
+def _usd_from_micro_units(units: int) -> float:
+    """Refuse unsupported integer balances before converting to float dollars."""
+    if abs(units) > USD_LIMIT * _MICROS_PER_USD:
+        raise ValueError("amount exceeds the supported USD range")
+    return units / _MICROS_PER_USD
 
 
 class Amount(FrozenModel):
@@ -25,12 +33,20 @@ class Amount(FrozenModel):
     tokens : int, default=0
         Signed token count.
     usd : float, default=0.0
-        Finite dollar amount, rounded to the nearest micro-dollar with ties to even.
+        Finite dollar amount between -1,000,000,000 and 1,000,000,000 inclusive,
+        rounded to the nearest micro-dollar with ties to even.
+
+    Raises
+    ------
+    ValueError
+        If the dollar amount is outside the supported range, before rounding.
 
     Notes
     -----
-    Arithmetic uses integer micro-dollars. Negative balances are retained so
-    replay and settlement can represent overspending. Estimate conversion
+    Arithmetic uses integer micro-dollars and refuses results outside the
+    supported range. Within this range, float serialization preserves every
+    whole micro-dollar exactly on round trip. Negative balances are retained
+    so replay and settlement can represent overspending. Estimate conversion
     enforces the stricter nonnegative contract for capped units.
 
     Examples
@@ -48,7 +64,9 @@ class Amount(FrozenModel):
     @classmethod
     def _normalize_usd(cls, value: float) -> float:
         """Normalize only after the safe base has validated a finite float."""
-        return _micro_units(value) / _MICROS_PER_USD
+        if abs(value) > USD_LIMIT:
+            raise ValueError("amount exceeds the supported USD range")
+        return _usd_from_micro_units(_micro_units(value))
 
     @property
     def _micro_usd(self) -> int:
@@ -69,6 +87,11 @@ class Amount(FrozenModel):
         Amount
             Sum of the balances.
 
+        Raises
+        ------
+        ValueError
+            If the sum is outside the supported dollar range.
+
         Examples
         --------
         >>> Amount(tokens=1, usd=0.01) + Amount(tokens=2, usd=0.02)
@@ -76,7 +99,7 @@ class Amount(FrozenModel):
         """
         return Amount(
             tokens=self.tokens + other.tokens,
-            usd=(self._micro_usd + other._micro_usd) / _MICROS_PER_USD,
+            usd=_usd_from_micro_units(self._micro_usd + other._micro_usd),
         )
 
     def __sub__(self, other: "Amount") -> "Amount":
@@ -93,6 +116,11 @@ class Amount(FrozenModel):
         Amount
             Signed difference of the balances.
 
+        Raises
+        ------
+        ValueError
+            If the difference is outside the supported dollar range.
+
         Examples
         --------
         >>> Amount(tokens=1, usd=0.01) - Amount(tokens=2, usd=0.02)
@@ -100,7 +128,7 @@ class Amount(FrozenModel):
         """
         return Amount(
             tokens=self.tokens - other.tokens,
-            usd=(self._micro_usd - other._micro_usd) / _MICROS_PER_USD,
+            usd=_usd_from_micro_units(self._micro_usd - other._micro_usd),
         )
 
     def fits_in(self, other: "Amount", *, cap_tokens: bool, cap_usd: bool) -> bool:
@@ -150,7 +178,8 @@ class Amount(FrozenModel):
         Raises
         ------
         ValueError
-            If an estimate field violates its nonnegative, finite contract.
+            If an estimate field violates its nonnegative, finite contract
+            or its dollar amount exceeds the supported range.
 
         Examples
         --------

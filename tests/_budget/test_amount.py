@@ -1,11 +1,17 @@
 import json
+import math
+import random
+import sys
 from collections.abc import Callable
+from fractions import Fraction
+from operator import add, sub
 from typing import Any
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from pydantic import ValidationError
 
+from swarm_arena._budget import amount as amount_module
 from swarm_arena._budget.amount import MICRO_USD, Amount
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.tooling import Estimate
@@ -139,3 +145,110 @@ def test_invalid_usd_is_sanitized(value: Any, validate: Callable[[Any], Amount])
     with pytest.raises(ValidationError) as caught:
         validate(value)
     assert_secret_absent(caught.value, "private-amount-value", sanitized=True)
+
+
+def test_supported_usd_range_preserves_micro_units_and_replay() -> None:
+    assert amount_module.USD_LIMIT == 1_000_000_000
+    limit_units = 1_000_000_000_000_000
+    rng = random.Random(8401)
+    samples = [
+        -limit_units,
+        -limit_units + 1,
+        -1,
+        0,
+        1,
+        limit_units - 1,
+        limit_units,
+        *(rng.randint(-limit_units, limit_units) for _ in range(2_000)),
+    ]
+    for units in samples:
+        usd = units / 1_000_000
+        assert round(float(usd) * 1_000_000) == units
+        amount = Amount(usd=usd)
+        assert Fraction(str(amount.usd)) * 1_000_000 == units
+        replayed = Amount.model_validate_json(amount.model_dump_json())
+        assert Fraction(str(replayed.usd)) * 1_000_000 == units
+
+
+@pytest.mark.parametrize(
+    "usd",
+    [
+        math.nextafter(1_000_000_000.0, math.inf),
+        1_000_000_000.000001,
+        1e10,
+        1e12,
+        sys.float_info.max,
+    ],
+)
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize(
+    "validate",
+    [
+        pytest.param(lambda usd: Amount(usd=usd), id="constructor"),
+        pytest.param(lambda usd: Amount.model_validate({"usd": usd}), id="model_validate"),
+        pytest.param(
+            lambda usd: Amount.model_validate_json(json.dumps({"usd": usd})),
+            id="model_validate_json",
+        ),
+    ],
+)
+def test_out_of_range_usd_is_refused_before_rounding(
+    usd: float, sign: int, validate: Callable[[float], Amount]
+) -> None:
+    value = sign * usd
+    with pytest.raises(ValueError, match="amount exceeds the supported USD range") as caught:
+        validate(value)
+    assert_secret_absent(caught.value, str(value), sanitized=True)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "operation"),
+    [
+        (1_000_000_000.0, 0.000001, add),
+        (-1_000_000_000.0, -0.000001, add),
+        (1_000_000_000.0, -0.000001, sub),
+        (-1_000_000_000.0, 0.000001, sub),
+        (1_000_000_000.0, 1_000_000_000.0, add),
+        (-1_000_000_000.0, 1_000_000_000.0, sub),
+    ],
+)
+def test_arithmetic_refuses_out_of_range_result(
+    left: float, right: float, operation: Callable[[Amount, Amount], Amount]
+) -> None:
+    with pytest.raises(ValueError, match="amount exceeds the supported USD range") as caught:
+        operation(Amount(usd=left), Amount(usd=right))
+    for value in (left, right):
+        assert_secret_absent(caught.value, str(value), sanitized=True)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_tiny_debits_and_credits_at_range_ends_are_exact(sign: int) -> None:
+    balance = Amount(usd=sign * 1_000_000_000)
+    debit = Amount(usd=sign * 0.000001)
+    for count in range(1, 1_002):
+        balance = balance - debit
+        assert Fraction(str(balance.usd)) * 1_000_000 == sign * (1_000_000_000_000_000 - count)
+    for count in range(1_000, -1, -1):
+        balance = balance + debit
+        assert Fraction(str(balance.usd)) * 1_000_000 == sign * (1_000_000_000_000_000 - count)
+    assert balance - balance == Amount()
+    assert balance + Amount(usd=-balance.usd) == Amount()
+
+
+def test_from_estimate_refuses_unsupported_pool() -> None:
+    with pytest.raises(ValueError, match="amount exceeds the supported USD range"):
+        Amount.from_estimate(Estimate(usd=1e10))
+
+
+def test_range_diagnostic_survives_sanitizer_without_value() -> None:
+    with pytest.raises(ValidationError) as caught:
+        Amount(usd=1_234_567_890.123456)
+    assert caught.value.errors() == [
+        {
+            "type": "value_error",
+            "loc": ("usd",),
+            "msg": "amount exceeds the supported USD range",
+            "input": None,
+        }
+    ]
+    assert_secret_absent(caught.value, "1234567890.123456", sanitized=True)

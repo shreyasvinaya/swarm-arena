@@ -1737,9 +1737,14 @@ def new_run_id(now: datetime) -> str: ...
 #### R4.13.6 Budget — M1b (+M3 LLM prices, +M4 gateway)
 
 ```python
+USD_LIMIT = 1_000_000_000                            # _budget/amount.py; inclusive signed USD bound
+
 class Amount(FrozenModel):
     tokens: int = 0
     usd: float = 0.0
+    # Construction rejects abs(usd) > USD_LIMIT before normalization.
+    # Integer micro-dollar arithmetic rejects out-of-range results before float conversion;
+    # supported balances and split remainders round-trip exactly. Limits.max_usd <= USD_LIMIT.
     def fits_in(self, other: "Amount", *, cap_tokens: bool, cap_usd: bool) -> bool: ...
     # + __add__, __sub__; an unset Limits cap means "unlimited" for that unit
 

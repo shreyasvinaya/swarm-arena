@@ -83,9 +83,11 @@ def test_signed_pools_are_floored() -> None:
     assert round_pool(total, 2) == expected["a"]
 
 
-@pytest.mark.parametrize("usd", [1e100, 1e308, -1e100])
-@pytest.mark.parametrize("count", [3, 7])
-def test_large_finite_pools_never_round_shares_up(usd: float, count: int) -> None:
+@pytest.mark.parametrize("usd", [1_000_000_000.0, 999_999_999.999999, -999_999_999.0])
+@pytest.mark.parametrize("count", [3, 101, 1_001])
+def test_large_supported_pools_conserve_bulk_and_sequential_remainders(
+    usd: float, count: int
+) -> None:
     total = Amount(usd=usd)
     holders = [str(index) for index in range(count)]
     equal = equal_shares(total, holders)
@@ -93,10 +95,36 @@ def test_large_finite_pools_never_round_shares_up(usd: float, count: int) -> Non
     micro_total = round(Fraction(str(total.usd)) * 1_000_000)
     assert equal == weighted
     assert equal[holders[0]] == round_pool(total, count)
-    assert all(
-        round(Fraction(str(share.usd)) * 1_000_000) <= micro_total // count
-        for share in equal.values()
-    )
+    allocated = Amount()
+    sequential_remainder = total
+    for share in equal.values():
+        assert Fraction(str(share.usd)) * 1_000_000 == micro_total // count
+        allocated = allocated + share
+        sequential_remainder = sequential_remainder - share
+    exact_parts = sum(round(Fraction(str(share.usd)) * 1_000_000) for share in equal.values())
+    assert Fraction(str(allocated.usd)) * 1_000_000 == exact_parts
+    assert exact_parts + Fraction(str((total - allocated).usd)) * 1_000_000 == micro_total
+    assert exact_parts + Fraction(str(sequential_remainder.usd)) * 1_000_000 == micro_total
+    assert allocated.fits_in(total, cap_tokens=False, cap_usd=True)
+
+
+def test_many_weighted_holders_conserve_micro_dollars() -> None:
+    total = Amount(usd=1_000_000_000)
+    weights = {str(index): float(index + 1) for index in range(1_001)}
+    shares = weighted_shares(total, weights)
+    denominator = sum(Fraction(str(weight)) for weight in weights.values())
+    allocated = Amount()
+    remaining = total
+    exact_parts = 0
+    for holder, share in shares.items():
+        expected = 1_000_000_000_000_000 * Fraction(str(weights[holder])) // denominator
+        assert Fraction(str(share.usd)) * 1_000_000 == expected
+        exact_parts += expected
+        allocated = allocated + share
+        remaining = remaining - share
+    assert Fraction(str(allocated.usd)) * 1_000_000 == exact_parts
+    assert exact_parts + Fraction(str(remaining.usd)) * 1_000_000 == 1_000_000_000_000_000
+    assert exact_parts + Fraction(str((total - allocated).usd)) * 1_000_000 == 1_000_000_000_000_000
 
 
 @pytest.mark.parametrize(

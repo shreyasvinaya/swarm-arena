@@ -4,15 +4,12 @@ import math
 from collections.abc import Mapping, Sequence
 from fractions import Fraction
 
-from swarm_arena._budget.amount import _MICROS_PER_USD, Amount
+from swarm_arena._budget.amount import Amount, _usd_from_micro_units
 
 
 def _floored_amount(tokens: int, micro_usd: int) -> Amount:
-    """Keep float serialization from rounding a large floored share upward."""
-    amount = Amount(tokens=tokens, usd=micro_usd / _MICROS_PER_USD)
-    if amount._micro_usd > micro_usd:
-        amount = Amount(tokens=tokens, usd=math.nextafter(amount.usd, -math.inf))
-    return amount
+    """Convert already-floored integer units without losing micro-dollars."""
+    return Amount(tokens=tokens, usd=_usd_from_micro_units(micro_usd))
 
 
 def weighted_shares(total: Amount, weights: Mapping[str, float]) -> dict[str, Amount]:
@@ -42,8 +39,8 @@ def weighted_shares(total: Amount, weights: Mapping[str, float]) -> dict[str, Am
     -----
     Decimal representations of weights are converted to exact fractions before
     summation and division, avoiding floating-point overflow and floor drift.
-    If a very large share cannot be represented at micro-dollar precision as a
-    float, its dollar representation is rounded downward.
+    Amount's supported dollar range preserves each floored share exactly
+    through float serialization and subsequent arithmetic.
 
     Examples
     --------
