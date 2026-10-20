@@ -11,7 +11,7 @@ from swarm_arena import Goal, PartSpec, Plan, Ref
 from swarm_arena._engine.solution import SolutionDocument, solution_view
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import Head
-from swarm_arena._journal.replay import RunState
+from swarm_arena._journal.replay import GoalState, RunState
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
@@ -133,7 +133,19 @@ def test_ok_solution_in_final_order_with_lineage_and_stats() -> None:
     assert data["finalists"][0]["lineage"] == ["c-0"]
     assert data["source_head"]["seq"] == H.seq
     assert data["replicate_stats"] == [
-        {"tool_identity": "ti", "inputs_sha256": ANY, "n": 3, "mean": 2.0, "min": 1.0, "max": 3.0}
+        {
+            "part": None,
+            "judge": "program",
+            "rubric_hash": "stamped-rubric",
+            "panel_hash": "",
+            "fidelity": "",
+            "tool_identity": "ti",
+            "inputs_sha256": ANY,
+            "n": 3,
+            "mean": 2.0,
+            "min": 1.0,
+            "max": 3.0,
+        }
     ]
     assert data["replicate_stats"][0]["inputs_sha256"] == sha256_hex(
         canonical_json({"optional": None, "x": 1})
@@ -206,6 +218,89 @@ def test_replicate_stats_use_latest_matching_identity_and_fidelity() -> None:
     assert data["replicate_stats"][0]["n"] == 3
     assert data["replicate_stats"][0]["mean"] == 2.0
     assert data["best_of_n"]["value"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("parts", "judges", "fidelities"),
+    [
+        (("a", "b"), ("a", "b"), ("a", "b")),
+        (("a", "b"), ("main", "main"), ("same", "same")),
+        ((None, "a"), ("main", "main"), ("same", "same")),
+    ],
+    ids=["review-repro", "parts-same-identity-fidelity", "main-and-part"],
+)
+def test_replicate_stats_keep_comparison_domains_separate(
+    parts: tuple[str | None, str | None],
+    judges: tuple[str, str],
+    fidelities: tuple[str, str],
+) -> None:
+    plan = Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[],
+        judges=[Ref(path="missing:Judge", name="main")],
+        parts=[
+            PartSpec(
+                name=part,
+                goal=Goal(id=part, namespace="n"),
+                judges=[Ref(path="missing:Judge", name=judge)],
+            )
+            for part, judge in zip(parts, judges, strict=True)
+            if part is not None
+        ],
+    )
+    candidates = [
+        _c(f"c-{i}", part=part, replicate=1).model_copy(
+            update={"fidelity": fidelity, "request": ToolRequest(inputs={"x": 1}, replicate=1)}
+        )
+        for i, (part, fidelity) in enumerate(zip(parts, fidelities, strict=True))
+    ]
+    scores = [
+        Score(
+            id=f"s-{i}",
+            candidate_id=candidate.id,
+            judge=judge,
+            rubric_hash=f"rubric-{judge}",
+            panel_hash=f"panel-{judge}",
+            key=(value,),
+            value=value,
+        )
+        for i, (candidate, judge, value) in enumerate(
+            zip(candidates, judges, (1.0, 1000.0), strict=True)
+        )
+    ]
+    state = RunState(
+        run_id="r",
+        plans={"g": [(plan, "human")]},
+        goals={
+            "g": GoalState(
+                status="stopped",
+                final_parts={
+                    candidate.part: candidate.id for candidate in candidates if candidate.part
+                },
+                end_reason="stop --now",
+            )
+        },
+        candidates={candidate.id: candidate for candidate in candidates},
+        scores={score.id: score for score in scores},
+    )
+    stats = json.loads(solution_view(state, "g", H))["replicate_stats"]
+    assert len(stats) == 2
+    assert stats == [
+        {
+            "part": candidate.part,
+            "judge": score.judge,
+            "rubric_hash": score.rubric_hash,
+            "panel_hash": score.panel_hash,
+            "fidelity": candidate.fidelity,
+            "tool_identity": "ti",
+            "inputs_sha256": sha256_hex(canonical_json({"x": 1})),
+            "n": 1,
+            "mean": score.value,
+            "min": score.value,
+            "max": score.value,
+        }
+        for candidate, score in zip(candidates, scores, strict=True)
+    ]
 
 
 def test_deterministic_groups_and_missing_values_have_no_stats() -> None:

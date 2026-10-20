@@ -86,19 +86,32 @@ def _entry(state: RunState, candidate: Candidate | None) -> dict[str, Any]:
 
 
 def _replicate_stats(pairs: list[tuple[Candidate, Score]]) -> list[dict[str, Any]]:
-    """Summarize finite ranking values only for groups with explicit replicates."""
-    grouped: dict[tuple[str, str], list[tuple[Candidate, float]]] = {}
+    """Summarize explicit replicates within each exact comparison domain."""
+    grouped: dict[
+        tuple[str | None, tuple[str, str, str], str, str, str], list[tuple[Candidate, float]]
+    ] = {}
     for candidate, score in pairs:
         if score.value is not None and math.isfinite(score.value):
-            key = candidate.tool_identity, sha256_hex(canonical_json(candidate.request.inputs))
+            key = (
+                candidate.part,
+                score.identity,
+                candidate.fidelity,
+                candidate.tool_identity,
+                sha256_hex(canonical_json(candidate.request.inputs)),
+            )
             grouped.setdefault(key, []).append((candidate, score.value))
     result: list[dict[str, Any]] = []
-    for (tool_identity, inputs_sha256), members in grouped.items():
+    for (part, identity, fidelity, tool_identity, inputs_sha256), members in grouped.items():
         if not any(candidate.request.replicate > 0 for candidate, _ in members):
             continue
         values = [value for _, value in members]
         result.append(
             {
+                "part": part,
+                "judge": identity[0],
+                "rubric_hash": identity[1],
+                "panel_hash": identity[2],
+                "fidelity": fidelity,
                 "tool_identity": tool_identity,
                 "inputs_sha256": inputs_sha256,
                 "n": len(values),
@@ -130,7 +143,12 @@ def solution_view(state: RunState, goal_id: str, source: Head) -> bytes:
         Ranks are one-based. Each finalist's plan_revision is the zero-based
         final evaluation revision, and plan_revisions contains all recorded
         plans with journal-authoritative origins. Lineage lists direct parents.
-        Statistics use each group's newest ranking identity and fidelity;
+        Statistics use each group's newest ranking identity and fidelity. Each
+        replicate_stats row contains part (null for the main goal), judge,
+        rubric_hash, panel_hash, fidelity, tool_identity, inputs_sha256, n, mean,
+        min and max. Aggregation stays within one part, exact Score.identity,
+        fidelity, tool identity and canonical input hash; a cohort is included
+        only when a member has replicate > 0. These fields are the v1 format;
         best_of_n reports the first finalist's ranking value when available.
 
     Examples

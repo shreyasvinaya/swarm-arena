@@ -2305,8 +2305,15 @@ All start at `schema_version = 1`: journal `Event` and the segment link line, `O
 best-of-N, plan-revision, and run-metadata subtrees use `FiniteJsonObject` and
 retain nulls. Readers use `SolutionDocument.model_validate_json` for the registered
 upgrade path and newer-version refusal. Finalist `plan_revision` is the zero-based
-final evaluation revision; `lineage` lists direct parent ids. `manifest.json`
-similarly uses a private `RunManifest` StoredModel, kind `manifest`, when its
+final evaluation revision; `lineage` lists direct parent ids. In solution v1,
+each `replicate_stats` row carries `part` (null for the main goal), `judge`,
+`rubric_hash`, `panel_hash`, `fidelity`, `tool_identity`, `inputs_sha256`, `n`,
+`mean`, `min` and `max`. Statistics use each ranking group's newest exact
+`Score.identity` and fidelity, then aggregate by tool identity and canonical
+input hash only within that same group, identity and fidelity. A cohort is
+included only when at least one member has `replicate > 0`; main-goal and part
+cohorts are never combined. `manifest.json` similarly uses a private
+`RunManifest` StoredModel, kind `manifest`, when its
 producer is implemented. These artifact models are distinct from
 `_model.data.Manifest`, the workspace-path-to-SHA-256 file-map alias.
 
