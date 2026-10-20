@@ -196,6 +196,38 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
 CORE = sorted(set(PUBLIC) - {"swarm_arena", "swarm_arena.testing"})
 
 
+@pytest.mark.parametrize("pydantic_model", [False, True])
+def test_publish_invalidates_original_class_source_location(
+    pydantic_model: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Plain:
+        class Nested:
+            pass
+
+    class Model(BaseModel):
+        class Nested(BaseModel):
+            pass
+
+    demo = Model if pydantic_model else Plain
+    # Python 3.13 adds this metadata; also exercise invalidation on older versions.
+    for cls in (demo, demo.Nested):
+        type.__setattr__(cls, "__firstlineno__", 1)
+    module = types.ModuleType("source_location_facade")
+    module.__file__ = __file__
+    vars(module)["Demo"] = demo
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    publish(module.__name__, ["Demo"])
+    for cls in (demo, demo.Nested):
+        assert cls.__module__ == module.__name__
+        assert "__firstlineno__" not in vars(cls)
+        try:
+            source, _ = inspect.getsourcelines(cls)
+        except OSError:
+            pass  # Retargeted classes need not have inspectable source.
+        else:
+            assert source[0].lstrip().startswith(f"class {cls.__name__}")
+
+
 def test_root_import_publishes_core_facades() -> None:  # __module__ never depends on import order
     code = f"import sys, swarm_arena; print(sorted(set({CORE!r}) - set(sys.modules)))"
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)

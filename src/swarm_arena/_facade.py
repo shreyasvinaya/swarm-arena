@@ -17,6 +17,9 @@ def publish(module_name: str, names: Sequence[str]) -> None:
     every method example: the private module skips the class, and the public module skips
     the method. Only functions whose ``__qualname__`` puts them in the class body change,
     so a function that a library injects into the class (pydantic does) is left alone.
+    Original class line metadata is removed when publishing, as with Python 3.13's
+    native ``__module__`` assignment, so source inspection cannot read unrelated
+    lines from the facade module.
 
     Parameters
     ----------
@@ -51,6 +54,9 @@ def publish(module_name: str, names: Sequence[str]) -> None:
 
 def _publish_class(cls: type, module_name: str) -> None:
     cls.__module__ = module_name
+    # Some metaclasses retain Python 3.13's original line in the new module.
+    if "__firstlineno__" in vars(cls):
+        delattr(cls, "__firstlineno__")
     prefix = cls.__qualname__ + "."
     for attr, value in vars(cls).items():
         if isinstance(value, type):

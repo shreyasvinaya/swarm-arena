@@ -295,7 +295,7 @@ async def test_exit_watch_polls_waitid_without_pidfd(monkeypatch: pytest.MonkeyP
     def no_pidfd(pid: int, flags: int = 0) -> int:
         raise OSError(errno.ENOSYS, "pidfd_open not supported")
 
-    monkeypatch.setattr(os, "pidfd_open", no_pidfd)
+    monkeypatch.setattr(os, "pidfd_open", no_pidfd, raising=False)
     p = await anyio.to_thread.run_sync(_spawn, ["sleep", "0.3"])
     with contextlib.closing(ExitWatch(p.pid)) as watch:
         with anyio.fail_after(5):

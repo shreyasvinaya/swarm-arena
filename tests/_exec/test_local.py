@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -156,12 +157,22 @@ async def test_python_argv0_replaced(local_executor: LocalExecutor, tmp_path: Pa
     code = WRITE.format("{'exe': __import__('sys').executable}")
     out = await local_executor.submit(command_job(tmp_path, Command(argv=["python", "-c", code])))
     assert out.data["exe"] == sys.executable
+    # Framework Python on macOS resolves interpreter symlinks in sys.executable.
+    # Record invocation through the configured path instead of assuming its spelling survives.
+    marker = tmp_path / "python-called"
+    interpreter = tmp_path / "custom-python"
+    interpreter.write_text(
+        f"#!/bin/sh\nprintf called > {shlex.quote(str(marker))}\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    interpreter.chmod(0o755)
     link = tmp_path / "py"
-    link.symlink_to(sys.executable)
+    link.symlink_to(interpreter)
     out2 = await local_executor.submit(
         command_job(tmp_path, Command(argv=["python", "-c", code], python=str(link)))
     )
-    assert out2.data["exe"] == str(link)
+    assert marker.read_text() == "called"
+    assert out2.data["exe"] == sys.executable
 
 
 async def test_command_cwd_is_inside_workspace(
