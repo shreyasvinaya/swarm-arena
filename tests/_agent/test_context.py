@@ -1,5 +1,6 @@
 from collections.abc import Awaitable
 from dataclasses import replace
+from doctest import SKIP, DocTestParser, DocTestRunner
 from threading import get_ident
 from typing import Any, cast
 
@@ -56,7 +57,13 @@ async def test_parallel_post_learning_respects_rate_limit(ctx_env: CtxEnv) -> No
     c = await ctx.run_tool({"x": 1.0})
     results = await _gather(*(ctx.post_learning(f"t{i}", "x", [c.id]) for i in range(2)))
     assert sum(isinstance(r, Learning) for r in results) == 1
-    assert sum(isinstance(r, SoftError) for r in results) == 1
+    assert [str(r) for r in results if isinstance(r, SoftError)] == [
+        "max_learnings_per_agent_round reached"
+    ]
+    assert ctx_env.counters.learnings == 3
+    assert len(ctx_env.events("learning")) == 1
+    assert sum(isinstance(item, Learning) for item in ctx_env.rt.own) == 1
+    assert isinstance(await ctx.run_tool({"x": 2.0}), Candidate)
 
 
 async def test_soft_errors_do_not_use_a_run(ctx_env: CtxEnv) -> None:
@@ -677,11 +684,16 @@ async def test_properties_and_my_candidates_are_free(ctx_env: CtxEnv) -> None:
     assert ctx_env.events("agent_counters") == []
 
 
-async def test_snapshot_file_access_does_not_admit_new_other_agent_files(ctx_env: CtxEnv) -> None:
+@pytest.mark.parametrize("prior_own", [False, True])
+async def test_snapshot_file_access_does_not_admit_new_other_agent_files(
+    ctx_env: CtxEnv, prior_own: bool
+) -> None:
     ctx = ctx_env.script_ctx()
     rt = ctx_env.rt
     digest = ctx_env.artifacts.put_bytes(b"earlier\n")
-    earlier = _candidate(agent="b").model_copy(update={"overlay": {"problem/a.phyk": digest}})
+    earlier = _candidate(agent="a" if prior_own else "b").model_copy(
+        update={"overlay": {"problem/a.phyk": digest}}
+    )
     event = rt.journal.append(
         EventDraft(type="tool_end", payload={"candidate": earlier.model_dump(mode="json")})
     )
@@ -689,15 +701,36 @@ async def test_snapshot_file_access_does_not_admit_new_other_agent_files(ctx_env
     await rt.journal.commit()
     frontier = await anyio.to_thread.run_sync(rt.board.frontier)
     view = await anyio.to_thread.run_sync(rt.board.snapshot, rt.goal_key, frontier)
-    ctx = AgentContext(replace(rt, view=view))
+    ctx = AgentContext(
+        replace(
+            rt,
+            view=view,
+            repeats=RepeatIndex("engine-run", [("earlier", earlier)]),
+        )
+    )
+    if prior_own:
+        own = ctx.my_candidates()
+        assert [c.id for c in own] == [earlier.id]
+        digest = own[0].overlay["problem/a.phyk"]
     hidden_digest = ctx_env.artifacts.put_bytes(b"later\n")
     later = earlier.model_copy(
-        update={"id": "c-later", "round": 1, "overlay": {"problem/a.phyk": hidden_digest}}
+        update={
+            "id": "c-later",
+            "agent": "b",
+            "round": 1,
+            "overlay": {"problem/a.phyk": hidden_digest},
+        }
     )
     event = rt.journal.append(
         EventDraft(type="tool_end", payload={"candidate": later.model_dump(mode="json")})
     )
     rt.board.put_candidate(later, epoch=event.epoch, seq=event.seq)
+    await rt.journal.commit()
+    assert await anyio.to_thread.run_sync(ctx._read_artifact, digest) == b"earlier\n"
+    with pytest.raises(SoftError, match=r"^file not in your view$"):
+        await anyio.to_thread.run_sync(ctx._read_artifact, hidden_digest)
+    assert (rt.counters.turns, rt.counters.board_reads) == (0, 0)
+    assert ctx_env.events("agent_counters") == []
     assert await ctx.call_action(
         "read_file", {"path": "problem/a.phyk", "candidate": earlier.id}
     ) == {"path": "problem/a.phyk", "content": "earlier\n"}
@@ -706,6 +739,32 @@ async def test_snapshot_file_access_does_not_admit_new_other_agent_files(ctx_env
     with pytest.raises(SoftError, match="file not in your view"):
         await anyio.to_thread.run_sync(ctx._read_artifact, hidden_digest)
     assert (rt.counters.turns, rt.counters.board_reads) == (2, 2)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "budget",
+        "scores_of",
+        "search_learnings",
+        "read_learning",
+        "get_candidate",
+        "best",
+        "post_learning",
+        "save_notes",
+        "call_action",
+    ],
+)
+def test_memory_examples_are_self_contained_and_run(method: str) -> None:
+    doc = getattr(AgentContext, method).__doc__
+    assert doc is not None
+    example = DocTestParser().get_doctest(doc, {"AgentContext": AgentContext}, method, None, 0)
+    assert example.examples
+    assert not any(item.options.get(SKIP) for item in example.examples)
+    runner = DocTestRunner()
+    result = runner.run(example)
+    assert result.failed == 0
+    assert result.attempted > 1
 
 
 async def test_tool_metadata_failure_is_sanitized(

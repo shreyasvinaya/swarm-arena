@@ -73,8 +73,8 @@ class AgentContext:
 
     Examples
     --------
-    Metadata and own-result inspection can run in memory with mocked services;
-    actions that journal events require the core's active runtime.
+    Metadata and actions can run in memory with mocked service boundaries.
+    New tool executions require the core's active execution services.
 
     >>> from unittest.mock import Mock
     >>> from swarm_arena import AgentSpec, Goal, Ref, RoundSpec, ScriptTool, TeamSpec
@@ -100,7 +100,6 @@ class AgentContext:
         """Bind runtime state and snapshot tool metadata on the owning loop."""
         self._rt, self._gate, self._thread = rt, gate, get_ident()
         self._read_ids: dict[str, None] = {}
-        self._file_digests: set[str] = set()
         self._feedback = {name: check.feedback for name, check in rt.checks}
         self.goal: Goal = rt.goal.model_copy(deep=True)
         self.spec: AgentSpec = rt.spec.model_copy(deep=True)
@@ -172,7 +171,6 @@ class AgentContext:
                 candidate = self._rt.view.get_candidate(id)
             except (KeyError, ValueError):
                 raise SoftError(f"unknown candidate: {id}") from None
-        self._file_digests.update(effective_files(self._rt.goal, candidate).values())
         return candidate
 
     def _learning(self, id: str) -> Learning:
@@ -239,7 +237,29 @@ class AgentContext:
 
         Examples
         --------
-        >>> remaining = ctx.budget  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.tool import Estimate
+        >>> rt.holder = "g/t/a"
+        >>> rt.ledger.limits = Limits(max_usd=5)
+        >>> rt.ledger.remaining.return_value.to_estimate.return_value = Estimate(usd=3)
+        >>> assert ctx.budget == Estimate(tokens=None, usd=3)
+        >>> rt.ledger.remaining.assert_called_once_with("g/t/a")
+        >>> rt.ledger.remaining.return_value.to_estimate.assert_called_once_with(
+        ...     cap_tokens=False, cap_usd=True)
+        >>> assert rt.counters.turns == 0
         """
 
         def read() -> Estimate:
@@ -332,7 +352,31 @@ class AgentContext:
 
         Examples
         --------
-        >>> scores = ctx.scores_of("c-1")  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="t", agent="a",
+        ...     round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> rt.view.get_candidate.return_value = candidate
+        >>> from swarm_arena import Score
+        >>> score = Score(id="s-1", candidate_id="c-1", judge="rank", key=(2.0,))
+        >>> rt.view.scores.return_value = [score]
+        >>> scores = ctx.scores_of("c-1")
+        >>> assert scores == [score] and scores[0] is not score
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
 
         def read() -> list[Score]:
@@ -376,7 +420,27 @@ class AgentContext:
 
         Examples
         --------
-        >>> hints = ctx.search_learnings("baseline")  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Learning
+        >>> hint = Learning(id="L-1", namespace="demo", run_id="r", goal_id="g", round=1,
+        ...     author="t/a", title="Baseline", text="It converged.", evidence=["c-1"])
+        >>> rt.view.search_learnings.return_value = [hint]
+        >>> hints = ctx.search_learnings("baseline")
+        >>> assert hints == [hint] and hints[0] is not hint
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
 
         def read() -> list[Learning]:
@@ -427,7 +491,27 @@ class AgentContext:
 
         Examples
         --------
-        >>> hint = ctx.read_learning("L-1")  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Learning
+        >>> hint = Learning(id="L-1", namespace="demo", run_id="r", goal_id="g", round=1,
+        ...     author="t/a", title="Baseline", text="It converged.", evidence=["c-1"])
+        >>> rt.view.get_learning.return_value = hint
+        >>> found = ctx.read_learning("L-1")
+        >>> assert found == hint and found is not hint
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
 
         def read() -> Learning:
@@ -454,7 +538,28 @@ class AgentContext:
 
         Examples
         --------
-        >>> candidate = ctx.get_candidate("c-1")  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="t", agent="a",
+        ...     round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> rt.view.get_candidate.return_value = candidate
+        >>> found = ctx.get_candidate("c-1")
+        >>> assert found == candidate and found is not candidate
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
 
         def read() -> Candidate:
@@ -466,12 +571,13 @@ class AgentContext:
         return self._on_loop(read)
 
     def _read_artifact(self, sha256: str) -> bytes:
-        """Authorize file digests on-loop and fetch bytes in the action worker."""
+        """Authorize snapshot and own file digests without a prior charged lookup."""
 
         def authorize() -> None:
             rt = self._rt
-            allowed = set(rt.goal.files.manifest.values()) | self._file_digests
-            for candidate in rt.own:
+            allowed = set(rt.goal.files.manifest.values())
+            candidates = [rt.view.get_candidate(id) for id in rt.view._visible_candidate_ids()]
+            for candidate in [*candidates, *rt.own]:
                 if isinstance(candidate, Candidate):
                     allowed.update(effective_files(rt.goal, candidate).values())
             if sha256 not in allowed:
@@ -499,7 +605,29 @@ class AgentContext:
 
         Examples
         --------
-        >>> rows = ctx.best(3)  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Row
+        >>> rt.part, rt.rankings, rt.goal_key = None, {"": "rank"}, rt.goal.key()
+        >>> row = Row(rank=1, candidate_id="c-1", run_id="r", goal_id="g",
+        ...     team="t", agent="a", part=None, fidelity="full", key=(2.0,), value=2.0,
+        ...     judge="rank", rubric_hash="r", panel_hash="p", built_on=[], partial=False)
+        >>> rt.view.leaderboard.return_value = [row]
+        >>> assert ctx.best(1) == [row]
+        >>> rt.view.leaderboard.assert_called_once_with(rt.goal_key, judge="rank")
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
 
         def read() -> list[Row]:
@@ -549,10 +677,42 @@ class AgentContext:
         Learning
             Published learning with core-generated identity and call provenance.
 
+        Raises
+        ------
+        SoftError
+            If validation fails or max_learnings_per_agent_round is reached.
+            This learning rate limit leaves the round open for other actions.
+
         Examples
         --------
-        >>> hint = await ctx.post_learning(
-        ...     "Baseline", "It converged.", [candidate.id])  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.tool import ToolOutput, ToolRequest
+        >>> candidate = Candidate(id="c-1", run_id="r", goal_id="g", team="t", agent="a",
+        ...     round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
+        >>> rt.view.get_candidate.return_value = candidate
+        >>> import anyio
+        >>> rt.repeats.run_id = "r"
+        >>> rt.ids.next.return_value = "L-1"
+        >>> rt.journal.append.return_value = Mock(epoch=1, seq=2)
+        >>> hint = anyio.run(ctx.post_learning, "Baseline", "It converged.", ["c-1"])
+        >>> assert (hint.id, hint.author, hint.evidence) == ("L-1", "t/a", ["c-1"])
+        >>> rt.board.put_learning.assert_called_once_with(hint, epoch=1, seq=2)
+        >>> assert rt.own == [hint] and rt.counters.learnings == 1
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 0)
         """
         self._charge()
         rt = self._rt
@@ -599,7 +759,25 @@ class AgentContext:
 
         Examples
         --------
-        >>> await ctx.save_notes("Try a smaller step.")  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> import anyio
+        >>> anyio.run(ctx.save_notes, "Try a smaller step.")
+        >>> assert ctx.notes == "Try a smaller step."
+        >>> assert rt.journal.append.call_args.args[0].payload == {"text": ctx.notes}
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 0)
         """
         self._charge()
         try:
@@ -629,7 +807,28 @@ class AgentContext:
 
         Examples
         --------
-        >>> files = await ctx.call_action("list_files", {})  # doctest: +SKIP
+        Use in-memory service doubles to exercise the action without storage.
+
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"), goal_id="g", address="g/t/a",
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", resumed=(), checks=[],
+        ...           tool=tool, own=[], limits=Limits(), watchdog=Mock(limit=None),
+        ...           counters=Mock(turns=0, board_reads=0, learnings=0))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> import anyio
+        >>> from swarm_arena.tool import FileSet
+        >>> rt.goal = Goal(id="g", namespace="demo",
+        ...                files=FileSet(manifest={"problem/a.phyk": "a" * 64}))
+        >>> ctx = AgentContext(rt)
+        >>> assert anyio.run(ctx.call_action, "list_files", {}) == {"files": ["problem/a.phyk"]}
+        >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
+        >>> rt.artifacts.get_bytes.assert_not_called()
         """
         action = next((a for a in self.actions if a.name == name), None)
         self._charge(board_read=action is not None and action.counts_as == "board_read")

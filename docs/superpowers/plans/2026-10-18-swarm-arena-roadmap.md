@@ -1222,6 +1222,7 @@ class LineageGraph(FrozenModel):
 class BoardView(ABC):                           # one goal's round-start snapshot
     goal: GoalKey
     frontier: Frontier
+    def _visible_candidate_ids(self) -> frozenset[str]: ...  # private seam: fixed snapshot goal/part membership, no I/O or charges; M2 views implement it too
     # abstract read methods with signatures identical to Board's below, limited to the snapshot:
     # best, learnings, search_learnings, get_learning, get_candidate, scores, lineage, leaderboard.
     # A namespace or goal argument that differs from the view's raises ValueError [plan].

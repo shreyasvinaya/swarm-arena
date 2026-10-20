@@ -352,7 +352,8 @@ class BoardView(_Reads):
 
     Identifier reads raise KeyError for items outside the recorded frontier.
     Other goal or namespace arguments raise ValueError. Implement all eight
-    read methods to provide a custom snapshot.
+    read methods and the private candidate-membership seam to provide a custom
+    snapshot.
 
     Attributes
     ----------
@@ -370,6 +371,10 @@ class BoardView(_Reads):
 
     goal: GoalKey
     frontier: Frontier
+
+    def _visible_candidate_ids(self) -> frozenset[str]:
+        """Return fixed, goal-scoped candidate membership without I/O or charges."""
+        raise NotImplementedError
 
 
 class Board(Configurable, _Reads):

@@ -463,6 +463,14 @@ class _RunView(_MemoryReads, BoardView):
         self.frontier = deepcopy(frontier)
         self._scope = goal
         self._records = records
+        group = self._group(goal)
+        self._candidate_ids = frozenset(
+            id for id, c in records.candidates.items() if (c.goal_id, c.part) == group
+        )
+
+    def _visible_candidate_ids(self) -> frozenset[str]:
+        """Return candidate membership fixed when this snapshot was captured."""
+        return self._candidate_ids
 
 
 class RunBoard(_MemoryReads, Board):

@@ -14,7 +14,7 @@ from swarm_arena._board.run_board import RunBoard
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
-from swarm_arena.board import BoardView, Candidate, Frontier, Learning
+from swarm_arena.board import BoardView, Candidate, Frontier, GoalKey, Learning
 from swarm_arena.planning import Decision
 from swarm_arena.tool import ToolOutput, ToolRequest
 
@@ -111,6 +111,28 @@ def test_snapshot_hides_items_after_mark(board: RunBoard) -> None:
         view.scores("c-2")
     with pytest.raises(KeyError):
         view.lineage("c-2")
+
+
+@pytest.mark.parametrize(
+    ("goal", "expected"),
+    [(KEY, frozenset({"c-main"})), (PART_KEY, frozenset({"c-part"}))],
+)
+def test_visible_candidate_ids_are_frozen_and_goal_scoped(
+    board: RunBoard, goal: GoalKey, expected: frozenset[str]
+) -> None:
+    board.put_candidate(_c("c-main"), epoch=1, seq=1)
+    board.put_candidate(_c("c-part", part="p"), epoch=1, seq=2)
+    board.put_candidate(_c("c-other", goal_id="g2"), epoch=1, seq=3)
+    board.put_candidate(_c("c-after-frontier"), epoch=1, seq=6)
+    view = board.snapshot(goal, _frontier(seq=5))
+    ids = view._visible_candidate_ids()
+    assert isinstance(ids, frozenset)
+    assert ids == expected
+    assert all(view.get_candidate(id).id == id for id in ids)
+    board.put_candidate(_c("c-later"), epoch=1, seq=7)
+    board.put_candidate(_c("c-main", goal_id="g2"), epoch=1, seq=8)
+    assert view._visible_candidate_ids() == expected
+    assert board.snapshot(goal, Frontier())._visible_candidate_ids() == frozenset()
 
 
 def test_view_rejects_other_goal(board: RunBoard) -> None:
