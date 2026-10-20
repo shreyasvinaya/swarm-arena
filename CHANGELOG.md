@@ -71,6 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `swarm_arena.testing.check_tool`, `check_check`, `check_judge`, and
   `make_candidate` exercise connectors locally without a manager or provider.
+- `swarm_arena.testing.read_output_file` and `read_logs` return the verified
+  bytes of a run's declared output files and of its stdout and stderr logs.
 - Runnable function and script examples, connector authoring guidance, and a
   public API reference cover local execution, file edits, checks, and scoring.
 - `swarm-arena --version` reports the installed package version.

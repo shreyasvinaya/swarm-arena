@@ -261,6 +261,7 @@ Rules [plan]:
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
+| `_exec/threads.py` | `run_sync_daemon` and the daemon-call holder: run blocking user code on a daemon thread that never blocks interpreter exit | M1a | `tests/_exec/test_threads.py` |
 | `_exec/local.py` | `LocalExecutor` | M1a | `tests/_exec/test_local.py` |
 | `_exec/local_stage.py` | Staging, command preparation, effective limits and environment | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
 | `_exec/local_workspace.py` | Workspace creation, ownership checks and cleanup | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
