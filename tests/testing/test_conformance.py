@@ -176,6 +176,7 @@ async def test_other_tool_parent_warns(ws: Path, local_executor: LocalExecutor) 
     assert out.data["a"] == "1"
 
 
+@pytest.mark.filterwarnings("ignore:editable glob permits Python import shadowing:UserWarning")
 async def test_protected_edit_refused(ws: Path, local_executor: LocalExecutor) -> None:
     tool = ScriptTool(command=["python", "problem/run.py"], editable=["problem/*"])
     with pytest.raises(SoftError, match=r"problem/run\.py: protected"):
@@ -217,6 +218,7 @@ async def test_respelled_tool_file_is_a_config_error() -> None:
     assert executor.jobs == []
 
 
+@pytest.mark.filterwarnings("ignore:editable glob permits Python import shadowing:UserWarning")
 async def test_input_and_edit_errors_hide_values(ws: Path, local_executor: LocalExecutor) -> None:
     with pytest.raises(ValidationError) as invalid:
         await check_tool(FunctionTool(add), {"a": SECRET}, executor=local_executor)
