@@ -495,6 +495,71 @@ async def test_failed_reserve_keeps_debit(env: LedgerEnv, monkeypatch: pytest.Mo
     assert await env.count("reserve") == 0
 
 
+async def test_reserve_on_admit_precedes_cancellable_durability(
+    env: LedgerEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _setup(env)
+    admitted: list[Reservation] = []
+    original = env.journal.append
+    with anyio.CancelScope() as scope:
+
+        def on_admit(reservation: Reservation) -> None:
+            assert env.ledger.remaining("g1/t/a") == Amount(usd=0.625)
+            admitted.append(reservation)
+
+        def append(draft: EventDraft) -> Event:
+            assert len(admitted) == 1
+            assert draft.payload["reservation"]["id"] == admitted[0].id
+            event = original(draft)
+            scope.cancel()
+            return event
+
+        with monkeypatch.context() as patch:
+            patch.setattr(env.journal, "append", append)
+            await env.ledger.reserve(
+                "g1/t/a", Amount(usd=10), kind="tool", goal_id="g1", on_admit=on_admit
+            )
+            pytest.fail("the durability wait must remain cancellable")
+    assert len(admitted) == 1
+    assert env.ledger.remaining("g1/t/a") == Amount(usd=0.625)
+    await env.journal.commit()
+    assert await env.last_reservation() == admitted[0]
+    await env.ledger.settle(admitted[0].id, Amount())
+    assert env.ledger.remaining("g1/t/a") == Amount(usd=10.625)
+    assert await env.count("settle") == 1
+    replay = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _balances(env.ledger) == _balances(replay)
+
+
+async def test_reserve_on_admit_retains_debit_after_unknown_durability(
+    env: LedgerEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _setup(env)
+    admitted: list[Reservation] = []
+    original = env.journal.append_durable
+
+    async def lost_ack(draft: EventDraft) -> Event:
+        assert len(admitted) == 1
+        await original(draft)
+        raise RuntimeError("acknowledgement unavailable")
+
+    monkeypatch.setattr(env.journal, "append_durable", lost_ack)
+    with pytest.raises(RuntimeError, match="acknowledgement unavailable"):
+        await env.ledger.reserve(
+            "g1/t/a", Amount(usd=10), kind="tool", goal_id="g1", on_admit=admitted.append
+        )
+    assert len(admitted) == 1
+    assert env.ledger.remaining("g1/t/a") == Amount(usd=0.625)
+    assert env.ledger._charges[admitted[0].id] == Amount(usd=10)
+    assert await env.count("settle") == 0
+    replay = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _balances(env.ledger) == _balances(replay)
+
+
 async def test_failed_settle_does_not_release_budget(
     env: LedgerEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:

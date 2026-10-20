@@ -555,10 +555,15 @@ class GoalRunner:
         tranche = self._tranche("final")
         scope = self._scope("judge", 0, tranche, final=True)
         reservation: Reservation | None = None
+        dispatched = False
         amount = Amount()
 
+        def on_admit(admitted: Reservation) -> None:
+            nonlocal reservation
+            reservation = admitted
+
         async def invoke() -> tuple[list[Candidate], JudgeOutcome]:
-            nonlocal reservation, amount
+            nonlocal amount, dispatched
             with llm_scope(scope):
                 judge = await run_sync_daemon(ref.build, Judge)
                 amount = await run_sync_daemon(
@@ -571,18 +576,21 @@ class GoalRunner:
                         llm=False,
                     )
                 )
-                reservation = (
+                if amount != Amount():
                     await self.deps.ledger.reserve(
-                        f"{self.goal_id}/:final", amount, kind="final", goal_id=self.goal_id
+                        f"{self.goal_id}/:final",
+                        amount,
+                        kind="final",
+                        goal_id=self.goal_id,
+                        on_admit=on_admit,
                     )
-                    if amount != Amount()
-                    else None
-                )
+                ctx = self._judge_context(ref, finalists, 0, final=True)
+                dispatched = True
                 return await final_judge(
                     self.goal_id,
                     (ref, judge),
                     finalists,
-                    self._judge_context(ref, finalists, 0, final=True),
+                    ctx,
                 )
 
         try:
@@ -629,7 +637,9 @@ class GoalRunner:
             return order
         finally:
             if reservation is not None:
-                await self.deps.ledger.settle(reservation.id, amount, estimated=True)
+                await self.deps.ledger.settle(
+                    reservation.id, amount if dispatched else Amount(), estimated=dispatched
+                )
             await self._close(tranche)
             self._stop()
 

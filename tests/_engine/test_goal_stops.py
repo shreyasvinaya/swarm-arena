@@ -14,10 +14,15 @@ from _fakes.tools import ProviderJudge
 from swarm_arena import Goal, Plan, ProgramJudge, Ref, RunConfig
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
+from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
+from swarm_arena._errors import Fenced
 from swarm_arena._exec.executor import Job
+from swarm_arena._journal.event import Event, EventDraft
+from swarm_arena._journal.reader import read_committed
+from swarm_arena._journal.replay import RunState
 from swarm_arena._model.planning_types import History
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import ToolOutput
@@ -338,3 +343,168 @@ async def test_interrupted_join_replan_keeps_unjoined_parts(
     view = json.loads(env.store.read("goals/g/solution.json").data)
     assert view["status"] == "unjoined"
     assert len(view["parts"]) == 2
+
+
+class TestFinalReservationOwnership:
+    @pytest.fixture
+    def run_config(self, run_config: RunConfig) -> RunConfig:
+        return run_config.model_copy(
+            update={
+                "limits": run_config.limits.model_copy(
+                    update={"max_tokens": 1_000_000, "max_usd": 100.0}
+                ),
+                "settle_timeout_s": 0.02,
+            }
+        )
+
+    @pytest.mark.parametrize("phase", ["acknowledgement", "dispatched"])
+    async def test_stop_settles_final_reservation_before_completion(
+        self, env: EngineEnv, monkeypatch: pytest.MonkeyPatch, phase: str
+    ) -> None:
+        admitted: list[Reservation] = []
+        dispatched: list[str] = []
+        cancelled_ack: list[str] = []
+        balances: list[tuple[int, int]] = []
+        journal = env.deps.journal
+        ledger = env.deps.ledger
+        real_append = journal.append
+        real_durable = journal.append_durable
+        real_judge = ProviderJudge.judge
+
+        def append(draft: EventDraft) -> Event:
+            if draft.type == "reserve" and draft.payload["reservation"]["kind"] == "final":
+                admitted.append(Reservation.model_validate(draft.payload["reservation"]))
+                balances.append((ledger._total.tokens, ledger._total._micro_usd))
+                if phase == "acknowledgement":
+                    _signal(env, "stop_now")
+                    journal._group_window_s = 1.0
+            return real_append(draft)
+
+        async def durable(draft: EventDraft) -> Event:
+            try:
+                return await real_durable(draft)
+            except anyio.get_cancelled_exc_class():
+                if draft.type == "reserve" and draft.payload["reservation"]["kind"] == "final":
+                    cancelled_ack.append(draft.payload["reservation"]["id"])
+                raise
+
+        async def judge(
+            self: ProviderJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            if ctx.final:
+                dispatched.append(ctx.batch_id)
+                _signal(env, "stop_now")
+                await anyio.sleep_forever()
+            return await real_judge(self, goal, candidates, ctx)
+
+        monkeypatch.setattr(journal, "append", append)
+        monkeypatch.setattr(journal, "append_durable", durable)
+        monkeypatch.setattr(ProviderJudge, "judge", judge)
+        runner = GoalRunner(
+            env.deps,
+            goal_id="g",
+            plan=_plan(
+                teams=1, rounds=1, judges=[Ref(path="_fakes.tools:ProviderJudge", name="y")]
+            ),
+            replanner=None,
+        )
+        with anyio.fail_after(5):
+            out = await runner.run()
+        _assert_terminal(env, out, "stop --now")
+        assert out.finalists
+        assert len(admitted) == 1
+        reservation = admitted[0]
+        was_dispatched = phase == "dispatched"
+        assert bool(dispatched) is was_dispatched
+        assert cancelled_ack == ([] if was_dispatched else [reservation.id])
+        committed = read_committed(env.store)
+        assert committed is not None
+        state = RunState.from_events(committed[1])
+        assert all(r.state != "open" for r in state.reservations.values()), (
+            "bounded final judging stranded its direct final reservation"
+        )
+        settlements = [
+            e for e in committed[1] if e.type == "settle" and e.payload["id"] == reservation.id
+        ]
+        assert len(settlements) == 1
+        settlement = settlements[0]
+        charge = reservation.amount if was_dispatched else Amount()
+        assert settlement.payload["actual"] == charge.model_dump()
+        assert settlement.payload["estimated"] is was_dispatched
+        assert settlement.seq < next(e.seq for e in committed[1] if e.type == "goal_finished")
+        assert ledger._charges[reservation.id] == charge
+        refund = reservation.amount - charge
+        assert (ledger._total.tokens, ledger._total._micro_usd) == (
+            balances[0][0] + refund.tokens,
+            balances[0][1] + refund._micro_usd,
+        )
+        replay = Ledger.replay(state, journal=journal, ids=env.deps.ids)
+        assert ledger._charges == replay._charges
+        assert ledger._total == replay._total
+        assert ledger._work == replay._work
+        assert ledger._reserve_pool.left == replay._reserve_pool.left
+        assert {g: (p.left, p.ended) for g, p in ledger._goals.items()} == {
+            g: (p.left, p.ended) for g, p in replay._goals.items()
+        }
+        assert {g: p.left for g, p in ledger._slices.items()} == {
+            g: p.left for g, p in replay._slices.items()
+        }
+        assert ledger.free() == replay.free()
+        assert ledger.remaining("g/:final") == replay.remaining("g/:final")
+
+    async def test_failed_final_reserve_ack_retains_charge_without_completion(
+        self, env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = env.deps.journal
+        original = journal._publish
+        admitted: list[Reservation] = []
+        dispatched: list[str] = []
+        real_judge = ProviderJudge.judge
+
+        async def publish() -> None:
+            finals = [
+                Reservation.model_validate(e.payload["reservation"])
+                for e in journal._queue
+                if e.type == "reserve" and e.payload["reservation"]["kind"] == "final"
+            ]
+            await original()
+            if finals:
+                admitted.extend(finals)
+                raise RuntimeError("acknowledgement unavailable")
+
+        async def judge(
+            self: ProviderJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            if ctx.final:
+                dispatched.append(ctx.batch_id)
+            return await real_judge(self, goal, candidates, ctx)
+
+        monkeypatch.setattr(journal, "_publish", publish)
+        monkeypatch.setattr(ProviderJudge, "judge", judge)
+        runner = GoalRunner(
+            env.deps,
+            goal_id="g",
+            plan=_plan(
+                teams=1, rounds=1, judges=[Ref(path="_fakes.tools:ProviderJudge", name="y")]
+            ),
+            replanner=None,
+        )
+        with anyio.fail_after(5), pytest.raises(Fenced):
+            await runner.run()
+        assert len(admitted) == 1
+        reservation = admitted[0]
+        assert not dispatched
+        assert not env.events("goal_finished")
+        assert not env.store.exists("goals/g/solution.json")
+        assert not [e for e in env.events("settle") if e.payload["id"] == reservation.id]
+        committed = read_committed(env.store)
+        assert committed is not None
+        state = RunState.from_events(committed[1])
+        assert state.reservations[reservation.id].state == "open"
+        ledger = env.deps.ledger
+        assert ledger._charges[reservation.id] == reservation.amount
+        replay = Ledger.replay(state, journal=journal, ids=env.deps.ids)
+        assert ledger._charges == replay._charges
+        assert ledger._total == replay._total
+        assert ledger.free() == replay.free()
+        assert ledger.remaining("g/:final") == replay.remaining("g/:final")

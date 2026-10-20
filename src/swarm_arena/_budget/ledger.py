@@ -1,6 +1,6 @@
 """Account for durable reservations, ordered funding, and history-only replay."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Literal
@@ -590,6 +590,7 @@ class Ledger:
         kind: ReservationKind,
         goal_id: str,
         keep_charged: bool = False,
+        on_admit: Callable[[Reservation], None] | None = None,
     ) -> Reservation:
         """
         Debit synchronously, then commit before allowing paid work to begin.
@@ -606,6 +607,11 @@ class Ledger:
             Associated goal, empty for run-level work.
         keep_charged : bool, default=False
             Keep the full reservation charged on settlement.
+        on_admit : Callable[[Reservation], None] or None, default=None
+            Synchronous ownership callback, called immediately after the debit
+            and before awaiting durability. Callers retain the reservation for
+            cleanup even if cancelled during that wait. The callback must
+            return normally; it does not authorize dispatch before durability.
 
         Returns
         -------
@@ -644,6 +650,8 @@ class Ledger:
             keep_charged=keep_charged,
         )
         self._book(reservation)
+        if on_admit is not None:
+            on_admit(reservation)
         await self._journal.append_durable(
             EventDraft(
                 type=EventType.RESERVE,
