@@ -10,6 +10,8 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     Field,
+    TypeAdapter,
+    ValidationError,
     field_validator,
 )
 from pydantic.errors import PydanticErrorMixin
@@ -431,6 +433,41 @@ class Ref(FrozenModel):
         if isinstance(name, str):
             return name
         raise TypeError(f"{self.path} has no name; set Ref.name")
+
+
+_REF_PATH_ADAPTER: TypeAdapter[str] = TypeAdapter(Ref.model_fields["path"].rebuild_annotation())
+
+
+def is_ref_path(value: object) -> bool:
+    """
+    Recognize a complete Ref path without importing components or doing I/O.
+
+    Parameters
+    ----------
+    value : object
+        Potential component path in ``module:QualName`` form.
+
+    Returns
+    -------
+    bool
+        Whether the value is a string accepted by the ``Ref.path`` field's
+        Pydantic constraint, including its Unicode word-character semantics.
+        Non-string inputs are rejected without coercion.
+
+    Examples
+    --------
+    >>> is_ref_path("demo.tools:Outer.Inner")
+    True
+    >>> is_ref_path("demo:Thing/other")
+    False
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        _REF_PATH_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
 
 
 def coerce_ref(value: object) -> object:

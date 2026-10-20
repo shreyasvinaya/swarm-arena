@@ -1,6 +1,5 @@
 """Track reference provenance without importing or constructing components."""
 
-import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,9 +9,7 @@ from swarm_arena._model.base import CatalogKind, FrozenModel, Origin
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import json_equal
 from swarm_arena._model.plan import Plan
-from swarm_arena._model.ref import Ref
-
-_REF_PATH = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*(\.[A-Za-z_]\w*)*")
+from swarm_arena._model.ref import Ref, is_ref_path
 
 
 class RefSite(FrozenModel):
@@ -76,8 +73,7 @@ def is_nested_ref(value: Any) -> bool:
     return (
         isinstance(value, dict)
         and value.keys() <= {"path", "config", "name"}
-        and isinstance(value.get("path"), str)
-        and _REF_PATH.fullmatch(value["path"]) is not None
+        and is_ref_path(value.get("path"))
     )
 
 

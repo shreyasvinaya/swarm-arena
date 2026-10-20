@@ -288,11 +288,51 @@ def test_nested_paths_escape_pointer_tokens_without_collisions() -> None:
     assert site_key(sites["/judges/0/config/a~1b"]) == root + "/config/a~1b"
 
 
-@pytest.mark.parametrize("path", ["demo:Thing", "demo.sub:Outer.Inner", "_demo:_Thing", "aé:bλ"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "demo:Thing",
+        "demo.sub:Outer.Inner",
+        "_demo:_Thing",
+        "aé:bλ",
+        "review_a\u0301:Policy",
+        "demo:Poli\u0301cy",
+        "demo.su\u0301b:Outer.Inne\u0301r",
+    ],
+)
 def test_nested_ref_accepts_full_ref_path(path: str) -> None:
     Ref(path=path)
     assert is_nested_ref({"path": path})
     assert is_nested_ref({"path": path, "config": {}, "name": "alias"})
+
+
+@pytest.mark.parametrize("path", ["review_a\u0301:Policy", "demo:Poli\u0301cy"])
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_combining_mark_nested_sites_and_revision_diff(path: str, depth: int) -> None:
+    def plan(value: int) -> Plan:
+        nested = Ref(path=path, config={"fixed": value}).model_dump(exclude_none=True)
+        for _ in range(depth):
+            nested = {"box": [nested]}
+        return Plan(
+            goal=Goal(id="g", namespace="demo"),
+            teams=[],
+            judges=[],
+            policy=Ref(path="demo:Chain", config={"policies": [nested]}),
+        )
+
+    parent = stamp(plan(1), origin="human", parent=None)
+    pointer = "/policy/config/policies/0" + "/box/0" * depth
+    sites = {site.pointer: site for site in ref_sites(parent)}
+    assert set(sites) == {"/policy", pointer}
+    assert sites[pointer].ref.path == path
+    assert sites[pointer].kind == "policy"
+    human = {site_key(site): True for site in sites.values()}
+    for value in (1, 2):
+        child = stamp(plan(value), origin="autonomous", parent=parent)
+        diffs = {site.pointer: site for site in diff_revision(parent, child, parent_human=human)}
+        assert set(diffs) == set(sites)
+        assert diffs[pointer].ref.config == {"fixed": value}
+        assert diffs[pointer].carried_human is (value == 1)
 
 
 @pytest.mark.parametrize(
@@ -326,20 +366,38 @@ def test_nonref_mapping_still_traverses_nested_values() -> None:
     assert "/judges/0/config/box/extra/0" in pointers
 
 
+@pytest.mark.parametrize("module_name", ["provenance_canary", "provenance_canary_a\u0301"])
 def test_ref_operations_never_import_even_changed_human_canary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    module_name: str,
 ) -> None:
     marker = tmp_path / "imported"
-    (tmp_path / "provenance_canary.py").write_text(
+    (tmp_path / f"{module_name}.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).touch()\nraise RuntimeError('imported')\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     parent = _plan().model_copy(
-        update={"judges": [Ref(path="provenance_canary:Judge", config={"x": True})]}
+        update={
+            "judges": [
+                Ref(
+                    path=f"{module_name}:Judge",
+                    config={
+                        "nested": {"path": f"{module_name}:Judg\u0301e", "config": {"x": True}}
+                    },
+                )
+            ]
+        }
     )
     child = parent.model_copy(
-        update={"judges": [Ref(path="provenance_canary:Judge", config={"x": 1})]}
+        update={
+            "judges": [
+                Ref(
+                    path=f"{module_name}:Judge",
+                    config={"nested": {"path": f"{module_name}:Judg\u0301e", "config": {"x": 1}}},
+                )
+            ]
+        }
     )
 
     def unexpected(*args: Any, **kwargs: Any) -> Any:
@@ -353,6 +411,8 @@ def test_ref_operations_never_import_even_changed_human_canary(
         human = {site_key(s): True for s in ref_sites(parent)}
         diffs = diff_revision(parent, child, parent_human=human)
         assert not next(s for s in diffs if s.pointer == "/judges/0").carried_human
+        nested = next(s for s in diffs if s.pointer == "/judges/0/config/nested")
+        assert not nested.carried_human
     assert not marker.exists()
 
 
