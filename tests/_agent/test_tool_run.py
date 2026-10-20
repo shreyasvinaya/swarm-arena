@@ -1121,3 +1121,527 @@ async def test_tool_start_and_end_share_task_id(rt_env: RtEnv) -> None:
     started = rt_env.events("tool_start")[-1]
     ended = rt_env.events("tool_end")[-1]
     assert started.task_id == ended.task_id == candidate.id
+
+
+@pytest.mark.parametrize("phase", ["command", "started"])
+async def test_connector_limit_is_a_safe_error_candidate(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from pathlib import Path
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import Command, ToolRequest
+
+    secret = str(uuid4())
+    error = LimitReached("budget", secret)
+    error.add_note(secret)
+    error.__cause__ = RuntimeError(secret)
+    if phase == "command":
+        rt = rt_env.with_tool(PyTool({"code": "pass"}))
+
+        def command(self: PyTool, request: ToolRequest, workspace: Path) -> Command:
+            raise error
+
+        monkeypatch.setattr(PyTool, "command", command)
+        monkeypatch.setattr(rt.tool, "providers", lambda: frozenset({"openai"}))
+        inputs: dict[str, Any] = {}
+    else:
+        rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", providers=["openai"]))
+        rt = dataclasses.replace(rt, executor=_OutputExecutor(rt_env, error))
+        inputs = {"x": 1}
+    try:
+        candidate = await execute_tool_run(rt, inputs, parents=(), replicate=None, edits=None)
+    except Exception as escaped:
+        assert_secret_absent(escaped, secret)
+        raise
+    assert candidate.output.status == RunStatus.ERROR
+    assert candidate.warnings == ["tool error: LimitReached"]
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]
+    assert rt_env.charged(candidate) == (
+        Amount.model_validate(reservation["amount"]) if phase == "started" else Amount()
+    )
+    assert rt_env.reservation_state(candidate) == ("estimated" if phase == "started" else "settled")
+    assert len(rt_env.events("tool_start")) == int(phase == "started")
+    assert len(rt_env.events("tool_end")) == len(rt_env.events("settle")) == 1
+    assert secret not in rt_env.events("tool_end")[-1].model_dump_json()
+
+
+@pytest.mark.parametrize("bad", ["truth", "integer", "string", "none"])
+@pytest.mark.parametrize("fail_call", [1, 2, 3])
+async def test_determinism_return_is_contained_on_every_read(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, bad: str, fail_call: int
+) -> None:
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import ToolRequest
+
+    secret = str(uuid4())
+    calls = 0
+
+    class BadTruth:
+        def __bool__(self) -> bool:
+            error = RuntimeError(secret)
+            error.add_note(secret)
+            raise error from ValueError(secret)
+
+    def deterministic(request: ToolRequest) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == fail_call:
+            return {"truth": BadTruth(), "integer": 1, "string": "yes", "none": None}[bad]
+        return False
+
+    monkeypatch.setattr(rt_env.rt.tool, "is_deterministic", deterministic)
+    with pytest.raises(SoftError) as caught:
+        await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert isinstance(caught.value, SoftError)
+    assert str(caught.value) == "invalid tool request: TypeError"
+    assert not rt_env.events("reserve")
+    assert rt_env.rt.counters.tool_runs == 0
+    assert not rt_env.rt.repeats._pending
+
+
+@pytest.mark.parametrize("fail_call", [1, 2, 3])
+async def test_determinism_fence_keeps_control_meaning(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, fail_call: int
+) -> None:
+    from swarm_arena._model.tooling import ToolRequest
+
+    calls = 0
+
+    def deterministic(request: ToolRequest) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == fail_call:
+            raise Fenced("run ownership lost")
+        return False
+
+    monkeypatch.setattr(rt_env.rt.tool, "is_deterministic", deterministic)
+    with pytest.raises(Fenced):
+        await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert not rt_env.events("reserve")
+    assert not rt_env.rt.repeats._pending
+
+
+async def test_fingerprint_mutation_cannot_change_candidate_or_accounting(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import uuid4
+
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.tooling import Usage
+
+    secret = str(uuid4())
+    original = ToolOutput(status=RunStatus.OK, data={"nested": {"value": 1}}, usage=Usage(usd=0.2))
+    rt = dataclasses.replace(rt_env.rt, executor=_OutputExecutor(rt_env, original))
+
+    def fingerprint(output: ToolOutput) -> str:
+        output.data["nested"]["value"] = float("nan")
+        object.__setattr__(output.usage, "usd", 999)
+        error = RuntimeError(secret)
+        error.add_note(secret)
+        raise error from ValueError(secret)
+
+    monkeypatch.setattr(rt.tool, "fingerprint", fingerprint)
+    candidate = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert candidate.output.data == {"nested": {"value": 1}}
+    assert candidate.output.usage.usd == 0.2
+    assert rt_env.charged(candidate) == Amount(usd=0.2)
+    assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+    assert candidate.warnings == ["fingerprint error: RuntimeError"]
+    committed = read_committed(rt_env.run_store)
+    assert committed is not None
+    assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
+    assert secret not in rt_env.events("tool_end")[-1].model_dump_json()
+
+
+@pytest.mark.parametrize("mode", ["timeout", "cancel", "fence"])
+async def test_fingerprint_abandonment_discards_late_mutation(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    import threading
+
+    import swarm_arena._agent.tool_run as pipeline
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.results import Candidate
+
+    entered, worker_done, done = anyio.Event(), anyio.Event(), anyio.Event()
+    release = threading.Event()
+    token = anyio.lowlevel.current_token()
+    scopes: list[anyio.CancelScope] = []
+    candidates: list[Candidate] = []
+    fenced: list[Fenced] = []
+    monkeypatch.setattr(
+        pipeline, "FINGERPRINT_TIMEOUT_S", 0.1 if mode == "timeout" else 30, raising=False
+    )
+
+    def fingerprint(output: ToolOutput) -> str:
+        anyio.from_thread.run_sync(entered.set, token=token)
+        release.wait()
+        output.data["late"] = {"value": float("nan")}
+        anyio.from_thread.run_sync(worker_done.set, token=token)
+        return "too late"
+
+    async def run() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                candidates.append(
+                    await execute_tool_run(
+                        rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None
+                    )
+                )
+        except Fenced as error:
+            fenced.append(error)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(rt_env.rt.tool, "fingerprint", fingerprint)
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(run)
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+            if mode != "timeout":
+                if mode == "fence":
+                    rt_env.rt.journal.fenced.set()
+                scopes[0].cancel()
+            with anyio.move_on_after(1):
+                await done.wait()
+            assert done.is_set(), "fingerprint waiter did not abandon blocked hook"
+            if mode == "fence":
+                assert fenced
+                assert not rt_env.events("tool_end")
+                assert not rt_env.events("settle")
+            else:
+                assert len(candidates) == 1
+                candidate = candidates[0]
+                assert candidate.output.data == {"x": 1, "y": 1}
+                assert rt_env.reservation_state(candidate) == "settled"
+                assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+                assert candidate.warnings == [
+                    "fingerprint error: "
+                    + ("TimeoutError" if mode == "timeout" else "CancelledError")
+                ]
+            before = read_committed(rt_env.run_store)
+            release.set()
+            with anyio.fail_after(5):
+                await worker_done.wait()
+            await anyio.lowlevel.checkpoint()
+            assert read_committed(rt_env.run_store) == before
+            if candidates:
+                assert before is not None
+                assert RunState.from_events(before[1]).candidates[candidates[0].id] == candidates[0]
+                assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
+        finally:
+            release.set()
+
+
+def _fingerprint_round(rt_env: RtEnv) -> Any:
+    from swarm_arena import Plan, Ref, ScriptedManager
+    from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._journal.views import ViewWriter
+    from swarm_arena._model.results import AgentStatus
+
+    rt = rt_env.rt
+    deps = EngineDeps(
+        run_id=rt.repeats.run_id,
+        config=rt.config,
+        store=rt_env.run_store,
+        journal=rt.journal,
+        ledger=rt.ledger,
+        board=rt.board,
+        executor=rt.executor,
+        artifacts=rt.artifacts,
+        ids=rt.ids,
+        views=ViewWriter(rt_env.run_store, rt.journal),
+        stops=StopState(),
+        clock=RunClock(0),
+    )
+    slot = AgentSlot(
+        address=rt.address,
+        team=rt.team,
+        spec=rt.spec,
+        manager=ScriptedManager([{"inputs": {"x": 1}}]),
+        tool_ref=rt.tool_ref,
+        goal=rt.goal,
+        goal_key=rt.goal_key,
+        part=None,
+        notes="",
+        watchdog=rt.watchdog,
+        status=AgentStatus.ACTIVE,
+    )
+    return RoundRunner(
+        deps,
+        goal_id="g",
+        plan=Plan(
+            goal=rt.goal,
+            teams=[rt.team],
+            judges=[
+                Ref(
+                    path="swarm_arena:ProgramJudge", config={"function": "_fakes.tools:score_min_y"}
+                )
+            ],
+        ),
+        agents=[slot],
+        round_spec=rt.round_spec,
+        rounds_left=1,
+    )
+
+
+@pytest.mark.parametrize("mode", ["stop", "deadline"])
+async def test_round_finishes_with_blocked_fingerprint(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    import threading
+
+    from swarm_arena._engine import round as round_module
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+
+    runner = _fingerprint_round(rt_env)
+    entered, watch_done, done = anyio.Event(), anyio.Event(), anyio.Event()
+    release = threading.Event()
+    token = anyio.lowlevel.current_token()
+    results: list[Any] = []
+    original_watch = runner._watch
+    monkeypatch.setattr(round_module, "BEFORE_KILL_TIMEOUT_S", 0.0)
+
+    def fingerprint(self: FunctionTool, output: ToolOutput) -> str:
+        anyio.from_thread.run_sync(entered.set, token=token)
+        release.wait()
+        output.data["late"] = float("nan")
+        return "late"
+
+    async def watch(*args: Any) -> None:
+        try:
+            await original_watch(*args)
+        finally:
+            watch_done.set()
+
+    async def run() -> None:
+        try:
+            results.append(await runner.run(2))
+        finally:
+            done.set()
+
+    monkeypatch.setattr(FunctionTool, "fingerprint", fingerprint)
+    monkeypatch.setattr(runner, "_watch", watch)
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(run)
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+            if mode == "stop":
+                runner.deps.stops.stop_now = True
+            else:
+                runner.deps.clock._before = runner.deps.config.limits.run_timeout_s
+            with anyio.fail_after(8):
+                await watch_done.wait()
+            with anyio.move_on_after(1):
+                await done.wait()
+            assert done.is_set(), "round still waiting for fingerprint after stop/deadline"
+            candidate = results[0].candidates[0]
+            assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+            assert len(rt_env.events("settle")) == 1
+            assert candidate.output.data == {"x": 1, "y": 1}
+            committed = read_committed(rt_env.run_store)
+            assert committed is not None
+            assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "extra-action"])
+@pytest.mark.parametrize(
+    ("case", "limit"),
+    [
+        ("budget", "budget"),
+        ("usage_overflow", "usage_overflow"),
+        ("tool_limit", "max_tool_runs_per_round"),
+        ("repeat_limit", "max_refused_repeats"),
+        ("closed_admission", "stop"),
+        ("queued_start", "stop"),
+    ],
+)
+async def test_core_tool_limits_survive_extra_actions_and_round_classification(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, case: str, limit: str, wrapped: bool
+) -> None:
+    from swarm_arena._agent.context import AgentContext
+    from swarm_arena._agent.manager import Manager
+    from swarm_arena._agent.watchdog import Watchdog
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._model.base import FrozenModel, JsonValue
+    from swarm_arena._model.planning_types import RoundReport
+    from swarm_arena.tool import Action, Estimate
+
+    class Args(FrozenModel):
+        pass
+
+    rt = rt_env.rt
+    if case == "budget":
+        monkeypatch.setattr(rt.tool, "estimate", lambda request: Estimate(usd=1000))
+    elif case == "usage_overflow":
+        res = await rt.ledger.reserve(rt.holder, Amount(), kind="tool", goal_id="g")
+        await rt.ledger.settle_overflow(res.id, Amount(usd=USD_LIMIT))
+    elif case == "tool_limit":
+        rt.counters.tool_runs = rt.limits.max_tool_runs_per_round
+    elif case == "repeat_limit":
+        rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
+        rt = dataclasses.replace(
+            rt, watchdog=Watchdog(rt.limits.model_copy(update={"max_refused_repeats": 1}))
+        )
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        with pytest.raises(SoftError):
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    elif case == "closed_admission":
+        rt_env.inflight.close()
+    else:
+
+        class QueuedStart(_OutputExecutor):
+            async def submit(self, job: Job) -> ToolOutput:
+                rt_env.inflight.close()
+                return await super().submit(job)
+
+        rt = dataclasses.replace(rt, executor=QueuedStart(rt_env, ToolOutput(status=RunStatus.OK)))
+    ctx = AgentContext(rt)
+
+    async def handler(context: AgentContext, args: Args) -> JsonValue:
+        await context.run_tool({"x": 1})
+        return None
+
+    ctx.actions = (Action(name="run", description="Run", input_model=Args, handler=handler),)
+    call = ctx.call_action("run", {}) if wrapped else ctx.run_tool({"x": 1})
+    with pytest.raises(LimitReached) as caught:
+        await call
+    assert caught.value.limit == limit
+    if case in {"closed_admission", "queued_start"}:
+        assert len(rt_env.events("reserve")) == len(rt_env.events("settle")) == 1
+        assert not rt_env.events("tool_start")
+        reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+        assert rt_env.charged(reservation) == Amount()
+
+    class RaisesControl(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            raise caught.value
+
+    runner = _fingerprint_round(rt_env)
+    runner.agents[0].manager = RaisesControl()
+    runner.converge = True
+    result = await runner.run(2)
+    assert result.reasons["t/a"] == "limit reached"
+
+
+async def test_stage_soft_error_keeps_safe_diagnostic_through_extra_action(rt_env: RtEnv) -> None:
+    from swarm_arena._agent.context import AgentContext
+    from swarm_arena._model.base import FrozenModel, JsonValue
+    from swarm_arena.tool import Action
+
+    class Args(FrozenModel):
+        pass
+
+    ctx = AgentContext(rt_env.with_script_tool(editable=["problem/*.phyk"]))
+
+    async def handler(context: AgentContext, args: Args) -> JsonValue:
+        await context.run_tool({}, edits={"problem/run.py": "pass"})
+        return None
+
+    ctx.actions = (Action(name="run", description="Run", input_model=Args, handler=handler),)
+    with pytest.raises(SoftError, match=r"problem/run\.py") as caught:
+        await ctx.call_action("run", {})
+    assert "action failed" not in str(caught.value)
+    assert not rt_env.events("reserve")
+
+
+@pytest.mark.parametrize("mode", ["foreign", "queued-mutated", "queued-copy"])
+async def test_only_current_admission_refusal_can_refund_and_propagate(
+    rt_env: RtEnv, mode: str
+) -> None:
+    from uuid import uuid4
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._agent.tool_run import Inflight
+
+    secret = str(uuid4())
+    registry = Inflight()
+    registry.close()
+    with anyio.CancelScope() as scope:
+        await anyio.lowlevel.checkpoint()
+        with pytest.raises(LimitReached) as prior:
+            registry.add(scope)
+
+    class ReplayedSignal(_OutputExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            if mode == "foreign":
+                assert job.on_started is not None
+                await job.on_started(Job.Started(kind="process", job_id=job.id))
+                raise prior.value
+            rt_env.inflight.close()
+            try:
+                return await super().submit(job)
+            except LimitReached as core:
+                error = core
+                if mode == "queued-copy":
+                    error = LimitReached("stop", secret)
+                    error.__dict__.update(core.__dict__)
+                error.args = (secret,)
+                error.limit = secret
+                error.add_note(secret)
+                raise error from ValueError(secret)
+
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", providers=["openai"]))
+    rt = dataclasses.replace(rt, executor=ReplayedSignal(rt_env, ToolOutput(status=RunStatus.OK)))
+    if mode == "queued-mutated":
+        with pytest.raises(LimitReached) as caught:
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert_secret_absent(caught.value, secret, sanitized=True)
+        assert caught.value.limit == "stop"
+        assert str(caught.value) == "the round is stopping"
+        assert not rt_env.events("tool_end")
+        assert rt_env.events("settle")[-1].payload["actual"] == Amount().model_dump()
+    else:
+        candidate = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert candidate.warnings == ["tool error: LimitReached"]
+        assert candidate.output.status == RunStatus.ERROR
+        reserved = rt_env.events("reserve")[-1].payload["reservation"]["amount"]
+        assert rt_env.charged(candidate) == (
+            Amount.model_validate(reserved) if mode == "foreign" else Amount()
+        )
+        assert secret not in rt_env.events("tool_end")[-1].model_dump_json()
+
+
+async def test_round_rejects_transferred_core_signal(rt_env: RtEnv) -> None:
+    from uuid import uuid4
+
+    from swarm_arena._agent.context import AgentContext
+    from swarm_arena._agent.manager import Manager
+    from swarm_arena._model.planning_types import RoundReport
+
+    secret = str(uuid4())
+
+    class ForgingManager(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            try:
+                ctx.get_candidate("c-absent")
+            except SoftError as core:
+                error = LimitReached("stop", secret)
+                error.__dict__.update(core.__dict__)
+                error.add_note(secret)
+                raise error from ValueError(secret)
+            raise AssertionError("missing candidate unexpectedly visible")
+
+    runner = _fingerprint_round(rt_env)
+    runner.agents[0].manager = ForgingManager()
+    result = await runner.run(2)
+    assert result.reasons["t/a"] == "manager error: LimitReached"
+    await rt_env.rt.journal.commit()
+    assert secret not in str(rt_env.events("agent_status")[-1].payload)

@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from pathlib import PurePosixPath
 from typing import Any
 
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_signal
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry
@@ -173,7 +173,7 @@ def validate_edits(
         if reason:
             errors.append(f"{_shown(path)}: {reason}")
     if errors:
-        raise SoftError("\n".join(errors))
+        raise _core_signal(SoftError("\n".join(errors)))
 
 
 def _check_live_edits(edits: Mapping[str, str]) -> None:
@@ -491,7 +491,9 @@ def plan_tool_stage(
     root = fold_merge(root, overlay)
     collisions = _layout_collisions(edits, root.keys())
     if collisions:
-        raise SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
+        raise _core_signal(
+            SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
+        )
     overlay.update(edit_hashes(edits))
     root = fold_merge(root, overlay)
     return Job.Stage(root=root, parents=list(parents), request_json=request_json), overlay, warnings

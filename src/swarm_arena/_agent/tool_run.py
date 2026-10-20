@@ -8,10 +8,11 @@ from typing import Any, TypeVar
 import anyio
 
 from swarm_arena._agent.manager import LimitReached
+from swarm_arena._agent.repeats import _is_deterministic
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import ConfigError, Fenced, SoftError
+from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
@@ -36,6 +37,9 @@ from swarm_arena._tooling.staging import (
     validate_edits,
 )
 from swarm_arena._tooling.tool import effective_tool_timeout, tool_grace
+
+FINGERPRINT_TIMEOUT_S = 10.0
+"""Maximum seconds to await the optional fingerprint hook before recording null."""
 
 
 class Inflight:
@@ -89,7 +93,7 @@ class Inflight:
         False
         """
         if self.closed:
-            raise LimitReached("stop", "the round is stopping")
+            raise _core_signal(LimitReached("stop", "the round is stopping"))
         self._scopes[scope] = grace_s
 
     def discard(self, scope: anyio.CancelScope) -> None:
@@ -278,7 +282,7 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     except Fenced:
         raise
     except Exception as error:
-        raise SoftError(f"invalid tool request: {type(error).__name__}") from None
+        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
 def _request(
@@ -291,14 +295,14 @@ def _request(
     """Validate inputs and visible parents before any budget or count change."""
     resolved: list[Candidate] = []
     if len(set(parents)) != len(parents):
-        raise SoftError("duplicate parent ids")
+        raise _core_signal(SoftError("duplicate parent ids"))
     for id in parents:
         candidate = next((c for c in rt.own if isinstance(c, Candidate) and c.id == id), None)
         if candidate is None:
             try:
                 candidate = rt.view.get_candidate(id)
             except (KeyError, ValueError):
-                raise SoftError(f"unknown parent: {id}") from None
+                raise _core_signal(SoftError(f"unknown parent: {id}")) from None
         resolved.append(candidate)
     model = _request_hook(rt.tool.get_input_model)
     try:
@@ -314,9 +318,9 @@ def _request(
     except Fenced:
         raise
     except ConfigError as error:
-        raise SoftError(str(error)) from None
+        raise _core_signal(SoftError(str(error))) from None
     except Exception as error:
-        raise SoftError(f"invalid tool request: {type(error).__name__}") from None
+        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
 def _stage_settings(
@@ -340,7 +344,7 @@ def _stage_settings(
     except (SoftError, Fenced):
         raise
     except Exception as error:
-        raise SoftError(f"invalid tool stage: {type(error).__name__}") from None
+        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
 
 def _stage(
@@ -365,7 +369,7 @@ def _stage(
     except (SoftError, Fenced):
         raise
     except Exception as error:
-        raise SoftError(f"invalid tool stage: {type(error).__name__}") from None
+        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
 
 
 def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
@@ -393,8 +397,11 @@ async def execute_tool_run(
 
     Input, stage, repeat, and run-count admission occur without an await.
     Internal round cancellation retains partial output; outer cancellation
-    propagates. Fencing prevents completion and settlement. Connector failures
-    become error candidates with type-only warnings.
+    before completion propagates. Optional fingerprinting receives a deep copy
+    and waits at most ten seconds outside the completion shield. Interrupted
+    fingerprinting records null and completes settlement while still owner.
+    Fencing prevents completion and settlement. Connector failures become
+    error candidates with type-only warnings.
 
     Parameters
     ----------
@@ -439,7 +446,7 @@ async def execute_tool_run(
     settings = _stage_settings(rt, request)
     index: int | None = None
     try:
-        deterministic = _request_hook(rt.tool.is_deterministic, request)
+        deterministic = _request_hook(_is_deterministic, rt.tool, request)
         if not deterministic:
             index = rt.repeats.next_replicate(rt, request, requested=replicate)
             request = request.model_copy(update={"replicate": index})
@@ -456,13 +463,15 @@ async def execute_tool_run(
             rt.watchdog.record_refusal()
             rt.journal.append(_draft(rt, EventType.WATCHDOG, refused=outcome.candidate.id))
             if rt.watchdog.reason is not None:
-                raise LimitReached("max_refused_repeats", rt.watchdog.reason)
-            raise SoftError(f"repeat refused: {outcome.candidate.id}")
+                raise _core_signal(LimitReached("max_refused_repeats", rt.watchdog.reason))
+            raise _core_signal(SoftError(f"repeat refused: {outcome.candidate.id}"))
         if outcome.action in {"return_own", "link"}:
             assert outcome.candidate is not None
             return outcome.candidate
         if rt.counters.tool_runs >= rt.limits.max_tool_runs_per_round:
-            raise LimitReached("max_tool_runs_per_round", "tool runs used up for this round")
+            raise _core_signal(
+                LimitReached("max_tool_runs_per_round", "tool runs used up for this round")
+            )
         rt.counters.tool_runs += 1
         return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
     finally:
@@ -485,6 +494,7 @@ async def _run(
     if inflight is None:
         raise RuntimeError("tool run requires track_inflight")
     started = False
+    admission_refusal: LimitReached | None = None
     partial: list[ToolOutput] = []
     output = ToolOutput(status=RunStatus.ERROR)
     amount = Amount.from_estimate(rt.limits.default_run_reservation)
@@ -508,9 +518,10 @@ async def _run(
     res = await rt.ledger.reserve(rt.holder, amount, kind="tool", goal_id=rt.goal_id)
 
     async def on_started(event: Job.Started) -> None:
-        nonlocal started
+        nonlocal started, admission_refusal
         if inflight.closed:
-            raise LimitReached("stop", "the round is stopping")
+            admission_refusal = _core_signal(LimitReached("stop", "the round is stopping"))
+            raise admission_refusal
         await rt.journal.append_durable(
             _draft(
                 rt,
@@ -557,7 +568,11 @@ async def _run(
                 on_partial=on_partial,
             )
             with anyio.CancelScope() as run_scope:
-                inflight.add(run_scope, grace_s=job.grace_s)
+                try:
+                    inflight.add(run_scope, grace_s=job.grace_s)
+                except LimitReached as error:
+                    admission_refusal = error
+                    raise
                 try:
                     output = await rt.executor.submit(job)
                 finally:
@@ -566,11 +581,12 @@ async def _run(
                 output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
     except Fenced:
         raise
-    except LimitReached:
-        with anyio.CancelScope(shield=True):
-            await rt.ledger.settle(res.id, Amount())
-        raise
     except Exception as error:
+        rebuilt = _rebuild_core_signal(error)
+        if error is admission_refusal and isinstance(rebuilt, LimitReached) and not started:
+            with anyio.CancelScope(shield=True):
+                await rt.ledger.settle(res.id, Amount())
+            raise rebuilt from None
         warnings.append(f"tool error: {type(error).__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
 
@@ -617,19 +633,26 @@ async def _run(
             except Exception as error:
                 warnings.append(f"tool error: {type(error).__name__}")
                 output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
-        fingerprint: str | None = None
-        if output.status == RunStatus.OK or (
-            output.partial and output.status not in {RunStatus.ERROR, RunStatus.LOST}
-        ):
-            try:
-                value = await run_sync_daemon(rt.tool.fingerprint, output)
+    # Optional fingerprint work must remain cancellable before durable completion.
+    fingerprint: str | None = None
+    if output.status == RunStatus.OK or (
+        output.partial and output.status not in {RunStatus.ERROR, RunStatus.LOST}
+    ):
+        try:
+            with anyio.fail_after(FINGERPRINT_TIMEOUT_S):
+                value = await run_sync_daemon(rt.tool.fingerprint, output.model_copy(deep=True))
                 if not isinstance(value, str):
                     raise TypeError("invalid fingerprint")
                 fingerprint = check_utf8(value)
-            except Fenced:
-                raise
-            except Exception as error:
-                warnings.append(f"fingerprint error: {type(error).__name__}")
+        except Fenced:
+            raise
+        except anyio.get_cancelled_exc_class() as error:
+            warnings.append(f"fingerprint error: {type(error).__name__}")
+        except Exception as error:
+            warnings.append(f"fingerprint error: {type(error).__name__}")
+    with anyio.CancelScope(shield=True):
+        if rt.journal.fenced.is_set():
+            raise Fenced("run ownership lost")
         candidate = Candidate(
             id=id,
             run_id=rt.repeats.run_id,
@@ -671,6 +694,8 @@ async def _run(
             )
             checks.extend(await run_checks(candidate, [(name, check)], context))
         candidate = candidate.model_copy(update={"checks": checks})
+        # Python-form validation sees non-finite data before JSON could turn it into null.
+        Candidate.model_validate(candidate.model_dump(mode="python", warnings=False))
         rt.watchdog.record_run(
             candidate.output.status,
             passed=not candidate.gated_out and candidate.output.status == RunStatus.OK,

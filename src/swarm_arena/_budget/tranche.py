@@ -9,6 +9,7 @@ import anyio.lowlevel
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
 from swarm_arena._budget.ledger import Ledger, _nonnegative
+from swarm_arena._errors import _core_signal
 
 _logger = logging.getLogger(__name__)
 _USD_LIMIT_MICROS = Amount(usd=USD_LIMIT)._micro_usd
@@ -207,7 +208,7 @@ class Tranche:
                     else self._size.usd,
                 )
                 if not estimate.fits_in(size, cap_tokens=True, cap_usd=True):
-                    raise LimitReached("budget", f"budget used up for {self._holder}")
+                    raise _core_signal(LimitReached("budget", f"budget used up for {self._holder}"))
                 with anyio.CancelScope(shield=True):
                     res = await self._ledger.reserve(
                         self._holder, size, kind="tranche", goal_id=self._goal_id

@@ -179,7 +179,7 @@ async def test_read_file_action_reads_only_the_agent_view(ctx_env: CtxEnv) -> No
         "content": "a = 1\n",
     }
     assert ctx_env.counters.board_reads == 1
-    with pytest.raises(SoftError, match="action failed: SoftError"):
+    with pytest.raises(SoftError, match=r"no such file: secret\.py"):
         await ctx.call_action("read_file", {"path": "secret.py"})
     outside = ctx_env.artifacts.put_bytes(b"not a file of this agent's view")
     with pytest.raises(SoftError, match="file not in your view"):
@@ -970,3 +970,61 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
         assert str(caught.value) == "unknown candidate: c-absent"
     elif isinstance(caught.value, LimitReached):
         assert caught.value.limit == ("stop" if control == "gate" else "max_consecutive_failures")
+
+
+@pytest.mark.parametrize("kind", [SoftError, LimitReached])
+@pytest.mark.parametrize("attack", ["copy", "mutate"])
+async def test_core_signal_payload_cannot_be_transferred_or_mutated(
+    ctx_env: CtxEnv, kind: type[Exception], attack: str
+) -> None:
+    import traceback
+    from uuid import uuid4
+
+    secret = str(uuid4())
+    ctx = ctx_env.ctx()
+    originals: list[Exception] = []
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        try:
+            if kind is LimitReached and attack == "mutate":
+                # Obtain a genuine public gate control without a private marker import.
+                limited = ctx_env.ctx(gate=lambda: LimitReached("stop", "the run is stopping"))
+                limited.get_candidate("c-absent")
+            else:
+                context.get_candidate("c-absent")
+        except (SoftError, LimitReached) as core:
+            originals.append(core)
+            if attack == "copy":
+                error = (
+                    LimitReached("budget", secret) if kind is LimitReached else SoftError(secret)
+                )
+                error.__dict__.update(core.__dict__)
+            else:
+                error = core
+                error.args = (secret,)
+                if isinstance(error, LimitReached):
+                    error.limit = secret
+            error.add_note(secret)
+            raise error from RuntimeError(secret)
+        return None
+
+    ctx.actions = (
+        Action(name="attack", description="Attack", input_model=EmptyArgs, handler=handler),
+    )
+    with pytest.raises((SoftError, LimitReached)) as caught:
+        await ctx.call_action("attack", {})
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert secret not in "".join(traceback.format_exception(caught.value))
+    assert secret not in str(getattr(caught.value, "limit", ""))
+    assert not getattr(caught.value, "__notes__", ())
+    assert caught.value.__cause__ is None
+    assert caught.value is not originals[0]
+    if attack == "copy":
+        assert type(caught.value) is SoftError
+        assert str(caught.value) == f"action failed: {kind.__name__}"
+    elif kind is SoftError:
+        assert str(caught.value) == "unknown candidate: c-absent"
+    else:
+        assert isinstance(caught.value, LimitReached)
+        assert caught.value.limit == "stop"
+        assert str(caught.value) == "the run is stopping"

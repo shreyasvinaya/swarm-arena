@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, TypeVar
+from weakref import WeakKeyDictionary
 
 if TYPE_CHECKING:
     from swarm_arena._agent.manager import LimitReached
@@ -151,22 +152,50 @@ class LeaseHeld(RuntimeError):
     """
 
 
-_CORE_SIGNAL = object()
+_CORE_SIGNALS: WeakKeyDictionary[
+    BaseException, tuple[type[BaseException], tuple[str, ...], str | None]
+] = WeakKeyDictionary()
 _SignalT = TypeVar("_SignalT", SoftError, "LimitReached")
 
 
 def _core_signal(error: _SignalT) -> _SignalT:
-    """Mark a freshly core-created, sanitized action failure and return it.
+    """Register a freshly core-created signal and snapshot its vetted payload.
 
     Call only at core construction sites, never on exceptions caught from
-    connectors. Boundaries recognize the identity marker with
-    ``getattr(error, "_core_signal", None) is _CORE_SIGNAL``. This shared
-    convention preserves public exception types and does not trust their class
-    alone. LimitReached is imported lazily to avoid the model/error import cycle.
+    connectors. Weak keys retain provenance without retaining the exception.
+    The payload is stored outside its transferable, mutable attributes.
+    LimitReached is imported lazily to avoid the model/error import cycle.
     """
     from swarm_arena._agent.manager import LimitReached
 
-    if not isinstance(error, (SoftError, LimitReached)):
+    if type(error) is not SoftError and type(error) is not LimitReached:
         raise TypeError("expected an action control signal")
-    error.__dict__["_core_signal"] = _CORE_SIGNAL
+    if error not in _CORE_SIGNALS:
+        _CORE_SIGNALS[error] = (
+            type(error),
+            error.args,
+            error.limit if isinstance(error, LimitReached) else None,
+        )
     return error
+
+
+def _rebuild_core_signal(error: BaseException) -> "SoftError | LimitReached | None":
+    """Reconstruct a registered signal from its snapshot, never user changes.
+
+    Only the exact public core exception types may be registry keys: subclasses
+    cannot supply custom equality or hashing to impersonate a registered key.
+    The fresh result has no notes or exception chain and is registered so
+    nested action boundaries preserve the same vetted payload.
+    """
+    from swarm_arena._agent.manager import LimitReached
+
+    if type(error) is not SoftError and type(error) is not LimitReached:
+        return None
+    payload = _CORE_SIGNALS.get(error)
+    if payload is None:
+        return None
+    kind, args, limit = payload
+    if kind is SoftError:
+        return _core_signal(SoftError(*args))
+    assert limit is not None
+    return _core_signal(LimitReached(limit, args[0]))

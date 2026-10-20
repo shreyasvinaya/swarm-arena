@@ -22,7 +22,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _rebuild_core_signal
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
@@ -730,7 +730,7 @@ class RoundRunner:
                 else:
                     reasons[key] = (
                         "limit reached"
-                        if isinstance(error, LimitReached)
+                        if isinstance(_rebuild_core_signal(error), LimitReached)
                         else f"manager error: {type(error).__name__}"
                     )
             finally:

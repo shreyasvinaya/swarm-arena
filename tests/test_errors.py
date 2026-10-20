@@ -46,3 +46,63 @@ def test_plan_error_copies_sequence() -> None:
     errors.append("b")
     assert err.errors == ["a"]
     assert PlanError(("a", "b")).errors == ["a", "b"]
+
+
+def test_core_signal_snapshot_is_weak_and_fresh() -> None:
+    import gc
+    import weakref
+
+    from swarm_arena._errors import _core_signal, _rebuild_core_signal
+    from swarm_arena.manager import LimitReached
+
+    for original in (_core_signal(SoftError("safe")), _core_signal(LimitReached("stop", "safe"))):
+        original.args = ("changed",)
+        original.add_note("changed")
+        original.__cause__ = ValueError("changed")
+        if isinstance(original, LimitReached):
+            original.limit = "changed"
+        rebuilt = _rebuild_core_signal(original)
+        assert rebuilt is not None
+        assert rebuilt is not original
+        assert type(rebuilt) is type(original)
+        assert rebuilt.args == ("safe",)
+        assert rebuilt.__cause__ is None
+        assert rebuilt.__context__ is None
+        assert not getattr(rebuilt, "__notes__", ())
+        if isinstance(rebuilt, LimitReached):
+            assert rebuilt.limit == "stop"
+        again = _rebuild_core_signal(rebuilt)
+        assert again is not None
+        assert again is not rebuilt
+        assert again.args == rebuilt.args
+        reference = weakref.ref(rebuilt)
+        del rebuilt
+        gc.collect()
+        assert reference() is None
+    assert _rebuild_core_signal(SoftError("unregistered")) is None
+    assert _rebuild_core_signal(ValueError("unregistered")) is None
+
+
+def test_core_signal_registry_rejects_user_equality() -> None:
+    from typing import Any
+
+    from swarm_arena._errors import _core_signal, _rebuild_core_signal
+    from swarm_arena.manager import LimitReached
+
+    original = _core_signal(LimitReached("stop", "safe"))
+
+    class EqualType(type):
+        def __eq__(cls, other: object) -> bool:
+            return True
+
+        def __hash__(cls) -> int:
+            return hash(LimitReached)
+
+    class ForgedLimit(LimitReached, metaclass=EqualType):
+        def __eq__(self, other: Any) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return hash(original)
+
+    assert _rebuild_core_signal(ForgedLimit("budget", "forged")) is None

@@ -13,7 +13,7 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import execute_tool_run
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import _CORE_SIGNAL, ConfigError, Fenced, SoftError, _core_signal
+from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import JsonValue
@@ -926,10 +926,9 @@ class AgentContext:
         except Fenced:
             raise
         except Exception as error:
-            if isinstance(error, (SoftError, LimitReached)) and (
-                getattr(error, "_core_signal", None) is _CORE_SIGNAL
-            ):
-                raise
+            rebuilt = _rebuild_core_signal(error)
+            if rebuilt is not None:
+                raise rebuilt from None
             raise _core_signal(SoftError(f"action failed: {type(error).__name__}")) from None
         finally:
             lifetime.live = False

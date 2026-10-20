@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Literal
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._errors import Fenced, SoftError
+from swarm_arena._errors import Fenced, SoftError, _core_signal
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -16,9 +16,18 @@ from swarm_arena._model.tooling import RunStatus, ToolRequest
 
 if TYPE_CHECKING:
     from swarm_arena._agent.runtime import AgentRuntime
+    from swarm_arena._tooling.tool import Tool
 
 COUNTED = frozenset({RunStatus.OK, RunStatus.ERROR})
 """Complete outcomes that consume repeat and replicate slots."""
+
+
+def _is_deterministic(tool: "Tool", request: ToolRequest) -> bool:
+    """Read the hook without executing truthiness on a malformed return."""
+    result = tool.is_deterministic(request)
+    if type(result) is not bool:
+        raise TypeError("invalid determinism result")
+    return result
 
 
 class RepeatOutcome(FrozenModel):
@@ -202,7 +211,7 @@ class RepeatIndex:
             goal_key=rt.goal_key,
             tool_ref=rt.tool_ref,
             request=request,
-            deterministic=rt.tool.is_deterministic(request),
+            deterministic=_is_deterministic(rt.tool, request),
         )
 
     def lookup(
@@ -333,7 +342,7 @@ class RepeatIndex:
         """
         n = rt.spec.replicates
         if requested is not None and (requested < 0 or requested >= n):
-            raise SoftError("replicate index out of range")
+            raise _core_signal(SoftError("replicate index out of range"))
         agent = f"{rt.team.name}/{rt.spec.name}"
         matched: Candidate | None = None
         for index in range(n) if requested is None else (requested,):
@@ -342,7 +351,9 @@ class RepeatIndex:
             except Fenced:
                 raise
             except Exception as error:
-                raise SoftError(f"invalid tool request: {type(error).__name__}") from None
+                raise _core_signal(
+                    SoftError(f"invalid tool request: {type(error).__name__}")
+                ) from None
             own = next(
                 (c for c in self._entries.get(key, ()) if self._own(c, agent) and self._counted(c)),
                 None,
@@ -352,7 +363,7 @@ class RepeatIndex:
                 self._allocations[(id(rt), id(request), index)] = (rt, request, key)
                 return index
             if requested is not None:
-                raise SoftError("replicate index already used")
+                raise _core_signal(SoftError("replicate index already used"))
             if matched is None:
                 matched = own
         rt.watchdog.record_refusal()
@@ -367,8 +378,8 @@ class RepeatIndex:
             )
         )
         if rt.watchdog.reason is not None:
-            raise LimitReached("max_refused_repeats", rt.watchdog.reason)
-        raise SoftError(f"repeat refused: replicates used up ({n} of {n})")
+            raise _core_signal(LimitReached("max_refused_repeats", rt.watchdog.reason))
+        raise _core_signal(SoftError(f"repeat refused: replicates used up ({n} of {n})"))
 
     def release(self, rt: "AgentRuntime", request: ToolRequest, index: int) -> None:
         """
