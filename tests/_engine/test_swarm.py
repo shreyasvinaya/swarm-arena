@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 
 import anyio
@@ -51,14 +52,42 @@ def test_trio_backend_raises(run_config: RunConfig) -> None:
         anyio.run(Swarm(run_config).run, plan(), backend="trio")
 
 
-async def test_stop_creates_epoch_key_and_queued_goals_no_result(run_config: RunConfig) -> None:
+async def test_stop_creates_epoch_key_and_queued_goals_no_result(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.stops import StopState
+
     cfg = with_limits(run_config, max_concurrent_goals=1)
     swarm = Swarm(cfg)
-    slow = PyTool({"code": "import time; time.sleep(2); " + WRITE.format("{'data': {'y': 1.0}}")})
+    release = tmp_path / "release"
+    observed = anyio.Event()
+
+    class SignalingStops(StopState):
+        def __setattr__(self, name: str, value: object) -> None:
+            super().__setattr__(name, value)
+            if name == "stop" and value:
+                observed.set()
+
+    monkeypatch.setattr(run_module, "StopState", SignalingStops)
+    monkeypatch.setattr(
+        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.02)
+    )
+    held = PyTool(
+        {
+            "code": f"import pathlib, time\nwhile not pathlib.Path({str(release)!r}).exists():"
+            " time.sleep(0.01)\n" + WRITE.format("{'data': {'y': 1.0}}")
+        }
+    )
     async with anyio.create_task_group() as tg:
-        tg.start_soon(swarm.run, [plan(goal_id="a", tool=slow), plan(goal_id="b")])
-        await wait_tool_started(cfg)
-        await swarm.stop()
+        tg.start_soon(swarm.run, [plan(goal_id="a", tool=held), plan(goal_id="b")])
+        try:
+            await wait_tool_started(cfg)
+            await swarm.stop()
+            with anyio.fail_after(20):
+                await observed.wait()
+        finally:
+            await anyio.to_thread.run_sync(release.write_text, "go")
     assert (run_dir(cfg) / "control/stop-e1").exists()
     assert {
         e.goal_id: e.payload["reason"] for e in events(cfg, "no_result") if e.goal_id == "b"
