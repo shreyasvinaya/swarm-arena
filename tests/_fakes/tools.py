@@ -817,3 +817,41 @@ class AdmissionManager(Manager):
 
     async def run_round(self, ctx: AgentContext) -> RoundReport:
         return RoundReport()
+
+
+def square(x: float) -> dict[str, float]:
+    return {"x": x, "y": x * x}
+
+
+def touch(marker: str) -> dict[str, str]:
+    Path(marker).touch()
+    return {"marker": marker}
+
+
+class CommandRaisesTool(PyTool):
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        raise RuntimeError("boom")
+
+
+WRITE_THEN_SLEEP: str = WRITE.format("{'data': {'step': 1}}") + "; import time; time.sleep(600)"
+
+
+def write_then_sleep(marker: Path, seconds: float = 600) -> str:
+    return (
+        WRITE.format("{'data': {'step': 1}}")
+        + f"; from pathlib import Path; Path({str(marker)!r}).touch()"
+        + f"; import time; time.sleep({seconds!r})"
+    )
+
+
+class ContextInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    value: Any
+    defaulted: int = 7
+
+
+class ContextTool(PyTool):
+    input_model = ContextInputs
+
+    def is_deterministic(self, request: ToolRequest) -> bool:
+        return False

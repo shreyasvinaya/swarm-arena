@@ -269,6 +269,10 @@ class RunState:
                 self.candidates[candidate.id] = candidate
                 self.positions[candidate.id] = (event.epoch, event.seq)
                 self.started.pop(candidate.id, None)
+                if "repeat_key" in payload:
+                    self.goals.setdefault(event.goal_id, GoalState()).repeat_keys[candidate.id] = (
+                        payload["repeat_key"]
+                    )
             case EventType.RUN_LOST:
                 id = payload["candidate_id"]
                 self.lost.add(id)

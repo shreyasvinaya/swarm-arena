@@ -391,6 +391,8 @@ Rules [plan]:
 |---|---|---|
 | `conftest.py` (repo root) | Doctest collection: `collect_ignore` for `src/swarm_arena/llm`, `ray`, `_store/s3.py`, and `testing/_fake_model.py` when the extra is missing (test paths: `tests/conftest.py`) | M1a |
 | `tests/conftest.py` | `anyio_backend` fixture fixed to `"asyncio"`; temp stores and roots. `collect_ignore` for every test path that imports an extra, applied when that extra's distribution is missing (`importlib.metadata.version`, never `find_spec`, R3), because `-m` deselection happens only after import: `llm`: `llm/`, `testing/test_fake_model.py`, `e2e/test_rosenbrock_llm.py`, `e2e/test_autonomous_replan.py`, `e2e/test_llm_plan_file.py`, `e2e/test_llm_final_slice.py`; `ray`: `ray/` (with `test_submit.py`), `e2e/test_rosenbrock_ray.py`, `e2e/test_ray_cancel.py`, `e2e/test_ray_dispatch_crash.py`; `s3`: `_store/test_s3.py`. A milestone that adds such a file adds it here. `test_public_api.py`, `test_docstrings.py`, and `test_compat.py` skip the `llm` and `ray` modules and the lazy `swarm_arena.testing` names through `tests/_surface.py` `deps_present` (`importlib.metadata`; never `importorskip` or `find_spec`), M5 | M1a (+M2 +M3 +M4 +M5) |
+| `tests/_fakes/engine.py` | Test-side env types and helpers for agent and engine tests (`RtEnv`, `CtxEnv`, `EngineEnv`, the config helpers `with_limits` and `with_executor`, `take_over_retrying`); importable as `_fakes.engine`, never collected | M1b (+M2) |
+| `tests/_agent/conftest.py` | Agent fixtures `rt_env` and `ctx_env`; M2 changes their board to `ArenaBoard` | M1b (+M2) |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
@@ -2016,13 +2018,15 @@ class ProviderStops:                                 # _engine/stops.py — M3 [
 
 async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, parents: Sequence[str],
                            replicate: int | None, edits: Mapping[str, str] | None) -> Candidate: ...
-    # validate inputs, edits (validate_edits), and parents → repeat rules and replicate allocation → count the tool run
-    # → reserve (durable) → put_edits → stage → Job(on_started = durable start event)
-    # → executor.submit (refused at Inflight.add and again in on_started, before the start event, when the round's
-    # admission is closed; a refused run settles Amount() and raises LimitReached("stop")) → logs (written once to
-    # goals/<goal-id>/logs/<candidate-id>.{out,err}, R4.2) → checks → durable completion event (Candidate with
-    # tool_identity and requested_by_call, R4.13.7) → settle (or keep charged)
-    # → board.put_candidate(candidate, epoch=, seq=) with the completion event's position
+    # validate inputs, edits (validate_edits), and parents (including root/protection and duplicates)
+    # → repeat rules and replicate allocation → plan the stage → count the tool run → reserve (durable) → put_edits
+    # → Job(on_started = durable start event) → executor.submit (refused when the round's admission is closed:
+    # at Inflight.add and again in on_started; a refused run settles Amount() and raises LimitReached('stop'))
+    # → logs → checks → durable completion event → settle (or keep charged) → board.put_candidate
+    # The final request (including the allocated replicate) supplies key, stage.request_json, Job, and Candidate.
+    # Pure stage planning completes before count/reserve; artifact writes follow reserve.
+    # Logs use goals/<goal-id>/logs/<candidate-id>.{out,err}; board publication uses the completion event's position.
+    # Cancelled preparation with no committed tool_start settles zero and launches no check commands.
     # AgentContext.run_tool applies the gate and counts the turn, then calls execute_tool_run, which owns every other check.
 
 class RepeatOutcome(FrozenModel):

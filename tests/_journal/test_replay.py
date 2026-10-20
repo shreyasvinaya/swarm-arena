@@ -720,3 +720,10 @@ def test_no_result_reason_is_distinct_from_terminal_reason_and_resets() -> None:
     assert (goal.no_result_reason, goal.end_reason) == ("no passing candidate", "stop")
     continued = RunState.from_events([*events, _ev(5, "goal_started", {}, goal_id="g")])
     assert continued.goals["g"].no_result_reason is None
+
+
+def test_repeat_keys_folded() -> None:
+    end = _end(3, "c-1")
+    end = end.model_copy(update={"payload": {**end.payload, "repeat_key": "k1"}})
+    state = RunState.from_events([*_PRE, end])
+    assert state.goals["g"].repeat_keys == {"c-1": "k1"}
