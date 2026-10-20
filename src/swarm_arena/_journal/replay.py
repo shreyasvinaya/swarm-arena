@@ -77,6 +77,8 @@ class GoalState(FrozenModel):
         Part selections, populated by the converge pipeline's fold.
     join_attempts : int, default=0
         Failed joins, populated by the converge pipeline's fold.
+    join_failures : list[str], default=[]
+        Ordered failure reasons in this lifecycle and partition.
     select_only : bool, default=False
         Whether convergence can only select existing candidates.
     converge_started : bool, default=False
@@ -106,6 +108,7 @@ class GoalState(FrozenModel):
     final_parts: dict[str, str | None] | None = None
     kept_parts: dict[str, str] = {}
     join_attempts: int = 0
+    join_failures: list[str] = []
     select_only: bool = False
     converge_started: bool = False
     converge_round: int | None = None
@@ -160,6 +163,7 @@ class RunState:
     plans: dict[str, list[tuple[Plan, Origin]]] = field(default_factory=dict)
     goals: dict[str, GoalState] = field(default_factory=dict)
     candidates: dict[str, Candidate] = field(default_factory=dict)
+    fingerprints: dict[str, str | None] = field(default_factory=dict)
     scores: dict[str, Score] = field(default_factory=dict)
     learnings: dict[str, Learning] = field(default_factory=dict)
     positions: dict[str, tuple[int, int]] = field(default_factory=dict)
@@ -248,6 +252,10 @@ class RunState:
                     plan = Plan._from_data(payload["plan"], base_dir=Path(payload["base_dir"]))
                 else:
                     plan = Plan.model_validate(payload["plan"])
+                if revisions and revisions[-1][0].parts != plan.parts:
+                    self.goals[event.goal_id] = self.goals[event.goal_id].model_copy(
+                        update={"kept_parts": {}, "join_attempts": 0, "join_failures": []}
+                    )
                 revisions.append((plan, cast(Origin, origin)))
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
@@ -267,6 +275,10 @@ class RunState:
             case EventType.TOOL_END:
                 candidate = Candidate.model_validate(payload["candidate"])
                 self.candidates[candidate.id] = candidate
+                fingerprint = payload.get("fingerprint")
+                if fingerprint is not None and not isinstance(fingerprint, str):
+                    raise ValueError("invalid fingerprint")
+                self.fingerprints[candidate.id] = fingerprint
                 self.positions[candidate.id] = (event.epoch, event.seq)
                 self.started.pop(candidate.id, None)
                 if "repeat_key" in payload:
@@ -312,6 +324,7 @@ class RunState:
                 updates["status"] = "running"
                 if event.goal_id in self._finished_goals:
                     updates.update(_reset_converge())
+                    updates.update(kept_parts={}, join_attempts=0, join_failures=[])
                     updates["end_reason"] = None
                     self._finished_goals.remove(event.goal_id)
             case EventType.GOAL_FINISHED:
@@ -353,6 +366,14 @@ class RunState:
                     *goal.decisions,
                     (payload["round"], Decision.model_validate(payload["decision"])),
                 ]
+            case EventType.PART_KEPT:
+                updates["kept_parts"] = {
+                    **goal.kept_parts,
+                    payload["part"]: payload["candidate_id"],
+                }
+            case EventType.JOIN_FAILED:
+                updates["join_attempts"] = payload["attempt"]
+                updates["join_failures"] = [*goal.join_failures, *payload["reasons"]]
             case EventType.CONVERGE_STARTED:
                 updates["converge_started"] = True
                 updates["select_only"] = payload["select_only"]

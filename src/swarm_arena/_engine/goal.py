@@ -1,0 +1,809 @@
+"""Run one goal through barriers, revisions, convergence, and durable results."""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Literal
+
+import anyio
+
+from swarm_arena._agent.manager import LimitReached, Manager
+from swarm_arena._agent.tool_run import command_journal
+from swarm_arena._agent.watchdog import Watchdog
+from swarm_arena._board.run_board import RunBoard
+from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.estimate import judge_amount, make_price_of
+from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+from swarm_arena._budget.tranche import Tranche
+from swarm_arena._engine.admission import RunAdmission
+from swarm_arena._engine.converge import converge
+from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
+from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
+from swarm_arena._engine.solution import solution_view
+from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.event import EventDraft, EventType
+from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.replay import GoalState, RunState
+from swarm_arena._model.base import CallRole
+from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
+from swarm_arena._model.planning_types import Decision, History, RoundState
+from swarm_arena._model.ref import Ref
+from swarm_arena._model.results import AgentStatus, Candidate
+from swarm_arena._model.tooling import RunStatus
+from swarm_arena._planning.planner import Planner
+from swarm_arena._planning.policy import Policy, guard
+from swarm_arena._planning.provenance import stamp
+from swarm_arena._planning.validate import admit_revision
+from swarm_arena._scoring.judge import Judge, JudgeContext
+from swarm_arena._scoring.runner import (
+    JudgeError,
+    JudgeOutcome,
+    final_judge,
+    judge_round,
+    prepare_judge_batch,
+)
+
+_INACTIVE = {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
+
+
+@dataclass
+class GoalOutcome:
+    """
+    Return a goal's terminal status and ordered finalists.
+
+    Attributes
+    ----------
+    goal_id : str
+        Main goal identifier.
+    status : {'finished', 'stopped', 'no_result'}
+        Latest lifecycle outcome.
+    finalists : list[Candidate]
+        Ordered main-goal results; unjoined parts are in the solution view.
+    reason : str or None
+        Stop or no-result explanation.
+
+    Examples
+    --------
+    >>> GoalOutcome("g", "no_result", [], "no passing candidate").finalists
+    []
+    """
+
+    goal_id: str
+    status: Literal["finished", "stopped", "no_result"]
+    finalists: list[Candidate]
+    reason: str | None
+
+
+def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
+    """
+    Build the initial revision event shared with run initialization.
+
+    Parameters
+    ----------
+    plan : Plan
+        Admitted initial plan with its assigned origin.
+    base_dir : Path
+        Original source directory for later revision admission.
+
+    Returns
+    -------
+    EventDraft
+        Plan, origin, base directory, and empty run planner-call ids.
+
+    Examples
+    --------
+    >>> from swarm_arena import Goal
+    >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+    >>> r0_revision_draft(plan, Path("/plans")).payload["planner_call_ids"]
+    []
+    """
+    return EventDraft(
+        type=EventType.PLAN_REVISION,
+        goal_id=plan.goal.id,
+        payload={
+            "plan": plan.model_dump(mode="json"),
+            "origin": plan.origin,
+            "base_dir": str(base_dir),
+            "planner_call_ids": [],
+        },
+    )
+
+
+class GoalRunner:
+    """
+    Drive an admitted goal using shared run services and committed history.
+
+    Parameters
+    ----------
+    deps : EngineDeps
+        Shared services, including the run-wide admission reservation.
+    goal_id : str
+        Main goal id, also used for part budgets.
+    plan : Plan
+        Latest admitted plan revision.
+    replanner : Planner or None
+        Optional autonomous revision producer.
+    history : Sequence[Plan], optional
+        Admitted revision history; otherwise restored from the journal.
+    state : GoalState or None, default=None
+        Resume progress. Full evidence and event positions are read from the
+        committed journal at initialization, never inferred from this subset.
+    journal_r0 : bool, default=True
+        False when the run coordinator already recorded the initial revision.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> from swarm_arena import Goal, RunConfig
+    >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+    >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+    >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
+    0
+    """
+
+    def __init__(
+        self,
+        deps: EngineDeps,
+        *,
+        goal_id: str,
+        plan: Plan,
+        replanner: Planner | None,
+        history: Sequence[Plan] = (),
+        state: GoalState | None = None,
+        journal_r0: bool = True,
+    ) -> None:
+        """Copy resume carriers and share the run's admission reservation."""
+        self.deps, self.goal_id, self.plan, self.replanner = deps, goal_id, plan, replanner
+        if deps.admission is None:
+            deps.admission = RunAdmission(deps.config.limits.max_agents_total)
+        self.admission = deps.admission
+        self.history = list(history)
+        self.state = state.model_copy(deep=True) if state is not None else GoalState()
+        self.journal_r0 = journal_r0
+        self.rounds_closed = self.state.rounds_closed
+        self.select_only = self.state.select_only
+        self.join_attempts = self.state.join_attempts
+        self.join_failures = list(self.state.join_failures)
+        self.kept_parts = dict(self.state.kept_parts)
+        self.repeat_entries: list[tuple[str, Candidate]] = []
+        self.agents: list[AgentSlot] = []
+        self.recorded = RunState()
+        self.status: Literal["finished", "stopped", "no_result"] = "finished"
+        self.reason: str | None = None
+        self.final_parts: dict[str, str | None] | None = None
+        self._resumed: dict[str, list[tuple[str, Candidate]]] = {}
+        self._frontier = (
+            self.state.frontiers.get(self.state.round)
+            if (self.state.round > self.state.rounds_closed)
+            else None
+        )
+        self._decisions = list(self.state.decisions)
+
+    def active_agents(self) -> int:
+        """
+        Return the largest remaining ordinary or converge agent count.
+
+        Returns
+        -------
+        int
+            Peak reserved by the goal scheduler, including a future team.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import Goal, RunConfig
+        >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+        >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+        >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
+        0
+        """
+        statuses = {f"{s.team.name}/{s.spec.name}": s.status for s in self.agents}
+        statuses = {**self.state.agents, **statuses}
+        main = sum(
+            statuses.get(f"{team.name}/{agent.name}") not in _INACTIVE
+            for team in self.plan.teams
+            for agent in team.agents
+        )
+        conv = self.plan.converge
+        return max(main, len(conv.team.agents) if conv.mode == "team" and conv.team else 0)
+
+    def _draft(self, type: EventType, *, round_no: int | None = None, **payload: Any) -> EventDraft:
+        return EventDraft(
+            type=type,
+            goal_id=self.goal_id,
+            round=round_no if round_no is not None else payload.get("round", 0),
+            payload=payload,
+        )
+
+    async def _refresh(self) -> None:
+        """Fold only a committed head, including the durable fingerprint map."""
+        head = await self.deps.journal.commit()
+        if head is not None:
+            chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, head)
+            self.recorded = RunState.from_events(event for _, events in chain for event in events)
+
+    async def _plan_view(self) -> None:
+        head = self.deps.journal.head
+        assert head is not None
+        await self.deps.views.write(
+            f"goals/{self.goal_id}/plan.r{self.plan.revision}.toml",
+            self.plan.dumps().encode(),
+            source=head,
+        )
+
+    async def _slots(self, teams: Sequence[TeamSpec], *, reuse: bool) -> list[AgentSlot]:
+        previous = {slot.address: slot for slot in self.agents} if reuse else {}
+        slots: list[AgentSlot] = []
+        for team in teams:
+            for spec in team.agents:
+                address = f"{self.goal_id}/{team.name}/{spec.name}"
+                key = f"{team.name}/{spec.name}"
+                old = previous.get(address)
+                goal = team_goal(self.plan, team)
+                manager = (
+                    old.manager
+                    if old and old.spec.manager == spec.manager
+                    else await run_sync_daemon(spec.manager.build, Manager)
+                )
+                slots.append(
+                    AgentSlot(
+                        address=address,
+                        team=team,
+                        spec=spec,
+                        manager=manager,
+                        tool_ref=spec.tool,
+                        goal=goal,
+                        goal_key=goal.key(),
+                        part=team.part,
+                        notes=old.notes if old else self.state.notes.get(key, ""),
+                        watchdog=old.watchdog if old else Watchdog(self.deps.config.limits),
+                        status=old.status
+                        if old
+                        else self.state.agents.get(key, AgentStatus.ACTIVE),
+                    )
+                )
+        board = self.deps.board
+        if isinstance(board, RunBoard):
+            board.register_goal(self.plan.goal.key(), self.goal_id, None)
+            for part in self.plan.parts:
+                board.register_goal(part.goal.key(), self.goal_id, part.name)
+        return slots
+
+    def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
+        seen = {candidate.id for _, candidate in self.repeat_entries}
+        for key, candidate in entries:
+            if candidate.id not in seen:
+                self.repeat_entries.append((key, candidate))
+                seen.add(candidate.id)
+
+    def _restore_repeats(self) -> None:
+        """Keep items after the restarted frontier private to their owner."""
+        mark = (
+            next((m for m in self._frontier.marks if m.run_id == self.deps.run_id), None)
+            if self._frontier
+            else None
+        )
+        boundary = (mark.epoch, mark.seq) if mark is not None else (0, 0)
+        for candidate in self.recorded.candidates.values():
+            if candidate.goal_id != self.goal_id or candidate.run_id != self.deps.run_id:
+                continue
+            key = self.state.repeat_keys.get(candidate.id)
+            if key is None:
+                key = self.recorded.goals.get(self.goal_id, GoalState()).repeat_keys.get(
+                    candidate.id
+                )
+            if key is None:
+                continue
+            pair = (key, candidate)
+            if self._frontier is not None and self.recorded.positions[candidate.id] > boundary:
+                self._resumed.setdefault(f"{candidate.team}/{candidate.agent}", []).append(pair)
+            else:
+                self._merge_repeats([pair])
+
+    def _ranking_name(self, part: str | None) -> str:
+        _, refs, name = part_scoring(self.plan, part)
+        return name or (refs[0].component_name() if len(refs) == 1 else "")
+
+    def _round_state(self) -> RoundState:
+        candidates = [c for c in self.recorded.candidates.values() if c.goal_id == self.goal_id]
+        by_id = {c.id: c for c in candidates}
+        scores = [s for s in self.recorded.scores.values() if s.candidate_id in by_id]
+        identities: dict[str | None, tuple[str, str, str]] = {}
+        for score in scores:
+            part = by_id[score.candidate_id].part
+            if part is not None and part not in {p.name for p in self.plan.parts}:
+                continue
+            if score.judge == self._ranking_name(part):
+                identities[part] = score.identity
+        return RoundState(
+            goal_id=self.goal_id,
+            round=self.rounds_closed,
+            rounds_total=self.plan.rounds_total(self.deps.config.limits),
+            plan=self.plan,
+            candidates=candidates,
+            scores=scores,
+            status={f"{s.team.name}/{s.spec.name}": s.status for s in self.agents},
+            ranking_identity=identities,
+        )
+
+    def _tranche(self, service: str) -> Tranche:
+        limits = self.deps.config.limits
+        return Tranche(
+            self.deps.ledger,
+            f"{self.goal_id}/:{service}",
+            self.goal_id,
+            size=Amount(tokens=limits.llm_tranche_tokens, usd=limits.llm_tranche_usd),
+        )
+
+    def _scope(
+        self, role: CallRole, round: int, tranche: Tranche, *, final: bool = False
+    ) -> LLMScope:
+        deps = self.deps
+        return LLMScope(
+            role=role,
+            run_id=deps.run_id,
+            goal_id=self.goal_id,
+            team="",
+            agent="",
+            round=round,
+            candidate_id=None,
+            tranche=tranche,
+            journal=deps.journal,
+            artifacts=deps.artifacts,
+            models=deps.config.models,
+            tracing=deps.config.tracing,
+            cache=deps.config.cache,
+            force_no_cache_read=final,
+        )
+
+    async def _close(self, tranche: Tranche) -> None:
+        with anyio.move_on_after(self.deps.config.settle_timeout_s):
+            while tranche.pending():  # noqa: ASYNC110 - external call settlement
+                await anyio.sleep(0.05)
+        # Charges and overflow are already authoritative in the ledger/journal.
+        await tranche.close()
+
+    def _judge_context(
+        self, ref: Ref, batch: Sequence[Candidate], round: int, *, final: bool = False
+    ) -> JudgeContext:
+        deps = self.deps
+        first = batch[0]
+        goal = (
+            self.plan.goal
+            if first.part is None
+            else next(p.goal for p in self.plan.parts if p.name == first.part)
+        )
+        executor, on_started = command_journal(
+            deps.journal, deps.executor, candidate_id=first.id, component=ref.component_name()
+        )
+        return JudgeContext(
+            goal=goal,
+            executor=executor,
+            artifact_root=deps.config.artifact_root,
+            run_id=deps.run_id,
+            round=round,
+            part=first.part,
+            fidelity=first.fidelity,
+            ids=deps.ids,
+            on_started=on_started,
+            secrets_file=deps.config.secrets.file,
+            tool_timeout_s=deps.config.limits.tool_timeout_s,
+            final=final,
+            read_cache=not final,
+        )
+
+    def _publish_scores(self, outcome: JudgeOutcome, scope: LLMScope, round: int) -> None:
+        for score in outcome.scores:
+            if not score.llm_call_ids:
+                score = score.model_copy(update={"llm_call_ids": list(scope.call_ids)})
+            event = self.deps.journal.append(
+                self._draft(EventType.SCORE, round=round, score=score.model_dump(mode="json"))
+            )
+            self.deps.board.put_score(score, epoch=event.epoch, seq=event.seq)
+        for error in outcome.errors:
+            self.deps.journal.append(
+                self._draft(EventType.JUDGE_ERROR, round=round, **error.model_dump())
+            )
+
+    async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
+        """Fund exact batches and publish each group's judges in plan order."""
+        tranche = self._tranche("judges")
+        try:
+            for part in [None, *(p.name for p in self.plan.parts)]:
+                batch = [
+                    c
+                    for c in candidates
+                    if c.part == part
+                    and not c.gated_out
+                    and (c.output.status == RunStatus.OK or c.output.partial)
+                ]
+                if not batch:
+                    continue
+                _, refs, _ = part_scoring(self.plan, part)
+                for ref in refs:
+                    leaders = [c for c, _ in self._round_state().ranked(part)]
+                    scope = self._scope("judge", round, tranche)
+                    try:
+                        judge = await run_sync_daemon(ref.build, Judge)
+                        prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
+                        amount = await run_sync_daemon(
+                            partial(
+                                judge_amount,
+                                judge,
+                                len(prepared[0]),
+                                self.deps.config,
+                                make_price_of(self.deps.config.models),
+                                llm=False,
+                            )
+                        )
+                    except Fenced:
+                        raise
+                    except Exception as error:
+                        outcome = JudgeOutcome(
+                            scores=[],
+                            errors=[
+                                JudgeError(
+                                    candidate_id=c.id,
+                                    judge=ref.component_name(),
+                                    reason=f"judge error: {type(error).__name__}",
+                                )
+                                for c in batch
+                            ],
+                        )
+                        self._publish_scores(outcome, scope, round)
+                        continue
+                    try:
+                        reservation = (
+                            await self.deps.ledger.reserve(
+                                f"{self.goal_id}/:judges",
+                                amount,
+                                kind="judge",
+                                goal_id=self.goal_id,
+                            )
+                            if amount != Amount()
+                            else None
+                        )
+                    except LimitReached:
+                        self.deps.journal.append(
+                            self._draft(
+                                EventType.RESERVE_EXHAUSTED,
+                                **{"round": round, "needed": amount.model_dump()},
+                            )
+                        )
+                        self.select_only = True
+                        self.status, self.reason = "stopped", "reserve_exhausted"
+                        return False
+                    with llm_scope(scope):
+                        outcome = await judge_round(
+                            self.goal_id,
+                            [(ref, judge)],
+                            batch,
+                            leaders,
+                            lambda _, ref=ref, prepared=prepared: self._judge_context(
+                                ref, prepared[0], round
+                            ),
+                            prepared=prepared,
+                        )
+                    if reservation is not None:
+                        await self.deps.ledger.settle(reservation.id, amount, estimated=True)
+                    self._publish_scores(outcome, scope, round)
+                    await self._refresh()
+            return True
+        finally:
+            await self._close(tranche)
+
+    async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
+        if not finalists:
+            return []
+        name = self._ranking_name(None)
+        ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
+        tranche = self._tranche("final")
+        scope = self._scope("judge", 0, tranche, final=True)
+        try:
+            with llm_scope(scope):
+                try:
+                    judge = await run_sync_daemon(ref.build, Judge)
+                    amount = await run_sync_daemon(
+                        partial(
+                            judge_amount,
+                            judge,
+                            len(finalists),
+                            self.deps.config,
+                            make_price_of(self.deps.config.models),
+                            llm=False,
+                        )
+                    )
+                except Fenced:
+                    raise
+                except Exception as error:
+                    self._publish_scores(
+                        JudgeOutcome(
+                            scores=[],
+                            errors=[
+                                JudgeError(
+                                    candidate_id=c.id,
+                                    judge=name,
+                                    reason=f"judge error: {type(error).__name__}",
+                                )
+                                for c in finalists
+                            ],
+                        ),
+                        scope,
+                        0,
+                    )
+                    return []
+                try:
+                    reservation = (
+                        await self.deps.ledger.reserve(
+                            f"{self.goal_id}/:final", amount, kind="final", goal_id=self.goal_id
+                        )
+                        if amount != Amount()
+                        else None
+                    )
+                except LimitReached:
+                    self.status, self.reason = "no_result", "final slice used up"
+                    return []
+                order, outcome = await final_judge(
+                    self.goal_id,
+                    (ref, judge),
+                    finalists,
+                    self._judge_context(ref, finalists, 0, final=True),
+                )
+                if reservation is not None:
+                    await self.deps.ledger.settle(reservation.id, amount, estimated=True)
+                self._publish_scores(outcome, scope, 0)
+                return order
+        finally:
+            await self._close(tranche)
+
+    async def _replan(self) -> bool:
+        """Prepare off-lock, then atomically recheck capacity and publish."""
+        if self.replanner is None:
+            return False
+        tranche = self._tranche("planner")
+        scope = self._scope("planner", self.rounds_closed, tranche)
+        state = self._round_state()
+        history = History(
+            goal_id=self.goal_id,
+            revisions=self.history,
+            scores=state.scores,
+            learnings=[
+                item for item in self.recorded.learnings.values() if item.goal_id == self.goal_id
+            ],
+            decisions=self._decisions,
+            budget_left=self.deps.ledger.goal_remaining(self.goal_id),
+            rounds_done=self.rounds_closed,
+            join_failures=self.join_failures,
+        )
+        try:
+            try:
+                with llm_scope(scope):
+                    proposed = await self.replanner.plan(self.plan.goal, self.deps.config, history)
+                    if not isinstance(proposed, Plan):
+                        raise TypeError("invalid planner result")
+            finally:
+                await self._close(tranche)
+        except Fenced:
+            raise
+        except Exception as error:
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PLAN_REJECTED,
+                    errors=[f"planner error: {type(error).__name__}"],
+                    origin="autonomous",
+                )
+            )
+            return False
+        try:
+            revision = stamp(proposed, origin="autonomous", parent=self.plan)
+            admitted, _ = await anyio.to_thread.run_sync(
+                partial(
+                    admit_revision,
+                    revision,
+                    self.deps.config,
+                    self.deps.artifacts,
+                    history=self.history,
+                    other_active_agents=0,
+                )
+            )
+            peak = max(
+                sum(len(t.agents) for t in admitted.teams),
+                len(admitted.converge.team.agents)
+                if admitted.converge.mode == "team" and admitted.converge.team
+                else 0,
+            )
+
+            async def publish() -> None:
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.PLAN_REVISION,
+                        plan=admitted.model_dump(mode="json"),
+                        origin="autonomous",
+                        planner_call_ids=list(scope.call_ids),
+                    )
+                )
+                await self.deps.journal.commit()
+                if self.plan.parts != admitted.parts:
+                    self.kept_parts, self.join_attempts, self.join_failures = {}, 0, []
+                self.plan = admitted
+                self.history.append(admitted)
+
+            await self.admission.update(self.goal_id, peak, publish=publish)
+        except PlanError as error:
+            self.deps.journal.append(
+                self._draft(EventType.PLAN_REJECTED, errors=error.errors, origin="autonomous")
+            )
+            return False
+        self.agents = await self._slots(self.plan.teams, reuse=True)
+        await self._plan_view()
+        return True
+
+    def _stop(self) -> bool:
+        stops = self.deps.stops
+        if self.deps.clock.left(self.deps.config.limits.run_timeout_s) <= 0:
+            stops.run_timeout = True
+        reason = (
+            "stop --now"
+            if stops.stop_now
+            else "run_timeout_s"
+            if stops.run_timeout
+            else "stop"
+            if stops.stop
+            else "run budget"
+            if stops.run_budget
+            else "goal budget"
+            if self.goal_id in stops.goal_budget
+            else None
+        )
+        if reason is not None:
+            if self.reason != "reserve_exhausted":
+                self.status, self.reason = "stopped", reason
+            self.select_only |= stops.stop_now or stops.run_timeout
+        return reason is not None
+
+    async def _run_rounds(self) -> None:
+        while self.rounds_closed < self.plan.rounds_total(self.deps.config.limits):
+            if self._stop():
+                self._merge_repeats([pair for pairs in self._resumed.values() for pair in pairs])
+                self._resumed = {}
+                break
+            round = self.rounds_closed + 1
+            spec = self.plan.rounds[round - 1] if self.plan.rounds else RoundSpec()
+            recovered = [c for pairs in self._resumed.values() for _, c in pairs]
+            out = await RoundRunner(
+                self.deps,
+                goal_id=self.goal_id,
+                plan=self.plan,
+                agents=self.agents,
+                round_spec=spec,
+                rounds_left=self.plan.rounds_total(self.deps.config.limits) - self.rounds_closed,
+                resumed=self._resumed,
+                repeat_entries=self.repeat_entries,
+                frontier=self._frontier,
+            ).run(round)
+            self._resumed, self._frontier = {}, None
+            self._merge_repeats(out.repeat_entries)
+            await self._refresh()
+            funded = await self._barrier([*recovered, *out.candidates], round)
+            self.rounds_closed = round
+            if funded:
+                state = self._round_state()
+                try:
+                    policy = await run_sync_daemon(self.plan.policy.build, Policy)
+                    decision = guard(await run_sync_daemon(policy.after_round, state), state)
+                except Fenced:
+                    raise
+                except Exception as error:
+                    decision = guard(
+                        Decision(policy=f"policy error: {type(error).__name__}"), state
+                    )
+                event = self.deps.journal.append(
+                    self._draft(
+                        EventType.DECISION,
+                        **{"round": round, "decision": decision.model_dump(mode="json")},
+                    )
+                )
+                self._decisions.append((round, decision))
+                self.deps.board.put_decision(
+                    self.goal_id, round, decision, epoch=event.epoch, seq=event.seq
+                )
+                for slot in self.agents:
+                    key = f"{slot.team.name}/{slot.spec.name}"
+                    reason = decision.prune.get(key, decision.prune.get(slot.team.name))
+                    if reason is not None:
+                        slot.status = AgentStatus.PRUNED
+                        self.deps.journal.append(
+                            EventDraft(
+                                type=EventType.AGENT_STATUS,
+                                goal_id=self.goal_id,
+                                team=slot.team.name,
+                                agent=slot.spec.name,
+                                round=round,
+                                payload={"status": "pruned", "reason": reason},
+                            )
+                        )
+                for part in self.plan.parts:
+                    if not any(
+                        s.part == part.name and s.status not in _INACTIVE for s in self.agents
+                    ):
+                        best = kept_best(state, part.name)
+                        if best is not None and self.kept_parts.get(part.name) != best.id:
+                            self.kept_parts[part.name] = best.id
+                            self.deps.journal.append(
+                                self._draft(
+                                    EventType.PART_KEPT, part=part.name, candidate_id=best.id
+                                )
+                            )
+                if decision.no_result:
+                    self.status, self.reason = "no_result", decision.no_result
+                elif round < self.plan.rounds_total(self.deps.config.limits) and not self._stop():
+                    await self._replan()
+                await self.admission.update(self.goal_id, self.active_agents())
+            await self.deps.journal.append_durable(
+                self._draft(
+                    EventType.ROUND_CLOSED,
+                    **{"round": round, "run_elapsed_s": self.deps.clock.elapsed()},
+                )
+            )
+            if not funded or self.status == "no_result":
+                break
+        await self._refresh()
+
+    async def run(self) -> GoalOutcome:
+        """
+        Execute rounds and publish a result after its terminal journal commit.
+
+        Returns
+        -------
+        GoalOutcome
+            Finalists, or an explicit reason when nothing passes.
+
+        Examples
+        --------
+        >>> outcome = await runner.run()  # doctest: +SKIP
+        """
+        await self.admission.update(self.goal_id, self.active_agents())
+        if self.journal_r0:
+            self.deps.journal.append(r0_revision_draft(self.plan, self.plan.base_dir))
+            await self.deps.journal.commit()
+            await self._plan_view()
+        await self._refresh()
+        if not self.history:
+            self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
+        self._restore_repeats()
+        self.agents = await self._slots(self.plan.teams, reuse=False)
+        await self._run_rounds()
+        finalists: list[Candidate] = []
+        if self.status != "no_result":
+            self._stop()
+            self.deps.journal.append(
+                self._draft(EventType.CONVERGE_STARTED, select_only=self.select_only)
+            )
+            await self.deps.journal.commit()
+            finalists = await converge(self, select_only=self.select_only)
+        if not finalists and not (self.final_parts and any(self.final_parts.values())):
+            if self.status != "no_result":
+                self.status, self.reason = "no_result", "no passing candidate"
+            self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
+        else:
+            self.deps.journal.append(
+                self._draft(
+                    EventType.FINAL_ORDER,
+                    candidate_ids=[c.id for c in finalists],
+                    parts=self.final_parts,
+                )
+            )
+        self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=self.reason))
+        await self._refresh()
+        head = self.deps.journal.head
+        assert head is not None
+        await self.deps.views.write(
+            f"goals/{self.goal_id}/solution.json",
+            solution_view(self.recorded, self.goal_id, head),
+            source=head,
+        )
+        await self.deps.ledger.end_goal(self.goal_id)
+        await self.admission.release(self.goal_id)
+        return GoalOutcome(self.goal_id, self.status, finalists, self.reason)

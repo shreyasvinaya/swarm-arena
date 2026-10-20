@@ -894,3 +894,16 @@ async def test_overflow_charge_overrides_keep_charged_and_validates_limit(env: L
         RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
     )
     assert replayed._charges[res.id] == actual
+
+
+async def test_goal_remaining_excludes_service_reserve_and_final_slice(env: LedgerEnv) -> None:
+    await env.start()
+    await env.goal("g1")
+    before = env.ledger.goal_remaining("g1")
+    assert before.usd == 42.5
+    assert before.tokens is None
+    env.ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+    reservation = await env.ledger.reserve("g1/t/a", Amount(usd=2), kind="tool", goal_id="g1")
+    assert env.ledger.goal_remaining("g1").usd == 40.5
+    await env.ledger.settle(reservation.id, Amount(usd=1))
+    assert env.ledger.goal_remaining("g1").usd == 41.5

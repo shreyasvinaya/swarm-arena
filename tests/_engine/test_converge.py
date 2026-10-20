@@ -52,3 +52,8 @@ def test_non_distinct_selection_does_not_fingerprint() -> None:
     assert select_finalists(
         [(candidate, _s(1))], top_n=2, distinct=False, fingerprint=unexpected
     ) == [candidate]
+
+
+def test_unknown_fingerprints_are_always_distinct() -> None:
+    ranking = [(_c("c-1", data={}), _s(2)), (_c("c-2", data={}), _s(1))]
+    assert len(select_finalists(ranking, top_n=2, distinct=True, fingerprint=lambda c: None)) == 2

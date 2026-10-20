@@ -329,6 +329,7 @@ Rules [plan]:
 | `_engine/swarm.py` | `Swarm` facade | M1b | `tests/_engine/test_swarm.py` |
 | `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3) | M1b +M2 +M3 | `tests/_engine/test_run.py` |
 | `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
+| `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
 | `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b | `tests/_engine/test_round.py` |
 | `_engine/stops.py` | Mid-round stop rules (§6.4); `ProviderStops`, the run's one provider-failure registry (M3, R4.13.10) | M1b +M3 | `tests/_engine/test_stops.py` |
 | `_engine/parts.py` | Part assignment, kept best of a part, join, re-join attempts (groups come from `_scoring/ranking.py`) | M1b | `tests/_engine/test_parts.py` |
@@ -1721,6 +1722,7 @@ class RunState:                                      # pure fold of committed ev
                                                      # preserves ordinary round/rounds_closed and finalization state,
                                                      # recording its own converge_round and frontier (converge=true)
     candidates: dict[str, Candidate]
+    fingerprints: dict[str, str | None]             # tool_end fingerprint from the producing effective tool; null is always distinct
     scores: dict[str, Score]
     learnings: dict[str, Learning]
     positions: dict[str, tuple[int, int]]            # [plan] item id → (epoch, seq) of its event; feeds RunBoard on resume (R4.6)
@@ -1740,6 +1742,11 @@ class RunState:                                      # pure fold of committed ev
 `end_reason` (`goal_finished.reason`) and resets on continuation. The existing
 `final_order` and `final_parts` fields retain `final_order.candidate_ids` and
 `final_order.parts`; a null parts mapping denotes a main-goal or joined result.
+`GoalState.kept_parts` folds `part_kept.{part,candidate_id}`. `join_attempts`
+folds `join_failed.attempt`; `join_failures` accumulates its reasons in order.
+These three fields reset on a continued lifecycle or a changed partition,
+not on an ordinary round. Candidates, repeat keys, and fingerprints survive
+continuation. `plan_rejected` never adds a plan revision.
 
 #### R4.13.5 Ids — M1a (R2.7 item 7)
 
@@ -1801,6 +1808,9 @@ class Ledger:
         # Replay restores those grants exactly. Never journal remaining(holder): its read-time view clips
         # the grant left by the current global run balance, which a later refund or cap raise can increase.
     def remaining(self, holder: str) -> Amount: ...
+    def goal_remaining(self, goal_id: str) -> Estimate: ...
+        # Spendable goal work, excluding the final slice and shared service reserve; uncapped units are None.
+        # This is History.budget_left for replanning future rounds.
     async def reserve(self, holder: str, amount: Amount, *, kind: ReservationKind, goal_id: str,
                       keep_charged: bool = False) -> Reservation: ...   # LimitReached("budget"); durable before return
     async def settle(self, reservation_id: str, actual: Amount, *, estimated: bool = False) -> None: ...  # idempotent, durable
@@ -2087,10 +2097,14 @@ class Watchdog:
 ```python
 async def run_checks(candidate: Candidate, checks: Sequence[tuple[str, Check]], ctx: CheckContext) -> list[CheckResult]: ...
 async def judge_round(goal_id: str, judges: Sequence[tuple[Ref, Judge]], candidates: Sequence[Candidate],
-                      leaders: Sequence[Candidate], ctx_for: Callable[[Judge], JudgeContext]) -> JudgeOutcome: ...
+                      leaders: Sequence[Candidate], ctx_for: Callable[[Judge], JudgeContext], *,
+                      prepared: tuple[list[Candidate], frozenset[str]] | None = None) -> JudgeOutcome: ...
     # stamps ids and hashes; non-finite or failing → judge_error events; anchors = leaders[:judge.anchor_count()]
     # [plan] M3: a judge that raises ProviderFailed gets JudgeOutcome.provider_failed[judge name] = provider, with no
     # judge_error events and no scores; the other judges still run (§6.4: ranking-judge pause, panel drop)
+def prepare_judge_batch(judge: Judge, candidates: Sequence[Candidate], leaders: Sequence[Candidate]) -> tuple[list[Candidate], frozenset[str]]: ...
+    # Eligible candidates plus unique anchors, prepared once before provider funding. The caller contains
+    # hook failures; judge_round(prepared=...) consumes the funded batch without calling anchor_count again.
 async def final_judge(goal_id: str, ranking: tuple[Ref, Judge], finalists: Sequence[Candidate],
                       ctx: JudgeContext) -> tuple[list[Candidate], JudgeOutcome]: ...     # one batch; read_cache=False; returns (order, outcome); scores stamped with ctx.ids
     # [plan] M3: re-raises ProviderFailed, so the goal writes NO_RESULT with reason provider_failed (§6.4)
@@ -2167,14 +2181,38 @@ class EngineDeps:                                    # _engine/round.py — M1b 
     run_id: str; config: RunConfig; store: Store; journal: JournalWriter; ledger: Ledger; board: Board
     executor: Executor; artifacts: ArtifactStore; ids: IdGen; views: ViewWriter
     stops: StopState; clock: RunClock                # M1b plan types (stop control, run clock)
+    admission: RunAdmission | None = None            # one shared service per run; standalone GoalRunner initializes it
     provider_stops: ProviderStops                    # [plan] +M3: the run's one ProviderStops; every AgentRuntime.stops (R4.13.10)
 class RunRunner:                                     # _engine/run.py
     async def run(self) -> dict[str, list[Candidate]]: ...
 class GoalRunner:                                    # _engine/goal.py
+    def __init__(self, deps: EngineDeps, *, goal_id: str, plan: Plan, replanner: Planner | None,
+                 history: Sequence[Plan] = (), state: GoalState | None = None,
+                 journal_r0: bool = True) -> None: ...
+    # Reads the committed RunState on initialization for history, fingerprints and event positions.
+    # Recovered repeat pairs after the unfinished round's frontier remain private to their owner;
+    # they join repeat_entries at the barrier or an early break, deduplicated by candidate id.
+    def active_agents(self) -> int: ...              # max(active main agents, future converge team); select mode counts zero converge agents
+    repeat_entries: list[tuple[str, Candidate]]
     async def run(self) -> GoalOutcome: ...          # rounds → converge → final judge → solution view
+@dataclass
+class GoalOutcome:
+    goal_id: str; status: Literal["finished", "stopped", "no_result"]
+    finalists: list[Candidate]; reason: str | None
+def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft: ...
+class RunAdmission:                                 # _engine/admission.py
+    def __init__(self, max_agents_total: int) -> None: ...
+    async def update(self, goal_id: str, peak: int, *,
+                     publish: Callable[[], Awaitable[None]] | None = None) -> None: ...
+    # One lock and per-goal reserved peaks. Snapshot/admit outside the lock; recheck the
+    # sum under the lock, then durably publish and update capacity atomically. No planner
+    # or snapshot hook runs under this lock. The scheduler releases finished goals.
+    async def release(self, goal_id: str) -> None: ...
 class RoundRunner:                                   # _engine/round.py
     async def run(self, round: int) -> RoundOutcome: ...
 async def converge(goal: GoalRunner, *, select_only: bool) -> list[Candidate]: ...   # _engine/converge.py
+    # Converge outputs receive ordinary judges before the uncached final ranking. An unfunded barrier
+    # records reserve_exhausted and selects previously judged survivors or unjoined parts, not its new outputs.
 def solution_view(state: RunState, goal_id: str, source: Head) -> bytes: ...         # _engine/solution.py, pure
 async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Executor) -> None: ...
     # _engine/preflight.py: each distinct (path, normalized built config) once per call. Main/part checks and judges,
@@ -2370,7 +2408,7 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
 
 ### R4.14 Journal event types — M1b (additions noted)
 
-`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a replanner revision rejected by `validate_plan`; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started`, `final_order`, `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
 
 ### R4.15 Stored formats and `schema_version`
 

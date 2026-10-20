@@ -728,3 +728,42 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
         await call
     assert caught.value is failure
     assert later.seen == []
+
+
+async def test_prepared_batch_funded_size_equals_submitted_batch() -> None:
+    from swarm_arena._scoring.runner import prepare_judge_batch
+
+    class Once(Judge):
+        name = "once"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.seen: list[str] = []
+
+        def anchor_count(self) -> int:
+            self.calls += 1
+            assert self.calls == 1
+            return 2
+
+        async def judge(
+            self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            self.seen = [c.id for c in candidates]
+            assert ctx.anchors == frozenset({"c-1", "c-2"})
+            return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    judge = Once()
+    candidates = [_cand("c-1")]
+    prepared = prepare_judge_batch(judge, candidates, [*candidates, _cand("c-2")])
+    assert len(prepared[0]) == 2
+    outcome = await judge_round(
+        "g",
+        [(Ref(path="_fakes.tools:FixedJudge", name="once"), judge)],
+        candidates,
+        [],
+        lambda judge: _judge_ctx(),
+        prepared=prepared,
+    )
+    assert judge.seen == ["c-1", "c-2"]
+    assert len(outcome.scores) == 2

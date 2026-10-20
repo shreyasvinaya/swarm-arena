@@ -17,6 +17,7 @@ from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._model.tooling import Estimate
 
 ReservationKind = Literal["tool", "tranche", "call", "judge", "planner", "curator", "final"]
 
@@ -506,6 +507,41 @@ class Ledger:
         self._shares = {h: p for h, p in self._shares.items() if self._holder_goals[h] != goal_id}
         self._shares.update(validated)
         self._holder_goals.update(dict.fromkeys(validated, goal_id))
+
+    def goal_remaining(self, goal_id: str) -> Estimate:
+        """
+        Return spendable goal work, excluding final slices and service reserve.
+
+        Parameters
+        ----------
+        goal_id : str
+            Registered goal identifier.
+
+        Returns
+        -------
+        Estimate
+            Nonnegative work balance; uncapped units are None.
+
+        Examples
+        --------
+        >>> from typing import cast
+        >>> ledger = Ledger(Limits(max_usd=100), reserve_fraction=0.15,
+        ...     goal_weights=None, journal=cast(JournalWriter, object()), ids=IdGen("r", 1))
+        >>> import anyio
+        >>> anyio.run(ledger.hold_final_slices, {"g": Amount()})
+        >>> ledger.goal_remaining("g").usd
+        85.0
+        """
+        goal = self._goal(goal_id)
+        amount = (
+            Amount()
+            if self._overflow_reservation is not None or goal.ended
+            else self._capped(_minimum(_positive(goal.left), _positive(self._total)))
+        )
+        return amount.to_estimate(
+            cap_tokens=self._limits.max_tokens is not None,
+            cap_usd=self._limits.max_usd is not None,
+        )
 
     def remaining(self, holder: str) -> Amount:
         """

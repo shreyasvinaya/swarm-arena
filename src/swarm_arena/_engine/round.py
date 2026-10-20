@@ -19,6 +19,7 @@ from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
+from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline
 from swarm_arena._errors import Fenced
@@ -78,6 +79,8 @@ class EngineDeps:
         Latched run and goal stops.
     clock : RunClock
         Accumulated active run time.
+    admission : RunAdmission or None, default=None
+        Shared scheduler capacity service; standalone goals initialize it.
 
     Examples
     --------
@@ -98,6 +101,7 @@ class EngineDeps:
     views: ViewWriter
     stops: StopState
     clock: RunClock
+    admission: RunAdmission | None = None
 
 
 @dataclass

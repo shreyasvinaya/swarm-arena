@@ -1,4 +1,5 @@
 import hashlib
+import json
 import math
 import os
 import secrets
@@ -13,6 +14,8 @@ from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from swarm_arena import Goal
 from swarm_arena._agent.context import AgentContext
+from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.goal import FileSet
@@ -30,6 +33,7 @@ from swarm_arena._model.tooling import (
 )
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext
+from swarm_arena._tooling.function_tool import FunctionTool
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Action, Tool
 from swarm_arena.manager import Manager, RoundReport
@@ -906,3 +910,80 @@ class FailingPreflightTool(PyTool):
 
     def preflight(self) -> None:
         raise RuntimeError("no license")
+def join_sum() -> dict[str, float]:
+    """Sum the assigned parents' value fields from their staged data files."""
+    return {
+        "value": sum(
+            float(json.loads(path.read_text())["value"])
+            for path in Path("parents").glob("*/data.json")
+        )
+    }
+
+
+SCOPE_PROBE_SEEN: list[LLMScope] = []
+
+
+class ScopeProbeJudge(Judge):
+    name = "probe"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        SCOPE_PROBE_SEEN.append(scope)
+        call = await scope.tranche.reserve_call(Amount(usd=0.01))
+        await scope.tranche.settle_call(call, Amount(usd=0.01))
+        scope.call_ids.append(f"llm-{len(SCOPE_PROBE_SEEN)}")
+        return [
+            Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
+            for c in candidates
+        ]
+
+
+class ConstantFingerprintTool(FunctionTool):
+    """Fingerprint independently of request data for distinct-selection tests."""
+
+    def fingerprint(self, output: ToolOutput) -> str:
+        return f"timeout-{self.config.timeout_s}"
+
+
+class RaisingFingerprintTool(FunctionTool):
+    """Contain a hook failure without making otherwise useful outputs fail."""
+
+    def fingerprint(self, output: ToolOutput) -> str:
+        raise RuntimeError("fingerprint-secret-sentinel")
+
+
+class AnchoredProviderJudge(ProviderJudge):
+    def anchor_count(self) -> int:
+        return 2
+
+
+def goal_part_value(value: float) -> dict[str, float]:
+    return {"value": value}
+
+
+def goal_score_value(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(candidate.output.data["value"])
+
+
+def goal_score_negative_value(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(candidate.output.data["value"])
+
+
+class FailLaterRoundCheck(Check):
+    name = "later"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(
+            check=self.name,
+            passed=candidate.round == 1,
+            reasons=[] if candidate.round == 1 else ["later round failed"],
+        )

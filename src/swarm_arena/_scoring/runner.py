@@ -123,6 +123,47 @@ async def run_checks(
     return results
 
 
+def prepare_judge_batch(
+    judge: Judge, candidates: Sequence[Candidate], leaders: Sequence[Candidate]
+) -> tuple[list[Candidate], frozenset[str]]:
+    """
+    Prepare the exact eligible and unique-anchor batch before funding it.
+
+    The caller contains exceptions from the judge's anchor hook. Prepared
+    batches passed to ``judge_round`` do not invoke that hook again.
+
+    Parameters
+    ----------
+    judge : Judge
+        Judge supplying the anchor count.
+    candidates : Sequence[Candidate]
+        New candidates, filtered by checks.
+    leaders : Sequence[Candidate]
+        Ranked leaders supplying the anchor prefix.
+
+    Returns
+    -------
+    tuple[list[Candidate], frozenset[str]]
+        Ordered batch and anchor ids.
+
+    Examples
+    --------
+    >>> from swarm_arena import ProgramJudge
+    >>> prepare_judge_batch(ProgramJudge("builtins:abs"), [], [])
+    ([], frozenset())
+    """
+    batch = [candidate for candidate in candidates if not candidate.gated_out]
+    if not batch:
+        return [], frozenset()
+    anchors = leaders[: judge.anchor_count()]
+    members = {candidate.id for candidate in batch}
+    for anchor in anchors:
+        if anchor.id not in members:
+            batch.append(anchor)
+            members.add(anchor.id)
+    return batch, frozenset(anchor.id for anchor in anchors)
+
+
 async def _judge_batch(
     ref: Ref,
     judge: Judge,
@@ -138,14 +179,7 @@ async def _judge_batch(
     nonfinite: set[str] = set()
     try:
         if leaders is not None:
-            anchors = leaders[: judge.anchor_count()]
-            batch = list(batch)
-            members = {candidate.id for candidate in batch}
-            for anchor in anchors:
-                if anchor.id not in members:
-                    batch.append(anchor)
-                    members.add(anchor.id)
-            ctx.anchors = frozenset(anchor.id for anchor in anchors)
+            batch, ctx.anchors = prepare_judge_batch(judge, batch, leaders)
         scores = await judge.judge(ctx.goal, batch, ctx)
         if (
             not isinstance(scores, Sequence)
@@ -196,6 +230,8 @@ async def judge_round(
     candidates: Sequence[Candidate],
     leaders: Sequence[Candidate],
     ctx_for: Callable[[Judge], JudgeContext],
+    *,
+    prepared: tuple[list[Candidate], frozenset[str]] | None = None,
 ) -> JudgeOutcome:
     """
     Judge gated-in candidates once per judge, adding its leader anchors.
@@ -218,6 +254,9 @@ async def judge_round(
         Ordered leaders whose prefix supplies each judge's anchors.
     ctx_for : Callable[[Judge], JudgeContext]
         Factory returning a new execution context for each judge.
+    prepared : tuple or None, default=None
+        Already funded batch and anchor ids for a single judge. The caller
+        contains preparation-hook failures before providing this value.
 
     Returns
     -------
@@ -243,8 +282,14 @@ async def judge_round(
     for ref, judge in judges:
         ctx = ctx_for(judge)
         ctx.batch_id = f"{goal_id}-{ref.component_name()}-{eligible[0].id}"
-        ctx.anchors = frozenset()
-        outcome = await _judge_batch(ref, judge, eligible, ctx, leaders=leaders)
+        ctx.anchors = frozenset() if prepared is None else prepared[1]
+        outcome = await _judge_batch(
+            ref,
+            judge,
+            eligible if prepared is None else prepared[0],
+            ctx,
+            leaders=leaders if prepared is None else None,
+        )
         scores.extend(outcome.scores)
         errors.extend(outcome.errors)
     return JudgeOutcome(scores=scores, errors=errors)

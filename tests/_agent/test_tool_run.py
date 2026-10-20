@@ -1066,3 +1066,49 @@ async def test_inflight_grace_remains_during_cancel_collection(rt_env: RtEnv) ->
             executor.release.set()
     assert rt_env.inflight.max_grace_s() == 0.0
     assert rt_env.events("tool_end")[-1].payload["candidate"]["output"]["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("mode", ["same", "raise", "invalid", "surrogate"])
+async def test_durable_fingerprint_uses_effective_tool_and_contains_failures(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    runtime = rt_env.rt
+    seen: list[ToolOutput] = []
+
+    def fingerprint(output: ToolOutput) -> Any:
+        seen.append(output)
+        if mode == "raise":
+            raise RuntimeError("fingerprint-secret-sentinel")
+        if mode == "invalid":
+            return 3
+        if mode == "surrogate":
+            return "\ud800"
+        return "same"
+
+    monkeypatch.setattr(runtime.tool, "fingerprint", fingerprint)
+    candidate = await execute_tool_run(runtime, {"x": 2.0}, parents=(), replicate=None, edits=None)
+    event = rt_env.events("tool_end")[-1]
+    assert seen == [candidate.output]
+    assert event.payload["fingerprint"] == ("same" if mode == "same" else None)
+    assert "fingerprint-secret-sentinel" not in event.model_dump_json()
+    if mode != "same":
+        assert any("fingerprint error:" in warning for warning in candidate.warnings)
+
+
+@pytest.mark.parametrize("status", [RunStatus.ERROR, RunStatus.LOST])
+async def test_unusable_output_has_no_fingerprint(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, status: RunStatus
+) -> None:
+    async def submit(job: Job) -> ToolOutput:
+        return ToolOutput(status=status, partial=True, data={"y": 1.0})
+
+    def fingerprint(output: ToolOutput) -> str:
+        raise AssertionError("unusable output reached fingerprint hook")
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", submit)
+    monkeypatch.setattr(rt_env.rt.tool, "fingerprint", fingerprint)
+    candidate = await execute_tool_run(
+        rt_env.rt, {"x": 2.0}, parents=(), replicate=None, edits=None
+    )
+    assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+    assert not candidate.warnings

@@ -727,3 +727,61 @@ def test_repeat_keys_folded() -> None:
     end = end.model_copy(update={"payload": {**end.payload, "repeat_key": "k1"}})
     state = RunState.from_events([*_PRE, end])
     assert state.goals["g"].repeat_keys == {"c-1": "k1"}
+
+
+def test_converge_state_folded() -> None:
+    events = [
+        *_PRE,
+        _ev(7, "part_kept", {"part": "b", "candidate_id": "c-b1"}, goal_id="g"),
+        _ev(8, "join_failed", {"attempt": 1, "reasons": ["x"]}, goal_id="g"),
+        _ev(9, "converge_started", {"select_only": True}, goal_id="g"),
+        _ev(10, "join_failed", {"attempt": 2, "reasons": ["y"]}, goal_id="g"),
+    ]
+    state = RunState.from_events(events)
+    g = state.goals["g"]
+    assert (g.kept_parts, g.join_attempts, g.select_only, g.converge_started) == (
+        {"b": "c-b1"},
+        2,
+        True,
+        True,
+    )
+    assert g.join_failures == ["x", "y"]
+    events += [
+        _ev(11, "goal_finished", {"reason": "stop"}, goal_id="g"),
+        _ev(12, "goal_started", {}, goal_id="g"),
+    ]
+    continued = RunState.from_events(events).goals["g"]
+    assert (continued.kept_parts, continued.join_attempts, continued.join_failures) == ({}, 0, [])
+
+
+def test_tool_fingerprints_folded_with_legacy_null() -> None:
+    first = _end(3, "c-1")
+    first = first.model_copy(update={"payload": {**first.payload, "fingerprint": "same"}})
+    state = RunState.from_events([*_PRE, first, _end(4, "c-2")])
+    assert state.fingerprints == {"c-1": "same", "c-2": None}
+
+
+def test_join_history_survives_round_and_resets_with_partition() -> None:
+    from swarm_arena import PartSpec
+
+    events = [
+        *_PRE,
+        _ev(3, "part_kept", {"part": "b", "candidate_id": "c-b1"}, goal_id="g"),
+        _ev(4, "join_failed", {"attempt": 1, "reasons": ["failed"]}, goal_id="g"),
+        _ev(5, "round_started", {"round": 2}, goal_id="g"),
+    ]
+    old = RunState.from_events(events).goals["g"]
+    assert (old.join_attempts, old.join_failures, old.kept_parts) == (1, ["failed"], {"b": "c-b1"})
+    plan = _plan().model_copy(
+        update={"parts": [PartSpec(name="a", goal=Goal(id="a", namespace="n"))], "revision": 1}
+    )
+    events.append(
+        _ev(
+            6,
+            "plan_revision",
+            {"plan": plan.model_dump(mode="json"), "origin": "autonomous"},
+            goal_id="g",
+        )
+    )
+    new = RunState.from_events(events).goals["g"]
+    assert (new.join_attempts, new.join_failures, new.kept_parts) == (0, [], {})

@@ -19,6 +19,7 @@ from swarm_arena._journal.a2a import task_to_json, tool_run_task
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.data import check_utf8
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate
@@ -616,6 +617,19 @@ async def _run(
             except Exception as error:
                 warnings.append(f"tool error: {type(error).__name__}")
                 output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
+        fingerprint: str | None = None
+        if output.status == RunStatus.OK or (
+            output.partial and output.status not in {RunStatus.ERROR, RunStatus.LOST}
+        ):
+            try:
+                value = await run_sync_daemon(rt.tool.fingerprint, output)
+                if not isinstance(value, str):
+                    raise TypeError("invalid fingerprint")
+                fingerprint = check_utf8(value)
+            except Fenced:
+                raise
+            except Exception as error:
+                warnings.append(f"fingerprint error: {type(error).__name__}")
         candidate = Candidate(
             id=id,
             run_id=rt.repeats.run_id,
@@ -666,6 +680,7 @@ async def _run(
             EventType.TOOL_END,
             candidate=candidate.model_dump(mode="json"),
             repeat_key=key,
+            fingerprint=fingerprint,
             a2a=task_to_json(tool_run_task(candidate, context_id=rt.repeats.run_id, at=utc_now())),
         ).model_copy(update={"task_id": id})
         event = await rt.journal.append_durable(end)
