@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import warnings
-from collections.abc import AsyncGenerator, Generator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -48,7 +48,11 @@ _DEFAULT_GOAL: Final = Goal(id="check", namespace="testing")
 _IDS: Final = IdGen("local", 0)
 _ROOT_LOCK: Final = threading.Lock()
 _LOG_TAIL_BYTES: Final = 2048
-_INVALID_COLLECT_NOTE: Final = f"swarm-arena: {_NOT_AN_OUTPUT}"  # as note_in_log writes it
+_NOTE_PREFIX: Final = "swarm-arena: "  # as note_in_log writes each note line
+_INVALID_COLLECT_NOTE: Final = _NOTE_PREFIX + _NOT_AN_OUTPUT
+# LocalExecutor gives an invalid collect result one of these statuses: the run's stop
+# status after a timeout or a cancel, else error.
+_REPLACED_COLLECT: Final = (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED)
 _root: str | None = None
 
 _C = TypeVar("_C", Tool, Check, Judge)
@@ -148,6 +152,25 @@ def _stderr_tail(out: ToolOutput) -> str:
     return data[-_LOG_TAIL_BYTES:].decode(errors="replace")
 
 
+def _has_invalid_collect_note(tail: str) -> bool:
+    """
+    Return whether a stderr tail holds LocalExecutor's invalid-collect note.
+
+    The note is a whole line. The executor writes it after the tool's last
+    output, so when that output has no final newline, the note ends the tool's
+    final line instead: then only the executor's own notes come after it.
+    """
+    lines = tail.splitlines()
+    if _INVALID_COLLECT_NOTE in lines:
+        return True
+    for line in reversed(lines):
+        if line.endswith(_INVALID_COLLECT_NOTE):
+            return True
+        if not line.startswith(_NOTE_PREFIX):
+            return False  # the tool's final line, and it does not end with the note
+    return False
+
+
 def _failed_runs(outputs: Sequence[tuple[str, object]]) -> list[str]:
     """Describe each run with status error and the end of its log (the tool's own text)."""
     return [
@@ -157,12 +180,14 @@ def _failed_runs(outputs: Sequence[tuple[str, object]]) -> list[str]:
     ]
 
 
-@contextlib.contextmanager
-def _failed_runs_on(notes: Sequence[str]) -> Generator[None, None, None]:
-    """Add the failed-run notes to a contract failure, so its stderr tail is never lost."""
+@contextlib.asynccontextmanager
+async def _failed_runs_on(runner: _Watched) -> AsyncGenerator[None, None]:
+    """Add the failed-run notes to any error from the block, which then propagates unchanged."""
     try:
         yield
-    except AssertionError as error:
+    except Exception as error:  # not BaseException: a cancellation stays as it is
+        with anyio.CancelScope(shield=True):  # bounded: it reads the stored logs' tails
+            notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs)
         for note in notes:
             error.add_note(note)
         raise
@@ -298,9 +323,10 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     if not isinstance(out, ToolOutput):
         raise _fail("Executor.submit() must return a ToolOutput")
     message = "Tool.collect() must return a valid ToolOutput (data must be finite JSON)"
-    # LocalExecutor turns an invalid collect result into status error with this exact note.
-    if getattr(out, "status", None) == RunStatus.ERROR and _INVALID_COLLECT_NOTE in (
-        _stderr_tail(out).splitlines()
+    # LocalExecutor replaces an invalid collect result with an empty output and this note,
+    # on every path; a tool's own text on an ok run is never taken for the note.
+    if getattr(out, "status", None) in _REPLACED_COLLECT and _has_invalid_collect_note(
+        _stderr_tail(out)
     ):
         raise _fail(message)
     try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
@@ -405,15 +431,22 @@ async def check_tool(
     ``UserWarning``, as the core gives a soft warning. The job runs on
     ``executor`` with the run identity ``local`` and the goal's id in its
     environment. A run that ends with status ``error`` gives a ``UserWarning``
-    with the last 2 KB of its stderr log; if a contract assert fails too, that
-    text is a note on the ``AssertionError`` instead.
+    with the last 2 KB of its stderr log. If the call raises an error after
+    such a run instead (a failed contract assert, or an error from the tool's
+    own methods), that text is a note on the error, which is otherwise passed
+    on unchanged.
 
     After the run, the output must be a valid ``ToolOutput`` (finite JSON data;
     it is validated again in lax mode, as the core does), and its files must
-    be in the artifact store. ``fingerprint()`` must
-    give the same nonempty str twice and must not depend on ``logs_ref`` or
-    the run times. ``collect()`` is also called once on an empty workspace with
-    a failed run: it may raise, but it must not report ``ok``.
+    be in the artifact store. An invalid ``collect()`` result is a contract
+    failure on every path: ``LocalExecutor`` replaces it with an empty output
+    (status ``error``, or ``timeout`` or ``cancelled`` for a stopped run) and a
+    note in the stderr log, and the kit raises the ``AssertionError`` for that
+    note.
+    ``fingerprint()`` must give the same nonempty str twice and must not
+    depend on ``logs_ref`` or the run times. ``collect()`` is also called once
+    on an empty workspace with a failed run: it may raise, but it must not
+    report ``ok``.
 
     Parameters
     ----------
@@ -486,12 +519,10 @@ async def check_tool(
         secrets_file=None,
         artifact_root=_artifact_root(),
     )
-    async with _executor(executor) as runner:
+    async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         out = await runner.submit(job)
-    notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs)
-    with _failed_runs_on(notes):  # a contract failure carries the tail; else it is a warning
         checked = await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
-    for note in notes:
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return checked
 
@@ -512,8 +543,9 @@ async def check_check(
     be valid in strict mode as it is: a value that a lax validation would
     repair, such as ``passed="no"``, is a contract failure. A command that ends
     with status ``error`` gives a ``UserWarning`` with the last 2 KB of its
-    stderr log; if a contract assert fails too, that text is a note on the
-    ``AssertionError`` instead.
+    stderr log. If the call raises an error after such a command instead (a
+    failed contract assert, or an error from ``check()`` itself), that text is
+    a note on the error, which is otherwise passed on unchanged.
 
     Parameters
     ----------
@@ -557,13 +589,10 @@ async def check_check(
     ref, built, goal = await anyio.to_thread.run_sync(_build, check, Check, goal)
     if built.feedback not in ("pass_fail", "reasons"):
         raise _fail("Check.feedback must be 'pass_fail' or 'reasons'")
-    async with _executor(executor) as runner:
+    async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         ctx = CheckContext(goal=goal, executor=runner, artifact_root=_artifact_root(), ids=_ids())
-        result = await built.check(candidate, ctx)
-    notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs)
-    with _failed_runs_on(notes):
-        result = _check_result(result)
-    for note in notes:
+        result = _check_result(await built.check(candidate, ctx))
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return result.model_copy(update={"check": ref.component_name()})
 
@@ -589,8 +618,9 @@ async def check_judge(
     non-finite key is dropped as a judge error, as the core rejects it. Every
     other score must be valid in strict mode as it is. A command that ends with
     status ``error`` gives a ``UserWarning`` with the last 2 KB of its stderr
-    log; if a contract assert fails too, that text is a note on the
-    ``AssertionError`` instead.
+    log. If the call raises an error after such a command instead (a failed
+    contract assert, or an error from ``judge()`` itself), that text is a note
+    on the error, which is otherwise passed on unchanged.
 
     Parameters
     ----------
@@ -630,7 +660,7 @@ async def check_judge(
     """
     ref, built, goal = await anyio.to_thread.run_sync(_build, judge, Judge, goal)
     await anyio.to_thread.run_sync(_check_judge_methods, ref, built)
-    async with _executor(executor) as runner:
+    async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         ctx = JudgeContext(
             goal=goal,
             executor=runner,
@@ -638,11 +668,11 @@ async def check_judge(
             ids=_ids(),
             batch_id="b-" + secrets.token_hex(4),
         )
-        scores = await built.judge(goal, candidates, ctx)
-    notes = await anyio.to_thread.run_sync(_failed_runs, runner.outputs)
-    with _failed_runs_on(notes):
-        valid, scored = _check_scores(scores, candidates, ctx)
-    for note in notes:
+        valid, scored = _check_scores(await built.judge(goal, candidates, ctx), candidates, ctx)
+        stamped = stamp_scores(
+            valid, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
+        )
+    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     for candidate_id, reason in ctx.errors.items():
         warnings.warn(f"judge error for {candidate_id}: {reason}", UserWarning, stacklevel=2)
@@ -650,6 +680,4 @@ async def check_judge(
         if candidate.id not in scored and candidate.id not in ctx.errors:
             message = f"judge gave no score and no judge error for {candidate.id}"
             warnings.warn(message, UserWarning, stacklevel=2)
-    return stamp_scores(
-        valid, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
-    )
+    return stamped

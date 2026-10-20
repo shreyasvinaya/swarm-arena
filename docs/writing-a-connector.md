@@ -137,8 +137,9 @@ writes its result to the path in `SWARM_ARENA_RESULT`
 ```
 
 `data` is required. The data returned by `collect()` must be finite JSON (no
-NaN and no infinity): `LocalExecutor` reports a violation as status `error`, and
-under `check_tool` it is an `AssertionError`. `usage`, `files`,
+NaN and no infinity): `LocalExecutor` reports a violation as status `error`
+(`timeout` or `cancelled` for a stopped run) with empty data, and under
+`check_tool` it is an `AssertionError` on every path. `usage`, `files`,
 `failed_provider`, and `schema_version` are optional in the file format that
 the built-in `ScriptTool` reader uses. The full contract (request shape,
 parents, edits, exit codes, partial results, the environment) is in
@@ -358,10 +359,13 @@ how a plan names it.
 
 ### When a run ends with status `error`
 
-The kit gives a `UserWarning` that holds the last 2 KB of the run's stderr log,
-for a tool run and for each command that a check or judge runs. If the same
-call also fails a contract, the kit adds that text to the `AssertionError` as a
-note instead, so the log is never lost. To keep the whole workspace, with its
+The kit shows the last 2 KB of the run's stderr log when a tool run, or a
+command that a check or judge runs, ends with status `error`. If the kit call
+then returns, each such run gives a `UserWarning` with that text. If the call
+raises an error after such a run instead (a failed contract assert, or an error
+from your own code that the kit passes on, such as a `KeyError` in
+`fingerprint()`, `check()`, or `judge()`), the kit adds the text to that error
+as a note and raises the error unchanged. To keep the whole workspace, with its
 logs, pass your own executor:
 
 ```python

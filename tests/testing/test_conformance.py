@@ -3,10 +3,12 @@ import subprocess
 import sys
 import traceback
 import warnings
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
@@ -24,12 +26,16 @@ from _fakes.tools import (
     FixedJudge,
     GoalCheck,
     InvalidCheckResult,
+    NanCollectTool,
     NotACheckResult,
     OkCollectTool,
     PanelJudge,
     PreflightFailsCheck,
     PyTool,
     RecordingExecutor,
+    ResultCheck,
+    ResultFingerprintTool,
+    ResultJudge,
     StrayJudge,
     add,
     manifest_size,
@@ -39,17 +45,36 @@ from _fakes.tools import (
 )
 from pydantic import ValidationError
 
-from swarm_arena import FunctionTool, Goal, Limits, ProgramJudge, Ref, ScriptCheck, ScriptTool
+from swarm_arena import (
+    FunctionTool,
+    Goal,
+    Limits,
+    ProgramJudge,
+    Ref,
+    Score,
+    ScriptCheck,
+    ScriptTool,
+)
 from swarm_arena._errors import ConfigError, SoftError
 from swarm_arena._model.ids import run_tag
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.base import open_store
 from swarm_arena.board import Candidate
 from swarm_arena.executor import Job, LocalExecutor
-from swarm_arena.scoring import Check, CheckContext, CheckResult, Judge, Lexicographic
+from swarm_arena.scoring import (
+    Check,
+    CheckContext,
+    CheckResult,
+    Judge,
+    JudgeContext,
+    Lexicographic,
+)
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
 from swarm_arena.testing._conformance import _artifact_root
-from swarm_arena.tool import FileRef, FileSet, RunStatus, ToolOutput, ToolRequest
+from swarm_arena.tool import Command, FileRef, FileSet, RunStatus, ToolOutput, ToolRequest
 
 SECRET = "SECRET_SENTINEL_KIT"
+INVALID_COLLECT_NOTE = "swarm-arena: collect failed: Tool.collect() did not return a ToolOutput"
 RUN_PY = """\
 import json, os
 data = {name: open(f"problem/{name}.txt").read() for name in ("a", "b")}
@@ -334,15 +359,192 @@ async def test_contract_failure_keeps_the_failed_run_tail(local_executor: LocalE
         assert "COMMAND-DIAG" in text
 
 
-async def test_note_check_matches_the_exact_note_line(local_executor: LocalExecutor) -> None:
-    # The tool prints the executor's note text inside its own line: that is not the note.
+async def test_any_error_after_a_failed_run_keeps_the_tail(local_executor: LocalExecutor) -> None:
+    # A connector's own error after a failed run is passed on unchanged, with the tail as a note.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the tail goes on the error, not a warning
+        with pytest.raises(KeyError) as tool:
+            await check_tool(
+                ResultFingerprintTool(PyTool.Config(code=FAILING_COMMAND)),
+                {},
+                executor=local_executor,
+            )
+        check = ResultCheck({"code": FAILING_COMMAND})
+        with pytest.raises(KeyError) as checked:
+            await check_check(check, make_candidate(ok()), executor=local_executor)
+        judge = ResultJudge({"code": FAILING_COMMAND})
+        with pytest.raises(KeyError) as judged:
+            await check_judge(judge, GOAL, [make_candidate(ok())], executor=local_executor)
+    for caught, method, key in [
+        (tool, "fingerprint", "result"),
+        (checked, "check", "passed"),
+        (judged, "judge", "value"),
+    ]:
+        error = caught.value
+        assert error.args == (key,)
+        assert (error.__cause__, error.__context__) == (None, None)  # not wrapped or chained
+        assert traceback.extract_tb(error.__traceback__)[-1].name == method  # raised there
+        [note] = error.__notes__
+        assert "ended with status error" in note
+        assert "COMMAND-DIAG" in note
+
+
+async def test_error_while_stamping_after_a_failed_command_keeps_the_tail(
+    local_executor: LocalExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    judged: list[bool] = []
+    judge = BrokenJudge.judge
+
+    async def judge_and_record(
+        self: BrokenJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        scores = await judge(self, goal, candidates, ctx)
+        judged.append(True)
+        return scores
+
+    def rubric_hash(self: BrokenJudge) -> str:  # its rubric file is gone once judge() ran
+        if judged:
+            raise OSError("rubric file is gone")
+        return "rubric"
+
+    monkeypatch.setattr(BrokenJudge, "judge", judge_and_record)
+    monkeypatch.setattr(BrokenJudge, "rubric_hash", rubric_hash)
+    broken_judge = BrokenJudge({"mode": "command_fails"})
+    with pytest.raises(OSError, match="rubric file is gone") as caught:
+        await check_judge(broken_judge, GOAL, [make_candidate(ok())], executor=local_executor)
+    assert "COMMAND-DIAG" in notes_of(caught.value)
+
+
+async def test_error_after_a_good_run_has_no_note(local_executor: LocalExecutor) -> None:
+    tool = ResultFingerprintTool(PyTool.Config(code=EMPTY_RESULT))
+    with pytest.raises(KeyError) as caught:
+        await check_tool(tool, {}, executor=local_executor)
+    assert not hasattr(caught.value, "__notes__")
+
+
+async def test_base_exception_after_a_failed_run_is_left_alone(
+    local_executor: LocalExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Stop(BaseException):  # like a cancellation: not an error of the connector
+        pass
+
+    async def check(self: ResultCheck, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        await ctx.execute(Command(argv=["python", "-c", FAILING_COMMAND]))
+        raise Stop
+
+    monkeypatch.setattr(ResultCheck, "check", check)
+    with pytest.raises(Stop) as caught:
+        await check_check(ResultCheck({"code": ""}), make_candidate(ok()), executor=local_executor)
+    assert not hasattr(caught.value, "__notes__")
+
+
+async def test_error_keeps_its_tail_when_the_caller_is_cancelled(
+    local_executor: LocalExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with anyio.CancelScope() as scope:
+
+        async def check(self: ResultCheck, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+            await ctx.execute(Command(argv=["python", "-c", FAILING_COMMAND]))
+            scope.cancel()  # the caller gives up while the check fails
+            raise KeyError("passed")
+
+        monkeypatch.setattr(ResultCheck, "check", check)
+        component = ResultCheck({"code": ""})
+        with pytest.raises(KeyError) as caught:
+            await check_check(component, make_candidate(ok()), executor=local_executor)
+    assert "COMMAND-DIAG" in notes_of(caught.value)
+
+
+async def test_note_check_matches_the_note_only_where_the_executor_writes_it(
+    local_executor: LocalExecutor,
+) -> None:
+    # The tool prints the executor's note text in its own line, and more output after it: the
+    # executor writes its note after the tool's last output, so this line is not the note.
     code = (
-        "import sys; sys.stderr.write('echo: swarm-arena: collect failed: Tool.collect() "
-        "did not return a ToolOutput\\n'); sys.exit(1)"
+        f"import sys; sys.stderr.write('echo: {INVALID_COLLECT_NOTE}\\nmore output\\n'); "
+        "sys.exit(1)"
     )
     with pytest.warns(UserWarning, match="ended with status error"):
         out = await check_tool(PyTool(PyTool.Config(code=code)), {}, executor=local_executor)
     assert out.status == RunStatus.ERROR
+
+
+async def test_note_joined_to_a_final_line_without_newline_counts(
+    local_executor: LocalExecutor,
+) -> None:
+    # The tool's last stderr write has no newline, so the executor's note joins that line.
+    code = EMPTY_RESULT + "; import sys; sys.stderr.write('50%')"
+    with pytest.raises(AssertionError, match=VALID_OUTPUT) as caught:
+        await check_tool(NanCollectTool(PyTool.Config(code=code)), {}, executor=local_executor)
+    assert f"50%{INVALID_COLLECT_NOTE}" in notes_of(caught.value)
+
+
+async def test_timed_out_run_with_an_invalid_collect_breaks_the_contract(
+    local_executor: LocalExecutor,
+) -> None:
+    # A broken collect is broken on every path: the executor gives timeout, not error, here.
+    tool = NanCollectTool(PyTool.Config(code="import time; time.sleep(60)", grace_s=0.5))
+    with pytest.raises(AssertionError, match=VALID_OUTPUT):
+        await check_tool(tool, {}, executor=local_executor, timeout_s=0.5)
+
+
+async def test_ok_run_whose_tool_prints_the_note_passes(local_executor: LocalExecutor) -> None:
+    # Only a failed or stopped run can hold the executor's note; the tool's own text cannot.
+    code = EMPTY_RESULT + f"; import sys; sys.stderr.write('{INVALID_COLLECT_NOTE}\\n')"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = await check_tool(PyTool(PyTool.Config(code=code)), {}, executor=local_executor)
+    assert out.status == RunStatus.OK
+
+
+def with_stderr(status: RunStatus, stderr: str) -> ToolOutput:
+    """Return an output whose stored stderr log is ``stderr``, as LocalExecutor stores it."""
+    store = ArtifactStore(open_store(_artifact_root()))
+    hashes = [store.put_bytes(b""), store.put_bytes(stderr.encode())]
+    return ToolOutput(status=status, logs_ref="sha256:" + ":".join(hashes))
+
+
+@pytest.mark.parametrize("status", list(RunStatus))
+async def test_note_check_reads_the_statuses_of_a_replaced_collect(status: RunStatus) -> None:
+    # LocalExecutor replaces an invalid collect with an empty error, timeout or cancelled output.
+    executor = FixedExecutor(with_stderr(status, INVALID_COLLECT_NOTE + "\n"))
+    tool = PyTool(PyTool.Config(code="pass"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the failed-run warning of status error
+        if status in (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED):
+            with pytest.raises(AssertionError, match=VALID_OUTPUT):
+                await check_tool(tool, {}, executor=executor)
+        else:
+            assert (await check_tool(tool, {}, executor=executor)).status == status
+
+
+@pytest.mark.parametrize(
+    ("stderr", "is_note"),
+    [
+        pytest.param(f"{INVALID_COLLECT_NOTE}\n", True, id="line"),
+        pytest.param(f"diag\n{INVALID_COLLECT_NOTE}", True, id="final-line-without-newline"),
+        pytest.param(f"{INVALID_COLLECT_NOTE}\nmore output\n", True, id="line-anywhere"),
+        pytest.param(f"50%{INVALID_COLLECT_NOTE}\n", True, id="joined-to-final-tool-line"),
+        pytest.param(
+            f"50%{INVALID_COLLECT_NOTE}\nswarm-arena: no partial output\n",
+            True,
+            id="joined-then-notes",
+        ),
+        pytest.param(f"echo: {INVALID_COLLECT_NOTE}\nmore output\n", False, id="tool-echo"),
+        pytest.param(f"x {INVALID_COLLECT_NOTE} y\n", False, id="inside-a-line"),
+        pytest.param(f"{INVALID_COLLECT_NOTE}.\n", False, id="other-text"),
+        pytest.param("", False, id="empty"),
+    ],
+)
+async def test_note_check_matches_whole_lines(stderr: str, is_note: bool) -> None:
+    executor = FixedExecutor(with_stderr(RunStatus.ERROR, stderr))
+    tool = PyTool(PyTool.Config(code="pass"))
+    if is_note:
+        with pytest.raises(AssertionError, match=VALID_OUTPUT):
+            await check_tool(tool, {}, executor=executor)
+    else:
+        with pytest.warns(UserWarning, match="ended with status error"):
+            assert (await check_tool(tool, {}, executor=executor)).status == RunStatus.ERROR
 
 
 async def test_output_files_in_the_store_pass(ws: Path, local_executor: LocalExecutor) -> None:
@@ -413,6 +615,21 @@ async def test_custom_executor_with_microsecond_times_passes() -> None:
             PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(out)
         )
     assert (checked.data, checked.started_at, checked.ended_at) == ({"x": 1}, when, when)
+
+
+async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
+    # Ruling 284: the core validates a ToolOutput again in lax mode. An executor that rebuilds
+    # the output from its JSON form without validation holds status "ok" as a str, which
+    # strict mode refuses.
+    sent = ToolOutput(status=RunStatus.OK, data={"x": 1})
+    rebuilt = ToolOutput.model_construct(**sent.model_dump(mode="json"))
+    assert type(rebuilt.status) is str
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        checked = await check_tool(
+            PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(rebuilt)
+        )
+    assert (checked.status, checked.data) == (RunStatus.OK, {"x": 1})
 
 
 async def test_preflight_runs_before_any_job() -> None:

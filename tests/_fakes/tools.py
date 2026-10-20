@@ -649,3 +649,53 @@ class GoalCheck(Check):
 
 def manifest_size(goal: Goal, candidate: Candidate) -> Score:
     return Score.maximize(len(goal.files.manifest))
+
+
+class ResultFingerprintTool(PyTool):  # reads a result key that a failed run does not have
+    def fingerprint(self, output: ToolOutput) -> str:
+        return str(output.data["result"])
+
+
+class NanCollectTool(PyTool):  # model_copy skips the finite-data validator, on every path
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        output = tool_output_from_result(workspace, run)
+        return output.model_copy(update={"data": {"x": math.nan}})
+
+
+class ResultCheck(Check):
+    """Run ``code`` through ``ctx.execute``, then read ``passed`` from its data unguarded."""
+
+    name = "result-check"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        code: str
+
+    @property
+    def config(self) -> Config:
+        return cast(ResultCheck.Config, super().config)
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        out = await ctx.execute(Command(argv=["python", "-c", self.config.code]))
+        return CheckResult(check=self.name, passed=out.data["passed"])
+
+
+class ResultJudge(Judge):
+    """Run ``code`` through ``ctx.execute``, then read ``value`` from its data unguarded."""
+
+    name = "result-judge"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        code: str
+
+    @property
+    def config(self) -> Config:
+        return cast(ResultJudge.Config, super().config)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        out = await ctx.execute(Command(argv=["python", "-c", self.config.code]))
+        value = out.data["value"]
+        return [Score.maximize(value).model_copy(update={"candidate_id": c.id}) for c in candidates]
