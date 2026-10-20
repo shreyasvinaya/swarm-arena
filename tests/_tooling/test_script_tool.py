@@ -722,7 +722,7 @@ async def test_module_import_shadowing_warning_preserves_behavior(tmp_path: Path
     from swarm_arena._tooling.files import snapshot_ref
     from swarm_arena.executor import LocalExecutor
     from swarm_arena.testing import check_tool
-    from swarm_arena.testing._conformance import _artifacts
+    from swarm_arena.testing._state import _artifacts
     from swarm_arena.tool import Tool
 
     (tmp_path / "run.py").write_text(
