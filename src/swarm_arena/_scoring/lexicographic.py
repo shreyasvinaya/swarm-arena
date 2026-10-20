@@ -7,7 +7,7 @@ from pydantic import Field, JsonValue
 
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
-from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel, _validate_config
+from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
@@ -67,7 +67,7 @@ class Lexicographic(Judge):
     def __init__(self, judges: Sequence[Judge | Ref] | Config, /) -> None:
         """Validate references without importing or constructing their members."""
         data = judges if isinstance(judges, self.Config) else {"judges": list(judges)}
-        self._config = _validate_config(self.Config, data, where="Lexicographic")
+        super().__init__(data)
         self._members: list[Judge] | None = None
 
     @property
@@ -94,18 +94,7 @@ class Lexicographic(Judge):
         if self._members is None:
             members: list[Judge] = []
             for ref in self.config.judges:
-                try:
-                    cls = ref.load()
-                except TypeError:
-                    raise TypeError(f"cannot build judge {ref.path}") from None
-                except Exception:
-                    raise ValueError(f"cannot import {ref.path}") from None
-                if not issubclass(cls, Judge):
-                    raise TypeError(f"cannot build judge {ref.path}: expected Judge subclass")
-                # The sanitized ConfigError names the member path once, as its prefix.
-                validated = _validate_config(
-                    cls.Config, ref.config, where=f"cannot build judge {ref.path}"
-                )
+                cls, validated = ref._resolve_config(Judge)
                 try:
                     members.append(cls(validated))
                 except TypeError:

@@ -6,21 +6,26 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 import anyio
 from pydantic import ConfigDict, Field, ValidationError
 
+from swarm_arena._model.base import StoredModel
+from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import FileSet, Goal
+from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Score
-from swarm_arena._model.tooling import RunStatus
+from swarm_arena._model.tooling import DEFAULT_GRACE_S, EnvName, GraceS, RunStatus, TimeoutS
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.script_check import _preflight_files, _result_error
 from swarm_arena._tooling.script_tool import script_command
 
 
-class _JudgeResultFile(_ConfigInputModel):
+class _JudgeResultFile(StoredModel):
     """Validate numeric judge output without coercing strings or booleans."""
 
-    model_config = ConfigDict(strict=True, extra="ignore", frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, allow_inf_nan=False)
 
+    schema_kind: ClassVar[str] = "judge_result"
+    schema_version: int = CURRENT["judge_result"]
     value: float | None = None
     key: list[float] | None = None
     verdict: str | None = None
@@ -87,10 +92,10 @@ class ScriptJudge(Judge):
         command: Annotated[list[str], Field(min_length=1)]
         python: str | None = None
         files: FileSet = FileSet()
-        env: list[Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]] = []
+        env: list[EnvName] = []
         direction: Literal["min", "max"] = "max"
-        timeout_s: Annotated[float, Field(gt=0)] | None = None
-        grace_s: Annotated[float, Field(ge=0)] = 10.0
+        timeout_s: TimeoutS | None = None
+        grace_s: GraceS = DEFAULT_GRACE_S
         resources: Resources = Resources()
 
     def __init__(self, config: Config | None = None, /, **fields: Any) -> None:
@@ -114,6 +119,34 @@ class ScriptJudge(Judge):
         ['x']
         """
         return cast(ScriptJudge.Config, super().config)
+
+    def rubric_hash(self) -> str:
+        """
+        Hash rubric settings while excluding timeout, grace and resources.
+
+        Returns
+        -------
+        str
+            SHA-256 identity of the scoring configuration.
+
+        Examples
+        --------
+        >>> from swarm_arena import ScriptJudge
+        >>> ScriptJudge(command=["judge"]).rubric_hash() == ScriptJudge(
+        ...     command=["judge"], timeout_s=2).rubric_hash()
+        True
+        """
+        cls = type(self)
+        return sha256_hex(
+            canonical_json(
+                {
+                    "path": f"{cls.__module__}:{cls.__qualname__}",
+                    "config": self.config.model_dump(
+                        mode="json", exclude={"timeout_s", "grace_s", "resources"}
+                    ),
+                }
+            )
+        )
 
     def preflight(self) -> None:
         """

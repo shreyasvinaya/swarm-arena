@@ -49,10 +49,8 @@ async def test_value_with_direction(
     assert (s.verdict, s.notes) == ("ok", "n")
 
 
-async def test_key_list_and_extras(
-    tmp_path: Path, artifacts: ArtifactStore, jctx: JudgeContext
-) -> None:
-    body = WRITE.format("{'key': [1, 2], 'value': 0.25, 'verdict': 'ok', 'notes': 'n', 'extra': 9}")
+async def test_key_list(tmp_path: Path, artifacts: ArtifactStore, jctx: JudgeContext) -> None:
+    body = WRITE.format("{'key': [1, 2], 'value': 0.25, 'verdict': 'ok', 'notes': 'n'}")
     judge = await anyio.to_thread.run_sync(sj, tmp_path, artifacts, body)
     [s] = await judge.judge(GOAL, [cand(id="c1")], jctx)
     assert (s.key, s.value, s.verdict, s.notes) == ((1.0, 2.0), 0.25, "ok", "n")
@@ -103,7 +101,7 @@ async def test_hidden_file_staged_for_the_judge(
     ("body", "error"),
     [
         ("raise SystemExit(1)", "judge script failed: error"),
-        (WRITE.format("{'other': 1}"), "result needs key or value"),
+        (WRITE.format("{'other': 1}"), "invalid judge result: <field>: extra_forbidden"),
     ],
 )
 async def test_failed_script_or_bad_result_is_judge_error(
@@ -187,9 +185,9 @@ async def test_executor_error_cancels_sibling() -> None:
 @pytest.mark.parametrize(
     "data",
     [
-        {"value": "SENTINEL_PRIVATE_VALUE_22"},
-        {"key": [], "notes": "SENTINEL_PRIVATE_VALUE_22"},
-        {"key": [float("inf")], "notes": "SENTINEL_PRIVATE_VALUE_22"},
+        {"value": "ad25cd43a1711e358861c29d157cf8df"},
+        {"key": [], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+        {"key": [float("inf")], "notes": "ad25cd43a1711e358861c29d157cf8df"},
     ],
 )
 async def test_result_errors_hide_secrets(data: dict[str, Any]) -> None:
@@ -200,7 +198,7 @@ async def test_result_errors_hide_secrets(data: dict[str, Any]) -> None:
     context = JudgeContext(goal=GOAL, executor=Results(), artifact_root="/a")
     assert await ScriptJudge(command=["x"]).judge(GOAL, [cand()], context) == []
     assert "invalid judge result" in context.errors["c1"]
-    assert "SENTINEL_PRIVATE_VALUE_22" not in repr(context.errors)
+    assert "ad25cd43a1711e358861c29d157cf8df" not in repr(context.errors)
 
 
 async def test_resources_pass_through() -> None:
@@ -269,3 +267,31 @@ async def test_nonfinite_candidate_output_does_not_cancel_batch(
     assert output.status is RunStatus.ERROR
     assert [score.candidate_id for score in scores] == ["good"]
     assert jctx.errors == {"bad": "judge script failed: error"}
+
+
+@pytest.mark.parametrize(
+    "settings", [{"timeout_s": 2}, {"grace_s": 20}, {"resources": {"cpus": 2}}]
+)
+def test_rubric_excludes_execution_settings(settings: dict[str, Any]) -> None:
+    assert (
+        ScriptJudge(command=["judge"]).rubric_hash()
+        == ScriptJudge(command=["judge"], **settings).rubric_hash()
+    )
+
+
+@pytest.mark.parametrize("version", [None, 1, 99, 0, True, "1"])
+async def test_judge_result_schema_version(jctx: JudgeContext, version: Any) -> None:
+    payload = {"value": 1.0}
+    if version is not None:
+        payload["schema_version"] = version
+
+    class ResultExecutor(RecordingExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            return ToolOutput(status=RunStatus.OK, data=payload)
+
+    jctx.executor = ResultExecutor()
+    result = await ScriptJudge(command=["judge"]).judge(GOAL, [cand()], jctx)
+    assert bool(result) is (version is None or (type(version) is int and version == 1))
+    if version == 99:
+        assert "schema_version" in repr(jctx.errors)
+        assert "newer" in repr(jctx.errors)

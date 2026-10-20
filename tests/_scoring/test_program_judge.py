@@ -18,7 +18,7 @@ from swarm_arena._scoring import program_judge
 from swarm_arena._scoring.judge import JudgeContext
 from swarm_arena._scoring.program_judge import ProgramJudge
 
-SECRET = "SENTINEL_TASK21_SECRET"
+SECRET = "6dca447c8d41f358f1c5dcc3d2e651cb"
 _REQUEST: contextvars.ContextVar[str] = contextvars.ContextVar("request", default="unset")
 
 
@@ -106,7 +106,7 @@ def test_lazy_import_and_sanitized_import_error(monkeypatch: pytest.MonkeyPatch)
     def fail(path: str) -> object:
         raise RuntimeError(SECRET)
 
-    monkeypatch.setattr(program_judge, "load_object", fail)
+    monkeypatch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
     judge = ProgramJudge("example:score")
     with pytest.raises(ValueError, match="cannot import example:score") as caught:
         judge.preflight()
@@ -200,7 +200,7 @@ async def test_invalid_non_key_fields_are_candidate_errors(
 
 async def test_score_subclass_with_an_extra_field_is_an_invalid_score(
     judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
-) -> None:  # IF3 A3: Score forbids extra fields, so re-validation refuses it
+) -> None:  # Score forbids extra fields, so re-validation refuses it
     class TaggedScore(Score):
         tag: str = SECRET
 
@@ -213,7 +213,7 @@ async def test_score_subclass_with_an_extra_field_is_an_invalid_score(
 
 async def test_candidate_copy_is_made_in_the_daemon_thread(
     judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
-) -> None:  # IF3 A3: a deep copy of a large output must not stall the event loop
+) -> None:  # a deep copy of a large output must not stall the event loop
     copied_on: list[threading.Thread] = []
     real_copy = Candidate.model_copy
 
@@ -233,7 +233,7 @@ async def test_candidate_copy_is_made_in_the_daemon_thread(
 
 async def test_scoring_function_sees_the_callers_context_variables(
     judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
-) -> None:  # IF3 A3: later plans read driver state through ContextVars
+) -> None:  # later plans read driver state through ContextVars
     seen: list[str] = []
 
     def score(goal: Goal, candidate: Candidate) -> Score:
@@ -363,3 +363,34 @@ def test_bound_instance_method_is_rejected_without_losing_binding() -> None:
 
     with pytest.raises(TypeError, match="bound instance method"):
         ProgramJudge(Scorer().score)
+
+
+async def test_system_exit_is_local_to_candidate(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def score(goal: Goal, candidate: Candidate) -> Score:
+        if candidate.id == "bad":
+            raise SystemExit(SECRET)
+        return Score.maximize(3)
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: score)
+    try:
+        scores = await ProgramJudge("example:score").judge(
+            GOAL, [cand(id="bad"), cand(id="good")], judge_ctx
+        )
+    except SystemExit:
+        pytest.fail("user SystemExit escaped judging")
+    assert [s.candidate_id for s in scores] == ["good"]
+    assert judge_ctx.errors == {"bad": "SystemExit: scoring function raised"}
+    assert SECRET not in repr(judge_ctx.errors)
+
+
+async def test_keyboard_interrupt_from_scoring_still_propagates(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def score(goal: Goal, candidate: Candidate) -> Score:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(program_judge, "load_object", lambda path: score)
+    with pytest.raises(KeyboardInterrupt):
+        await ProgramJudge("example:score").judge(GOAL, [cand()], judge_ctx)

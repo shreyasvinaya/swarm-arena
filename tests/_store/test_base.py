@@ -1,11 +1,13 @@
-import traceback
 from pathlib import Path
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._errors import ConditionalWritesUnsupported
 from swarm_arena._store.base import Blob, Store, open_store
 from swarm_arena._store.local import LocalStore
+
+SECRET = "9537d6d3032b2555b86a3df9fb9abdda"
 
 
 def test_blob() -> None:
@@ -36,12 +38,12 @@ def test_open_store_expands_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert open_store("~/artifacts").url == str(tmp_path / "artifacts")
 
 
-@pytest.mark.parametrize("scheme", ["s3", "gs", "file", "SECRET-sentinel+1.2"])
+@pytest.mark.parametrize("scheme", ["s3", "gs", "file", "scheme" + SECRET + "+1.2"])
 def test_scheme_errors_are_sanitized(scheme: str) -> None:
-    url = f"{scheme}://SECRET-sentinel:password@bucket/private"
+    url = f"{scheme}://9537d6d3032b2555b86a3df9fb9abdda:password@bucket/private"
     with pytest.raises(ConditionalWritesUnsupported) as caught:
         open_store(url)
-    assert "SECRET-sentinel" not in "".join(traceback.format_exception(caught.value))
+    assert_secret_absent(caught.value, SECRET)
 
 
 def test_base_child(tmp_path: Path) -> None:

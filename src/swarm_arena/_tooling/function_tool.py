@@ -1,7 +1,7 @@
 """Wrap annotated Python functions as subprocess tools."""
 
-import importlib
 import inspect
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, cast, get_type_hints
@@ -14,12 +14,20 @@ from pydantic import (
 
 from swarm_arena._model.ref import (
     _ConfigInputModel,
-    _validate_config,
     config_or_fields,
     import_path,
     load_object,
 )
-from swarm_arena._model.tooling import Command, CompletedRun, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    DEFAULT_GRACE_S,
+    Command,
+    CompletedRun,
+    EnvName,
+    GraceS,
+    TimeoutS,
+    ToolOutput,
+    ToolRequest,
+)
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
@@ -31,11 +39,8 @@ class _EmptyInputs(_ConfigInputModel):
 def _load_function(path: str) -> Callable[..., Any]:
     """Load through the shared cache without exposing import exception values."""
     module_name = path.split(":", 1)[0]
-    try:
-        fn = load_object(path)
-        module = importlib.import_module(module_name)
-    except (Exception, SystemExit):
-        raise ValueError(f"cannot import {path}") from None
+    fn = load_object(path)
+    module = sys.modules.get(module_name)
     # sys.modules can hold any object, so the spec is read defensively.
     spec = getattr(module, "__spec__", None)
     real = getattr(spec, "name", None)
@@ -124,8 +129,9 @@ def import_root(module_name: str) -> str:
     >>> Path(import_root("swarm_arena")).is_dir()
     True
     """
+    load_object(module_name + ":__name__")
     try:
-        module = importlib.import_module(module_name)
+        module = sys.modules.get(module_name)
         spec = getattr(module, "__spec__", None)
         file = getattr(module, "__file__", None)
         if file is None or spec is None:
@@ -145,6 +151,10 @@ class FunctionTool(Tool):
     Construction stores the reference without importing it. Use
     ``get_input_model()`` to inspect parameters; ``input_model`` is only an
     empty frozen placeholder. The function must return a finite JSON object.
+    Files written by the function are never uploaded, including checkpoints
+    retained after timeout or cancellation. Use ScriptTool or a custom Tool
+    when output files are needed. Environment names are explicitly allowlisted
+    with ``env`` and cannot be made planner-settable.
     The configured module must use its real import name; ``sys.modules`` aliases,
     and entries without an import spec (such as a class put there), are
     rejected during preflight with an identifier-only TypeError.
@@ -165,6 +175,7 @@ class FunctionTool(Tool):
     'my_package.tools:solve'
     """
 
+    _human_only: ClassVar[frozenset[str]] = frozenset({"env"})
     name: ClassVar[str] = "function"
     description: ClassVar[str] = "Runs a Python function in a subprocess."
     input_model: ClassVar[type[BaseModel]] = _EmptyInputs
@@ -181,10 +192,12 @@ class FunctionTool(Tool):
             Whether repeated requests should yield the same result.
         providers : list[str], default=[]
             Language-model provider names used by the function.
+        env : list[str], default=[]
+            Human-configured names forwarded through Command.env.
         timeout_s : float or None, default=None
-            Execution timeout, or None to use the run's tool timeout.
+            Positive execution timeout, or None to use the run's tool timeout.
         grace_s : float, default=10.0
-            Shutdown grace period before forced termination.
+            Nonnegative shutdown grace period before forced termination.
 
         Examples
         --------
@@ -197,8 +210,9 @@ class FunctionTool(Tool):
         function: str
         deterministic: bool = True
         providers: list[str] = []
-        timeout_s: float | None = None
-        grace_s: float = 10.0
+        env: list[EnvName] = []
+        timeout_s: TimeoutS | None = None
+        grace_s: GraceS = DEFAULT_GRACE_S
 
     def __init__(
         self, function: "str | Callable[..., Any] | FunctionTool.Config", /, **fields: Any
@@ -211,7 +225,7 @@ class FunctionTool(Tool):
         else:
             path = import_path(function) if callable(function) else function
             data = {**fields, "function": path}
-        super().__init__(_validate_config(self.Config, data, where="FunctionTool"))
+        super().__init__(data)
 
     @property
     def config(self) -> Config:
@@ -358,13 +372,14 @@ class FunctionTool(Tool):
                 import_root(self.config.function.split(":", 1)[0]),
                 self.config.function,
             ],
+            env=self.config.env,
             timeout_s=self.config.timeout_s,
             grace_s=self.config.grace_s,
         )
 
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
         """
-        Collect the function's result using the standard tool envelope rules.
+        Collect structured function data, ignoring output-file declarations.
 
         Parameters
         ----------
@@ -401,4 +416,4 @@ class FunctionTool(Tool):
         >>> output.data
         {'sum': 5}
         """
-        return tool_output_from_result(workspace, run)
+        return tool_output_from_result(workspace, run, include_files=False)

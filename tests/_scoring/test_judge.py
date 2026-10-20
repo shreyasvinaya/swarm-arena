@@ -1,6 +1,5 @@
-import traceback
-
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, FixedJudge, RecordingExecutor, cand
 from pydantic import BaseModel, ConfigDict, field_serializer
 
@@ -201,7 +200,7 @@ def test_is_finite_score_accepts_finite_numeric_tuple(key: tuple[int | float, ..
 
 
 def test_rubric_hash_sanitizes_serialization_errors() -> None:
-    secret = "SECRET_SENTINEL_RUBRIC"
+    secret = "1748c57f137692a66d528db35a73990b_RUBRIC"
 
     class BrokenConfig(BaseModel):
         model_config = ConfigDict(extra="forbid", frozen=True)
@@ -215,6 +214,6 @@ def test_rubric_hash_sanitizes_serialization_errors() -> None:
     j._config = BrokenConfig(value=secret)
     with pytest.raises(ValueError, match="cannot encode judge rubric") as error:
         j.rubric_hash()
-    assert secret not in "".join(traceback.format_exception(error.value))
+    assert_secret_absent(error.value, secret)
     assert error.value.__cause__ is None
     assert error.value.__suppress_context__

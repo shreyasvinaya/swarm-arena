@@ -9,10 +9,10 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from traceback import format_exception
 from typing import Any, Never
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import cand
 from pydantic import ValidationError
 
@@ -45,7 +45,7 @@ from swarm_arena._tooling.staging import (
 
 H = "1" * 64
 CAP = 2**20  # the output cap every collect_output_files call passes
-SECRET = "round-three-secret-contents"
+SECRET = "d383bdc024161c045a536ba242373511"
 EDIT_CASES = [
     ({"p/sub/a.txt"}, {"p/SUB/b.txt": SECRET}),
     (set(), {"p/sub/a.txt": SECRET, "p/SUB/b.txt": SECRET}),
@@ -60,6 +60,11 @@ EDIT_CASES = [
     ({"p/a.txt"}, {"p": SECRET}),
     ({"p"}, {"p/a.txt": SECRET}),
 ]
+
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:editable glob permits Python import shadowing:UserWarning"
+)
 
 
 @pytest.mark.parametrize(("root", "edits"), EDIT_CASES)
@@ -87,7 +92,7 @@ def test_edit_layout_soft_refusal(root: set[str], edits: dict[str, str], operati
         invoke()
     for path in root | edits.keys():
         assert path in str(exc.value)
-    assert SECRET not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)
 
 
 CAFE_PY = "p/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py"
@@ -154,7 +159,7 @@ def test_exact_tool_file_replaces_goal_file(tmp_path: Path, artifacts: ArtifactS
 )
 def test_tool_root_names_the_layer_that_conflicts(
     goal_files: dict[str, str], tool_files: dict[str, str], message: str
-) -> None:  # IF3 A0b
+) -> None:
     with pytest.raises(ConfigError, match=exactly(message)):
         tool_root(goal_files, tool_files)
     with pytest.raises(ConfigError, match=exactly(message)):
@@ -167,7 +172,7 @@ def test_tool_root_names_the_layer_that_conflicts(
 )
 def test_declared_output_must_use_its_on_disk_spelling(
     tmp_path: Path, artifacts: ArtifactStore, on_disk: str, declared: str
-) -> None:  # IF3 A0b: the same rule as snapshots (G6)
+) -> None:  # the same rule as snapshots
     ws = tmp_path / "ws"
     (ws / on_disk).parent.mkdir(parents=True)
     (ws / on_disk).write_text(SECRET)
@@ -246,7 +251,7 @@ def test_output_ancestor_conflict_before_upload(
         collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert first in str(exc.value)
     assert second in str(exc.value)
-    assert SECRET not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)
     with pytest.raises(NotFound):
         artifacts.get_bytes(sha256_hex(SECRET.encode()))
 
@@ -320,7 +325,7 @@ def test_collection_checks_full_stage_layout(
     assert "P/b.txt" in str(exc.value)
 
 
-# --- Canonical caseless keys (G1) ---
+# --- Canonical caseless keys ---
 
 SCRIPT = "problem/\N{LATIN SMALL LETTER S WITH CARON}olver.py"
 SCRIPT_ALIAS = "problem/\N{LATIN SMALL LETTER LONG S}\N{COMBINING CARON}olver.py"
@@ -373,12 +378,12 @@ def test_canonical_caseless_edits_collide() -> None:
         validate_edits(edits, editable=["**/*"], protected=set(), max_edit_bytes=100)
     assert NOTE in str(exc.value)
     assert NOTE_ALIAS in str(exc.value)
-    assert SECRET not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)
     with pytest.raises(SoftError, match="folded path collision"):
         _tool_stage(edits=edits)
 
 
-# --- A respelling is refused wherever two layers merge (G9) ---
+# --- A respelling is refused wherever two layers merge ---
 
 
 def test_each_producer_refuses_a_respelling_with_its_own_error(
@@ -455,7 +460,7 @@ def test_exact_spellings_pass_every_producer_and_later_stage(
     assert (tmp_path / "later/parents/c1/p/out.txt").read_bytes() == b"OUT"
 
 
-# --- data.json is reserved at the top of a parent tree (G3) ---
+# --- data.json is reserved at the top of a parent tree ---
 
 
 @pytest.mark.parametrize("path", ["data.json/x", "Data.json/x", "DATA.json/notes.txt"])
@@ -463,7 +468,7 @@ def test_parent_data_directory_edit_is_soft_refused(path: str) -> None:
     with pytest.raises(SoftError) as exc:
         validate_edits({path: SECRET}, editable=["**/*"], protected=set(), max_edit_bytes=100)
     assert str(exc.value) == f"{path}: folded path collision with parent data.json"
-    assert SECRET not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, SECRET)
     with pytest.raises(SoftError) as exc:
         _tool_stage(edits={path: SECRET})
     assert str(exc.value) == f"{path}: folded path collision with parent data.json"
@@ -511,7 +516,7 @@ def test_parent_data_directory_output_fails_producing_run(
     assert path in completed.stderr_path.read_text()
 
 
-# --- A base overlay that does not fit the root is a soft warning (G4) ---
+# --- A base overlay that does not fit the root is a soft warning ---
 
 
 @pytest.mark.parametrize(
@@ -535,7 +540,7 @@ def test_base_overlay_layout_conflict_is_a_soft_warning(overlay: dict[str, str])
     ]
 
 
-# --- Merge and layout errors keep the tree context (G7) ---
+# --- Merge and layout errors keep the tree context ---
 
 
 def test_merge_errors_name_the_parent_or_tree(tmp_path: Path, artifacts: ArtifactStore) -> None:
@@ -561,7 +566,7 @@ def test_merge_errors_name_the_parent_or_tree(tmp_path: Path, artifacts: Artifac
         effective_files(goal, cand(overlay={"P/b.txt": H}))
 
 
-# --- The generated layout is computed once (G8) ---
+# --- The generated layout is computed once ---
 
 
 def test_collection_reuses_the_stage_layout_without_serializing(
@@ -583,8 +588,6 @@ def test_collection_reuses_the_stage_layout_without_serializing(
     [ref] = collect_output_files(tmp_path, ["out.txt"], artifacts, stage=stage, max_bytes=CAP)
     assert ref.path == "out.txt"
 
-
-# --- Workspace paths are strict UTF-8 (integration fix 3, A0) ---
 
 # The surrogateescape spelling of SCRIPT: the same bytes on disk, another fold_key.
 SCRIPT_BYTES = SCRIPT.encode().decode("ascii", "surrogateescape")
@@ -620,7 +623,7 @@ def test_surrogate_spelling_cannot_overwrite_a_protected_script(
         )
     assert str(soft.value) == f"{SCRIPT_BYTES!r}: not valid UTF-8"
     str(soft.value).encode("utf-8")
-    assert SECRET not in "".join(format_exception(soft.value))
+    assert_secret_absent(soft.value, SECRET)
     # Planning, edit storing, the tool root and every protected-set builder refuse it.
     attempts: list[Callable[[], object]] = [
         lambda: _tool_stage(
@@ -635,7 +638,7 @@ def test_surrogate_spelling_cannot_overwrite_a_protected_script(
     for attempt in attempts:
         with pytest.raises(ValueError, match="not valid UTF-8") as exc:
             attempt()
-        assert SECRET not in "".join(format_exception(exc.value))
+        assert_secret_absent(exc.value, SECRET)
     # The sink refuses a bypassed model before it writes anything.
     stage = Job.Stage.model_construct(root={**goal, SCRIPT_BYTES: artifacts.put_bytes(b"AGENT")})
     with pytest.raises(ValueError, match="not valid UTF-8"):

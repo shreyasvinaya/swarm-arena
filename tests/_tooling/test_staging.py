@@ -1,6 +1,7 @@
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, cand
 
 from swarm_arena._errors import NotFound, SoftError
@@ -28,7 +29,7 @@ from swarm_arena._tooling.staging import (
 H1, H2, H3 = "1" * 64, "2" * 64, "3" * 64
 
 
-def test_tool_identity_ignores_spelling() -> None:  # Review Focus 5
+def test_tool_identity_ignores_spelling() -> None:
     toml_form = Ref(path="_fakes.tools:PyTool", config={"code": "x"})
     python_form = Ref.of(PyTool(PyTool.Config(code="x", grace_s=10.0)))
     assert tool_identity(toml_form, None) == tool_identity(python_form, None)
@@ -74,13 +75,13 @@ def stage(**kw: Any) -> tuple[Job.Stage, dict[str, str], list[str]]:
 def test_folded_edit_is_protected(protected: str, edit: str) -> None:
     with pytest.raises(SoftError, match="protected") as exc:
         validate_edits(
-            {edit: "secret-edit-sentinel"},
+            {edit: "08907f89bd5ee3b619d71ae6fe51976f"},
             editable=["**/*"],
             protected={protected},
             max_edit_bytes=100,
         )
     assert str(exc.value) == f"{edit}: protected"
-    assert "secret-edit-sentinel" not in str(exc.value)
+    assert_secret_absent(exc.value, "08907f89bd5ee3b619d71ae6fe51976f")
 
 
 @pytest.mark.parametrize("boundary", ["protected", "private_paths"])
@@ -91,7 +92,10 @@ def test_folded_staging_permissions(original: str, variant: str, boundary: str) 
     permissions = {boundary: {original}}
     with pytest.raises(RuntimeError, match="edit path not editable"):
         stage(
-            goal_files={}, editable=["p/*"], edits={variant: "secret-edit-sentinel"}, **permissions
+            goal_files={},
+            editable=["p/*"],
+            edits={variant: "08907f89bd5ee3b619d71ae6fe51976f"},
+            **permissions,
         )
     parent = ParentRef(
         candidate_id="c1", run_id="r", tool_identity="T", overlay={variant: H3, "p/a.txt": H3}
@@ -327,17 +331,16 @@ def test_edit_validation_uses_utf8_bytes_and_does_not_echo_contents() -> None:
             max_edit_bytes=3,
         )
     assert "p/a.txt: 4 bytes > max_edit_bytes 3" in str(exc.value)
-    assert secret not in str(exc.value)
+    assert_secret_absent(exc.value, secret)
 
 
 def test_fixed_config_sanitizes_validation_errors() -> None:
-    import traceback
 
     secret = "secret-sentinel-0123456789"
     ref = Ref(path="_fakes.tools:PyTool", config={"code": "x", "timeout_s": secret})
     with pytest.raises(ValueError, match="timeout_s") as exc:
         fixed_config(ref, None)
-    assert secret not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
     assert "timeout_s" in str(exc.value)
 
 
@@ -370,25 +373,30 @@ def test_script_stage_output_wins_and_keeps_effective_and_own_files_separate() -
 def test_identity_errors_suppress_secret_exception_chains(
     monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    from traceback import format_exception
     from typing import Never
 
     import swarm_arena._tooling.staging as staging
 
-    secret = "identity-secret-sentinel"
+    secret = "78fd74b433f755f5a2c7b176003d66be"
 
     def fail(*args: Any, **kwargs: Any) -> Never:
         raise ValueError(secret)
 
     if operation == "import":
-        monkeypatch.setattr(Ref, "load", fail)
+        monkeypatch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
     elif operation == "serialize":
         monkeypatch.setattr(PyTool.Config, "model_dump", fail)
     else:
         monkeypatch.setattr(staging, "canonical_json", fail)
     with pytest.raises(ValueError, match="cannot") as exc:
-        tool_identity(Ref(path="_fakes.tools:PyTool", config={"code": secret}), None)
-    assert secret not in "".join(format_exception(exc.value))
+        tool_identity(
+            Ref(
+                path="sentinel_import:PyTool" if operation == "import" else "_fakes.tools:PyTool",
+                config={"code": secret},
+            ),
+            None,
+        )
+    assert_secret_absent(exc.value, secret)
 
 
 @pytest.mark.parametrize(
@@ -398,15 +406,15 @@ def test_identity_errors_suppress_secret_exception_chains(
 def test_validate_edits_soft_refuses_folded_duplicates(first: str, second: str) -> None:
     with pytest.raises(SoftError, match="folded path collision") as exc:
         validate_edits(
-            {first: "secret-edit-sentinel", second: "replacement"},
+            {first: "08907f89bd5ee3b619d71ae6fe51976f", second: "replacement"},
             editable=["p/*"],
             protected=set(),
             max_edit_bytes=100,
         )
     assert first in str(exc.value)
     assert second in str(exc.value)
-    assert "secret-edit-sentinel" not in str(exc.value)
-    assert "replacement" not in str(exc.value)
+    assert_secret_absent(exc.value, "08907f89bd5ee3b619d71ae6fe51976f")
+    assert_secret_absent(exc.value, "replacement")
 
 
 @pytest.mark.parametrize(
@@ -416,7 +424,7 @@ def test_validate_edits_soft_refuses_folded_duplicates(first: str, second: str) 
 def test_validate_edits_soft_refuses_folded_root_alias(stored: str, edit: str) -> None:
     with pytest.raises(SoftError, match="folded path collision") as exc:
         validate_edits(
-            {edit: "secret-edit-sentinel"},
+            {edit: "08907f89bd5ee3b619d71ae6fe51976f"},
             root={stored},
             editable=["p/*"],
             protected=set(),
@@ -424,7 +432,7 @@ def test_validate_edits_soft_refuses_folded_root_alias(stored: str, edit: str) -
         )
     assert stored in str(exc.value)
     assert edit in str(exc.value)
-    assert "secret-edit-sentinel" not in str(exc.value)
+    assert_secret_absent(exc.value, "08907f89bd5ee3b619d71ae6fe51976f")
 
 
 @pytest.mark.parametrize("source", ["edits", "goal", "tool", "parent"])
@@ -450,3 +458,23 @@ def test_validate_edits_keeps_exact_root_updates_and_distinct_names() -> None:
     assert st.root == {"p/run.py": H1, **edit_hashes(edits)}
     assert overlay == edit_hashes(edits)
     assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "path", ["a" * 300, "/".join(["a"] * 246), "/".join(["a" * 255] * 5), "p/\u0378.txt", "p/a/b"]
+)
+def test_bad_edit_paths_are_soft_refusals(path: str) -> None:
+    with pytest.raises(SoftError):
+        validate_edits(
+            {path: "ok"},
+            editable=["p/a?b"] if path == "p/a/b" else ["**"],
+            protected=frozenset(),
+            max_edit_bytes=100,
+        )
+
+
+def test_overlay_without_identity_names_missing_identity() -> None:
+    parent = ParentRef(candidate_id="c0", run_id="r", tool_identity="", overlay={"p/a.txt": H3})
+    _, overlay, notes = stage(parents=[parent])
+    assert not overlay
+    assert notes == ["base parent c0 not overlaid: has no tool identity; paths: p/a.txt"]

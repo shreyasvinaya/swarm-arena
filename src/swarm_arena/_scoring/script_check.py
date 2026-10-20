@@ -4,18 +4,20 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from swarm_arena._model.base import _sanitize_validation_error
-from swarm_arena._model.canonical import canonical_json
+from swarm_arena._model.base import StoredModel, _sanitize_validation_error
+from swarm_arena._model.data import finite_json
+from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import FileSet
+from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, CheckResult
-from swarm_arena._model.tooling import RunStatus
+from swarm_arena._model.tooling import DEFAULT_GRACE_S, EnvName, GraceS, RunStatus, TimeoutS
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._tooling.script_tool import script_command
 
 
-class _CheckResultFile(_ConfigInputModel):
+class _CheckResultFile(StoredModel):
     """
     Validate check output strictly without exposing rejected values.
 
@@ -43,17 +45,18 @@ class _CheckResultFile(_ConfigInputModel):
 
     passed: bool
     reasons: list[str] = []
+    schema_kind: ClassVar[str] = "check_result"
+    schema_version: int = CURRENT["check_result"]
     details: dict[str, Any] = {}
 
     @field_validator("details")
     @classmethod
-    def _finite_details(cls, details: dict[str, Any]) -> dict[str, Any]:
-        """Require finite JSON details without echoing values or dynamic keys."""
+    def _details_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Delegate the check to finite_json, preserving the field's fixed reason."""
         try:
-            canonical_json(details)
-        except (TypeError, ValueError, OverflowError, RecursionError):
+            return finite_json(value)
+        except ValueError:
             raise ValueError("details must be finite JSON") from None
-        return details
 
 
 def _preflight_files(name: str, files: FileSet) -> None:
@@ -64,9 +67,8 @@ def _preflight_files(name: str, files: FileSet) -> None:
 
 def _result_error(kind: str, model: type[BaseModel], error: Exception) -> str:
     """Render the first validation code with only safe schema locations."""
-    first = _sanitize_validation_error(model, error).errors()[0]
-    location = ".".join(str(part) for part in first.get("loc", ()))
-    return f"invalid {kind} result: {location}: {first['type']}"
+    safe = _sanitize_validation_error(model, error)
+    return f"invalid {kind} result: " + validation_summary(safe)
 
 
 class ScriptCheck(Check):
@@ -129,10 +131,10 @@ class ScriptCheck(Check):
         command: Annotated[list[str], Field(min_length=1)]
         python: str | None = None
         files: FileSet = FileSet()
-        env: list[Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]] = []
+        env: list[EnvName] = []
         feedback: Literal["pass_fail", "reasons"] = "reasons"
-        timeout_s: Annotated[float, Field(gt=0)] | None = None
-        grace_s: Annotated[float, Field(ge=0)] = 10.0
+        timeout_s: TimeoutS | None = None
+        grace_s: GraceS = DEFAULT_GRACE_S
         resources: Resources = Resources()
 
     def __init__(self, config: Config | None = None, /, **fields: Any) -> None:

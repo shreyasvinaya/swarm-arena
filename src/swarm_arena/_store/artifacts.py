@@ -1,7 +1,10 @@
 """Store immutable file contents by SHA-256 and verify every retrieval."""
 
 import contextlib
+import os
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Final
 
 from pydantic import ValidationError
 
@@ -9,6 +12,9 @@ from swarm_arena._errors import AlreadyExists, StorageError
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.tooling import FileRef
 from swarm_arena._store.base import Store
+from swarm_arena._store.local import LocalStore
+
+_MAX_ARTIFACT_BYTES: Final = 2**30
 
 
 class ArtifactStore:
@@ -57,11 +63,14 @@ class ArtifactStore:
 
         Callers can set a workspace-relative path with ``model_copy``. The
         basename must satisfy ``FileRef.path`` rules, including reserved names.
+        Reads refuse symlinks in every component and nonregular sources, and
+        cap each file at 1 GiB before reading. Hashing and publication use
+        1 MiB chunks and atomic, write-once local storage.
 
         Parameters
         ----------
         path : Path
-            Source file to read.
+            Regular source file, at most 1 GiB, without symlinked components.
 
         Returns
         -------
@@ -77,21 +86,42 @@ class ArtifactStore:
 
         Examples
         --------
-        >>> ref = artifacts.put_file(Path("results/output.txt"))  # doctest: +SKIP
-        >>> ref.path  # doctest: +SKIP
-        'output.txt'
+        >>> from tempfile import TemporaryDirectory
+        >>> from swarm_arena._store.base import open_store
+        >>> with TemporaryDirectory() as tmp:
+        ...     root = Path(tmp).resolve()
+        ...     artifacts = ArtifactStore(open_store(str(root / "artifacts")))
+        ...     _ = (root / "output.txt").write_bytes(b"hello")
+        ...     ref = artifacts.put_file(root / "output.txt")
+        ...     (ref.path, ref.size, artifacts.get_bytes(ref.sha256))
+        ('output.txt', 5, b'hello')
         """
+        from swarm_arena._tooling.result_file import _chunks, open_regular_file
+
         try:
-            data = path.read_bytes()
-        except OSError:
-            raise StorageError("artifact source read failed") from None
-        digest = sha256_hex(data)
-        try:
-            ref = FileRef(name=path.name, path=path.name, sha256=digest, size=len(data))
+            FileRef(name=path.name, path=path.name, sha256="0" * 64, size=0)
         except ValidationError:
             raise ValueError("invalid artifact file reference: path") from None
-        self.put_bytes(data)
-        return ref
+        absolute = path.absolute()
+        try:
+            fd = open_regular_file(
+                Path(absolute.anchor), absolute.relative_to(absolute.anchor).as_posix()
+            )
+            try:
+                digest, size = self._put_chunks(
+                    _chunks(fd, path.name, _MAX_ARTIFACT_BYTES, step=2**20)
+                )
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            raise StorageError("artifact source read failed") from None
+        return FileRef(name=path.name, path=path.name, sha256=digest, size=size)
+
+    def _put_chunks(self, chunks: Iterable[bytes]) -> tuple[str, int]:
+        """Publish local artifact chunks without adding a streaming Store API."""
+        if not isinstance(self._store, LocalStore):
+            raise StorageError("streamed artifacts require local storage")
+        return self._store._create_artifact(chunks)
 
     def get_bytes(self, sha256: str) -> bytes:
         """Read artifact contents and verify their digest.
@@ -126,6 +156,10 @@ class ArtifactStore:
     def fetch(self, sha256: str, dest: Path, *, read_only: bool = True) -> None:
         """Write verified contents to a destination with explicit permissions.
 
+        Reads are capped at 1 GiB and refuse symlinks or special files. A
+        destination is published atomically through pinned directories; no
+        symlinked directory or leaf is followed and hardlinks are replaced.
+
         Parameters
         ----------
         sha256 : str
@@ -142,12 +176,31 @@ class ArtifactStore:
 
         Examples
         --------
-        >>> artifacts.fetch(digest, Path("workspace/input.txt"))  # doctest: +SKIP
+        >>> from tempfile import TemporaryDirectory
+        >>> from swarm_arena._store.base import open_store
+        >>> with TemporaryDirectory() as tmp:
+        ...     root = Path(tmp).resolve()
+        ...     artifacts = ArtifactStore(open_store(str(root / "artifacts")))
+        ...     digest = artifacts.put_bytes(b"hello")
+        ...     artifacts.fetch(digest, root / "workspace/input.txt")
+        ...     (root / "workspace/input.txt").read_bytes()
+        b'hello'
         """
-        data = self.get_bytes(sha256)
+        from swarm_arena._tooling.materialize import _directory, _write
+        from swarm_arena._tooling.result_file import read_regular_file
+
+        if not isinstance(self._store, LocalStore):
+            raise StorageError("artifact fetch requires local storage")
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            dest.chmod(0o444 if read_only else 0o644)
-        except OSError:
-            raise StorageError("artifact destination write failed") from None
+            data = read_regular_file(Path(self._store.url), sha256, max_bytes=_MAX_ARTIFACT_BYTES)
+            if sha256_hex(data) != sha256:
+                raise StorageError("artifact failed its hash check")
+            absolute = dest.absolute()
+            root = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with _directory(root, absolute.parts[1:-1]) as directory:
+                    _write(directory, absolute.name, data, read_only=read_only)
+            finally:
+                os.close(root)
+        except (OSError, ValueError):
+            raise StorageError("artifact destination or source failed") from None

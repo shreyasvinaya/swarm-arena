@@ -1,6 +1,9 @@
 """Publish complete local objects with an exclusive temporary file and hard link."""
 
+import contextlib
+import hashlib
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from secrets import token_hex
 
@@ -125,6 +128,30 @@ class LocalStore(Store):
         except OSError:
             raise OSError("store create failed") from None
         return sha256_hex(data)
+
+    def _create_artifact(self, chunks: Iterable[bytes]) -> tuple[str, int]:
+        """Hash and publish one artifact with memory bounded by the input chunk size."""
+        temp = self._root / f".artifact.tmp-{token_hex(16)}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                for chunk in chunks:
+                    stream.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            key = digest.hexdigest()
+            with contextlib.suppress(FileExistsError):
+                os.link(temp, self._root / key)
+            return key, size
+        except OSError:
+            raise StorageError("artifact source or destination failed") from None
+        finally:
+            temp.unlink(missing_ok=True)
 
     def replace(self, key: str, data: bytes, *, if_match: str) -> str:
         """Refuse conditional replacement until M1b.

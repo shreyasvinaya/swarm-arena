@@ -11,7 +11,7 @@ from _fakes import tools as fake_tools
 from swarm_arena._model.tooling import ToolRequest
 from swarm_arena._tooling.result_file import request_json
 
-SECRET = "SECRET_SENTINEL_TASK18"
+SECRET = "b7c9cdbd45ac6961fae12985afab51de"
 
 
 def run(
@@ -143,7 +143,7 @@ def test_failed_replace_cleans_temporary_file(
     assert [p.name for p in (tmp_path / "swarm").iterdir()] == ["request.json"]
 
 
-@pytest.mark.parametrize("request_text", ["{SECRET_SENTINEL_TASK18", "[]", "{}"])
+@pytest.mark.parametrize("request_text", ["{b7c9cdbd45ac6961fae12985afab51de", "[]", "{}"])
 def test_bad_request_fails_without_leaking_contents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

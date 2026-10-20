@@ -1,5 +1,6 @@
 """Run user scripts and expose read-only views of goal and candidate files."""
 
+import warnings
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from pathlib import Path
@@ -19,9 +20,19 @@ from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.schema import _SchemaError, compile_object_schema
-from swarm_arena._model.tooling import Command, CompletedRun, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    DEFAULT_GRACE_S,
+    Command,
+    CompletedRun,
+    EnvName,
+    GraceS,
+    TimeoutS,
+    ToolOutput,
+    ToolRequest,
+)
 from swarm_arena._tooling.paths import check_relpath, fold_key
 from swarm_arena._tooling.result_file import tool_output_from_result
+from swarm_arena._tooling.shadowing import _can_create_python
 from swarm_arena._tooling.staging import effective_files
 from swarm_arena._tooling.tool import Action, Tool
 
@@ -242,9 +253,9 @@ class ScriptTool(Tool):
         files: FileSet = FileSet()
         editable: list[str] = []
         params: dict[str, dict[str, Any]] = {}
-        timeout_s: Annotated[float, Field(gt=0)] | None = None
-        grace_s: Annotated[float, Field(ge=0)] = 10.0
-        env: list[Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]] = []
+        timeout_s: TimeoutS | None = None
+        grace_s: GraceS = DEFAULT_GRACE_S
+        env: list[EnvName] = []
         deterministic: bool = True
         providers: list[str] = []
         description: str = ""
@@ -253,6 +264,21 @@ class ScriptTool(Tool):
         """Validate configuration without inspecting or importing the script."""
         super().__init__(config_or_fields(config, fields))
         self._input_model: type[BaseModel] | None = None
+        for argument in self.config.command[1:]:
+            script = _as_relpath(argument)
+            if script is None or not fold_key(script).endswith(".py"):
+                continue
+            parent = Path(script).parent.as_posix()
+            protected = {*self.config.files.manifest, script}
+            if any(
+                _can_create_python(pattern, parent, protected) for pattern in self.config.editable
+            ):
+                warnings.warn(
+                    "editable glob permits Python import shadowing next to a protected script",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
 
     @property
     def config(self) -> Config:

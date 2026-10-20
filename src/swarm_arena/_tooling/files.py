@@ -1,14 +1,20 @@
 """Snapshot goal and component files into immutable, content-addressed manifests."""
 
+import os
 from pathlib import Path
 from typing import Final
 
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
-from swarm_arena._model.ref import Configurable, Ref, _validate_config
+from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import check_relpath, fold_conflicts, fold_key, matches
-from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
+from swarm_arena._tooling.result_file import (
+    _directory_fd,
+    _inspect_path,
+    read_regular_file,
+    symlinked_component,
+)
 
 MAX_SNAPSHOT_FILE_BYTES: Final = 2**30
 """Most bytes of one snapshotted goal, tool, check, or judge file (1 GiB)."""
@@ -49,6 +55,7 @@ def _listed_path(base: Path, relative: str, listings: dict[Path, dict[str, list[
     ...     _listed_path(Path(tmp), "problem/run.py", {})
     'problem/run.py'
     """
+    base = base.resolve()
     current = base
     for part in Path(relative).parts:
         if (names := listings.get(current)) is None:
@@ -69,14 +76,19 @@ def _listed_path(base: Path, relative: str, listings: dict[Path, dict[str, list[
 def _listing(directory: Path) -> dict[str, list[str]]:
     """List a directory's entry names, grouped by folded key."""
     names: dict[str, list[str]] = {}
-    for entry in directory.iterdir():
-        names.setdefault(fold_key(entry.name), []).append(entry.name)
+    absolute = directory.absolute()
+    with _directory_fd(Path(absolute.anchor), absolute.parts[1:]) as fd:
+        for name in os.listdir(fd):
+            names.setdefault(fold_key(name), []).append(name)
     return names
 
 
 def _identity(path: Path) -> tuple[int, int]:
     """Return the device and inode of a path without following a final symlink."""
-    info = path.stat(follow_symlinks=False)
+    absolute = path.absolute()
+    _, info = _inspect_path(Path(absolute.anchor), absolute.relative_to(absolute.anchor).as_posix())
+    if info is None:
+        raise FileNotFoundError
     return info.st_dev, info.st_ino
 
 
@@ -154,7 +166,7 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
         except OSError:
             raise ValueError(f"cannot snapshot glob {glob!r}") from None
         if not found:
-            raise ValueError(f"glob {glob!r} matched no file")
+            raise ValueError(f"glob {glob!r} matched no file under {base_dir}")
     paths = sorted(selected)
     conflicts = fold_conflicts(paths)
     if conflicts:
@@ -204,16 +216,7 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     >>> ref = Ref(path="my_package.tools:MyTool", config={"files": ["tool/*"]})
     >>> frozen = snapshot_ref(ref, Path("."), artifacts)  # doctest: +SKIP
     """
-    try:
-        cls = ref.load()
-    except TypeError:
-        raise TypeError(f"{ref.path} is not a Configurable class") from None
-    except Exception:
-        # Import hooks can include arbitrary module or config values in errors.
-        raise ValueError(f"cannot import {ref.path}") from None
-    if not issubclass(cls, Configurable):
-        raise TypeError(f"{ref.path} is not a Configurable subclass")
-    config = _validate_config(cls.Config, ref.config, where=ref.path)
+    _, config = ref._resolve_config(Configurable)
     updated = dict(ref.config)
     for key in type(config).model_fields:
         if key not in ref.config:

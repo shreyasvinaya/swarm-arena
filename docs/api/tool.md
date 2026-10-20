@@ -43,14 +43,18 @@ relative, in normal form, and strict UTF-8. A name with a lone surrogate, such a
 the `surrogateescape` spelling of a non-ASCII name, is refused as
 `not valid UTF-8`: it names the same file on disk as the real name, but compares
 as another path. So a file whose name on disk is not valid UTF-8 cannot be
-snapshotted or declared.
+snapshotted or declared. A path has at most 1024 UTF-8 bytes, at most 255
+bytes per component, and at most 32 components. Characters unassigned in the
+running Python's Unicode tables are refused, including newer case pairs that
+some filesystems would otherwise fold differently.
 
 Every read of a tool-written file is bounded. Its size is checked before it is
 read, so a larger file, even a sparse one, is refused unread:
 
-- `swarm/result.json`: at most 16 MiB.
-- The files one result declares: at most 256 MiB together. Their sizes are
-  summed before any is read, and they are hashed one at a time.
+- `swarm/result.json`: at most 1 MiB, with at most 100 levels of JSON nesting.
+  The byte cap also bounds memory used by decoded JSON objects.
+- At most 4096 output files may be declared, including empty files. Hashing
+  and artifact uploads read files in chunks of at most 1 MiB.
 - `LocalExecutor` uploads the last `max_log_bytes` (default 8 MiB) of each log,
   and at most `max_output_bytes` (default 256 MiB) of declared output files per
   run (`LocalExecutor.Config`). A run whose outputs cross that cap gets status
@@ -81,3 +85,28 @@ becomes a job failure; KeyboardInterrupt and cancellation propagate.
 
 Result reads and diagnostic appends refuse special files such as
 FIFOs so collection cannot stall waiting for another process to open them.
+
+## Python function tools
+
+`swarm_arena.FunctionTool` returns structured JSON data on success, timeout and
+cancellation. Files written in its workspace are never uploaded, even when a
+checkpoint result declares them. Use `swarm_arena.ScriptTool` or a custom `Tool`
+for output artifacts.
+
+```python
+from swarm_arena import FunctionTool
+
+tool = FunctionTool("my_package.tools:solve", env=["ANTHROPIC_API_KEY"], timeout_s=30)
+assert tool.config.env == ["ANTHROPIC_API_KEY"]
+```
+
+Environment names use the same explicit allowlist as `Command.env`; their
+values come from the executor's environment or configured secrets source.
+The environment allowlist is human-controlled and cannot be planner-settable.
+Timeouts must be positive, grace periods nonnegative, and both finite.
+Built-in component constructors report invalid settings as a sanitized Pydantic
+`ValidationError`; reference configuration validation reports `ConfigError`.
+
+`ScriptTool` emits a `UserWarning` at construction when an editable glob can
+create a Python module beside a protected Python script. Such modules can
+shadow imports. Restrict edits to data formats such as `problem/*.physk`.

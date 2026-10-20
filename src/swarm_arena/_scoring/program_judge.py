@@ -7,7 +7,7 @@ from typing import ClassVar, cast
 
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.goal import Goal
-from swarm_arena._model.ref import _ConfigInputModel, _validate_config, import_path, load_object
+from swarm_arena._model.ref import _ConfigInputModel, import_path, load_object
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
@@ -103,7 +103,7 @@ class ProgramJudge(Judge):
             if isinstance(function, self.Config)
             else {"function": function if isinstance(function, str) else import_path(function)}
         )
-        self._config = _validate_config(self.Config, data, where="ProgramJudge")
+        super().__init__(data)
         self._function: Callable[[Goal, Candidate], Score] | None = None
 
     @property
@@ -158,10 +158,7 @@ class ProgramJudge(Judge):
     def _load_function(self) -> Callable[[Goal, Candidate], Score]:
         """Load and cache the callable without exposing import exception values."""
         if self._function is None:
-            try:
-                fn = load_object(self.config.function)
-            except Exception:
-                raise ValueError(f"cannot import {self.config.function}") from None
+            fn = load_object(self.config.function)
             if not callable(fn) or _is_async_callable(fn):
                 raise TypeError("ProgramJudge needs a sync function")
             self._function = cast(Callable[[Goal, Candidate], Score], fn)
@@ -232,7 +229,7 @@ class ProgramJudge(Judge):
                     _discard_awaitable(result)
                     ctx.judge_error(candidate.id, "ProgramJudge needs a sync function")
                     continue
-            except Exception as error:
+            except (Exception, SystemExit) as error:
                 ctx.judge_error(candidate.id, f"{type(error).__name__}: scoring function raised")
                 continue
             if not isinstance(result, Score):

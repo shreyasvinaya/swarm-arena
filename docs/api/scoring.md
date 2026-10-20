@@ -74,5 +74,19 @@ The core stamps copies of raw scores with ids and judge/rubric identity,
 preserving candidate ids and existing panel/batch ids. The default rubric is a
 SHA-256 digest of the canonical judge import path and configuration; default
 panel identity, anchor count, provider set, and model tuple are empty/zero.
-The internal finite-key helper also checks scores created with `model_copy` or
-`model_construct`, which bypass normal `Score` validation.
+Scores created with `model_copy` or `model_construct` are checked again before ranking.
+
+Script checks and judges accept an optional integer `schema_version` in their
+result JSON. Omission means version 1; version 1 is supported, while a newer
+version is refused with a clear version diagnostic. Both reject unknown fields,
+including misspellings. Check output requires `passed`; judge output requires
+`key` or `value`.
+
+`swarm_arena.ScriptJudge.rubric_hash()` includes the command, interpreter, files,
+environment names and scoring direction. Changing `timeout_s`, `grace_s` or
+`resources` preserves the rubric identity. Custom judges should exclude settings
+that only affect execution when defining their scoring identity.
+
+`swarm_arena.ProgramJudge` records a scoring function's `SystemExit` as that
+candidate's judge error and continues with the next candidate. KeyboardInterrupt
+and cancellation propagate.

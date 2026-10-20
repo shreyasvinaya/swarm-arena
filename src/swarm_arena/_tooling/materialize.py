@@ -24,7 +24,13 @@ from swarm_arena._tooling.paths import (
     output_paths,
     parent_tree,
 )
-from swarm_arena._tooling.result_file import read_regular_file, symlinked_component
+from swarm_arena._tooling.result_file import (
+    MAX_DECLARED_FILES,
+    _chunks,
+    _inspect_path,
+    open_regular_file,
+    symlinked_component,
+)
 
 
 def _json_bytes(value: dict[str, Any], rel: str, *, compact: bool = False) -> bytes:
@@ -97,13 +103,19 @@ def _check_layout(workspace: Path, files: AbstractSet[str], directories: Abstrac
         raise ValueError(f"conflicting workspace path: {first} and {second}")
     if workspace.is_symlink():
         raise ValueError("symlink not allowed: workspace path")
+    directories = set(directories) | {
+        parent.as_posix()
+        for rel in files | directories
+        for parent in PurePosixPath(rel).parents
+        if parent.as_posix() != "."
+    }
     for rel in sorted(files | directories):
         try:
-            if symlinked_component(workspace, rel) is not None:
+            link, info = _inspect_path(workspace, rel)
+            if link is not None:
                 raise ValueError(f"symlink not allowed: {rel}")
-            path = workspace / rel
-            if path.exists():
-                mode = path.lstat().st_mode
+            if info is not None:
+                mode = info.st_mode
                 expected = stat.S_ISREG(mode) if rel in files else stat.S_ISDIR(mode)
                 if not expected:
                     raise ValueError(f"invalid workspace path: {rel}")
@@ -114,14 +126,21 @@ def _check_layout(workspace: Path, files: AbstractSet[str], directories: Abstrac
 @contextlib.contextmanager
 def _directory(root: int, parts: tuple[str, ...]) -> Generator[int, None, None]:
     """Create and pin descendant directories without following symlinks."""
-    with contextlib.ExitStack() as stack:
-        fd = root
+    fd = root
+    try:
         for part in parts:
             with contextlib.suppress(FileExistsError):
                 os.mkdir(part, dir_fd=fd)
-            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            stack.callback(os.close, fd)
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
+            )
+            if fd != root:
+                os.close(fd)
+            fd = child
         yield fd
+    finally:
+        if fd != root:
+            os.close(fd)
 
 
 def _write(root: int, rel: str, data: bytes, *, read_only: bool) -> None:
@@ -286,6 +305,8 @@ def collect_output_files(
     ...
     ValueError: conflicting output path with staged layout: p/run.py and P/out.txt
     """
+    if len(declared) > MAX_DECLARED_FILES:
+        raise ValueError("too many declared files")
     layout = _stage_layout(stage)
     paths = output_paths(
         declared,
@@ -299,21 +320,27 @@ def collect_output_files(
         try:
             if symlinked_component(workspace, rel) is not None:
                 raise ValueError(f"symlink not allowed: {rel}")
-            (workspace / rel).lstat()
+            if _inspect_path(workspace, rel)[1] is None:
+                raise FileNotFoundError
             listed = _listed_path(workspace, rel, listings)
         except FileNotFoundError:
             raise ValueError(f"{rel} is missing") from None
         except OSError:
             raise ValueError(f"cannot inspect output path: {rel}") from None
-        if listed != rel:  # a case-sensitive disk would not find it (G6, as for snapshots)
+        if listed != rel:  # a case-sensitive disk would not find it
             raise ValueError(f"declared output {rel} is spelled {listed} on disk")
-        data = read_regular_file(workspace, rel, max_bytes=left)
-        left -= len(data)
+        fd = open_regular_file(workspace, rel)
         try:
-            digest = artifacts.put_bytes(data)
-        except Exception:
-            raise ValueError(f"cannot store output path: {rel}") from None
-        output.append(
-            FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=len(data))
-        )
+            try:
+                digest, size = artifacts._put_chunks(_chunks(fd, rel, left, step=2**20))
+            except ValueError as exc:
+                if str(exc) == f"{rel} crosses the size cap":
+                    raise ValueError(f"{rel} crosses the size cap") from None
+                raise ValueError(f"cannot store output path: {rel}") from None
+            except Exception:
+                raise ValueError(f"cannot store output path: {rel}") from None
+        finally:
+            os.close(fd)
+        left -= size
+        output.append(FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=size))
     return output

@@ -26,11 +26,15 @@ from swarm_arena.config import PlannerCatalog
 from swarm_arena.tool import Command, CompletedRun, FileSet, ParentRef, RunStatus, ToolRequest
 
 HA, HA2, HR, HN = (digit * 64 for digit in ("a", "b", "c", "d"))
-SECRET = "SECRET_SENTINEL_script_tool"
+SECRET = "6963d7947c33e1f0de4bb3a6e2ebc184"
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:editable glob permits Python import shadowing:UserWarning"
+)
 
 
 def test_constructor_timeout_error_is_secret_safe() -> None:
-    secret = "SECRET_SENTINEL_constructor_timeout"
+    secret = "1748c57f137692a66d528db35a73990b_constructor_timeout"
     with pytest.raises(ValidationError, match="timeout_s") as caught:
         ScriptTool(command=["x"], timeout_s=secret)
     assert_secret_absent(caught.value, secret, sanitized=True)
@@ -38,7 +42,7 @@ def test_constructor_timeout_error_is_secret_safe() -> None:
 
 @pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
 def test_config_env_error_is_secret_safe(entrypoint: str) -> None:
-    secret = "SECRET_SENTINEL_config_env"
+    secret = "1748c57f137692a66d528db35a73990b_config_env"
     _check_model_error(
         ScriptTool.Config, {"command": ["x"], "env": [{"token": secret}]}, entrypoint, "env", secret
     )
@@ -62,7 +66,7 @@ def _check_model_error(
 @pytest.mark.parametrize("entrypoint", ["constructor", "model_validate", "model_validate_json"])
 @pytest.mark.parametrize("kind", ["integer", "array", "enum", "extra"])
 def test_parameter_input_error_is_secret_safe(entrypoint: str, kind: str) -> None:
-    secret = "SECRET_SENTINEL_parameter_input"
+    secret = "1748c57f137692a66d528db35a73990b_parameter_input"
     schemas: dict[str, dict[str, Any]] = {
         "integer": {"type": "integer"},
         "array": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
@@ -79,7 +83,7 @@ def test_parameter_input_error_is_secret_safe(entrypoint: str, kind: str) -> Non
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_schema_type_error_is_secret_safe(nested: bool) -> None:
-    secret = "SECRET_SENTINEL_schema_type"
+    secret = "1748c57f137692a66d528db35a73990b_schema_type"
     schema: dict[str, Any] = {"type": secret}
     if nested:
         schema = {"type": "array", "items": schema}
@@ -90,7 +94,7 @@ def test_schema_type_error_is_secret_safe(nested: bool) -> None:
 
 
 def test_config_nested_location_is_secret_safe() -> None:
-    secret = "SECRET_SENTINEL_config_location"
+    secret = "1748c57f137692a66d528db35a73990b_config_location"
     with pytest.raises(ValidationError, match="params") as caught:
         ScriptTool.Config(command=["x"], params={secret: secret})  # ty: ignore[invalid-argument-type]
     assert_secret_absent(caught.value, secret)
@@ -320,7 +324,7 @@ def test_folded_script_edit_is_refused_and_original_unchanged(
 
     stage_edits({})
     with pytest.raises(SoftError, match=r"problem/RUN\.py: protected"):
-        stage_edits({"problem/RUN.py": "secret-edit-sentinel"})
+        stage_edits({"problem/RUN.py": "08907f89bd5ee3b619d71ae6fe51976f"})
     assert (workspace / "problem/run.py").read_bytes() == original
     assert [path.name for path in (workspace / "problem").iterdir()] == ["run.py"]
 
@@ -346,13 +350,13 @@ def test_folded_command_path_protects_root_spelling(
     assert protected == frozenset({stored})
     with pytest.raises(SoftError, match="protected") as exc:
         validate_edits(
-            {stored: "secret-edit-sentinel"},
+            {stored: "08907f89bd5ee3b619d71ae6fe51976f"},
             editable=tool.editable(),
             protected=protected,
             max_edit_bytes=100,
         )
     assert str(exc.value) == f"{stored}: protected"
-    assert "secret-edit-sentinel" not in str(exc.value)
+    assert_secret_absent(exc.value, "08907f89bd5ee3b619d71ae6fe51976f")
     stage, overlay, warnings = plan_tool_stage(
         goal_files={stored: HR},
         tool_files={},
@@ -492,8 +496,8 @@ def test_malformed_json_hides_input_on_all_error_surfaces(model_kind: str) -> No
 def test_sanitized_errors_do_not_claim_input_was_none() -> None:
     with pytest.raises(ValidationError) as caught:
         ScriptTool.Config(command=["x"], timeout_s=SECRET)
-    assert "input_value" not in str(caught.value)
-    assert "input_type" not in str(caught.value)
+    assert_secret_absent(caught.value, "input_value")
+    assert_secret_absent(caught.value, "input_type")
 
 
 @pytest.mark.parametrize("alias", ["count", AliasChoices("count", "number"), AliasPath("count", 0)])
@@ -645,3 +649,37 @@ def test_nonreserved_parameter_names_remain_usable() -> None:
     }
     tool = ScriptTool(command=["x"], params={key: {"type": "integer"} for key in values})
     assert tool.get_input_model().model_validate(values).model_dump() == values
+
+
+@pytest.mark.parametrize(
+    "glob", ["problem/*", "problem/*.py", "**", "problem/j?on.py", "problem/[a-z]*.py"]
+)
+def test_warns_about_python_import_shadowing(glob: str) -> None:
+    with pytest.warns(UserWarning, match="import shadowing"):
+        ScriptTool(command=["python", "problem/run.py"], editable=[glob])
+
+
+def test_data_only_glob_does_not_warn() -> None:
+    import warnings
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        ScriptTool(command=["python", "problem/run.py"], editable=["problem/*.physk"])
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "pattern", ["problem/solve.p?", "problem/solve.??", "problem/solve*", "problem/solve[!x].py"]
+)
+def test_shadowing_warning_handles_extension_and_negated_globs(pattern: str) -> None:
+    with pytest.warns(UserWarning, match="import shadowing"):
+        ScriptTool(command=["python", "problem/run.py"], editable=[pattern])
+
+
+def test_exact_protected_script_glob_has_no_shadowing_warning() -> None:
+    import warnings
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        ScriptTool(command=["python", "problem/run.py"], editable=["problem/run.py"])
+    assert seen == []

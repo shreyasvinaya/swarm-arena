@@ -137,12 +137,12 @@ def test_snapshot_fileset_sanitizes_io_errors(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_glob(self: Path, pattern: str) -> Iterator[Path]:
-        raise OSError("snapshot-secret-sentinel")
+        raise OSError("fa89d1a4ebc7ed804e52ad2b3cdc0c7b")
 
     monkeypatch.setattr(Path, "glob", fail_glob)
     with pytest.raises(ValueError, match="cannot snapshot glob") as exc:
         snapshot_fileset(FileSet(globs=["data/*"]), tmp_path, artifacts)
-    assert_secret_absent(exc.value, "snapshot-secret-sentinel", sanitized=True)
+    assert_secret_absent(exc.value, "fa89d1a4ebc7ed804e52ad2b3cdc0c7b", sanitized=True)
 
 
 def test_snapshot_ref_nested(tmp_path: Path, artifacts: ArtifactStore) -> None:
@@ -208,19 +208,22 @@ def test_snapshot_ref_single_ref_and_omitted_defaults(
 def test_snapshot_ref_requires_configurable_class(
     tmp_path: Path, artifacts: ArtifactStore, path: str
 ) -> None:
-    with pytest.raises(TypeError, match="Configurable"):
+    with pytest.raises(TypeError, match=r"class|Configurable"):
         snapshot_ref(Ref(path=path), tmp_path, artifacts)
 
 
 @pytest.mark.parametrize(
     "config",
     [
-        {"label": {"snapshot-secret-sentinel": "snapshot-secret-sentinel"}},
-        {"snapshot-secret-sentinel": "snapshot-secret-sentinel"},
-        {"files": {"manifest": {"snapshot-secret-sentinel": "invalid"}}},
+        {"label": {"fa89d1a4ebc7ed804e52ad2b3cdc0c7b": "fa89d1a4ebc7ed804e52ad2b3cdc0c7b"}},
+        {"fa89d1a4ebc7ed804e52ad2b3cdc0c7b": "fa89d1a4ebc7ed804e52ad2b3cdc0c7b"},
+        {"files": {"manifest": {"fa89d1a4ebc7ed804e52ad2b3cdc0c7b": "invalid"}}},
         {
             "members": [
-                {"path": "_fakes.tools:Widget", "config": {"size": "snapshot-secret-sentinel"}}
+                {
+                    "path": "_fakes.tools:Widget",
+                    "config": {"size": "fa89d1a4ebc7ed804e52ad2b3cdc0c7b"},
+                }
             ]
         },
     ],
@@ -230,7 +233,7 @@ def test_snapshot_ref_sanitizes_validation_errors(
 ) -> None:
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(Ref(path="_fakes.tools:FilesWidget", config=config), tmp_path, artifacts)
-    assert_secret_absent(exc.value, "snapshot-secret-sentinel", sanitized=True)
+    assert_secret_absent(exc.value, "fa89d1a4ebc7ed804e52ad2b3cdc0c7b", sanitized=True)
 
 
 def test_snapshot_ref_sanitizes_validator_message(
@@ -245,7 +248,7 @@ def test_snapshot_ref_sanitizes_validator_message(
     monkeypatch.setattr(Widget, "Config", Config)
     # Python 3.13 tracebacks quote the whole multi-line call, so the sentinel
     # must not be a literal inside it.
-    secret = "snapshot-secret-sentinel"
+    secret = "fa89d1a4ebc7ed804e52ad2b3cdc0c7b"
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(Ref(path="_fakes.tools:Widget", config={"size": secret}), tmp_path, artifacts)
     assert_secret_absent(exc.value, secret)
@@ -255,12 +258,12 @@ def test_snapshot_ref_sanitizes_import_errors(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_load(self: Ref) -> type:
-        raise ValueError("snapshot-secret-sentinel")
+        raise ValueError("fa89d1a4ebc7ed804e52ad2b3cdc0c7b")
 
-    monkeypatch.setattr(Ref, "load", fail_load)
-    with pytest.raises(ValueError, match=r"cannot import _fakes\.tools:Widget") as exc:
-        snapshot_ref(Ref(path="_fakes.tools:Widget"), tmp_path, artifacts)
-    assert_secret_absent(exc.value, "snapshot-secret-sentinel")
+    monkeypatch.setattr("swarm_arena._model.ref.importlib.import_module", fail_load)
+    with pytest.raises(ValueError, match=r"cannot import sentinel_import:Widget") as exc:
+        snapshot_ref(Ref(path="sentinel_import:Widget"), tmp_path, artifacts)
+    assert_secret_absent(exc.value, "fa89d1a4ebc7ed804e52ad2b3cdc0c7b")
 
 
 PLAN_TOML = """
@@ -450,7 +453,7 @@ def test_snapshot_folded_alias_identity(
 
     lower, upper = tmp_path / "run.py", tmp_path / "RUN.py"
     original_stat = Path.stat
-    original_iterdir = Path.iterdir
+    original_listing = files_module._listing
 
     def stat_path(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
         if self in (lower, upper):
@@ -462,18 +465,22 @@ def test_snapshot_folded_alias_identity(
         assert self == tmp_path
         yield from [lower, upper]
 
-    def iterdir(self: Path) -> Iterator[Path]:
-        if self == tmp_path:
-            yield from [lower, upper] if upper_listed else [lower]
-        else:
-            yield from original_iterdir(self)
+    def listing(directory: Path) -> dict[str, list[str]]:
+        if directory == tmp_path:
+            return {"run.py": ["run.py", "RUN.py"] if upper_listed else ["run.py"]}
+        return original_listing(directory)
+
+    def identity(path: Path) -> tuple[int, int]:
+        info = stat_path(path, follow_symlinks=False)
+        return info.st_dev, info.st_ino
 
     def read(base: Path, rel: str, *, max_bytes: int) -> bytes:
         return b"x"
 
     monkeypatch.setattr(Path, "stat", stat_path)
     monkeypatch.setattr(Path, "glob", glob)
-    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(files_module, "_listing", listing)
+    monkeypatch.setattr(files_module, "_identity", identity)
     monkeypatch.setattr(files_module, "read_regular_file", read)
     if not upper_listed:
         snapshot = snapshot_fileset(FileSet(globs=["*"]), tmp_path, artifacts)
@@ -524,7 +531,7 @@ def test_snapshot_refuses_a_file_over_its_cap_unread(
     monkeypatch: pytest.MonkeyPatch,
     bytes_read: list[int],
     sparse: Any,
-) -> None:  # integration fix 3, RC1
+) -> None:
     from swarm_arena._tooling import files as files_module
 
     assert files_module.MAX_SNAPSHOT_FILE_BYTES == 2**30  # 1 GiB per goal or tool file
@@ -537,3 +544,9 @@ def test_snapshot_refuses_a_file_over_its_cap_unread(
     assert sum(bytes_read) <= 1024  # data/fits.bin at most; the big file is refused by its size
     snapshot = snapshot_fileset(FileSet(globs=["data/fits.bin"]), tmp_path, artifacts)
     assert snapshot.manifest == {"data/fits.bin": sha256_hex(bytes(1024))}
+
+
+def test_unmatched_glob_names_its_base(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    with pytest.raises(ValueError, match="matched no file under") as caught:
+        snapshot_fileset(FileSet(globs=["*.physk"]), tmp_path, artifacts)
+    assert str(tmp_path) in str(caught.value)

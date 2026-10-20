@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Never
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._errors import NotFound
 from swarm_arena._exec.executor import Job
@@ -207,7 +208,7 @@ def test_collect_output_files_uploads(tmp_path: Path, artifacts: ArtifactStore) 
 
 def test_collect_output_files_checks_each_size_before_reading_it(
     tmp_path: Path, artifacts: ArtifactStore, bytes_read: list[int], sparse: Any
-) -> None:  # integration fix 3, A1
+) -> None:
     declared = ["out/a.txt", "out/b.txt"]
     (tmp_path / "out").mkdir()
     (tmp_path / "out/a.txt").write_bytes(b"a" * 600)
@@ -387,7 +388,6 @@ def test_collection_normalizes_and_refuses_collisions(
 
 
 def test_metadata_errors_do_not_disclose_values(tmp_path: Path, artifacts: ArtifactStore) -> None:
-    import traceback
 
     secret = "secret-sentinel-0123456789"
 
@@ -398,31 +398,29 @@ def test_metadata_errors_do_not_disclose_values(tmp_path: Path, artifacts: Artif
     parent = PARENT.model_copy(update={"data": BadDict(x=1)})
     with pytest.raises(ValueError, match="cannot serialize workspace path") as exc:
         materialize(Job.Stage(parents=[parent]), tmp_path / "ws", artifacts)
-    assert secret not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
     assert not (tmp_path / "ws").exists()
 
 
 def test_collection_storage_errors_suppress_secret_exception_chains(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from traceback import format_exception
 
-    secret = "storage-secret-sentinel"
+    secret = "798a57fe4ea9ea05ca6e0a4d26c6990d"
     (tmp_path / "a.txt").write_text(secret)
 
     def fail(data: bytes) -> Never:
         raise ValueError(secret)
 
-    monkeypatch.setattr(artifacts, "put_bytes", fail)
+    monkeypatch.setattr(artifacts, "_put_chunks", fail)
     with pytest.raises(ValueError, match=r"cannot store output path: a\.txt") as exc:
         collect_output_files(tmp_path, ["a.txt"], artifacts, stage=Job.Stage(), max_bytes=CAP)
-    assert secret not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
 
 
 def test_materialize_write_errors_suppress_secret_exception_chains(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from traceback import format_exception
     from typing import Any
 
     secret = "write-secret-sentinel"
@@ -434,7 +432,7 @@ def test_materialize_write_errors_suppress_secret_exception_chains(
     monkeypatch.setattr(os, "replace", fail)
     with pytest.raises(ValueError, match=r"cannot write workspace path: a\.txt") as exc:
         materialize(Job.Stage(root={"a.txt": digest}), tmp_path / "ws", artifacts)
-    assert secret not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
     assert list((tmp_path / "ws").iterdir()) == [tmp_path / "ws/swarm"]
 
 
@@ -452,6 +450,103 @@ def test_collection_refuses_folded_output_duplicates_before_upload(
         collect_output_files(tmp_path, [first, second], artifacts, stage=Job.Stage(), max_bytes=CAP)
     assert first in str(exc.value)
     assert second in str(exc.value)
-    assert content.decode() not in str(exc.value)
+    assert_secret_absent(exc.value, content.decode())
     with pytest.raises(NotFound):
         artifacts.get_bytes(sha256_hex(content))
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo", "file"])
+def test_existing_wrong_kind_refused_before_any_write(
+    tmp_path: Path, artifacts: ArtifactStore, kind: str
+) -> None:
+    bad = tmp_path / "z"
+    if kind == "directory":
+        bad.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(bad)
+    else:
+        bad.write_bytes(b"untouched")
+    stage = Job.Stage(
+        root={
+            "a": artifacts.put_bytes(b"a"),
+            ("z/x" if kind == "file" else "z"): artifacts.put_bytes(b"z"),
+        }
+    )
+    with pytest.raises(ValueError, match="invalid workspace path: z"):
+        materialize(stage, tmp_path, artifacts)
+    assert not (tmp_path / "a").exists()
+
+
+def test_output_upload_reads_in_chunks(
+    tmp_path: Path, artifacts: ArtifactStore, bytes_read: list[int]
+) -> None:
+    data = b"x" * (4 * 2**20)
+    (tmp_path / "out.txt").write_bytes(data)
+    refs = collect_output_files(
+        tmp_path, ["out.txt"], artifacts, stage=Job.Stage(), max_bytes=len(data)
+    )
+    assert max(bytes_read) <= 2**20
+    assert refs[0].size == len(data)
+    assert artifacts.get_bytes(refs[0].sha256) == data
+
+
+def test_empty_output_count_is_bounded(tmp_path: Path, artifacts: ArtifactStore) -> None:
+    with pytest.raises(ValueError, match="too many declared files"):
+        collect_output_files(
+            tmp_path, [f"out{i}" for i in range(4097)], artifacts, stage=Job.Stage(), max_bytes=0
+        )
+
+
+def test_materialize_directory_walk_keeps_constant_descriptors(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = "/".join(["d"] * 31 + ["out.txt"])
+    stage = Job.Stage(root={path: artifacts.put_bytes(b"bytes")})
+    opened: set[int] = set()
+    peak = 0
+    real_open, real_close = os.open, os.close
+
+    def record_open(*args: Any, **kwargs: Any) -> int:
+        nonlocal peak
+        fd = real_open(*args, **kwargs)
+        opened.add(fd)
+        peak = max(peak, len(opened))
+        return fd
+
+    def record_close(fd: int) -> None:
+        opened.discard(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", record_open)
+    monkeypatch.setattr(os, "close", record_close)
+    materialize(stage, tmp_path / "workspace", artifacts)
+    assert (tmp_path / "workspace" / path).read_bytes() == b"bytes"
+    assert peak <= 4
+
+
+@pytest.mark.parametrize("prefix", ["", "candidate/files/", "parents/c1/"])
+def test_maximum_length_path_stages_collects_and_reads(
+    tmp_path: Path, artifacts: ArtifactStore, prefix: str
+) -> None:
+    from swarm_arena._tooling.result_file import read_regular_file
+
+    path = "/".join(["a" * 255] * 3 + ["a" * 254, "x"])
+    assert len(path.encode()) == 1024
+    workspace = tmp_path / "workspace"
+    digest = artifacts.put_bytes(b"boundary")
+    if prefix == "candidate/files/":
+        stage = Job.Stage(candidate=Job.CandidateFiles(request={}, output={}, files={path: digest}))
+    elif prefix:
+        stage = Job.Stage(
+            parents=[
+                ParentRef(candidate_id="c1", run_id="r", tool_identity="T", overlay={path: digest})
+            ]
+        )
+    else:
+        stage = Job.Stage(root={path: digest})
+    materialize(stage, workspace, artifacts)
+    assert read_regular_file(workspace, prefix + path, max_bytes=8) == b"boundary"
+    if not prefix:
+        [ref] = collect_output_files(workspace, [path], artifacts, stage=Job.Stage(), max_bytes=8)
+        assert ref.path == path
+        assert artifacts.get_bytes(ref.sha256) == b"boundary"

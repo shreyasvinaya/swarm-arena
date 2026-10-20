@@ -12,7 +12,14 @@ from pydantic import BaseModel
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.ref import Configurable
-from swarm_arena._model.tooling import Command, CompletedRun, Estimate, ToolOutput, ToolRequest
+from swarm_arena._model.tooling import (
+    DEFAULT_GRACE_S,
+    Command,
+    CompletedRun,
+    Estimate,
+    ToolOutput,
+    ToolRequest,
+)
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
@@ -300,7 +307,11 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> command = tool.command(request, workspace)  # doctest: +SKIP
+        >>> from pathlib import Path
+        >>> from swarm_arena import ScriptTool
+        >>> from swarm_arena.tool import ToolRequest
+        >>> ScriptTool(command=["true"]).command(ToolRequest(), Path(".")).argv
+        ['true']
         """
 
     @abstractmethod
@@ -351,4 +362,4 @@ def effective_tool_timeout(tool: Tool, *, round_timeout_s: float | None, limit_s
 
 def tool_grace(tool: Tool) -> float:
     """Return the tool's configured shutdown grace or the ten-second default."""
-    return getattr(tool.config, "grace_s", 10.0)
+    return getattr(tool.config, "grace_s", DEFAULT_GRACE_S)

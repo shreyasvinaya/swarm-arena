@@ -635,3 +635,18 @@ first and run candidate code in a separate process and directory, passing only
 the inputs it needs and keeping result writing in the trusted judge. These
 precautions reduce accidental exposure; a separate process or directory under
 the same OS user is still not a security sandbox for hostile code.
+
+### Result format versions and bounds
+
+Check and judge result objects may include `"schema_version": 1`; omitting it
+also means version 1. Both reject newer versions and unknown fields, including
+misspelled names. The result JSON limit is 1 MiB and 100 nesting levels; declare
+larger data as output artifacts. At most 4096 output files may be declared,
+including empty files, within `LocalExecutor.Config.max_output_bytes`.
+Workspace paths have at most 1024 UTF-8 bytes, 255 bytes per component and 32
+components. Code points unassigned in the running Python are refused.
+
+`FunctionTool` is data-only, including timeout and cancellation checkpoints.
+Use `ScriptTool` or a custom `Tool` when a function's files must become output
+artifacts. Its `env=["ANTHROPIC_API_KEY"]` setting explicitly allows named
+variables into the subprocess and remains human-controlled.

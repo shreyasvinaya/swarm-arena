@@ -4,16 +4,17 @@ import contextlib
 import errno
 import hashlib
 import json
-import math
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator, Sequence
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Final, NoReturn
+from typing import Any, ClassVar, Final
 
 from pydantic import Field, ValidationError
 
 from swarm_arena._model.base import StoredModel
+from swarm_arena._model.data import FiniteJsonObject, finite_json
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.tooling import (
@@ -29,10 +30,12 @@ from swarm_arena._tooling.paths import output_paths
 _RESULT = "swarm/result.json"
 _CHUNK: Final = 1 << 20
 _MAX_READ: Final = 1 << 30  # one read(2) call; macOS refuses more than INT_MAX
-MAX_RESULT_JSON_BYTES: Final = 16 * 2**20
+MAX_RESULT_JSON_BYTES: Final = 2**20
 """Most bytes ``read_result_json`` reads from ``swarm/result.json``."""
-MAX_DECLARED_FILES_BYTES: Final = 256 * 2**20
-"""Most bytes of all files one result declares (the ``LocalExecutor`` default cap)."""
+MAX_DECLARED_FILES: Final = 4096
+"""Most output paths in one result, including empty files."""
+NOTE_PREFIX: Final = "swarm-arena: "
+_OUTPUT_BYTE_LIMIT: Final[ContextVar[int | None]] = ContextVar("output_byte_limit", default=None)
 
 
 class ToolResultFile(StoredModel):
@@ -59,7 +62,8 @@ class ToolResultFile(StoredModel):
     """
 
     schema_kind: ClassVar[str] = "tool_result"
-    data: dict[str, Any]
+    schema_version: int = CURRENT["tool_result"]
+    data: FiniteJsonObject
     usage: Usage = Usage()
     files: list[str] = []
     failed_provider: str | None = Field(default=None, min_length=1)
@@ -86,7 +90,7 @@ def request_json(request: ToolRequest) -> dict[str, Any]:
     {'n': 2}
     """
     return {
-        "schema_version": 1,
+        "schema_version": CURRENT["request"],
         "params": request.inputs,
         "round": request.round,
         "round_overrides": request.round_overrides,
@@ -94,20 +98,73 @@ def request_json(request: ToolRequest) -> dict[str, Any]:
     }
 
 
+@contextlib.contextmanager
+def _directory_fd(base: Path, parts: Sequence[str]) -> Generator[int, None, None]:
+    """Pin an existing directory with constant descriptors and relative opens."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK
+    fd = os.open(base, flags)
+    try:
+        for part in parts:
+            child = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _inspect_path(base: Path, rel: str) -> tuple[str | None, os.stat_result | None]:
+    """Inspect relative components without constructing PATH_MAX-sized OS names."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK
+    try:
+        fd = os.open(base, flags)
+    except FileNotFoundError:
+        return None, None
+    try:
+        parts = PurePosixPath(rel).parts
+        info = os.fstat(fd)
+        for index, part in enumerate(parts):
+            try:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None, None
+            if stat.S_ISLNK(info.st_mode):
+                return "/".join(parts[: index + 1]), info
+            if index < len(parts) - 1:
+                child = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        return None, info
+    finally:
+        os.close(fd)
+
+
 def symlinked_component(base: Path, rel: str) -> str | None:
-    """Return the first symlink component below base, or None if none exists."""
-    current = base
-    parts: list[str] = []
-    for part in PurePosixPath(rel).parts:
-        parts.append(part)
-        current = current / part
-        try:
-            mode = current.lstat().st_mode
-        except FileNotFoundError:
-            return None
-        if stat.S_ISLNK(mode):
-            return "/".join(parts)
-    return None
+    """
+    Find the first symlink below a trusted root using relative descriptor walks.
+
+    Parameters
+    ----------
+    base : Path
+        Trusted root; missing paths have no symlink component.
+    rel : str
+        Relative path to inspect without following links below the root.
+
+    Returns
+    -------
+    str or None
+        First symlink component, including its relative parent path.
+
+    Examples
+    --------
+    >>> from tempfile import TemporaryDirectory
+    >>> with TemporaryDirectory() as tmp:
+    ...     base = Path(tmp)
+    ...     (base / "link").symlink_to("missing")
+    ...     symlinked_component(base, "link/out.txt")
+    'link'
+    """
+    return _inspect_path(base, rel)[0]
 
 
 def open_regular_file(workspace: Path, rel: str) -> int:
@@ -279,19 +336,6 @@ def _regular_file_size(workspace: Path, rel: str) -> int:
         os.close(fd)
 
 
-def _reject(value: str) -> NoReturn:
-    """Reject JSON's nonstandard non-finite constants without echoing input."""
-    raise ValueError("non-finite number in swarm/result.json")
-
-
-def _finite_float(value: str) -> float:
-    """Reject overflow in otherwise valid JSON float literals."""
-    number = float(value)
-    if not math.isfinite(number):
-        _reject(value)
-    return number
-
-
 def read_result_json(workspace: Path) -> dict[str, Any]:
     """
     Read a JSON object from a regular ``swarm/result.json`` file.
@@ -310,7 +354,7 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
     ------
     ValueError
         If the file is missing, unsafe, unreadable, larger than
-        ``MAX_RESULT_JSON_BYTES`` (16 MiB), invalid JSON, not an object, or
+        ``MAX_RESULT_JSON_BYTES`` (1 MiB), invalid JSON, not an object, or
         contains a non-finite number.
 
     Examples
@@ -329,19 +373,19 @@ def read_result_json(workspace: Path) -> dict[str, Any]:
     raw = read_regular_file(workspace, _RESULT, max_bytes=MAX_RESULT_JSON_BYTES)
     try:
         text = raw.decode("utf-8")
-        result = json.loads(text, parse_constant=_reject, parse_float=_finite_float)
+        result = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError(f"{_RESULT} is not valid JSON: invalid encoding or syntax") from None
     except RecursionError:
         raise ValueError(f"{_RESULT} is not valid JSON: nesting too deep") from None
-    except ValueError as exc:
-        # parse hooks supply this fixed reason; int conversion can also reject
-        # extremely long numeric literals without exposing their contents.
-        if str(exc) == "non-finite number in swarm/result.json":
-            raise ValueError("non-finite number in swarm/result.json") from None
+    except ValueError:
         raise ValueError(f"{_RESULT} is not valid JSON: invalid number") from None
     if not isinstance(result, dict):
         raise ValueError(f"{_RESULT} must contain a JSON object")
+    try:
+        finite_json(result)
+    except ValueError as exc:
+        raise ValueError(f"{_RESULT}: {exc}") from None
     return result
 
 
@@ -350,51 +394,53 @@ def _validation_reason(exc: ValidationError) -> str:
     return f"{_RESULT}: " + validation_summary(exc)
 
 
-def _load_result(workspace: Path) -> tuple[ToolResultFile, list[FileRef]]:
+def _load_result(
+    workspace: Path, *, include_files: bool = True, max_output_bytes: int | None = None
+) -> tuple[ToolResultFile, list[FileRef]]:
     """Validate the envelope and all artifacts before accepting any result."""
     raw = read_result_json(workspace)
-    version = raw.get("schema_version", 1)
-    if (
-        isinstance(version, int)
-        and not isinstance(version, bool)
-        and version > CURRENT["tool_result"]
-    ):
-        raise ValueError("tool_result schema_version is newer than this swarm-arena supports")
+    if max_output_bytes is None:
+        max_output_bytes = _OUTPUT_BYTE_LIMIT.get()
     try:
         result = ToolResultFile.model_validate(raw)
     except ValidationError as exc:
         raise ValueError(_validation_reason(exc)) from None
-    # Pydantic may coerce strings such as "NaN" to floats after JSON parsing.
-    if result.usage.usd is not None and not math.isfinite(result.usage.usd):
-        raise ValueError("non-finite number in swarm/result.json")
-    # The result parser has no original stage. The executor's upload collector
-    # performs the full staged-layout check with its required stage argument.
+    if not include_files:
+        return result, []
+    if len(result.files) > MAX_DECLARED_FILES:
+        raise ValueError("too many declared files")
+    # The executor owns the per-run byte budget. Direct collectors can supply
+    # that same limit; without it hashing still uses bounded chunks.
     paths = output_paths(result.files, effective_files=())
-    total = 0
-    for rel in paths:  # every size before any read, so an oversized set is never read
-        total += _regular_file_size(workspace, rel)
-        if total > MAX_DECLARED_FILES_BYTES:
-            raise ValueError(
-                f"declared files are too large: {rel} crosses MAX_DECLARED_FILES_BYTES"
-            )
+    sizes = {rel: _regular_file_size(workspace, rel) for rel in paths}
+    if max_output_bytes is not None and sum(sizes.values()) > max_output_bytes:
+        raise ValueError("declared files cross max_output_bytes")
     files: list[FileRef] = []
-    left = MAX_DECLARED_FILES_BYTES
-    for rel in paths:  # one file at a time, each bounded by what is left of the cap
-        digest, size = _hash_regular_file(workspace, rel, max_bytes=left)
-        left -= size
+    left = max_output_bytes
+    for rel in paths:
+        digest, size = _hash_regular_file(
+            workspace, rel, max_bytes=sizes[rel] if left is None else left
+        )
+        if left is not None:
+            left -= size
         files.append(FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=size))
     return result, files
 
 
-def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
+def tool_output_from_result(
+    workspace: Path,
+    run: CompletedRun,
+    *,
+    include_files: bool = True,
+    max_output_bytes: int | None = None,
+) -> ToolOutput:
     """
     Collect a tool envelope according to process status and artifact validity.
 
-    Every read is bounded: ``swarm/result.json`` by ``MAX_RESULT_JSON_BYTES``
-    (16 MiB), and the declared files together by ``MAX_DECLARED_FILES_BYTES``
-    (256 MiB). Their sizes are summed before any of them is read, so a result
-    whose files cross the cap is invalid unread; the files are hashed one at a
-    time.
+    The result JSON is capped at 1 MiB to bound its decoded object graph.
+    At most 4096 output paths are accepted. Files are hashed in 1 MiB chunks;
+    a supplied executor byte limit is checked across all files before hashing.
+    No separate default output byte limit is imposed here.
 
     Parameters
     ----------
@@ -402,6 +448,11 @@ def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
         Completed tool workspace.
     run : CompletedRun
         Process status, timestamps, and log paths.
+    include_files : bool, default=True
+        Validate and hash declared files; False returns only structured data.
+    max_output_bytes : int or None, default=None
+        Executor-owned byte budget. None uses the current collection context,
+        or hashes each file up to its observed size outside an executor.
 
     Returns
     -------
@@ -418,7 +469,9 @@ def tool_output_from_result(workspace: Path, run: CompletedRun) -> ToolOutput:
     """
     status = run.status
     try:
-        result, files = _load_result(workspace)
+        result, files = _load_result(
+            workspace, include_files=include_files, max_output_bytes=max_output_bytes
+        )
     except ValueError as exc:
         if status in (RunStatus.OK, RunStatus.TIMEOUT, RunStatus.CANCELLED):
             note_in_log(run.stderr_path, str(exc))  # why nothing was kept
@@ -578,7 +631,7 @@ def note_in_log(path: Path, message: str) -> None:
         return
     try:
         sanitized = "".join(char if char.isprintable() else " " for char in message)
-        os.write(fd, f"swarm-arena: {sanitized}\n".encode())
+        os.write(fd, f"{NOTE_PREFIX}{sanitized}\n".encode())
     except OSError:
         pass
     finally:

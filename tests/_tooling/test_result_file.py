@@ -1,12 +1,12 @@
 import json
 import os
-import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._tooling.result_file import (
@@ -117,16 +117,16 @@ def test_ok_with_valid_result(tmp_path: Path) -> None:
         ('{"schema_version": 2, "data": {}}', "newer"),
         ('{"data": {}, "files": ["swarm/x"]}', "reserved"),
         ('{"data": {}, "files": ["out/none.txt"]}', "out/none.txt"),
-        ('{"data": {"f": NaN}}', "non-finite number"),
+        ('{"data": {"f": NaN}}', "finite JSON"),
         ('{"data": {}, "failed_provider": ""}', "failed_provider"),
-        ('{"data": {"f": 1e999}}', "non-finite number"),
-        ('{"data": {"g": [-1e999]}}', "non-finite number"),
-        ('{"data": {}, "usage": {"usd": 1e999}}', "non-finite number"),
+        ('{"data": {"f": 1e999}}', "finite JSON"),
+        ('{"data": {"g": [-1e999]}}', "finite JSON"),
+        ('{"data": {}, "usage": {"usd": 1e999}}', "finite JSON"),
     ],
 )
 def test_exit_zero_without_valid_result_is_error(
     tmp_path: Path, content: str | None, reason: str
-) -> None:  # Review Focus 3
+) -> None:
     if content is not None:
         (tmp_path / "swarm").mkdir(exist_ok=True)
         (tmp_path / "swarm/result.json").write_text(content)
@@ -149,7 +149,7 @@ def test_killed_run_with_result_is_partial(tmp_path: Path, status: RunStatus) ->
 
 
 @pytest.mark.parametrize("status", [RunStatus.TIMEOUT, RunStatus.CANCELLED])
-def test_stopped_run_partial_rule(tmp_path: Path, status: RunStatus) -> None:  # IF3 A8
+def test_stopped_run_partial_rule(tmp_path: Path, status: RunStatus) -> None:
     write_result(tmp_path / "empty", {"data": {}})  # valid but empty: still partial
     r = run(tmp_path / "empty", status, None)
     out = tool_output_from_result(tmp_path / "empty", r)
@@ -221,7 +221,7 @@ def test_command_output_rejects_non_finite(tmp_path: Path) -> None:
         RunStatus.ERROR,
         {},
     )
-    assert "non-finite number" in r.stderr_path.read_text()
+    assert "finite JSON" in r.stderr_path.read_text()
 
 
 @pytest.mark.parametrize("kind", ["fifo", "symlink", "symlinked_swarm_dir"])
@@ -345,13 +345,13 @@ def test_command_preserves_status_and_raw_data(tmp_path: Path, status: RunStatus
 @pytest.mark.parametrize(
     "content",
     [
-        '{"data": [], "usage": {"usd": "SENTINEL_SECRET"}}',
-        '{"data": {}, "SENTINEL_SECRET": "SENTINEL_SECRET"}',
-        '{"data": {}, "usage": {"SENTINEL_SECRET": 1}}',
-        '{"data": {}, "files": [123], "failed_provider": {"SENTINEL_SECRET": 1}}',
-        '{"schema_version": "SENTINEL_SECRET", "data": {}}',
-        '{"data": {"SENTINEL_SECRET": NaN}}',
-        '{"data": "SENTINEL_SECRET"',
+        '{"data": [], "usage": {"usd": "5530fe069928c6e26fb64159567116d0"}}',
+        '{"data": {}, "5530fe069928c6e26fb64159567116d0": "5530fe069928c6e26fb64159567116d0"}',
+        '{"data": {}, "usage": {"5530fe069928c6e26fb64159567116d0": 1}}',
+        '{"data": {}, "files": [123], "failed_provider": {"5530fe069928c6e26fb64159567116d0": 1}}',
+        '{"schema_version": "5530fe069928c6e26fb64159567116d0", "data": {}}',
+        '{"data": {"5530fe069928c6e26fb64159567116d0": NaN}}',
+        '{"data": "5530fe069928c6e26fb64159567116d0"',
     ],
 )
 def test_result_diagnostics_hide_values_and_dynamic_keys(tmp_path: Path, content: str) -> None:
@@ -361,15 +361,15 @@ def test_result_diagnostics_hide_values_and_dynamic_keys(tmp_path: Path, content
     assert out.status == RunStatus.ERROR
     message = r.stderr_path.read_text()
     assert "swarm-arena: " in message
-    assert "SENTINEL_SECRET" not in message
+    assert "5530fe069928c6e26fb64159567116d0" not in message
 
 
 def test_json_decode_errors_are_sanitized(tmp_path: Path) -> None:
     r = run(tmp_path, RunStatus.OK, 0)
-    (tmp_path / "swarm/result.json").write_bytes(b'{"SENTINEL_SECRET": "\xff"}')
+    (tmp_path / "swarm/result.json").write_bytes(b'{"5530fe069928c6e26fb64159567116d0": "\xff"}')
     with pytest.raises(ValueError, match="not valid JSON") as exc:
         read_result_json(tmp_path)
-    assert "SENTINEL_SECRET" not in "".join(traceback.format_exception(exc.value))
+    assert_secret_absent(exc.value, "5530fe069928c6e26fb64159567116d0")
     assert command_output_from_result(tmp_path, r).status == RunStatus.ERROR
 
 
@@ -424,7 +424,7 @@ def test_log_drops_oserrors_and_nonregular(tmp_path: Path, monkeypatch: pytest.M
     p.write_text("original")
 
     def fail_write(fd: int, data: bytes) -> int:
-        raise OSError("SENTINEL_SECRET")
+        raise OSError("5530fe069928c6e26fb64159567116d0")
 
     monkeypatch.setattr(os, "write", fail_write)
     assert note_in_log(p, "m") is None
@@ -453,7 +453,7 @@ def test_read_refuses_parent_replaced_after_component_check(
     (parent / "data").write_bytes(b"safe")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "data").write_bytes(b"SENTINEL_SECRET")
+    (outside / "data").write_bytes(b"5530fe069928c6e26fb64159567116d0")
     original = result_file.symlinked_component
 
     def swap(base: Path, rel: str) -> str | None:
@@ -558,16 +558,16 @@ def test_log_closes_all_descriptors(
         path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
     ) -> int:
         if failure == "open" and Path(path).name == "stderr.log":
-            raise OSError("SENTINEL_SECRET")
+            raise OSError("5530fe069928c6e26fb64159567116d0")
         fd = original_open(path, flags, mode, dir_fd=dir_fd)
         opened.append(fd)
         return fd
 
     def fail_fstat(fd: int) -> os.stat_result:
-        raise OSError("SENTINEL_SECRET")
+        raise OSError("5530fe069928c6e26fb64159567116d0")
 
     def fail_write(fd: int, data: bytes) -> int:
-        raise OSError("SENTINEL_SECRET")
+        raise OSError("5530fe069928c6e26fb64159567116d0")
 
     monkeypatch.setattr(os, "open", track_open)
     if failure == "fstat":
@@ -682,7 +682,7 @@ def test_open_log_refuses_fifo_with_reader(tmp_path: Path) -> None:
 def test_output_directory_alias_fails_producing_run(
     tmp_path: Path, first: str, second: str
 ) -> None:
-    secret = "output-directory-secret"
+    secret = "050021d56994d9d8652e3dd859119a80"
     for rel in [first, second]:
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -697,8 +697,6 @@ def test_output_directory_alias_fails_producing_run(
     assert second in diagnostic
     assert secret not in diagnostic
 
-
-# --- Every read of a tool-written file is bounded (integration fix 3, A1) ---
 
 CAP = 1 << 20
 
@@ -735,7 +733,7 @@ def test_read_regular_file_never_reads_past_its_cap_while_a_file_grows(
 def test_result_json_read_is_bounded(tmp_path: Path, bytes_read: list[int], sparse: Any) -> None:
     from swarm_arena._tooling.result_file import MAX_RESULT_JSON_BYTES
 
-    assert MAX_RESULT_JSON_BYTES == 16 * 2**20
+    assert MAX_RESULT_JSON_BYTES == 2**20
     r = run(tmp_path, RunStatus.OK, 0)
     sparse(tmp_path / "swarm/result.json", 2 * MAX_RESULT_JSON_BYTES)
     with pytest.raises(ValueError, match=r"^swarm/result\.json crosses the size cap$"):
@@ -750,33 +748,32 @@ def test_result_json_read_is_bounded(tmp_path: Path, bytes_read: list[int], spar
 def test_declared_files_over_the_cap_fail_before_any_is_hashed(
     tmp_path: Path, bytes_read: list[int], sparse: Any, status: RunStatus
 ) -> None:
-    from swarm_arena._tooling.result_file import MAX_DECLARED_FILES_BYTES
+    from swarm_arena.executor import LocalExecutor
 
-    assert MAX_DECLARED_FILES_BYTES == 256 * 2**20  # the LocalExecutor default
-    sparse(tmp_path / "out/a", MAX_DECLARED_FILES_BYTES)
-    sparse(tmp_path / "out/b", MAX_DECLARED_FILES_BYTES)
-    write_result(tmp_path, {"data": {"k": "SENTINEL_SECRET"}, "files": ["out/a", "out/b"]})
+    cap = LocalExecutor.Config().max_output_bytes
+    sparse(tmp_path / "out/a", cap)
+    sparse(tmp_path / "out/b", cap)
+    write_result(
+        tmp_path, {"data": {"k": "5530fe069928c6e26fb64159567116d0"}, "files": ["out/a", "out/b"]}
+    )
     r = run(tmp_path, status, 0 if status == RunStatus.OK else None)
-    out = tool_output_from_result(tmp_path, r)
+    out = tool_output_from_result(tmp_path, r, max_output_bytes=cap)
     expected = RunStatus.ERROR if status == RunStatus.OK else status
     assert (out.status, out.partial, out.data, out.files) == (expected, False, {}, [])
     assert sum(bytes_read) < 4096  # result.json only: the 512 MiB of outputs are never read
     log = r.stderr_path.read_text()
-    assert "out/b crosses MAX_DECLARED_FILES_BYTES" in log
-    assert "SENTINEL_SECRET" not in log
+    assert "declared files cross max_output_bytes" in log
+    assert "5530fe069928c6e26fb64159567116d0" not in log
 
 
 def test_declared_files_are_hashed_one_at_a_time_within_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from swarm_arena._tooling import result_file
-
-    monkeypatch.setattr(result_file, "MAX_DECLARED_FILES_BYTES", 10)
     (tmp_path / "out").mkdir()
     (tmp_path / "out/a").write_bytes(b"aaaa")
     (tmp_path / "out/b").write_bytes(b"bbbbbb")  # 4 + 6: exactly the cap
     write_result(tmp_path, {"data": {}, "files": ["out/a", "out/b"]})
-    out = tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0))
+    out = tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0), max_output_bytes=10)
     assert out.status == RunStatus.OK
     assert [(f.path, f.size, f.sha256) for f in out.files] == [
         ("out/a", 4, sha256_hex(b"aaaa")),
@@ -784,13 +781,94 @@ def test_declared_files_are_hashed_one_at_a_time_within_the_cap(
     ]
     (tmp_path / "out/b").write_bytes(b"bbbbbbb")  # one byte over
     r = run(tmp_path, RunStatus.OK, 0)
-    assert tool_output_from_result(tmp_path, r).status == RunStatus.ERROR
-    assert "out/b crosses MAX_DECLARED_FILES_BYTES" in r.stderr_path.read_text()
+    assert tool_output_from_result(tmp_path, r, max_output_bytes=10).status == RunStatus.ERROR
+    assert "declared files cross max_output_bytes" in r.stderr_path.read_text()
 
 
-def test_every_read_regular_file_caller_passes_a_cap() -> None:  # integration fix 3, RC1
+def test_every_read_regular_file_caller_passes_a_cap() -> None:
     import inspect
 
     parameter = inspect.signature(read_regular_file).parameters["max_bytes"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty  # required: no unbounded default
+
+
+def test_result_json_small_cap_refuses_dense_large_object(
+    tmp_path: Path, bytes_read: list[int]
+) -> None:
+    (tmp_path / "swarm").mkdir()
+    with (tmp_path / "swarm/result.json").open("wb") as stream:
+        stream.write(b'{"data":{"x":[' + b"0," * (8 * 2**20 - 12) + b"0]}}")
+    with pytest.raises(ValueError, match="size cap"):
+        read_result_json(tmp_path)
+    assert sum(bytes_read) == 0
+
+
+def test_result_json_depth_bound(tmp_path: Path) -> None:
+    (tmp_path / "swarm").mkdir()
+    (tmp_path / "swarm/result.json").write_text('{"data":' + "[" * 110 + "0" + "]" * 110 + "}")
+    with pytest.raises(ValueError, match="nesting"):
+        read_result_json(tmp_path)
+
+
+def test_declared_file_count_bound_before_reads(tmp_path: Path) -> None:
+    write_result(tmp_path, {"data": {}, "files": [f"out{i}" for i in range(4097)]})
+    out = tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0))
+    assert out.status == RunStatus.ERROR
+    assert "too many declared files" in (tmp_path / "swarm/stderr.log").read_text()
+
+
+def test_logs_ref_helpers_and_note_prefix(tmp_path: Path) -> None:
+    from swarm_arena._model.tooling import format_logs_ref, parse_logs_ref
+    from swarm_arena._tooling.result_file import NOTE_PREFIX
+
+    assert parse_logs_ref(format_logs_ref("a" * 64, "b" * 64)) == ("a" * 64, "b" * 64)
+    assert NOTE_PREFIX == "swarm-arena: "
+    log = tmp_path / "stderr"
+    note_in_log(log, "hello")
+    assert log.read_text() == NOTE_PREFIX + "hello\n"
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        None,
+        "",
+        "sha256:a:b",
+        "sha256:" + "A" * 64 + ":" + "b" * 64,
+        "sha256:" + "a" * 64 + ":" + "b" * 64 + ":extra",
+    ],
+)
+def test_malformed_logs_ref_is_sanitized(ref: Any) -> None:
+    from swarm_arena._model.tooling import parse_logs_ref
+
+    with pytest.raises(ValueError, match="invalid logs_ref"):
+        parse_logs_ref(ref)
+
+
+def test_executor_byte_limit_context_has_no_duplicate_default(tmp_path: Path) -> None:
+    from swarm_arena._tooling.result_file import _OUTPUT_BYTE_LIMIT
+
+    write_result(tmp_path, {"data": {}, "files": ["out.dat"]})
+    (tmp_path / "out.dat").write_bytes(b"12345")
+    token = _OUTPUT_BYTE_LIMIT.set(4)
+    try:
+        assert (
+            tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0)).status
+            == RunStatus.ERROR
+        )
+    finally:
+        _OUTPUT_BYTE_LIMIT.reset(token)
+    assert tool_output_from_result(tmp_path, run(tmp_path, RunStatus.OK, 0)).status == RunStatus.OK
+
+
+def test_logs_ref_errors_hide_values() -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import format_logs_ref, parse_logs_ref
+
+    secret = "274a09e0b8e44f38bc63cd92472c53f2"
+    for operation in (lambda: format_logs_ref(secret, "a" * 64), lambda: parse_logs_ref(secret)):
+        with pytest.raises(ValueError, match="invalid logs_ref") as caught:
+            operation()
+        assert_secret_absent(caught.value, secret)

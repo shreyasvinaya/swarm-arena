@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Final
 
-from pydantic import AfterValidator, Field, field_serializer
+from pydantic import AfterValidator, Field, TypeAdapter, field_serializer
 
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.canonical import UtcDatetime, sha256_hex
@@ -329,6 +329,76 @@ class ToolRequest(FrozenModel):
             else "sha256:" + sha256_hex(content.encode())
             for path, content in edits.items()
         }
+
+
+def format_logs_ref(stdout_sha: str, stderr_sha: str) -> str:
+    """
+    Format the ordered stdout and stderr artifact digests.
+
+    Parameters
+    ----------
+    stdout_sha : str
+        Lowercase SHA-256 digest of stdout.
+    stderr_sha : str
+        Lowercase SHA-256 digest of stderr.
+
+    Returns
+    -------
+    str
+        Reference carrying both validated digests.
+
+    Raises
+    ------
+    ValueError
+        If either digest is invalid, without echoing its value.
+
+    Examples
+    --------
+    >>> parse_logs_ref(format_logs_ref("a" * 64, "b" * 64)) == ("a" * 64, "b" * 64)
+    True
+    """
+    try:
+        adapter = TypeAdapter(Sha256)
+        adapter.validate_python(stdout_sha, strict=True)
+        adapter.validate_python(stderr_sha, strict=True)
+    except Exception:
+        raise ValueError("invalid logs_ref") from None
+    return f"sha256:{stdout_sha}:{stderr_sha}"
+
+
+def parse_logs_ref(ref: str) -> tuple[str, str]:
+    """
+    Parse an ordered stdout and stderr artifact reference.
+
+    Parameters
+    ----------
+    ref : str
+        Reference returned by ``format_logs_ref``.
+
+    Returns
+    -------
+    tuple[str, str]
+        Stdout digest followed by stderr digest.
+
+    Raises
+    ------
+    ValueError
+        If the reference is malformed, without echoing its value.
+
+    Examples
+    --------
+    >>> parse_logs_ref("sha256:bad:ref")
+    Traceback (most recent call last):
+    ...
+    ValueError: invalid logs_ref
+    """
+    if not isinstance(ref, str):
+        raise ValueError("invalid logs_ref")
+    parts = ref.split(":")
+    if len(parts) != 3 or parts[0] != "sha256":
+        raise ValueError("invalid logs_ref")
+    format_logs_ref(parts[1], parts[2])
+    return parts[1], parts[2]
 
 
 class ToolOutput(FrozenModel):

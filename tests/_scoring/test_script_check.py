@@ -20,7 +20,7 @@ from swarm_arena._scoring.script_judge import ScriptJudge, _JudgeResultFile
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
 
-SECRET = "SENTINEL_PRIVATE_VALUE_22"
+SECRET = "ad25cd43a1711e358861c29d157cf8df"
 
 
 def script_check(tmp_path: Path, artifacts: ArtifactStore, body: str, **cfg: Any) -> ScriptCheck:
@@ -201,5 +201,23 @@ async def test_construct_bypass_still_rejects_non_json_details(bad: Any) -> None
     result = await ScriptCheck(command=["example"]).check(cand(), context)
     assert result.passed is False
     assert result.details == {}
-    assert result.reasons == ["invalid check result: details: value_error"]
+    assert result.reasons == ["invalid check result: details: details must be finite JSON"]
     assert SECRET not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("version", [None, 1, 99, 0, True, "1"])
+async def test_check_result_schema_version(ctx: CheckContext, version: Any) -> None:
+    payload = {"passed": True}
+    if version is not None:
+        payload["schema_version"] = version
+
+    class ResultExecutor(RecordingExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            return ToolOutput(status=RunStatus.OK, data=payload)
+
+    ctx.executor = ResultExecutor()
+    result = await ScriptCheck(command=["check"]).check(cand(), ctx)
+    assert result.passed is (version is None or (type(version) is int and version == 1))
+    if version == 99:
+        assert "schema_version" in repr(result.reasons)
+        assert "newer" in repr(result.reasons)

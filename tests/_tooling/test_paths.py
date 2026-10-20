@@ -325,8 +325,6 @@ def test_caseless_pairs_are_one_file_on_apfs(tmp_path: Path, first: str, second:
     assert [entry.name for entry in tmp_path.iterdir()] == [first]
 
 
-# --- Workspace paths are strict UTF-8 (integration fix 3, A0) ---
-
 # The surrogateescape spelling of "problem/\N{LATIN SMALL LETTER S WITH CARON}olver.py":
 # os.fsencode gives both the same bytes on disk, but fold_key keeps them apart.
 SURROGATE_SCRIPT = "problem/\udcc5\udca1olver.py"
@@ -358,3 +356,25 @@ def test_surrogate_spelling_names_the_same_file_but_folds_apart() -> None:
     assert os.fsencode(SURROGATE_SCRIPT) == os.fsencode(script)  # one file on any filesystem
     assert fold_key(SURROGATE_SCRIPT) != fold_key(script)  # so only check_relpath can stop it
     assert check_relpath(script) == script
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["a" * 256, "é" * 128, "/".join(["a"] * 33), "/".join(["a" * 255] * 4 + ["x"]), "p/\u0378.txt"],
+)
+def test_portable_path_bounds(path: str) -> None:
+    with pytest.raises(ValueError, match=r"exceeds|unassigned"):
+        check_relpath(path)
+
+
+def test_portable_path_boundaries() -> None:
+    for path in [
+        "é" * 127,
+        "/".join(["a"] * 32),
+        "/".join(["a" * 255] * 3 + ["a" * 254, "x"]),
+    ]:
+        assert check_relpath(path) == path
+
+
+def test_question_mark_cannot_cross_segment() -> None:
+    assert not matches("p/a/b", ["p/a?b"])

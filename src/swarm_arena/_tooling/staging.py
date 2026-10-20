@@ -10,7 +10,8 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry
 from swarm_arena._model.goal import Goal
-from swarm_arena._model.ref import Configurable, Ref, _validate_config
+from swarm_arena._model.migrate import CURRENT
+from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
 from swarm_arena._store.artifacts import ArtifactStore
@@ -49,15 +50,7 @@ def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]:
     >>> fixed_config(Ref(path="swarm_arena._model.ref:Configurable"), None)
     {}
     """
-    try:
-        cls = ref.load()
-    except TypeError:
-        raise TypeError(f"{ref.path} is not a Configurable class") from None
-    except Exception:
-        raise ValueError(f"cannot import {ref.path}") from None
-    if not issubclass(cls, Configurable):
-        raise TypeError(f"{ref.path} is not a Configurable subclass")
-    config = _validate_config(cls.Config, ref.config, where=ref.path)
+    _, config = ref._resolve_config(Configurable)
     try:
         result = config.model_dump(mode="json")
     except Exception:
@@ -478,7 +471,9 @@ def plan_tool_stage(
         base = parents[0]
         reason = ""
         refused = sorted(base.overlay)
-        if not receiving_identity or base.tool_identity != receiving_identity:
+        if not base.tool_identity:
+            reason = "has no tool identity"
+        elif not receiving_identity or base.tool_identity != receiving_identity:
             reason = "made by another tool"
         else:
             refused = sorted(path for path in base.overlay if not editable_here(path))
@@ -551,9 +546,13 @@ def plan_script_stage(
     return Job.Stage(
         root=dict(own_files),
         candidate=Job.CandidateFiles(
-            request={**_request_json(candidate.request), "parents": candidate.parent_ids},
+            request={
+                **_request_json(candidate.request),
+                "schema_version": CURRENT["candidate_request"],
+                "parents": candidate.parent_ids,
+            },
             output={
-                "schema_version": 1,
+                "schema_version": CURRENT["candidate_output"],
                 "status": output.status.value,
                 "partial": output.partial,
                 "data": output.data,

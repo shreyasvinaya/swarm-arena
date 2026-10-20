@@ -18,6 +18,8 @@ CURRENT: Final[Mapping[str, int]] = MappingProxyType(
         "candidate_request": 1,
         "candidate_output": 1,
         "tool_result": 1,
+        "check_result": 1,
+        "judge_result": 1,
     }
 )
 _migration_functions: Final[dict[tuple[str, int], MigrationFn]] = {}

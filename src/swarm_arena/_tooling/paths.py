@@ -306,6 +306,8 @@ def check_relpath(path: str) -> str:
         surrogate (U+D800 to U+DFFF), such as the ``surrogateescape``
         spelling of a non-ASCII name, is not valid UTF-8: it names the same
         bytes on disk as the real name, but ``fold_key`` keeps the two apart.
+        Paths are limited to 1024 UTF-8 bytes, 255 bytes per component and 32
+        components, and refuse Unicode code points unassigned by this Python.
 
     Examples
     --------
@@ -328,6 +330,14 @@ def check_relpath(path: str) -> str:
         reason = "contains NUL"
     elif not _is_utf8(path):
         reason = "not valid UTF-8"
+    elif len(path.encode("utf-8")) > 1024:
+        reason = "exceeds 1024 UTF-8 bytes"
+    elif any(len(part.encode("utf-8")) > 255 for part in parts):
+        reason = "component exceeds 255 UTF-8 bytes"
+    elif len(parts) > 32:
+        reason = "exceeds 32 components"
+    elif any(unicodedata.category(char) == "Cn" for char in path):
+        reason = "contains an unassigned Unicode code point"
     elif fold_key(parts[0]) in RESERVED:
         reason = f"uses the reserved name {parts[0]!r}"
     if reason is not None:

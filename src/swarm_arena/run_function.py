@@ -15,6 +15,8 @@ from typing import NoReturn
 from pydantic import ValidationError
 
 from swarm_arena._model.canonical import canonical_json
+from swarm_arena._model.data import finite_json
+from swarm_arena._model.migrate import CURRENT
 from swarm_arena._tooling.function_tool import _load_function, function_input_model
 
 
@@ -115,7 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"FunctionTool {args.function}: must return a JSON object", file=sys.stderr)
             return 1
         reason = f"FunctionTool {args.function}: values must be finite JSON"
-        payload = canonical_json({"schema_version": 1, "data": result})
+        payload = canonical_json(
+            {"schema_version": CURRENT["tool_result"], "data": finite_json(result)}
+        )
         reason = "cannot write swarm/result.json"
         _write_result(payload, result_path)
         return 0

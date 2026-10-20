@@ -23,7 +23,7 @@ from swarm_arena._model.tooling import Command, RunStatus, ToolRequest
 from swarm_arena._tooling.function_tool import FunctionTool, function_input_model, import_root
 from swarm_arena._tooling.result_file import request_json
 
-SECRET = "SECRET_SENTINEL_TASK18"
+SECRET = "b7c9cdbd45ac6961fae12985afab51de"
 
 
 def function_job(tmp_path: Path, tool: FunctionTool, req: ToolRequest) -> Job:
@@ -61,7 +61,7 @@ def test_init_imports_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("constructor imported referenced code")
 
     with monkeypatch.context() as patch:
-        patch.setattr("swarm_arena._tooling.function_tool.load_object", fail)
+        patch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
         t = FunctionTool("no_such_mod:f")
     with pytest.raises(ValueError, match="cannot import no_such_mod:f"):
         t.get_input_model()
@@ -129,7 +129,7 @@ def test_command_argv() -> None:
     "fields", [{"providers": [SECRET, {}]}, {"deterministic": SECRET}, {"unknown": SECRET}]
 )
 def test_config_errors_hide_values(fields: dict[str, Any]) -> None:
-    with pytest.raises(ValueError, match="FunctionTool") as caught:
+    with pytest.raises(ValidationError) as caught:
         FunctionTool(add, **fields)
     assert_secret_absent(caught.value, SECRET)
     with pytest.raises(ValidationError) as direct:
@@ -153,9 +153,9 @@ def test_import_and_annotation_failures_hide_values(monkeypatch: pytest.MonkeyPa
         raise RuntimeError(SECRET)
 
     with monkeypatch.context() as patch:
-        patch.setattr("swarm_arena._tooling.function_tool.load_object", fail)
+        patch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
         with pytest.raises(ValueError, match="cannot import") as caught:
-            FunctionTool(add).get_input_model()
+            FunctionTool("sentinel_import:solve").get_input_model()
     assert_secret_absent(caught.value, SECRET)
     monkeypatch.setattr(add, "__annotations__", {"a": SECRET})
     with pytest.raises(TypeError, match="FunctionTool") as annotation:
@@ -179,7 +179,9 @@ def test_custom_and_literal_validation_errors_hide_values(
         raise PydanticCustomError(SECRET, SECRET)
 
     annotation = (
-        Annotated[int, BeforeValidator(fail)] if custom else Literal["SECRET_SENTINEL_TASK18"]
+        Annotated[int, BeforeValidator(fail)]
+        if custom
+        else Literal["b7c9cdbd45ac6961fae12985afab51de"]
     )
     monkeypatch.setattr(add, "__annotations__", {"a": annotation, "b": int})
     model = function_input_model(add)
@@ -285,9 +287,6 @@ def test_preflight_import_failure_hides_values(
     assert_secret_absent(caught.value, SECRET)
 
 
-# --- Aliases and import roots (integration fix 3, A2) ---
-
-
 def _solve(x: int) -> dict[str, int]:
     """Return the input as data."""
     return {"x": x}
@@ -357,3 +356,127 @@ def test_import_root_finds_an_extension_package(
     module.__file__ = str(init)
     monkeypatch.setitem(sys.modules, "task18_ext", module)
     assert import_root("task18_ext") == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"timeout_s": 0},
+        {"timeout_s": -1},
+        {"timeout_s": float("nan")},
+        {"grace_s": -1},
+        {"grace_s": float("inf")},
+        {"env": ["INVALID=KEY"]},
+    ],
+)
+def test_function_limits_and_env_are_validated_at_construction(fields: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        FunctionTool(add, **fields)
+
+
+def test_function_env_allowlist_and_human_only() -> None:
+    tool = FunctionTool(add, env=["API_KEY"])
+    assert tool.command(ToolRequest(), Path(".")).env == ["API_KEY"]
+    assert "env" in tool._human_only
+
+
+@pytest.mark.parametrize("status", [RunStatus.OK, RunStatus.TIMEOUT, RunStatus.CANCELLED])
+def test_function_collect_is_data_only(tmp_path: Path, status: RunStatus) -> None:
+    from datetime import UTC, datetime
+
+    from swarm_arena.tool import CompletedRun
+
+    (tmp_path / "swarm").mkdir()
+    (tmp_path / "swarm/result.json").write_text('{"data":{"answer":3},"files":["missing.txt"]}')
+    now = datetime.now(UTC)
+    run = CompletedRun(
+        returncode=0,
+        status=status,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+        started_at=now,
+        ended_at=now,
+    )
+    output = FunctionTool(add).collect(ToolRequest(), tmp_path, run)
+    assert output.data == {"answer": 3}
+    assert output.files == []
+    assert output.status == status
+
+
+async def test_function_environment_reaches_subprocess(
+    tmp_path: Path, local_executor: LocalExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "environment_function.py").write_text(
+        "import os\ndef solve() -> dict[str, bool]:\n"
+        '    return {"allowed": os.environ.get("ALLOW_KEY") == "yes", '
+        '"blocked": "BLOCK_KEY" in os.environ}\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("ALLOW_KEY", "yes")
+    monkeypatch.setenv("BLOCK_KEY", "hidden")
+    output = await local_executor.submit(
+        function_job(
+            tmp_path, FunctionTool("environment_function:solve", env=["ALLOW_KEY"]), ToolRequest()
+        )
+    )
+    assert output.status == RunStatus.OK
+    assert output.data == {"allowed": True, "blocked": False}
+
+
+@pytest.mark.parametrize("status", [RunStatus.OK, RunStatus.TIMEOUT, RunStatus.CANCELLED])
+def test_function_checkpoint_artifacts_are_never_hashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: RunStatus
+) -> None:
+    from datetime import UTC, datetime
+
+    from swarm_arena._tooling import result_file
+    from swarm_arena.tool import CompletedRun
+
+    (tmp_path / "swarm").mkdir()
+    (tmp_path / "swarm/result.json").write_text('{"data":{"answer":7},"files":["large.dat"]}')
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("FunctionTool inspected an artifact")
+
+    monkeypatch.setattr(result_file, "_hash_regular_file", fail)
+    now = datetime.now(UTC)
+    completed = CompletedRun(
+        status=status,
+        returncode=0,
+        started_at=now,
+        ended_at=now,
+        stdout_path=tmp_path / "stdout",
+        stderr_path=tmp_path / "stderr",
+    )
+    output = FunctionTool(add).collect(ToolRequest(), tmp_path, completed)
+    assert output.data == {"answer": 7}
+    assert not output.files
+
+
+def test_function_environment_is_not_planner_settable() -> None:
+    from swarm_arena.config import PlannerCatalog
+
+    with pytest.raises(ValidationError, match="human-only field 'env'"):
+        PlannerCatalog.model_validate(
+            {
+                "entries": [
+                    {
+                        "name": "function",
+                        "kind": "tool",
+                        "ref": "swarm_arena:FunctionTool",
+                        "description": "Function",
+                        "settable": {"env": {"type": "array", "items": {"type": "string"}}},
+                    }
+                ]
+            }
+        )
+
+
+def test_import_root_uses_shared_import_error_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(path: str) -> object:
+        raise RuntimeError(SECRET)
+
+    monkeypatch.setattr("swarm_arena._model.ref.importlib.import_module", fail)
+    with pytest.raises(ValueError, match="cannot import root_failure:__name__") as caught:
+        import_root("root_failure")
+    assert_secret_absent(caught.value, SECRET)

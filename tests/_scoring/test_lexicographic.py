@@ -16,7 +16,7 @@ from swarm_arena._scoring.judge import JudgeContext, stamp_scores
 from swarm_arena._scoring.lexicographic import Lexicographic
 from swarm_arena._scoring.program_judge import ProgramJudge
 
-SECRET = "SENTINEL_TASK21_SECRET"
+SECRET = "6dca447c8d41f358f1c5dcc3d2e651cb"
 
 
 async def test_key_is_member_keys_in_order(judge_ctx: JudgeContext) -> None:
@@ -277,10 +277,10 @@ def test_member_import_diagnostics_keep_path(method: str) -> None:
 @pytest.mark.parametrize("method", ["preflight", "rubric_hash"])
 def test_member_config_diagnostics_keep_safe_detail(method: str) -> None:
     lex = Lexicographic([Ref(path="_fakes.tools:FixedJudge", config={"value": SECRET})])
-    with pytest.raises(ConfigError, match=r"cannot build judge _fakes\.tools:FixedJudge") as caught:
+    with pytest.raises(ConfigError, match=r"_fakes\.tools:FixedJudge") as caught:
         getattr(lex, method)()
-    assert str(caught.value) == "cannot build judge _fakes.tools:FixedJudge: value: float_parsing"
-    assert str(caught.value).count("_fakes.tools:FixedJudge") == 1  # the path once (IF3 A3)
+    assert str(caught.value) == "_fakes.tools:FixedJudge: value: float_parsing"
+    assert str(caught.value).count("_fakes.tools:FixedJudge") == 1  # the path once
     assert_secret_absent(caught.value, SECRET)
 
 
