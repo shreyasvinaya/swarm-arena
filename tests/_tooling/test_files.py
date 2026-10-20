@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
@@ -7,14 +9,14 @@ from typing import Any
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import FilesWidget, Widget
-from pydantic import create_model, field_validator
+from pydantic import ValidationError, create_model, field_validator, model_serializer
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan
-from swarm_arena._model.ref import Ref, RefField
+from swarm_arena._model.ref import Configurable, Ref, RefField, _ConfigInputModel
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
 
@@ -194,8 +196,96 @@ def test_snapshot_ref_preserves_raw_scalars(tmp_path: Path, artifacts: ArtifactS
     assert snapshot_ref(ref, tmp_path, artifacts) == ref
 
 
-def test_snapshot_ref_single_ref_and_omitted_defaults(
+def test_snapshot_nested_lexicographic_ref_reloads(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    ref = Ref(
+        path="swarm_arena.scoring:Lexicographic",
+        config={"judges": [{"path": "_fakes.tools:FixedJudge", "config": {"value": 1.0}}]},
+    )
+    snap = snapshot_ref(ref, tmp_path, artifacts)
+    assert Ref.model_validate_json(snap.model_dump_json()) == snap
+    assert "name" not in snap.config["judges"][0]
+    assert type(snap.config["judges"][0]["config"]["value"]) is float
+
+
+def test_snapshot_ref_revalidates_serialized_config(
     tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class NullableFileSet(FileSet):
+        @model_serializer
+        def serialize(self) -> dict[str, Any]:
+            return {"manifest": None}
+
+    config = create_model(
+        "Config", __base__=FilesWidget.Config, files=(NullableFileSet, NullableFileSet())
+    )
+    monkeypatch.setattr(FilesWidget, "Config", config)
+    secret = "96adb125d6424fbe835d80730f10b94c"
+    ref = Ref(path="_fakes.tools:FilesWidget", config={"files": {}, "label": secret})
+    with pytest.raises(ValidationError, match="TOML data cannot contain null") as caught:
+        snapshot_ref(ref, tmp_path, artifacts)
+    assert_secret_absent(caught.value, secret, sanitized=True)
+
+
+@pytest.mark.parametrize("wire_format", ["json", "toml"])
+def test_snapshot_nested_plan_round_trip_after_source_removal(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_format: str,
+) -> None:
+    class Chain(Configurable):
+        Config = create_model("Config", __base__=_ConfigInputModel, policies=(list[RefField], ...))
+
+    module = types.ModuleType("snapshot_components")
+    monkeypatch.setattr(module, "Chain", Chain, raising=False)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    source = _write(tmp_path, "data/input.txt", b"frozen input")
+    plan = Plan.loads(
+        """
+teams = []
+judges = [{path = "swarm_arena.scoring:Lexicographic", config = {judges = [
+    {path = "swarm_arena.scoring:Lexicographic", config = {judges = [
+        {path = "_fakes.tools:FilesWidget", config = {files = ["data/*"], label = "raw"}}
+    ]}}
+]}}]
+policy = {path = "snapshot_components:Chain", config = {policies = [
+    {path = "snapshot_components:Chain", config = {policies = [
+        {path = "_fakes.tools:FilesWidget", name = "named", config = {files = ["data/*"]}}
+    ]}}
+]}}
+[goal]
+id = "g"
+namespace = "n"
+""",
+        base_dir=tmp_path,
+    )
+    original = deepcopy(plan)
+    snap = snapshot_plan(plan, artifacts)
+    assert plan == original
+    judge = snap.judges[0].config["judges"][0]
+    policy = snap.policy.config["policies"][0]
+    for nested, field in [(judge, "judges"), (policy, "policies")]:
+        assert "name" not in nested
+        manifest = nested["config"][field][0]["config"]["files"]["manifest"]
+        assert manifest == {"data/input.txt": sha256_hex(b"frozen input")}
+        assert artifacts.get_bytes(manifest["data/input.txt"]) == b"frozen input"
+    assert policy["config"]["policies"][0]["name"] == "named"
+    source.unlink()
+    source.parent.rmdir()
+    if wire_format == "json":
+        restored = Plan.model_validate_json(snap.model_dump_json())
+    else:
+        restored = Plan.loads(snap.dumps(), base_dir=tmp_path)
+    assert restored.model_dump(mode="json") == snap.model_dump(mode="json")
+    assert snapshot_plan(snap, artifacts) == snap
+    assert snapshot_plan(restored, artifacts) == restored
+
+
+@pytest.mark.parametrize("raw_size", [True, 2, 2.0, "2"])
+def test_snapshot_ref_single_ref_and_omitted_defaults(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, raw_size: Any
 ) -> None:
     _write(tmp_path, "data/a.csv")
     config = create_model(
@@ -203,14 +293,20 @@ def test_snapshot_ref_single_ref_and_omitted_defaults(
         __base__=FilesWidget.Config,
         member=(RefField, Ref(path="no_such_mod:OmittedDefault")),
         files=(FileSet, FileSet(globs=["missing-default/*"])),
+        size=(int, 1),
     )
     monkeypatch.setattr(FilesWidget, "Config", config)
     empty = Ref(path="_fakes.tools:FilesWidget")
     assert snapshot_ref(empty, tmp_path, artifacts) == empty
     ref = Ref(
-        path=empty.path, config={"member": {"path": empty.path, "config": {"files": ["data/*"]}}}
+        path=empty.path,
+        config={"member": {"path": empty.path, "config": {"files": ["data/*"], "size": raw_size}}},
     )
     out = snapshot_ref(ref, tmp_path, artifacts)
+    assert Ref.model_validate_json(out.model_dump_json()) == out
+    assert "name" not in out.config["member"]
+    assert out.config["member"]["config"]["size"] == raw_size
+    assert type(out.config["member"]["config"]["size"]) is type(raw_size)
     assert list(out.config["member"]["config"]["files"]["manifest"]) == ["data/a.csv"]
     assert "files" not in out.config
 

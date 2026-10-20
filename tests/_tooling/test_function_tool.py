@@ -221,17 +221,17 @@ def test_duplicate_function_keyword_is_rejected(
 def test_command_uses_configured_module_for_reexport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "task18_reexport.py").write_text("from _fakes.tools import add\n")
+    (tmp_path / "function_reexport.py").write_text("from _fakes.tools import add\n")
     monkeypatch.syspath_prepend(str(tmp_path))
-    tool = FunctionTool("task18_reexport:add")
+    tool = FunctionTool("function_reexport:add")
     try:
         tool.preflight()
-        assert sys.modules["task18_reexport"].add.__module__ == "_fakes.tools"
+        assert sys.modules["function_reexport"].add.__module__ == "_fakes.tools"
         assert import_root("_fakes.tools") != str(tmp_path)
         command = tool.command(ToolRequest(), tmp_path)
-        assert command.argv[-3:] == ["--import-root", str(tmp_path), "task18_reexport:add"]
+        assert command.argv[-3:] == ["--import-root", str(tmp_path), "function_reexport:add"]
     finally:
-        sys.modules.pop("task18_reexport", None)
+        sys.modules.pop("function_reexport", None)
 
 
 def test_preflight_rejects_stdlib_module_alias() -> None:
@@ -251,39 +251,39 @@ def test_preflight_rejects_stdlib_module_alias() -> None:
 def test_preflight_rejects_package_module_alias(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    package = tmp_path / "task18_alias"
+    package = tmp_path / "alias_package"
     package.mkdir()
     (package / "__init__.py").write_text(
-        "import sys\nimport task18_defining\nsys.modules[__name__] = task18_defining\n"
+        "import sys\nimport alias_defining_module\nsys.modules[__name__] = alias_defining_module\n"
     )
-    (tmp_path / "task18_defining.py").write_text(
+    (tmp_path / "alias_defining_module.py").write_text(
         f'PRIVATE = "{SECRET}"\ndef solve() -> dict[str, int]:\n    return {{"answer": 42}}\n'
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     try:
         with pytest.raises(TypeError, match="is an alias of") as caught:
-            FunctionTool("task18_alias:solve").preflight()
+            FunctionTool("alias_package:solve").preflight()
         assert str(caught.value) == (
-            "FunctionTool task18_alias:solve: task18_alias is an alias of "
-            "task18_defining; use the defining module"
+            "FunctionTool alias_package:solve: alias_package is an alias of "
+            "alias_defining_module; use the defining module"
         )
         assert_secret_absent(caught.value, SECRET)
-        assert import_root("task18_alias") == str(tmp_path)
-        FunctionTool("task18_defining:solve").preflight()
+        assert import_root("alias_package") == str(tmp_path)
+        FunctionTool("alias_defining_module:solve").preflight()
     finally:
-        sys.modules.pop("task18_alias", None)
-        sys.modules.pop("task18_defining", None)
+        sys.modules.pop("alias_package", None)
+        sys.modules.pop("alias_defining_module", None)
 
 
 @pytest.mark.parametrize("exception", ["RuntimeError", "SystemExit"])
 def test_preflight_import_failure_hides_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception: str
 ) -> None:
-    (tmp_path / "task18_import_error.py").write_text(f'raise {exception}("{SECRET}")\n')
+    (tmp_path / "preflight_import_error.py").write_text(f'raise {exception}("{SECRET}")\n')
     monkeypatch.syspath_prepend(str(tmp_path))
-    with pytest.raises(ValueError, match="cannot import task18_import_error:solve") as caught:
-        FunctionTool("task18_import_error:solve").preflight()
-    assert str(caught.value) == "cannot import task18_import_error:solve"
+    with pytest.raises(ValueError, match="cannot import preflight_import_error:solve") as caught:
+        FunctionTool("preflight_import_error:solve").preflight()
+    assert str(caught.value) == "cannot import preflight_import_error:solve"
     assert_secret_absent(caught.value, SECRET)
 
 
@@ -297,13 +297,14 @@ class _NotAModule:  # sys.modules may hold any object; the stdlib does (typing.i
 
 
 def _specless_module() -> types.ModuleType:
-    module = types.ModuleType("task18_specless")  # a real module, but made without a spec
+    module = types.ModuleType("specless_function_module")  # a real module, but made without a spec
     setattr(module, "solve", _solve)  # noqa: B010 (a module attribute the checker cannot see)
     return module
 
 
 @pytest.mark.parametrize(
-    ("name", "entry"), [("task18_not_a_module", _NotAModule), ("task18_specless", None)]
+    ("name", "entry"),
+    [("nonmodule_function_entry", _NotAModule), ("specless_function_module", None)],
 )
 def test_sys_modules_entry_without_a_spec_is_refused(
     monkeypatch: pytest.MonkeyPatch, name: str, entry: object
@@ -321,7 +322,7 @@ def test_sys_modules_entry_without_a_spec_is_refused(
 def test_import_root_finds_a_sourceless_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    package = tmp_path / "task18_sourceless"
+    package = tmp_path / "sourceless_function_package"
     package.mkdir()
     source = package / "__init__.py"
     source.write_text("def solve(x: int) -> dict[str, int]:\n    return {'x': x}\n")
@@ -329,33 +330,33 @@ def test_import_root_finds_a_sourceless_package(
     source.unlink()  # only __init__.pyc is left, as in a sourceless install
     monkeypatch.syspath_prepend(str(tmp_path))
     try:
-        module = importlib.import_module("task18_sourceless")
+        module = importlib.import_module("sourceless_function_package")
         assert Path(module.__file__ or "").name == "__init__.pyc"
-        assert import_root("task18_sourceless") == str(tmp_path.resolve())
-        command = FunctionTool("task18_sourceless:solve").command(ToolRequest(), tmp_path)
+        assert import_root("sourceless_function_package") == str(tmp_path.resolve())
+        command = FunctionTool("sourceless_function_package:solve").command(ToolRequest(), tmp_path)
         assert command.argv[-3:] == [
             "--import-root",
             str(tmp_path.resolve()),
-            "task18_sourceless:solve",
+            "sourceless_function_package:solve",
         ]
     finally:
-        sys.modules.pop("task18_sourceless", None)
+        sys.modules.pop("sourceless_function_package", None)
 
 
 def test_import_root_finds_an_extension_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # a compiled __init__ (mypyc builds) is a package by its spec, not its file name
-    package = tmp_path / "task18_ext"
+    package = tmp_path / "extension_function_package"
     package.mkdir()
     init = package / "__init__.cpython-311-darwin.so"
     init.touch()
-    module = types.ModuleType("task18_ext")
+    module = types.ModuleType("extension_function_package")
     module.__spec__ = importlib.machinery.ModuleSpec(
-        "task18_ext", None, origin=str(init), is_package=True
+        "extension_function_package", None, origin=str(init), is_package=True
     )
     module.__file__ = str(init)
-    monkeypatch.setitem(sys.modules, "task18_ext", module)
-    assert import_root("task18_ext") == str(tmp_path.resolve())
+    monkeypatch.setitem(sys.modules, "extension_function_package", module)
+    assert import_root("extension_function_package") == str(tmp_path.resolve())
 
 
 @pytest.mark.parametrize(

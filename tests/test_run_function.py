@@ -215,16 +215,16 @@ def test_import_root_precedes_pythonpath(tmp_path: Path) -> None:
 def test_runner_does_not_add_cwd_for_late_imports(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    (root / "task18_late.py").write_text(
+    (root / "late_import_function.py").write_text(
         "def solve() -> dict[str, bool]:\n"
         "    try:\n"
-        "        import task18_workspace_only\n"
+        "        import workspace_only_dependency\n"
         "    except ModuleNotFoundError:\n"
         "        return {'shadowed': False}\n"
         "    return {'shadowed': True}\n"
     )
-    (tmp_path / "task18_workspace_only.py").write_text("")
-    done = run(tmp_path, "task18_late:solve", {}, import_dir=root, pythonpath=root)
+    (tmp_path / "workspace_only_dependency.py").write_text("")
+    done = run(tmp_path, "late_import_function:solve", {}, import_dir=root, pythonpath=root)
     assert done.returncode == 0, done.stderr
     assert json.loads((tmp_path / "swarm/result.json").read_text())["data"] == {"shadowed": False}
 
@@ -233,8 +233,8 @@ def test_runner_does_not_add_cwd_for_late_imports(tmp_path: Path) -> None:
     ("source", "error"),
     [
         (
-            "import task18_missing_dependency\n",
-            "ModuleNotFoundError: No module named 'task18_missing_dependency'",
+            "import missing_function_dependency\n",
+            "ModuleNotFoundError: No module named 'missing_function_dependency'",
         ),
         (f'raise RuntimeError("{SECRET}")\n', f"RuntimeError: {SECRET}"),
         ("raise SystemExit(0)\n", "SystemExit: 0"),
@@ -243,12 +243,12 @@ def test_runner_does_not_add_cwd_for_late_imports(tmp_path: Path) -> None:
 def test_import_failure_prints_user_traceback(tmp_path: Path, source: str, error: str) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    (root / "task18_import_failure.py").write_text(source)
-    done = run(tmp_path, "task18_import_failure:solve", {}, import_dir=root)
+    (root / "runner_import_failure.py").write_text(source)
+    done = run(tmp_path, "runner_import_failure:solve", {}, import_dir=root)
     assert done.returncode == 1
-    assert "cannot import task18_import_failure:solve" in done.stderr
+    assert "cannot import runner_import_failure:solve" in done.stderr
     assert "Traceback (most recent call last):" in done.stderr
-    assert "task18_import_failure.py" in done.stderr
+    assert "runner_import_failure.py" in done.stderr
     assert error in done.stderr
     assert not done.stdout
     assert not (tmp_path / "swarm/result.json").exists()

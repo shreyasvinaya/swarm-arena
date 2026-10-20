@@ -120,6 +120,5 @@ def _toml_json(value: Any) -> Any:
     return finite_json(value, allow_none=False)
 
 
-FiniteJson = Annotated[Any, AfterValidator(finite_json)]
 FiniteJsonObject = Annotated[dict[str, Any], AfterValidator(finite_json)]
 TomlJsonObject = Annotated[dict[str, Any], AfterValidator(_toml_json)]

@@ -229,6 +229,8 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     Validate against the referenced component's Config without constructing the
     component. Only file-set and reference fields present in the raw config are
     written back; omitted defaults stay omitted and other values stay raw.
+    Nested references omit absent model fields, and the returned reference is
+    validated so its configuration remains reloadable from JSON and TOML.
 
     Parameters
     ----------
@@ -256,9 +258,17 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
 
     Examples
     --------
+    >>> import tempfile
     >>> from swarm_arena import Ref
-    >>> ref = Ref(path="my_package.tools:MyTool", config={"files": ["tool/*"]})
-    >>> frozen = snapshot_ref(ref, Path("."), artifacts)  # doctest: +SKIP
+    >>> from swarm_arena._store.base import open_store
+    >>> ref = Ref(path="swarm_arena.scoring:Lexicographic", config={"judges": [
+    ...     {"path": "swarm_arena:ScriptJudge", "config": {"command": ["score"]}}
+    ... ]})
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     artifacts = ArtifactStore(open_store(f"{tmp}/artifacts"))
+    ...     frozen = snapshot_ref(ref, Path(tmp), artifacts)
+    >>> Ref.model_validate_json(frozen.model_dump_json()) == frozen
+    True
     """
     _, config = ref._resolve_config(Configurable)
     updated = dict(ref.config)
@@ -269,12 +279,15 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
         if isinstance(value, FileSet):
             updated[key] = snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
         elif isinstance(value, Ref):
-            updated[key] = snapshot_ref(value, base_dir, artifacts).model_dump(mode="json")
+            updated[key] = snapshot_ref(value, base_dir, artifacts).model_dump(
+                mode="json", exclude_none=True
+            )
         elif isinstance(value, list) and value and all(isinstance(item, Ref) for item in value):
             updated[key] = [
-                snapshot_ref(item, base_dir, artifacts).model_dump(mode="json") for item in value
+                snapshot_ref(item, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
+                for item in value
             ]
-    return ref.model_copy(update={"config": updated})
+    return Ref(path=ref.path, config=updated, name=ref.name)
 
 
 def _snapshot_team(team: TeamSpec, base_dir: Path, artifacts: ArtifactStore) -> TeamSpec:
