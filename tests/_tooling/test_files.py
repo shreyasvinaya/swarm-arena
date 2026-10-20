@@ -2,10 +2,10 @@ import os
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
-from traceback import format_exception
 from typing import Any
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import FilesWidget, Widget
 from pydantic import create_model, field_validator
 from pydantic_core import PydanticCustomError
@@ -142,8 +142,7 @@ def test_snapshot_fileset_sanitizes_io_errors(
     monkeypatch.setattr(Path, "glob", fail_glob)
     with pytest.raises(ValueError, match="cannot snapshot glob") as exc:
         snapshot_fileset(FileSet(globs=["data/*"]), tmp_path, artifacts)
-    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
-    assert exc.value.__suppress_context__
+    assert_secret_absent(exc.value, "snapshot-secret-sentinel", sanitized=True)
 
 
 def test_snapshot_ref_nested(tmp_path: Path, artifacts: ArtifactStore) -> None:
@@ -231,8 +230,7 @@ def test_snapshot_ref_sanitizes_validation_errors(
 ) -> None:
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(Ref(path="_fakes.tools:FilesWidget", config=config), tmp_path, artifacts)
-    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
-    assert exc.value.__suppress_context__
+    assert_secret_absent(exc.value, "snapshot-secret-sentinel", sanitized=True)
 
 
 def test_snapshot_ref_sanitizes_validator_message(
@@ -250,7 +248,7 @@ def test_snapshot_ref_sanitizes_validator_message(
     secret = "snapshot-secret-sentinel"
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(Ref(path="_fakes.tools:Widget", config={"size": secret}), tmp_path, artifacts)
-    assert secret not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, secret)
 
 
 def test_snapshot_ref_sanitizes_import_errors(
@@ -262,7 +260,7 @@ def test_snapshot_ref_sanitizes_import_errors(
     monkeypatch.setattr(Ref, "load", fail_load)
     with pytest.raises(ValueError, match=r"cannot import _fakes\.tools:Widget") as exc:
         snapshot_ref(Ref(path="_fakes.tools:Widget"), tmp_path, artifacts)
-    assert "snapshot-secret-sentinel" not in "".join(format_exception(exc.value))
+    assert_secret_absent(exc.value, "snapshot-secret-sentinel")
 
 
 PLAN_TOML = """
@@ -426,11 +424,8 @@ def test_snapshot_ref_config_validation_failures_are_secret_safe(
     with pytest.raises(ConfigError) as exc:
         snapshot_ref(ref, tmp_path, artifacts)
 
-    for diagnostic in (str(exc.value), repr(exc.value.args), "".join(format_exception(exc.value))):
-        assert secret not in diagnostic
+    assert_secret_absent(exc.value, secret, sanitized=True)
     assert str(exc.value) == f"_fakes.tools:Widget: {expected}"
-    assert exc.value.__suppress_context__
-    assert exc.value.__cause__ is None
 
 
 @pytest.mark.parametrize(

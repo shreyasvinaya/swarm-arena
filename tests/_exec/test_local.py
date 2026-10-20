@@ -13,12 +13,12 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Sequence
 from itertools import pairwise
 from pathlib import Path
-from traceback import format_exception
 from typing import Any
 
 import anyio
 import pytest
 from _fakes.proc import pid_alive, reap, require_visible_proc, spawn_group, wait_until
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
     COLLECTING,
     RELEASE,
@@ -539,18 +539,6 @@ async def test_folded_output_vs_staged_path_fails_producing_run(
     assert "output-secret" not in diagnostic
 
 
-# --- Fix round 1 ---
-
-
-def assert_secret_safe(error: BaseException, secret: str) -> None:
-    for text in (str(error), repr(error), repr(error.args), "".join(format_exception(error))):
-        assert secret not in text
-    if isinstance(error, ValidationError):
-        assert secret not in repr(error.errors())
-        assert secret not in error.json()
-    assert error.__cause__ is None
-
-
 async def cancel_when(
     submit: Callable[[], Coroutine[Any, Any, object]], ready: Callable[[], Awaitable[bool]]
 ) -> None:
@@ -713,10 +701,10 @@ def test_config_errors_hide_values(entry: str) -> None:  # M1
 
     with pytest.raises(ValidationError, match="workspace_root") as caught:
         build()
-    assert_secret_safe(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
     with pytest.raises(ValidationError, match="max_concurrent") as caught:
         LocalExecutor(max_concurrent=secret)
-    assert_secret_safe(caught.value, secret)
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 async def test_rlimits_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # M11
@@ -997,9 +985,6 @@ def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> 
     )
     assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
     assert time.monotonic() - started < 15  # the blocked collect thread would hold it for 30 s
-
-
-# --- Fix round 2 ---
 
 
 @pytest.fixture
