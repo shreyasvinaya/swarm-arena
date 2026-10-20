@@ -1,13 +1,16 @@
+import asyncio
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import pytest
+from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
 from swarm_arena._errors import Fenced
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.ref import Ref
@@ -558,3 +561,170 @@ async def test_raising_judge_needs_no_score_stamping(final: bool) -> None:
     assert outcome.scores == []
     assert [error.reason for error in outcome.errors] == ["RuntimeError: judge raised"]
     assert SECRET not in outcome.model_dump_json()
+
+
+BOUNDARY_SECRET = "6ec2800b-c2de-4674-b121-cb946c0ef834"
+
+
+def _private_hook_failure() -> ValueError:
+    error = ValueError(BOUNDARY_SECRET)
+    error.add_note(BOUNDARY_SECRET)
+    error.__cause__ = RuntimeError(BOUNDARY_SECRET)
+    return error
+
+
+async def _boundary_outcome(judge: Judge, *, final: bool, ctx: JudgeContext) -> JudgeOutcome:
+    candidates = [_cand("c-1"), _cand("c-2")]
+    ref = Ref.of(_RecordingJudge()).model_copy(update={"name": "broken"})
+    later = _RecordingJudge()
+    if final:
+        order, outcome = await final_judge("g", (ref, judge), candidates, ctx)
+        assert order == []
+        later_order, later_outcome = await final_judge(
+            "g", (Ref.of(later), later), candidates, _judge_ctx()
+        )
+        assert [candidate.id for candidate in later_order] == ["c-1", "c-2"]
+    else:
+        outcome = await judge_round(
+            "g",
+            [(ref, judge), (Ref.of(later), later)],
+            candidates,
+            [_cand("c-0")],
+            lambda current: ctx if current is judge else _judge_ctx(),
+        )
+        later_outcome = outcome
+    assert later.seen == [["c-1", "c-2"]]
+    assert [(score.candidate_id, score.judge) for score in later_outcome.scores] == [
+        ("c-1", "recording"),
+        ("c-2", "recording"),
+    ]
+    assert all(score.judge != "broken" for score in outcome.scores)
+    for result in (outcome, later_outcome):
+        assert BOUNDARY_SECRET not in str(result) + repr(result) + str(result.model_dump())
+        assert_secret_absent(RuntimeError(result.model_dump_json()), BOUNDARY_SECRET)
+        for event_type, entries in (
+            (EventType.SCORE, result.scores),
+            (EventType.JUDGE_ERROR, result.errors),
+        ):
+            for entry in entries:
+                event = EventDraft(type=event_type, payload=entry.model_dump(mode="json"))
+                assert EventDraft.model_validate_json(event.model_dump_json()) == event
+                assert_secret_absent(RuntimeError(event.model_dump_json()), BOUNDARY_SECRET)
+    return outcome
+
+
+@pytest.mark.parametrize("hook", ["rubric_hash", "panel_hash", "anchor_count"])
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("context_error", [False, True])
+async def test_judge_hook_failures_are_contained(
+    hook: str, final: bool, context_error: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    judge = _RecordingJudge(anchor_count=1)
+    failure = _private_hook_failure()
+
+    def fail() -> Any:
+        raise failure
+
+    monkeypatch.setattr(judge, hook, fail)
+    ctx = _judge_ctx(ids=IdGen("run-1", 1))
+    if context_error:
+        ctx.judge_error("c-2", "candidate failed")
+    if final and hook == "anchor_count":
+        # Final judging never consults the anchor hook.
+        order, outcome = await final_judge("g", (Ref.of(judge), judge), [_cand()], ctx)
+        assert [candidate.id for candidate in order] == ["c-1"]
+        assert outcome.errors == []
+        return
+    try:
+        outcome = await _boundary_outcome(judge, final=final, ctx=ctx)
+    except Exception as error:
+        assert_secret_absent(error, BOUNDARY_SECRET, sanitized=True)
+        raise
+    expected = [("c-1", "ValueError: judge raised")]
+    expected.append(("c-2", "candidate failed" if context_error else "ValueError: judge raised"))
+    if not final and hook != "anchor_count":
+        expected.append(("c-0", "ValueError: judge raised"))
+    assert [(error.candidate_id, error.reason) for error in outcome.errors] == expected
+    assert ctx.ids.counters() == {}
+
+
+class _MalformedReturnJudge(_RecordingJudge):
+    def __init__(self, result: object) -> None:
+        super().__init__()
+        self.result = result
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return cast(list[Score], self.result)
+
+    def rubric_hash(self) -> str:
+        pytest.fail("malformed output must never reach score stamping")
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        [Score(key=(1.0,), candidate_id="c-1"), BOUNDARY_SECRET],
+        {"private": BOUNDARY_SECRET},
+        "",
+        b"",
+    ],
+)
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("context_error", [False, True])
+async def test_malformed_judge_output_fails_the_whole_invocation(
+    result: object, final: bool, context_error: bool
+) -> None:
+    ctx = _judge_ctx(ids=IdGen("run-1", 1))
+    if context_error:
+        ctx.judge_error("c-2", "candidate failed")
+    outcome = await _boundary_outcome(_MalformedReturnJudge(result), final=final, ctx=ctx)
+    assert [(error.candidate_id, error.reason) for error in outcome.errors] == [
+        ("c-1", "TypeError: judge raised"),
+        ("c-2", "candidate failed" if context_error else "TypeError: judge raised"),
+    ]
+    assert ctx.ids.counters() == {}
+
+
+@pytest.mark.parametrize(
+    ("hook", "final"),
+    [
+        ("rubric_hash", False),
+        ("rubric_hash", True),
+        ("panel_hash", False),
+        ("panel_hash", True),
+        ("anchor_count", False),
+    ],
+)
+@pytest.mark.parametrize("failure_type", [Fenced, asyncio.CancelledError])
+async def test_judge_hooks_preserve_fencing_and_cancellation(
+    hook: str,
+    final: bool,
+    failure_type: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = _RecordingJudge()
+    later = _RecordingJudge()
+    failure = failure_type("ownership or cancellation")
+
+    def fail() -> Any:
+        raise failure
+
+    monkeypatch.setattr(judge, hook, fail)
+    call = (
+        final_judge("g", (Ref.of(judge), judge), [_cand()], _judge_ctx())
+        if final
+        else judge_round(
+            "g",
+            [(Ref.of(judge), judge), (Ref.of(later), later)],
+            [_cand()],
+            [],
+            lambda current: _judge_ctx(),
+        )
+    )
+    with pytest.raises(failure_type) as caught:
+        await call
+    assert caught.value is failure
+    assert later.seen == []

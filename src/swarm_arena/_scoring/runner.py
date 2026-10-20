@@ -124,31 +124,55 @@ async def run_checks(
 
 
 async def _judge_batch(
-    ref: Ref, judge: Judge, batch: Sequence[Candidate], ctx: JudgeContext
+    ref: Ref,
+    judge: Judge,
+    batch: Sequence[Candidate],
+    ctx: JudgeContext,
+    *,
+    leaders: Sequence[Candidate] | None = None,
 ) -> JudgeOutcome:
-    """Call one judge, apply error precedence, and stamp only accepted scores."""
+    """Contain judge hooks and malformed output before building safe outcomes."""
     name = ref.component_name()
     raised: str | None = None
+    seen: set[str] = set()
+    nonfinite: set[str] = set()
     try:
+        if leaders is not None:
+            anchors = leaders[: judge.anchor_count()]
+            batch = list(batch)
+            members = {candidate.id for candidate in batch}
+            for anchor in anchors:
+                if anchor.id not in members:
+                    batch.append(anchor)
+                    members.add(anchor.id)
+            ctx.anchors = frozenset(anchor.id for anchor in anchors)
         scores = await judge.judge(ctx.goal, batch, ctx)
+        if (
+            not isinstance(scores, Sequence)
+            or isinstance(scores, (str, bytes, bytearray))
+            or any(not isinstance(score, Score) for score in scores)
+        ):
+            raise TypeError("invalid judge result")
+        members = {candidate.id for candidate in batch}
+        accepted: list[Score] = []
+        for score in scores:
+            if score.candidate_id not in members or score.candidate_id in seen:
+                continue
+            seen.add(score.candidate_id)
+            if not is_finite_score(score):
+                nonfinite.add(score.candidate_id)
+            elif score.candidate_id not in ctx.errors:
+                accepted.append(score)
+        stamped = (
+            stamp_scores(accepted, judge=judge, judge_name=name, ids=ctx.ids, batch_id=ctx.batch_id)
+            if accepted
+            else []
+        )
     except Fenced:
         raise
     except Exception as error:
-        scores = []
+        stamped = []
         raised = f"{type(error).__name__}: judge raised"
-
-    members = {candidate.id for candidate in batch}
-    seen: set[str] = set()
-    nonfinite: set[str] = set()
-    accepted: list[Score] = []
-    for score in scores:
-        if score.candidate_id not in members or score.candidate_id in seen:
-            continue
-        seen.add(score.candidate_id)
-        if not is_finite_score(score):
-            nonfinite.add(score.candidate_id)
-        elif score.candidate_id not in ctx.errors:
-            accepted.append(score)
 
     errors: list[JudgeError] = []
     for candidate in batch:
@@ -163,11 +187,6 @@ async def _judge_batch(
         else:
             continue
         errors.append(JudgeError(candidate_id=candidate.id, judge=name, reason=reason))
-    stamped = (
-        stamp_scores(accepted, judge=judge, judge_name=name, ids=ctx.ids, batch_id=ctx.batch_id)
-        if accepted
-        else []
-    )
     return JudgeOutcome(scores=stamped, errors=errors)
 
 
@@ -184,7 +203,8 @@ async def judge_round(
     Empty gated-in batches skip all judges. Foreign scores and later duplicate
     scores are discarded before finite-key validation and stamping. Each judge
     gets one fresh context from ``ctx_for``; its batch and anchor ids are set on
-    that supplied context.
+    that supplied context. Hook failures and malformed returns fail the whole
+    invocation with type-only errors; fencing and cancellation propagate.
 
     Parameters
     ----------
@@ -221,17 +241,10 @@ async def judge_round(
     if not eligible:
         return JudgeOutcome(scores=scores, errors=errors)
     for ref, judge in judges:
-        anchors = leaders[: judge.anchor_count()]
-        batch = list(eligible)
-        members = {candidate.id for candidate in batch}
-        for anchor in anchors:
-            if anchor.id not in members:
-                batch.append(anchor)
-                members.add(anchor.id)
         ctx = ctx_for(judge)
-        ctx.batch_id = f"{goal_id}-{ref.component_name()}-{batch[0].id}"
-        ctx.anchors = frozenset(anchor.id for anchor in anchors)
-        outcome = await _judge_batch(ref, judge, batch, ctx)
+        ctx.batch_id = f"{goal_id}-{ref.component_name()}-{eligible[0].id}"
+        ctx.anchors = frozenset()
+        outcome = await _judge_batch(ref, judge, eligible, ctx, leaders=leaders)
         scores.extend(outcome.scores)
         errors.extend(outcome.errors)
     return JudgeOutcome(scores=scores, errors=errors)
@@ -248,7 +261,8 @@ async def final_judge(
 
     Final order compares score keys descending, then candidate ids ascending,
     across every finalist's round and fidelity. The supplied context is marked
-    final, cache reads are disabled, and anchors are cleared.
+    final, cache reads are disabled, and anchors are cleared. Judge and metadata
+    hook failures or malformed returns produce an empty order and safe errors.
 
     Parameters
     ----------
