@@ -311,3 +311,23 @@ def test_catalog_match_only_removes_top_level_settable_fields_without_io(
         assert catalog.match(bad, "tool") is None
         assert catalog.match(wrong_path, "tool") is None
         assert catalog.match(good, "manager") is None
+
+
+def test_catalog_match_uses_shared_json_equal_and_first_typed_match() -> None:
+    from swarm_arena._model import catalog, data
+
+    assert catalog.json_equal is data.json_equal
+    entries = [
+        CatalogEntry(
+            name=name,
+            kind="tool",
+            ref="demo:Tool",
+            description="",
+            config={"x": [{"value": value}]},
+        )
+        for name, value in [("bool", True), ("int", 1), ("float", 1.0), ("int-again", 1)]
+    ]
+    matched = PlannerCatalog(entries=entries).match(
+        Ref(path="demo:Tool", config={"x": [{"value": 1}]}), "tool"
+    )
+    assert matched is entries[1]

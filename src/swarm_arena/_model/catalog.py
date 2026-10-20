@@ -14,47 +14,11 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._model.base import CatalogKind, LLMRole, _SafeModel
-from swarm_arena._model.data import TomlJsonObject
+from swarm_arena._model.data import TomlJsonObject, json_equal
 from swarm_arena._model.goal import _Slug
 from swarm_arena._model.ref import Ref, load_object
 from swarm_arena._model.schema import compile_object_schema
 from swarm_arena._model.settings import _ConfigModel
-
-
-def _json_equal(left: Any, right: Any) -> bool:
-    """
-    Compare validated JSON values without conflating scalar types.
-
-    Parameters
-    ----------
-    left : Any
-        Validated JSON value.
-    right : Any
-        Validated JSON value to compare.
-
-    Returns
-    -------
-    bool
-        Whether types and values agree recursively, ignoring mapping order.
-
-    Examples
-    --------
-    >>> _json_equal({"x": [True, 1.0]}, {"x": [1, 1.0]})
-    False
-    >>> _json_equal({"a": 1, "b": 2}, {"b": 2, "a": 1})
-    True
-    """
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, dict):
-        return left.keys() == right.keys() and all(
-            _json_equal(value, right[key]) for key, value in left.items()
-        )
-    if isinstance(left, list):
-        return len(left) == len(right) and all(
-            _json_equal(a, b) for a, b in zip(left, right, strict=True)
-        )
-    return left == right
 
 
 class ModelSpec(_ConfigModel):
@@ -417,7 +381,7 @@ class PlannerCatalog(_ConfigModel):
             if (
                 entry.kind == kind
                 and entry.ref == ref.path
-                and _json_equal(
+                and json_equal(
                     {k: v for k, v in ref.config.items() if k not in entry.settable}, entry.config
                 )
             ):

@@ -218,7 +218,7 @@ Rules [plan]:
 | `_model/__init__.py` | Empty | M1a | — |
 | `_model/base.py` | `FrozenModel`, `StoredModel`, `JsonValue`, the `Origin` and role literals | M1a | `tests/_model/test_base.py` |
 | `_model/compat.py` | Isolated Pydantic implementation assumptions | M1a | `tests/_model/test_compat.py` |
-| `_model/data.py` | Finite JSON and depth bounds, `Sha256`, manifest validation | M1a | `tests/_model/test_data_validation.py` |
+| `_model/data.py` | Finite JSON and depth bounds, `Sha256`, manifest validation; shared type-aware `json_equal` used by catalog matching and provenance | M1a | `tests/_model/test_data_validation.py` |
 | `_model/diagnostics.py` | Transportable sanitized validation errors and `validation_summary` | M1a | `tests/_model/test_validation_safety.py` |
 | `_model/safe.py` | Shared model validation and error sanitization boundaries | M1a | `tests/_model/test_validation_boundaries.py`, `tests/_model/test_validation_safety.py` |
 | `_model/locations.py` | Schema-aware identifier-only validation locations | M1a | `tests/_model/test_validation_locations.py` |
