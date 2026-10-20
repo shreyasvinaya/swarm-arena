@@ -866,7 +866,8 @@ class GoalRunner:
             revision = stamp(proposed, origin="autonomous", parent=self.plan)
 
             async def prepare() -> Plan:
-                admitted, _ = await anyio.to_thread.run_sync(
+                # Admission can execute extension Config validators.
+                admitted, _ = await run_sync_daemon(
                     partial(
                         admit_revision,
                         revision,
