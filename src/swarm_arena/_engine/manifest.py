@@ -4,10 +4,14 @@ import os
 import platform
 import subprocess
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar
 
+import anyio
+
 from swarm_arena._exec.procinfo import host_id
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import UtcDatetime, format_utc, sha256_hex, utc_now
 from swarm_arena._model.data import FiniteJsonObject, Sha256
@@ -105,8 +109,15 @@ def build_manifest(
     dict[str, Any]
         Validated JSON-mode RunManifest fields. Tool rows contain the reference
         path, base identity and git commit at the plan's base directory. Resolved
-        secret values are never read. Async callers must offload this function
-        with anyio.to_thread.run_sync because host and git probes perform I/O.
+        secret values are never read.
+
+    Notes
+    -----
+    This synchronous entry point runs user config validators and serializers.
+    Async callers must use build_manifest_async, which separates abandonable
+    user code from bounded host/git work. Do not offload this entire function
+    to an ordinary AnyIO worker: a blocked user hook can prevent cancellation
+    and interpreter exit.
 
     Examples
     --------
@@ -116,21 +127,103 @@ def build_manifest(
     >>> manifest["run_id"]  # doctest: +SKIP
     'r'
     """
-    tools: list[FiniteJsonObject] = []
-    seen: set[tuple[str, str, str | None]] = set()
+    return _build_manifest(
+        run_id=run_id,
+        config=config,
+        plans=plans,
+        capacity=capacity,
+        identities=_tool_identities(config, plans),
+    )
+
+
+async def build_manifest_async(
+    *, run_id: str, config: RunConfig, plans: Sequence[Plan], capacity: Resources | None
+) -> dict[str, Any]:
+    """
+    Build run provenance with abandonable user configuration hooks.
+
+    Parameters
+    ----------
+    run_id : str
+        Run identifier.
+    config : RunConfig
+        Human configuration, hashed as deterministic UTF-8 TOML.
+    plans : Sequence[Plan]
+        Admitted snapshotted plans. Ordinary and converge tools use base refs
+        and catalog settable fields, independent of round overrides.
+    capacity : Resources or None
+        Executor-reported capacity, or None when unavailable.
+
+    Returns
+    -------
+    dict[str, Any]
+        The same validated JSON-mode RunManifest fields as build_manifest.
+
+    Notes
+    -----
+    This is the supported entry point for async callers. Tool identity
+    validation and serialization run through run_sync_daemon; cancellation
+    abandons a blocked hook without preventing interpreter exit. Only after
+    that phase succeeds does an AnyIO worker assemble the manifest and perform
+    bounded host/git probes. Do not wrap build_manifest in to_thread.run_sync.
+
+    Examples
+    --------
+    >>> import anyio
+    >>> from functools import partial
+    >>> from swarm_arena import RunConfig
+    >>> anyio.run(partial(build_manifest_async, run_id="r",  # doctest: +SKIP
+    ...     config=RunConfig(), plans=[], capacity=None))["run_id"]
+    'r'
+    """
+    identities = await run_sync_daemon(_tool_identities, config, plans)
+    return await anyio.to_thread.run_sync(
+        partial(
+            _build_manifest,
+            run_id=run_id,
+            config=config,
+            plans=plans,
+            capacity=capacity,
+            identities=identities,
+        )
+    )
+
+
+def _tool_identities(config: RunConfig, plans: Sequence[Plan]) -> list[list[tuple[str, str]]]:
+    """Resolve user tool configs without performing host/git probes."""
+    identities: list[list[tuple[str, str]]] = []
     for plan in plans:
+        rows: list[tuple[str, str]] = []
         teams = list(plan.teams)
         if plan.converge.mode == "team" and plan.converge.team is not None:
             teams.append(plan.converge.team)
-        commit = _git_commit(plan.base_dir)
         for team in teams:
             for agent in team.agents:
                 ref = agent.tool
                 identity = tool_identity(ref, find_entry(ref, "tool", config.planner_catalog))
-                key = (ref.path, identity, commit)
-                if key not in seen:
-                    seen.add(key)
-                    tools.append({"ref": ref.path, "identity": identity, "git_commit": commit})
+                rows.append((ref.path, identity))
+        identities.append(rows)
+    return identities
+
+
+def _build_manifest(
+    *,
+    run_id: str,
+    config: RunConfig,
+    plans: Sequence[Plan],
+    capacity: Resources | None,
+    identities: Sequence[Sequence[tuple[str, str]]],
+) -> dict[str, Any]:
+    """Assemble host provenance using already resolved tool identities."""
+    tools: list[FiniteJsonObject] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for plan, rows in zip(plans, identities, strict=True):
+        commit = _git_commit(plan.base_dir)
+        for path, identity in rows:
+            key = (path, identity, commit)
+            if key not in seen:
+                seen.add(key)
+                tools.append({"ref": path, "identity": identity, "git_commit": commit})
     return RunManifest(
         run_id=run_id,
         created_at=format_utc(utc_now()),

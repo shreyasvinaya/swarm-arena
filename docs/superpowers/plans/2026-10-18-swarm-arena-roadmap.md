@@ -2220,7 +2220,11 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     # Admitted later revisions use this same preflight before dispatch. User construction/hooks use run_sync_daemon;
     # failures aggregate reference paths and exception types only.
 def build_manifest(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
-                   capacity: Resources | None) -> dict[str, Any]: ...  # _engine/manifest.py; offload from async callers
+                   capacity: Resources | None) -> dict[str, Any]: ...  # _engine/manifest.py; synchronous callers only
+async def build_manifest_async(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
+                              capacity: Resources | None) -> dict[str, Any]: ...  # supported async entry point
+    # Tool identity config validation/serialization uses run_sync_daemon, then bounded host/git work uses to_thread.
+    # Async callers must use build_manifest_async; never offload the whole sync builder to an ordinary AnyIO worker.
     # Validated JSON-mode RunManifest dump, with nulls preserved. Hash deterministic UTF-8 config/plan TOML dumps;
     # record GoalKey.files_sha256, base-ref tool identities (catalog settable fields excluded), and bounded git probes.
 class GoalStatus(FrozenModel):

@@ -1,7 +1,11 @@
+import os
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 
@@ -17,8 +21,9 @@ from swarm_arena import (
     TeamSpec,
 )
 from swarm_arena._engine import manifest as manifest_mod
-from swarm_arena._engine.manifest import RunManifest, build_manifest
+from swarm_arena._engine.manifest import RunManifest, build_manifest, build_manifest_async
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.catalog import CatalogEntry
 from swarm_arena.config import SecretsPolicy
 
 
@@ -177,3 +182,162 @@ def test_manifest_invalid_json_hides_input() -> None:
     with pytest.raises(ValueError, match="json_invalid") as caught:
         RunManifest.model_validate_json(malformed)
     assert_secret_absent(caught.value, "MANIFEST_SECRET")
+
+
+@pytest.mark.parametrize("capacity", [None, Resources(cpus=2)])
+async def test_async_manifest_preserves_output_and_worker_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capacity: Resources | None
+) -> None:
+    from swarm_arena.config import PlannerCatalog
+
+    plan = _plan()
+    plan.rounds.append(RoundSpec(tool_overrides={"k": 2}))
+    plan = plan.model_copy(
+        update={
+            "converge": ConvergeSpec(
+                mode="team", team=plan.teams[0].model_copy(update={"name": "join"})
+            )
+        }
+    )
+    plans = [plan, Plan.loads(plan.dumps(), base_dir=tmp_path)]
+    config = RunConfig(
+        planner_catalog=PlannerCatalog(
+            entries=[
+                CatalogEntry(
+                    name="counter",
+                    kind="tool",
+                    ref="_fakes.tools:CountingTool",
+                    description="Count",
+                    settable={"k": {"type": "integer"}},
+                )
+            ]
+        )
+    )
+    now = manifest_mod.utc_now()
+    monkeypatch.setattr(manifest_mod, "utc_now", lambda: now)
+    expected = build_manifest(run_id="r", config=config, plans=plans, capacity=capacity)
+    loop_thread = threading.get_ident()
+    phases: list[str] = []
+    real_identity = manifest_mod.tool_identity
+    real_git = manifest_mod._git_commit
+    real_host = manifest_mod.host_id
+
+    def identity(ref: Ref, entry: CatalogEntry | None) -> str:
+        assert threading.current_thread().daemon
+        assert threading.get_ident() != loop_thread
+        phases.append("identity")
+        return real_identity(ref, entry)
+
+    def git(base_dir: Path) -> str | None:
+        assert anyio.from_thread.run_sync(threading.get_ident) == loop_thread
+        assert not threading.current_thread().daemon
+        phases.append("git")
+        return real_git(base_dir)
+
+    def host() -> str:
+        assert anyio.from_thread.run_sync(threading.get_ident) == loop_thread
+        phases.append("host")
+        return real_host()
+
+    monkeypatch.setattr(manifest_mod, "tool_identity", identity)
+    monkeypatch.setattr(manifest_mod, "_git_commit", git)
+    monkeypatch.setattr(manifest_mod, "host_id", host)
+    actual = await build_manifest_async(run_id="r", config=config, plans=plans, capacity=capacity)
+    assert actual == expected
+    assert len(actual["tools"]) == 2
+    assert phases == ["identity"] * 4 + ["git", "git", "host"]
+
+
+@pytest.mark.parametrize("hook", ["validator", "serializer"])
+def test_cancelled_manifest_identity_allows_process_exit(tmp_path: Path, hook: str) -> None:
+    script = r"""
+import threading
+from typing import Self
+
+import anyio
+from pydantic import field_serializer, model_validator
+from _fakes.tools import CountingTool, RecordingExecutor
+from swarm_arena import AgentSpec, Goal, Plan, Ref, RunConfig, TeamSpec
+from swarm_arena._engine.manifest import build_manifest_async
+from swarm_arena._engine.preflight import run_preflight
+
+block = False
+entered = threading.Event()
+
+def block_hook(name: str) -> None:
+    if block and name == HOOK:
+        print(f"{name}_entered daemon={threading.current_thread().daemon}", flush=True)
+        entered.set()
+        threading.Event().wait()
+
+class BlockingTool(CountingTool):
+    class Config(CountingTool.Config):
+        @model_validator(mode="after")
+        def validate_prerequisites(self) -> Self:
+            block_hook("validator")
+            return self
+
+        @field_serializer("k")
+        def serialize_k(self, value: int) -> int:
+            block_hook("serializer")
+            return value
+
+async def main() -> None:
+    global block
+    plan = Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[TeamSpec(name="t", rationale="Explore", agents=[
+            AgentSpec(name="a", rationale="Explore",
+                      tool=Ref(path="__main__:BlockingTool"),
+                      manager=Ref(path="_fakes.tools:NoopManager"))
+        ])],
+        judges=[],
+    )
+    config = RunConfig()
+    await run_preflight([plan], config, RecordingExecutor())
+    print("preflight_passed", flush=True)
+    block = True
+    scope = anyio.CancelScope()
+
+    async def build() -> None:
+        with scope:
+            await build_manifest_async(
+                run_id="r", config=config, plans=[plan], capacity=None
+            )
+        print(f"manifest_returned cancel_called={scope.cancel_called}", flush=True)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(build)
+        with anyio.fail_after(2):
+            while not entered.is_set():
+                await anyio.sleep(0.01)
+        scope.cancel()
+
+anyio.run(main)
+print("interpreter_exiting", flush=True)
+"""
+    root = Path(__file__).resolve().parents[2]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")]),
+    }
+    try:
+        done = subprocess.run(
+            [sys.executable, "-B", "-c", f"HOOK = {hook!r}\n" + script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"manifest cancellation blocked process exit: {exc.stdout!r}")
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == ""
+    assert done.stdout.splitlines() == [
+        "preflight_passed",
+        f"{hook}_entered daemon=True",
+        "manifest_returned cancel_called=True",
+        "interpreter_exiting",
+    ]
