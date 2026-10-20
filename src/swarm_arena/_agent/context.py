@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
+from dataclasses import dataclass
 from threading import get_ident
 from typing import Any, Literal, TypeVar
 
@@ -12,7 +13,7 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import execute_tool_run
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import ConfigError, Fenced, SoftError
+from swarm_arena._errors import _CORE_SIGNAL, ConfigError, Fenced, SoftError, _core_signal
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import JsonValue
@@ -23,12 +24,59 @@ from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import Estimate
+from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.runner import for_manager
 from swarm_arena._tooling.staging import effective_files
-from swarm_arena._tooling.tool import Action
+from swarm_arena._tooling.tool import Action, Tool
 
 _T = TypeVar("_T")
-_nested: ContextVar[frozenset[object]] = ContextVar("agent_nested_actions", default=frozenset())
+
+
+@dataclass(eq=False)
+class _ActionLifetime:
+    """Revoke accounting suppression in every inherited task context at once."""
+
+    owner: object
+    live: bool = True
+
+
+_nested: ContextVar[tuple[_ActionLifetime, ...]] = ContextVar("agent_nested_actions", default=())
+
+
+@dataclass(frozen=True)
+class _ToolMetadata:
+    """Carry prepared hook results without running connector code on the loop."""
+
+    description: str
+    input_model: type[BaseModel]
+    editable: tuple[str, ...]
+    actions: tuple[Action[Any], ...]
+    feedback: Mapping[str, str]
+
+
+def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolMetadata:
+    """Read and validate metadata in the runner's abandonable daemon boundary."""
+    try:
+        description = tool.get_description()
+        input_model = tool.get_input_model()
+        editable = tuple(tool.editable())
+        actions = tuple(tool.extra_actions())
+        feedback = {name: check.feedback for name, check in checks}
+        if not isinstance(description, str):
+            raise TypeError("invalid description")
+        if not isinstance(input_model, type) or not issubclass(input_model, BaseModel):
+            raise TypeError("invalid input model")
+        if not all(isinstance(path, str) for path in editable):
+            raise TypeError("invalid editable paths")
+        if not all(isinstance(action, Action) for action in actions):
+            raise TypeError("invalid actions")
+        if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
+            raise TypeError("invalid feedback policy")
+        return _ToolMetadata(description, input_model, editable, actions, feedback)
+    except Fenced:
+        raise
+    except Exception as error:
+        raise _core_signal(SoftError(f"invalid tool metadata: {type(error).__name__}")) from None
 
 
 class AgentContext:
@@ -38,6 +86,10 @@ class AgentContext:
     Constructed by the core on the owning event-loop thread. Synchronous reads
     from AnyIO action workers marshal to that loop; arbitrary unmanaged threads
     are unsupported. Extra actions charge once, including their nested reads.
+    Child tasks released after the enclosing action exits are charged normally.
+    The runner prepares connector metadata in supervised daemon workers before
+    constructing this loop-owned context. Feedback uses the producing policy;
+    unknown policies hide reasons and details.
 
     Parameters
     ----------
@@ -97,25 +149,36 @@ class AgentContext:
     def __init__(
         self, rt: AgentRuntime, *, gate: Callable[[], LimitReached | None] = lambda: None
     ) -> None:
-        """Bind runtime state and snapshot tool metadata on the owning loop."""
+        """Prepare metadata for standalone synchronous callers and bind state.
+
+        The async engine uses the private binding seam with a supervised
+        metadata snapshot, so no connector hooks run on its event loop.
+        """
+        self._bind(rt, gate=gate, metadata=_prepare_metadata(rt.tool, rt.checks))
+
+    def _bind(
+        self,
+        rt: AgentRuntime,
+        *,
+        gate: Callable[[], LimitReached | None],
+        metadata: _ToolMetadata,
+        feedback_for: Callable[[Candidate], Mapping[str, str]] | None = None,
+    ) -> None:
+        """Bind runtime state and already prepared metadata on the owner loop."""
         self._rt, self._gate, self._thread = rt, gate, get_ident()
         self._read_ids: dict[str, None] = {}
-        self._feedback = {name: check.feedback for name, check in rt.checks}
+        self._feedback = dict(metadata.feedback)
+        self._feedback_for = feedback_for
         self.goal: Goal = rt.goal.model_copy(deep=True)
         self.spec: AgentSpec = rt.spec.model_copy(deep=True)
         self.round: int = rt.round
         self.round_spec: RoundSpec = rt.round_spec.model_copy(deep=True)
         self.digest: str = rt.digest
         self.resumed: bool = bool(rt.resumed)
-        try:
-            self.tool_description: str = rt.tool.get_description()
-            self.input_model: type[BaseModel] = rt.tool.get_input_model()
-            self.editable: tuple[str, ...] = tuple(rt.tool.editable())
-            self.actions: tuple[Action[Any], ...] = tuple(rt.tool.extra_actions())
-        except Fenced:
-            raise
-        except Exception as error:
-            raise SoftError(f"invalid tool metadata: {type(error).__name__}") from None
+        self.tool_description: str = metadata.description
+        self.input_model: type[BaseModel] = metadata.input_model
+        self.editable: tuple[str, ...] = metadata.editable
+        self.actions: tuple[Action[Any], ...] = metadata.actions
 
     def _on_loop(self, fn: Callable[[], _T]) -> _T:
         """Marshal an AnyIO worker's complete lookup and accounting operation."""
@@ -139,13 +202,16 @@ class AgentContext:
         rt = self._rt
         blocked = self._gate()
         if blocked is not None:
-            raise blocked
+            raise _core_signal(LimitReached(blocked.limit, str(blocked)))
         if rt.watchdog.limit is not None:
-            raise LimitReached(rt.watchdog.limit, rt.watchdog.reason or "agent stopped")
-        if self in _nested.get():
+            raise _core_signal(
+                LimitReached(rt.watchdog.limit, rt.watchdog.reason or "agent stopped")
+            )
+        lifetime = next((item for item in reversed(_nested.get()) if item.owner is self), None)
+        if lifetime is not None and lifetime.live:
             return
         if rt.counters.turns >= rt.limits.max_turns_per_round:
-            raise LimitReached("max_turns_per_round", "turns used up for this round")
+            raise _core_signal(LimitReached("max_turns_per_round", "turns used up for this round"))
         rt.counters.turns += 1
         exhausted = board_read and rt.counters.board_reads >= rt.limits.max_board_reads_per_round
         if board_read and not exhausted:
@@ -157,11 +223,24 @@ class AgentContext:
             )
         )
         if exhausted:
-            raise SoftError("max_board_reads_per_round reached")
+            raise _core_signal(SoftError("max_board_reads_per_round reached"))
 
     def _manager(self, candidate: Candidate) -> Candidate:
         """Filter feedback without exposing mutable runtime-owned containers."""
-        return for_manager(candidate.model_copy(deep=True), self._feedback)
+        if self._feedback_for is not None:
+            feedback = self._feedback_for(candidate)
+        elif (
+            candidate.run_id == self._rt.repeats.run_id
+            and candidate.goal_id == self._rt.goal_id
+            and candidate.part == self._rt.part
+            and candidate.team == self._rt.team.name
+            and candidate.agent == self._rt.spec.name
+            and candidate.round == self.round
+        ):
+            feedback = self._feedback
+        else:
+            feedback = {}
+        return for_manager(candidate.model_copy(deep=True), feedback)
 
     def _candidate(self, id: str) -> Candidate:
         """Resolve an own item or snapshot result without charging a nested read."""
@@ -170,7 +249,7 @@ class AgentContext:
             try:
                 candidate = self._rt.view.get_candidate(id)
             except (KeyError, ValueError):
-                raise SoftError(f"unknown candidate: {id}") from None
+                raise _core_signal(SoftError(f"unknown candidate: {id}")) from None
         return candidate
 
     def _learning(self, id: str) -> Learning:
@@ -187,7 +266,7 @@ class AgentContext:
             try:
                 learning = self._rt.view.get_learning(id)
             except (KeyError, ValueError):
-                raise SoftError(f"unknown learning: {id}") from None
+                raise _core_signal(SoftError(f"unknown learning: {id}")) from None
         return learning.model_copy(deep=True)
 
     @property
@@ -446,7 +525,7 @@ class AgentContext:
         def read() -> list[Learning]:
             self._charge(board_read=True)
             if scope not in ("goal", "namespace"):
-                raise SoftError("invalid learning scope")
+                raise _core_signal(SoftError("invalid learning scope"))
             rt = self._rt
             found = rt.view.search_learnings(
                 rt.goal.namespace,
@@ -581,7 +660,7 @@ class AgentContext:
                 if isinstance(candidate, Candidate):
                     allowed.update(effective_files(rt.goal, candidate).values())
             if sha256 not in allowed:
-                raise SoftError("file not in your view")
+                raise _core_signal(SoftError("file not in your view"))
 
         self._on_loop(authorize)
         return self._rt.artifacts.get_bytes(sha256)
@@ -634,10 +713,10 @@ class AgentContext:
             self._charge(board_read=True)
             rt = self._rt
             if part is not None and part != rt.part:
-                raise SoftError("best(part=...) can read only this agent's own part")
+                raise _core_signal(SoftError("best(part=...) can read only this agent's own part"))
             judge = rt.rankings.get(rt.part or "")
             if judge is None:
-                raise SoftError("missing ranking for agent group")
+                raise _core_signal(SoftError("missing ranking for agent group"))
             rows = rt.view.leaderboard(rt.goal_key, judge=judge)[: max(0, k)]
             self._read_ids.update((row.candidate_id, None) for row in rows)
             return rows
@@ -732,13 +811,15 @@ class AgentContext:
                 posted_by_call=current_requesting_call(),
             )
         except ValidationError as error:
-            raise SoftError(f"invalid learning: {validation_summary(error)}") from None
+            raise _core_signal(
+                SoftError(f"invalid learning: {validation_summary(error)}")
+            ) from None
         for id in learning.evidence:
             self._candidate(id)
         for id in learning.refines:
             self._learning(id)
         if rt.counters.learnings >= rt.limits.max_learnings_per_agent_round:
-            raise SoftError("max_learnings_per_agent_round reached")
+            raise _core_signal(SoftError("max_learnings_per_agent_round reached"))
         rt.counters.learnings += 1
         learning = learning.model_copy(update={"id": rt.ids.next("L")})
         event = rt.journal.append(
@@ -783,9 +864,9 @@ class AgentContext:
         try:
             size = len(text.encode("utf-8"))
         except (AttributeError, UnicodeError):
-            raise SoftError("notes must be UTF-8 text") from None
+            raise _core_signal(SoftError("notes must be UTF-8 text")) from None
         if size > self._rt.limits.max_notes_bytes:
-            raise SoftError("max_notes_bytes reached")
+            raise _core_signal(SoftError("max_notes_bytes reached"))
         self._rt.journal.append(self._event(EventType.NOTES_SAVED, {"text": text}))
         self._rt.notes = text
 
@@ -833,17 +914,23 @@ class AgentContext:
         action = next((a for a in self.actions if a.name == name), None)
         self._charge(board_read=action is not None and action.counts_as == "board_read")
         if action is None:
-            raise SoftError(f"unknown action: {name}")
+            raise _core_signal(SoftError(f"unknown action: {name}"))
         try:
             validated = _validate_config(action.input_model, dict(args), where="action arguments")
         except ConfigError as error:
-            raise SoftError(str(error)) from None
-        token = _nested.set(_nested.get() | {self})
+            raise _core_signal(SoftError(str(error))) from None
+        lifetime = _ActionLifetime(self)
+        token = _nested.set((*_nested.get(), lifetime))
         try:
             return await action.handler(self, validated)
-        except (SoftError, LimitReached, Fenced):
+        except Fenced:
             raise
         except Exception as error:
-            raise SoftError(f"action failed: {type(error).__name__}") from None
+            if isinstance(error, (SoftError, LimitReached)) and (
+                getattr(error, "_core_signal", None) is _CORE_SIGNAL
+            ):
+                raise
+            raise _core_signal(SoftError(f"action failed: {type(error).__name__}")) from None
         finally:
+            lifetime.live = False
             _nested.reset(token)

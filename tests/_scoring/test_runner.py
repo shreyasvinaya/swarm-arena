@@ -471,7 +471,9 @@ def test_for_manager_hides_reasons_of_pass_fail_checks() -> None:
     assert original.checks[0].details == {"x": SECRET}
     assert c.id == original.id
     assert c.output == original.output
-    assert for_manager(original, {}).checks == original.checks
+    assert all(
+        not check.reasons and not check.details for check in for_manager(original, {}).checks
+    )
 
 
 def test_judge_outcome_and_error_are_frozen_models() -> None:
@@ -767,3 +769,17 @@ async def test_prepared_batch_funded_size_equals_submitted_batch() -> None:
     )
     assert judge.seen == ["c-1", "c-2"]
     assert len(outcome.scores) == 2
+
+
+@pytest.mark.parametrize("policy", [{}, {"gate": "unknown"}])
+def test_for_manager_unknown_policy_hides_feedback(policy: dict[str, str]) -> None:
+    original = _cand(
+        checks=[
+            CheckResult(check="gate", passed=True, reasons=[SECRET], details={"private": SECRET})
+        ]
+    )
+    filtered = for_manager(original, policy)
+    assert filtered.checks[0].reasons == []
+    assert filtered.checks[0].details == {}
+    assert original.checks[0].reasons == [SECRET]
+    assert original.checks[0].details == {"private": SECRET}

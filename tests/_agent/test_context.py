@@ -179,7 +179,7 @@ async def test_read_file_action_reads_only_the_agent_view(ctx_env: CtxEnv) -> No
         "content": "a = 1\n",
     }
     assert ctx_env.counters.board_reads == 1
-    with pytest.raises(SoftError, match=r"no such file: secret\.py"):
+    with pytest.raises(SoftError, match="action failed: SoftError"):
         await ctx.call_action("read_file", {"path": "secret.py"})
     outside = ctx_env.artifacts.put_bytes(b"not a file of this agent's view")
     with pytest.raises(SoftError, match="file not in your view"):
@@ -825,3 +825,148 @@ async def test_new_context_does_not_inherit_another_runtimes_starts(ctx_env: Ctx
     assert ctx_env.env.rt.started_runs == 1
     ctx_env.ctx(agent="b")
     assert ctx_env.rt.started_runs == 0
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("operation", ["notes", "board", "paid"])
+@pytest.mark.parametrize("available", [False, True])
+async def test_escaped_action_lifetime_is_revoked(
+    ctx_env: CtxEnv, cancelled: bool, operation: str, available: bool
+) -> None:
+    import asyncio
+
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena.tool import Usage
+
+    class PaidExecutor:
+        async def submit(self, job: Job) -> ToolOutput:
+            assert job.on_started is not None
+            await job.on_started(Job.Started(kind="process", job_id=job.id))
+            return ToolOutput(status="ok", usage=Usage(usd=0.000003))
+
+    ctx = ctx_env.ctx(
+        limits=Limits(max_turns_per_round=2 if available else 1), executor=PaidExecutor()
+    )
+    rt = ctx_env.rt
+    release, entered = anyio.Event(), anyio.Event()
+    children: list[asyncio.Task[None]] = []
+    results: list[Any] = []
+
+    async def child() -> None:
+        await release.wait()
+        for _ in range(2):
+            try:
+                if operation == "notes":
+                    results.append(await ctx.save_notes("escaped"))
+                elif operation == "board":
+                    results.append(ctx.search_learnings("escaped"))
+                else:
+                    results.append(await ctx.run_tool({"x": float(len(results))}))
+            except Exception as error:
+                results.append(error)
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        children.append(asyncio.create_task(child()))
+        entered.set()
+        if cancelled:
+            await anyio.sleep_forever()
+        return None
+
+    ctx.actions = (
+        Action(name="spawn", description="Spawn", input_model=EmptyArgs, handler=handler),
+    )
+    parent = asyncio.create_task(ctx.call_action("spawn", {}))
+    try:
+        await entered.wait()
+        if cancelled:
+            parent.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await parent
+        else:
+            await parent
+        release.set()
+        await children[0]
+    finally:
+        release.set()
+        for task in [parent, *children]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent, *children, return_exceptions=True)
+    assert sum(isinstance(result, LimitReached) for result in results) == (1 if available else 2)
+    assert all(
+        result.limit == "max_turns_per_round"
+        for result in results
+        if isinstance(result, LimitReached)
+    )
+    assert rt.counters.turns == (2 if available else 1)
+    assert rt.counters.board_reads == int(available and operation == "board")
+    assert rt.counters.tool_runs == int(available and operation == "paid")
+    assert len(ctx_env.events("notes_saved")) == int(available and operation == "notes")
+    assert len(ctx_env.events("reserve")) == int(available and operation == "paid")
+    assert [event.payload["actual"] for event in ctx_env.events("settle")] == (
+        [Amount(usd=0.000003).model_dump()] if available and operation == "paid" else []
+    )
+    await rt.journal.commit()
+    committed = read_committed(ctx_env.env.run_store)
+    assert committed is not None
+    state = RunState.from_events(committed[1])
+    assert state.goals["g"].counters["t/a"] == {
+        "turns": rt.counters.turns,
+        "board_reads": rt.counters.board_reads,
+    }
+    assert Ledger.replay(state, journal=rt.journal, ids=rt.ids).remaining(
+        rt.holder
+    ) == rt.ledger.remaining(rt.holder)
+
+
+@pytest.mark.parametrize("kind", [ValueError, SoftError, LimitReached])
+async def test_action_connector_control_errors_are_sanitized(
+    ctx_env: CtxEnv, kind: type[Exception]
+) -> None:
+    from uuid import uuid4
+
+    secret = str(uuid4())
+    ctx = ctx_env.ctx()
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        error = LimitReached("budget", secret) if kind is LimitReached else kind(secret)
+        error.add_note(secret)
+        raise error from RuntimeError(secret)
+
+    ctx.actions = (Action(name="fail", description="Fail", input_model=EmptyArgs, handler=handler),)
+    with pytest.raises(SoftError, match=f"action failed: {kind.__name__}") as caught:
+        await ctx.call_action("fail", {})
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert caught.value.__cause__ is None
+    assert not getattr(caught.value, "__notes__", ())
+
+
+@pytest.mark.parametrize("control", ["soft", "limit", "gate", "watchdog", "fenced"])
+async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: str) -> None:
+    from swarm_arena._errors import Fenced
+
+    blocked = False
+    ctx = ctx_env.ctx(gate=lambda: LimitReached("stop", "stopping") if blocked else None)
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        nonlocal blocked
+        if control == "soft":
+            return context.get_candidate("c-absent").id
+        if control == "fenced":
+            raise Fenced("run ownership lost")
+        if control == "gate":
+            blocked = True
+        else:
+            ctx_env.rt.watchdog.limit = "max_consecutive_failures"
+            ctx_env.rt.watchdog.reason = "agent stopped"
+        context.search_learnings("nested")
+        return None
+
+    ctx.actions = (Action(name="core", description="Core", input_model=EmptyArgs, handler=handler),)
+    expected = Fenced if control == "fenced" else SoftError if control == "soft" else LimitReached
+    with pytest.raises(expected) as caught:
+        await ctx.call_action("core", {})
+    if control == "soft":
+        assert str(caught.value) == "unknown candidate: c-absent"
+    elif isinstance(caught.value, LimitReached):
+        assert caught.value.limit == ("stop" if control == "gate" else "max_consecutive_failures")

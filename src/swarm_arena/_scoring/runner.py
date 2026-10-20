@@ -368,7 +368,9 @@ def for_manager(candidate: Candidate, feedback: Mapping[str, str]) -> Candidate:
         Candidate whose stored checks must remain unchanged.
     feedback : Mapping[str, str]
         Plan check names mapped to feedback modes. ``pass_fail`` hides both
-        reasons and structured details; other modes retain the check feedback.
+        reasons and structured details; only an explicit ``reasons`` retains them.
+        Missing or unknown policies hide feedback. The caller resolves the
+        producing candidate's group and plan revision, never the reader's policy.
 
     Returns
     -------
@@ -388,7 +390,7 @@ def for_manager(candidate: Candidate, feedback: Mapping[str, str]) -> Candidate:
     """
     checks = [
         result.model_copy(update={"reasons": [], "details": {}})
-        if feedback.get(result.check) == "pass_fail"
+        if feedback.get(result.check) != "reasons"
         else result.model_copy()
         for result in candidate.checks
     ]

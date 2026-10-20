@@ -1,6 +1,7 @@
 import dataclasses
 import threading
 from collections.abc import Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1175,3 +1176,185 @@ async def test_restarted_owner_can_read_and_parent_its_recovered_candidate(env: 
     assert child.parent_ids == [parent.id]
     assert child.read_ids == [parent.id]
     assert out.repeat_entries[0] == first.repeat_entries[0]
+
+
+@pytest.mark.parametrize(
+    "hook", ["get_description", "get_input_model", "editable", "extra_actions"]
+)
+@pytest.mark.parametrize("failure", ["raise", "hang"])
+async def test_metadata_preparation_is_supervised_per_agent(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, hook: str, failure: str
+) -> None:
+    secret = str(uuid4())
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    owner = threading.get_ident()
+    hook_threads: list[int] = []
+    ticks: list[float] = []
+    managers: list[str] = []
+    original_build = Ref.build
+
+    def build(self: Ref, base: type[Any]) -> Any:
+        instance = original_build(self, base)
+        if self.name == "faulty" and base is Tool:
+            original_hook = getattr(instance, hook)
+
+            def metadata() -> Any:
+                hook_threads.append(threading.get_ident())
+                entered.set()
+                if failure == "raise":
+                    error = ValueError(secret)
+                    error.add_note(secret)
+                    raise error from RuntimeError(secret)
+                release.wait(1)
+                returned.set()
+                return original_hook()
+
+            setattr(instance, hook, metadata)
+        return instance
+
+    class Probe(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            assert threading.get_ident() == owner
+            managers.append(ctx.spec.name)
+            ctx.search_learnings("heartbeat peer")
+            return RoundReport(summary="healthy")
+
+    async def heartbeat() -> None:
+        while True:
+            ticks.append(anyio.current_time())
+            await anyio.sleep(0.005)
+
+    e = env.with_limits(round_timeout_s=0.15)
+    runner = _construction_round(
+        e, Tool, [_with_manager("a", Probe()), _with_manager("b", Probe())]
+    )
+    monkeypatch.setattr(Ref, "build", build)
+    try:
+        start = anyio.current_time()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(heartbeat)
+            out = await runner.run(1)
+            tasks.cancel_scope.cancel()
+        elapsed = anyio.current_time() - start
+        assert entered.is_set()
+        assert managers == ["b"]
+        assert hook_threads
+        assert all(thread != owner for thread in hook_threads)
+        assert out.reasons["t/a"]
+        assert out.reasons["t/b"] == ""
+        assert len(e.events("agent_status")) == 2
+        assert_secret_absent(RuntimeError(repr(out)), secret)
+        assert_secret_absent(RuntimeError(repr(e.events("agent_status"))), secret)
+        if failure == "hang":
+            assert not returned.is_set()
+            assert elapsed < 0.7
+            assert len(ticks) >= 5
+            assert max(b - a for a, b in pairwise(ticks)) < 0.1
+        before = e.event_types()
+    finally:
+        release.set()
+    if failure == "hang":
+        assert await anyio.to_thread.run_sync(returned.wait, 1)
+        await anyio.lowlevel.checkpoint()
+        assert e.event_types() == before
+        assert managers == ["b"]
+
+
+@pytest.mark.parametrize(
+    ("part_policy", "main_policy"), [("pass_fail", "reasons"), ("reasons", "pass_fail")]
+)
+@pytest.mark.parametrize("reloaded", [False, True])
+async def test_seed_feedback_follows_producer_group_and_revision(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    part_policy: str,
+    main_policy: str,
+    reloaded: bool,
+) -> None:
+    from swarm_arena._model.results import Candidate
+
+    secret = str(uuid4())
+
+    def check(policy: str) -> Ref:
+        return Ref(
+            path="_fakes.tools:FeedbackCheck",
+            name="shared",
+            config={"feedback": policy, "reason": secret},
+        )
+
+    part = PartSpec(name="p", goal=Goal(id="sub", namespace="n"), checks=[check(part_policy)])
+    plan = PLAN.model_copy(update={"parts": [part], "checks": [check(main_policy)]})
+    producer = _runner("a")
+    producer.team = producer.team.model_copy(update={"part": "p"})
+    producer.part, producer.goal, producer.goal_key = "p", part.goal, part.goal.key()
+    out = await RoundRunner(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        agents=[producer, _runner("b")],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+    ).run(1)
+    parents = out.candidates
+    assert len(parents) == 2
+    assert all(c.checks[0].reasons == [secret] for c in parents)
+    from swarm_arena._journal.event import EventDraft
+
+    # A durable result without a producer-status policy (for example a crash)
+    # must stay private even when its check name matches a known group.
+    unrecorded = parents[0].model_copy(update={"id": "c-unrecorded"})
+    event = await env.deps.journal.append_durable(
+        EventDraft(
+            type="tool_end", goal_id="g", payload={"candidate": unrecorded.model_dump(mode="json")}
+        )
+    )
+    env.deps.board.put_candidate(unrecorded, epoch=event.epoch, seq=event.seq)
+    parents.append(unrecorded)
+    if reloaded:
+        from _fakes.tools import FeedbackCheck
+
+        # A later connector load must not redefine a producing policy.
+        original = FeedbackCheck.__init__
+
+        def reload_check(self: FeedbackCheck, config: Any = None) -> None:
+            original(self, config)
+            self.feedback = "reasons"
+
+        monkeypatch.setattr(FeedbackCheck, "__init__", reload_check)
+    seen: list[Candidate] = []
+
+    class Reader(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            seen.extend(ctx.get_candidate(id) for id in ctx.seed_parents)
+            return RoundReport(summary="read parents")
+
+    # Swap both policies in the receiving revision. The producing policy wins.
+    revised = plan.model_copy(
+        update={
+            "revision": 1,
+            "checks": [check(part_policy)],
+            "parts": [part.model_copy(update={"checks": [check(main_policy)]})],
+        }
+    )
+    reader = _with_manager("join", Reader())
+    second = await RoundRunner(
+        env.deps,
+        goal_id="g",
+        plan=revised,
+        agents=[reader],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+        converge=True,
+        seed_parents=[c.id for c in parents],
+    ).run(2)
+    assert second.reasons["t/join"] == ""
+    assert len(seen) == 3
+    for candidate in seen:
+        policy = part_policy if candidate.part == "p" else main_policy
+        if candidate.id == unrecorded.id:
+            policy = "pass_fail"
+        assert candidate.checks[0].reasons == ([secret] if policy == "reasons" else [])
+        assert candidate.checks[0].details == ({"private": secret} if policy == "reasons" else {})
+    assert all(
+        e.payload["candidate"]["checks"][0]["reasons"] == [secret] for e in env.events("tool_end")
+    )

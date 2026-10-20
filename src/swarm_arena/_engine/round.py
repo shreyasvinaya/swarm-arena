@@ -6,7 +6,7 @@ from typing import Any
 
 import anyio
 
-from swarm_arena._agent.context import AgentContext
+from swarm_arena._agent.context import AgentContext, _prepare_metadata, _ToolMetadata
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
@@ -264,8 +264,10 @@ class _RoundContext(AgentContext):
         *,
         gate: Callable[[], LimitReached | None],
         refresh: Callable[[], None],
+        metadata: _ToolMetadata,
+        feedback_for: Callable[[Candidate], Mapping[str, str]],
     ) -> None:
-        super().__init__(rt, gate=gate)
+        self._bind(rt, gate=gate, metadata=metadata, feedback_for=feedback_for)
         self._refresh = refresh
         self._running_tools = 0
 
@@ -292,7 +294,10 @@ class RoundRunner:
 
     Each slot prepares its components under live stop and deadline supervision.
     A failed or abandoned preparation ends only that slot; its manager never
-    starts. User constructors run in abandonable daemon workers.
+    starts. User constructors and tool metadata hooks run in abandonable daemon
+    workers. Agent-status records retain the actual check policy, producing
+    group, revision and new candidate ids. Assigned parents and historical
+    candidates use that policy; unknown history hides feedback.
 
     Parameters
     ----------
@@ -483,6 +488,66 @@ class RoundRunner:
             started_runs=self.started_runs.get(key, 0),
         )
 
+    async def _feedback_policies(self) -> dict[str, dict[str, str]]:
+        """Recover actual producing policies without re-running old check hooks.
+
+        Candidate ids identify their producing group and plan revision. If a
+        producer crashed before its status committed, or an older journal has
+        no policy snapshot, its candidate feedback remains private.
+        """
+        if self.deps.journal.head is None:
+            return {}
+        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        policies: dict[str, dict[str, str]] = {}
+        for _, events in chain:
+            for event in events:
+                if event.type != EventType.AGENT_STATUS or event.goal_id != self.goal_id:
+                    continue
+                policy = event.payload.get("feedback_policy")
+                if not isinstance(policy, dict):
+                    continue
+                checks, ids = policy.get("checks"), policy.get("candidates")
+                if not isinstance(checks, dict) or not isinstance(ids, list):
+                    continue
+                modes = {name: mode for name, mode in checks.items() if isinstance(mode, str)}
+                for id in ids:
+                    if isinstance(id, str):
+                        policies[id] = modes
+        return policies
+
+    async def _context(
+        self, rt: AgentRuntime, policies: Mapping[str, Mapping[str, str]]
+    ) -> _RoundContext:
+        """Prepare hooks under slot supervision, keeping all view reads on-loop."""
+        historical = set(rt.view._visible_candidate_ids())
+        historical.update(item.id for item in rt.own if isinstance(item, Candidate))
+        historical.update(
+            candidate.id for candidate in rt.repeats.candidates_of(f"{rt.team.name}/{rt.spec.name}")
+        )
+        metadata = await run_sync_daemon(_prepare_metadata, rt.tool, rt.checks)
+
+        def feedback_for(candidate: Candidate) -> Mapping[str, str]:
+            if candidate.run_id != self.deps.run_id or candidate.goal_id != self.goal_id:
+                return {}
+            if candidate.id in historical:
+                return policies.get(candidate.id, {})
+            if (
+                candidate.round == rt.round
+                and candidate.part == rt.part
+                and candidate.team == rt.team.name
+                and candidate.agent == rt.spec.name
+            ):
+                return metadata.feedback
+            return {}
+
+        return _RoundContext(
+            rt,
+            gate=self._gate,
+            refresh=self._refresh_budget,
+            metadata=metadata,
+            feedback_for=feedback_for,
+        )
+
     async def _parent_views(self, frontier: Frontier) -> dict[str, BoardView]:
         parents: dict[str, BoardView] = {}
         if not self.seed_parents:
@@ -613,6 +678,7 @@ class RoundRunner:
             self.started_runs = {**restored, **self.started_runs}
         private_paths = judge_private_paths(self.plan)
         parents = await self._parent_views(frontier)
+        feedback_policies = await self._feedback_policies()
         runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]
@@ -631,7 +697,7 @@ class RoundRunner:
                     await anyio.lowlevel.checkpoint()
                     rt = await self._runtime(slot, round, frontier, private_paths, parents)
                     runtimes[index] = rt
-                    ctx = _RoundContext(rt, gate=self._gate, refresh=self._refresh_budget)
+                    ctx = await self._context(rt, feedback_policies)
                     contexts[index] = ctx
                     with llm_scope(
                         LLMScope(
@@ -659,7 +725,7 @@ class RoundRunner:
                     isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None
                 ):
                     raise Fenced("run ownership lost") from None
-                if rt is None:
+                if contexts[index] is None:
                     reasons[key] = f"agent error: {type(error).__name__}"
                 else:
                     reasons[key] = (
@@ -668,9 +734,9 @@ class RoundRunner:
                         else f"manager error: {type(error).__name__}"
                     )
             finally:
-                if rt is None:
+                if contexts[index] is None:
                     reasons.setdefault(key, "runtime preparation cancelled")
-                else:
+                if rt is not None:
                     slot.notes = rt.notes
                 remaining -= 1
                 if remaining == 0:
@@ -701,7 +767,7 @@ class RoundRunner:
         candidates: list[Candidate] = []
         learnings: list[Learning] = []
         statuses: dict[str, AgentStatus] = {}
-        for slot, rt in zip(agents, runtimes, strict=True):
+        for slot, rt, ctx in zip(agents, runtimes, contexts, strict=True):
             key = f"{slot.team.name}/{slot.spec.name}"
             own_learnings: list[Learning] = []
             slot.status = AgentStatus.FINISHED
@@ -742,6 +808,20 @@ class RoundRunner:
                     status=slot.status.value,
                     reason=reasons[key],
                     a2a=task_to_json(a2a),
+                    feedback_policy=(
+                        {
+                            "revision": self.plan.revision,
+                            "part": slot.part,
+                            "checks": dict(ctx._feedback),
+                            "candidates": [
+                                item.id
+                                for item in rt.own
+                                if isinstance(item, Candidate) and item.id not in recovered_ids
+                            ],
+                        }
+                        if ctx is not None and rt is not None
+                        else None
+                    ),
                 )
             )
         entries: dict[str, tuple[str, Candidate]] = {}

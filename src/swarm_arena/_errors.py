@@ -1,6 +1,10 @@
 """Define user-visible plan, configuration, action, and storage errors."""
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from swarm_arena._agent.manager import LimitReached
 
 
 class PlanError(ValueError):
@@ -145,3 +149,24 @@ class LeaseHeld(RuntimeError):
     >>> isinstance(LeaseHeld("run lease is held"), RuntimeError)
     True
     """
+
+
+_CORE_SIGNAL = object()
+_SignalT = TypeVar("_SignalT", SoftError, "LimitReached")
+
+
+def _core_signal(error: _SignalT) -> _SignalT:
+    """Mark a freshly core-created, sanitized action failure and return it.
+
+    Call only at core construction sites, never on exceptions caught from
+    connectors. Boundaries recognize the identity marker with
+    ``getattr(error, "_core_signal", None) is _CORE_SIGNAL``. This shared
+    convention preserves public exception types and does not trust their class
+    alone. LimitReached is imported lazily to avoid the model/error import cycle.
+    """
+    from swarm_arena._agent.manager import LimitReached
+
+    if not isinstance(error, (SoftError, LimitReached)):
+        raise TypeError("expected an action control signal")
+    error.__dict__["_core_signal"] = _CORE_SIGNAL
+    return error
