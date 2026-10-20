@@ -80,11 +80,12 @@ async def test_script_tool_edit_overlay_check_and_lexicographic_judge(
         out,
         request=ToolRequest(edits={"problem/model_b.txt": "1.0"}),
         tool=tool,
-        goal_id="fit",
-        parent_ids=[parent.id],
+        goal=goal,
+        parents=[parent],
     )
-    # The conformance helper hashes this request's edits; retain the base overlay too.
-    child = child.model_copy(update={"overlay": {**parent.overlay, **child.overlay}})
+    # The child inherits the base overlay and adds this run's edit.
+    assert child.parent_ids == [parent.id]
+    assert set(child.overlay) == {"problem/model_a.txt", "problem/model_b.txt"}
     baseline = make_candidate(first, request=parent.request, tool=tool, goal_id="fit")
     for c in (child, baseline):
         assert (await check_check(ScriptCheck(**CHECK), c, goal=goal, executor=executor)).passed

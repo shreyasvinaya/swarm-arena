@@ -187,3 +187,4 @@ def test_root_import_publishes_core_facades() -> None:  # __module__ never depen
 PUBLIC["swarm_arena"] += ["ScriptCheck", "ScriptJudge"]
 
 PUBLIC["swarm_arena.testing"] += ["check_tool", "check_check", "check_judge", "make_candidate"]
+PUBLIC["swarm_arena.testing"] += ["read_logs", "read_output_file"]
