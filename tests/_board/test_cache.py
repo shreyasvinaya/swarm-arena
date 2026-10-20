@@ -1220,3 +1220,40 @@ def test_failed_human_transaction_can_be_retried(tmp_path: Path) -> None:
     assert cache.has_object(PIN_NAME)
     assert cache.has_object(REVIEW_NAME)
     cache.close()
+
+
+def test_human_and_event_learnings_have_identical_child_rows(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    draft = run.learning(
+        "L-run",
+        "Shared hint",
+        tags=["beta", "alpha"],
+        evidence=["c-2", "c-1"],
+        refines=["L-0"],
+        supersedes=["L-old"],
+    )
+    head = run.commit(run.plan(), run.candidate("c-1"), run.candidate("c-2"), draft)
+    human = Learning.model_validate(draft.payload["learning"]).model_copy(
+        update={"id": "L-human", "author": "human:alice"}
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    try:
+        ingest_run(cache, run.store, "r1", run.run_root, head)
+        cache.apply_human_objects(
+            [PIN_NAME], [HumanObject(kind="add", learning=human, author="human:alice")]
+        )
+        for table, columns, expected in (
+            ("learning_tags", "tag", [("alpha",), ("beta",)]),
+            ("learning_evidence", "candidate_id", [("c-1",), ("c-2",)]),
+            ("learning_links", "kind, target_id", [("refines", "L-0"), ("supersedes", "L-old")]),
+        ):
+            event_rows, human_rows = (
+                cache._conn.execute(
+                    f"SELECT {columns} FROM {table} WHERE learning_id=? ORDER BY {columns}",
+                    (learning_id,),
+                ).fetchall()
+                for learning_id in ("L-run", "L-human")
+            )
+            assert event_rows == human_rows == expected
+    finally:
+        cache.close()

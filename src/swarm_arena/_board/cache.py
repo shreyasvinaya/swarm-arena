@@ -359,6 +359,25 @@ class ArenaCache:
             for warning in pending:
                 _LOG.warning("%s", warning)
 
+    def _insert_learning_children(self, learning: Learning) -> None:
+        """Project child rows after parent insertion within the caller's transaction."""
+        self._conn.executemany(
+            "INSERT INTO learning_tags VALUES (?, ?)",
+            [(learning.id, tag) for tag in learning.tags],
+        )
+        self._conn.executemany(
+            "INSERT INTO learning_evidence VALUES (?, ?)",
+            [(learning.id, cid) for cid in learning.evidence],
+        )
+        self._conn.executemany(
+            "INSERT INTO learning_links VALUES (?, ?, ?)",
+            [
+                (learning.id, kind, target)
+                for kind in ("refines", "supersedes")
+                for target in getattr(learning, kind)
+            ],
+        )
+
     def _index_human(
         self, name: str, line: int, ts: str, obj: HumanObject, pending: list[str]
     ) -> None:
@@ -415,22 +434,7 @@ class ArenaCache:
                 "learning",
                 pending,
             ):
-                self._conn.executemany(
-                    "INSERT INTO learning_tags VALUES (?, ?)",
-                    [(learning.id, tag) for tag in learning.tags],
-                )
-                self._conn.executemany(
-                    "INSERT INTO learning_evidence VALUES (?, ?)",
-                    [(learning.id, cid) for cid in learning.evidence],
-                )
-                self._conn.executemany(
-                    "INSERT INTO learning_links VALUES (?, ?, ?)",
-                    [
-                        (learning.id, kind, target)
-                        for kind in ("refines", "supersedes")
-                        for target in getattr(learning, kind)
-                    ],
-                )
+                self._insert_learning_children(learning)
 
     def has_object(self, name: str) -> bool:
         """
@@ -1100,19 +1104,4 @@ class ArenaCache:
                 "learning",
                 pending,
             ):
-                self._conn.executemany(
-                    "INSERT INTO learning_tags VALUES (?, ?)",
-                    [(learning.id, tag) for tag in learning.tags],
-                )
-                self._conn.executemany(
-                    "INSERT INTO learning_evidence VALUES (?, ?)",
-                    [(learning.id, cid) for cid in learning.evidence],
-                )
-                self._conn.executemany(
-                    "INSERT INTO learning_links VALUES (?, ?, ?)",
-                    [
-                        (learning.id, kind, target)
-                        for kind in ("refines", "supersedes")
-                        for target in getattr(learning, kind)
-                    ],
-                )
+                self._insert_learning_children(learning)
