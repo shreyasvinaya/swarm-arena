@@ -1757,12 +1757,8 @@ continuation. `plan_rejected` never adds a plan revision.
 Optional payload keys added in M1b fix rounds (journal v1 is unreleased, so no
 schema_version bump): `plan_revision.preflight_complete: bool` is true only after
 the shared component preflight succeeded for that revision (startup revisions carry
-true); `plan_revision.preflight_only: bool` marks a recovery checkpoint that
-completes preflight for an existing revision without adding a revision or moving its
-first round; `plan_rejected.rejected_revision: int` refuses, on recovery, an accepted
-revision that never completed preflight (a nonzero revision leaves the effective
-history and dispatch resumes from the previous admitted revision; refusing revision 0
-ends the goal without dispatch). `plan_revision.join_retry` and
+true); a revision is published only after its preflight succeeds, and a failing
+preflight refuses the revision like an admission failure. `plan_revision.join_retry` and
 `plan_rejected.join_retry` count completed retry proposals (one-based, independent of
 `join_failed.attempt`; accepted and refused proposals both use the allowance).
 `GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
