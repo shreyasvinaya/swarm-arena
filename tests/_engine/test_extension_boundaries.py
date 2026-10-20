@@ -243,8 +243,9 @@ async def _worker(mode: str, root: Path) -> None:
         ),
         limits=Limits(
             round_timeout_s=20 if variant == "stop" and mode.endswith("serializer") else 1.5,
+            # Stop probes must outlive the stop-file poll and lease-renewal wait.
             run_timeout_s=30
-            if variant == "stop" and mode.endswith("serializer")
+            if variant == "stop"
             else 3
             if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}
             else 8,

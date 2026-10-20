@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from _fakes.tools import cand
 
-from swarm_arena import Goal, Plan, Ref
+from swarm_arena import Goal, PartSpec, Plan, Ref
 from swarm_arena._engine import control as control_mod
 from swarm_arena._engine.control import (
     GoalStatus,
@@ -72,9 +72,12 @@ def _commit(store: Store, events: list[Event]) -> None:
     Lease(store, *owner, ttl_s=60).advance(Head(epoch=1, seq=len(events), segment=key))
 
 
-def _events() -> list[Event]:
+def _events(*, parts: list[PartSpec] | None = None) -> list[Event]:
     plan = Plan(
-        goal=Goal(id="g", namespace="n"), teams=[], judges=[Ref(path="must_not_import:Judge")]
+        goal=Goal(id="g", namespace="n"),
+        teams=[],
+        judges=[Ref(path="must_not_import:Judge")],
+        parts=parts or [],
     )
     candidate = cand(id="c1", run_id="r1")
     return [
@@ -180,7 +183,7 @@ async def test_status_no_owner_and_empty_expired_owner(run_root: Path) -> None:
 
 async def test_status_preserves_one_identity_fidelity_and_tuple_value(run_root: Path) -> None:
     store = _live_run(run_root, "r1")
-    events = _events()
+    events = _events(parts=[PartSpec(name="p", goal=Goal(id="sub", namespace="n"))])
     for id, part, round, fidelity, judge, rubric, key, value in [
         ("old", None, 1, "old", "stamped", "", (999.0,), 999),
         ("new", None, 2, "new", "stamped", "new", (4.0, 2.0), 7),
@@ -204,7 +207,7 @@ async def test_status_non_scalar_or_parts_only_has_no_best(
     value: float | None,
 ) -> None:
     store = _live_run(run_root, "r1")
-    events = _events()
+    events = _events(parts=[PartSpec(name="p", goal=Goal(id="sub", namespace="n"))])
     events[3] = _event(
         4, "tool_end", {"candidate": cand(run_id="r1", part=part).model_dump(mode="json")}
     )

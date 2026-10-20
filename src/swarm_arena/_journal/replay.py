@@ -307,8 +307,6 @@ class RunState:
                 limits = Limits.model_validate(payload["new"])
                 self.config = self.config.model_copy(update={"limits": limits})
             case EventType.PLAN_REVISION:
-                if payload.get("preflight_only", False):
-                    return
                 revisions = self.plans.setdefault(event.goal_id, [])
                 origin = payload["origin"]
                 if origin not in get_args(Origin):
@@ -330,18 +328,6 @@ class RunState:
                     1 if len(revisions) == 1 else max(goal.round, goal.rounds_closed) + 1,
                 )
                 self.plan_first_rounds.setdefault(event.goal_id, []).append(first_round)
-            case EventType.PLAN_REJECTED:
-                rejected = payload.get("rejected_revision")
-                if rejected is not None and rejected != 0:
-                    revisions = self.plans[event.goal_id]
-                    starts = self.plan_first_rounds[event.goal_id]
-                    keep = [
-                        (p, start)
-                        for p, start in zip(revisions, starts, strict=True)
-                        if p[0].revision != rejected
-                    ]
-                    self.plans[event.goal_id] = [p for p, _ in keep]
-                    self.plan_first_rounds[event.goal_id] = [start for _, start in keep]
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
                 self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
@@ -360,17 +346,13 @@ class RunState:
             case EventType.TOOL_END:
                 candidate = Candidate.model_validate(payload["candidate"])
                 self.candidates[candidate.id] = candidate
-                if self.plans.get(candidate.goal_id):
-                    plan = self.plan_for_round(candidate.goal_id, candidate.round)
-                    producing_goal = (
-                        plan.goal
-                        if candidate.part is None
-                        else next(
-                            (part.goal for part in plan.parts if part.name == candidate.part), None
-                        )
-                    )
-                    if producing_goal is not None:
-                        self.candidate_goal_keys[candidate.id] = producing_goal.key()
+                plan = self.plan_for_round(candidate.goal_id, candidate.round)
+                producing_goal = (
+                    plan.goal
+                    if candidate.part is None
+                    else {part.name: part.goal for part in plan.parts}[candidate.part]
+                )
+                self.candidate_goal_keys[candidate.id] = producing_goal.key()
                 fingerprint = payload.get("fingerprint")
                 if fingerprint is not None and not isinstance(fingerprint, str):
                     raise _core_error(ValueError, "invalid fingerprint")
@@ -464,19 +446,7 @@ class RunState:
                         *goal.preflight_revisions,
                         payload["plan"]["revision"],
                     ]
-                if payload.get("preflight_only", False):
-                    self.goals[event.goal_id] = goal.model_copy(update=updates)
-                    return
-                if "rejected_revision" in payload and goal.join_phase == "rounds":
-                    updates["join_phase"] = "replan"
                 retry = payload.get("join_retry")
-                if (
-                    retry is None
-                    and goal.join_phase == "replan"
-                    and "rejected_revision" not in payload
-                ):
-                    # Older v1 journals identify this transition by event order.
-                    retry = goal.join_retries + 1
                 if retry is not None:
                     updates["join_retries"] = retry
                     updates["join_phase"] = (

@@ -470,6 +470,7 @@ def test_from_state_uses_latest_revision_and_recorded_score_order() -> None:
         run_id="run-1",
         plans={"g": [(p, "human") for p in plans]},
         candidates={"c-1": _c("c-1")},
+        candidate_goal_keys={"c-1": plans[0].goal.key()},
         scores={
             "s-new": _score("s-new", "c-1", 1),
             "s-old": _score("s-old", "c-1", 100, rubric_hash="old"),
@@ -507,25 +508,3 @@ def test_part_identity_change_preserves_history_but_not_current_parents(board: R
     assert view._visible_candidate_ids() == frozenset({"new"})
     assert set(view.lineage("new").nodes) == {"old", "new"}
     assert frozen.get_candidate("old") == old
-
-
-def test_rebuild_does_not_assign_current_identity_to_unattributed_history() -> None:
-    plan = Plan(
-        goal=Goal(id="g", namespace="n"),
-        teams=[],
-        judges=[],
-        parts=[PartSpec(name="p", goal=Goal(id="sub", namespace="n"))],
-    )
-    old = _c("old", part="p")
-    state = RunState(
-        run_id="run-1",
-        plans={"g": [(plan, "human")]},
-        candidates={old.id: old},
-        positions={old.id: (1, 1)},
-    )
-    board = RunBoard.from_state(state, run_root="/runs", head=lambda: HEAD)
-    view = board.snapshot(PART_KEY, _frontier())
-    assert view._visible_candidate_ids() == frozenset()
-    with pytest.raises(ValueError, match="outside"):
-        view.get_candidate(old.id)
-    assert board.get_candidate(old.id) == old

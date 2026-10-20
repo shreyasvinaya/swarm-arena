@@ -812,12 +812,6 @@ class RunBoard(_MemoryReads, Board):
             board.put_learning(learning, epoch=epoch, seq=seq)
         decisions = {goal_id: deepcopy(goal.decisions) for goal_id, goal in state.goals.items()}
         with board._lock:
-            # An unknown historical part identity must never inherit the current key.
-            board._records.candidate_goals = {
-                id: key
-                for id, key in board._records.candidate_goals.items()
-                if state.candidates[id].part is None or id in state.candidate_goal_keys
-            }
-            board._records.candidate_goals.update(state.candidate_goal_keys)
+            board._records.candidate_goals = dict(state.candidate_goal_keys)
             board._decisions = decisions
         return board

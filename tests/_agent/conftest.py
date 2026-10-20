@@ -7,7 +7,17 @@ import pytest
 from _fakes.engine import CtxEnv, RtEnv
 from _fakes.tools import RecordingExecutor
 
-from swarm_arena import AgentSpec, FunctionTool, Goal, Limits, Ref, RoundSpec, RunConfig, TeamSpec
+from swarm_arena import (
+    AgentSpec,
+    FunctionTool,
+    Goal,
+    Limits,
+    Plan,
+    Ref,
+    RoundSpec,
+    RunConfig,
+    TeamSpec,
+)
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
@@ -36,6 +46,13 @@ async def rt_env(
     config = run_config.model_copy(update={"limits": limits})
     lease = Lease.acquire_new(store, owner_id="engine", host="local", ttl_s=60)
     ids = IdGen(run_id, 1)
+    goal = Goal(id="g", namespace="n")
+    tool = FunctionTool("_fakes.tools:square")
+    ref = Ref.of(tool)
+    spec = AgentSpec(
+        name="a", rationale="Explore", tool=ref, manager=Ref(path="_fakes.tools:NoopManager")
+    )
+    team = TeamSpec(name="t", rationale="Explore", agents=[spec])
     async with JournalWriter(
         store,
         lease,
@@ -49,6 +66,18 @@ async def rt_env(
         await journal.append_durable(
             EventDraft(
                 type=EventType.RUN_CONFIG, payload={"config": config.model_dump(mode="json")}
+            )
+        )
+        await journal.append_durable(
+            EventDraft(
+                type=EventType.PLAN_REVISION,
+                goal_id="g",
+                payload={
+                    "plan": Plan(goal=goal, teams=[team], judges=[]).model_dump(mode="json"),
+                    "origin": "human",
+                    "preflight_complete": True,
+                    "first_round": 1,
+                },
             )
         )
         await ledger.hold_final_slices({"g": Amount(usd=5)})
@@ -68,13 +97,6 @@ async def rt_env(
                 payload={"round": 1, "shares": {h: a.model_dump() for h, a in grants.items()}},
             )
         )
-        goal = Goal(id="g", namespace="n")
-        tool = FunctionTool("_fakes.tools:square")
-        ref = Ref.of(tool)
-        spec = AgentSpec(
-            name="a", rationale="Explore", tool=ref, manager=Ref(path="_fakes.tools:NoopManager")
-        )
-        team = TeamSpec(name="t", rationale="Explore", agents=[spec])
         board = RunBoard(run_id=run_id, run_root=config.run_root, head=lambda: journal.head)
         board.register_goal(goal.key(), "g", None)
         executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))

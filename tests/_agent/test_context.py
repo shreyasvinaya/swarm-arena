@@ -780,9 +780,27 @@ async def test_tool_metadata_failure_is_sanitized(
 
 
 async def test_part_context_routes_learnings_events_and_read_ids(ctx_env: CtxEnv) -> None:
-    from swarm_arena import Goal
+    from swarm_arena import Goal, PartSpec, Plan
 
     goal = Goal(id="sub", namespace="n")
+    await ctx_env.rt.journal.append_durable(
+        EventDraft(
+            type="plan_revision",
+            goal_id="g",
+            payload={
+                "plan": Plan(
+                    goal=ctx_env.rt.goal,
+                    teams=[ctx_env.rt.team.model_copy(update={"part": "part"})],
+                    judges=[],
+                    parts=[PartSpec(name="part", goal=goal)],
+                    revision=1,
+                ).model_dump(mode="json"),
+                "origin": "human",
+                "preflight_complete": True,
+                "first_round": 1,
+            },
+        )
+    )
     ctx_env.env.board.register_goal(goal.key(), "g", "part")
     ctx = ctx_env.ctx(
         goal=goal,

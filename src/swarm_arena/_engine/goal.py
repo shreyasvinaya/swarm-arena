@@ -936,46 +936,6 @@ class GoalRunner:
         except Exception as error:
             raise PlanError([f"preflight failed: {type(error).__name__}"]) from None
 
-    async def _ensure_preflight(self) -> bool:
-        """Check older accepted revisions lacking a durable completion marker."""
-        while self.plan.revision not in self.recorded.goals[self.goal_id].preflight_revisions:
-            try:
-                completed, _ = await self._supervised_step(
-                    partial(self._preflight, self.plan), final=False
-                )
-            except PlanError as error:
-                self.deps.journal.append(
-                    self._draft(
-                        EventType.PLAN_REJECTED,
-                        errors=error.errors,
-                        origin=self.plan.origin,
-                        first_round=self.rounds_closed + 1,
-                        rejected_revision=self.plan.revision,
-                    )
-                )
-                await self._refresh()
-                if self.plan.revision == 0:
-                    self.status, self.reason = "no_result", "preflight failed"
-                    return False
-                self.join_phase = self.recorded.goals[self.goal_id].join_phase
-                self.history = [p for p, _ in self.recorded.plans[self.goal_id]]
-                self.plan = self.recorded.plan_for_round(self.goal_id, self.rounds_closed + 1)
-                await self.admission.update(self.goal_id, self.active_agents())
-                continue
-            if not completed:
-                return False
-            self.deps.journal.append(
-                self._draft(
-                    EventType.PLAN_REVISION,
-                    plan=self.plan.model_dump(mode="json"),
-                    origin=self.plan.origin,
-                    preflight_complete=True,
-                    preflight_only=True,
-                )
-            )
-            await self._refresh()
-        return True
-
     def _stop(self) -> bool:
         stops = self.deps.stops
         if self.deps.ledger.run_exhausted():
@@ -1192,7 +1152,7 @@ class GoalRunner:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
         await self._restore_terminal_decision()
         self._restore_repeats()
-        if self.status != "no_result" and await self._ensure_preflight():
+        if self.status != "no_result":
             self.agents = await self._slots(self.plan.teams, reuse=False)
             if not self.state.converge_started and self.join_phase != "replan":
                 await self._run_rounds()

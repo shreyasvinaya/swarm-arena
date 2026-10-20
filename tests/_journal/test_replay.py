@@ -103,6 +103,15 @@ def _end(seq: int, id: str) -> Event:
     )
 
 
+@pytest.mark.parametrize("missing_plan", [False, True])
+def test_candidate_requires_a_declared_producing_goal(missing_plan: bool) -> None:
+    end = _end(3, "candidate")
+    end.payload["candidate"]["part"] = "UNDECLARED_PART_SECRET"
+    with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
+        RunState.from_events([*(_PRE if not missing_plan else []), end])
+    assert_secret_absent(caught.value, "UNDECLARED_PART_SECRET")
+
+
 def _cmd_start(seq: int, job_id: str) -> Event:
     return _ev(
         seq,

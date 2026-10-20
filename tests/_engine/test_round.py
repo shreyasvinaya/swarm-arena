@@ -30,6 +30,7 @@ from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import round as round_module
+from swarm_arena._engine.goal import r0_revision_draft
 from swarm_arena._engine.round import AgentSlot, RoundRunner
 from swarm_arena._errors import Fenced
 from swarm_arena._model.board_types import Frontier
@@ -768,6 +769,7 @@ async def test_restored_lost_start_counts_for_watchdog(env: EngineEnv) -> None:
 async def test_converge_uses_final_holder_and_ignores_ordinary_stops(
     env: EngineEnv, flag: str
 ) -> None:
+    env.deps.journal.append(r0_revision_draft(PLAN, PLAN.base_dir))
     if flag == "goal_budget":
         env.deps.stops.goal_budget.add("g")
     else:
@@ -808,6 +810,7 @@ async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
 
     part = PartSpec(name="p", goal=Goal(id="sub", namespace="n"))
     plan = PLAN.model_copy(update={"parts": [part]})
+    env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
     slot = _runner("a")
     slot.team = slot.team.model_copy(update={"part": "p"})
     slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
@@ -1284,6 +1287,7 @@ async def test_seed_feedback_follows_producer_group_and_revision(
 
     part = PartSpec(name="p", goal=Goal(id="sub", namespace="n"), checks=[check(part_policy)])
     plan = PLAN.model_copy(update={"parts": [part], "checks": [check(main_policy)]})
+    env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
     producer = _runner("a")
     producer.team = producer.team.model_copy(update={"part": "p"})
     producer.part, producer.goal, producer.goal_key = "p", part.goal, part.goal.key()
@@ -1335,6 +1339,18 @@ async def test_seed_feedback_follows_producer_group_and_revision(
             "checks": [check(part_policy)],
             "parts": [part.model_copy(update={"checks": [check(main_policy)]})],
         }
+    )
+    env.deps.journal.append(
+        EventDraft(
+            type="plan_revision",
+            goal_id="g",
+            payload={
+                "plan": revised.model_dump(mode="json"),
+                "origin": "human",
+                "first_round": 2,
+                "preflight_complete": True,
+            },
+        )
     )
     reader = _with_manager("join", Reader())
     second = await RoundRunner(

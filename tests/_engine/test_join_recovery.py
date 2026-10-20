@@ -181,14 +181,7 @@ async def test_join_retry_survives_committed_process_crash(tmp_path: Path, bound
         tmp_path / "control", "refused_control" if boundary == "plan_rejected" else "control"
     )
     cfg = await launch(tmp_path / "crashed", boundary)
-    legacy = RunState.from_events(
-        e.model_copy(update={"payload": {k: v for k, v in e.payload.items() if k != "join_retry"}})
-        for e in all_events(cfg)
-    ).goals["g"]
-    assert legacy.join_phase == (
-        "replan" if boundary in {"join_failed", "plan_rejected"} else "rounds"
-    )
-    assert legacy.join_retries == (0 if boundary == "join_failed" else 1)
+    assert all(e.payload["preflight_complete"] for e in events(cfg, "plan_revision"))
     result = await Swarm(cfg, replanner=RetryPlanner(refuse=boundary == "plan_rejected")).resume(
         "join", force=True
     )
