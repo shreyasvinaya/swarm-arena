@@ -155,10 +155,11 @@ class Swarm:
         A goal stopped by ``stop`` or ``stop --now`` with rounds left continues.
         A goal stopped by a limit continues only when this resume changes the
         limits. Every goal end returns its unused pool; continued goals reopen
-        with their goal_weights share of the free work pool before limits_changed.
+        with their goal_weights share of the remaining unallocated work budget
+        before limits_changed.
 
-        A resumed stopped goal gets only its share of the free work pool
-        (`Ledger.free()`), which can be 0 when other goals were still running and
+        A resumed stopped goal gets only its share of the remaining unallocated
+        work budget, which can be 0 when other goals were still running and
         already got its unused budget; unless the resume raises the limits, such
         a goal stops again with `goal budget` at its first run.
 
