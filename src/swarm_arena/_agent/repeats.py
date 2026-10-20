@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Literal
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import Fenced, SoftError
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -135,6 +135,8 @@ class RepeatIndex:
         self._entries: dict[str, list[Candidate]] = {}
         self._candidates: list[Candidate] = []
         self._pending: set[str] = set()
+        # Keep the original objects alive until release, so identity cannot be reused.
+        self._allocations: dict[tuple[int, int, int], tuple[AgentRuntime, ToolRequest, str]] = {}
         for key, candidate in entries:
             self._insert(key, candidate)
 
@@ -165,6 +167,9 @@ class RepeatIndex:
         """
         self._insert(key, candidate)
         self._pending.discard(key)
+        for token, (_, _, pending_key) in tuple(self._allocations.items()):
+            if pending_key == key:
+                del self._allocations[token]
         self.added.append((key, candidate))
 
     def key(self, rt: "AgentRuntime", request: ToolRequest) -> str:
@@ -332,13 +337,19 @@ class RepeatIndex:
         agent = f"{rt.team.name}/{rt.spec.name}"
         matched: Candidate | None = None
         for index in range(n) if requested is None else (requested,):
-            key = self.key(rt, request.model_copy(update={"replicate": index}))
+            try:
+                key = self.key(rt, request.model_copy(update={"replicate": index}))
+            except Fenced:
+                raise
+            except Exception as error:
+                raise SoftError(f"invalid tool request: {type(error).__name__}") from None
             own = next(
                 (c for c in self._entries.get(key, ()) if self._own(c, agent) and self._counted(c)),
                 None,
             )
             if own is None and key not in self._pending:
                 self._pending.add(key)
+                self._allocations[(id(rt), id(request), index)] = (rt, request, key)
                 return index
             if requested is not None:
                 raise SoftError("replicate index already used")
@@ -348,7 +359,7 @@ class RepeatIndex:
         rt.journal.append(
             EventDraft(
                 type=EventType.WATCHDOG,
-                goal_id=rt.goal.id,
+                goal_id=rt.goal_id,
                 team=rt.team.name,
                 agent=rt.spec.name,
                 round=rt.round,
@@ -361,14 +372,15 @@ class RepeatIndex:
 
     def release(self, rt: "AgentRuntime", request: ToolRequest, index: int) -> None:
         """
-        Release a pending index after a tool-run pipeline exception.
+        Release a retained allocation without calling tool hooks.
 
         Parameters
         ----------
         rt : AgentRuntime
             Agent whose replicate was reserved.
         request : ToolRequest
-            Request used to reserve the replicate.
+            Exact request object used to reserve the replicate; it may have
+            changed since allocation.
         index : int
             Reserved index; release is idempotent and preserves committed use.
 
@@ -388,7 +400,9 @@ class RepeatIndex:
         >>> idx.next_replicate(rt, req)
         0
         """
-        self._pending.discard(self.key(rt, request.model_copy(update={"replicate": index})))
+        allocation = self._allocations.pop((id(rt), id(request), index), None)
+        if allocation is not None:
+            self._pending.discard(allocation[2])
 
     def _own(self, candidate: Candidate, agent: str) -> bool:
         """Match run and team/agent, rather than an agent name alone."""

@@ -97,6 +97,7 @@ async def test_link_counts_no_run_and_reserves_nothing(rt_env: RtEnv) -> None:
     )  # agent a's entry, as from an earlier round
     assert await execute_tool_run(rt_b, {"x": 2.0}, parents=(), replicate=None, edits=None) == first
     assert rt_b.counters.tool_runs == 0
+    assert rt_b.started_runs == 0
     assert rt_env.committed_types().count("reserve") == 1
 
 
@@ -535,13 +536,11 @@ async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> 
     assert not rt_env.inflight._scopes
 
 
-@pytest.mark.parametrize("failure", ["raise", "invalid", "nonfinite", "logs", "huge_usage"])
+@pytest.mark.parametrize("failure", ["raise", "invalid", "nonfinite", "logs"])
 async def test_connector_failures_are_safe_settled_error_candidates(
     rt_env: RtEnv, failure: str
 ) -> None:
     from _fakes.secrecy import assert_secret_absent
-
-    from swarm_arena._model.tooling import Usage
 
     secret = "sentinel-private-tool-value"
     outputs: dict[str, Any] = {
@@ -549,7 +548,6 @@ async def test_connector_failures_are_safe_settled_error_candidates(
         "invalid": {"secret": secret},
         "nonfinite": ToolOutput.model_construct(status=RunStatus.OK, data={secret: float("nan")}),
         "logs": ToolOutput(status=RunStatus.OK, logs_ref=secret),
-        "huge_usage": ToolOutput(status=RunStatus.OK, usage=Usage(usd=1_000_000_001)),
     }
     rt = dataclasses.replace(rt_env.rt, executor=_OutputExecutor(rt_env, outputs[failure]))
     cand = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
@@ -733,3 +731,338 @@ async def test_unstarted_provider_result_settles_zero(rt_env: RtEnv) -> None:
     assert rt_env.reservation_state(candidate) == "settled"
     assert rt_env.charged(candidate) == Amount()
     assert rt_env.events("tool_start") == []
+
+
+@pytest.mark.parametrize(
+    "rt_env",
+    [{"max_usd": 100}, {"max_tokens": 1_000_000}, {}],
+    indirect=True,
+    ids=["capped", "tokens-only", "uncapped"],
+)
+async def test_tool_usage_overflow_is_terminal(rt_env: RtEnv) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+
+    rt = rt_env.with_tool(
+        PyTool(
+            {
+                "code": WRITE.format(
+                    "{'data': {}, 'usage': {'usd': 1000000001.0, "
+                    "'input_tokens': 7, 'output_tokens': 3}}"
+                )
+            }
+        )
+    )
+    candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert candidate.output.usage.total_tokens == 10
+    assert candidate.warnings == ["tool error: usage exceeds supported range"]
+    assert rt_env.charged(candidate) == Amount(tokens=10, usd=USD_LIMIT)
+    assert rt_env.events("settle")[-1].payload["usage_overflow"] is True
+    assert rt_env.types_after_start()[-2:] == ["tool_end", "settle"]
+    committed = read_committed(rt_env.run_store)
+    assert committed is not None
+    replayed = Ledger.replay(RunState.from_events(committed[1]), journal=rt.journal, ids=rt.ids)
+    for ledger in (rt.ledger, replayed):
+        assert ledger.run_exhausted()
+        assert ledger.goal_exhausted("g")
+        with pytest.raises(LimitReached) as caught:
+            await ledger.reserve(rt.holder, Amount(), kind="tool", goal_id="g")
+        assert caught.value.limit == "usage_overflow"
+
+
+@pytest.mark.parametrize("fail_call", [2, 3])
+async def test_replicate_allocation_hook_failure_is_sanitized(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, fail_call: int
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import ToolRequest
+
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
+    calls = 0
+    secret = "PRIVATE_REPLICATE_HOOK"
+
+    def deterministic(request: ToolRequest) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls >= fail_call:
+            raise RuntimeError(secret)
+        return False
+
+    monkeypatch.setattr(rt.tool, "is_deterministic", deterministic)
+    with pytest.raises(SoftError) as caught:
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert_secret_absent(caught.value, secret)
+    assert str(caught.value) == "invalid tool request: RuntimeError"
+    assert not rt.repeats._pending
+    assert not rt_env.events("reserve")
+
+
+async def test_release_hook_cannot_replace_success(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import ToolRequest
+
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
+    secret = "PRIVATE_RELEASE_HOOK"
+
+    def deterministic(request: ToolRequest) -> bool:
+        if rt.own:
+            raise RuntimeError(secret)
+        return False
+
+    monkeypatch.setattr(rt.tool, "is_deterministic", deterministic)
+    try:
+        result = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    except Exception as error:
+        assert_secret_absent(error, secret)
+        raise
+    assert result.output.status == RunStatus.OK
+    assert rt_env.board.get_candidate(result.id) == result
+    assert not rt.repeats._pending
+    assert rt_env.reservation_state(result) == "settled"
+
+
+@pytest.mark.parametrize("failure", ["budget", "fence", "cancel"])
+async def test_release_keeps_primary_control_outcome(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._model.tooling import ToolRequest
+
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", deterministic=False))
+    secret = "PRIVATE_CLEANUP_HOOK"
+    calls = 0
+
+    def deterministic(request: ToolRequest) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls > 3:
+            raise RuntimeError(secret)
+        return False
+
+    monkeypatch.setattr(rt.tool, "is_deterministic", deterministic)
+    if failure == "budget":
+        await rt.ledger.reserve(rt.holder, rt.ledger.remaining(rt.holder), kind="tool", goal_id="g")
+        with pytest.raises(LimitReached) as caught:
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert caught.value.limit == "budget"
+        assert_secret_absent(caught.value, secret)
+    elif failure == "fence":
+        rt_env.fence_on_append(EventType.TOOL_START)
+        with pytest.raises(Fenced) as fenced:
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert_secret_absent(fenced.value, secret)
+    else:
+        queued = _QueuedExecutor(rt.executor)
+        rt = dataclasses.replace(rt, executor=queued)
+        async with anyio.create_task_group() as group:
+            group.start_soon(_run_capturing, rt, {"x": 1}, [])
+            await queued.entered.wait()
+            group.cancel_scope.cancel()
+    assert not rt.repeats._pending
+
+
+async def test_part_runtime_routes_main_goal_and_retains_part_context(rt_env: RtEnv) -> None:
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena._model.goal import FileSet, Goal
+
+    sha = rt_env.rt.artifacts.put_bytes(b"part content")
+    goal = Goal(id="sub", namespace="n", files=FileSet(manifest={"part.txt": sha}))
+    rt_env.board.register_goal(goal.key(), "g", "part")
+    rt = dataclasses.replace(
+        rt_env.rt,
+        goal=goal,
+        goal_key=goal.key(),
+        part="part",
+        checks=[
+            (
+                "part_check",
+                ScriptCheck(
+                    command=[
+                        "python",
+                        "-c",
+                        "assert open('candidate/files/part.txt').read() == 'part content'; "
+                        + WRITE.format("{'passed': True}"),
+                    ]
+                ),
+            )
+        ],
+        view=rt_env.board.snapshot(goal.key(), rt_env.board.frontier()),
+    )
+    # A real command verifies staged part files and the main-goal environment.
+    code = "import os; assert open('part.txt').read() == 'part content'; " + WRITE.format(
+        "{'data': {'goal': os.environ['SWARM_ARENA_GOAL_ID']}}"
+    )
+    tool_rt = rt_env.with_tool(PyTool({"code": code}))
+    rt = dataclasses.replace(
+        rt,
+        tool=tool_rt.tool,
+        tool_ref=tool_rt.tool_ref,
+        execution_ref=tool_rt.execution_ref,
+        tool_identity=tool_rt.tool_identity,
+    )
+    candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.goal_id == "g"
+    assert candidate.part == "part"
+    assert candidate.output.data == {"goal": "g"}
+    assert len(candidate.checks) == 1
+    assert candidate.checks[0].passed
+    assert candidate.output.logs_ref == f"goals/g/logs/{candidate.id}"
+    assert (
+        rt_env.board.snapshot(goal.key(), rt_env.board.frontier()).get_candidate(candidate.id)
+        == candidate
+    )
+    for event in rt_env.events("tool_start") + rt_env.events("tool_end"):
+        assert event.goal_id == "g"
+    assert rt.repeats.added[0][0] == repeat_key(
+        goal_key=goal.key(), tool_ref=rt.tool_ref, request=candidate.request, deterministic=True
+    )
+
+
+async def test_started_runs_increment_only_after_durable_start_and_restore(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal.event import Event, EventDraft
+
+    rt = rt_env.rt
+    assert rt.started_runs == 0
+    original = rt.journal.append_durable
+    observed: list[int] = []
+
+    async def append(draft: EventDraft) -> Event:
+        if draft.type == EventType.TOOL_START:
+            observed.append(rt.started_runs)
+        event = await original(draft)
+        if draft.type == EventType.TOOL_START:
+            observed.append(rt.started_runs)
+        return event
+
+    monkeypatch.setattr(rt.journal, "append_durable", append)
+    await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert observed == [0, 0]
+    assert rt.started_runs == 1
+    # The resume runner restores all current-round starts, including completed runs.
+    restored = sum(
+        e.goal_id == "g" and e.team == "t" and e.agent == "a" and e.round == 1
+        for e in rt_env.events("tool_start")
+    )
+    resumed = dataclasses.replace(rt, started_runs=restored)
+    await execute_tool_run(resumed, {"x": 2}, parents=(), replicate=None, edits=None)
+    assert resumed.started_runs == 2
+
+
+@pytest.mark.parametrize("failure", ["prepare", "fence", "queued", "budget"])
+async def test_unstarted_runs_do_not_increment_started_count(rt_env: RtEnv, failure: str) -> None:
+    rt = rt_env.rt
+    if failure == "prepare":
+        rt = rt_env.with_tool(CommandRaisesTool({"code": ""}))
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    elif failure == "fence":
+        rt_env.fence_on_append(EventType.TOOL_START)
+        with pytest.raises(Fenced):
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    elif failure == "budget":
+        await rt.ledger.reserve(rt.holder, rt.ledger.remaining(rt.holder), kind="tool", goal_id="g")
+        with pytest.raises(LimitReached):
+            await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    else:
+        queued = _QueuedExecutor(rt.executor)
+        rt = dataclasses.replace(rt, executor=queued)
+        errors: list[LimitReached] = []
+        async with anyio.create_task_group() as group:
+            group.start_soon(_run_capturing, rt, {"x": 1}, errors)
+            await queued.entered.wait()
+            assert rt.started_runs == 0
+            rt_env.inflight.close()
+            queued.release.set()
+        assert errors[0].limit == "stop"
+    assert rt.counters.tool_runs == 1
+    assert rt.started_runs == 0
+
+
+async def test_inflight_tracks_active_job_grace_until_collection(rt_env: RtEnv) -> None:
+    from swarm_arena._agent.tool_run import Inflight
+
+    registry = Inflight()
+    assert registry.max_grace_s() == 0.0
+    with anyio.CancelScope() as first, anyio.CancelScope() as second:
+        await anyio.lowlevel.checkpoint()
+        registry.add(first, grace_s=2.0)
+        registry.add(second, grace_s=5.0)
+        assert registry.max_grace_s() == 5.0
+        registry.close()
+        assert registry.max_grace_s() == 5.0
+        registry.discard(second)
+        assert registry.max_grace_s() == 2.0
+        registry.discard(first)
+        registry.discard(first)
+        assert registry.max_grace_s() == 0.0
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", grace_s=3.0))
+    queued = _QueuedExecutor(rt.executor)
+    rt = dataclasses.replace(rt, executor=queued)
+    async with anyio.create_task_group() as group:
+        group.start_soon(_run_capturing, rt, {"x": 1}, [])
+        await queued.entered.wait()
+        assert rt_env.inflight.max_grace_s() == tool_grace(rt.tool)
+        rt_env.cancel_inflight()
+    assert rt_env.inflight.max_grace_s() == 0.0
+
+
+async def test_seed_parents_prepend_and_deduplicate_stably(rt_env: RtEnv) -> None:
+    first = await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    second = await execute_tool_run(rt_env.rt, {"x": 2}, parents=(), replicate=None, edits=None)
+    rt = dataclasses.replace(rt_env.rt, seed_parents=(second.id, first.id, second.id))
+    result = await execute_tool_run(
+        rt,
+        {"x": 3},
+        parents=(first.id, second.id, first.id),
+        replicate=None,
+        edits=None,
+        read_ids=(first.id,),
+    )
+    assert result.parent_ids == [second.id, first.id]
+    assert [p.candidate_id for p in result.request.parents] == result.parent_ids
+    assert result.read_ids == [first.id]
+    assert rt_env.events("tool_end")[-1].payload["candidate"]["read_ids"] == [first.id]
+    assert rt.seed_parents == (second.id, first.id, second.id)
+
+
+async def test_inflight_grace_remains_during_cancel_collection(rt_env: RtEnv) -> None:
+    class CollectingExecutor(_QueuedExecutor):
+        def __init__(self, delegate: Executor) -> None:
+            super().__init__(delegate)
+            self.collecting = anyio.Event()
+
+        async def submit(self, job: Job) -> ToolOutput:
+            self.entered.set()
+            try:
+                await anyio.sleep_forever()
+            except anyio.get_cancelled_exc_class():
+                with anyio.CancelScope(shield=True):
+                    self.collecting.set()
+                    await self.release.wait()
+                return ToolOutput(status=RunStatus.CANCELLED)
+            raise AssertionError("cancelled submission returned without collection")
+
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", grace_s=3.0))
+    executor = CollectingExecutor(rt.executor)
+    rt = dataclasses.replace(rt, executor=executor)
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as group:
+            group.start_soon(_run_capturing, rt, {"x": 1}, [])
+            await executor.entered.wait()
+            rt_env.inflight.close()
+            rt_env.inflight.cancel_all()
+            await executor.collecting.wait()
+            assert rt_env.inflight.max_grace_s() == 3.0
+            executor.release.set()
+    assert rt_env.inflight.max_grace_s() == 0.0
+    assert rt_env.events("tool_end")[-1].payload["candidate"]["output"]["status"] == "cancelled"

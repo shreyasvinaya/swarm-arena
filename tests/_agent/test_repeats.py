@@ -43,6 +43,7 @@ def rt() -> AgentRuntime:
     return AgentRuntime(
         address="g/t/a",
         holder="g/t/a",
+        goal_id="g",
         goal=goal,
         goal_key=goal.key(),
         part=None,
@@ -398,3 +399,34 @@ def test_replicate_pools_are_per_key(rt_nd2: AgentRuntime) -> None:
     idx = RepeatIndex("this-run")
     assert idx.next_replicate(rt_nd2, ToolRequest(inputs={"x": 1})) == 0
     assert idx.next_replicate(rt_nd2, ToolRequest(inputs={"x": 2})) == 0
+
+
+def test_release_uses_retained_allocation_without_reentering_hook(rt_nd2: AgentRuntime) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    idx, request = RepeatIndex("this-run"), ToolRequest(inputs={"x": 1})
+    index = idx.next_replicate(rt_nd2, request)
+    secret = "PRIVATE_RELEASE_STATE"
+    tool = Mock(is_deterministic=Mock(side_effect=RuntimeError(secret)))
+    rt_nd2.tool = tool
+    rt_nd2.goal_key = Goal(id="changed", namespace="n").key()
+    request.inputs["x"] = 2
+    try:
+        idx.release(rt_nd2, request, index)
+        idx.release(rt_nd2, request, index)
+    except Exception as error:
+        assert_secret_absent(error, secret)
+        raise
+    assert not idx._pending
+    tool.is_deterministic.assert_not_called()
+
+
+def test_part_replicate_refusal_routes_main_goal(rt_nd: AgentRuntime) -> None:
+    rt_nd.goal = Goal(id="sub", namespace="n")
+    rt_nd.goal_key = rt_nd.goal.key()
+    rt_nd.part = "part"
+    idx, request = RepeatIndex("this-run"), ToolRequest()
+    idx.next_replicate(rt_nd, request)
+    with pytest.raises(SoftError):
+        idx.next_replicate(rt_nd, request)
+    assert cast(_Journal, rt_nd.journal).events[-1].goal_id == "g"

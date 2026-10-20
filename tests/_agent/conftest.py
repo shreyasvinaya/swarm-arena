@@ -28,11 +28,11 @@ from swarm_arena._tooling.staging import tool_identity
 
 @pytest.fixture
 async def rt_env(
-    tmp_path: Path, run_config: RunConfig, artifacts: ArtifactStore
+    tmp_path: Path, run_config: RunConfig, artifacts: ArtifactStore, request: pytest.FixtureRequest
 ) -> AsyncIterator[RtEnv]:
     run_id = "engine-run"
     store = LocalStore(Path(run_config.run_root) / run_id)
-    limits = Limits(max_usd=100)
+    limits = Limits(**getattr(request, "param", {"max_usd": 100}))
     config = run_config.model_copy(update={"limits": limits})
     lease = Lease.acquire_new(store, owner_id="engine", host="local", ttl_s=60)
     ids = IdGen(run_id, 1)
@@ -82,6 +82,7 @@ async def rt_env(
         rt = AgentRuntime(
             address="g/t/a",
             holder="g/t/a",
+            goal_id="g",
             goal=goal,
             goal_key=goal.key(),
             part=None,

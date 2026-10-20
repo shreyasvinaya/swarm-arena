@@ -76,6 +76,8 @@ class AgentRuntime:
     holder : str
         Ledger holder for tool runs and the tranche, including the goal's
         final slice for a converge-team agent.
+    goal_id : str
+        Main goal identifier for events, candidates, learnings and ledger ownership.
     goal : Goal
         Main goal or this part's sub-goal.
     goal_key : GoalKey
@@ -141,6 +143,14 @@ class AgentRuntime:
     rankings : Mapping[str, str], optional
         Group to ranking judge name; the round runner fills the own group from
         Plan.ranking_name() or the part ranking. The main group key is empty.
+    started_runs : int, default=0
+        Starts whose durable tool_start returned in this round. On resume the
+        runner restores the current goal/team/agent/round count from committed
+        tool_start events, including completed and lost runs.
+    seed_parents : tuple[str, ...], default=()
+        Ordered assigned parent ids; exposed read-only to the manager and
+        prepended to explicit parents with stable deduplication. The runner
+        supplies a view permitting these assigned candidates.
     private_paths : frozenset[str], default=frozenset()
         Every check and judge file path of the current revision.
 
@@ -158,6 +168,7 @@ class AgentRuntime:
 
     address: str
     holder: str
+    goal_id: str
     goal: Goal
     goal_key: GoalKey
     part: str | None
@@ -189,5 +200,7 @@ class AgentRuntime:
     ids: IdGen
     config: RunConfig
     resumed: tuple[Candidate, ...]
+    started_runs: int = 0
+    seed_parents: tuple[str, ...] = ()
     private_paths: frozenset[str] = frozenset()
     rankings: Mapping[str, str] = field(default_factory=dict)

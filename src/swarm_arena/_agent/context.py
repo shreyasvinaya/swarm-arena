@@ -58,6 +58,8 @@ class AgentContext:
         Current effort settings.
     digest : str
         Round-start board digest.
+    seed_parents : tuple[str, ...]
+        Read-only ordered assigned parent ids, prepended to every tool request.
     resumed : bool
         Whether committed results exist for the restarted round.
     tool_description : str
@@ -126,7 +128,7 @@ class AgentContext:
         return EventDraft(
             type=type,
             task_id=agent_task_id(rt.address, rt.round),
-            goal_id=rt.goal.id,
+            goal_id=rt.goal_id,
             team=rt.team.name,
             agent=rt.spec.name,
             round=rt.round,
@@ -191,6 +193,24 @@ class AgentContext:
         return learning.model_copy(deep=True)
 
     @property
+    def seed_parents(self) -> tuple[str, ...]:
+        """
+        Return the ordered parent identifiers assigned by the runner.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Read-only seeds prepended to explicit parents, with first occurrence
+            winning when the pipeline removes duplicates.
+
+        Examples
+        --------
+        >>> AgentContext.seed_parents.fset is None
+        True
+        """
+        return self._rt.seed_parents
+
+    @property
     def notes(self) -> str:
         """
         Return carried notes without charging a turn.
@@ -247,7 +267,8 @@ class AgentContext:
         inputs : Mapping[str, Any]
             Tool inputs.
         parents : Sequence[str], default=()
-            Visible parent candidate identifiers.
+            Visible parent candidate identifiers. Assigned seed_parents are
+            prepended, with stable deduplication (first occurrence wins).
         replicate : int or None, default=None
             Explicit replicate, or automatic allocation.
         edits : Mapping[str, str] or None, default=None
@@ -376,7 +397,7 @@ class AgentContext:
                 if isinstance(item, Learning)
                 and not item.hidden
                 and item.namespace == rt.goal.namespace
-                and (scope == "namespace" or item.goal_id == rt.goal.id)
+                and (scope == "namespace" or item.goal_id == rt.goal_id)
                 and set(tags).issubset(item.tags)
                 and (
                     query.casefold() in item.title.casefold()
@@ -540,7 +561,7 @@ class AgentContext:
                 id="pending",
                 namespace=rt.goal.namespace,
                 run_id=rt.repeats.run_id,
-                goal_id=rt.goal.id,
+                goal_id=rt.goal_id,
                 round=rt.round,
                 author=f"{rt.team.name}/{rt.spec.name}",
                 title=title,

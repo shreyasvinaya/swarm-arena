@@ -956,9 +956,9 @@ class RoundReport(FrozenModel):
 # _agent/manager.py — M1b
 class LimitReached(RuntimeError):
     def __init__(self, limit: str, message: str) -> None: ...
-    limit: str                                  # the Limits field name, "budget", or "stop" [plan]
+    limit: str                                  # the Limits field name, "budget", "usage_overflow", or "stop" [plan]
         # "stop": a stop request blocks new actions. "budget": the agent share, the goal pool, or the run cap; the
-        # message says which.
+        # message says which. "usage_overflow": terminal run-wide exhaustion from over-range reported usage.
 
 class Manager(ABC):
     Config: ClassVar[type[BaseModel]]
@@ -977,6 +977,7 @@ class AgentContext:
     notes: str
     budget: Estimate                            # what is left for this agent
     resumed: bool                               # [plan] true when the round restarted after resume
+    seed_parents: tuple[str, ...]                # read-only assigned parent ids; prepended to explicit parents, stable first occurrence wins
     tool_description: str                       # [plan] Tool.get_description()
     input_model: type[BaseModel]                # [plan] Tool.get_input_model()
     editable: tuple[str, ...]                   # [plan] Tool.editable()
@@ -1810,6 +1811,12 @@ class Ledger:
     def run_exhausted(self) -> bool: ...             # [plan] charges, incl. open and estimated reservations, reach the work pool
     def goal_exhausted(self, goal_id: str) -> bool: ...   # [plan] the same for the goal pool
 
+@dataclass(frozen=True, kw_only=True)
+class TrancheOutcome:
+    overflow: bool = False
+    # Callers may ignore this additive outcome when relying on durable settle.usage_overflow
+    # and ledger.run_exhausted(); LimitReached still propagates through normal admission.
+
 class Tranche:                                       # one per agent and per goal judges / planner / curator holder
     # [plan] reserve_call is serialized; settle_call after close is a no-op
     def __init__(self, ledger: Ledger, holder: str, goal_id: str, *, size: Amount) -> None: ...
@@ -1819,10 +1826,10 @@ class Tranche:                                       # one per agent and per goa
         # call estimate
     def can_cover(self, estimate: Amount) -> bool: ...   # [plan] M3: True when reserve_call(estimate) would succeed now;
                                                          # no side effects
-    async def settle_call(self, reservation_id: str, actual: Amount) -> None: ...
+    async def settle_call(self, reservation_id: str, actual: Amount) -> TrancheOutcome: ...
     def pending(self) -> int: ...                    # [plan] calls reserved and not yet settled (M1b Task 10; round end and
                                                      # barrier wait up to settle_timeout_s while > 0, then close)
-    async def close(self) -> None: ...               # returns the unused part with a committed settle event
+    async def close(self) -> TrancheOutcome: ...     # returns the unused part with a committed settle event
 
 PriceSource = Callable[[str], ModelSpec.Prices | None]   # LiteLLM model name → USD per 1M tokens, or None
 def register_price_source(source: PriceSource) -> None: ...   # swarm_arena.llm registers LiteLLM's pinned price map at import (M3)
@@ -1994,7 +2001,8 @@ class AgentRuntime:
     address: str
     holder: str                                      # [plan] the ledger holder that the agent's tool runs and tranche charge:
                                                      # the agent address, or "<goal>/:final" for a converge-team agent (§8.1)
-    goal: Goal; goal_key: GoalKey; part: str | None
+    goal_id: str                                     # main goal id for events, candidates, learnings, logs, env and ledger
+    goal: Goal; goal_key: GoalKey; part: str | None    # part sub-goal for inputs/files/checks; part GoalKey for repeats
     team: TeamSpec; spec: AgentSpec; round: int; round_spec: RoundSpec; fidelity: str
     tool: Tool; tool_ref: Ref; execution_ref: Ref; tool_identity: str; catalog_entry: CatalogEntry | None
         # tool_ref is the snapshotted base for identity/repeat keys; required private execution_ref is the
@@ -2005,6 +2013,11 @@ class AgentRuntime:
     repeats: RepeatIndex; watchdog: Watchdog
     journal: JournalWriter; board: Board; executor: Executor; artifacts: ArtifactStore; ids: IdGen
     config: RunConfig; resumed: tuple[Candidate, ...]
+    started_runs: int = 0                            # increment only after durable tool_start returns; distinct from tool_runs
+        # Resume restores this goal/team/agent/current-round count from committed tool_start events,
+        # including starts of completed and lost candidates (not just currently pending jobs).
+    seed_parents: tuple[str, ...] = ()                # ordered assigned ids; manager sees a read-only tuple
+        # Runner supplies permitted visibility for assigned candidates; never insert foreign results into own.
     rankings: Mapping[str, str] = field(default_factory=dict)
         # Group key (empty for main, part name otherwise) to ranking judge; the round runner
         # fills the own group from Plan.ranking_name() or the part ranking.
@@ -2026,7 +2039,8 @@ async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, paren
                            read_ids: Sequence[str] = ()) -> Candidate: ...
     # Snapshot read_ids at action entry and stamp new candidates before journaling/indexing.
     # Repeat-linked and resumed results retain their original journaled read_ids.
-    # validate inputs, edits (validate_edits), and parents (including root/protection and duplicates)
+    # Prepend seed_parents to explicit parents and stably deduplicate (first occurrence wins).
+    # validate inputs, edits (validate_edits), and visible parents (including root/protection)
     # → repeat rules and replicate allocation → plan the stage → count the tool run → reserve (durable) → put_edits
     # → Job(on_started = durable start event) → executor.submit (refused when the round's admission is closed:
     # at Inflight.add and again in on_started; a refused run settles Amount() and raises LimitReached('stop'))
@@ -2035,7 +2049,19 @@ async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, paren
     # Pure stage planning completes before count/reserve; artifact writes follow reserve.
     # Logs use goals/<goal-id>/logs/<candidate-id>.{out,err}; board publication uses the completion event's position.
     # Cancelled preparation with no committed tool_start settles zero and launches no check commands.
+    # Usage above USD_LIMIT retains an ERROR candidate and reported tokens, then settles via settle_overflow
+    # after durable tool_end; live and replayed admission become terminal in all limits modes.
+    # Replicate allocation hooks have type-only diagnostics; release uses retained allocation data without hooks.
     # AgentContext.run_tool applies the gate and counts the turn, then calls execute_tool_run, which owns every other check.
+
+class Inflight:
+    closed: bool
+    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None: ...
+    def discard(self, scope: anyio.CancelScope) -> None: ...
+    def max_grace_s(self) -> float: ...               # maximum active Job.grace_s, or 0.0 when idle
+    def close(self) -> None: ...                     # close admission without dropping entries
+    def cancel_all(self) -> None: ...                # retain entries until executor.submit exits
+    # Drain waits must also preserve the executor-owned collection allowance after grace (P47).
 
 class RepeatOutcome(FrozenModel):
     action: Literal["run", "refuse", "return_own", "link"]

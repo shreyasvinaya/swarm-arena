@@ -63,3 +63,32 @@ def test_runtime_rankings_default_is_independent_and_accepts_own_group() -> None
     assert first.rankings is not second.rankings
     part = AgentRuntime(**_values(), rankings={"part": "quality"})
     assert part.rankings == {"part": "quality"}
+
+
+def test_runtime_main_goal_required_and_seed_and_start_defaults() -> None:
+    values = _values()
+    values.pop("goal_id", None)
+    with pytest.raises(TypeError, match="goal_id"):
+        AgentRuntime(**values)
+    values["goal_id"] = "g"
+    runtime = AgentRuntime(**values)
+    assert runtime.goal_id == "g"
+    assert runtime.seed_parents == ()
+    assert runtime.started_runs == 0
+    restored = AgentRuntime(**values, started_runs=4, seed_parents=("c2", "c1"))
+    assert restored.started_runs == 4
+    assert restored.seed_parents == ("c2", "c1")
+
+
+def test_registry_documents_tranche_outcomes_and_overflow_admission() -> None:
+    from pathlib import Path
+
+    roadmap = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md").read_text()
+    budget = roadmap.split("#### R4.13.6 ", 1)[1].split("#### R4.13.7 ", 1)[0]
+    assert (
+        "async def settle_call(self, reservation_id: str, actual: Amount) -> TrancheOutcome"
+        in budget
+    )
+    assert "async def close(self) -> TrancheOutcome" in budget
+    limits = roadmap.split("class LimitReached(RuntimeError):", 1)[1].split("class Manager", 1)[0]
+    assert '"usage_overflow"' in limits

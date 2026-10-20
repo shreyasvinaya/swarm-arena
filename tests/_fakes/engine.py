@@ -96,11 +96,12 @@ class RtEnv:
     def rt_for_agent(self, agent: str, *, entries: Sequence[tuple[str, Candidate]]) -> AgentRuntime:
         return replace(
             self.rt,
-            address=f"g/t/{agent}",
-            holder=f"g/t/{agent}",
+            address=f"{self.rt.goal_id}/t/{agent}",
+            holder=f"{self.rt.goal_id}/t/{agent}",
             spec=self.rt.spec.model_copy(update={"name": agent}),
             own=[],
             counters=AgentCounters(),
+            started_runs=0,
             watchdog=Watchdog(self.rt.limits),
             repeats=RepeatIndex(self.rt.repeats.run_id, entries),
         )
@@ -214,10 +215,11 @@ class CtxEnv:
         self.rt = replace(
             base,
             **{
-                "address": f"g/t/{agent}",
-                "holder": f"g/t/{agent}",
+                "address": f"{base.goal_id}/t/{agent}",
+                "holder": f"{base.goal_id}/t/{agent}",
                 "spec": base.spec.model_copy(update={"name": agent, "replicates": replicates}),
                 "counters": AgentCounters(tool_runs=tool_runs, learnings=learnings),
+                "started_runs": 0,
                 "watchdog": Watchdog(limits),
                 "own": [],
                 "repeats": RepeatIndex(base.repeats.run_id),

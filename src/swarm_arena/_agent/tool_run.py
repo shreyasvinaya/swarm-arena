@@ -9,7 +9,7 @@ import anyio
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
-from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import ConfigError, Fenced, SoftError
 from swarm_arena._exec.env import tool_env_vars
@@ -57,9 +57,9 @@ class Inflight:
     def __init__(self) -> None:
         """Start with open admission and no submissions."""
         self.closed = False
-        self._scopes: set[anyio.CancelScope] = set()
+        self._scopes: dict[anyio.CancelScope, float] = {}
 
-    def add(self, scope: anyio.CancelScope) -> None:
+    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
         """
         Admit a submission unless the round has closed.
 
@@ -67,6 +67,8 @@ class Inflight:
         ----------
         scope : anyio.CancelScope
             Scope controlling one executor submission.
+        grace_s : float, default=0.0
+            Effective job grace in seconds; retained through executor collection.
 
         Raises
         ------
@@ -87,7 +89,7 @@ class Inflight:
         """
         if self.closed:
             raise LimitReached("stop", "the round is stopping")
-        self._scopes.add(scope)
+        self._scopes[scope] = grace_s
 
     def discard(self, scope: anyio.CancelScope) -> None:
         """
@@ -102,7 +104,25 @@ class Inflight:
         --------
         The :meth:`add` example admits and discards a scope in memory.
         """
-        self._scopes.discard(scope)
+        self._scopes.pop(scope, None)
+
+    def max_grace_s(self) -> float:
+        """
+        Return the largest grace of currently admitted submissions.
+
+        Returns
+        -------
+        float
+            Maximum job grace, or zero when idle. Closing or cancelling does not
+            remove entries; the executor retains its collection allowance after
+            grace, and discard occurs only when submit exits.
+
+        Examples
+        --------
+        >>> Inflight().max_grace_s()
+        0.0
+        """
+        return max(self._scopes.values(), default=0.0)
 
     def close(self) -> None:
         """
@@ -239,7 +259,7 @@ def _draft(rt: AgentRuntime, type: EventType, **payload: Any) -> EventDraft:
     """Stamp agent context without resolving or copying secrets."""
     return EventDraft(
         type=type,
-        goal_id=rt.goal.id,
+        goal_id=rt.goal_id,
         team=rt.team.name,
         agent=rt.spec.name,
         round=rt.round,
@@ -352,7 +372,7 @@ def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
     stdout_sha, stderr_sha = parse_logs_ref(ref)
     stdout, stderr = rt.artifacts.get_bytes(stdout_sha), rt.artifacts.get_bytes(stderr_sha)
     store = open_store(rt.config.run_root).child(rt.repeats.run_id)
-    stem = f"goals/{rt.goal.id}/logs/{id}"
+    stem = f"goals/{rt.goal_id}/logs/{id}"
     store.create(stem + ".out", stdout)
     store.create(stem + ".err", stderr)
     return stem
@@ -382,7 +402,8 @@ async def execute_tool_run(
     inputs : Mapping[str, Any]
         Inputs validated against the effective tool's input model.
     parents : Sequence[str]
-        Ordered visible parent candidate identifiers.
+        Ordered visible parent candidate identifiers. Runtime seed_parents are
+        prepended; one stable deduplication preserves the first occurrence.
     replicate : int or None
         Requested nondeterministic replicate, or automatic allocation.
     edits : Mapping[str, str] or None
@@ -411,7 +432,9 @@ async def execute_tool_run(
     >>> candidate = await execute_tool_run(rt, {"x": 1.0}, parents=(),
     ...     replicate=None, edits=None)  # doctest: +SKIP
     """
+    parents = tuple(dict.fromkeys((*rt.seed_parents, *parents)))
     request = _request(rt, inputs, parents, replicate, edits)
+    allocation_request = request
     settings = _stage_settings(rt, request)
     index: int | None = None
     try:
@@ -443,7 +466,7 @@ async def execute_tool_run(
         return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
     finally:
         if index is not None:
-            rt.repeats.release(rt, request, index)
+            rt.repeats.release(rt, allocation_request, index)
 
 
 async def _run(
@@ -481,7 +504,7 @@ async def _run(
     except Exception as error:
         warnings.append(f"tool error: {type(error).__name__}")
         failed = True
-    res = await rt.ledger.reserve(rt.holder, amount, kind="tool", goal_id=rt.goal.id)
+    res = await rt.ledger.reserve(rt.holder, amount, kind="tool", goal_id=rt.goal_id)
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started
@@ -497,6 +520,7 @@ async def _run(
             )
         )
         started = True
+        rt.started_runs += 1
 
     async def on_partial(value: ToolOutput) -> None:
         partial.append(value)
@@ -519,7 +543,7 @@ async def _run(
                 resources=rt.spec.resources,
                 env=tool_env_vars(
                     run_id=rt.repeats.run_id,
-                    goal_id=rt.goal.id,
+                    goal_id=rt.goal_id,
                     candidate_id=id,
                     team=rt.team.name,
                     agent=rt.spec.name,
@@ -532,7 +556,7 @@ async def _run(
                 on_partial=on_partial,
             )
             with anyio.CancelScope() as run_scope:
-                inflight.add(run_scope)
+                inflight.add(run_scope, grace_s=job.grace_s)
                 try:
                     output = await rt.executor.submit(job)
                 finally:
@@ -565,18 +589,24 @@ async def _run(
             output = ToolOutput(status=RunStatus.ERROR)
         actual = Amount()
         estimated = False
-        try:
-            usage = output.usage
-            reported = Amount(tokens=usage.total_tokens, usd=usage.usd or 0.0)
-            if started:
-                actual = reported
-                estimated = providers and usage.usd is None and usage.total_tokens == 0
-        except Fenced:
-            raise
-        except Exception as error:
-            warnings.append(f"tool error: {type(error).__name__}")
-            output = ToolOutput(status=RunStatus.ERROR)
-            actual, estimated = Amount(), started and providers
+        usage = output.usage
+        overflow = usage.usd is not None and usage.usd > USD_LIMIT
+        if overflow:
+            warnings.append("tool error: usage exceeds supported range")
+            output = output.model_copy(update={"status": RunStatus.ERROR})
+            actual = Amount(tokens=max(0, usage.total_tokens), usd=USD_LIMIT)
+        else:
+            try:
+                reported = Amount(tokens=usage.total_tokens, usd=usage.usd or 0.0)
+                if started:
+                    actual = reported
+                    estimated = providers and usage.usd is None and usage.total_tokens == 0
+            except Fenced:
+                raise
+            except Exception as error:
+                warnings.append(f"tool error: {type(error).__name__}")
+                output = ToolOutput(status=RunStatus.ERROR)
+                actual, estimated = Amount(), started and providers
         if output.logs_ref is not None:
             try:
                 logs_ref = await anyio.to_thread.run_sync(_logs, rt, id, output.logs_ref)
@@ -589,7 +619,7 @@ async def _run(
         candidate = Candidate(
             id=id,
             run_id=rt.repeats.run_id,
-            goal_id=rt.goal.id,
+            goal_id=rt.goal_id,
             part=rt.part,
             team=rt.team.name,
             agent=rt.spec.name,
@@ -639,7 +669,10 @@ async def _run(
             a2a=task_to_json(tool_run_task(candidate, context_id=rt.repeats.run_id, at=utc_now())),
         ).model_copy(update={"task_id": id})
         event = await rt.journal.append_durable(end)
-        await rt.ledger.settle(res.id, actual, estimated=estimated)
+        if overflow:
+            await rt.ledger.settle_overflow(res.id, actual)
+        else:
+            await rt.ledger.settle(res.id, actual, estimated=estimated)
         rt.board.put_candidate(candidate, epoch=event.epoch, seq=event.seq)
         rt.own.append(candidate)
         rt.repeats.add(key, candidate)

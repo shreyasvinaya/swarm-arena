@@ -1,7 +1,7 @@
 from collections.abc import Awaitable
 from dataclasses import replace
 from threading import get_ident
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import pytest
@@ -718,3 +718,51 @@ async def test_tool_metadata_failure_is_sanitized(
     with pytest.raises(SoftError, match="invalid tool metadata: ValueError") as error:
         ctx_env.ctx()
     assert_secret_absent(error.value, SECRET, sanitized=True)
+
+
+async def test_part_context_routes_learnings_events_and_read_ids(ctx_env: CtxEnv) -> None:
+    from swarm_arena import Goal
+
+    goal = Goal(id="sub", namespace="n")
+    ctx_env.env.board.register_goal(goal.key(), "g", "part")
+    ctx = ctx_env.ctx(
+        goal=goal,
+        goal_key=goal.key(),
+        part="part",
+        view=ctx_env.env.board.snapshot(goal.key(), ctx_env.env.board.frontier()),
+    )
+    assert ctx.goal.id == "sub"
+    evidence = await ctx.run_tool({"x": 0})
+    learning = await ctx.post_learning("part hint", "body", [evidence.id])
+    assert learning.goal_id == "g"
+    assert ctx.search_learnings("part hint") == [learning]
+    result = await ctx.run_tool({"x": 1})
+    assert result.goal_id == "g"
+    assert result.read_ids == [learning.id]
+    await ctx_env.rt.journal.commit()
+    committed = read_committed(ctx_env.env.run_store)
+    assert committed is not None
+    events = [e for e in committed[1] if e.agent == "a"]
+    assert all(e.goal_id == "g" for e in events)
+    state = RunState.from_events(committed[1])
+    assert state.candidates[result.id].read_ids == [learning.id]
+
+
+async def test_seed_parents_are_read_only_to_manager(ctx_env: CtxEnv) -> None:
+    ctx = ctx_env.ctx()
+    first = await ctx.run_tool({"x": 1})
+    seeded = AgentContext(replace(ctx_env.rt, seed_parents=(first.id,)), gate=lambda: None)
+    assert seeded.seed_parents == (first.id,)
+    with pytest.raises(AttributeError):
+        cast(Any, seeded).seed_parents = ()
+    second = await seeded.run_tool({"x": 2}, parents=(first.id, first.id))
+    assert second.parent_ids == [first.id]
+
+
+async def test_new_context_does_not_inherit_another_runtimes_starts(ctx_env: CtxEnv) -> None:
+    from swarm_arena._agent.tool_run import execute_tool_run
+
+    await execute_tool_run(ctx_env.env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert ctx_env.env.rt.started_runs == 1
+    ctx_env.ctx(agent="b")
+    assert ctx_env.rt.started_runs == 0
