@@ -3,9 +3,14 @@
 import os
 import stat
 from collections.abc import Iterator
+from copy import deepcopy
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Any, Final, cast
 
+from pydantic import AliasChoices, AliasPath
+from pydantic_core import PydanticUndefined
+
+from swarm_arena._model.compat import _alias_paths
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
@@ -229,6 +234,7 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     Validate against the referenced component's Config without constructing the
     component. Only file-set and reference fields present in the raw config are
     written back; omitted defaults stay omitted and other values stay raw.
+    Validation aliases retain their original input paths and precedence.
     Nested references omit absent model fields, and the returned reference is
     validated so its configuration remains reloadable from JSON and TOML.
 
@@ -271,22 +277,53 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     True
     """
     _, config = ref._resolve_config(Configurable)
-    updated = dict(ref.config)
-    for key in type(config).model_fields:
-        if key not in ref.config:
+    updated = deepcopy(ref.config)
+    settings = type(config).model_config
+    for key, field in type(config).model_fields.items():
+        alias = field.validation_alias
+        paths = (
+            _alias_paths(
+                alias.convert_to_aliases()
+                if isinstance(alias, (AliasPath, AliasChoices))
+                else alias
+            )
+            if settings.get("validate_by_alias", True)
+            else []
+        )
+        if alias is None or settings.get(
+            "validate_by_name",
+            settings.get("populate_by_name", False) or not settings.get("validate_by_alias", True),
+        ):
+            paths.append((key,))
+        path = next(
+            (
+                path
+                for path in paths
+                if AliasPath(cast(str, path[0]), *path[1:]).search_dict_for_path(ref.config)
+                is not PydanticUndefined
+            ),
+            None,
+        )
+        if path is None:
             continue
         value = getattr(config, key)
         if isinstance(value, FileSet):
-            updated[key] = snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
+            frozen: Any = snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
         elif isinstance(value, Ref):
-            updated[key] = snapshot_ref(value, base_dir, artifacts).model_dump(
+            frozen = snapshot_ref(value, base_dir, artifacts).model_dump(
                 mode="json", exclude_none=True
             )
         elif isinstance(value, list) and value and all(isinstance(item, Ref) for item in value):
-            updated[key] = [
+            frozen = [
                 snapshot_ref(item, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
                 for item in value
             ]
+        else:
+            continue
+        target: Any = updated
+        for part in path[:-1]:
+            target = target[part]
+        target[path[-1]] = frozen
     return Ref(path=ref.path, config=updated, name=ref.name)
 
 

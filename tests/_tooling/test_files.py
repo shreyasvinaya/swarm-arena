@@ -9,7 +9,16 @@ from typing import Any
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import FilesWidget, Widget
-from pydantic import ValidationError, create_model, field_validator, model_serializer
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    ConfigDict,
+    Field,
+    ValidationError,
+    create_model,
+    field_validator,
+    model_serializer,
+)
 from pydantic_core import PydanticCustomError
 
 from swarm_arena._errors import ConfigError
@@ -189,6 +198,89 @@ def test_snapshot_ref_keeps_omitted_fileset_omitted(
     )
     assert out == Ref(path="_fakes.tools:FilesWidget", config={"label": "x"})
     assert "files" not in out.config
+
+
+@pytest.mark.parametrize("kind", ["files", "ref", "refs"])
+@pytest.mark.parametrize(
+    ("alias", "raw_path", "settings", "unused"),
+    [
+        ("sources", ("sources",), {}, {}),
+        ("sources", ("files",), {"populate_by_name": True}, {}),
+        ("sources", ("files",), {"validate_by_alias": False}, {"sources": ["unused"]}),
+        (
+            "sources",
+            ("sources",),
+            {"populate_by_name": True},
+            {"files": ["unused"]},
+        ),
+        (AliasChoices("sources", "legacy"), ("legacy",), {}, {}),
+        (
+            AliasChoices("sources", "legacy"),
+            ("sources",),
+            {},
+            {"legacy": ["unused"]},
+        ),
+        (AliasPath("payload", "sources"), ("payload", "sources"), {}, {}),
+        (AliasPath("payload", -1), ("payload", -1), {}, {}),
+        (
+            AliasChoices(AliasPath("payload", 1), "legacy"),
+            ("legacy",),
+            {},
+            {"payload": []},
+        ),
+    ],
+)
+def test_snapshot_ref_validation_aliases(
+    tmp_path: Path,
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    alias: str | AliasChoices | AliasPath,
+    raw_path: tuple[str | int, ...],
+    settings: dict[str, Any],
+    unused: dict[str, Any],
+) -> None:
+    source = _write(tmp_path, "problem/run.py")
+    payload: Any = ["problem/run.py"]
+    annotation: Any = FileSet
+    if kind != "files":
+        payload = {"path": "_fakes.tools:FilesWidget", "config": {"files": payload}}
+        annotation = RefField
+        if kind == "refs":
+            payload = [payload]
+            annotation = list[RefField]
+    schema = create_model(
+        "Config",
+        __base__=Widget.Config,
+        __config__=ConfigDict(extra="ignore", **settings),
+        files=(annotation, Field(validation_alias=alias)),
+    )
+    monkeypatch.setattr(Widget, "Config", schema)
+    raw: dict[str, Any] = dict(unused)
+    if len(raw_path) == 1:
+        raw[str(raw_path[0])] = payload
+    elif isinstance(raw_path[1], int):
+        raw[str(raw_path[0])] = [payload]
+    else:
+        raw[str(raw_path[0])] = {raw_path[1]: payload, "other": 7}
+    raw["size"] = "2"
+    ref = Ref(path="_fakes.tools:Widget", config=raw)
+    before = ref.model_copy(deep=True)
+    frozen = snapshot_ref(ref, tmp_path, artifacts)
+    assert ref == before
+    assert frozen.config.keys() == ref.config.keys()
+    assert frozen.config["size"] == "2"
+    for key, value in unused.items():
+        assert frozen.config[key] == value
+    result: Any = frozen.config
+    for part in raw_path:
+        result = result[part]
+    if kind != "files":
+        result = (result[0] if kind == "refs" else result)["config"]["files"]
+    assert result["manifest"] == {"problem/run.py": sha256_hex(source.read_bytes())}
+    source.unlink()
+    reloaded = Ref.model_validate_json(frozen.model_dump_json())
+    assert snapshot_ref(reloaded, tmp_path, artifacts) == frozen
 
 
 def test_snapshot_ref_preserves_raw_scalars(tmp_path: Path, artifacts: ArtifactStore) -> None:
