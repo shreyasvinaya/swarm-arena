@@ -1,12 +1,35 @@
 """Reserve durable batches and account for individual calls locally."""
 
+import logging
 from dataclasses import dataclass, field
 
 import anyio
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._budget.amount import Amount, _usd_from_micro_units
+from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
 from swarm_arena._budget.ledger import Ledger, _nonnegative
+
+_logger = logging.getLogger(__name__)
+_USD_LIMIT_MICROS = Amount(usd=USD_LIMIT)._micro_usd
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrancheOutcome:
+    """
+    Flag conservative range-limit charging for downstream journal producers.
+
+    Parameters
+    ----------
+    overflow : bool, default=False
+        Whether any reported call or batch usage exceeded the supported range.
+
+    Examples
+    --------
+    >>> TrancheOutcome().overflow
+    False
+    """
+
+    overflow: bool = False
 
 
 @dataclass
@@ -54,14 +77,27 @@ class Tranche:
 
     Examples
     --------
-    >>> from unittest.mock import Mock
-    >>> tranche = Tranche(Mock(spec=Ledger), "g1/t/a", "g1",
-    ...                   size=Amount(tokens=25_000, usd=0.25))
-    >>> tranche.pending()
-    0
-    >>> call_id = await tranche.reserve_call(Amount(usd=0.1))  # doctest: +SKIP
-    >>> await tranche.settle_call(call_id, Amount(usd=0.01))  # doctest: +SKIP
-    >>> await tranche.close()  # doctest: +SKIP
+    >>> from unittest.mock import AsyncMock
+    >>> from swarm_arena._journal.writer import JournalWriter
+    >>> from swarm_arena._model.ids import IdGen
+    >>> from swarm_arena._model.limits import Limits
+    >>> journal = AsyncMock(spec=JournalWriter)
+    >>> ledger = Ledger(Limits(), reserve_fraction=0.15, goal_weights=None,
+    ...                 journal=journal, ids=IdGen("example", 1))
+    >>> async def example() -> tuple[int, Amount]:
+    ...     await ledger.hold_final_slices({"g1": Amount()})
+    ...     ledger.open_goal("g1")
+    ...     ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+    ...     tranche = Tranche(ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    ...     cid = await tranche.reserve_call(Amount(usd=0.1))
+    ...     assert tranche.pending() == 1
+    ...     outcome = await tranche.settle_call(cid, Amount(usd=0.01))
+    ...     assert not outcome.overflow
+    ...     outcome = await tranche.close()
+    ...     event = journal.append_durable.call_args.args[0]
+    ...     return tranche.pending(), Amount.model_validate(event.payload["actual"])
+    >>> anyio.run(example)
+    (0, Amount(tokens=0, usd=0.01))
     """
 
     def __init__(self, ledger: Ledger, holder: str, goal_id: str, *, size: Amount) -> None:
@@ -74,6 +110,18 @@ class Tranche:
         self._batches: list[_Batch] = []
         self._calls: dict[str, _Call] = {}
         self._closed = False
+        self._outcome = TrancheOutcome()
+
+    def _reported_amount(self, tokens: int, micros: int, *, overflow: bool = False) -> Amount:
+        """Contain reported usage in exact units, explicitly flagging overflow."""
+        if overflow or micros > _USD_LIMIT_MICROS:
+            if not self._outcome.overflow:
+                self._outcome = TrancheOutcome(overflow=True)
+                _logger.warning(
+                    "reported usage exceeds the supported range; charged as the range limit"
+                )
+            micros = _USD_LIMIT_MICROS
+        return _nonnegative(Amount(tokens=tokens, usd=_usd_from_micro_units(micros)))
 
     async def reserve_call(self, estimate: Amount) -> str:
         """
@@ -98,7 +146,25 @@ class Tranche:
 
         Examples
         --------
-        >>> cid = await tranche.reserve_call(Amount(usd=0.05))  # doctest: +SKIP
+        >>> from unittest.mock import AsyncMock
+        >>> from swarm_arena._journal.writer import JournalWriter
+        >>> from swarm_arena._model.ids import IdGen
+        >>> from swarm_arena._model.limits import Limits
+        >>> journal = AsyncMock(spec=JournalWriter)
+        >>> ledger = Ledger(Limits(), reserve_fraction=0.15, goal_weights=None,
+        ...                 journal=journal, ids=IdGen("example", 1))
+        >>> async def example() -> tuple[int, Amount]:
+        ...     await ledger.hold_final_slices({"g1": Amount()})
+        ...     ledger.open_goal("g1")
+        ...     ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+        ...     tranche = Tranche(ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+        ...     cid = await tranche.reserve_call(Amount(usd=0.05))
+        ...     assert tranche.pending() == 1
+        ...     outcome = await tranche.close()
+        ...     event = journal.append_durable.call_args.args[0]
+        ...     return tranche.pending(), Amount.model_validate(event.payload["actual"])
+        >>> anyio.run(example)
+        (0, Amount(tokens=0, usd=0.05))
         """
         async with self._lock:
             if self._closed:
@@ -143,7 +209,7 @@ class Tranche:
             self._calls[cid] = _Call(estimate, batch)
             return cid
 
-    async def settle_call(self, reservation_id: str, actual: Amount) -> None:
+    async def settle_call(self, reservation_id: str, actual: Amount) -> TrancheOutcome:
         """
         Settle an admitted call once, ignoring arrivals after close.
 
@@ -154,23 +220,56 @@ class Tranche:
         actual : Amount
             Nonnegative reported usage, including any overspend.
 
+        Returns
+        -------
+        TrancheOutcome
+            Cumulative range-overflow flag, available for caller journaling.
+
+        Notes
+        -----
+        An over-range report is explicitly charged at ``USD_LIMIT`` with its
+        tokens preserved. One value-free warning is emitted per tranche.
+        Normal Amount construction still rejects over-range estimates.
+
         Examples
         --------
-        >>> await tranche.settle_call(cid, Amount(usd=0.01))  # doctest: +SKIP
+        >>> from unittest.mock import AsyncMock
+        >>> from swarm_arena._journal.writer import JournalWriter
+        >>> from swarm_arena._model.ids import IdGen
+        >>> from swarm_arena._model.limits import Limits
+        >>> journal = AsyncMock(spec=JournalWriter)
+        >>> ledger = Ledger(Limits(), reserve_fraction=0.15, goal_weights=None,
+        ...                 journal=journal, ids=IdGen("example", 1))
+        >>> async def example() -> tuple[int, Amount]:
+        ...     await ledger.hold_final_slices({"g1": Amount()})
+        ...     ledger.open_goal("g1")
+        ...     ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+        ...     tranche = Tranche(ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+        ...     cid = await tranche.reserve_call(Amount(usd=0.05))
+        ...     outcome = await tranche.settle_call(cid, Amount(usd=0.01))
+        ...     assert tranche.pending() == 0 and not outcome.overflow
+        ...     outcome = await tranche.close()
+        ...     event = journal.append_durable.call_args.args[0]
+        ...     return tranche.pending(), Amount.model_validate(event.payload["actual"])
+        >>> anyio.run(example)
+        (0, Amount(tokens=0, usd=0.01))
         """
         async with self._lock:
             if self._closed:
-                return
+                return self._outcome
             call = self._calls[reservation_id]
             if call.actual is not None:
-                return
-            actual = _nonnegative(actual)
+                return self._outcome
+            actual = self._reported_amount(
+                actual.tokens, actual._micro_usd, overflow=actual.usd > USD_LIMIT
+            )
             if call.batch is None:
                 await self._ledger.settle(reservation_id, actual)
             else:
                 call.batch.tokens += call.estimate.tokens - actual.tokens
                 call.batch.micros += call.estimate._micro_usd - actual._micro_usd
             call.actual = actual
+            return self._outcome
 
     def pending(self) -> int:
         """
@@ -189,18 +288,48 @@ class Tranche:
         """
         return 0 if self._closed else sum(c.actual is None for c in self._calls.values())
 
-    async def close(self) -> None:
+    async def close(self) -> TrancheOutcome:
         """
         Return unused batch funding and charge pending calls at their estimates.
+
+        Returns
+        -------
+        TrancheOutcome
+            Stable terminal outcome, including any conservative range charge.
 
         Notes
         -----
         Repeated closes are idempotent. If a durable settlement fails, another
         close retries the remaining settlements without reopening admission.
+        Batch usage is summed in integer micro-dollars. A total above
+        ``USD_LIMIT`` charges exactly that limit, preserving reported tokens
+        (which have no upper bound), and flags overflow for caller journaling.
+        This exhausts a capped USD budget; uncapped units remain unlimited.
 
         Examples
         --------
-        >>> await tranche.close()  # doctest: +SKIP
+        >>> from unittest.mock import AsyncMock
+        >>> from swarm_arena._journal.writer import JournalWriter
+        >>> from swarm_arena._model.ids import IdGen
+        >>> from swarm_arena._model.limits import Limits
+        >>> journal = AsyncMock(spec=JournalWriter)
+        >>> ledger = Ledger(Limits(), reserve_fraction=0.15, goal_weights=None,
+        ...                 journal=journal, ids=IdGen("example", 1))
+        >>> async def example() -> tuple[int, Amount]:
+        ...     await ledger.hold_final_slices({"g1": Amount()})
+        ...     ledger.open_goal("g1")
+        ...     ledger.open_round("g1", 1, ["g1/t/a"], rounds_left=1)
+        ...     tranche = Tranche(ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+        ...     cid = await tranche.reserve_call(Amount(usd=0.05))
+        ...     pending = await tranche.reserve_call(Amount(usd=0.05))
+        ...     outcome = await tranche.settle_call(cid, Amount(usd=0.01))
+        ...     assert tranche.pending() == 1
+        ...     outcome = await tranche.close()
+        ...     assert await tranche.close() is outcome
+        ...     event = journal.append_durable.call_args.args[0]
+        ...     return tranche.pending(), Amount.model_validate(event.payload["actual"])
+        >>> anyio.run(example)
+        (0, Amount(tokens=0, usd=0.06))
         """
         async with self._lock:
             self._closed = True
@@ -208,9 +337,8 @@ class Tranche:
                 if batch.settled:
                     continue
                 amounts = [self._calls[c].actual or self._calls[c].estimate for c in batch.calls]
-                actual = Amount(
-                    tokens=sum(a.tokens for a in amounts),
-                    usd=_usd_from_micro_units(sum(a._micro_usd for a in amounts)),
+                actual = self._reported_amount(
+                    sum(a.tokens for a in amounts), sum(a._micro_usd for a in amounts)
                 )
                 await self._ledger.settle(batch.id, actual)
                 batch.settled = True
@@ -218,3 +346,4 @@ class Tranche:
                 if call.batch is None and call.actual is None:
                     await self._ledger.settle(cid, call.estimate, estimated=True)
                     call.actual = call.estimate
+            return self._outcome
