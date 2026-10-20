@@ -1,4 +1,3 @@
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -6,12 +5,7 @@ import pytest
 from swarm_arena._model import migrate
 from swarm_arena._model.migrate import migration, upgrade
 
-
-@pytest.fixture(autouse=True)
-def isolated_migrations(monkeypatch: pytest.MonkeyPatch) -> None:
-    functions: dict[tuple[str, int], migrate.MigrationFn] = {}
-    monkeypatch.setattr(migrate, "_migration_functions", functions)
-    monkeypatch.setattr(migrate, "_MIGRATIONS", MappingProxyType(functions))
+pytestmark = pytest.mark.usefixtures("isolated_migrations")
 
 
 def test_current_version_is_identity() -> None:

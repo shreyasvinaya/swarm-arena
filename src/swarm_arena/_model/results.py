@@ -327,6 +327,8 @@ class Learning(StoredModel):
         Team/agent address or human-prefixed author.
     title : str
         Stripped, nonempty single line of at most 120 characters.
+        C0/C1 controls, DEL, and Unicode line separators are refused before
+        trimming. Printable non-ASCII text is accepted.
     text : str
         Markdown body of at most 1500 characters.
     evidence : list[str], default=[]
@@ -376,9 +378,14 @@ class Learning(StoredModel):
     @field_validator("title")
     @classmethod
     def _check_title(cls, title: str) -> str:
-        """Strip surrounding whitespace and enforce the single-line title limit."""
+        """Reject controls and line separators, then trim and check the length."""
+        if any(
+            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or char in "\u2028\u2029"
+            for char in title
+        ):
+            raise ValueError("title must be nonempty, single-line, and at most 120 characters")
         stripped = title.strip()
-        if not stripped or len(stripped) > 120 or "\n" in title or "\r" in title:
+        if not stripped or len(stripped) > 120:
             raise ValueError("title must be nonempty, single-line, and at most 120 characters")
         return stripped
 

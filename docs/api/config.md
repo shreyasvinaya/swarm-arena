@@ -50,8 +50,14 @@ or pattern, and patterns use Rust regex syntax (no lookaround or backreferences;
 `PlannerCatalog` rejects duplicate names. For entries with settable fields it
 imports the component class during validation and rejects fields listed in that
 component's human-only settings. Entries without settable fields need no import.
-`match()` compares the component kind, import path, and raw fixed configuration;
-full component validation belongs to the later planning validation layer.
+`match()` compares the component kind and import path exactly, then removes
+explicitly settable top-level fields from the reference configuration and compares
+the remaining fixed settings. JSON types and values must agree recursively:
+`True`, `1`, and `1.0` are distinct, including inside lists and nested mappings.
+Mapping order does not matter; list order does. A nested field remains fixed even
+if its name matches a settable top-level field. Matching performs no imports or
+I/O and does not validate defaults or settable values; full component validation
+belongs to the later planning validation layer.
 
 Load errors report the configuration path and schema field names, aliases and
 list/tuple indices; human settings show unknown model keys as typo identifiers,

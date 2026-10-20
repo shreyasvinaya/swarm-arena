@@ -222,3 +222,92 @@ def test_catalog_errors_hide_values_and_mapping_keys(
     with pytest.raises(ValidationError) as caught:
         model.model_validate(data)
     assert_secret_absent(caught.value, "f31a4604-550d-5b3d-b9b3-65a6a2254cd4")
+
+
+@pytest.mark.parametrize(
+    ("fixed", "offered"),
+    [(True, 1), (True, 1.0), (1, 1.0), (False, 0), (False, 0.0), (0, 0.0)],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("shape", ["scalar", "list", "mapping", "nested"])
+def test_catalog_match_distinguishes_json_scalar_types(
+    fixed: Any, offered: Any, reverse: bool, shape: str
+) -> None:
+    if reverse:
+        fixed, offered = offered, fixed
+    if shape == "list":
+        fixed, offered = [fixed], [offered]
+    elif shape == "mapping":
+        fixed, offered = {"x": fixed}, {"x": offered}
+    elif shape == "nested":
+        fixed, offered = {"x": [{"y": fixed}]}, {"x": [{"y": offered}]}
+    entry = CatalogEntry(
+        name="demo", kind="tool", ref="demo:Tool", description="", config={"value": fixed}
+    )
+    catalog = PlannerCatalog(entries=[entry])
+    assert catalog.match(Ref(path=entry.ref, config={"value": offered}), "tool") is None
+
+
+@pytest.mark.parametrize(
+    ("fixed", "offered", "matches"),
+    [
+        (True, True, True),
+        (1, 1, True),
+        (1.0, 1.0, True),
+        (0.0, -0.0, True),
+        ("1", 1, False),
+        ([], {}, False),
+        ([1, 2], [2, 1], False),
+        ([1], [1, 2], False),
+        ([1, 2], [1], False),
+        ({"x": 1}, {"y": 1}, False),
+        ({"x": 1}, {"x": 1, "y": 2}, False),
+        (
+            {"x": [True, 1, 1.0, "é"], "y": {"a": 2, "b": 3}},
+            {"y": {"b": 3, "a": 2}, "x": [True, 1, 1.0, "é"]},
+            True,
+        ),
+    ],
+)
+def test_catalog_match_preserves_json_value_and_container_rules(
+    fixed: Any, offered: Any, matches: bool
+) -> None:
+    entry = CatalogEntry(
+        name="demo", kind="tool", ref="demo:Tool", description="", config={"value": fixed}
+    )
+    result = PlannerCatalog(entries=[entry]).match(
+        Ref(path=entry.ref, config={"value": offered}), "tool"
+    )
+    assert result is (entry if matches else None)
+
+
+def test_catalog_match_only_removes_top_level_settable_fields_without_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = CatalogEntry(
+        name="demo",
+        kind="tool",
+        ref="_fakes.tools:Widget",
+        description="",
+        config={"nested": {"label": True}},
+        settable={"label": {"type": "string"}},
+    )
+    catalog = PlannerCatalog(entries=[entry])
+    good = Ref(path=entry.ref, config={"nested": {"label": True}, "label": 42})
+    bad = Ref(path=entry.ref, config={"nested": {"label": 1}, "label": "allowed"})
+    wrong_path = Ref(path="different:Tool", config=good.config)
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("catalog matching must not import, validate components, or perform I/O")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("swarm_arena._model.catalog.load_object", unexpected)
+        patch.setattr("builtins.open", unexpected)
+        patch.setattr("io.open", unexpected)
+        patch.setattr("os.open", unexpected)
+        patch.setattr(Ref, "_resolve_config", unexpected)
+        patch.setattr("importlib.import_module", unexpected)
+        assert catalog.match(good, "tool") is entry
+        assert catalog.match(bad, "tool") is None
+        assert catalog.match(wrong_path, "tool") is None
+        assert catalog.match(good, "manager") is None

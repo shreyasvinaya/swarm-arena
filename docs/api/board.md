@@ -11,7 +11,10 @@ JSON. Overlay keys must be normalized relative workspace paths, and values
 must be lowercase SHA-256 digests.
 
 `Learning` titles are stripped, single-line, nonempty, and at most 120
-characters. Bodies are limited to 1500 characters. Non-human authors must cite
+characters. Before trimming, titles reject all C0/C1 control characters and DEL,
+and every line separator recognized by Python's `str.splitlines()`, including
+U+0085, U+2028, and U+2029. Printable non-ASCII titles are accepted. Bodies are
+limited to 1500 characters. Non-human authors must cite
 at least one evidence candidate; an author starting with `human:` may omit
 that evidence. The `from_human` property is derived and excluded from JSON.
 
