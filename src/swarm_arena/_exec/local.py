@@ -439,16 +439,21 @@ class _JobRun:
         Stamp the stop on the output: the stop status, and ``partial``.
 
         ``partial`` is True when the stop-path collect returned a valid
-        ``ToolOutput``, even an empty one (spec §5), whatever the collect said
-        itself; files that ``_finish`` drops later do not change it. A failed,
-        abandoned, or invalid collect gives an empty output with
+        ``ToolOutput`` that says it is partial or keeps data or files (spec
+        §5: a valid result is kept as partial; without one, the data is
+        empty). A collect that keeps data but says ``partial=False`` is still
+        partial, and files that ``_finish`` drops later do not change it. A
+        valid but empty output that does not say partial is not partial. A
+        failed, abandoned, or invalid collect gives an empty output with
         ``partial=False`` and a note.
         """
-        if self._output is None:
+        output = self._output
+        if output is None:
             if self._provisional is not None:  # a collect was tried and gave nothing
                 note_in_log(self._stderr, "no partial output: collect failed or timed out")
             return ToolOutput(status=status)
-        return self._output.model_copy(update={"status": status, "partial": True})
+        partial = output.partial or bool(output.data or output.files)
+        return output.model_copy(update={"status": status, "partial": partial})
 
     def _read_log(self, rel: str) -> bytes:
         """Read the last ``max_log_bytes`` of a regular log; anything else is empty."""
@@ -698,11 +703,14 @@ class LocalExecutor(Executor):
         collect failure: status ERROR after a normal exit, with the reason in
         the stderr log. A stopped run's output has the stop status: after a
         timeout it is the output collected before SIGKILL, with
-        ``partial=True`` whenever that collect returned a valid
-        ``ToolOutput``, even an empty one, and also when its files are
-        dropped later (over ``max_output_bytes``, or a failed upload). When
-        collect failed, timed out, or gave an invalid result, the output is
-        empty with ``partial=False``, and a note goes to the stderr log. On a
+        ``partial=True`` when that collect returned a valid ``ToolOutput``
+        that says it is partial or keeps data or files, also when those
+        files are dropped later (over ``max_output_bytes``, or a failed
+        upload). A valid but empty output that does not say partial, such
+        as a script tool's timeout without ``swarm/result.json``, gives
+        ``partial=False``. When collect failed, timed out, or gave an invalid
+        result, the output is empty with ``partial=False``, and a note goes to
+        the stderr log. On a
         cancel after the start handshake, ``job.on_partial`` gets the best
         output there is (status CANCELLED), also when the tool had already
         exited and its collect was still running. A command

@@ -1205,7 +1205,7 @@ async def test_collect_must_return_a_valid_tool_output(
     assert out.started_at is not None
 
 
-# --- partial=True iff the stopped run's collect returned a valid ToolOutput (IF3 A8) ---
+# --- A stopped run is partial when its valid collect output kept something or says so ---
 
 
 async def _cancel_when_ready(
@@ -1230,35 +1230,41 @@ async def _cancel_when_ready(
 
 
 @pytest.mark.parametrize(
-    ("result", "kept"),
+    ("result", "partial", "kept"),
     [
-        (None, ({}, [])),  # no result.json: the collect still returned a valid, empty output
-        ("{'data': {}}", ({}, [])),  # a valid but empty result
-        ("{'data': {}, 'files': ['out/x.txt']}", ({}, ["out/x.txt"])),
-        ("{'data': {'step': 3}}", ({"step": 3}, [])),
+        (None, False, ({}, [])),  # no result.json: the data is empty and not partial (spec 5)
+        ("{'data': {}}", True, ({}, [])),  # a valid result, even an empty one, is partial
+        ("{'data': {}, 'files': ['out/x.txt']}", True, ({}, ["out/x.txt"])),
+        ("{'data': {'step': 3}}", True, ({"step": 3}, [])),
     ],
 )
-async def test_stopped_run_is_partial_when_its_collect_returns_an_output(
+async def test_stopped_run_is_partial_only_with_a_valid_result(
     local_executor: LocalExecutor,
     tmp_path: Path,
     result: str | None,
+    partial: bool,
     kept: tuple[dict[str, Any], list[str]],
 ) -> None:
     write = "" if result is None else "; " + WRITE.format(result)
     code = "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x')" + write
     out = await _cancel_when_ready(local_executor, tmp_path / "ws", {}, tmp_path, code)
-    assert (out.status, out.partial) == (RunStatus.CANCELLED, True)
+    assert (out.status, out.partial) == (RunStatus.CANCELLED, partial)
     assert (out.data, [ref.path for ref in out.files]) == kept
     stderr = log(tmp_path, out, 2)
-    assert b"no partial output" not in stderr  # the collect did not fail
+    assert b"no partial output" not in stderr  # the collect itself did not fail
     assert (b"swarm/result.json is missing" in stderr) is (result is None)
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
-async def test_valid_empty_collect_output_is_partial_on_both_stop_paths(
-    local_executor: LocalExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str
+@pytest.mark.parametrize("says_partial", [False, True])
+async def test_valid_empty_collect_output_is_partial_only_if_it_says_so(
+    local_executor: LocalExecutor,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+    says_partial: bool,
 ) -> None:  # the collect output does not depend on the tool's speed, so a timeout cannot race
-    empty = ToolOutput(status=RunStatus.OK)
+    empty = ToolOutput(status=RunStatus.OK, partial=says_partial)
     monkeypatch.setattr(OkCollectTool, "collect", lambda self, request, workspace, run: empty)
     if stop == "timeout":
         job = tool_job(
@@ -1273,7 +1279,7 @@ async def test_valid_empty_collect_output_is_partial_on_both_stop_paths(
         kw = {"tool_cls": OkCollectTool}
         out = await _cancel_when_ready(local_executor, tmp_path / "ws", kw, tmp_path, "pass")
         status = RunStatus.CANCELLED
-    assert (out.status, out.partial, out.data, out.files) == (status, True, {}, [])
+    assert (out.status, out.partial, out.data, out.files) == (status, says_partial, {}, [])
     assert b"no partial output" not in log(tmp_path, out, 2)
 
 
