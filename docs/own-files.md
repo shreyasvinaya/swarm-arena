@@ -1,6 +1,7 @@
 # Use your own files and script
 
-Written in M1a.
+Run tools, checks, and judges locally with your existing scripts. Start with
+[Try it offline](#try-it-offline); no Python subclass or model provider is needed.
 
 ## File snapshots
 
@@ -32,11 +33,8 @@ Once a file set has a manifest, snapshotting reuses it without reading the sourc
 files again. Source edits or deletion therefore cannot change an existing
 snapshot. A file set with no globs needs no source files.
 
-The internal snapshot helpers cover the main goal, part goals, tools, managers,
-checks, judges, policy, and convergence team. Component configs are validated
-before traversing explicit `FileSet` and nested `Ref` fields, including lists of
-refs. Omitted defaults stay omitted, unrelated settings keep their original
-representation, and the returned plan retains its original base directory.
+In the offline conformance kit, file globs are resolved from the current working
+directory. Run the driver from the directory containing your declared files.
 
 (workspace-staging)=
 ## Workspace staging
@@ -99,14 +97,13 @@ or ancestor directories with different spellings but the same folded key,
 including `a.txt`/`A.txt` and composed/decomposed Unicode names, on every platform.
 No layer merge accepts a respelling. Merge and layout errors name full
 workspace paths such as `parents/c2/p/a.txt` or `candidate/files/p/a.txt`.
-It also rejects symlinks and file/directory conflicts, reads verified artifact
-bytes directly, and publishes through pinned directory descriptors.
+It also rejects symlinks and file/directory conflicts and verifies artifact
+contents before staging them.
 Root artifacts are writable; parent and candidate
 artifacts are read-only. The workspace's ancestors are trusted executor-owned
-directories. Output collection uses the shared regular-file reader, refuses
-symlink components and special files. The sink, staging helpers, snapshotter,
-and output collectors use one folded-layout checker for files, implicit ancestor
-directories, and file/directory conflicts.
+directories. Output collection refuses symlink components and special files.
+The same collision rules apply to files and their ancestor directories when
+snapshotting, staging, and collecting outputs.
 
 Output collection checks declarations against each other and against the
 complete original workspace layout before uploading any output. Declarations
@@ -190,8 +187,9 @@ protected using its canonical relative path: `problem/run.py`,
 `./problem/run.py`, and `problem//run.py` protect the same file. All tool-owned
 manifest paths are protected too. Command and interpreter matching compares
 folded (canonical caseless) keys and retains the root's stored spelling, including composed
-and decomposed Unicode names. These restrictions apply even under a broad
-editable glob, both to live edits and to a base parent's overlay.
+and decomposed Unicode names. These restrictions apply to live edits and to a
+base parent's overlay. They protect the named files, but do not prevent
+[import shadowing](#tool-workspace-and-protection) through newly added modules.
 
 The tool provides two read-only actions, each counted as a board read:
 
@@ -204,13 +202,133 @@ Candidate lookup uses the agent context, so candidates outside its view cannot
 be read. Artifact reads run on a worker thread. Neither action exposes arbitrary
 filesystem paths or artifact hashes as a way to select additional files.
 
+## Try it offline
+
+Install this checkout in your project environment (Python 3.11+, POSIX):
+
+```sh
+uv init --python 3.11 script-demo
+cd script-demo
+uv add --editable /absolute/path/to/agent-swarm
+```
+
+Save the following four files, creating their parent directories as needed.
+Run `uv run python try_scripts.py` from `script-demo`. The driver writes the
+initial problem file, runs the tool with an edit, checks the candidate's effective
+file, and scores its output. The conformance kit snapshots file globs relative
+to this current directory and manages a local executor.
+
+### `problem/run.py`
+
+The tool reads parameters and an editable problem file, then writes a result:
+
+```python
+import json
+import os
+from pathlib import Path
+
+params = json.loads(Path("swarm/request.json").read_text())["params"]
+value = float(Path("problem/value.physk").read_text())
+loss = (value * params["scale"]) ** 2
+Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"data": {"loss": loss}}))
+```
+
+### `checks/check.py`
+
+The check sees the candidate's edited file and its recorded output:
+
+```python
+import json
+import os
+from pathlib import Path
+
+output = json.loads(Path("candidate/output.json").read_text())
+request = json.loads(Path("candidate/request.json").read_text())
+value = float(Path("candidate/files/problem/value.physk").read_text())
+expected = (value * request["params"]["scale"]) ** 2
+passed = output["data"]["loss"] == expected
+Path(os.environ["SWARM_ARENA_RESULT"]).write_text(
+    json.dumps({"passed": passed, "reasons": [] if passed else ["loss mismatch"]})
+)
+```
+
+### `judge/score.py`
+
+The judge returns a loss; its configuration below makes smaller values better:
+
+```python
+import json
+import os
+from pathlib import Path
+
+output = json.loads(Path("candidate/output.json").read_text())
+Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"value": output["data"]["loss"]}))
+```
+
+### `try_scripts.py`
+
+All imports use the public API:
+
+```python
+from pathlib import Path
+
+import anyio
+
+from swarm_arena import Goal, ScriptCheck, ScriptJudge, ScriptTool
+from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
+from swarm_arena.tool import RunStatus, ToolRequest
+
+
+async def main() -> None:
+    """
+    Run, check, and score the local script example.
+
+    Examples
+    --------
+    Save the companion scripts, then run ``uv run python try_scripts.py``.
+    """
+    Path("problem/value.physk").write_text("1.0")
+    goal = Goal(id="script-demo", namespace="demo", files=["problem/run.py", "problem/*.physk"])
+    tool = ScriptTool(
+        command=["python", "problem/run.py"],
+        editable=["problem/*.physk"],
+        params={"scale": {"type": "number", "minimum": 0.0}},
+    )
+    params = {"scale": 1.0}
+    edits = {"problem/value.physk": "0.5"}
+    out = await check_tool(tool, params, goal=goal, edits=edits)
+    assert out.status is RunStatus.OK
+    candidate = make_candidate(
+        out, request=ToolRequest(inputs=params, edits=edits), tool=tool, goal_id=goal.id
+    )
+    check = ScriptCheck(command=["python", "checks/check.py"], files=["checks/check.py"])
+    result = await check_check(check, candidate, goal=goal)
+    assert result.passed
+    judge = ScriptJudge(
+        command=["python", "judge/score.py"], files=["judge/score.py"], direction="min"
+    )
+    [score] = await check_judge(judge, goal, [candidate])
+    assert score.key == (-0.25,)
+    print(f"{out.status.value}: loss={out.data['loss']}, check={result.passed}, key={score.key}")
+
+
+if __name__ == "__main__":
+    anyio.run(main)
+```
+
+Expected output:
+
+```text
+ok: loss=0.25, check=True, key=(-0.25,)
+```
+
 ## Configure files, a tool, a check, and a judge
 
-The design's §4.12 example below connects a physika problem to three scripts.
+The configuration example below connects a physika problem to three scripts.
 Its `.phyk` extension is illustrative; globs can select `.physk` files or any
 other regular files. No Python subclass is needed. This is a configuration
 excerpt: the LLM manager and model alias belong to later milestones, while
-M1a supplies the script components and local execution.
+the current release supplies the script components and local execution.
 
 ```toml
 [goal]
@@ -299,10 +417,20 @@ be inherited and then replaced by the current edit.
 
 Only the paths named in `command` and `python`, and the tool's own `files`, are protected. A helper module your script imports (for example `problem/helpers.py`) can be edited when an `editable` glob matches it. To keep it fixed, list it in the tool's `files` or narrow `editable`.
 
+**Import shadowing:** even when `problem/run.py` is protected, an editable glob
+such as `problem/*` lets an agent create `problem/json.py` and replace the
+`json` module that script imports. Newly created package `__init__.py` files
+can do the same. Protecting existing helpers does not prevent these additions.
+The risk applies anywhere on the program's import path, including the working
+directory for `python -m` or `python -c`. Prefer globs that exclude code, such
+as `editable=["problem/*.physk"]`, and keep trusted scripts and helpers outside
+the editable set.
+
 Check and judge private paths and the core's reserved paths are also excluded
 from edits and overlays. Protected names use canonical caseless folding;
 editable globs remain case sensitive. For example, `./problem/RUN.py` in a
-command protects the root's `problem/run.py`, even with `editable=["problem/*"]`.
+command protects the root's `problem/run.py`. Use `editable=["problem/*.physk"]`
+to permit problem edits without allowing new Python modules beside that script.
 All workspace paths must be relative strict UTF-8 (no lone surrogates), without `..` or symlinks. Top-level
 `swarm/`, `parents/`, and `candidate/` are reserved, including folded variants.
 For example, `out/plot.png` is a valid output path; `../plot.png` and
@@ -364,7 +492,7 @@ is empty. If its declared files are then over `max_output_bytes` or fail to
 upload, they are dropped and the status becomes `error`; `partial` stays true.
 For a stopped run, a valid collect output is partial if it marks itself partial
 or contains data or files. A valid but empty collect output that does not itself
-mark partial gives `partial=false`, including a ScriptTool or PyTool with no
+mark partial gives `partial=false`, including a `ScriptTool` or `FunctionTool` with no
 valid `result.json`. Failed, timed-out, or invalid collection gives empty data,
 `partial=false`, and a note. Write partial results atomically so collection never
 sees half a JSON document:
@@ -397,8 +525,21 @@ result_path = os.environ["SWARM_ARENA_RESULT"]
 ```
 
 `env=["ANTHROPIC_API_KEY"]` allows that variable into the process; it names the
-variable and does not embed its value in the plan. The executor resolves the
-allowlist from its configured secrets file or environment.
+variable and does not embed its value in the plan. For custom connectors, use
+the public `Command.env` field:
+
+```python
+from swarm_arena.tool import Command
+
+command = Command(argv=["python", "problem/run.py"], env=["ANTHROPIC_API_KEY"])
+```
+
+The executor resolves each allowlisted name from its environment, falling back
+to its configured secrets file when the name is absent. Keep secret values out
+of command arguments, request parameters, and plans. A script receives only its
+allowlisted names plus the base environment and invocation variables; it can
+read a value with `os.environ["ANTHROPIC_API_KEY"]`. The script must also avoid
+printing secrets to its own logs.
 
 Edits are UTF-8 text replacements, including additions that match `editable`.
 Each edit is limited by `limits.max_edit_bytes`, default **262,144 bytes**.

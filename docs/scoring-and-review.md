@@ -1,6 +1,8 @@
 # Scoring and review
 
-Written in M1b.
+Script and function judges work locally today; see the
+[scoring API](api/scoring.md). Review workflows and model-based judges are
+planned for a later release.
 
 `Lexicographic` concatenates member keys in order, so each member must return
 keys of one fixed length within a candidate batch. Different members may use

@@ -18,7 +18,9 @@
 
 ## Status
 
-M1a (foundations): tools, checks, judges, `LocalExecutor`, and the `swarm_arena.testing` conformance kit work; plans, managers, and full runs arrive in M1b.
+Tools, checks, judges, `LocalExecutor`, and the `swarm_arena.testing` conformance
+kit work today. Plan orchestration, managers, and full swarm runs are planned
+for a later release.
 
 Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,
 replace `/path/to/agent-swarm` with the clone's absolute path and run:
@@ -90,7 +92,9 @@ if __name__ == "__main__":
 ```
 
 The conformance kit uses `LocalExecutor` by default. See
-[Writing a connector](docs/writing-a-connector.md) for checks and judges, or
+[Try your own scripts offline](docs/own-files.md#try-it-offline) for a runnable
+tool, check, and judge example, [Writing a connector](docs/writing-a-connector.md)
+for custom components, or
 [the end-to-end test](tests/e2e/test_single_run.py) for file edits, parent overlays,
 and lexicographic scoring with private judge data.
 
