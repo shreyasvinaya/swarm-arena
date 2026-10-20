@@ -2559,7 +2559,7 @@ requires-dist = [
     { name = "aiobotocore", marker = "extra == 's3'", specifier = ">=2.16.0" },
     { name = "anyio", specifier = ">=4.15,<5" },
     { name = "pydantic", specifier = ">=2.14.0,<3" },
-    { name = "s3fs", marker = "extra == 's3'", specifier = ">=2023.12.0" },
+    { name = "s3fs", marker = "extra == 's3'", specifier = ">=2023.12.1" },
     { name = "typing-extensions", specifier = ">=4.16.0" },
 ]
 provides-extras = ["s3"]
