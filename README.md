@@ -18,9 +18,29 @@
 
 ## Status
 
-Tools, checks, judges, `LocalExecutor`, and the `swarm_arena.testing` conformance
-kit work today. Plan orchestration, managers, and full swarm runs are planned
-for a later release.
+Full offline swarm runs, scripted managers, pruning, convergence, and resumable
+run journals work today, alongside tools, checks, judges, `LocalExecutor`, and the
+`swarm_arena.testing` conformance kit. Model-driven managers arrive with the
+`llm` extra (M3).
+
+## Quickstart
+
+From a source checkout (Python 3.11+, POSIX), run the Rosenbrock swarm without an
+API key or model provider:
+
+```sh
+uv sync --all-extras --all-groups
+uv run swarm-arena run --yes examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
+```
+
+Two teams compare gradient descent and random search over at most two rounds.
+The CLI prints an estimate, the run directory, and `done: rosenbrock 2 finalists`.
+Read `<run-dir>/goals/rosenbrock/solution.json` for the ordered results; run data
+stays under `.swarm-arena/`. See [Getting started](docs/getting-started.md) for the
+included source, plan, limits, Python API, and `status`/`stop`/`resume` commands,
+or the [example README](examples/rosenbrock/README.md) for a short walkthrough.
+
+## Test one connector
 
 Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,
 replace `/path/to/agent-swarm` with the clone's absolute path and run:

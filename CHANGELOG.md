@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Offline Rosenbrock swarm example with a Getting started guide and README quickstart.
+
 - `Swarm.resume` continues committed runs with auditable lease takeover,
   conservative lost-run accounting, restored round state, and repaired result views.
 

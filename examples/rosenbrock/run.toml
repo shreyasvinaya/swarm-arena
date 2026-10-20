@@ -1,0 +1,6 @@
+run_root = ".swarm-arena/runs"
+arena_root = ".swarm-arena/arena"
+artifact_root = ".swarm-arena/artifacts"
+
+[limits]
+max_rounds = 2
