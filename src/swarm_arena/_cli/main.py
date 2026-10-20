@@ -21,11 +21,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def _error_message(error: Exception) -> str:
     """Retain sanitized core diagnostics, hiding unforeseen exception values."""
-    if isinstance(error, (PlanError, ConfigError, StorageError, Fenced, LeaseHeld)):
-        return str(error) or type(error).__name__
     trace = error.__traceback__
     while trace is not None and trace.tb_next is not None:
         trace = trace.tb_next
+    origin = trace.tb_frame.f_globals.get("__name__", "") if trace is not None else ""
+    if (
+        isinstance(error, (PlanError, ConfigError, StorageError, Fenced, LeaseHeld))
+        and isinstance(origin, str)
+        and origin.startswith("swarm_arena._")
+    ):
+        return str(error) or type(error).__name__
     # These core producers sanitize their plain ValueError/RuntimeError messages.
     safe_producers = {
         "swarm_arena._engine.control",
@@ -35,11 +40,7 @@ def _error_message(error: Exception) -> str:
         "swarm_arena._budget.ledger",
         "swarm_arena._journal.lease",
     }
-    if (
-        type(error) in (ValueError, RuntimeError)
-        and trace is not None
-        and trace.tb_frame.f_globals.get("__name__") in safe_producers
-    ):
+    if type(error) in (ValueError, RuntimeError) and origin in safe_producers:
         return str(error) or type(error).__name__
     return type(error).__name__
 

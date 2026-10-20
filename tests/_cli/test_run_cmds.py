@@ -12,6 +12,7 @@ from swarm_arena import Plan, RunConfig, Swarm
 from swarm_arena._cli import run_cmds
 from swarm_arena._cli.main import main
 from swarm_arena._engine.solution import SolutionDocument
+from swarm_arena._errors import ConfigError, Fenced, PlanError
 from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import Estimate
@@ -354,6 +355,23 @@ def test_unforeseen_errors_hide_values(
         else [command, str(example.run_root / "r")]
     )
     assert main(argv) == 1
+    assert capsys.readouterr().err == f"{error_type.__name__}\n"
+
+
+@pytest.mark.parametrize("error_type", [ConfigError, Fenced, PlanError])
+def test_external_core_exception_classes_hide_values(
+    example: Example,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail(*args: object, **kwargs: object) -> None:
+        if error_type is PlanError:
+            raise PlanError(["CLI-SECRET-SENTINEL"])
+        raise error_type("CLI-SECRET-SENTINEL")
+
+    monkeypatch.setattr(Swarm, "run", fail)
+    assert main(["run", "--yes", str(example.run_toml), str(example.plan_toml)]) == 1
     assert capsys.readouterr().err == f"{error_type.__name__}\n"
 
 
