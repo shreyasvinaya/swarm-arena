@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Policy`, `KeepTopTeams`, `SuccessiveHalving`, `Patience`, and `Chain` provide
   configurable per-group pruning with starved-agent and last-team protection.
 - `Planner` ABC (`swarm_arena.planning`).
+- `Manager` ABC, `LimitReached`, and `RoundReport` (`swarm_arena.manager`).
 
 - `Decision`, `RoundState`, and `History` describe policy decisions and planning
   evidence, with ranking isolated by group, judge identity, and newest fidelity.

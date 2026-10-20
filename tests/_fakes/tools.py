@@ -12,6 +12,7 @@ from typing import Any, ClassVar, cast
 from pydantic import BaseModel, ConfigDict
 
 from swarm_arena import Goal
+from swarm_arena._agent.context import AgentContext
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
@@ -30,6 +31,7 @@ from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Action, Tool
+from swarm_arena.manager import Manager, RoundReport
 
 
 class Widget(Configurable):
@@ -699,3 +701,19 @@ class ResultJudge(Judge):
         out = await ctx.execute(Command(argv=["python", "-c", self.config.code]))
         value = out.data["value"]
         return [Score.maximize(value).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+
+class NoopManager(Manager):
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        models: list[str] = []
+
+    @property
+    def config(self) -> Config:
+        return cast(NoopManager.Config, super().config)
+
+    def models(self) -> tuple[str, ...]:
+        return tuple(self.config.models)
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        return RoundReport()

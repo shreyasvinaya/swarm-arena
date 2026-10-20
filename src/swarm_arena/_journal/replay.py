@@ -378,3 +378,38 @@ def _reset_converge() -> dict[str, Any]:
         "final_parts": None,
         "counters": {},
     }
+
+
+def continues_on_resume(state: RunState, goal_id: str, limits: Limits) -> bool:
+    """
+    Check whether a stopped goal has another ordinary round to run.
+
+    Parameters
+    ----------
+    state : RunState
+        Committed state before the resume's limits_changed event.
+    goal_id : str
+        Goal whose latest lifecycle and plan revision are inspected.
+    limits : Limits
+        Limits requested for the resumed run.
+
+    Returns
+    -------
+    bool
+        True for a stopped goal with rounds left after an explicit stop or a
+        limits change. Finished and no-result goals do not continue.
+
+    Examples
+    --------
+    >>> continues_on_resume(RunState(), "absent", Limits())
+    False
+    """
+    goal = state.goals.get(goal_id)
+    revisions = state.plans.get(goal_id)
+    return bool(
+        goal is not None
+        and revisions
+        and goal.status == "stopped"
+        and goal.rounds_closed < revisions[-1][0].rounds_total(limits)
+        and (goal.end_reason in {"stop", "stop --now"} or limits != state.config.limits)
+    )

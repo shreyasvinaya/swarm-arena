@@ -282,3 +282,22 @@ class History(FrozenModel):
     budget_left: Estimate
     rounds_done: int
     join_failures: list[str] = []
+
+
+class RoundReport(FrozenModel):
+    """
+    Record a manager's summary of its completed round.
+
+    Parameters
+    ----------
+    summary : str, default=""
+        Human-readable account of the round's work.
+
+    Examples
+    --------
+    >>> from swarm_arena.manager import RoundReport
+    >>> RoundReport(summary="Completed the search").summary
+    'Completed the search'
+    """
+
+    summary: str = ""

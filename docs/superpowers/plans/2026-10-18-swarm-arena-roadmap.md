@@ -1759,6 +1759,8 @@ class Reservation(FrozenModel):
     keep_charged: bool = False                       # gateway tool runs (M4)
 
 class Ledger:
+    @property
+    def limits(self) -> Limits: ...                  # current limits, read-only
     # Holder pools [plan]: agent -> its round share; <goal>/:judges, :planner, :curator -> the reserve left after the
     # final slices, then the goal's pool; <goal>/:final -> the goal's final slice, then the reserve left after the final
     # slices, then the goal's pool (converge and the final judge run from the reserve, §6.4, §6.5); ":run" -> the reserve.
