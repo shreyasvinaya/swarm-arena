@@ -21,6 +21,25 @@ def test_changelog_describes_one_initial_release() -> None:
     assert "swarm_arena._" not in text
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "heading"),
+    [("README.md", "Quickstart"), ("docs/getting-started.md", "Install")],
+)
+def test_quickstarts_distinguish_release_and_source_installs(
+    relative_path: str, heading: str
+) -> None:
+    text = (ROOT / relative_path).read_text()
+    section = text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
+    release, prerelease = section.split("Before the first release", 1)
+    assert "For releases" in release
+    assert "```sh\nuv add swarm-arena\n```" in release
+    assert 'uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"' in prerelease
+    assert (
+        "git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync"
+        in prerelease
+    )
+
+
 @pytest.mark.parametrize("path", GUIDES, ids=lambda path: path.name)
 def test_guides_use_public_interfaces_without_stub_markers(path: Path) -> None:
     text = path.read_text()

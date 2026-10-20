@@ -25,6 +25,28 @@ run journals work today, alongside tools, checks, judges, `LocalExecutor`, and t
 
 ## Quickstart
 
+For releases, install the package in a uv project:
+
+```sh
+uv add swarm-arena
+```
+
+**Before the first release**, the PyPI package is a name-reservation placeholder
+without this CLI or API. Install the development source instead:
+
+```sh
+uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"
+```
+
+Contributors can clone the source and set up its environment:
+
+```sh
+git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync
+```
+
+This quickstart needs `Swarm` and the `run` CLI. Until those reach GitHub's default
+branch, use a development checkout containing them.
+
 From a source checkout (Python 3.11+, POSIX), run the Rosenbrock swarm without an
 API key or model provider:
 

@@ -16,11 +16,27 @@ scripted managers. It needs no API key or model provider.
 
 ## Install
 
-Use Python 3.11 or newer on POSIX. In a uv project, install the package with:
+Use Python 3.11 or newer on POSIX. For releases, install the package in a uv project:
 
 ```sh
 uv add swarm-arena
 ```
+
+**Before the first release**, the PyPI package is a name-reservation placeholder
+without this CLI or API. Install the development source instead:
+
+```sh
+uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"
+```
+
+Contributors can clone the source and set up its environment:
+
+```sh
+git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync
+```
+
+This quickstart needs `Swarm` and the `run` CLI. Until those reach GitHub's default
+branch, use a development checkout containing them.
 
 To run the bundled example from a source checkout, use these two commands in the
 repository root:
