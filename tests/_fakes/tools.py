@@ -37,6 +37,7 @@ from swarm_arena._tooling.function_tool import FunctionTool
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Action, Tool
 from swarm_arena.manager import Manager, RoundReport
+from swarm_arena.planning import Decision, Policy, RoundState
 
 
 class Widget(Configurable):
@@ -1220,3 +1221,187 @@ class ReportRefusalManager(Manager):
                 return RoundReport(summary="request refused")
             evidence.append(candidate.id)
         return RoundReport(summary="both requests admitted")
+
+
+def sleepy(seconds: float, marker: str) -> dict[str, float]:
+    """
+    Publish process identity atomically and sleep only on the first invocation.
+
+    Parameters
+    ----------
+    seconds : float
+        Maximum first-invocation delay in seconds. A sibling ``.release`` file
+        ends the wait early so lifecycle tests can release committed work.
+    marker : str
+        Absolute path to the PID/PGID JSON marker. An existing marker skips sleep.
+
+    Returns
+    -------
+    dict[str, float]
+        Judgeable value data.
+
+    Examples
+    --------
+    >>> sleepy(0.0, "/tmp/sleepy-example.json")  # doctest: +SKIP
+    {'value': 1.0}
+    """
+    path = Path(marker)
+    if not path.exists():
+        pending = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        pending.write_text(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0)}))
+        pending.replace(path)
+        deadline = time.monotonic() + seconds
+        release = path.with_suffix(".release")
+        while not release.exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.02))
+    return {"value": 1.0}
+
+
+def _wait_preparation_marker(path: Path) -> None:
+    """Bound every file barrier so failed tests cannot strand a daemon forever."""
+    deadline = time.monotonic() + 60
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("preparation barrier timed out")
+        time.sleep(0.02)
+
+
+class BlockedPreparationTool(Tool):
+    """
+    Block command preparation until a file releases the executor-owned daemon.
+
+    Examples
+    --------
+    >>> BlockedPreparationTool({"root": "/tmp/probe"}).name
+    'blocked-preparation'
+    """
+
+    name = "blocked-preparation"
+    description = "Coordinate pre-launch cancellation through files."
+    input_model = PyInputs
+
+    class Config(BaseModel):
+        """
+        Locate coordination files for one isolated test.
+
+        Parameters
+        ----------
+        root : str
+            Directory containing entered, release, returned and launch markers.
+
+        Examples
+        --------
+        >>> BlockedPreparationTool.Config(root="/tmp/probe").root
+        '/tmp/probe'
+        """
+
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        root: str
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        """
+        Return a launch-marker command after the preparation release signal.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation being prepared.
+        workspace : Path
+            Executor-owned directory, retained while this callback is blocked.
+
+        Returns
+        -------
+        Command
+            A command that must never launch after cancellation.
+
+        Examples
+        --------
+        >>> tool.command(ToolRequest(), workspace)  # doctest: +SKIP
+        """
+        root = Path(cast(BlockedPreparationTool.Config, self.config).root)
+        entered = root / "preparation-entered.json"
+        pending = root / ".preparation-entered.tmp"
+        pending.write_text(json.dumps(str(workspace)))
+        pending.replace(entered)
+        _wait_preparation_marker(root / "preparation-release")
+        (workspace / "late-write").write_text("retained")
+        command = Command(
+            argv=[
+                "python",
+                "-c",
+                f"from pathlib import Path; Path({str(root / 'late-launch')!r}).touch()",
+            ]
+        )
+        (root / "preparation-returned").touch()
+        return command
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        """
+        Supply value data if an uncancelled invocation finishes.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation being collected.
+        workspace : Path
+            Executor workspace.
+        run : CompletedRun
+            Process outcome.
+
+        Returns
+        -------
+        ToolOutput
+            Judgeable output with the actual process status.
+
+        Examples
+        --------
+        >>> from datetime import UTC, datetime
+        >>> now = datetime(2026, 1, 1, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status=RunStatus.OK,
+        ...     stdout_path=Path('stdout'), stderr_path=Path('stderr'),
+        ...     started_at=now, ended_at=now)
+        >>> tool = BlockedPreparationTool({"root": "/tmp/probe"})
+        >>> tool.collect(ToolRequest(), Path('.'), run).data
+        {'value': 1.0}
+        """
+        return ToolOutput(status=run.status, data={"value": 1.0})
+
+
+class PreparationBarrierPolicy(Policy):
+    """
+    Keep the CLI alive after settlement while abandoned preparation returns.
+
+    Examples
+    --------
+    >>> PreparationBarrierPolicy({"root": "/tmp/probe"}).config.root
+    '/tmp/probe'
+    """
+
+    Config = BlockedPreparationTool.Config
+
+    def after_round(self, state: RoundState) -> Decision:
+        """
+        Wait for explicit release after the first round, then retain all agents.
+
+        Parameters
+        ----------
+        state : RoundState
+            Current round's committed candidate evidence.
+
+        Returns
+        -------
+        Decision
+            An empty pruning decision.
+
+        Examples
+        --------
+        >>> policy.after_round(state)  # doctest: +SKIP
+        """
+        if state.round == 1:
+            root = Path(cast(BlockedPreparationTool.Config, self.config).root)
+            (root / "barrier-entered").touch()
+            _wait_preparation_marker(root / "barrier-release")
+        return Decision()
