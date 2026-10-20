@@ -69,7 +69,13 @@ async def _run_and_store(rt: AgentRuntime, env: RtEnv) -> None:
 
 async def test_happy_path_event_order_and_logs(rt_env: RtEnv) -> None:
     cand = await execute_tool_run(rt_env.rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
-    assert rt_env.types_after_start() == ["reserve", "tool_start", "tool_end", "settle"]
+    assert rt_env.types_after_start() == [
+        "agent_counters",
+        "reserve",
+        "tool_start",
+        "tool_end",
+        "settle",
+    ]
     assert cand.output.status == RunStatus.OK
     assert cand.tool_identity
     assert cand.fidelity == rt_env.rt.fidelity
@@ -701,7 +707,13 @@ async def test_collect_exception_still_completes_and_settles(rt_env: RtEnv) -> N
     candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
     assert candidate.output.status == RunStatus.ERROR
     assert rt_env.reservation_state(candidate) == "settled"
-    assert rt_env.types_after_start() == ["reserve", "tool_start", "tool_end", "settle"]
+    assert rt_env.types_after_start() == [
+        "agent_counters",
+        "reserve",
+        "tool_start",
+        "tool_end",
+        "settle",
+    ]
 
 
 async def test_nondeterministic_run_limit_releases_pending_index(rt_env: RtEnv) -> None:

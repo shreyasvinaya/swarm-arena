@@ -9,7 +9,7 @@ from fractions import Fraction
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import anyio
@@ -47,6 +47,9 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+if TYPE_CHECKING:
+    from swarm_arena._engine.resume import ResumeState
 
 
 def _require_asyncio() -> None:
@@ -155,6 +158,28 @@ def _has_fenced(error: BaseException) -> bool:
     )
 
 
+async def _start_executor(config: RunConfig) -> Executor:
+    """Construct an executor within the shared user-code diagnostic boundary."""
+    try:
+        return await run_sync_daemon(_build_executor, config)
+    except Exception as exc:
+        if _has_fenced(exc):
+            raise
+        raise RuntimeError(f"executor construction failed: {type(exc).__name__}") from None
+
+
+async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool) -> None:
+    """Bound shielded shutdown while preserving an already-raised exception."""
+    with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
+        try:
+            await executor.aclose()
+        except Exception as exc:
+            if not failed and not shutdown.cancel_called:
+                if _has_fenced(exc):
+                    raise Fenced() from None
+                raise RuntimeError(f"executor shutdown failed: {type(exc).__name__}") from None
+
+
 def _promote(stage: Path, artifacts: ArtifactStore) -> None:
     staged = ArtifactStore(LocalStore(stage))
     for path in stage.iterdir():
@@ -177,6 +202,8 @@ class RunRunner:
         Async numeric estimate and warning approval callback.
     replanner : Planner or None
         Optional live revision producer shared by the goals.
+    resumed : ResumeState or None, default=None
+        Private prepared-service carrier returned by resume_run.
 
     Examples
     --------
@@ -193,10 +220,13 @@ class RunRunner:
         run_id: str | None,
         approve: Callable[[Estimate, Sequence[str]], Awaitable[bool]] | None,
         replanner: Planner | None,
+        resumed: "ResumeState | None" = None,
     ) -> None:
         self.config, self.plans = config, list(plans)
         self.run_id, self.approve, self.replanner = run_id, approve, replanner
         self._stop_mode = 0
+        self.resumed = resumed
+        self._used = False
 
     async def run(self) -> dict[str, list[Candidate]]:
         """
@@ -231,6 +261,22 @@ class RunRunner:
         {}
         """
         _require_asyncio()
+        if self.resumed is not None:
+            services = self.resumed._services
+            if services.closed or self._used:
+                raise RuntimeError("resumed runner is closed or already used")
+            self._used = True
+            assert services.deps is not None
+            failed = False
+            try:
+                return await self._drive(services.deps, self.resumed.epoch)
+            except BaseException as error:
+                failed = True
+                if _has_fenced(error):
+                    raise Fenced() from None
+                raise
+            finally:
+                await services._aclose(failed=failed)
         seen: set[str] = set()
         for plan in self.plans:
             if plan.goal.id in seen:
@@ -265,14 +311,7 @@ class RunRunner:
                 total = sum(slices.values(), Amount())
                 if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
                     raise RuntimeError("reserve cannot hold the final slices")
-                try:
-                    executor = await run_sync_daemon(_build_executor, self.config)
-                except Exception as exc:
-                    if _has_fenced(exc):
-                        raise
-                    raise RuntimeError(
-                        f"executor construction failed: {type(exc).__name__}"
-                    ) from None
+                executor = await _start_executor(self.config)
                 try:
                     capacity = await executor.capacity()
                     invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
@@ -311,16 +350,7 @@ class RunRunner:
             raise
         finally:
             if executor is not None:
-                with anyio.move_on_after(self.config.settle_timeout_s, shield=True) as shutdown:
-                    try:
-                        await executor.aclose()
-                    except Exception as exc:
-                        if not failed and not shutdown.cancel_called:
-                            if _has_fenced(exc):
-                                raise Fenced() from None
-                            raise RuntimeError(
-                                f"executor shutdown failed: {type(exc).__name__}"
-                            ) from None
+                await _close_executor(executor, self.config, failed=failed)
 
     async def _execute(
         self,
@@ -428,21 +458,37 @@ class RunRunner:
                     clock=RunClock(0),
                     admission=RunAdmission(config.limits.max_agents_total),
                 )
-                result: dict[str, list[Candidate]] = {}
-                with anyio.CancelScope() as scope:
-                    async with anyio.create_task_group() as watchers:
-                        watchers.start_soon(watch_stop_files, store, lease.doc.epoch, deps.stops)
-                        watchers.start_soon(self._watch_clock, deps)
-                        watchers.start_soon(self._watch_fence, journal, scope)
-                        result = await self._queue(deps)
-                        await self._record_stops(deps)
-                        watchers.cancel_scope.cancel()
-                if journal.fenced.is_set():
-                    raise Fenced()
-                return result
+                return await self._drive(deps, lease.doc.epoch)
             finally:
                 with anyio.CancelScope(shield=True):
                     await anyio.to_thread.run_sync(board.close)
+
+    async def aclose(self) -> None:
+        """
+        Release a prepared resume's writer, lease, board and executor once.
+
+        Examples
+        --------
+        >>> runner = RunRunner(RunConfig(), [], run_id=None, approve=None, replanner=None)
+        >>> import anyio
+        >>> anyio.run(runner.aclose)
+        """
+        if self.resumed is not None:
+            await self.resumed._services._aclose()
+
+    async def _drive(self, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
+        result: dict[str, list[Candidate]] = {}
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as watchers:
+                watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
+                watchers.start_soon(self._watch_clock, deps)
+                watchers.start_soon(self._watch_fence, deps.journal, scope)
+                result = await self._queue(deps)
+                await self._record_stops(deps)
+                watchers.cancel_scope.cancel()
+        if deps.journal.fenced.is_set():
+            raise Fenced()
+        return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
         await anyio.sleep(deps.clock.left(deps.config.limits.run_timeout_s))
@@ -467,14 +513,15 @@ class RunRunner:
         deps.journal.append(
             EventDraft(type=EventType.GOAL_FINISHED, goal_id=goal_id, payload={"reason": "stopped"})
         )
-        head = await deps.journal.commit()
+        with anyio.CancelScope(shield=True):
+            head = await deps.journal.commit()
+            await deps.ledger.end_goal(goal_id)
         assert head is not None
         chain = await anyio.to_thread.run_sync(read_chain, deps.store, head)
         state = RunState.from_events(e for _, events in chain for e in events)
         await deps.views.write(
             f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head
         )
-        await deps.ledger.end_goal(goal_id)
 
     def _stopping(self, deps: EngineDeps) -> bool:
         """Recheck live run limits at every goal admission boundary."""
@@ -489,12 +536,35 @@ class RunRunner:
         )
 
     async def _queue(self, deps: EngineDeps) -> dict[str, list[Candidate]]:
+        state = self.resumed.state if self.resumed is not None else None
+        order = (
+            self.resumed._services.order
+            if self.resumed is not None
+            else [p.goal.id for p in self.plans]
+        )
+        plans = {p.goal.id: p for p in self.plans}
         queued = [
-            GoalRunner(deps, goal_id=p.goal.id, plan=p, replanner=self.replanner, journal_r0=False)
-            for p in self.plans
+            GoalRunner(
+                deps,
+                goal_id=g,
+                plan=plans[g],
+                replanner=self.replanner,
+                state=state.goals[g] if state is not None else None,
+                journal_r0=False,
+            )
+            for g in order
         ]
         active: dict[str, GoalRunner] = {}
         results: dict[str, list[Candidate]] = {}
+        if state is not None:
+            head = deps.journal.head
+            assert head is not None
+            for g, goal in state.goals.items():
+                if g not in order:
+                    results[g] = [state.candidates[id] for id in goal.final_order]
+                    await deps.views.write(
+                        f"goals/{g}/solution.json", solution_view(state, g, head), source=head
+                    )
         assert deps.admission is not None
 
         async def run_goal(runner: GoalRunner) -> None:
@@ -506,13 +576,16 @@ class RunRunner:
             while queued or active:
                 await self._record_stops(deps)
                 if self._stopping(deps):
-                    for runner in queued:
+                    for runner in list(queued):
+                        if state is not None and state.goals[runner.goal_id].status != "queued":
+                            continue
                         await self._queued_result(deps, runner.goal_id)
                         results[runner.goal_id] = []
-                    queued.clear()
+                        queued.remove(runner)
                 while queued and len(active) < deps.config.limits.max_concurrent_goals:
                     runner = queued[0]
-                    if self._stopping(deps):
+                    fresh = state is None or state.goals[runner.goal_id].status == "queued"
+                    if self._stopping(deps) and fresh:
                         break
                     if (
                         sum(g.active_agents() for g in active.values()) + runner.active_agents()
@@ -524,14 +597,15 @@ class RunRunner:
                     except PlanError:
                         # A revision may have reserved a larger peak during publication.
                         break
-                    if self._stopping(deps):
+                    if self._stopping(deps) and fresh:
                         await deps.admission.release(runner.goal_id)
                         break
                     queued.pop(0)
-                    deps.ledger.open_goal(runner.goal_id)
-                    await deps.journal.append_durable(
-                        EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
-                    )
+                    if fresh:
+                        deps.ledger.open_goal(runner.goal_id)
+                        await deps.journal.append_durable(
+                            EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
+                        )
                     active[runner.goal_id] = runner
                     goals.start_soon(run_goal, runner)
                 if queued or active:

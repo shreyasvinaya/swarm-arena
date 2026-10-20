@@ -16,7 +16,7 @@ from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _r
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._journal.a2a import task_to_json, tool_run_task
+from swarm_arena._journal.a2a import agent_task_id, task_to_json, tool_run_task
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
@@ -473,6 +473,15 @@ async def execute_tool_run(
                 LimitReached("max_tool_runs_per_round", "tool runs used up for this round")
             )
         rt.counters.tool_runs += 1
+        rt.journal.append(
+            _draft(
+                rt,
+                EventType.AGENT_COUNTERS,
+                turns=rt.counters.turns,
+                board_reads=rt.counters.board_reads,
+                tool_runs=rt.counters.tool_runs,
+            ).model_copy(update={"task_id": agent_task_id(rt.address, rt.round)})
+        )
         return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
     finally:
         if index is not None:

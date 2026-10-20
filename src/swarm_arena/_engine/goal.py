@@ -26,7 +26,7 @@ from swarm_arena._engine.solution import solution_view
 from swarm_arena._errors import Fenced, PlanError
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
-from swarm_arena._journal.event import EventDraft, EventType
+from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import GoalState, RunState
 from swarm_arena._model.base import CallRole
@@ -175,15 +175,19 @@ class GoalRunner:
         self.repeat_entries: list[tuple[str, Candidate]] = []
         self.agents: list[AgentSlot] = []
         self.recorded = RunState()
+        self._events: list[Event] = []
         self.status: Literal["finished", "stopped", "no_result"] = "finished"
         self.reason: str | None = None
         self.final_parts: dict[str, str | None] | None = None
         self._resumed: dict[str, list[tuple[str, Candidate]]] = {}
         self._frontier = (
-            self.state.frontiers.get(self.state.round)
+            self.state.frontiers.get(self.state.converge_round)
+            if self.state.converge_round is not None
+            else self.state.frontiers.get(self.state.round)
             if (self.state.round > self.state.rounds_closed)
             else None
         )
+        self._recovering_converge = self.state.converge_round is not None
         self._decisions = list(self.state.decisions)
 
     def active_agents(self) -> int:
@@ -227,7 +231,8 @@ class GoalRunner:
         head = await self.deps.journal.commit()
         if head is not None:
             chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, head)
-            self.recorded = RunState.from_events(event for _, events in chain for event in events)
+            self._events = [event for _, events in chain for event in events]
+            self.recorded = RunState.from_events(self._events)
 
     async def _plan_view(self) -> None:
         head = self.deps.journal.head
@@ -263,18 +268,72 @@ class GoalRunner:
                         goal_key=goal.key(),
                         part=team.part,
                         notes=old.notes if old else self.state.notes.get(key, ""),
-                        watchdog=old.watchdog if old else Watchdog(self.deps.config.limits),
+                        watchdog=old.watchdog if old else self._restore_watchdog(key),
                         status=old.status
                         if old
                         else self.state.agents.get(key, AgentStatus.ACTIVE),
                     )
                 )
+        if self._recovering_converge and self.plan.converge.team in teams:
+            self._recovering_converge = False
         board = self.deps.board
         if isinstance(board, RunBoard):
             board.register_goal(self.plan.goal.key(), self.goal_id, None)
             for part in self.plan.parts:
                 board.register_goal(part.goal.key(), self.goal_id, part.name)
         return slots
+
+    def _restore_watchdog(self, key: str) -> Watchdog:
+        watchdog = Watchdog(self.deps.config.limits)
+        started: set[int] = set()
+        for event in self._events:
+            if event.goal_id != self.goal_id:
+                continue
+            if f"{event.team}/{event.agent}" == key:
+                if event.type == EventType.TOOL_START:
+                    started.add(event.round)
+                elif event.type == EventType.TOOL_END:
+                    candidate = self.recorded.candidates[event.payload["candidate"]["id"]]
+                    watchdog.record_run(
+                        candidate.output.status,
+                        passed=candidate.output.status == RunStatus.OK and not candidate.gated_out,
+                    )
+                elif event.type == EventType.WATCHDOG and "refused" in event.payload:
+                    watchdog.record_refusal()
+            if event.type == EventType.ROUND_CLOSED:
+                watchdog.end_round(ran=event.payload.get("round", event.round) in started)
+        return watchdog
+
+    async def _finish_recovered(self) -> GoalOutcome:
+        """Finish a committed selection without repeating agents or final judges."""
+        goal = self.recorded.goals[self.goal_id]
+        reason = goal.end_reason or goal.no_result_reason
+        if reason is None and self.recorded.stop != "none":
+            reason = "stop --now" if self.recorded.stop == "stop-now" else "stop"
+        with anyio.CancelScope(shield=True):
+            self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=reason))
+            await self.deps.journal.commit()
+            await self.deps.ledger.end_goal(self.goal_id)
+        await self._refresh()
+        head = self.deps.journal.head
+        assert head is not None
+        await self.deps.views.write(
+            f"goals/{self.goal_id}/solution.json",
+            solution_view(self.recorded, self.goal_id, head),
+            source=head,
+        )
+        await self.admission.release(self.goal_id)
+        goal = self.recorded.goals[self.goal_id]
+        return GoalOutcome(
+            self.goal_id,
+            "no_result"
+            if goal.status == "no_result"
+            else "stopped"
+            if goal.status == "stopped"
+            else "finished",
+            [self.recorded.candidates[id] for id in goal.final_order],
+            reason,
+        )
 
     def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
         seen = {candidate.id for _, candidate in self.repeat_entries}
@@ -313,8 +372,19 @@ class GoalRunner:
 
     def _round_state(self) -> RoundState:
         candidates = [c for c in self.recorded.candidates.values() if c.goal_id == self.goal_id]
+        boundary: tuple[int, int] | None = None
+        if self._recovering_converge and self._frontier is not None:
+            # Selection and assigned parents must use the original converge snapshot.
+            mark = next((m for m in self._frontier.marks if m.run_id == self.deps.run_id), None)
+            boundary = (mark.epoch, mark.seq) if mark is not None else (0, 0)
+            candidates = [c for c in candidates if self.recorded.positions[c.id] <= boundary]
         by_id = {c.id: c for c in candidates}
-        scores = [s for s in self.recorded.scores.values() if s.candidate_id in by_id]
+        scores = [
+            s
+            for s in self.recorded.scores.values()
+            if s.candidate_id in by_id
+            and (boundary is None or self.recorded.positions[s.id] <= boundary)
+        ]
         identities: dict[str | None, tuple[str, str, str]] = {}
         for score in scores:
             part = by_id[score.candidate_id].part
@@ -888,11 +958,14 @@ class GoalRunner:
             await self.deps.journal.commit()
             await self._plan_view()
         await self._refresh()
+        if self.state.selection_recorded and not self.state.finished:
+            return await self._finish_recovered()
         if not self.history:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
         self._restore_repeats()
         self.agents = await self._slots(self.plan.teams, reuse=False)
-        await self._run_rounds()
+        if not self.state.converge_started:
+            await self._run_rounds()
         finalists: list[Candidate] = []
         if self.status != "no_result":
             self._stop()

@@ -86,7 +86,11 @@ class GoalState(FrozenModel):
     converge_round : int or None, default=None
         Converge-team round to resume, separate from the ordinary round.
     counters : dict[str, dict[str, int]], default={}
-        Latest turns and board_reads per team/agent in the current round.
+        Latest turns, board_reads and admitted tool_runs in the current round.
+    finished : bool, default=False
+        Whether this lifecycle has a committed goal_finished event.
+    selection_recorded : bool, default=False
+        Whether final_order or no_result has committed in this lifecycle.
 
     Examples
     --------
@@ -94,6 +98,8 @@ class GoalState(FrozenModel):
     'queued'
     """
 
+    finished: bool = False
+    selection_recorded: bool = False
     status: Literal["queued", "running", "finished", "stopped", "no_result"] = "queued"
     round: int = 0
     rounds_closed: int = 0
@@ -322,6 +328,7 @@ class RunState:
                 updates["status"] = "queued"
             case EventType.GOAL_STARTED:
                 updates["status"] = "running"
+                updates["finished"] = False
                 if event.goal_id in self._finished_goals:
                     updates.update(_reset_converge())
                     updates.update(kept_parts={}, join_attempts=0, join_failures=[])
@@ -329,11 +336,13 @@ class RunState:
                     self._finished_goals.remove(event.goal_id)
             case EventType.GOAL_FINISHED:
                 reason = payload.get("reason")
+                updates["finished"] = True
                 updates["end_reason"] = reason
                 if goal.status != "no_result":
                     updates["status"] = "stopped" if reason in STOP_REASONS else "finished"
                 self._finished_goals.add(event.goal_id)
             case EventType.NO_RESULT:
+                updates["selection_recorded"] = True
                 updates["status"] = "no_result"
                 updates["no_result_reason"] = payload.get("reason")
             case EventType.ROUND_STARTED:
@@ -357,7 +366,12 @@ class RunState:
             case EventType.AGENT_COUNTERS:
                 updates["counters"] = {
                     **goal.counters,
-                    address: {"turns": payload["turns"], "board_reads": payload["board_reads"]},
+                    address: {
+                        **goal.counters.get(address, {}),
+                        "turns": payload["turns"],
+                        "board_reads": payload["board_reads"],
+                        **({"tool_runs": payload["tool_runs"]} if "tool_runs" in payload else {}),
+                    },
                 }
             case EventType.NOTES_SAVED:
                 updates["notes"] = {**goal.notes, address: payload["text"]}
@@ -380,6 +394,7 @@ class RunState:
             case EventType.RESERVE_EXHAUSTED:
                 updates["select_only"] = True
             case EventType.FINAL_ORDER:
+                updates["selection_recorded"] = True
                 updates["final_order"] = payload["candidate_ids"]
                 updates["final_parts"] = payload["parts"]
         if updates:
@@ -404,6 +419,7 @@ class RunState:
 def _reset_converge() -> dict[str, Any]:
     """Start a fresh ordinary round or continued lifecycle."""
     return {
+        "selection_recorded": False,
         "no_result_reason": None,
         "converge_started": False,
         "converge_round": None,

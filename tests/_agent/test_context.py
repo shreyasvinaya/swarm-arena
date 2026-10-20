@@ -913,6 +913,7 @@ async def test_escaped_action_lifetime_is_revoked(
     assert state.goals["g"].counters["t/a"] == {
         "turns": rt.counters.turns,
         "board_reads": rt.counters.board_reads,
+        **({"tool_runs": rt.counters.tool_runs} if available and operation == "paid" else {}),
     }
     assert Ledger.replay(state, journal=rt.journal, ids=rt.ids).remaining(
         rt.holder

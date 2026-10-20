@@ -29,6 +29,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
@@ -363,6 +364,7 @@ class RoundRunner:
         self.frontier, self.converge = frontier, converge
         self.seed_parents = tuple(dict.fromkeys(seed_parents)) if converge else ()
         self.started_runs = dict(started_runs)
+        self._counters: dict[str, dict[str, int]] = {}
 
     def _refresh_budget(self) -> None:
         if self.deps.ledger.run_exhausted():
@@ -472,7 +474,7 @@ class RoundRunner:
                 ),
             ),
             limits=deps.config.limits,
-            counters=AgentCounters(),
+            counters=AgentCounters(**self._counters.get(key, {})),
             repeats=RepeatIndex(deps.run_id, [*self.repeat_entries, *pairs]),
             watchdog=slot.watchdog,
             journal=deps.journal,
@@ -621,6 +623,96 @@ class RoundRunner:
                 wake_at = min(wake_at, cancel_until + BEFORE_KILL_TIMEOUT_S)
             await anyio.sleep_until(wake_at)
 
+    async def _restore(self, round: int) -> None:
+        """Recover only the latest matching round's committed action allowance."""
+        if (self.frontier is None and not self.converge) or self.deps.journal.head is None:
+            return
+        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        events = [event for _, batch in chain for event in batch]
+        if self.converge and self.frontier is None:
+            state = RunState.from_events(events)
+            goal = state.goals[self.goal_id]
+            starts = [
+                e
+                for e in events
+                if e.goal_id == self.goal_id
+                and e.type == EventType.ROUND_STARTED
+                and e.payload.get("converge", False)
+                and e.payload["round"] == round
+            ]
+            if (
+                goal.converge_round != round
+                or goal.selection_recorded
+                or not starts
+                or starts[-1].epoch == self.deps.journal.epoch
+                or any(
+                    e.goal_id == self.goal_id
+                    and e.type == EventType.JOIN_FAILED
+                    and e.seq > starts[-1].seq
+                    for e in events
+                )
+            ):
+                return
+            self.frontier = goal.frontiers[round]
+            mark = next((m for m in self.frontier.marks if m.run_id == self.deps.run_id), None)
+            boundary = (mark.epoch, mark.seq) if mark is not None else (0, 0)
+            self.repeat_entries = tuple(
+                pair for pair in self.repeat_entries if state.positions[pair[1].id] <= boundary
+            )
+            recovered: dict[str, list[tuple[str, Candidate]]] = {}
+            for candidate in state.candidates.values():
+                if (
+                    candidate.goal_id == self.goal_id
+                    and candidate.round == round
+                    and state.positions[candidate.id] > boundary
+                ):
+                    key = goal.repeat_keys.get(candidate.id)
+                    if key is not None:
+                        recovered.setdefault(f"{candidate.team}/{candidate.agent}", []).append(
+                            (key, candidate)
+                        )
+            self.resumed = {key: tuple(pairs) for key, pairs in recovered.items()}
+        start = max(
+            (
+                e.seq
+                for e in events
+                if e.goal_id == self.goal_id
+                and e.type == EventType.ROUND_STARTED
+                and e.payload["round"] == round
+                and bool(e.payload.get("converge", False)) == self.converge
+            ),
+            default=0,
+        )
+        admitted: dict[str, set[str]] = {}
+        started: dict[str, set[str]] = {}
+        for event in events:
+            if event.seq <= start or event.goal_id != self.goal_id or event.round != round:
+                continue
+            key = f"{event.team}/{event.agent}"
+            counters = self._counters.setdefault(key, {})
+            if event.type == EventType.AGENT_COUNTERS:
+                counters.update(
+                    {
+                        name: event.payload[name]
+                        for name in ("turns", "board_reads", "tool_runs")
+                        if name in event.payload
+                    }
+                )
+            elif event.type == EventType.LEARNING:
+                counters["learnings"] = counters.get("learnings", 0) + 1
+            elif event.type in {EventType.TOOL_START, EventType.RUN_LOST, EventType.TOOL_END}:
+                id = (
+                    event.payload["candidate"]["id"]
+                    if event.type == EventType.TOOL_END
+                    else event.payload["candidate_id"]
+                )
+                admitted.setdefault(key, set()).add(id)
+                if event.type == EventType.TOOL_START:
+                    started.setdefault(key, set()).add(id)
+        for key, ids in admitted.items():
+            self._counters[key].setdefault("tool_runs", len(ids))
+        self.started_runs = {**{key: len(ids) for key, ids in started.items()}, **self.started_runs}
+
     async def run(self, round: int) -> RoundOutcome:
         """
         Commit the frontier, run managers concurrently, and settle their tranches.
@@ -644,6 +736,7 @@ class RoundRunner:
         --------
         >>> outcome = await runner.run(1)  # doctest: +SKIP
         """
+        await self._restore(round)
         agents = [
             slot
             for slot in self.agents
@@ -661,21 +754,6 @@ class RoundRunner:
             self.deps.config.limits.effective_round_timeout_s(),
             self.deps.clock.left(self.deps.config.limits.run_timeout_s),
         )
-        if self.frontier is not None and self.deps.journal.head is not None:
-            chain = await anyio.to_thread.run_sync(
-                read_chain, self.deps.store, self.deps.journal.head
-            )
-            restored: dict[str, int] = {}
-            for _, events in chain:
-                for event in events:
-                    if (
-                        event.type == EventType.TOOL_START
-                        and event.goal_id == self.goal_id
-                        and event.round == round
-                    ):
-                        key = f"{event.team}/{event.agent}"
-                        restored[key] = restored.get(key, 0) + 1
-            self.started_runs = {**restored, **self.started_runs}
         private_paths = judge_private_paths(self.plan)
         parents = await self._parent_views(frontier)
         feedback_policies = await self._feedback_policies()
@@ -777,11 +855,15 @@ class RoundRunner:
                 candidates.extend(
                     item
                     for item in rt.own
-                    if isinstance(item, Candidate) and item.id not in recovered_ids
+                    if isinstance(item, Candidate)
+                    and (self.converge or item.id not in recovered_ids)
                 )
                 learnings.extend(own_learnings)
                 reason = rt.watchdog.end_round(ran=rt.started_runs > 0)
-                if rt.counters.tool_runs and not rt.started_runs:
+                if (
+                    rt.counters.tool_runs > self._counters.get(key, {}).get("tool_runs", 0)
+                    and not rt.started_runs
+                ):
                     slot.status = AgentStatus.STARVED
                 if reason is not None:
                     slot.status = AgentStatus.WATCHDOG_STOPPED

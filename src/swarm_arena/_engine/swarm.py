@@ -98,6 +98,12 @@ class Swarm:
             If approval, estimates, preflight or the asyncio backend check fails,
             or ownership is lost. Lost ownership raises a bare Fenced exception.
 
+        Notes
+        -----
+        Executor shutdown is shielded for at most ``config.settle_timeout_s``.
+        On expiry the original result or exception is preserved; shutdown failures
+        never replace an exception already raised by the run.
+
         Examples
         --------
         >>> swarm = Swarm(RunConfig())
@@ -110,6 +116,64 @@ class Swarm:
             approve=approve,
             replanner=self.replanner,
         )
+        return await self._runner.run()
+
+    async def resume(self, run_id: str, *, force: bool = False) -> dict[str, list[Candidate]]:
+        """
+        Continue a run from its committed journal under a new ownership epoch.
+
+        Parameters
+        ----------
+        run_id : str
+            Existing run to recover.
+        force : bool, default=False
+            Permit takeover while the previous owner's lease is still live.
+
+        Returns
+        -------
+        dict[str, list[Candidate]]
+            Latest finalists in plan order, or empty lists for no-result goals.
+
+        Raises
+        ------
+        PlanError
+            A goal's peak exceeds max_agents_total.
+        ValueError
+            A budget cap decreases or committed state is invalid.
+        LeaseHeld
+            The old owner is live and force was not requested.
+        Fenced
+            A competing resume wins ownership.
+
+        Notes
+        -----
+        Executor shutdown is shielded for at most ``config.settle_timeout_s``.
+        On expiry the original result or exception is preserved; shutdown failures
+        never replace an exception already raised by the run.
+
+        A goal stopped by ``stop`` or ``stop --now`` with rounds left continues.
+        A goal stopped by a limit continues only when this resume changes the
+        limits. Every goal end returns its unused pool; continued goals reopen
+        with their goal_weights share of the free work pool before limits_changed.
+
+        A resumed stopped goal gets only its share of the free work pool
+        (`Ledger.free()`), which can be 0 when other goals were still running and
+        already got its unused budget; unless the resume raises the limits, such
+        a goal stops again with `goal budget` at its first run.
+
+        A continued goal's earlier lifecycle stays in the run journal: its
+        `final_order` and its `goal_finished` stop reason are kept there, even
+        after the later lifecycle replaces `solution.json` and the replay clears
+        the goal's `end_reason`. `status` and `solution.json` show only the latest
+        lifecycle.
+
+        Examples
+        --------
+        >>> results = await swarm.resume("run-id", force=True)  # doctest: +SKIP
+        """
+        from swarm_arena._engine.resume import resume_run
+
+        self._runner = await resume_run(self.config, run_id, force=force, replanner=self.replanner)
         return await self._runner.run()
 
     async def stop(self, *, now: bool = False) -> None:

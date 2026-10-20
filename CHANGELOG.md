@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Swarm.resume` continues committed runs with auditable lease takeover,
+  conservative lost-run accounting, restored round state, and repaired result views.
+
 - `Swarm.run` approves estimates before publishing snapshots, runs queued goals
   with shared budgets and capacity, and returns durable finalists; `Swarm.stop`
   requests graceful or immediate stops, with journaled stop modes and fencing.
