@@ -7,7 +7,7 @@ import anyio
 
 from swarm_arena._agent.manager import Manager
 from swarm_arena._board.arena import _effective_arena_root
-from swarm_arena._errors import ConfigError, _core_error, _exception_type_name
+from swarm_arena._errors import ConfigError, StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
@@ -127,13 +127,12 @@ def _board_arena_root(config: RunConfig) -> str:
 
 
 async def _check_storage(config: RunConfig) -> None:
-    """Bound storage probing and configured board construction on a daemon."""
+    """Probe before ownership, with caller cancellation and type-only failures."""
     outcome = _Outcome()
     try:
-        with anyio.fail_after(config.settle_timeout_s):
-            await run_sync_daemon(check_storage, config)
+        await run_sync_daemon(check_storage, config)
     except BaseException as error:
-        raise outcome.classify(error) from None
+        outcome.contain(error, StorageError, "storage preflight")
 
 
 def check_storage(config: RunConfig) -> None:

@@ -25,7 +25,7 @@ from swarm_arena import (
 )
 from swarm_arena._engine import preflight
 from swarm_arena._engine.preflight import check_storage, run_preflight
-from swarm_arena._errors import ConditionalWritesUnsupported
+from swarm_arena._errors import ConditionalWritesUnsupported, _core_error
 from swarm_arena._exec.executor import Executor
 
 
@@ -323,7 +323,7 @@ async def test_storage_checked_first_in_worker_thread(monkeypatch: pytest.Monkey
 
     def fail(config: RunConfig) -> None:
         assert threading.get_ident() != loop_thread
-        raise ConditionalWritesUnsupported("storage unavailable")
+        raise _core_error(ConditionalWritesUnsupported, "storage unavailable")
 
     monkeypatch.setattr(preflight, "check_storage", fail)
     with pytest.raises(ConditionalWritesUnsupported):
