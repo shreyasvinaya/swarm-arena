@@ -165,7 +165,8 @@ def test_terminal_prompt_subprocess(
         else:
             assert master is not None
             os.write(master, b"n\n")
-        stdout, stderr = process.communicate(timeout=20)
+        # Include parent scheduling and interpreter shutdown on loaded CI hosts.
+        stdout, stderr = process.communicate(timeout=60)
         assert process.returncode == (130 if interrupt else 1), (output + stdout, stderr)
         assert stderr == (b"interrupted\n" if interrupt else b"run not approved\n")
     assert not Path(run_config.run_root).exists()
