@@ -362,7 +362,11 @@ class JournalWriter:
             try:
                 if abandonable:
                     await anyio.lowlevel.checkpoint_if_cancelled()
-                    return await run_sync_daemon(operation)
+                    with anyio.move_on_after(self._remaining()) as lifetime:
+                        result = await run_sync_daemon(operation)
+                    if lifetime.cancel_called or self._remaining() <= 0:
+                        raise _core_error(Fenced, "journal lease expired")
+                    return result
                 return await anyio.to_thread.run_sync(operation)
             except ChainError:
                 raise

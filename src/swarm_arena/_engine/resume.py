@@ -116,10 +116,18 @@ class _ResumeServices:
     """Keep the AnyIO writer context in one task across preparation and execution."""
 
     def __init__(
-        self, config: RunConfig, run_id: str, store: Store, lease: Lease, *, force: bool
+        self,
+        config: RunConfig,
+        run_id: str,
+        store: Store,
+        lease: Lease,
+        *,
+        force: bool,
+        clock: RunClock,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
+        self.clock = clock
         self.ready, self.close = anyio.Event(), anyio.Event()
         self.failure: BaseException | None = None
         self.resumed: ResumeState | None = None
@@ -150,7 +158,7 @@ class _ResumeServices:
         try:
             path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
             stops = StopState()
-            clock = RunClock(0)
+            clock = self.clock
             async with (
                 run_module._supervise_initialization(
                     self.store, lease.doc.epoch, stops, clock, config
@@ -165,6 +173,7 @@ class _ResumeServices:
                 ) as journal,
             ):
                 entered = True
+                journal.clock = clock
                 # The journal owns release even if supervision entry is cancelled.
                 async with run_module._supervise_writer(journal):
                     try:
@@ -174,9 +183,6 @@ class _ResumeServices:
                         )
                         events, state = await run_sync_daemon(_read, self.store, lease.doc)
                         replay_prepared()
-                        # Replay restores prior active time; include time spent reading it.
-                        clock = RunClock(state.run_elapsed_s + clock.elapsed())
-                        journal.clock = clock
                         async with run_module._supervise_initialization(
                             self.store, lease.doc.epoch, stops, clock, config
                         ) as prepared:
@@ -522,12 +528,18 @@ async def resume_run(
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
 
+    clock: RunClock | None = None
+
     def validate(doc: OwnerDoc) -> None:
+        nonlocal clock
         _, state = _read(store, doc)
         _check(state, config)
+        if clock is None:
+            clock = RunClock(state.run_elapsed_s)
 
     lease = await _take_over(config, run_id, store, force=force, validate=validate)
-    services = _ResumeServices(config, run_id, store, lease, force=force)
+    assert clock is not None
+    services = _ResumeServices(config, run_id, store, lease, force=force, clock=clock)
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:
         await services.ready.wait()

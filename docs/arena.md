@@ -557,7 +557,10 @@ initialization error instead of reporting a completed run.
 Resume preparation also observes the new epoch's stop files and the remaining
 run time, including while the writer loads its inherited chain, replay, review
 repair, board setup, or page repair is blocked. Abandoning the inherited-chain
-read cannot start a later append or publication. Interrupted preparation releases ownership and reports
+read is bounded by the confirmed lease expiry even before publication starts.
+The validated elapsed checkpoint and all preparation and replay time
+consume the same remaining run allowance. An abandoned read cannot start a later
+append or publication. Interrupted preparation releases ownership and reports
 `resume initialization stopped`; it does not start the driver.
 Round preparation does not consume the
 agent round timeout. Storage failures report exception types without exposing
