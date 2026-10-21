@@ -1288,20 +1288,19 @@ class ArenaCache:
             ).fetchone()[0]
 
     def _covered(self, run_id: str, head: Head) -> bool:
-        """Validate full metadata and ancestry, rejecting divergent older marks."""
+        """Validate metadata and ancestry in one shared-cache read snapshot."""
         with self._lock:
             _validate_head(head)
-            row = self._conn.execute(
-                "SELECT epoch, last_seq FROM segments WHERE run_id=? AND name=?",
-                (run_id, head.segment),
+            epoch, seq, newest = self._conn.execute(
+                "SELECT s.epoch, s.last_seq, newest.last_seq "
+                "FROM (SELECT max(last_seq) AS last_seq FROM segments WHERE run_id=?) newest "
+                "LEFT JOIN segments s ON s.run_id=? AND s.name=?",
+                (run_id, run_id, head.segment),
             ).fetchone()
-            if row is not None:
-                if row != (head.epoch, head.seq):
+            if epoch is not None:
+                if (epoch, seq) != (head.epoch, head.seq):
                     raise _core_error(ChainError, "cached segment metadata does not match head")
                 return True
-            newest = self._conn.execute(
-                "SELECT max(last_seq) FROM segments WHERE run_id=?", (run_id,)
-            ).fetchone()[0]
             if newest is not None and newest >= head.seq:
                 raise _core_error(ChainError, "head is not on the cached chain")
             return False

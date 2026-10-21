@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Barrier
 from threading import Event as ThreadEvent
 from time import monotonic
+from typing import Any
 
 import pytest
 from _fakes.arena import _plan_for_round, plans, run_root, search
@@ -25,6 +26,45 @@ from swarm_arena._journal.replay import RunState
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.results import Learning, Score
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_coverage_keeps_one_snapshot_during_peer_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, warm: bool
+) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    first = run.commit(run.plan())
+    head = run.commit(run.candidate("c-1"))
+    path = tmp_path / "toy.sqlite"
+    peer = ArenaCache(path)
+    if warm:
+        ingest_run(peer, run.store, "r1", run.run_root, first)
+    connect = sqlite3.connect
+    armed = False
+    injected = False
+
+    class AdvancingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            nonlocal injected
+            cursor = super().execute(sql, parameters)
+            if armed and not injected and sql.startswith("SELECT") and "segments" in sql:
+                injected = True
+                ingest_run(peer, run.store, "r1", run.run_root, head)
+            return cursor
+
+    def advancing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        return connect(*args, **kwargs, factory=AdvancingConnection)
+
+    monkeypatch.setattr(sqlite3, "connect", advancing_connect)
+    cache = ArenaCache(path)
+    try:
+        armed = True
+        assert ingest_run(cache, run.store, "r1", run.run_root, head) == 0
+        assert injected
+        assert candidate_ids(cache) == ["c-1"]
+    finally:
+        cache.close()
+        peer.close()
 
 
 def test_ingest_is_idempotent(tmp_path: Path) -> None:
