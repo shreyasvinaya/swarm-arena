@@ -1,6 +1,5 @@
 import sys
 
-import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, NoopManager
@@ -122,12 +121,10 @@ async def test_harness_retains_each_failure_and_resets_them_for_a_new_run(
     assert _events(harness, "agent_status") == []
 
 
-@pytest.mark.parametrize("fenced", [False, True])
 async def test_manager_control_flow_propagates_without_error_event(
     monkeypatch: pytest.MonkeyPatch,
-    fenced: bool,
 ) -> None:
-    failure = Fenced("ownership lost") if fenced else anyio.get_cancelled_exc_class()()
+    failure = Fenced("ownership lost")
     seen: list[int] = []
 
     async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:

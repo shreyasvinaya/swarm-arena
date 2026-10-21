@@ -19,6 +19,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
 from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
@@ -97,7 +98,8 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     """Hide arbitrary connector values at the admission boundary."""
     try:
         return action()
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _core_error(PlanError, [f"{pointer}: {type(error).__name__}"]) from None
 
 
@@ -132,7 +134,8 @@ def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
             if not issubclass(cls, Configurable):
                 raise TypeError
             safe = _safe_location(cls.Config, tuple(location))
-        except Exception:
+        except BaseException as error:
+            _classify_outcome(error)
             safe = ("<key>",) * len(location)
         tokens = [
             "<key>" if part == "<…>" else str(part).replace("~", "~0").replace("/", "~1")
@@ -403,7 +406,8 @@ def _rule_configs(
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
             continue
-        except Exception as error:
+        except BaseException as error:
+            error = _classify_outcome(error)
             errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
             continue
         try:
@@ -866,7 +870,8 @@ def _validate_round_refs(plan: Plan) -> None:
             effective_tool_ref(ref, overrides)
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
-        except Exception as error:
+        except BaseException as error:
+            error = _classify_outcome(error)
             errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
     if errors:
         raise _core_error(PlanError, errors) from None
@@ -997,7 +1002,8 @@ def admit_revision(
         frozen = _snapshot_round_refs(frozen, artifacts)
     except PlanError:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _core_error(PlanError, [f"/snapshot: {type(error).__name__}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents

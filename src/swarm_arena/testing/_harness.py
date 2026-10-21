@@ -36,6 +36,7 @@ from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.runner import judge_round
@@ -348,13 +349,15 @@ class OfflineHarness:
                 ),
             )
             manager_error: Exception | None = None
+            outcome = _Outcome()
             try:
                 report = await manager.run_round(AgentContext(rt, gate=lambda: None))
             except LimitReached:
                 report = RoundReport()
             except Fenced:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = outcome.classify(error)
                 if rt.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
                 self.manager_errors.append(error)

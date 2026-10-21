@@ -14,6 +14,7 @@ from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import (
     PARENT_DATA,
@@ -54,7 +55,8 @@ def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]:
     _, config = ref._resolve_config(Configurable)
     try:
         result = config.model_dump(mode="json")
-    except Exception:
+    except BaseException as error:
+        _classify_outcome(error)
         raise ValueError(f"{ref.path}: cannot serialize config") from None
     return {
         key: value for key, value in result.items() if entry is None or key not in entry.settable

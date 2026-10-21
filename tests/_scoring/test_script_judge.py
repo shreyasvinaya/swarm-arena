@@ -149,7 +149,7 @@ async def test_execute_errors_propagate() -> None:
 
     with pytest.raises(RuntimeError, match="fenced"):
         await ScriptCheck(command=["x"]).check(cand(), CheckContext(**ctx_args()))
-    with pytest.raises(RuntimeError, match="fenced"):
+    with pytest.raises(RuntimeError, match="ExceptionGroup"):
         await ScriptJudge(command=["x"]).judge(
             GOAL, [cand(id="c1"), cand(id="c2")], JudgeContext(**ctx_args())
         )
@@ -176,7 +176,7 @@ async def test_executor_error_cancels_sibling() -> None:
 
     context = JudgeContext(goal=GOAL, executor=Refusing(), artifact_root="/a")
     cands = [cand(id=cid, request=ToolRequest(inputs={"cid": cid})) for cid in ("bad", "waiting")]
-    with anyio.fail_after(2), pytest.raises(RuntimeError, match="fenced"):
+    with anyio.fail_after(2), pytest.raises(RuntimeError, match="ExceptionGroup"):
         await ScriptJudge(command=["x"]).judge(GOAL, cands, context)
     assert cancelled.is_set()
     assert context.errors == {}

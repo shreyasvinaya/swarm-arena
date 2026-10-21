@@ -38,7 +38,7 @@ from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate
 from swarm_arena._model.tooling import RunStatus
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import stamp
@@ -681,6 +681,7 @@ class GoalRunner:
                 }
                 leaders = [c for c, _ in self._round_state().ranked(part)]
                 scope = self._scope("judge", round, tranche)
+                preparation = _Outcome()
                 try:
                     judge = await run_sync_daemon(ref.build, Judge)
                     prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
@@ -699,7 +700,8 @@ class GoalRunner:
                     )
                 except Fenced:
                     raise
-                except Exception as error:
+                except BaseException as error:
+                    error = preparation.classify(error)
                     outcome = JudgeOutcome(
                         scores=[],
                         errors=[
@@ -988,11 +990,13 @@ class GoalRunner:
 
     async def _preflight(self, plan: Plan) -> None:
         """Convert shared prerequisite failures to an admission refusal."""
+        outcome = _Outcome()
         try:
             await run_preflight([plan], self.deps.config, self.deps.executor)
         except Fenced:
             raise
-        except Exception as error:
+        except BaseException as error:
+            error = outcome.classify(error)
             raise PlanError([f"preflight failed: {type(error).__name__}"]) from None
 
     def _stop(self) -> bool:

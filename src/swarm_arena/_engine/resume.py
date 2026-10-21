@@ -25,6 +25,7 @@ from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.validate import _rule_max_agents_total
 from swarm_arena._store.artifacts import ArtifactStore
@@ -177,13 +178,13 @@ class _ResumeServices:
                         (state.started_commands, commands, EventType.COMMAND_END),
                     ):
                         for id, started in jobs.items():
+                            outcome = _Outcome()
                             try:
                                 with anyio.move_on_after(config.settle_timeout_s):
                                     if await executor.kill_orphan(started):
                                         killed.append(id)
-                            except Fenced:
-                                raise
-                            except Exception as error:
+                            except BaseException as error:
+                                error = outcome.classify(error)
                                 raise _core_error(
                                     RuntimeError, f"orphan recovery failed: {type(error).__name__}"
                                 ) from None

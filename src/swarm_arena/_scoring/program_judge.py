@@ -9,6 +9,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, import_path, load_object
 from swarm_arena._model.results import Candidate, Score
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -223,14 +224,19 @@ class ProgramJudge(Judge):
         fn = self._load_function()
         scores: list[Score] = []
         for candidate in candidates:
+            outcome = _Outcome()
             try:
                 result = await run_sync_daemon(_score_copy, fn, goal, candidate)
                 if inspect.isawaitable(result):
                     _discard_awaitable(result)
                     ctx.judge_error(candidate.id, "ProgramJudge needs a sync function")
                     continue
-            except (Exception, SystemExit) as error:
-                ctx.judge_error(candidate.id, f"{type(error).__name__}: scoring function raised")
+            except KeyboardInterrupt:
+                raise
+            except BaseException as error:
+                name = type(error).__name__
+                error = outcome.classify(error)
+                ctx.judge_error(candidate.id, f"{name}: scoring function raised")
                 continue
             if not isinstance(result, Score):
                 ctx.judge_error(candidate.id, f"returned {type(result).__name__}, expected Score")
@@ -241,7 +247,8 @@ class ProgramJudge(Judge):
                     score = Score.model_validate(
                         {**result.model_dump(warnings=False), "candidate_id": candidate.id}
                     )
-                except Exception:
+                except BaseException as error:
+                    outcome.classify(error)
                     ctx.judge_error(candidate.id, "invalid Score returned")
                 else:
                     scores.append(score)

@@ -28,6 +28,7 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Tool
 
@@ -86,7 +87,8 @@ def function_input_model(fn: Callable[..., Any]) -> type[BaseModel]:
     try:
         signature = inspect.signature(fn)
         hints = get_type_hints(fn, include_extras=True)
-    except Exception:
+    except BaseException as error:
+        _classify_outcome(error)
         raise TypeError(f"FunctionTool {path}: cannot resolve signature or annotations") from None
     fields: dict[str, Any] = {}
     for name, parameter in signature.parameters.items():
@@ -98,7 +100,8 @@ def function_input_model(fn: Callable[..., Any]) -> type[BaseModel]:
         fields[name] = (hints[name], default)
     try:
         return create_model(f"{fn.__name__}_inputs", __base__=_ConfigInputModel, **fields)
-    except Exception:
+    except BaseException as error:
+        _classify_outcome(error)
         raise TypeError(f"FunctionTool {path}: cannot build input model") from None
 
 
@@ -140,7 +143,8 @@ def import_root(module_name: str) -> str:
         # (.py, a sourceless .pyc, or a compiled extension).
         levels = len(spec.name.split(".")) + (spec.submodule_search_locations is not None)
         return str(Path(file).resolve().parents[levels - 1])
-    except Exception:
+    except BaseException as error:
+        _classify_outcome(error)
         raise ValueError(f"cannot determine import root for {module_name}") from None
 
 

@@ -13,6 +13,7 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import RunStatus, ToolRequest
+from swarm_arena._outcomes import _classify_outcome
 
 if TYPE_CHECKING:
     from swarm_arena._agent.runtime import AgentRuntime
@@ -358,7 +359,8 @@ class RepeatIndex:
                 )
             except Fenced:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = _classify_outcome(error)
                 raise _core_signal(
                     SoftError(f"invalid tool request: {type(error).__name__}")
                 ) from None

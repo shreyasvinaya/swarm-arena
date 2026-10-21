@@ -1313,11 +1313,24 @@ async def test_action_counter_producer_retains_counted_prestart_error(
     assert not _events(c, "tool_start")
 
 
-@pytest.mark.parametrize("failure_site", ["build", "orphan"])
+@pytest.mark.parametrize(
+    ("failure_site", "failure_kind"),
+    [
+        ("build", "ordinary"),
+        ("orphan", "ordinary"),
+        ("orphan", "fenced"),
+        ("orphan", "cancel"),
+        ("orphan", "group"),
+    ],
+)
 async def test_preparation_failure_closes_and_sanitizes(
-    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, failure_site: str
+    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, failure_site: str, failure_kind: str
 ) -> None:
     import traceback
+
+    from _fakes.pr1_r2 import SECRET, failure
+
+    from swarm_arena._errors import Fenced
 
     sentinel = "private-resume-value-732"
     spy = _SpyExecutor(Path(crashed.config.run_root) / "spy")
@@ -1328,14 +1341,17 @@ async def test_preparation_failure_closes_and_sanitizes(
         return spy
 
     async def orphan(started: Job.Started) -> bool:
+        if failure_kind != "ordinary":
+            raise failure(failure_kind)
         raise ValueError(sentinel)
 
     monkeypatch.setattr("swarm_arena._engine.run._build_executor", build)
     monkeypatch.setattr(spy, "kill_orphan", orphan)
-    with pytest.raises(RuntimeError) as err:
+    with pytest.raises(Fenced if failure_kind == "fenced" else RuntimeError) as err:
         await resume_run(crashed.config, crashed.run_id, force=True, replanner=None)
     assert sentinel not in "".join(traceback.format_exception(err.value))
     assert sentinel not in repr(err.value.args)
+    assert SECRET not in "".join(traceback.format_exception(err.value))
     assert spy.closed_count == (0 if failure_site == "build" else 1)
     assert len(_events(crashed, "takeover")) == 1
     owner = read_owner(crashed.store)

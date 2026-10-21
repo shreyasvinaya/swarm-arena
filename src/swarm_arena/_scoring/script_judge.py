@@ -14,6 +14,7 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import DEFAULT_GRACE_S, EnvName, GraceS, RunStatus, TimeoutS
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.script_check import _preflight_files, _result_error
 from swarm_arena._tooling.script_tool import script_command
@@ -219,17 +220,18 @@ class ScriptJudge(Judge):
         scores: list[Score | None] = [None] * len(candidates)
 
         async def run(index: int, candidate: Candidate) -> None:
-            scores[index] = await self._score(candidate, ctx)
+            outcome = _Outcome()
+            try:
+                scores[index] = await self._score(candidate, ctx)
+            except BaseException as error:
+                raise outcome.classify(error) from None
 
         try:
             async with anyio.create_task_group() as group:
                 for index, candidate in enumerate(candidates):
                     group.start_soon(run, index, candidate)
-        except ExceptionGroup as errors:
-            first: Exception = errors
-            while isinstance(first, ExceptionGroup):
-                first = first.exceptions[0]
-            raise first from None
+        except BaseExceptionGroup as errors:
+            raise _classify_outcome(errors) from None
         return [score for score in scores if score is not None]
 
     async def _score(self, candidate: Candidate, ctx: JudgeContext) -> Score | None:

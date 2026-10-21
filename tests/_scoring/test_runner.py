@@ -493,16 +493,18 @@ async def test_fenced_from_command_start_propagates(
     local_executor: LocalExecutor, artifact_root: str
 ) -> None:
     async def fenced(_: Job.Started) -> None:
-        raise Fenced("another owner")
+        from swarm_arena._errors import _core_error
 
-    with pytest.raises(Fenced, match="another owner"):
+        raise _core_error(Fenced, "run ownership lost")
+
+    with pytest.raises(Fenced, match="run ownership lost"):
         await run_checks(
             _cand(),
             [("s", _script_check())],
             _check_ctx(executor=local_executor, artifact_root=artifact_root, on_started=fenced),
         )
     sj = _script_judge()
-    with pytest.raises(Fenced, match="another owner"):
+    with pytest.raises(Fenced, match="run ownership lost"):
         await judge_round(
             "g",
             [(Ref.of(sj), sj)],
@@ -512,7 +514,7 @@ async def test_fenced_from_command_start_propagates(
                 executor=local_executor, artifact_root=artifact_root, on_started=fenced
             ),
         )
-    with pytest.raises(Fenced, match="another owner"):
+    with pytest.raises(Fenced, match="run ownership lost"):
         await final_judge(
             "g",
             (Ref.of(sj), sj),

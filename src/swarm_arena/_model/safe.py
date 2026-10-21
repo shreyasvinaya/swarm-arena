@@ -18,6 +18,7 @@ from swarm_arena._model.locations import (
     _schema_index,
     _sequence_paths,
 )
+from swarm_arena._outcomes import _classify_outcome
 
 # One allowlist for all models: custom codes and messages cannot carry user data.
 _VALIDATION_ERROR_TYPES: Final = frozenset(get_args(ErrorType))
@@ -237,7 +238,8 @@ def _sanitize_validation_error(
         return _SanitizedValidationError.from_exception_data(
             model.__name__, details, hide_input=True
         )
-    except Exception:
+    except BaseException as failure:
+        _classify_outcome(failure)
         pass
     return _minimal_validation_error(model)
 
@@ -270,14 +272,21 @@ def _validation_wrapper(
         )
         try:
             return handler(data)
-        except Exception as error:
+        except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                error = _classify_outcome(error)
                 safe = _sanitize_validation_error(
                     model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
                 )
-            except Exception:
+            except RecursionError:
+                safe = None
+            except BaseException as error:
+                try:  # noqa: SIM105 - a context manager itself needs spare stack frames
+                    _classify_outcome(error)
+                except RecursionError:
+                    pass
                 safe = None
         finally:
             owner.thread_id = None

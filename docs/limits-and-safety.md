@@ -161,7 +161,9 @@ action error and does not itself end the round. Other policy pruning happens
 between rounds. Tool exceptions
 become error candidates; a manager exception ends only that agent's round.
 User-raised cancellation and exception groups are contained at manager, action,
-check, and tool boundaries with type-only diagnostics. Healthy peers continue
+check, tool, and judge boundaries with type-only diagnostics. Judge construction,
+batch preparation, anchor selection, and configuration validation use the same
+classification before recording a failure. Healthy peers continue
 and the goal can finish. Cancellation before dispatch refunds the tool reservation
 exactly once, including command preparation and edit uploads. Cleanup has a bounded
 settlement wait; work that may have started retains its charge. Actual caller

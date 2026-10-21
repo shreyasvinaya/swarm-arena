@@ -6,6 +6,7 @@ from typing import TypeVar
 from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 _M = TypeVar("_M", CheckResult, Score, RoundReport)
@@ -22,7 +23,8 @@ def _strict_copy(model: type[_M], value: _M) -> _M | None:
         dump = value.model_dump(warnings=False)
         valid = model.model_validate(dump, strict=True)
         return valid if valid.model_dump(warnings=False) == dump else None
-    except Exception:
+    except BaseException as error:
+        _classify_outcome(error)
         return None
 
 

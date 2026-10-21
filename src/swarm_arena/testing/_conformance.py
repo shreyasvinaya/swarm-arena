@@ -22,6 +22,7 @@ from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolOutput
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext, stamp_scores
 from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
@@ -441,6 +442,7 @@ async def check_manager(
     config = RunConfig() if config is None else config
     limits = config.limits if limits is None else limits
     harness = OfflineHarness()
+    outcome = _Outcome()
     try:
         reports = await harness.run_rounds(
             built_manager,
@@ -455,5 +457,6 @@ async def check_manager(
         return reports
     except (LimitReached, Fenced):
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = outcome.classify(error)
         raise AssertionError(f"manager raised {type(error).__name__}") from error

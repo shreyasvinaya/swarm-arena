@@ -28,6 +28,7 @@ from swarm_arena._model.base import (
 )
 from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
+from swarm_arena._outcomes import _classify_outcome
 
 
 class EmptyConfig(_SafeModel):
@@ -184,7 +185,8 @@ def load_object(path: str) -> object:
         obj: object = importlib.import_module(module)
         for part in qualname.split("."):
             obj = getattr(obj, part)
-    except (Exception, SystemExit):
+    except BaseException as error:
+        _classify_outcome(error)
         raise ValueError(f"cannot import {path}") from None
     return obj
 
@@ -231,12 +233,19 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         try:
             return model_cls.model_validate(data)
-        except Exception as error:
+        except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                error = _classify_outcome(error)
                 safe = _sanitize_validation_error(model_cls, error)
-            except Exception:
+            except RecursionError:
+                safe = None
+            except BaseException as error:
+                try:  # noqa: SIM105 - a context manager itself needs spare stack frames
+                    _classify_outcome(error)
+                except RecursionError:
+                    pass
                 safe = None
     finally:
         owner.thread_id = None
