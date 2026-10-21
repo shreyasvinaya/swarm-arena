@@ -9,6 +9,7 @@ from swarm_arena._model.ref import EmptyConfig
 from swarm_arena.board import BoardView, Learning
 from swarm_arena.manager import AgentContext, RoundReport
 from swarm_arena.planning import Policy
+from swarm_arena.tool import RunStatus
 
 
 class MergeAll(Curator):
@@ -38,10 +39,17 @@ class PostingManager(ScriptedManager):
     """Post current evidence without depending on a later scoring barrier."""
 
     async def _post_learning(self, ctx: AgentContext) -> None:
-        own = ctx.my_candidates()
+        own = [
+            candidate
+            for candidate in ctx.my_candidates()
+            if candidate.round == ctx.round
+            and candidate.output.status == RunStatus.OK
+            and not candidate.output.partial
+            and not candidate.gated_out
+        ]
         if own:
             await ctx.post_learning(
-                title=f"Observation from round {ctx.round}",
+                title=f"Round{ctx.round} observation",
                 text="Current evidence.",
                 evidence=[own[-1].id],
             )

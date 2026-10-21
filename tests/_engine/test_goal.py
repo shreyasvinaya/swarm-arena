@@ -1076,6 +1076,17 @@ async def test_engine_runs_curator_at_round_end(env: EngineEnv) -> None:
     receipts = env.events("curated")
     assert [e.round for e in receipts] == [1, 2]
     state = RunState.from_events(env._events())
+    originals = [item for item in state.learnings.values() if item.author != "curator"]
+    assert len(originals) == 2
+    assert len({item.title for item in originals}) == 2
+    for item in originals:
+        assert item.verified
+        assert len(item.evidence) == 1
+        candidate = state.candidates[item.evidence[0]]
+        assert candidate.round == item.round
+        assert candidate.output.status == "ok"
+        assert not candidate.output.partial
+        assert not candidate.gated_out
     for event in receipts:
         decision = next(e for e in env.events("decision") if e.round == event.round)
         assert event.payload["decision_seq"] == decision.seq
