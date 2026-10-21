@@ -222,7 +222,8 @@ async def test_prompt_cancellation_releases_reader(monkeypatch: pytest.MonkeyPat
             monkeypatch.setattr(run_cmds, "wait_readable", wait)
             async with anyio.create_task_group() as group:
                 group.start_soon(run_cmds._prompt)
-                await entered.wait()
+                with anyio.fail_after(10):
+                    await entered.wait()
                 group.cancel_scope.cancel()
             assert os.get_blocking(reader)
             # A leaked readiness registration would reject a second waiter.
