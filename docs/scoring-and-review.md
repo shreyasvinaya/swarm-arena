@@ -213,7 +213,10 @@ in the arena are the sole source of human scores for board reads; the receipt
 is for recovery. Resume repairs missing objects before opening the board, and
 a later import repairs them before committing another review. Recovery uses
 the original names, IDs and canonical bytes. An existing object with different
-bytes stops recovery. Retrying a CSV after a receipt committed creates a new
+bytes stops recovery. Receipt repair, import publication, and completion export share the owning writer's fencing and cancellation lifetime. Blocking I/O is abandonable; an already
+started write can finish, but cancellation never starts the next publication.
+
+Retrying a CSV after a receipt committed creates a new
 review batch; recovery itself does not duplicate the original batch.
 
 Successful fresh and resumed runs also write an immutable bundle under

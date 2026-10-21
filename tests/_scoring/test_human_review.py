@@ -563,3 +563,142 @@ async def test_review_export_create_once(state: RunState, review_run: FakeRun) -
     with pytest.raises(StorageError, match="bytes differ") as error:
         await write_review_export(state, review_run.store, head)
     assert_secret_absent(error.value, "SECRET_EXPORT_BYTES")
+
+
+@pytest.mark.parametrize("operation", ["resume", "import"])
+@pytest.mark.parametrize("interrupt", ["cancel", "fence"])
+@pytest.mark.parametrize("site", ["authority", "create"])
+async def test_stalled_receipt_io_ends_owner_before_worker_returns(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    interrupt: str,
+    site: str,
+) -> None:
+    import asyncio
+    import threading
+
+    import anyio
+
+    from swarm_arena import Swarm
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._model.canonical import utc_now
+    from swarm_arena._store.local import LocalStore
+
+    _add_namespace(review_run)
+    config = run_config.model_copy(update={"settle_timeout_s": 0.2, "lease_ttl_s": 0.3})
+    path = _file(tmp_path)
+
+    def fail(*args: Any, **kwargs: Any) -> str:
+        raise StorageError("interrupted publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(human_review, "write_human_objects", fail)
+        with pytest.raises(StorageError, match="interrupted publication"):
+            await HumanReview("alice").import_csv(review_run.run_id, path, config=config)
+    receipt = _events(review_run.store)[-1]
+    keys = receipt.payload["objects"]
+    assert len(keys) == 2
+    entered, release, returned, caller_done = (threading.Event() for _ in range(4))
+    workers: list[threading.Thread] = []
+    renewals_after_return: list[int] = []
+    creates: list[str] = []
+    scopes: list[anyio.CancelScope] = []
+    failures: list[BaseException] = []
+    repairing = False
+    real_repair = human_review._repair_review_objects
+    real_read, real_create, real_renew = human_review.read_owner, LocalStore.create, Lease.renew
+
+    async def repair(*args: Any, **kwargs: Any) -> None:
+        nonlocal repairing
+        repairing = True
+        await real_repair(*args, **kwargs)
+
+    def block() -> None:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(10), "worker release deadline"
+        returned.set()
+
+    def authority(*args: Any, **kwargs: Any) -> Any:
+        result = real_read(*args, **kwargs)
+        if repairing and site == "authority":
+            block()
+        return result
+
+    def create(self: LocalStore, key: str, data: bytes) -> str:
+        if key in keys:
+            creates.append(key)
+            if site == "create" and len(creates) == 1:
+                block()
+        return real_create(self, key, data)
+
+    def renew(self: Lease) -> None:
+        if caller_done.is_set():
+            renewals_after_return.append(self.doc.epoch)
+        real_renew(self)
+
+    async def caller() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                if operation == "resume":
+                    await Swarm(config).resume(review_run.run_id)
+                else:
+                    await HumanReview("bob").import_csv(review_run.run_id, path, config=config)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            caller_done.set()
+
+    monkeypatch.setattr(human_review, "_repair_review_objects", repair)
+    monkeypatch.setattr(human_review, "read_owner", authority)
+    monkeypatch.setattr(LocalStore, "create", create)
+    monkeypatch.setattr(Lease, "renew", renew)
+    task = asyncio.create_task(caller())
+    services: list[asyncio.Task[Any]] = []
+    successor: Lease | None = None
+    try:
+        assert await run_sync_daemon(entered.wait, 5)
+        services = [t for t in asyncio.all_tasks() if t.get_name() == f"resume-{review_run.run_id}"]
+        started = anyio.current_time()
+        if interrupt == "cancel":
+            scopes[0].cancel()
+        else:
+            successor = Lease.take_over(
+                review_run.store, owner_id="successor", host="local", ttl_s=60, force=True
+            )
+        done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
+        assert done, "caller retained by stalled receipt I/O"
+        assert anyio.current_time() - started < 3 * config.settle_timeout_s
+        owner = read_owner(review_run.store)
+        assert owner is not None
+        if interrupt == "cancel":
+            assert owner[0].expires_at <= utc_now(), "cancelled owner still holds its lease"
+            assert not failures
+        else:
+            assert owner[0].owner_id == "successor"
+            assert len(failures) == 1
+            assert isinstance(failures[0], Fenced)
+        assert all(t.done() for t in services), "resume service outlived its caller"
+        assert not returned.is_set()
+        release.set()
+        assert await run_sync_daemon(returned.wait, 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        await asyncio.gather(task, *services)
+        assert not renewals_after_return
+        assert read_owner(review_run.store) == owner
+        assert creates == ([] if site == "authority" else [keys[0]])
+        assert not any(e.payload.get("reviewer") == "bob" for e in _events(review_run.store))
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        if successor is not None:
+            successor.release()

@@ -718,3 +718,107 @@ async def test_review_export_failure_releases_run_services(
     assert owner[0].expires_at < utc_now()
     assert board_closed == [1]
     assert executor_closed == [1]
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("interrupt", ["cancel", "fence"])
+async def test_stalled_completion_export_ends_owner_before_worker_returns(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, resumed: bool, interrupt: str
+) -> None:
+    import asyncio
+    import threading
+
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._journal.lease import Lease
+
+    config = run_config.model_copy(update={"settle_timeout_s": 0.2, "lease_ttl_s": 0.3})
+    run_id = "export-cancel"
+    if resumed:
+        await Swarm(config).run(plan(rounds=1), run_id=run_id)
+    store = LocalStore(Path(config.run_root) / run_id)
+    prefix = f"review/e{2 if resumed else 1}-"
+    entered, release, returned, caller_done = (threading.Event() for _ in range(4))
+    creates: list[str] = []
+    workers: list[threading.Thread] = []
+    renewals_after_return: list[int] = []
+    failures: list[BaseException] = []
+    scopes: list[anyio.CancelScope] = []
+    real_create, real_renew = LocalStore.create, Lease.renew
+
+    def create(self: LocalStore, key: str, data: bytes) -> str:
+        if key.startswith(prefix):
+            creates.append(key)
+            if len(creates) == 1:
+                workers.append(threading.current_thread())
+                entered.set()
+                assert release.wait(10), "worker release deadline"
+            try:
+                return real_create(self, key, data)
+            finally:
+                returned.set()
+        return real_create(self, key, data)
+
+    def renew(self: Lease) -> None:
+        if caller_done.is_set():
+            renewals_after_return.append(self.doc.epoch)
+        real_renew(self)
+
+    async def caller() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                if resumed:
+                    await Swarm(config).resume(run_id)
+                else:
+                    await Swarm(config).run(plan(rounds=1), run_id=run_id)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            caller_done.set()
+
+    monkeypatch.setattr(LocalStore, "create", create)
+    monkeypatch.setattr(Lease, "renew", renew)
+    task = asyncio.create_task(caller())
+    services: list[asyncio.Task[Any]] = []
+    successor: Lease | None = None
+    try:
+        assert await run_sync_daemon(entered.wait, 15)
+        services = [t for t in asyncio.all_tasks() if t.get_name() == f"resume-{run_id}"]
+        started = anyio.current_time()
+        if interrupt == "cancel":
+            scopes[0].cancel()
+        else:
+            successor = Lease.take_over(
+                store, owner_id="successor", host="local", ttl_s=60, force=True
+            )
+        done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
+        assert done, "caller retained by stalled completion export"
+        assert anyio.current_time() - started < 3 * config.settle_timeout_s
+        owner = read_owner(store)
+        assert owner is not None
+        if interrupt == "cancel":
+            assert owner[0].expires_at <= utc_now()
+            assert not failures
+        else:
+            assert owner[0].owner_id == "successor"
+            assert len(failures) == 1
+            assert isinstance(failures[0], Fenced)
+        assert all(t.done() for t in services)
+        assert not returned.is_set()
+        release.set()
+        assert await run_sync_daemon(returned.wait, 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        await asyncio.gather(task, *services)
+        assert len(creates) == 1, "abandoned export started another file"
+        assert not renewals_after_return
+        assert read_owner(store) == owner
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        if successor is not None:
+            successor.release()

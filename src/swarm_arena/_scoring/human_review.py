@@ -28,6 +28,7 @@ from swarm_arena._board.pages import state_positions
 from swarm_arena._board.pointers import _validate_run_id
 from swarm_arena._engine.preflight import check_storage
 from swarm_arena._errors import AlreadyExists, Fenced, LeaseHeld, StorageError, _core_error
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -272,7 +273,7 @@ def _write_export(out_dir: Path, files: dict[str, bytes]) -> None:
         ) from None
 
 
-def _publish_review_object(
+async def _publish_review_object(
     arena: Store,
     store: Store,
     lease: Lease,
@@ -283,7 +284,7 @@ def _publish_review_object(
     now: datetime,
 ) -> None:
     """Check current authority immediately before one exact create-or-compare."""
-    owner = read_owner(store)
+    owner = await run_sync_daemon(read_owner, store)
     if (
         owner is None
         or owner[0].epoch != lease.doc.epoch
@@ -293,12 +294,23 @@ def _publish_review_object(
         raise _core_error(Fenced, "review publication lost ownership")
     parts = key.split("/")
     try:
-        write_human_objects(
-            arena, parts[0], "reviews", objects, now=now, reviewer=reviewer, name=parts[-1]
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        await run_sync_daemon(
+            partial(
+                write_human_objects,
+                arena,
+                parts[0],
+                "reviews",
+                objects,
+                now=now,
+                reviewer=reviewer,
+                name=parts[-1],
+            )
         )
     except AlreadyExists:
         expected = b"".join(canonical_json(obj.model_dump(mode="json")) + b"\n" for obj in objects)
-        if arena.read(key).data != expected:
+        existing = await run_sync_daemon(arena.read, key)
+        if existing.data != expected:
             raise _core_error(
                 StorageError, "review object bytes differ from committed receipt"
             ) from None
@@ -329,17 +341,8 @@ async def _repair_review_objects(
             ]
             if writer.fenced.is_set():
                 raise _core_error(Fenced)
-            await anyio.to_thread.run_sync(
-                partial(
-                    _publish_review_object,
-                    arena,
-                    store,
-                    lease,
-                    key,
-                    objects,
-                    reviewer=reviewer,
-                    now=event.ts,
-                )
+            await _publish_review_object(
+                arena, store, lease, key, objects, reviewer=reviewer, now=event.ts
             )
             if writer.fenced.is_set():
                 raise _core_error(Fenced)
@@ -448,6 +451,7 @@ class HumanReview:
         ...     "r", Path("review.csv"), config=config)
         """
         from swarm_arena._engine.resume import _take_over
+        from swarm_arena._engine.run import _supervise_writer
 
         _validate_run_id(run_id)
         data = await anyio.to_thread.run_sync(_read_csv, _local_path(csv_path))
@@ -465,24 +469,27 @@ class HumanReview:
         try:
             head = lease.doc.head
             assert head is not None
-            state = await anyio.to_thread.run_sync(_read_state, store, run_id, lease.doc)
-            scores = parse_review_csv(data, state, judge=self.judge_name)
             path = (
                 Path(gettempdir())
                 / f"swarm-arena-{os.getuid()}"
                 / "journals"
                 / f"{run_id}-e{lease.doc.epoch}.jsonl"
             )
-            async with JournalWriter(
-                store,
-                lease,
-                run_id=run_id,
-                next_seq=head.seq + 1,
-                local_path=path,
-                sync_interval_s=config.sync_interval_s,
-            ) as writer:
+            async with (
+                JournalWriter(
+                    store,
+                    lease,
+                    run_id=run_id,
+                    next_seq=head.seq + 1,
+                    local_path=path,
+                    sync_interval_s=config.sync_interval_s,
+                ) as writer,
+                _supervise_writer(writer),
+            ):
                 entered = True
-                arena = await anyio.to_thread.run_sync(open_store, config.arena_root)
+                state = await run_sync_daemon(_read_state, store, run_id, lease.doc)
+                scores = parse_review_csv(data, state, judge=self.judge_name)
+                arena = await run_sync_daemon(open_store, config.arena_root)
                 await _repair_review_objects(state, arena, store, lease, writer)
                 now = utc_now()
                 namespaces = {

@@ -4,7 +4,8 @@ import asyncio
 import os
 import socket
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from fractions import Fraction
 from functools import partial
 from hashlib import sha256
@@ -59,6 +60,33 @@ from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 if TYPE_CHECKING:
     from swarm_arena._engine.resume import ResumeState
+
+
+async def _watch_fence(journal: JournalWriter, scope: anyio.CancelScope) -> None:
+    await journal.fenced.wait()
+    scope.cancel()
+
+
+@asynccontextmanager
+async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
+    """Retain the existing fence watcher through preparation and publication."""
+    error: BaseException | None = None
+    with anyio.CancelScope() as scope:
+        async with anyio.create_task_group() as watchers:
+            watchers.start_soon(_watch_fence, journal, scope)
+            try:
+                await anyio.lowlevel.checkpoint_if_cancelled()
+                if journal.fenced.is_set():
+                    raise _core_error(Fenced)
+                yield
+            except BaseException as caught:
+                error = caught
+            finally:
+                watchers.cancel_scope.cancel()
+    if journal.fenced.is_set():
+        raise _core_error(Fenced) from None
+    if error is not None:
+        raise error
 
 
 class _RunJournal(JournalWriter):
@@ -560,30 +588,23 @@ class RunRunner:
 
     async def _drive(self, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
         result: dict[str, list[Candidate]] = {}
-        with anyio.CancelScope() as scope:
+        async with _supervise_writer(deps.journal):
             async with anyio.create_task_group() as watchers:
                 watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
                 watchers.start_soon(self._watch_clock, deps)
-                watchers.start_soon(self._watch_fence, deps.journal, scope)
                 result = await self._queue(deps)
                 await self._record_stops(deps)
                 watchers.cancel_scope.cancel()
-        if deps.journal.fenced.is_set():
-            raise _core_error(Fenced)
-        head = await deps.journal.commit()
-        assert head is not None
-        chain = await anyio.to_thread.run_sync(read_chain, deps.store, head)
-        state = RunState.from_events(e for _, batch in chain for e in batch)
-        await write_review_export(state, deps.store, head)
+            head = await deps.journal.commit()
+            assert head is not None
+            chain = await run_sync_daemon(read_chain, deps.store, head)
+            state = RunState.from_events(e for _, batch in chain for e in batch)
+            await write_review_export(state, deps.store, head)
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
         await anyio.sleep(deps.clock.left(deps.config.limits.run_timeout_s))
         deps.stops.run_timeout = True
-
-    async def _watch_fence(self, journal: JournalWriter, scope: anyio.CancelScope) -> None:
-        await journal.fenced.wait()
-        scope.cancel()
 
     async def _record_stops(self, deps: EngineDeps) -> None:
         mode = 2 if deps.stops.stop_now else 1 if deps.stops.stop else 0
@@ -726,13 +747,12 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
 
     files = render_review(state, top=20)
 
-    def write() -> None:
-        for name, data in files.items():
-            key = f"review/e{head.epoch}-{head.seq}/{name}"
-            try:
-                store.create(key, data)
-            except AlreadyExists:
-                if sha256(store.read(key).data).digest() != sha256(data).digest():
-                    raise _core_error(StorageError, "review export bytes differ") from None
-
-    await anyio.to_thread.run_sync(write)
+    for name, data in files.items():
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        key = f"review/e{head.epoch}-{head.seq}/{name}"
+        try:
+            await run_sync_daemon(store.create, key, data)
+        except AlreadyExists:
+            existing = await run_sync_daemon(store.read, key)
+            if sha256(existing.data).digest() != sha256(data).digest():
+                raise _core_error(StorageError, "review export bytes differ") from None

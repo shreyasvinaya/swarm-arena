@@ -24,6 +24,7 @@ from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.procinfo import host_id
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -142,24 +143,27 @@ class _ResumeServices:
                 / "journals"
                 / f"{self.run_id}-e{lease.doc.epoch}.jsonl"
             )
-            async with run_module._RunJournal(
-                self.store,
-                lease,
-                run_id=self.run_id,
-                next_seq=head.seq + 1,
-                local_path=path,
-                sync_interval_s=config.sync_interval_s,
-            ) as journal:
+            async with (
+                run_module._RunJournal(
+                    self.store,
+                    lease,
+                    run_id=self.run_id,
+                    next_seq=head.seq + 1,
+                    local_path=path,
+                    sync_interval_s=config.sync_interval_s,
+                ) as journal,
+                run_module._supervise_writer(journal),
+            ):
                 entered = True
                 try:
                     # A successful force CAS must be auditable even if replay now refuses.
                     await journal.append_durable(
                         EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
                     )
-                    events, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
+                    events, state = await run_sync_daemon(_read, self.store, lease.doc)
                     from swarm_arena._scoring.human_review import _repair_review_objects
 
-                    arena = await anyio.to_thread.run_sync(open_store, config.arena_root)
+                    arena = await run_sync_daemon(open_store, config.arena_root)
                     await _repair_review_objects(state, arena, self.store, lease, journal)
                     clock = RunClock(state.run_elapsed_s)
                     journal.clock = clock
@@ -247,7 +251,7 @@ class _ResumeServices:
                             )
                         )
                     await journal.commit()
-                    _, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
+                    _, state = await run_sync_daemon(_read, self.store, lease.doc)
                     board = await run_module._start_board(config)
                     await run_module._open_board(
                         board,
