@@ -731,10 +731,12 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
     from swarm_arena._exec.threads import run_sync_daemon
     from swarm_arena._journal.lease import Lease
 
-    config = run_config.model_copy(update={"settle_timeout_s": 0.2, "lease_ttl_s": 0.3})
+    # The stalled phase keeps a short renewal interval (ttl / 3) so a successor's fence is seen
+    # within the bound; the setup run keeps the default lease so CI load cannot fence it early.
+    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 1.5})
     run_id = "export-cancel"
     if resumed:
-        await Swarm(config).run(plan(rounds=1), run_id=run_id)
+        await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
     store = LocalStore(Path(config.run_root) / run_id)
     prefix = f"review/e{2 if resumed else 1}-"
     entered, release, returned, caller_done = (threading.Event() for _ in range(4))
