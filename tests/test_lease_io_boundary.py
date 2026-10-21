@@ -10,6 +10,33 @@ _ROOT = Path(__file__).resolve().parents[1] / "src" / "swarm_arena"
 _ALLOW = {
     ("_engine/run.py", "RunRunner.run", "admit_revision"): "Admission precedes acquisition.",
     ("_engine/run.py", "RunRunner.run", "_promote"): "Artifact promotion precedes acquisition.",
+    ("_engine/run.py", "_open_board", "board.open"): "Contained daemon under owner supervision.",
+    ("_engine/run.py", "_close_board", "board.close"): "Contained daemon with bounded cleanup.",
+    (
+        "_engine/round.py",
+        "RoundRunner._frontier",
+        "self.deps.board.frontier",
+    ): "Detached in daemon lambda under _prepare's outcome and lifecycle supervision.",
+    (
+        "_engine/round.py",
+        "RoundRunner._runtime",
+        "deps.board.snapshot",
+    ): "Daemon lambda under manage's outcome boundary and round lifecycle supervision.",
+    (
+        "_engine/round.py",
+        "RoundRunner._parent_views",
+        "self.deps.board.snapshot",
+    ): "Daemon lambda under _prepare's outcome and lifecycle supervision.",
+    (
+        "_engine/goal.py",
+        "GoalRunner._curate_round.invoke",
+        "self.deps.board.frontier",
+    ): "Detached in daemon lambda under invoke's outcome and _supervised_step.",
+    (
+        "_engine/goal.py",
+        "GoalRunner._curate_round.invoke",
+        "self.deps.board.snapshot",
+    ): "Daemon under invoke's outcome boundary and _supervised_step.",
     ("_engine/manifest.py", "build_manifest_async", "_build_manifest"): "Preownership host probes.",
     ("_engine/control.py", "request_stop", "_request_stop"): "Stop command owns no lease.",
     ("_engine/control.py", "read_status", "_read_status"): "Status reader owns no lease.",
@@ -33,6 +60,23 @@ _ALLOW = {
     ("_exec/local_run.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
     ("_exec/local_run.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
     ("_exec/local_run.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
+    (
+        "_exec/local.py",
+        "LocalExecutor.submit",
+        "_open_workspace",
+    ): "Local mkdir and store construction; no backend storage I/O.",
+    ("_exec/local.py", "LocalExecutor.submit", "_remove_workspace"): "Local workspace cleanup.",
+    (
+        "_exec/local.py",
+        "LocalExecutor.confirm_dead",
+        "group_has_live_member",
+    ): "Local process inspection.",
+    (
+        "_exec/local.py",
+        "LocalExecutor.kill_orphan",
+        "procinfo.kill_orphan",
+    ): "Local process cleanup.",
+    ("_exec/local.py", "LocalExecutor._get_host_id", "host_id"): "Local host identity.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "self._run_folder"): "Before acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_build"): "Preownership snapshots.",
     (
@@ -46,22 +90,39 @@ _ALLOW = {
         "Lease.acquire_new",
     ): "Initial acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_failed_runs"): "After writer release.",
+    (
+        "testing/_harness.py",
+        "OfflineHarness.run_rounds",
+        "board.frontier",
+    ): "Detached in _storage_io lambda under harness stop, deadline and writer supervision.",
+    (
+        "testing/_harness.py",
+        "OfflineHarness._rounds",
+        "rt.board.frontier",
+    ): "Detached in _storage_io lambda under harness stop, deadline and writer supervision.",
 }
 
 
-_STORE_METHODS = {"create", "read", "replace", "exists", "delete"}
+_STORE_METHODS = {"create", "read", "replace", "exists", "delete", "list"}
 _LEASE_METHODS = {"acquire_new", "take_over", "renew", "release", "advance"}
+_BOARD_METHODS = {"open", "close", "frontier", "snapshot"}
+_ARTIFACT_METHODS = {"put_bytes", "get_bytes", "_put_chunks"}
 
 
 def _storage_method(node: ast.expr, *, lease: bool = False) -> bool:
-    """Recognize the explicit store/lease receiver names used in owner modules."""
+    """Recognize named store/lease receivers and the board's I/O-only methods."""
     if not isinstance(node, ast.Attribute):
         return False
     receiver = ast.unparse(node.value).rsplit(".", 1)[-1].lower().lstrip("_")
     store = receiver in {"store", "arena"} or receiver.endswith("_store")
     owner = receiver == "lease" or receiver.endswith("_lease")
-    return (store and node.attr in _STORE_METHODS) or (
-        lease and owner and node.attr in _LEASE_METHODS
+    board = receiver == "board" or receiver.endswith("_board")
+    artifacts = receiver == "artifacts" or receiver.endswith("_artifacts")
+    return (
+        (store and node.attr in _STORE_METHODS)
+        or (lease and owner and node.attr in _LEASE_METHODS)
+        or (board and node.attr in _BOARD_METHODS)
+        or (artifacts and node.attr in _ARTIFACT_METHODS)
     )
 
 
@@ -112,7 +173,11 @@ def _worker_calls(source: str) -> list[tuple[str, str, int]]:
             ):
                 callback = callback.args[0]
             if function.endswith("to_thread.run_sync") or (
-                function.endswith("run_sync_daemon") and _storage_method(callback, lease=True)
+                function.endswith("run_sync_daemon")
+                and (
+                    _storage_method(callback, lease=True)
+                    or ast.unparse(callback).rsplit(".", 1)[-1].startswith("_upload_")
+                )
             ):
                 found.append((".".join(scope), ast.unparse(callback), node.lineno))
             elif asynchronous and asynchronous[-1] and _storage_method(node.func):
@@ -132,6 +197,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
         _ROOT / "_exec/local_run.py",
+        _ROOT / "_exec/local.py",
         _ROOT / "_scoring/human_review.py",
         _ROOT / "_agent/tool_run.py",
         _ROOT / "_tooling/script_tool.py",
@@ -201,3 +267,46 @@ async def publish():
     await _storage_io(lease.renew)
 """
     assert _worker_calls(source) == []
+
+
+@pytest.mark.parametrize(
+    "callback",
+    ["store.list", "board.open", "self.board.close", "board.frontier", "self.deps.board.snapshot"],
+)
+@pytest.mark.parametrize("worker", [False, True])
+def test_guard_finds_store_listing_and_board_io(callback: str, worker: bool) -> None:
+    call = f"await run_sync_daemon({callback})" if worker else f"{callback}()"
+    source = f"async def publish():\n    {call}"
+    assert _worker_calls(source) == [("publish", callback, 2)]
+
+
+def test_guard_accepts_published_views_and_in_memory_board_writes() -> None:
+    source = """
+async def publish():
+    board.put_candidate(candidate)
+    board.put_learning(learning)
+    view.best()
+    view.count_learnings()
+    await _storage_io(store.list, "reviews/")
+"""
+    assert _worker_calls(source) == []
+
+
+@pytest.mark.parametrize(
+    "callback", ["artifacts.put_bytes", "rt.artifacts.get_bytes", "self._artifacts._put_chunks"]
+)
+@pytest.mark.parametrize("worker", [False, True])
+def test_guard_finds_artifact_storage(callback: str, worker: bool) -> None:
+    call = f"await run_sync_daemon({callback}, data)" if worker else f"{callback}(data)"
+    assert _worker_calls(f"async def publish():\n    {call}") == [("publish", callback, 2)]
+
+
+def test_guard_finds_upload_helper_daemon() -> None:
+    source = """
+class Job:
+    def _upload_log(self, data):
+        return self._artifacts.put_bytes(data)
+    async def finish(self):
+        await run_sync_daemon(self._upload_log, data)
+"""
+    assert _worker_calls(source) == [("Job.finish", "self._upload_log", 6)]
