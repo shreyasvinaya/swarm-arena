@@ -16,6 +16,7 @@ from swarm_arena._board.cache import ArenaCache
 from swarm_arena._board.frontier import build_frontier
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.replay import RunState
+from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._store.local import LocalStore
 
 
@@ -109,4 +110,202 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
     finally:
         release.set()
         timer.cancel()
+        board.close()
+
+
+@pytest.mark.parametrize("phase", ["pointers", "journal", "ingest"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "best",
+        "learnings",
+        "search_learnings",
+        "get_candidate",
+        "get_learning",
+        "scores",
+        "lineage",
+        "leaderboard",
+    ],
+)
+async def test_public_board_reads_use_published_state_during_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, method: str
+) -> None:
+    from swarm_arena._board import arena
+
+    run = FakeRun(str(tmp_path / "runs"), "own")
+    run.commit(
+        run.plan(),
+        run.candidate("old"),
+        run.score("score", "old", 1),
+        run.learning("learning", "viscosity", evidence=["old"]),
+    )
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open(run.run_id, run.run_root, ["toy"])
+    board.frontier()
+    key = run.goal.key()
+    board.put_candidate(
+        Candidate.model_validate(run.candidate("hint-c").payload["candidate"]), epoch=1, seq=100
+    )
+    board.put_learning(
+        Learning.model_validate(run.learning("hint-l", "hint").payload["learning"]),
+        epoch=1,
+        seq=101,
+    )
+    board.put_score(
+        Score.model_validate(run.score("hint-s", "hint-c", 2).payload["score"]), epoch=1, seq=102
+    )
+
+    def read() -> Any:
+        if method == "best":
+            return board.best(key, 5, judge="j")
+        if method == "learnings":
+            return board.learnings("toy"), board.learnings("toy", goal=key)
+        if method == "search_learnings":
+            return (
+                board.search_learnings("toy", "viscosity"),
+                board.search_learnings("toy", "viscosity", goal=key),
+            )
+        if method == "get_candidate":
+            return board.get_candidate("old"), board.get_candidate("hint-c")
+        if method == "get_learning":
+            return board.get_learning("learning"), board.get_learning("hint-l")
+        if method == "scores":
+            return board.scores("old"), board.scores("hint-c")
+        if method == "lineage":
+            return board.lineage("old")
+        return board.leaderboard(key, judge="j")
+
+    expected = read()
+    head = run.commit(run.candidate("new"), run.score("new-score", "new", 0))
+    entered, release = ThreadEvent(), ThreadEvent()
+    finished = anyio.Event()
+    ticks: list[float] = []
+    original_pointers, original_read = arena.list_pointers, LocalStore.read
+    original_index = ArenaCache._index_event
+
+    def pause() -> None:
+        entered.set()
+        assert release.wait(5), "test failed to release refresh"
+
+    def pointers(*args: Any, **kwargs: Any) -> Any:
+        if phase == "pointers":
+            pause()
+        return original_pointers(*args, **kwargs)
+
+    def storage_read(self: LocalStore, name: str) -> Any:
+        if phase == "journal" and self.url.endswith("/own") and name == head.segment:
+            pause()
+        return original_read(self, name)
+
+    def index(self: ArenaCache, event: Event, state: RunState, pending: list[str]) -> None:
+        if phase == "ingest" and event.payload.get("candidate", {}).get("id") == "new":
+            pause()
+        original_index(self, event, state, pending)
+
+    monkeypatch.setattr(arena, "list_pointers", pointers)
+    monkeypatch.setattr(LocalStore, "read", storage_read)
+    monkeypatch.setattr(ArenaCache, "_index_event", index)
+
+    async def refresh() -> None:
+        try:
+            await anyio.to_thread.run_sync(board.frontier)
+        finally:
+            finished.set()
+
+    async def heartbeat() -> None:
+        while True:
+            ticks.append(perf_counter())
+            await anyio.sleep(0.01)
+
+    timer = Timer(0.8, release.set)
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(refresh)
+            group.start_soon(heartbeat)
+            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            timer.start()
+            try:
+                started = perf_counter()
+                result = read()
+                assert perf_counter() - started < 0.2
+                assert result == expected
+                before = len(ticks)
+                await anyio.sleep(0.06)
+                assert len(ticks) >= before + 3
+                assert not finished.is_set()
+            finally:
+                release.set()
+                await finished.wait()
+                group.cancel_scope.cancel()
+        assert board.best(key, 1, judge="j")[0].id == "new"
+    finally:
+        release.set()
+        timer.cancel()
+        board.close()
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_unpublished_and_unknown_namespace_reads_never_initialize_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    published: bool,
+) -> None:
+    from swarm_arena._board import arena
+
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    if published:
+        board.frontier()
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("read attempted storage or cache initialization")
+
+    monkeypatch.setattr(arena, "open_store", forbidden)
+    monkeypatch.setattr(board, "_cache", forbidden)
+    monkeypatch.setattr(board, "_read_cache", forbidden)
+    monkeypatch.setattr(board, "frontier", forbidden)
+    try:
+        for namespace in ("toy", "unattached"):
+            key = Goal(id="g", namespace=namespace).key()
+            assert board.best(key, 1, judge="j") == []
+            assert board.leaderboard(key, judge="j") == []
+            assert board.learnings(namespace) == []
+            assert board.learnings(namespace, goal=key) == []
+            assert board.search_learnings(namespace, "text") == []
+            assert board.search_learnings(namespace, "text", goal=key) == []
+        for read in (board.get_candidate, board.get_learning, board.scores, board.lineage):
+            with pytest.raises(KeyError):
+                read("missing")
+    finally:
+        board.close()
+
+
+def test_failed_reader_preparation_retains_published_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "own")
+    run.commit(run.plan(), run.candidate("old"), run.score("os", "old", 1))
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open(run.run_id, run.run_root, ["toy"])
+    old_frontier = board.frontier()
+    view = board.snapshot(run.goal.key(), old_frontier)
+    run.commit(run.candidate("new"), run.score("ns", "new", 0))
+
+    def fail(namespace: str) -> ArenaCache:
+        raise RuntimeError("reader preparation failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(board, "_read_cache", fail)
+            with pytest.raises(RuntimeError, match="reader preparation failed"):
+                board.frontier()
+        assert board._latest == old_frontier
+        assert [c.id for c in board.best(run.goal.key(), 5, judge="j")] == ["old"]
+        with pytest.raises(KeyError):
+            board.get_candidate("new")
+        board.frontier()
+        assert [c.id for c in board.best(run.goal.key(), 5, judge="j")] == ["new", "old"]
+        assert [c.id for c in view.best(view.goal, 5, judge="j")] == ["old"]
+    finally:
         board.close()

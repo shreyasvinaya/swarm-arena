@@ -35,10 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution, avoiding history replay on unchanged reads and sibling lookups.
 - Runs now default to the shared arena board, with fixed sibling rankings and
   scored past-run repeat hints; the offline manager harness uses an isolated arena.
+  Configured-board lifecycle calls preserve safe diagnostics and cancellation,
+  with shutdown bounded by the settle timeout on run and resume.
 
 - Arena cache reads release temporary membership and ID selections on outermost
   exit, including failures, while preserving nested-read membership.
-- `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling views, current producing-key rankings, hidden-safe learning counts, and lazy XDG-aware local caches; empty human objects retain durable coverage.
+- `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling
+  views across group namespaces, current producing-key rankings, hidden-safe
+  learning counts, and lazy XDG-aware local caches; empty human objects retain
+  durable coverage. Board and view reads use published state without waiting
+  for storage refresh; call `frontier()` before reading committed data.
 
 - Hide temporary and lock basenames consistently in local and paginated S3 listings.
 

@@ -615,11 +615,14 @@ def test_reader_and_unscored_owner_use_newest_identity(
     own = FakeRun(str(tmp_path / "runs"), "unscored")
     own.commit(own.plan())
     board.open(own.run_id, own.run_root, ["toy"])
+    board.frontier()
     assert [c.id for c in board.best(own.goal.key(), 2, judge="j")] == ["c-r1"]
 
 
 def test_board_reads_reuse_latest_frontier_until_refresh(tmp_path: Path, board: ArenaBoard) -> None:
     run = _seed(tmp_path)
+    assert board.best(run.goal.key(), 5, judge="j") == []
+    board.frontier()
     assert [c.id for c in board.best(run.goal.key(), 5, judge="j")] == ["c-r1"]
     run.commit(run.candidate("late"), run.score("late-s", "late", 0))
     assert [c.id for c in board.best(run.goal.key(), 5, judge="j")] == ["c-r1"]
@@ -662,6 +665,7 @@ def test_hidden_hint_cannot_bypass_named_curation(tmp_path: Path, board: ArenaBo
     learning = Learning.model_validate(run.learning("hint", "hint").payload["learning"])
     board.put_learning(learning, epoch=1, seq=99)
     _curate(tmp_path, "hide", learning.id)
+    board.frontier()
     with pytest.raises(KeyError):
         board.get_learning(learning.id)
 
@@ -832,7 +836,6 @@ def test_repeated_reads_reuse_committed_replay(
     if reopen:
         board.close()
         board.open("r0", runs[0].run_root, ["toy"])
-        board.frontier()
     folds: Counter[str] = Counter()
     original = RunState._apply
 
@@ -842,6 +845,8 @@ def test_repeated_reads_reuse_committed_replay(
 
     monkeypatch.setattr(RunState, "_apply", counted)
     try:
+        if reopen:
+            board.frontier()  # Cold plan reconstruction occurs before publication.
         frozen = board.snapshot(runs[0].goal.key(), frontier)
         expected = {"r0": 103, "r1": 103} if reopen else {}
         assert dict(folds) == expected
@@ -906,7 +911,7 @@ def test_lineage_fills_frontier_once_and_batches_ids(
         other.commit(other.plan())
         _publish(tmp_path, other)
     view = board.snapshot(run.goal.key(), board.frontier())
-    cache = view._cache if reader_kind == "view" else board._cache("toy")
+    cache = view._cache if reader_kind == "view" else board._read_state().readers["toy"]
     counts: Counter[str] = Counter()
     original = cache._replace_sets
 
@@ -946,7 +951,7 @@ def test_lineage_read_scope_cleans_up_after_failure(
     run.commit(run.plan(), run.candidate("a"), run.candidate("b", parents=["a"]))
     _publish(tmp_path, run)
     view = board.snapshot(run.goal.key(), board.frontier())
-    cache = view._cache if reader_kind == "view" else board._cache("toy")
+    cache = view._cache if reader_kind == "view" else board._read_state().readers["toy"]
     original = cache.candidates
     calls = 0
 

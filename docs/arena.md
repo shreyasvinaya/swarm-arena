@@ -112,12 +112,15 @@ of that identity choice. Hidden learnings never appear in lists, searches, or
 counts. Part-scoped learning reads use the resolving main goal; namespace-wide
 reads still prefer that goal after higher-priority relevance criteria.
 
-Board-level reads reuse the latest frontier, capturing one on the first read.
-Call `frontier()` again to refresh. A previously created view stays fixed.
-Storage reads and ingestion run under a separate refresh lock. Fixed views use
-WAL reader connections, so an event-loop view read does not wait for a worker
-fetching a journal or writing the cache for another goal. Frontier publication
-holds only a short in-memory lock; snapshot preparation belongs on a worker.
+Call `frontier()` on a worker to publish committed data before board-level reads,
+and again to refresh it. Before the first publication, committed reads are empty;
+candidate, learning and score ID lookups can still use process-local hints.
+A previously created view stays fixed. Storage reads and ingestion run under a
+separate refresh lock. Board and view reads use prepared WAL reader connections
+and plan projections, so an event-loop read does not wait for a worker fetching
+a journal or writing the cache. The frontier and its prepared reader state are
+published together under a short in-memory lock. A failed refresh leaves the
+previous generation readable; snapshot preparation also belongs on a worker.
 Plan resolution is retained per run and committed mark in the open board.
 Repeated reads at unchanged marks do not replay journal history. Advancement
 reuses committed replay checkpoints and folds only missing events; a cold or
