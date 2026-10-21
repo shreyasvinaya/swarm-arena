@@ -27,6 +27,27 @@ def published(tmp_path: Path) -> Iterator[tuple[ArenaBoard, ArenaView, FakeRun]]
     board.close()
 
 
+def _observe_drain(
+    board: ArenaBoard, monkeypatch: pytest.MonkeyPatch, checked: Event
+) -> list[bool]:
+    """Observe the first real reader-drain predicate before allowing the read to finish."""
+    drained: list[bool] = []
+    original = board._lifetime._condition.wait_for
+
+    def wait_for(predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        def observed() -> bool:
+            result = predicate()
+            if not checked.is_set():
+                drained.append(result)
+                checked.set()
+            return result
+
+        return original(observed, timeout)
+
+    monkeypatch.setattr(board._lifetime._condition, "wait_for", wait_for)
+    return drained
+
+
 @pytest.mark.parametrize("kind", ["board", "view"])
 @pytest.mark.parametrize("method", ["get_candidate", "scores"])
 def test_read_captured_before_close_keeps_reader_alive(
@@ -38,23 +59,23 @@ def test_read_captured_before_close_keeps_reader_alive(
     board, view, _ = published
     reader = board if kind == "board" else view
     cache = view._cache
-    entered, closing, closed = Event(), Event(), Event()
+    entered, draining, closed = Event(), Event(), Event()
     failures: list[BaseException] = []
-    early_close: list[bool] = []
+    drained = _observe_drain(board, monkeypatch, draining)
     operation = "candidates" if method == "get_candidate" else "scores"
     original = getattr(cache, operation)
 
     def paused(*args: Any, **kwargs: Any) -> Any:
         # scores pauses after candidate validation, between two cache operations.
         entered.set()
-        assert closing.wait(5)
-        early_close.append(closed.wait(0.1))
+        assert draining.wait(5)
+        assert drained == [False]
+        assert not closed.is_set()
         return original(*args, **kwargs)
 
     def shutdown() -> None:
         try:
             assert entered.wait(5)
-            closing.set()
             board.close()
         except BaseException as error:
             failures.append(error)
@@ -69,7 +90,6 @@ def test_read_captured_before_close_keeps_reader_alive(
         assert ([s.id for s in result] if method == "scores" else result.id) == (
             ["os"] if method == "scores" else "old"
         )
-        assert early_close == [False]
     finally:
         entered.set()
         worker.join(5)
@@ -85,14 +105,17 @@ def test_swapped_generation_stays_pinned_until_compound_read_finishes(
     board, view, run = published
     old = board._read_state()
     cache = view._cache
-    entered, swapped, closed = Event(), Event(), Event()
+    entered, swapped, closed, draining = Event(), Event(), Event(), Event()
+    drained = _observe_drain(board, monkeypatch, draining)
     failures: list[BaseException] = []
     original = cache.scores
 
     def paused(*args: Any, **kwargs: Any) -> Any:
         entered.set()
         assert swapped.wait(5)
-        closed.wait(0.1)
+        assert draining.wait(5)
+        assert drained == [False]
+        assert not closed.is_set()
         return original(*args, **kwargs)
 
     def refresh_and_close() -> None:
