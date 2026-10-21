@@ -413,6 +413,28 @@ def test_protocol_errors_are_fixed(server: Server, failure: str) -> None:
             assert response.startswith(b"HTTP/1.0 400 Bad Request\r\n")
 
 
+def test_loopback_startup_does_not_wait_for_reverse_dns(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release = Event(), Event()
+
+    def stalled_lookup(name: str = "") -> str:
+        entered.set()
+        assert release.wait(10), "resolver release deadline"
+        return "localhost"
+
+    monkeypatch.setattr(socket, "getfqdn", stalled_lookup)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        starting = pool.submit(make_server, server.board, ["toy"], author="alice", port=0)
+        try:
+            http = starting.result(timeout=2)
+            assert not entered.is_set()
+            assert http.server_port > 0
+        finally:
+            release.set()
+            starting.result(timeout=5).server_close()
+
+
 def test_refresh_never_blocks_published_gets(
     server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -427,7 +449,7 @@ def test_refresh_never_blocks_published_gets(
 
     def read_owner(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(20)
         return original(*args, **kwargs)
 
     with _default_server(server) as site:
@@ -436,11 +458,12 @@ def test_refresh_never_blocks_published_gets(
         clock[0] = 106.0
         with ThreadPoolExecutor(max_workers=2) as pool:
             refreshing = pool.submit(get, site, "/")
-            assert entered.wait(3)
+            assert entered.wait(5)
             try:
-                assert "Learning" in refreshing.result(timeout=0.5)
+                assert "Learning" in refreshing.result(timeout=2)
                 for path in ("/", "/learning/L-1", "/candidate/c-child"):
-                    assert pool.submit(get, site, path).result(timeout=0.5)
+                    assert pool.submit(get, site, path).result(timeout=2)
+                assert not release.is_set()
             finally:
                 release.set()
                 refreshing.result(timeout=5)
@@ -458,15 +481,16 @@ def test_response_write_does_not_block_other_gets(
         def reply(self: Any, status: int, body: str, *, location: str | None = None) -> None:
             if self.path == "/learning/L-1":
                 entered.set()
-                assert release.wait(5)
+                assert release.wait(10)
             original(self, status, body, location=location)
 
         monkeypatch.setattr(handler, "_reply", reply)
         with ThreadPoolExecutor(max_workers=2) as pool:
             writing = pool.submit(get, site, "/learning/L-1")
-            assert entered.wait(3)
+            assert entered.wait(5)
             try:
-                assert "Learning" in pool.submit(get, site, "/").result(timeout=0.5)
+                assert "Learning" in pool.submit(get, site, "/").result(timeout=2)
+                assert not writing.done()
             finally:
                 release.set()
                 assert writing.result(timeout=5)

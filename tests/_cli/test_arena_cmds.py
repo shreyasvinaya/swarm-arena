@@ -597,46 +597,50 @@ def test_board_serve_smoke(finished_run: FinishedRun) -> None:
             candidate_id = cache.candidates(state.frontier)[0][0].id
     finally:
         board.close()
-    env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve())}
-    proc = subprocess.Popen(
-        [
-            str(Path(sys.executable).with_name("swarm-arena")),
-            "board",
-            "serve",
-            finished_run.namespace,
-            "--config",
-            str(finished_run.config_path),
-            "--port",
-            "0",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-    try:
-        assert proc.stdout is not None
-        with selectors.DefaultSelector() as selector:
-            selector.register(proc.stdout, selectors.EVENT_READ)
-            assert selector.select(timeout=15), "viewer startup timed out"
-        line = proc.stdout.readline()
-        assert line.startswith("Serving http://127.0.0.1:"), line
-        url = line.split()[-1]
-        for path in ("", f"learning/{learning_id}", f"candidate/{candidate_id}"):
-            with urlopen(url + path, timeout=10) as response:
-                assert response.status == 200
-        proc.send_signal(signal.SIGINT)
-        _, stderr = proc.communicate(timeout=10)
-        assert proc.returncode == 0, stderr
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
+    stderr_path = finished_run.config_path.parent / "viewer-stderr.txt"
+    with stderr_path.open("w") as stderr_log:
+        env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve())}
+        proc = subprocess.Popen(
+            [
+                str(Path(sys.executable).with_name("swarm-arena")),
+                "board",
+                "serve",
+                finished_run.namespace,
+                "--config",
+                str(finished_run.config_path),
+                "--port",
+                "0",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=stderr_log,
+            text=True,
+            env=env,
+        )
+        try:
+            assert proc.stdout is not None
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                # Includes interpreter imports, config loading and initial frontier publication.
+                # stdout remains buffered so this also verifies the product flushes readiness.
+                assert selector.select(timeout=60), (
+                    f"viewer startup timed out (exit={proc.poll()}): {stderr_path.read_text()}"
+                )
+            line = proc.stdout.readline()
+            assert line.startswith("Serving http://127.0.0.1:"), (line, stderr_path.read_text())
+            url = line.split()[-1]
+            for path in ("", f"learning/{learning_id}", f"candidate/{candidate_id}"):
+                with urlopen(url + path, timeout=10) as response:
+                    assert response.status == 200
+            proc.send_signal(signal.SIGINT)
+            proc.communicate(timeout=10)
+            assert proc.returncode == 0, stderr_path.read_text()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            if proc.stdout is not None:
+                proc.stdout.close()

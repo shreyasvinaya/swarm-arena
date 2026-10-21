@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from contextlib import suppress
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from threading import Event, Lock, Thread
 from typing import Literal
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
@@ -508,6 +509,12 @@ def make_server(
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         block_on_close = False
+
+        def server_bind(self) -> None:
+            """Bind without the unused reverse-DNS lookup in HTTPServer.server_bind."""
+            TCPServer.server_bind(self)
+            self.server_name = str(self.server_address[0])
+            self.server_port = int(self.server_address[1])
 
         def server_close(self) -> None:
             """Stop scheduling refreshes and bound shutdown of the tracked daemon."""
