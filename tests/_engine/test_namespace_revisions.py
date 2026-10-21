@@ -9,6 +9,7 @@ from _fakes.run import all_events, plan
 from swarm_arena import Goal, Plan, RunConfig, Swarm
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._journal.replay import RunState
+from swarm_arena._journal.writer import JournalWriter
 from swarm_arena.planning import History
 
 
@@ -32,7 +33,9 @@ async def test_replanned_namespace_is_live_and_matches_resume(
         )
 
     monkeypatch.setattr(ReplacePart, "plan", change_namespace)
+    original_publish = JournalWriter._publish
     await part_driver(tmp_path, "inputs", False)
+    assert JournalWriter._publish is original_publish
     config = RunConfig.load(tmp_path / "runs" / "part" / "run.toml")
     state = RunState.from_events(all_events(config))
     current = state.plans["g"][-1][0]

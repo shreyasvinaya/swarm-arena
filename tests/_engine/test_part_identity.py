@@ -84,6 +84,7 @@ def _anchor_probe(root: Path, patch: pytest.MonkeyPatch) -> None:
 
 
 async def part_driver(root: Path, kind: str, crash: bool) -> None:
+    """Run the part scenario with writer and judge probes scoped to this call."""
     p = _plan(teams=1, rounds=2, converge_team=True)
     if kind == "manifest":
         for file in ["a.txt", "b.txt"]:
@@ -159,10 +160,25 @@ async def part_driver(root: Path, kind: str, crash: bool) -> None:
         if crash and hit:
             os._exit(91)
 
-    JournalWriter._publish = commit
     with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", commit)
         _anchor_probe(root, patch)
         await Swarm(cfg, replanner=ReplacePart()).run(p, run_id="part")
+
+
+async def test_part_driver_restores_writer_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_publish = JournalWriter._publish
+
+    async def fail(self: Swarm, plan: Plan, *, run_id: str) -> None:
+        assert JournalWriter._publish is not original_publish
+        raise RuntimeError("driver failed")
+
+    monkeypatch.setattr(Swarm, "run", fail)
+    with pytest.raises(RuntimeError, match="driver failed"):
+        await part_driver(tmp_path, "inputs", False)
+    assert JournalWriter._publish is original_publish
 
 
 @pytest.mark.parametrize("kind", ["inputs", "manifest"])
