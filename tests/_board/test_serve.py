@@ -521,3 +521,78 @@ def test_default_mutation_redirect_publishes_state(server: Server, action: str) 
             assert len(_objects(site)) == 1
         finally:
             connection.close()
+
+
+@pytest.mark.parametrize("tag", ["", "solver", "absent"])
+def test_rendered_search_form_ignores_blank_optional_inputs(server: Server, tag: str) -> None:
+    from html.parser import HTMLParser
+
+    class Form(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fields: dict[str, str] = {}
+            self.in_search = False
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            values = dict(attrs)
+            if tag == "form":
+                self.in_search = values.get("method") == "get"
+            if self.in_search and tag == "input" and values.get("name") is not None:
+                self.fields[str(values["name"])] = values.get("value") or ""
+
+    parser = Form()
+    parser.feed(get(server, "/"))
+    assert {"q", "tag", "run"} <= parser.fields.keys()
+    parser.fields.update(q="Learning", tag=tag)
+    submitted = get(server, "/?" + urlencode(parser.fields))
+    direct = get(server, "/?" + urlencode({"q": "Learning", "tag": tag}) if tag else "/?q=Learning")
+    assert submitted.count('class="learning"') == direct.count('class="learning"')
+    assert submitted.count('class="learning"') == (0 if tag == "absent" else 50)
+
+
+def test_run_viewer_blank_run_filter_includes_human_and_other_runs(server: Server) -> None:
+    from swarm_arena._board.human_objects import HumanObject, write_human_objects
+    from swarm_arena._model.canonical import utc_now
+    from swarm_arena._model.results import Learning
+
+    peer = FakeRun(server.run.run_root, "peer")
+    peer.commit(peer.plan(), peer.learning("L-peer", "Peer observation", evidence=["c-child"]))
+    add_pointer(server.board.config.arena_root, peer)
+    write_human_objects(
+        server.store,
+        "toy",
+        "curation",
+        [
+            HumanObject(
+                kind="add",
+                author="human:alice",
+                learning=Learning(
+                    id="L-human",
+                    namespace="toy",
+                    run_id="",
+                    goal_id="",
+                    round=0,
+                    author="human:alice",
+                    title="Human observation",
+                    text="Body",
+                ),
+            )
+        ],
+        now=utc_now(),
+    )
+    http = make_server(server.board, ["toy"], run_id=server.run.run_id, author="alice", port=0)
+    thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{http.server_port}"
+        with urlopen(base + "/?q=observation", timeout=5) as response:
+            assert response.read().count(b'class="learning"') == 0
+        with urlopen(base + "/?q=observation&run=", timeout=5) as response:
+            body = response.read()
+        assert b"Peer observation" in body
+        assert b"Human observation" in body
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()

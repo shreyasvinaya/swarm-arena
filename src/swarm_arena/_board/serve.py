@@ -94,12 +94,12 @@ def _index(
     page = max(1, int(value("page") or "1"))
     filters = LearningFilter(
         goal_id=value("goal") or None,
-        run=value("run") or run_id,
+        run=(value("run") or None) if "run" in params else run_id,
         part=value("part") or None,
         team=value("team") or None,
         agent=value("agent") or None,
         round=int(value("round")) if value("round") else None,
-        tags=params.get("tag", []),
+        tags=[tag for tag in params.get("tag", []) if tag.strip()],
         verified=True if value("verified") == "1" else None,
         human=True if value("human") == "1" else None,
         pinned=True if value("pinned") == "1" else None,
@@ -162,7 +162,7 @@ def _index(
         "pinned",
         "hidden",
     ):
-        body += f'<label>{name} <input name="{name}" value="{_e(value(name))}"></label> '
+        body += f'<label>{name} <input name="{name}" value="{_e(value(name) if name != "run" or "run" in params else run_id or "")}"></label> '
     body += "<button>Search</button></form><ul>"
     for item in selected[:_PAGE_SIZE]:
         body += (
