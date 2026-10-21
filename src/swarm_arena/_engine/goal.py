@@ -1213,12 +1213,13 @@ class GoalRunner:
             replan = (
                 funded
                 and self.status != "no_result"
+                and self.reason is None
                 and round < self.plan.rounds_total(self.deps.config.limits)
                 and not self._stop()
                 and self.replanner is not None
             )
             await self._close_round(round, replan=replan)
-            if not funded or self.status == "no_result":
+            if not funded or self.status == "no_result" or self.reason is not None:
                 break
             await self._complete_replan()
         await self._refresh()

@@ -2,13 +2,13 @@
 
 from collections.abc import Sequence
 
-from swarm_arena import ScriptedManager
+from swarm_arena import Goal, Plan, RunConfig, ScriptedManager
 from swarm_arena._board.curator import Curator
 from swarm_arena._model.planning_types import Decision, RoundState
 from swarm_arena._model.ref import EmptyConfig
 from swarm_arena.board import BoardView, Learning
 from swarm_arena.manager import AgentContext, RoundReport
-from swarm_arena.planning import Policy
+from swarm_arena.planning import History, Planner, Policy
 from swarm_arena.tool import RunStatus
 
 
@@ -186,3 +186,21 @@ async def join_crash_driver(root: str, boundary: str) -> None:
 
     JournalWriter._publish = publish
     await Swarm(config, replanner=RetryPlanner()).run(plan, run_id="curation")
+
+
+class PaidReplanner(Planner):
+    """Record planner dispatch and settle a small affordable reserve call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def plan(self, goal: Goal, config: RunConfig, history: History | None) -> Plan:
+        from swarm_arena._budget.amount import Amount
+        from swarm_arena._budget.llm_scope import current_llm_scope
+
+        self.calls += 1
+        scope = current_llm_scope()
+        assert scope is not None
+        call = await scope.tranche.reserve_call(Amount(usd=0.000003))
+        await scope.tranche.settle_call(call, Amount(usd=0.000003))
+        raise RuntimeError("proposal declined")

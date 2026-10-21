@@ -1436,7 +1436,7 @@ async def test_curator_reserve_exhaustion_completes_without_more_paid_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from _fakes.curators import MergeAll
+    from _fakes.curators import MergeAll, PaidReplanner
     from _fakes.engine import with_executor
     from _fakes.run import events
 
@@ -1444,10 +1444,15 @@ async def test_curator_reserve_exhaustion_completes_without_more_paid_work(
     from swarm_arena._budget.amount import Amount
     from swarm_arena._budget.llm_scope import current_llm_scope
 
+    remaining: list[float] = []
+
     async def curate(*args: Any, **kwargs: Any) -> Any:
         scope = current_llm_scope()
         assert scope is not None
-        await scope.tranche.reserve_call(Amount(usd=100))
+        try:
+            await scope.tranche.reserve_call(Amount(usd=100))
+        finally:
+            remaining.append(scope.tranche._ledger.remaining("g/:curator").usd)
         pytest.fail("unfunded work dispatched")
 
     monkeypatch.setattr(MergeAll, "curate", curate)
@@ -1457,13 +1462,21 @@ async def test_curator_reserve_exhaustion_completes_without_more_paid_work(
         ),
         workspace_root=str(tmp_path / "ws"),
     )
-    await Swarm(config).run(_curator_plan())
+    replanner = PaidReplanner()
+    await Swarm(config, replanner=replanner).run(_curator_plan())
     receipts = events(config, "curated")
     assert len(receipts) == 1
     assert receipts[0].payload["summaries"] == []
     assert receipts[0].payload["errors"] == ["curator limit: budget"]
     assert len(events(config, "tool_start")) == 1
     assert events(config, "goal_finished")[-1].payload["reason"] == "reserve_exhausted"
+
+    assert len(remaining) == 1
+    assert remaining[0] > 0
+    assert replanner.calls == 0
+    assert events(config, "round_closed")[0].payload["replan"] is False
+    assert not [e for e in events(config, "reserve") if e.seq > receipts[0].seq]
+    assert not [e for e in events(config, "settle") if e.seq > receipts[0].seq]
 
 
 @pytest.mark.parametrize(

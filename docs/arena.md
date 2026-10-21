@@ -333,6 +333,10 @@ results. Ordinary failures produce type-only diagnostics; genuine core budget
 and fencing signals retain their control behavior. Pending unknown calls are
 charged conservatively when the tranche closes.
 
+A curator reserve refusal ends ordinary rounds with `reserve_exhausted` and
+selects from existing candidates. It does not schedule a replan, even when the
+refused request leaves funds available in the ledger.
+
 A successful preparation publishes all summary `learning` events and one
 `curated` receipt together, without an await between their appends. Its plain
 v1 payload contains `summaries` (IDs), `supersedes` (summary ID to source IDs),
