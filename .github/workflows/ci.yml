@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read  # pr-verify reads the push run of the PR head
 
 # A newer push to the same branch (or a new commit on the same PR) cancels the older run.
 concurrency:
@@ -88,3 +89,29 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-groups
       - run: uv run pytest -q --durations=25
+
+  pr-verify:
+    # Same-repository PRs reuse the push run of their head commit instead of running
+    # every job twice. Fail closed unless that push run completed successfully.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Wait for the push run of the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for _ in $(seq 1 110); do
+            state=$(gh run list -R "$REPO" --workflow CI --event push --commit "$SHA" \
+              --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"' || true)
+            echo "push run for $SHA: ${state:-none}"
+            case "$state" in
+              "completed success") exit 0 ;;
+              completed*) exit 1 ;;
+            esac
+            sleep 60
+          done
+          echo "no completed push run for $SHA"
+          exit 1
