@@ -146,6 +146,8 @@ parent IDs. Each header names the ranking judge and the first eight characters
 of its rubric and panel hashes. Main views include a block for each scored part
 under that part's own judge; part views show only their own leaderboard.
 A candidate's latest visible human accept/reject verdict appears on its row.
+Group membership follows the fixed GoalKey capability, including candidates
+recorded under another run's different part name. Their recorded provenance is preserved.
 
 Pinned learning titles come first, followed by up to ten other titles in the
 view's relevance order. These lists cover the whole namespace, including other

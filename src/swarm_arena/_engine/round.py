@@ -14,7 +14,7 @@ from swarm_arena._agent.tool_run import Inflight, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.arena import ArenaView, past_run_repeat_entries
 from swarm_arena._board.base import Board, BoardView
-from swarm_arena._board.digest import build_digest
+from swarm_arena._board.digest import _digest_group_views, build_digest
 from swarm_arena._board.leaderboard import group_judges
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
@@ -267,6 +267,10 @@ class _SeedView(BoardView):
     def leaderboard(self, goal: GoalKey, *, judge: str) -> list[Row]:
         """Keep leaderboard reads restricted to the own group."""
         return self._view.leaderboard(goal, judge=judge)
+
+    def _digest_group_views(self) -> dict[str | None, BoardView] | None:
+        """Keep the underlying snapshot's fixed ranking-group capabilities."""
+        return _digest_group_views(self._view)
 
     def _visible_candidate_ids(self) -> frozenset[str]:
         return self._view._visible_candidate_ids() | self._parents.keys()

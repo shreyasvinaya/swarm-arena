@@ -1,5 +1,5 @@
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +8,9 @@ from _fakes.board import KEY, seed_board
 from _fakes.board import candidate as _c
 from _fakes.board import learning as _learning
 from _fakes.board import score as _score
+from _fakes.journals import FakeRun, add_pointer
 
+from swarm_arena import Plan
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.digest import (
     UNTRUSTED_CLOSE,
@@ -16,6 +18,8 @@ from swarm_arena._board.digest import (
     build_digest,
     estimate_tokens,
 )
+from swarm_arena._engine.round import _SeedView
+from swarm_arena._journal.event import EventDraft
 from swarm_arena.board import BoardView
 
 
@@ -549,3 +553,107 @@ def test_goal_scope_rejected_even_without_ranking(make_board: Callable[..., Aren
     with pytest.raises(ValueError, match="goal outside board snapshot") as caught:
         build_digest(view, goal=goal, run_id="run-1", round=1, ranking={}, cap_tokens=1500)
     assert_secret_absent(caught.value, "SECRET-SCOPE-SENTINEL")
+
+
+def _phase(run: FakeRun, number: int, closed: bool = False) -> EventDraft:
+    return EventDraft(
+        type="round_closed" if closed else "round_started",
+        goal_id=run.goal.id,
+        round=number,
+        payload={"round": number},
+    )
+
+
+def _review_digest(view: BoardView) -> str:
+    return build_digest(
+        view,
+        goal=view.goal,
+        run_id="owner",
+        round=3,
+        ranking={None: "j", "a": "j", "b": "j"},
+        cap_tokens=10000,
+    )
+
+
+@pytest.mark.parametrize("change", ["inputs", "manifest"])
+def test_revised_part_key(tmp_path: Path, change: str) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "owner")
+    initial = run.plan(parts=["a", "b"])
+    old_key = Plan.model_validate(initial.payload["plan"]).parts[0].goal.key()
+    run.commit(
+        initial, _phase(run, 1), run.candidate("old", part="a"), run.score("s-old", "old", 100)
+    )
+    arena = str(tmp_path / "arena")
+    add_pointer(arena, run)
+    board = ArenaBoard(arena_root=arena, cache_dir=str(tmp_path / "cache"))
+    board.open("owner", run.run_root, ["toy"])
+    try:
+        frozen = board.snapshot(run.goal.key(), board.frontier())
+        revision = run.plan(revision=1, parts=["a"], first_round=3)
+        subgoal = revision.payload["plan"]["parts"][0]["goal"]
+        if change == "inputs":
+            subgoal["inputs"] = {"version": 2}
+        else:
+            subgoal["files"] = {"globs": [], "manifest": {"input.txt": "a" * 64}}
+        run.commit(_phase(run, 1, True), revision)
+        pending = board.snapshot(run.goal.key(), board.frontier())
+        assert "1. old " in _review_digest(pending)
+        run.commit(
+            _phase(run, 3), run.candidate("new", part="a", round=3), run.score("s-new", "new", 1)
+        )
+        current = board.snapshot(run.goal.key(), board.frontier())
+        sibling = current._sibling_view("a")
+        for view in (current, sibling, _SeedView(current, {}), _SeedView(sibling, {})):
+            text = _review_digest(view)
+            assert "1. new " in text
+            assert " old " not in text
+            assert "Part b " not in text
+        assert "1. old " in _review_digest(frozen)
+        history = board.snapshot(old_key, board.frontier())
+        assert "1. old " in _review_digest(history)
+    finally:
+        board.close()
+
+
+@pytest.mark.parametrize("ranking", ["j", {None: "j", "a": "j"}])
+@pytest.mark.parametrize("kind", ["main", "part", "wrapped_main", "wrapped_part"])
+def test_equal_key_different_part_label(
+    tmp_path: Path, kind: str, ranking: str | Mapping[str | None, str]
+) -> None:
+    own = FakeRun(str(tmp_path / "runs"), "owner")
+    own_plan = own.plan(parts=["a"])
+    own.commit(own_plan)
+    peer = FakeRun(str(tmp_path / "runs"), "peer")
+    peer_plan = peer.plan(parts=["b"])
+    peer_plan.payload["plan"]["parts"][0]["goal"] = own_plan.payload["plan"]["parts"][0]["goal"]
+    peer.commit(peer_plan, peer.candidate("shared", part="b"), peer.score("s-shared", "shared", 5))
+    arena = str(tmp_path / "arena")
+    add_pointer(arena, own)
+    add_pointer(arena, peer)
+    board = ArenaBoard(arena_root=arena, cache_dir=str(tmp_path / "cache"))
+    board.open("owner", own.run_root, ["toy"])
+    try:
+        main = board.snapshot(own.goal.key(), board.frontier())
+        sibling = main._sibling_view("a")
+        assert [c.id for c in sibling.best(sibling.goal, 5, judge="j")] == ["shared"]
+        rows = sibling.leaderboard(sibling.goal, judge="j")
+        assert [(r.candidate_id, r.part) for r in rows] == [("shared", "b")]
+        selected = main if kind.endswith("main") else sibling
+        if kind.startswith("wrapped_"):
+            selected = _SeedView(selected, {})
+        text = build_digest(
+            selected, goal=selected.goal, run_id="owner", round=1, ranking=ranking, cap_tokens=10000
+        )
+        assert "1. shared " in text
+        if kind.endswith("main"):
+            assert "Part a (j, " in text
+            assert "Part b " not in text
+            assert "shared" not in text.split("Part a", 1)[0]
+        else:
+            assert not any(line.startswith("Part ") for line in text.splitlines())
+        assert selected.get_candidate("shared").part == "b"
+        assert [(r.candidate_id, r.part) for r in sibling.leaderboard(sibling.goal, judge="j")] == [
+            ("shared", "b")
+        ]
+    finally:
+        board.close()

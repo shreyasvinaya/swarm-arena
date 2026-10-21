@@ -2,8 +2,9 @@
 
 import sys
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Protocol, runtime_checkable
 
+from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.base import BoardView
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._model.board_types import Row
@@ -48,6 +49,29 @@ def _clip(text: str, cap: int) -> str:
     return text.encode("utf-8")[:cap].decode("utf-8", errors="ignore")
 
 
+@runtime_checkable
+class _DigestGroups(Protocol):
+    """Preserve fixed group capabilities through identifier-read wrappers."""
+
+    def _digest_group_views(self) -> dict[str | None, BoardView] | None:
+        """Return the wrapped view's fixed groups, if provided."""
+        ...
+
+
+def _digest_group_views(view: BoardView) -> dict[str | None, BoardView] | None:
+    """Select declared sibling capabilities without changing recorded labels."""
+    if isinstance(view, _DigestGroups):
+        return view._digest_group_views()
+    if not isinstance(view, ArenaView):
+        return None
+    if view.part is not None:
+        return {view.part: view}
+    return {
+        None: view,
+        **{part: view._sibling_view(part) for part in view._ranking_judges() if part is not None},
+    }
+
+
 def build_digest(
     view: BoardView,
     *,
@@ -72,7 +96,8 @@ def build_digest(
     Parameters
     ----------
     view : BoardView
-        Fixed goal snapshot with namespace-wide learning reads.
+        Fixed goal snapshot with namespace-wide learning reads. Arena groups
+        use fixed sibling capabilities; recorded part labels remain provenance.
     goal : GoalKey
         Snapshot goal identity.
     run_id : str
@@ -115,24 +140,40 @@ def build_digest(
     if goal != view.goal:
         raise ValueError("goal outside board snapshot")
     part = getattr(view, "part", None)
+    group_views = _digest_group_views(view)
     by_judge: dict[str, list[Row]] = {}
 
     def rows_for(group: str | None) -> list[Row]:
-        """Read each judge once through the fixed view's selected identities."""
+        """Select rows by the group's ranked candidate IDs, never recorded labels."""
         judge = ranking if isinstance(ranking, str) else ranking.get(group)
-        if judge is None:
+        scoped = view if group_views is None else group_views.get(group)
+        if judge is None or scoped is None:
             return []
-        if judge not in by_judge:
-            by_judge[judge] = view.leaderboard(goal, judge=judge)
-        return [row for row in by_judge[judge] if row.part == group][: max(0, k)]
+        selected = {
+            candidate.id
+            for candidate in scoped.best(
+                scoped.goal,
+                max(0, k),
+                judge=judge,
+                part=group if group_views is None else None,
+            )
+        }
+        if scoped is view:
+            if judge not in by_judge:
+                by_judge[judge] = scoped.leaderboard(scoped.goal, judge=judge)
+            rows = by_judge[judge]
+        else:
+            rows = scoped.leaderboard(scoped.goal, judge=judge)
+        return [row for row in rows if row.candidate_id in selected]
 
     main_rows = rows_for(part)
     if part is not None:
         parts: dict[str, list[Row]] = {}
     else:
-        if isinstance(ranking, str):
-            # The first read also discovers groups for a custom main BoardView.
-            rows_for(None)
+        if group_views is not None:
+            names = {name for name in group_views if name is not None}
+        elif isinstance(ranking, str):
+            # Custom connectors discover labels here, but best() selects membership.
             names = {row.part for row in by_judge.get(ranking, []) if row.part is not None}
         else:
             names = {name for name in ranking if name is not None}
