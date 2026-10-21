@@ -13,6 +13,7 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
+from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
 from swarm_arena._journal.a2a import agent_task_id
@@ -769,7 +770,7 @@ class AgentContext:
         refines : Sequence[str], default=()
             Visible learnings refined by this one.
         duplicate_reason : str or None, default=None
-            Accepted for compatibility; duplicate detection arrives in M2.
+            Nonblank explanation permitting a near-duplicate without refines.
 
         Returns
         -------
@@ -804,6 +805,7 @@ class AgentContext:
         ...     round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
         >>> rt.view.get_candidate.return_value = candidate
         >>> import anyio
+        >>> rt.view.search_learnings.return_value = []
         >>> rt.repeats.run_id = "r"
         >>> rt.ids.next.return_value = "L-1"
         >>> rt.journal.append.return_value = Mock(epoch=1, seq=2)
@@ -832,16 +834,23 @@ class AgentContext:
             )
         except ValidationError as error:
             raise _core_signal(
-                SoftError(f"invalid learning: {validation_summary(error)}")
+                SoftError(f"invalid learning: {validation_summary(error)}. {LEARNING_GUIDE}")
             ) from None
-        for id in learning.evidence:
-            self._candidate(id)
-        for id in learning.refines:
-            self._learning(id)
+        verified = vet_learning(
+            rt.view,
+            rt.own,
+            namespace=learning.namespace,
+            author=learning.author,
+            title=learning.title,
+            text=learning.text,
+            evidence=learning.evidence,
+            refines=learning.refines,
+            duplicate_reason=duplicate_reason,
+        )
         if rt.counters.learnings >= rt.limits.max_learnings_per_agent_round:
             raise _core_signal(SoftError("max_learnings_per_agent_round reached"))
         rt.counters.learnings += 1
-        learning = learning.model_copy(update={"id": rt.ids.next("L")})
+        learning = learning.model_copy(update={"id": rt.ids.next("L"), "verified": verified})
         event = rt.journal.append(
             self._event(EventType.LEARNING, {"learning": learning.model_dump(mode="json")})
         )

@@ -117,6 +117,45 @@ Lineage holds one shared frontier read scope per namespace and queries ancestor
 IDs in breadth-first batches. Each requested ancestor is looked up at most once,
 including missing parents and cycles; temporary sets are released on exit.
 
+## Posting learnings
+
+Use `await ctx.post_learning(title, text, evidence, ...)` to share a result.
+Titles must be nonempty single-line text of at most 120 characters after trimming;
+control characters and Unicode line separators are refused. The Markdown body
+can contain at most 1,500 characters. Title and body validation errors include
+the posting guide, `LEARNING_GUIDE`:
+
+> Write for a colleague: what you tried, what happened, and the number.
+
+Every agent post needs candidate evidence from its fixed round-start view or
+its own items from this round. Other agents' new items become available after
+the round barrier. Human authors (`human:`) may post without evidence.
+`verified` is set by the core when at least one supporting candidate is complete,
+has status `ok`, and has no failed checks. Partial, failed, or gated-out evidence
+can support an observation without verifying it.
+
+The duplicate check compares lowercase title word tokens with the top bm25
+search hit in the same view and with the agent's own visible learnings. A Jaccard
+similarity of at least 0.6 requires either `refines` naming a detected duplicate
+or a nonblank `duplicate_reason`. An unrelated refinement does not satisfy the
+rule. Hidden learnings do not participate. Duplicate refusals identify learning
+IDs without echoing titles or bodies.
+
+```python
+learning = await ctx.post_learning(
+    title="Fitting log(nu) converged in 8 iterations",
+    text="The raw-nu fit took 24 iterations on the same grid.",
+    evidence=[candidate.id],
+    refines=[previous_learning.id],
+)
+```
+
+Posting charges one action turn. Invalid posts allocate no learning ID and do
+not consume the learning quota. The `max_learnings_per_agent_round` cap remains
+a soft error, allowing other actions to continue. `ScriptedManager` supplies
+`duplicate_reason="scripted manager: one learning per round"` when posting its
+best visible scored evidence each round.
+
 ## The local cache
 
 Pass `cache_dir` to choose the directory. Otherwise the board uses

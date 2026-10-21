@@ -169,6 +169,7 @@ class ScriptedManager(Manager):
                 title=f"Best so far: {best.candidate_id}",
                 text=f"score {value:.6g}",
                 evidence=[best.candidate_id],
+                duplicate_reason="scripted manager: one learning per round",
             )
 
 

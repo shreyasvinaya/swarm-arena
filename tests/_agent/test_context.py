@@ -14,6 +14,7 @@ from swarm_arena import FunctionTool, Limits, Score
 from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._board.base import BoardView
+from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import SoftError
@@ -122,6 +123,85 @@ async def test_learning_rules(ctx_env: CtxEnv) -> None:
         with pytest.raises(SoftError):
             await ctx.post_learning(title, text, evidence)
     assert ctx_env.counters.learnings == 0
+
+
+@pytest.mark.parametrize("verified", [False, True])
+async def test_post_learning_sets_verified_from_evidence(ctx_env: CtxEnv, verified: bool) -> None:
+    c = _candidate().model_copy(update={"output": ToolOutput(status="ok", partial=not verified)})
+    ctx = ctx_env.ctx(own=[c])
+    posted = await ctx.post_learning("Measured result", "Converged in 8 iterations.", [c.id])
+    assert posted.verified is verified
+    assert ctx_env.events("learning")[-1].payload["learning"]["verified"] is verified
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 0)
+
+
+async def test_post_learning_duplicate_is_soft_error(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    view = await _snapshot(ctx_env, candidates=(_candidate(),), learnings=(_learning(),))
+    ctx = ctx_env.ctx(view=view)
+    allocate = Mock(wraps=ctx._rt.ids.next)
+    monkeypatch.setattr(ctx._rt.ids, "next", allocate)
+    before = len(ctx_env.events("learning"))
+    with pytest.raises(SoftError, match="near-duplicate of L-1"):
+        await ctx.post_learning("baseline", "Measured again.", ["c-old"])
+    assert ctx_env.counters.learnings == 0
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 0)
+    assert len(ctx_env.events("learning")) == before
+    allocate.assert_not_called()
+    assert ctx._rt.own == []
+    assert (
+        await ctx.post_learning("baseline", "8 iterations.", ["c-old"], refines=["L-1"])
+    ).verified
+
+
+@pytest.mark.parametrize("attack", ["none", "mutate", "impostor"])
+@pytest.mark.parametrize("failure", ["title", "text", "duplicate"])
+async def test_post_learning_guide_survives_action_boundary_safely(
+    ctx_env: CtxEnv, attack: str, failure: str
+) -> None:
+    import traceback
+
+    ctx = ctx_env.ctx(own=[_candidate(), _learning(title=SECRET)])
+    originals: list[SoftError] = []
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        try:
+            await context.post_learning(
+                SECRET + ("\n" if failure == "title" else ""),
+                SECRET * 100 if failure == "text" else "body",
+                ["c-old"],
+            )
+        except SoftError as error:
+            originals.append(error)
+            if attack == "none":
+                raise
+            unsafe = SoftError(SECRET) if attack == "impostor" else error
+            unsafe.args = (SECRET,)
+            unsafe.add_note(SECRET)
+            raise unsafe from RuntimeError(SECRET)
+        return None
+
+    ctx.actions = (Action(name="post", description="Post", input_model=EmptyArgs, handler=handler),)
+    with pytest.raises(SoftError) as caught:
+        await ctx.call_action("post", {})
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
+    assert SECRET not in "".join(traceback.format_exception(caught.value))
+    assert caught.value is not originals[0]
+    if attack == "impostor":
+        assert str(caught.value) == "action failed: SoftError"
+    elif failure == "duplicate":
+        assert str(caught.value).startswith("near-duplicate of L-1")
+    else:
+        assert str(caught.value).endswith(LEARNING_GUIDE)
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads, ctx_env.counters.learnings) == (
+        1,
+        0,
+        0,
+    )
+    assert ctx_env.events("learning") == []
 
 
 async def test_notes_cap_and_carry(ctx_env: CtxEnv) -> None:

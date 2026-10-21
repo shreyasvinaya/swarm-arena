@@ -102,6 +102,21 @@ async def test_post_learnings_cites_best_own_candidate() -> None:
     ]
 
 
+async def test_scripted_manager_posts_every_round() -> None:
+    manager = ScriptedManager(
+        ScriptedManager.Config(
+            requests=[ScriptedManager.Request(inputs={"x": 3.0}, round=1)],
+            post_learnings=True,
+        )
+    )
+    # Round one establishes scored evidence for both subsequent posting rounds.
+    harness = await _run(manager, rounds=3)
+    assert [item.round for item in harness.learnings] == [2, 3]
+    assert len({item.title for item in harness.learnings}) == 1
+    assert all(item.verified for item in harness.learnings)
+    assert [item.evidence for item in harness.learnings] == [[harness.candidates[0].id]] * 2
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -161,6 +176,7 @@ async def test_learning_selects_greatest_own_key_and_falls_back_to_key_value() -
         title="Best so far: second",
         text="score -1",
         evidence=["second"],
+        duplicate_reason="scripted manager: one learning per round",
     )
 
 
