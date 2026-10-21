@@ -249,6 +249,7 @@ class RunRunner:
         self._stop_mode = 0
         self.resumed = resumed
         self._used = False
+        self._queue_changed = anyio.Event()
 
     async def run(self) -> dict[str, list[Candidate]]:
         """
@@ -510,7 +511,13 @@ class RunRunner:
         if self.resumed is not None:
             await self.resumed._services._aclose()
 
+    def _wake_queue(self) -> None:
+        self._queue_changed.set()
+
     async def _drive(self, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
+        assert deps.admission is not None
+        deps.admission.on_change = self._wake_queue
+        deps.stops.on_change = self._wake_queue
         result: dict[str, list[Candidate]] = {}
         with anyio.CancelScope() as scope:
             async with anyio.create_task_group() as watchers:
@@ -605,9 +612,11 @@ class RunRunner:
             out = await runner.run()
             results[runner.goal_id] = out.finalists
             active.pop(runner.goal_id)
+            self._wake_queue()
 
         async with anyio.create_task_group() as goals:
             while queued or active:
+                changed = self._queue_changed = anyio.Event()
                 await self._record_stops(deps)
                 if self._stopping(deps):
                     for runner in list(queued):
@@ -643,5 +652,5 @@ class RunRunner:
                     active[runner.goal_id] = runner
                     goals.start_soon(run_goal, runner)
                 if queued or active:
-                    await anyio.sleep(0.02)
+                    await changed.wait()
         return {p.goal.id: results[p.goal.id] for p in self.plans}

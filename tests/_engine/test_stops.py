@@ -68,3 +68,20 @@ def test_run_clock_counts_only_running_time() -> None:
 def test_round_deadline_single_time_basis() -> None:
     assert round_deadline(1000.0, 5.0, 2.0) == 1002.0
     assert round_deadline(1000.0, 5.0, 86_400.0) == 1005.0
+
+
+@pytest.mark.parametrize("flag", ["stop", "stop_now", "run_timeout", "run_budget"])
+async def test_run_stop_latch_wakes_scheduler_once(flag: str) -> None:
+    changed = anyio.Event()
+    notifications: list[str] = []
+
+    def notify() -> None:
+        notifications.append(flag)
+        changed.set()
+
+    state = StopState(on_change=notify)
+    setattr(state, flag, True)
+    with anyio.fail_after(1):
+        await changed.wait()
+    setattr(state, flag, True)
+    assert notifications == [flag]

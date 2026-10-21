@@ -28,6 +28,8 @@ class StopState:
         Run work budget is exhausted.
     goal_budget : set[str], optional
         Goals whose work budgets are exhausted.
+    on_change : Callable or None, default=None
+        Notify the scheduler when a run-wide stop flag becomes true.
 
     Examples
     --------
@@ -41,6 +43,18 @@ class StopState:
     run_timeout: bool = False
     run_budget: bool = False
     goal_budget: set[str] = field(default_factory=set)
+    on_change: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Wake scheduling only for a newly latched run-wide stop."""
+        latched = (
+            name in {"stop", "stop_now", "run_timeout", "run_budget"}
+            and value is True
+            and not getattr(self, name, False)
+        )
+        object.__setattr__(self, name, value)
+        if latched and (notify := getattr(self, "on_change", None)) is not None:
+            notify()
 
     def gate_for(self, goal_id: str) -> Callable[[], LimitReached | None]:
         """

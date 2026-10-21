@@ -21,6 +21,11 @@ class RunAdmission:
         Admitted plans, including queued and finished goals. Their latest
         identities remain reserved after capacity is released.
 
+    Attributes
+    ----------
+    on_change : Callable or None
+        Optional scheduler notification when reserved capacity decreases.
+
     Examples
     --------
     >>> admission = RunAdmission(4)
@@ -32,6 +37,7 @@ class RunAdmission:
         """Initialize one lock and independent reservations for this run."""
         self.max_agents_total = max_agents_total
         self._lock = anyio.Lock()
+        self.on_change: Callable[[], None] | None = None
         self._peaks: dict[str, int] = {}
         self._identities = {plan.goal.id: self._keys(plan) for plan in plans}
 
@@ -95,9 +101,12 @@ class RunAdmission:
             with anyio.CancelScope(shield=True):
                 if publish is not None:
                     await publish()
+                previous = self._peaks.get(goal_id, 0)
                 self._peaks[goal_id] = peak
                 if keys is not None:
                     self._identities[goal_id] = keys
+                if peak < previous and self.on_change is not None:
+                    self.on_change()
 
     async def release(self, goal_id: str) -> None:
         """
@@ -114,4 +123,6 @@ class RunAdmission:
         >>> anyio.run(RunAdmission(2).release, "g")
         """
         async with self._lock:
-            self._peaks.pop(goal_id, None)
+            previous = self._peaks.pop(goal_id, 0)
+            if previous and self.on_change is not None:
+                self.on_change()
