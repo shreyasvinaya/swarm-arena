@@ -329,14 +329,12 @@ async def resume_run(
 
     Raises
     ------
-    PlanError
-        A goal's agent peak exceeds the requested run-wide limit.
     ValueError
-        The journal is missing or a budget cap decreases.
-    LeaseHeld
-        A live owner requires explicit force.
-    Fenced
-        A competing resume advances the epoch.
+        A goal's agent peak exceeds the run-wide limit, the journal is missing
+        or has an invalid replay payload, or a budget cap decreases.
+    RuntimeError
+        A live owner requires force, a competing resume advances the epoch,
+        or a runtime service fails.
 
     Examples
     --------

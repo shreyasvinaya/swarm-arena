@@ -175,6 +175,11 @@ start and report `NO_RESULT` with reason `stopped`. A stop arriving during
 convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
 
+A graceful stop that preempts the round policy journals the default `Decision()`
+without pruning. If a stop or deadline cuts a judging barrier short, candidates
+that have no ranking score stay unranked even after resume. The round closes,
+and later rounds judge their own outputs without rejudging those candidates.
+
 After `stop --now` or the run deadline, final judging gets at most
 `settle_timeout_s` (60 s by default). If cut short, selection uses available
 committed ranking evidence and records judge errors; it cannot wait forever for

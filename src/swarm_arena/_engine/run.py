@@ -269,12 +269,11 @@ class RunRunner:
 
         Raises
         ------
-        PlanError
+        ValueError
             If admission fails or goal identifiers repeat.
         RuntimeError
-            If the backend, estimates, approval or preflight refuses the run.
-        Fenced
-            If ownership is lost. In-flight work is cancelled before returning.
+            If the backend, estimates, approval or preflight refuses the run,
+            or ownership is lost. In-flight work is cancelled before returning.
 
         Notes
         -----

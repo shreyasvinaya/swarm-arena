@@ -1145,7 +1145,10 @@ class GoalRunner:
         abandoned on any stop. After an immediate stop or run deadline,
         barrier judging, converge slot preparation and final judging have
         ``settle_timeout_s`` to finish; on timeout, selection uses only previously
-        journaled ranking scores.
+        journaled ranking scores. A graceful stop that preempts the policy
+        journals the default ``Decision()`` without pruning. Candidates left
+        unjudged when a round's barrier is cut short stay unranked on resume;
+        later rounds do not rejudge those closed-round candidates.
         Policy checkpoints complete an unfinished round without repeating its
         managers or barrier. Round closure commits before replanning; revisions
         and rejections identify the first round to which they apply. Recovery
