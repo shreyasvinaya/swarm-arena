@@ -1,10 +1,37 @@
 """Display the committed, non-LLM history behind a candidate."""
 
+from collections.abc import Sequence
+
 from swarm_arena._board.arena import ArenaBoard, _namespace_frontier
 from swarm_arena._board.cache import ArenaCache, LearningFilter
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._model.board_types import Frontier
+from swarm_arena._model.plan import Plan
 from swarm_arena._model.results import Candidate
+
+
+def _historical_plan(
+    cache: ArenaCache,
+    frontier: Frontier,
+    candidate: Candidate,
+    seq: int,
+    revisions: Sequence[Plan],
+) -> tuple[Plan, str]:
+    """Select within the candidate prefix using published plan models."""
+    projection = cache._plan_projection(
+        frontier,
+        candidate.run_id,
+        candidate.goal_id,
+        through_seq=seq,
+        revisions=revisions,
+    )
+    plan = projection.plan_for_round(candidate.goal_id, candidate.round)
+    origin = next(
+        origin
+        for recorded, origin in projection.plans[candidate.goal_id]
+        if recorded.revision == plan.revision
+    )
+    return plan, origin
 
 
 def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
@@ -14,8 +41,8 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     Parameters
     ----------
     board : ArenaBoard
-        Open arena reader. Capture its latest frontier once if needed; an
-        already captured frontier stays fixed until explicitly refreshed.
+        Open arena reader. Read its published generation; call ``frontier()``
+        explicitly to publish initial or refreshed committed state.
     candidate_id : str
         Candidate identifier in a committed source run.
 
@@ -30,14 +57,18 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     Raises
     ------
     KeyError
-        If the candidate is absent from the committed frontier. Process-local
-        hints and orphaned journal segments do not count.
+        If the candidate is absent from the published frontier, including before
+        the first publication. Process-local hints and orphaned segments do
+        not count.
 
     Notes
     -----
     Reads never import producer plugins or re-admit historical plans. Scores
     are displayed in recorded position order without ranking or identity
     replacement. Planner, manager and tool-internal LLM calls are not included.
+    Retained plan models come from one captured generation; exact committed
+    mark and candidate source prefix restrict their round-applicable selection.
+    Reads do not replay history, refresh storage or initialize cache readers.
 
     Examples
     --------
@@ -45,28 +76,30 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     >>> lines[0].startswith("plan     ")  # doctest: +SKIP
     True
     """
-    with board._lock:
-        frontier = board._latest_frontier()
-        for namespace in board._namespaces:
-            cache = board._cache(namespace)
-            scoped = _namespace_frontier(frontier, namespace)
+    state = board._read_state()
+    for namespace in state.namespaces:
+        cache = state.readers.get(namespace)
+        if cache is None:
+            continue
+        scoped = _namespace_frontier(state.frontier, namespace)
+        with cache._lock, cache._frontier(scoped):
             candidates = cache.candidates(scoped, ids=[candidate_id])
             if candidates:
                 candidate, position = candidates[0]
-                return _lines(cache, scoped, candidate, position[2])
+                revisions = state.plans[candidate.run_id].revisions[candidate.goal_id]
+                return _lines(cache, scoped, candidate, position[2], revisions)
     raise KeyError(candidate_id)
 
 
-def _lines(cache: ArenaCache, frontier: Frontier, candidate: Candidate, seq: int) -> list[str]:
+def _lines(
+    cache: ArenaCache,
+    frontier: Frontier,
+    candidate: Candidate,
+    seq: int,
+    revisions: Sequence[Plan],
+) -> list[str]:
     """Render one committed candidate without consulting process-local hints."""
-    plan = cache._plan_for_round(
-        candidate.run_id, candidate.goal_id, candidate.round, through_seq=seq
-    )
-    origin = next(
-        origin
-        for recorded, origin, plan_seq in cache.plans(frontier, candidate.run_id, candidate.goal_id)
-        if recorded.revision == plan.revision and plan_seq < seq
-    )
+    plan, origin = _historical_plan(cache, frontier, candidate, seq, revisions)
     rationale = next(
         (
             agent.rationale
