@@ -788,6 +788,101 @@ async def test_cancelled_takeover_releases_undelivered_lease(
                     await run_sync_daemon(lease.release)
 
 
+@pytest.mark.parametrize("operation", ["import", "resume"])
+async def test_cancelled_writer_entry_releases_lease_once(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import asyncio
+    import threading
+
+    import anyio
+
+    from swarm_arena._engine import resume
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._journal.writer import JournalWriter
+    from swarm_arena._model.canonical import utc_now
+
+    config = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    entered = anyio.Event()
+    duplicate, unblock = threading.Event(), threading.Event()
+    scopes: list[anyio.CancelScope] = []
+    services: list[resume._ResumeServices] = []
+    leases: list[Lease] = []
+    releases: list[Lease] = []
+    workers: list[threading.Thread] = []
+    original_enter = JournalWriter.__aenter__
+    original_release = Lease.release
+    original_serve = resume._ResumeServices._serve_owned
+    before = _events(review_run.store)
+    path = _file(tmp_path)
+
+    async def serve(self: resume._ResumeServices) -> None:
+        services.append(self)
+        await original_serve(self)
+
+    async def enter(self: JournalWriter) -> JournalWriter:
+        writer = await original_enter(self)
+        leases.append(self._lease)
+        scope = scopes[0] if operation == "import" else services[0].preparation_scope
+        assert scope is not None
+        scope.cancel()
+        entered.set()
+        return writer
+
+    def release(self: Lease) -> None:
+        if any(self is lease for lease in leases):
+            releases.append(self)
+            if len(releases) > 1:
+                workers.append(threading.current_thread())
+                duplicate.set()
+                assert unblock.wait(5), "duplicate release cleanup deadline"
+        original_release(self)
+
+    async def caller() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            if operation == "import":
+                await HumanReview("alice").import_csv(review_run.run_id, path, config=config)
+            else:
+                runner = await resume.resume_run(
+                    config, review_run.run_id, force=False, replanner=None
+                )
+                await runner.aclose()
+
+    monkeypatch.setattr(JournalWriter, "__aenter__", enter)
+    monkeypatch.setattr(Lease, "release", release)
+    monkeypatch.setattr(resume._ResumeServices, "_serve_owned", serve)
+    task = asyncio.create_task(caller())
+    try:
+        with anyio.fail_after(5):
+            await entered.wait()
+        done, _ = await asyncio.wait([task], timeout=10 * config.settle_timeout_s)
+        assert done, f"caller blocked after writer entry: {len(releases)} lease releases"
+        assert len(leases) == len(releases) == 1
+        assert not duplicate.is_set(), "owner started a second blocking cleanup"
+        owner = read_owner(review_run.store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+        assert _events(review_run.store) == before
+        assert all(service.task is not None and service.task.done() for service in services)
+    finally:
+        unblock.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        for service in services:
+            assert service.task is not None
+            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 5)
+        # AnyIO pool threads are reused, so drain their call via the owner task;
+        # daemon cleanup threads can additionally be joined.
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await run_sync_daemon(worker.join, 5)
+                assert not worker.is_alive()
+
+
 @pytest.mark.parametrize("operation", ["import", "export"])
 @pytest.mark.parametrize("site", ["create", "read"])
 @pytest.mark.parametrize("kind", ["raw", "registered", "fenced"])

@@ -222,7 +222,10 @@ the original names, IDs and canonical bytes. An existing object with different
 bytes stops recovery. Receipt repair, import publication, and completion export
 share the owning writer's fencing and cancellation lifetime. Blocking I/O is
 abandonable; an already started write can finish, but cancellation never starts
-the next publication.
+the next publication. Once the journal context enters, it alone releases the
+lease, including cancellation while writer supervision enters. Import and
+resume perform fallback release through the abandonable boundary only if the
+journal never entered.
 
 Retrying a CSV after a receipt committed creates a new
 review batch; recovery itself does not duplicate the original batch.

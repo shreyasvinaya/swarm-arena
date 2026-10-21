@@ -615,52 +615,53 @@ class HumanReview:
                 / "journals"
                 / f"{run_id}-e{lease.doc.epoch}.jsonl"
             )
-            async with (
-                JournalWriter(
-                    store,
-                    lease,
-                    run_id=run_id,
-                    next_seq=head.seq + 1,
-                    local_path=path,
-                    sync_interval_s=config.sync_interval_s,
-                ) as writer,
-                _supervise_writer(writer),
-            ):
+            async with JournalWriter(
+                store,
+                lease,
+                run_id=run_id,
+                next_seq=head.seq + 1,
+                local_path=path,
+                sync_interval_s=config.sync_interval_s,
+            ) as writer:
                 entered = True
-                state = await run_sync_daemon(_read_state, store, run_id, lease.doc)
-                scores = parse_review_csv(data, state, judge=self.judge_name)
-                arena = await run_sync_daemon(open_store, config.arena_root)
-                await _repair_review_objects(state, arena, store, lease, writer)
-                now = utc_now()
-                keys = await run_sync_daemon(
-                    _review_keys, state, self._reviewer, config.arena_root, now
-                )
-                ids = IdGen(run_id, lease.doc.epoch, counters=state.id_counters)
-                scores = [
-                    s.model_copy(
-                        update={
-                            "id": ids.next("s"),
-                            "batch_id": keys[state.candidate_goal_keys[s.candidate_id].namespace],
-                        }
+                # The journal owns release even if supervision entry is cancelled.
+                async with _supervise_writer(writer):
+                    state = await run_sync_daemon(_read_state, store, run_id, lease.doc)
+                    scores = parse_review_csv(data, state, judge=self.judge_name)
+                    arena = await run_sync_daemon(open_store, config.arena_root)
+                    await _repair_review_objects(state, arena, store, lease, writer)
+                    now = utc_now()
+                    keys = await run_sync_daemon(
+                        _review_keys, state, self._reviewer, config.arena_root, now
                     )
-                    for s in scores
-                ]
-                payload = {
-                    "reviewer": self._reviewer,
-                    "scores": [s.model_dump(mode="json") for s in scores],
-                    "objects": list(keys.values()),
-                }
-                _receipt_objects(payload, state=state)
-                proposed = EventDraft(type=EventType.REVIEW_IMPORTED, payload=payload)
-                writer.append(EventDraft(type=EventType.TAKEOVER, payload={"force": False}))
-                receipt = writer.append(proposed)
-                await writer.commit()
-                await _repair_review_objects(
-                    RunState.from_events([receipt]), arena, store, lease, writer
-                )
+                    ids = IdGen(run_id, lease.doc.epoch, counters=state.id_counters)
+                    scores = [
+                        s.model_copy(
+                            update={
+                                "id": ids.next("s"),
+                                "batch_id": keys[
+                                    state.candidate_goal_keys[s.candidate_id].namespace
+                                ],
+                            }
+                        )
+                        for s in scores
+                    ]
+                    payload = {
+                        "reviewer": self._reviewer,
+                        "scores": [s.model_dump(mode="json") for s in scores],
+                        "objects": list(keys.values()),
+                    }
+                    _receipt_objects(payload, state=state)
+                    proposed = EventDraft(type=EventType.REVIEW_IMPORTED, payload=payload)
+                    writer.append(EventDraft(type=EventType.TAKEOVER, payload={"force": False}))
+                    receipt = writer.append(proposed)
+                    await writer.commit()
+                    await _repair_review_objects(
+                        RunState.from_events([receipt]), arena, store, lease, writer
+                    )
             return scores
         finally:
             if not entered:
                 with anyio.CancelScope(shield=True):
                     with suppress(Fenced):
-                        await anyio.to_thread.run_sync(lease.release)
+                        await run_sync_daemon(lease.release)
