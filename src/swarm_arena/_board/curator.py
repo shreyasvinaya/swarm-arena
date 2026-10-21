@@ -23,6 +23,12 @@ class Curator(Configurable, ABC):
     Subclasses propose content and nonempty ``supersedes`` lists. The core
     validates proposals and supplies identity, routing, evidence and flags.
 
+    Synchronous curator hooks run in abandonable daemon threads. The engine
+    abandons their waits at stop-now and on timeouts; late results cannot
+    publish summaries. Async curator hooks run on the engine loop and must
+    cooperate with cancellation: they must not block the loop or shield their
+    waits. Use a synchronous hook when its body requires abandonment.
+
     Parameters
     ----------
     config : BaseModel or Mapping[str, Any] or None, optional

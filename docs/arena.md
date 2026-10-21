@@ -333,6 +333,12 @@ results. Ordinary failures produce type-only diagnostics; genuine core budget
 and fencing signals retain their control behavior. Pending unknown calls are
 charged conservatively when the tranche closes.
 
+Synchronous curator hooks run in abandonable daemon threads: the engine abandons
+their waits at stop-now and on timeouts. Async curator hooks run on the engine
+loop and must cooperate with cancellation. They must not block the loop or
+shield their waits; either can delay stop-now completion and is outside the
+abandonment guarantee. Use a synchronous hook when its body needs abandonment.
+
 A curator reserve refusal ends ordinary rounds with `reserve_exhausted` and
 selects from existing candidates. It does not schedule a replan, even when the
 refused request leaves funds available in the ledger.
