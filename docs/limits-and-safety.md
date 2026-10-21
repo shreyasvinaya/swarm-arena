@@ -289,4 +289,8 @@ settlement commit but before final selection is published, resume reuses the
 recorded order without another judge call or reservation. Error-only batches
 also retain their no-result reason. A different lifecycle, revision, judge, or
 candidate set requires a new final batch; ordinary barrier scores cannot stand
-in for final completion.
+in for final completion. Recovery checks the recorded final inputs before
+convergence ranks candidates or launches a team: final scores cannot reselect
+the input batch. The completion key also binds the committed candidate set at
+that boundary, so newly produced candidates invalidate reuse.
+

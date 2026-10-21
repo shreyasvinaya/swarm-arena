@@ -764,10 +764,8 @@ class GoalRunner:
                 await self._refresh()
         return True
 
-    async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
-        """Reuse this lifecycle's completed final batch, or rescore within stop grace."""
-        if not finalists:
-            return []
+    def _final_identity(self, finalists: Sequence[Candidate]) -> dict[str, Any]:
+        """Bind final inputs to the lifecycle, plan, judge and candidate boundary."""
         name = self._ranking_name(None)
         ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
         lifecycle = next(
@@ -778,26 +776,52 @@ class GoalRunner:
             ),
             None,
         )
-        batch_identity: dict[str, Any] = {
+        return {
             "goal_id": self.goal_id,
             "lifecycle": lifecycle,
             "revision": self.plan.revision,
             "ref": ref.model_dump(mode="json"),
             "members": sorted(c.id for c in finalists),
+            "candidates": sorted(
+                c.id for c in self.recorded.candidates.values() if c.goal_id == self.goal_id
+            ),
         }
-        key = sha256_hex(canonical_json(batch_identity))
+
+    def _recover_final(
+        self, finalists: Sequence[Candidate] | None = None
+    ) -> list[Candidate] | None:
+        """Restore completion before selection can consume its own final scores."""
         for event in reversed(self._events):
-            if (
+            if not (
                 event.goal_id == self.goal_id
                 and event.round == 0
                 and event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
                 and isinstance(record := event.payload.get("final_batch"), dict)
-                and record.get("key") == key
             ):
-                by_id = {candidate.id: candidate for candidate in finalists}
-                self.status, self.reason = record["status"], record["reason"]
-                self._stop()
-                return [by_id[id] for id in record["order"]]
+                continue
+            by_id = self.recorded.candidates
+            if not all(id in by_id for id in record["members"]):
+                continue
+            inputs = finalists if finalists is not None else [by_id[id] for id in record["members"]]
+            identity = self._final_identity(inputs)
+            if record["key"] != sha256_hex(canonical_json(identity)):
+                continue
+            self.status, self.reason = record["status"], record["reason"]
+            self._stop()
+            return [by_id[id] for id in record["order"]]
+        return None
+
+    async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
+        """Reuse this lifecycle's completed final batch, or rescore within stop grace."""
+        if not finalists:
+            return []
+        recovered = self._recover_final(finalists)
+        if recovered is not None:
+            return recovered
+        batch_identity = self._final_identity(finalists)
+        key = sha256_hex(canonical_json(batch_identity))
+        name = self._ranking_name(None)
+        ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
         tranche = self._tranche("final")
         scope = self._scope("judge", 0, tranche, final=True)
         reservation: Reservation | None = None

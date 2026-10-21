@@ -15,7 +15,9 @@ from swarm_arena.scoring import Judge, JudgeContext
 from tests._engine.test_goal import _plan
 
 
-@pytest.mark.parametrize("change", ["same", "revision", "members", "lifecycle", "judge"])
+@pytest.mark.parametrize(
+    "change", ["same", "revision", "members", "lifecycle", "judge", "candidates"]
+)
 @pytest.mark.parametrize("failed", [False, True])
 async def test_final_completion_has_its_own_identity(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, change: str, failed: bool
@@ -48,7 +50,11 @@ async def test_final_completion_has_its_own_identity(
     assert len(batches) == 1
     pool = [runner.recorded.candidates[id] for id in batches[0]]
     expected = [] if failed else [c.id for c in result.finalists]
-    if change == "revision":
+    assert [c.id for c in runner._recover_final() or []] == expected
+    if change == "candidates":
+        extra = pool[0].model_copy(update={"id": "new-input"})
+        runner.recorded.candidates[extra.id] = extra
+    elif change == "revision":
         runner.plan = runner.plan.model_copy(update={"revision": runner.plan.revision + 1})
     elif change == "members":
         pool = pool[:1]
@@ -62,6 +68,8 @@ async def test_final_completion_has_its_own_identity(
                 "ranking": "other",
             }
         )
+    if change not in {"same", "members"}:
+        assert runner._recover_final() is None
     runner.status, runner.reason = "finished", None
     selected = await runner._final(pool)
     assert len(batches) == (1 if change == "same" else 2)

@@ -34,14 +34,29 @@ class FinalFailureJudge(MeteredJudge):
         return scores
 
 
-def final_plan(root: Path, failed: bool) -> Plan:
+class FinalFlipJudge(MeteredJudge):
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        scores = await super().judge(goal, candidates, ctx)
+        return (
+            [score.model_copy(update={"key": tuple(-v for v in score.key)}) for score in scores]
+            if ctx.final
+            else scores
+        )
+
+
+def final_plan(root: Path, failed: bool, flip: bool = False) -> Plan:
     current = _plan(root, 2, 1, False)
-    if failed:
+    if failed or flip:
         current = current.model_copy(
             update={
                 "judges": [
                     current.judges[0].model_copy(
-                        update={"path": "_engine.test_pr1_r2_final_recovery:FinalFailureJudge"}
+                        update={
+                            "path": "_engine.test_pr1_r2_final_recovery:"
+                            + ("FinalFailureJudge" if failed else "FinalFlipJudge")
+                        }
                     ),
                     *current.judges[1:],
                 ]
@@ -50,7 +65,7 @@ def final_plan(root: Path, failed: bool) -> Plan:
     return current
 
 
-async def final_crash_driver(root: Path, failed: bool) -> None:
+async def final_crash_driver(root: Path, failed: bool, flip: bool = False) -> None:
     await anyio.Path(root).mkdir(parents=True, exist_ok=True)
     original = os.replace
 
@@ -82,16 +97,18 @@ async def final_crash_driver(root: Path, failed: bool) -> None:
     patch = pytest.MonkeyPatch()
     patch.setattr(os, "replace", replace)
     try:
-        await Swarm(_config(root)).run(final_plan(root, failed), run_id="paid")
+        await Swarm(_config(root)).run(final_plan(root, failed, flip), run_id="paid")
     finally:
         patch.undo()
 
 
-@pytest.mark.parametrize("failed", [False, True])
-async def test_resume_reuses_committed_final_scores_and_order(tmp_path: Path, failed: bool) -> None:
+@pytest.mark.parametrize(("failed", "flip"), [(False, False), (True, False), (False, True)])
+async def test_resume_reuses_committed_final_scores_and_order(
+    tmp_path: Path, failed: bool, flip: bool
+) -> None:
     control, crashed = tmp_path / "control", tmp_path / "crashed"
     control.mkdir()
-    expected = await Swarm(_config(control)).run(final_plan(control, failed), run_id="paid")
+    expected = await Swarm(_config(control)).run(final_plan(control, failed, flip), run_id="paid")
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
@@ -99,16 +116,21 @@ async def test_resume_reuses_committed_final_scores_and_order(tmp_path: Path, fa
     code = (
         "import anyio,sys; from pathlib import Path; "
         "from _engine.test_pr1_r2_final_recovery import final_crash_driver; "
-        "anyio.run(final_crash_driver, Path(sys.argv[1]), sys.argv[2] == 'True')"
+        "anyio.run(final_crash_driver, Path(sys.argv[1]), "
+        "sys.argv[2] == 'True', sys.argv[3] == 'True')"
     )
     with anyio.fail_after(30):
         process = await anyio.run_process(
-            [sys.executable, "-c", code, str(crashed), str(failed)], env=environment, check=False
+            [sys.executable, "-c", code, str(crashed), str(failed), str(flip)],
+            env=environment,
+            check=False,
         )
     assert process.returncode == 91, process.stderr.decode()
     before = _history(crashed)
     assert any(e.type == ("judge_error" if failed else "score") and e.round == 0 for e in before)
     assert not any(e.type == "final_order" for e in before)
+    if flip:
+        assert [c.output.data["n"] for c in expected["g"]] == [5, 6]
     before_calls = _calls(crashed)
     assert sum(c["final"] for c in before_calls) == 1
     completed = [e for e in before if "final_batch" in e.payload]
