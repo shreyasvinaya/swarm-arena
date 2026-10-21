@@ -959,3 +959,17 @@ def test_curator_refusal_replays_terminal_disposition(receipt: bool) -> None:
     assert state.select_only
     assert state.pending_replan is None
     assert state.curated_decisions == ([4] if receipt else [])
+
+
+def test_closed_seq_per_round() -> None:
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(7, "round_closed", {"round": 1, "replan": True}, goal_id="g"),
+            _ev(12, "round_closed", {"round": 2, "reason": "stop"}, goal_id="g"),
+        ]
+    )
+    goal = state.goals["g"]
+    assert goal.closed_seq == {1: 7, 2: 12}
+    assert goal.pending_replan == 2
+    assert goal.pending_reason == "stop"

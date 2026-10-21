@@ -370,3 +370,45 @@ publish summaries. Replay indexes summaries through their learning events and
 uses the receipt only to prevent repeated curation. Recovery without a receipt
 may retry an eligible nonterminal attempt; terminal recovery performs no new
 paid curation. Curation does not change join-retry or pending-replan state.
+
+
+## Round pages
+
+Each closed ordinary round creates a small Markdown page at
+`<run_root>/<run-id>/goals/<goal-id>/rounds/round-NN.md`. The page is published
+only after the round-close commit, including committed curator summaries, and
+before the next live replan. It never grows afterwards: later rounds, reviews,
+curation objects, revised plans, and changed limits cannot change its contents.
+
+For example, the body of a page can look like this (the stored file also starts
+with a source-head comment):
+
+```markdown
+# physika / ns-viscosity · run example · round 2 of 3
+Leaderboard (rel-error, lower is better)
+| # | Candidate | Team / agent | Score | Built on |
+|---|-----------|--------------|-------|----------|
+| 1 | c-0193 | fd-solver / tuner-1 | 0.0041 | c-0112 |
+| 2 | c-0171 | spectral / author-b | 0.009 | — |
+
+New learnings (1)
+- L-0088 **Fit log(nu)** fd-solver/tuner-2 · verified
+  Converged with fewer steps. Evidence: c-0193 (0.0041)
+
+Pruned: team `surrogate` (no improvement).
+Full board: `swarm-arena board serve example` · 412 learnings in namespace `physika`.
+```
+
+The leaderboard shows at most ten rows, with each part ranked under its own
+judge and producing goal identity. Every displayed field uses the committed
+prefix through that round's closure and the revision that executed the round.
+The namespace count uses the recorded round-start frontier plus that goal's new
+committed learnings, including curator summaries. Evidence outside this run's
+recorded history is labeled `unavailable` rather than looked up in a newer view.
+
+Resume repairs missing pages for every committed closure, including finished
+goals, terminal policies, and join retries, without new manager, judge, or
+curator work. Existing pages remain untouched. Publication uses the segment
+containing the original close as its source head, so competing repairs cannot
+replace one another's page. Round pages are derived views; the committed journal
+and the recorded frontier remain their source of truth.

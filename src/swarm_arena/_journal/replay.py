@@ -56,6 +56,8 @@ class GoalState(FrozenModel):
         Latest ordinary round started.
     rounds_closed : int, default=0
         Latest ordinary round completed.
+    closed_seq : dict[int, int], default={}
+        Ordinary round number to its committed round_closed event sequence.
     agents : dict[str, AgentStatus], default={}
         Latest recorded team/agent statuses.
     decisions : list[tuple[int, Decision]], default=[]
@@ -118,6 +120,7 @@ class GoalState(FrozenModel):
     status: Literal["queued", "running", "finished", "stopped", "no_result"] = "queued"
     round: int = 0
     rounds_closed: int = 0
+    closed_seq: dict[int, int] = {}
     agents: dict[str, AgentStatus] = {}
     decisions: list[tuple[int, Decision]] = []
     curated_decisions: list[int] = []
@@ -179,6 +182,8 @@ class RunState:
     ``candidate_goal_keys`` retains each candidate's producing GoalKey, derived
     from its applicable committed revision when tool_end is folded. Historical
     evidence is never relabeled by a later same-name part revision.
+    Private event history retains the complete prefixes used by immutable round
+    pages, including historical limits and revision activation.
     ``llm_request_sha256`` is reserved for the later LLM event fold.
 
     Examples
@@ -210,6 +215,7 @@ class RunState:
     run_elapsed_s: float = 0.0
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
+    _events: list[Event] = field(default_factory=list, repr=False, compare=False)
     _finished_goals: set[str] = field(default_factory=set, repr=False, compare=False)
 
     def plan_for_round(self, goal_id: str, round: int) -> Plan:
@@ -290,6 +296,7 @@ class RunState:
 
     def _apply(self, event: Event) -> None:
         """Apply one owned event copy and retain the recorded budget history."""
+        self._events.append(event)
         payload = event.payload
         self.run_id = event.run_id
         self.epoch = event.epoch
@@ -436,6 +443,8 @@ class RunState:
                     updates.update(_reset_converge())
                     updates["round"] = payload["round"]
             case EventType.ROUND_CLOSED:
+                round = payload.get("round", event.round or goal.round)
+                updates["closed_seq"] = {**goal.closed_seq, round: event.seq}
                 updates["rounds_closed"] = max(
                     goal.rounds_closed, payload.get("round", event.round or goal.round)
                 )

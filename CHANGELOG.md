@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace-wide learning titles and counts inside untrusted markers under a
   strict UTF-8 byte cap.
 
+- Immutable per-round Markdown pages show the top ten candidates, new learnings,
+  and prune reasons, with historical frontier counts and missing-page resume repair.
+
 - Candidate traces show the committed round-applicable plan, tool usage, checks,
   journal and human scores, and citing learnings without importing producer plugins.
 - Learning posts vet visible evidence and refinements before ID allocation,

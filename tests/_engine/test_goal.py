@@ -1406,6 +1406,18 @@ async def test_curator_recovers_committed_phase_after_process_death(
         )
     with anyio.fail_after(60):
         result = await Swarm(cfg).resume("curation", force=True)
+    for event in events(cfg, "round_closed"):
+        page = (
+            tmp_path
+            / "runs"
+            / "curation"
+            / "goals"
+            / "g"
+            / "rounds"
+            / f"round-{event.round:02d}.md"
+        )
+        assert page.exists()
+        assert f"round {event.round} of 2" in page.read_text()
     if boundary == "terminal_decision":
         assert not result["g"]
         assert events(cfg, "curated") == []
@@ -1705,6 +1717,9 @@ async def test_curator_recovery_preserves_join_retry_phase(tmp_path: Path, bound
     assert len(events(config, "join_failed")) == 1
     assert len(events(config, "plan_revision")) == 2
     assert [event.round for event in events(config, "round_closed")] == [1, 2]
+    for round in (1, 2):
+        page = tmp_path / "runs" / "curation" / "goals" / "g" / "rounds" / f"round-{round:02d}.md"
+        assert page.exists()
     assert events(config, "goal_finished")[-1].payload["reason"] is None
 
 
@@ -1757,3 +1772,148 @@ async def test_curator_refusal_survives_process_death(tmp_path: Path, boundary: 
     assert len(events(config, "curated")) == int(boundary == "curated")
     later = [event for event in all_events(config) if event.seq > before[-1].seq]
     assert not [event for event in later if event.type in {"reserve", "settle"}]
+
+
+async def test_engine_writes_one_page_per_round(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal.views import ViewWriter
+
+    original = ViewWriter.write
+    pages: dict[str, bytes] = {}
+
+    async def write(self: ViewWriter, key: str, content: bytes, **kwargs: Any) -> None:
+        await original(self, key, content, **kwargs)
+        if "/rounds/" in key:
+            assert env.events("round_closed")[-1].payload["round"] == len(pages) + 1
+            for previous, data in pages.items():
+                assert env.store.read(previous).data == data
+            pages[key] = env.store.read(key).data
+
+    monkeypatch.setattr(ViewWriter, "write", write)
+    await GoalRunner(env.deps, goal_id="g", plan=_plan(), replanner=None).run()
+    assert set(pages) == {"goals/g/rounds/round-01.md", "goals/g/rounds/round-02.md"}
+    assert all(data.count(b"<!-- swarm-arena source_head:") == 1 for data in pages.values())
+    assert all(env.store.read(key).data == data for key, data in pages.items())
+    for candidate in env.candidates():
+        if candidate.round == 2:
+            assert candidate.id.encode() not in pages["goals/g/rounds/round-01.md"]
+
+
+async def test_page_repair_uses_recorded_frontier_and_preserves_existing(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._board.human_objects import HumanObject, write_human_objects
+    from swarm_arena._engine.goal import _repair_round_pages
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.canonical import utc_now
+    from swarm_arena._model.results import Learning
+    from swarm_arena._store.base import open_store
+
+    arena = open_store(env.deps.config.arena_root)
+    human = Learning(
+        id="L-h-original",
+        run_id="human",
+        goal_id="g",
+        round=0,
+        namespace="n",
+        author="human:alice",
+        title="Before",
+        text="Before the recorded frontier.",
+        evidence=[],
+    )
+    write_human_objects(
+        arena,
+        "n",
+        "curation",
+        [
+            HumanObject(
+                kind="add",
+                learning=human,
+                author="human:alice",
+            )
+        ],
+        now=utc_now(),
+    )
+    await GoalRunner(env.deps, goal_id="g", plan=_curator_plan(rounds=1), replanner=None).run()
+    first_key = "goals/g/rounds/round-01.md"
+    first = env.store.read(first_key).data
+    assert b"2 learnings in namespace `n`" in first
+    write_human_objects(
+        arena,
+        "n",
+        "curation",
+        [
+            HumanObject(kind="hide", learning_id=human.id, author="human:alice"),
+            HumanObject(
+                kind="add",
+                learning=human.model_copy(update={"id": "L-h-later"}),
+                author="human:alice",
+            ),
+            HumanObject(
+                kind="add",
+                learning=human.model_copy(update={"id": "L-h-extra"}),
+                author="human:alice",
+            ),
+        ],
+        now=utc_now(),
+    )
+    # A real deleted local view is absent; the journal and recorded frontier remain.
+    (Path(env.deps.config.run_root) / env.deps.run_id / first_key).unlink()
+    monkeypatch.setattr(env.deps.board, "frontier", lambda: pytest.fail("fresh frontier"))
+    state = RunState.from_events(env._events())
+    await _repair_round_pages(env.deps, state)
+    assert env.store.read(first_key).data == first
+    await _repair_round_pages(env.deps, state)
+    assert env.store.read(first_key).data == first
+
+
+async def test_page_exists_before_live_replan(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = GoalRunner._replan
+    observed: list[bytes] = []
+
+    async def replan(self: GoalRunner) -> None:
+        page = env.store.read("goals/g/rounds/round-01.md").data
+        assert b"round 1 of 2" in page
+        observed.append(page)
+        await original(self)
+
+    from _fakes.planners import SequencePlanner
+
+    monkeypatch.setattr(GoalRunner, "_replan", replan)
+    await GoalRunner(
+        env.deps, goal_id="g", plan=_plan(), replanner=SequencePlanner([_plan()])
+    ).run()
+    assert len(observed) == 1
+    assert env.store.read("goals/g/rounds/round-01.md").data == observed[0]
+
+
+async def test_page_includes_committed_curation(env: EngineEnv) -> None:
+    env.deps.config = env.deps.config.model_copy(
+        update={"curator": Ref(path="_fakes.curators:MergeAll")}
+    )
+    await GoalRunner(env.deps, goal_id="g", plan=_curator_plan(rounds=1), replanner=None).run()
+    receipt = env.events("curated")[0]
+    page = env.store.read("goals/g/rounds/round-01.md").data.decode()
+    assert "New learnings (2)" in page
+    assert "· 2 learnings in namespace `n`." in page
+    assert receipt.payload["summaries"][0] in page
+
+
+async def test_competing_page_repair_cannot_replace_original(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.goal import _repair_round_pages
+    from swarm_arena._journal.replay import RunState
+
+    await GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None).run()
+    key = "goals/g/rounds/round-01.md"
+    original = env.store.read(key).data
+    # Simulate another repair creating the page just after an absent-key probe.
+    with monkeypatch.context() as patch:
+        patch.setattr(env.store, "exists", lambda key: False)
+        patch.setattr(env.store, "replace", lambda *args, **kwargs: pytest.fail("page replaced"))
+        await _repair_round_pages(env.deps, RunState.from_events(env._events()))
+        assert env.store.read(key).data == original

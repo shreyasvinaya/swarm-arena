@@ -20,6 +20,7 @@ from swarm_arena._board.curator import (
     _prepare_curator,
     _stamp_summaries,
 )
+from swarm_arena._board.pages import _closed_prefix, page_key, round_page
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import judge_amount, make_price_of
 from swarm_arena._budget.ledger import Reservation
@@ -35,8 +36,10 @@ from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_si
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
+from swarm_arena._journal.lease import Head
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
+from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
@@ -124,6 +127,39 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "preflight_complete": True,
         },
     )
+
+
+async def _repair_round_pages(
+    deps: EngineDeps, state: RunState, *, goal_id: str | None = None
+) -> None:
+    """Publish absent pages from recorded frontiers without any paid work."""
+    for id, goal in state.goals.items():
+        if goal_id is not None and id != goal_id:
+            continue
+        for round, seq in sorted(goal.closed_seq.items()):
+            key = page_key(id, round)
+            if await anyio.to_thread.run_sync(deps.store.exists, key):
+                continue
+            prefix = _closed_prefix(state, id, round)
+            plan = prefix.plan_for_round(id, round)
+            frontier = prefix.goals[id].frontiers[round]
+            view = await anyio.to_thread.run_sync(deps.board.snapshot, plan.goal.key(), frontier)
+            count = view.count_learnings(plan.goal.namespace) + sum(
+                item.goal_id == id
+                and item.run_id == state.run_id
+                and item.round == round
+                and item.namespace == plan.goal.namespace
+                for item in prefix.learnings.values()
+            )
+            # Always use the segment that committed this close. Even competing
+            # repair attempts then have equal source heads, so ViewWriter can
+            # only create the page, never replace an existing valid page.
+            segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
+            epoch, last_seq = parse_segment_name(segment)
+            source = Head(epoch=epoch, seq=last_seq, segment=segment)
+            content = round_page(prefix, id, round, namespace_learnings=count, source=source)
+            # ViewWriter embeds the same header itself; pass just the body.
+            await deps.views.write(key, content.partition(b"\n")[2], source=source)
 
 
 class GoalRunner:
@@ -1205,6 +1241,9 @@ class GoalRunner:
             )
         )
 
+        await self._refresh()
+        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id)
+
     async def _run_rounds(self) -> None:
         # A crash after closure must not silently skip the pending replanner.
         await self._complete_replan()
@@ -1297,6 +1336,7 @@ class GoalRunner:
             await self.deps.journal.commit()
             await self._plan_view()
         await self._refresh()
+        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id)
         if self.state.selection_recorded and not self.state.finished:
             return await self._finish_recovered()
         if not self.history:
