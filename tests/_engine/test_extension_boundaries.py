@@ -34,7 +34,12 @@ from swarm_arena.manager import Manager, RoundReport
 from swarm_arena.scoring import Check, CheckResult, Judge, JudgeContext, Lexicographic
 from swarm_arena.tool import RunStatus, ToolOutput
 
+_SIGNAL_TIMEOUT_S = 30
+_STOP_TIMEOUT_S = 7
+
 _HOOK_ENTERED = threading.Event()
+_HOOK_RENEWED = threading.Event()
+_CHECK_ENTERED = threading.Event()
 _JUDGE_ENTERED = threading.Event()
 _JUDGE_RENEWED = threading.Event()
 _REPORT_KIND = "object"
@@ -106,6 +111,7 @@ class BlockingCheck(Check):
 
     async def check(self, candidate: Any, ctx: Any) -> Any:
         print("CHECK_ENTERED", flush=True)
+        _CHECK_ENTERED.set()
         await anyio.sleep_forever()
 
 
@@ -155,8 +161,14 @@ def score(goal: Goal, candidate: Any) -> Score:
     return Score.maximize(1.0)
 
 
+async def _wait_for_signal(event: threading.Event, label: str) -> None:
+    assert await anyio.to_thread.run_sync(event.wait, _SIGNAL_TIMEOUT_S), (
+        f"timed out waiting for {label}"
+    )
+
+
 async def _worker(mode: str, root: Path) -> None:
-    # Journal/lease internals are used only for evidence, never to drive the run.
+    # Observe the real extension/lease/journal signals before requesting a stop.
     from swarm_arena._journal.lease import Lease
     from swarm_arena._journal.reader import read_committed
     from swarm_arena._store.local import LocalStore
@@ -171,6 +183,7 @@ async def _worker(mode: str, root: Path) -> None:
         original_renew(self)
         if _HOOK_ENTERED.is_set():
             print("RENEWED_AFTER_HOOK", flush=True)
+            _HOOK_RENEWED.set()
         if _JUDGE_ENTERED.is_set():
             _JUDGE_RENEWED.set()
 
@@ -241,40 +254,61 @@ async def _worker(mode: str, root: Path) -> None:
                 else LocalExecutor
             )(workspace_root=str(root / "ws"))
         ),
-        limits=Limits(
-            round_timeout_s=20 if variant == "stop" and mode.endswith("serializer") else 1.5,
-            # Stop probes must outlive the stop-file poll and lease-renewal wait.
-            run_timeout_s=30
-            if variant == "stop"
-            else 3
-            if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}
-            else 8,
-            tool_timeout_s=1,
-        ),
+        # These are watchdogs, not the mechanism that makes a probe succeed.
+        # A stop is requested only after the specific progress signal is observed.
+        limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
         lease_ttl_s=1.5,
         settle_timeout_s=0.2,
     )
-    started = time.monotonic()
     swarm = Swarm(config)
+    live_store = LocalStore(root / "runs" / "boundary-run")
+    stop_started: float | None = None
+    run_finished = anyio.Event()
 
-    if mode in {"check-serializer", "output-serializer", "partial-serializer"}:
+    async def wait_for_event(kind: str, *, agent: str | None = None) -> None:
+        with anyio.fail_after(_SIGNAL_TIMEOUT_S):
+            while True:
+                live = await anyio.to_thread.run_sync(read_committed, live_store)
+                if live is not None and any(
+                    e.type == kind
+                    and (agent is None or e.agent == agent)
+                    and (kind != "stop_requested" or e.payload["now"])
+                    for e in live[1]
+                ):
+                    return
+                await anyio.sleep(0.02)
 
-        async def stop_on_serializer() -> None:
-            if mode == "partial-serializer" and variant == "stop":
-                assert await anyio.to_thread.run_sync(_PARTIAL_READY.wait, 5)
-                await swarm.stop(now=True)
-            assert await anyio.to_thread.run_sync(_SERIALIZER_ENTERED.wait, 5)
-            # This heartbeat cannot advance while a serializer owns the event loop.
-            await anyio.sleep(0.02)
+    async def stop() -> None:
+        nonlocal stop_started
+        stop_started = time.monotonic()
+        await swarm.stop(now=True)
+
+    async def stop_on_signal() -> None:
+        if mode == "hook":
+            await _wait_for_signal(_HOOK_ENTERED, "hook entry")
+            await _wait_for_signal(_HOOK_RENEWED, "lease renewal after hook entry")
+            # A renewal alone does not prove the healthy peer was allowed to finish.
+            await wait_for_event("tool_end", agent="peer")
+        elif mode == "check":
+            await _wait_for_signal(_CHECK_ENTERED, "check entry")
+        elif mode == "partial-serializer":
+            # The fallback serializer is entered only after submit is interrupted.
+            await _wait_for_signal(_PARTIAL_READY, "partial output delivery")
+            await stop()
+        else:
+            await _wait_for_signal(_SERIALIZER_ENTERED, "serializer entry")
+        if mode.endswith("serializer"):
+            await _wait_for_signal(_SERIALIZER_ENTERED, "serializer entry")
+            # Reaching a loop checkpoint after entry proves the blocked serializer
+            # does not own the loop; no heartbeat sleep races the run deadline.
+            await anyio.lowlevel.checkpoint()
             print("LOOP_RESPONSIVE", flush=True)
-            if variant == "stop" and mode != "partial-serializer":
-                await swarm.stop(now=True)
+        if stop_started is None:
+            await stop()
+        with anyio.fail_after(_STOP_TIMEOUT_S):
+            await run_finished.wait()
 
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(stop_on_serializer)
-            result = await swarm.run(plans, run_id="boundary-run")
-            tasks.cancel_scope.cancel()
-    elif mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
+    if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
         # Lifecycle termination belongs to the separate barrier-supervision fix.
         # This probe owns only thread isolation and live loop/lease/stop progress.
         async def run() -> None:
@@ -282,32 +316,45 @@ async def _worker(mode: str, root: Path) -> None:
 
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(run)
-            assert await anyio.to_thread.run_sync(_JUDGE_ENTERED.wait, 5)
-            assert await anyio.to_thread.run_sync(_JUDGE_RENEWED.wait, 5)
+            await _wait_for_signal(_JUDGE_ENTERED, "judge metadata entry")
+            await _wait_for_signal(_JUDGE_RENEWED, "lease renewal after judge entry")
             stop_recorded = False
             if variant == "stop":
-                await swarm.stop(now=True)
-                live_store = LocalStore(root / "runs" / "boundary-run")
-                with anyio.fail_after(5):
-                    while not stop_recorded:
-                        live = await anyio.to_thread.run_sync(read_committed, live_store)
-                        stop_recorded = live is not None and any(
-                            e.type == "stop_requested" and e.payload["now"] for e in live[1]
-                        )
-                        if not stop_recorded:
-                            await anyio.sleep(0.02)
-            print(json.dumps({"renewed": True, "stop_recorded": stop_recorded}), flush=True)
+                await stop()
+                with anyio.fail_after(_STOP_TIMEOUT_S):
+                    await wait_for_event("stop_requested")
+                stop_recorded = True
+            else:
+                stop_started = time.monotonic()
             tasks.cancel_scope.cancel()
+        assert stop_started is not None
+        print(
+            json.dumps(
+                {
+                    "renewed": True,
+                    "stop_recorded": stop_recorded,
+                    "elapsed_after_stop": time.monotonic() - stop_started,
+                }
+            ),
+            flush=True,
+        )
         return
+    if mode in {"hook", "check", "check-serializer", "output-serializer", "partial-serializer"}:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(stop_on_signal)
+            result = await swarm.run(plans, run_id="boundary-run")
+            run_finished.set()
+            # Let the observer finish rather than cancelling an unobserved signal.
     else:
         result = await swarm.run(plans, run_id="boundary-run")
+    elapsed_after_stop = None if stop_started is None else time.monotonic() - stop_started
     store = LocalStore(root / "runs" / "boundary-run")
     committed = read_committed(store)
     assert committed is not None
     events = [event.model_dump(mode="json") for event in committed[1]]
     print(
         json.dumps(
-            {"elapsed": time.monotonic() - started, "result": list(result), "events": events}
+            {"elapsed_after_stop": elapsed_after_stop, "result": list(result), "events": events}
         ),
         flush=True,
     )
@@ -329,9 +376,10 @@ def _probe(mode: str, root: Path) -> tuple[dict[str, Any], str]:
         env=env,
         capture_output=True,
         text=True,
-        timeout=12,
+        # Several bounded signal waits may precede the independently bounded stop.
+        timeout=4 * _SIGNAL_TIMEOUT_S + 2 * _STOP_TIMEOUT_S,
     )
-    assert process.returncode == 0, process.stderr
+    assert process.returncode == 0, process.stdout + process.stderr
     return json.loads(process.stdout.splitlines()[-1]), process.stdout
 
 
@@ -340,7 +388,8 @@ def test_blocked_request_hook_abandoned_with_peer_and_renewal(tmp_path: Path) ->
     assert "HOOK_THREAD swarm-arena-daemon-" in stdout
     assert "HOOK_THREAD MainThread" not in stdout
     assert "RENEWED_AFTER_HOOK" in stdout
-    assert data["elapsed"] < 7
+    assert data["elapsed_after_stop"] < 7
+    assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in data["events"])
     assert any(e["type"] == "tool_end" and e["agent"] == "peer" for e in data["events"])
     assert any(e["type"] == "goal_finished" for e in data["events"])
 
@@ -348,7 +397,8 @@ def test_blocked_request_hook_abandoned_with_peer_and_renewal(tmp_path: Path) ->
 def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> None:
     data, stdout = _probe("check", tmp_path)
     assert "CHECK_ENTERED" in stdout
-    assert data["elapsed"] < 7
+    assert data["elapsed_after_stop"] < 7
+    assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in data["events"])
     ends = [e for e in data["events"] if e["type"] == "tool_end"]
     assert len(ends) == 1
     candidate = ends[0]["payload"]["candidate"]
@@ -362,13 +412,13 @@ def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("mode", ["check-serializer", "output-serializer", "partial-serializer"])
-@pytest.mark.parametrize("stop", [False, True], ids=["deadline", "stop-now"])
-def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str, stop: bool) -> None:
-    data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
+def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str) -> None:
+    data, stdout = _probe(mode, tmp_path)
     assert "SERIALIZER_THREAD swarm-arena-daemon-" in stdout
     assert "SERIALIZER_THREAD MainThread" not in stdout
     assert "LOOP_RESPONSIVE" in stdout
-    assert data["elapsed"] < 7
+    assert data["elapsed_after_stop"] < 7
+    assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in data["events"])
     events = data["events"]
     ends = [event for event in events if event["type"] == "tool_end"]
     assert len(ends) == 1
@@ -390,8 +440,6 @@ def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str, stop
         assert candidate["warnings"] == ["tool error: CancelledError"]
     assert any(e["type"] == "settle" and e["seq"] > ends[0]["seq"] for e in events)
     assert any(e["type"] == "goal_finished" for e in events)
-    if stop:
-        assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in events)
 
 
 def test_collect_diagnostic_never_publishes_exception_values(tmp_path: Path) -> None:
@@ -431,6 +479,7 @@ def test_blocked_judge_metadata_keeps_loop_responsive(
     data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
     assert "JUDGE_THREAD swarm-arena-daemon-" in stdout
     assert "JUDGE_THREAD MainThread" not in stdout
+    assert data["elapsed_after_stop"] < 7
     assert data["renewed"]
     assert data["stop_recorded"] is stop
 
