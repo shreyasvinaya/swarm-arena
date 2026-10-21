@@ -34,7 +34,7 @@ cache = [
 ]
 langfuse = [
     "langfuse>=5,<6",
-    "openinference-instrumentation-openai-agents",
+    "openinference-instrumentation-openai-agents>=1.0.0",
 ]
 
 [build-system]

@@ -211,7 +211,7 @@ Expected: FAIL / collection ERROR with `ModuleNotFoundError: No module named 'ag
 ```bash
 uv add --optional llm "openai-agents[litellm]>=0.24,<0.25" "litellm>=1.107.0rc2,<1.108"
 uv add --optional cache "litellm[caching,proxy]>=1.107.0rc2,<1.108"
-uv add --optional langfuse "langfuse>=5,<6" "openinference-instrumentation-openai-agents"
+uv add --optional langfuse "langfuse>=5,<6" "openinference-instrumentation-openai-agents>=1.0.0"
 uv sync --all-extras --all-groups
 ```
 
