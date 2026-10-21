@@ -2,7 +2,9 @@
 
 from collections import defaultdict
 from contextvars import ContextVar
+from itertools import combinations
 from pathlib import Path
+from threading import Event as ThreadEvent
 
 import anyio
 import pytest
@@ -24,6 +26,7 @@ from swarm_arena import (
     TeamSpec,
 )
 from swarm_arena._board.arena import ArenaBoard
+from swarm_arena._board.learnings import DUPLICATE_JACCARD, jaccard, title_tokens
 from swarm_arena._board.reindex import recorded_frontiers
 from swarm_arena._errors import AlreadyExists, PreconditionFailed
 from swarm_arena._journal.event import Event
@@ -32,11 +35,39 @@ from swarm_arena._journal.reader import read_chain
 from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.results import Candidate, Learning
 from swarm_arena._store.local import LocalStore
+from swarm_arena.manager import AgentContext
 from swarm_arena.tool import RunStatus
 
 WRITER: ContextVar[str] = ContextVar("WRITER", default="")
 A = "2026-10-18T13-00-00Z_aaaaaa"
 B = "2026-10-18T13-00-00Z_bbbbbb"
+
+
+class RunPostingManager(PostingManager):
+    """
+    Distinguish each run and round while posting the same successful evidence.
+
+    Examples
+    --------
+    >>> RunPostingManager([]).config.requests
+    []
+    """
+
+    async def _post_learning(self, ctx: AgentContext) -> None:
+        own = [
+            candidate
+            for candidate in ctx.my_candidates()
+            if candidate.round == ctx.round
+            and candidate.output.status == RunStatus.OK
+            and not candidate.output.partial
+            and not candidate.gated_out
+        ]
+        if own:
+            await ctx.post_learning(
+                title=f"{own[-1].run_id.replace('-', '')}r{ctx.round} observation",
+                text="Current evidence.",
+                evidence=[own[-1].id],
+            )
 
 
 def _plan(goal_id: str, own_plan: Path, other_page: Path) -> Plan:
@@ -54,7 +85,7 @@ def _plan(goal_id: str, own_plan: Path, other_page: Path) -> Plan:
                         rationale="Observe committed file readiness.",
                         tool=Ref.of(FunctionTool("_fakes.tools:wait_for_file")),
                         manager=Ref.of(
-                            PostingManager(
+                            RunPostingManager(
                                 ScriptedManager.Config(
                                     requests=[
                                         {"inputs": {"path": str(own_plan)}, "round": 1},
@@ -79,6 +110,19 @@ def _plan(goal_id: str, own_plan: Path, other_page: Path) -> Plan:
 async def test_two_swarms_share_learnings_within_one_round(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    await _two_swarms_share_learnings(tmp_path, monkeypatch, startup_skew=False)
+
+
+async def test_two_swarms_share_learnings_after_peer_page_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _two_swarms_share_learnings(tmp_path, monkeypatch, startup_skew=True)
+
+
+async def _two_swarms_share_learnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, startup_skew: bool
+) -> None:
+    page_published = ThreadEvent()
     writes: list[tuple[str, str, str, bool]] = []
     create, replace = LocalStore.create, LocalStore.replace
 
@@ -89,6 +133,8 @@ async def test_two_swarms_share_learnings_within_one_round(
             writes.append((WRITER.get(), "create", f"{store.url}/{key}", False))
             raise
         writes.append((WRITER.get(), "create", f"{store.url}/{key}", True))
+        if WRITER.get() == A and key == "goals/a/rounds/round-01.md":
+            page_published.set()
         return result
 
     def tracked_replace(store: LocalStore, key: str, data: bytes, *, if_match: str) -> str:
@@ -120,6 +166,9 @@ async def test_two_swarms_share_learnings_within_one_round(
     configs, plans = {A: config_a, B: config_b}, {A: plan_a, B: plan_b}
 
     async def run_as(name: str, swarm: Swarm, plan: Plan) -> None:
+        if startup_skew and name == B:
+            # B owns no lease yet; publication, rather than a delay, releases it.
+            assert await anyio.to_thread.run_sync(page_published.wait, 30.0)
         token = WRITER.set(name)
         try:
             await swarm.run(plan, run_id=name)
@@ -177,6 +226,17 @@ async def test_two_swarms_share_learnings_within_one_round(
             assert round1_learning_id(other) in [x.id for x in snapshot.learnings("toy", limit=100)]
     finally:
         await anyio.to_thread.run_sync(board.close)
+
+    learnings = [
+        Learning.model_validate(event.payload["learning"])
+        for run_events in events.values()
+        for event in run_events
+        if event.type == "learning"
+    ]
+    for run_id in (A, B):
+        assert [item.round for item in learnings if item.run_id == run_id] == [1, 2, 3]
+    for first, second in combinations(learnings, 2):
+        assert jaccard(title_tokens(first.title), title_tokens(second.title)) < DUPLICATE_JACCARD
 
     assert {run for run, _, _, _ in writes} == {A, B}
     tried_by: dict[str, set[str]] = defaultdict(set)
