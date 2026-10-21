@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
@@ -33,6 +34,9 @@ def _prepare_command_output(value: object) -> ToolOutput:
 class CheckContext:
     """
     Execute check commands with run identity and candidate staging.
+
+    String identifiers and paths are copied to exact strings without invoking
+    subclass hooks. Non-string values raise a value-free ``TypeError``.
 
     Parameters
     ----------
@@ -99,6 +103,12 @@ class CheckContext:
         tool_timeout_s: float = 3600.0,
     ) -> None:
         """Retain execution settings without performing I/O."""
+        run_id = _context_string(run_id, "run_id")
+        part = None if part is None else _context_string(part, "part")
+        artifact_root = _context_string(artifact_root, "artifact_root")
+        secrets_file = (
+            None if secrets_file is None else _context_string(secrets_file, "secrets_file")
+        )
         self.goal = goal
         self.executor = executor
         self.artifact_root = artifact_root
@@ -146,6 +156,14 @@ class CheckContext:
         The :class:`CheckContext` example uses ``asyncio.run(context.execute(...))``
         with an in-memory recording executor and inspects the submitted command.
         """
+        files = (
+            None
+            if files is None
+            else {
+                _context_string(path, "files path"): _context_string(digest, "files hash")
+                for path, digest in files.items()
+            }
+        )
         stage = (
             plan_script_stage(
                 own_files=files or {},

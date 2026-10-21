@@ -310,3 +310,18 @@ collection and conformance helpers. Learning records are constructed by core
 code from the posting API and reconstructed by journal replay; there is no
 extension-returned Learning hook. Detachment applies the core validation rules,
 including UTC-millisecond timestamp normalization.
+
+### Context identifier inputs
+
+Public `AgentContext`, `JudgeContext` and `CheckContext` entry points copy
+identifier and name arguments to exact strings using `str.__str__` before core
+lookups, hashing, action admission or loop marshaling. This includes collection
+elements (parents, evidence, refinements, tags and anchors), action and part
+names, context run/batch/fidelity identifiers, and staging/edit paths.
+`JudgeContext.judge_error(candidate_id, reason)` copies both strings and keeps
+the first reason for each candidate. A string subclass therefore cannot supply
+equality, hashing, conversion or formatting hooks to subsequent core operations.
+Non-string identifiers raise `TypeError` naming only the parameter and required
+type, without formatting the supplied value. Optional identifiers still accept
+`None` where documented. For example, `ctx.judge_error("c1", "invalid result")`
+records the same first-error diagnostic as before.

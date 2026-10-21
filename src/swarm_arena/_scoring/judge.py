@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
@@ -91,6 +92,9 @@ class JudgeContext(CheckContext):
         tool_timeout_s: float = 3600.0,
     ) -> None:
         """Retain batch settings and initialize an independent error channel."""
+        fidelity = _context_string(fidelity, "fidelity")
+        batch_id = _context_string(batch_id, "batch_id")
+        anchors = frozenset(_context_string(value, "anchors") for value in anchors)
         super().__init__(
             goal=goal,
             executor=executor,
@@ -114,6 +118,9 @@ class JudgeContext(CheckContext):
         """
         Record a candidate's first judging error.
 
+        Identifier and reason subclasses are copied to exact strings without
+        invoking their hooks before either value is stored.
+
         Parameters
         ----------
         candidate_id : str
@@ -121,11 +128,18 @@ class JudgeContext(CheckContext):
         reason : str
             Sanitized diagnostic supplied by the judge, without secret values.
 
+        Raises
+        ------
+        TypeError
+            If the identifier or reason is not a string; values are never included.
+
         Examples
         --------
         The :class:`JudgeContext` example calls ``context.judge_error(...)`` twice
         and verifies that the first reason wins.
         """
+        candidate_id = _context_string(candidate_id, "candidate_id")
+        reason = _context_string(reason, "reason")
         self.errors.setdefault(candidate_id, reason)
 
 
