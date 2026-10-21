@@ -309,6 +309,9 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.REVIEW_IMPORTED:
+                # Arena review objects own scores; the receipt only retains IDs for recovery.
+                pass
             case EventType.RUN_STARTED:
                 self.manifest = deepcopy(payload.get("manifest", {}))
             case EventType.RUN_CONFIG:

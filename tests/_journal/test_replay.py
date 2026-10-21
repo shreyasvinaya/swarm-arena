@@ -973,3 +973,26 @@ def test_closed_seq_per_round() -> None:
     assert goal.closed_seq == {1: 7, 2: 12}
     assert goal.pending_replan == 2
     assert goal.pending_reason == "stop"
+
+
+def test_replay_accepts_review_imported() -> None:
+    score = Score(
+        id="s-0123456789abcdef-e2-0042", candidate_id="c", judge="human:alice", key=(1, 7)
+    )
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(
+                3,
+                "review_imported",
+                {
+                    "reviewer": "alice",
+                    "scores": [score.model_dump(mode="json")],
+                    "objects": [],
+                },
+                epoch=2,
+            ),
+        ]
+    )
+    assert state.scores == {}
+    assert state.id_counters["s"] == 42

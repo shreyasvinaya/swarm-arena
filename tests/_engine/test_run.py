@@ -662,3 +662,59 @@ async def test_custom_board_construction_errors_hide_values(
     with pytest.raises(RuntimeError, match="construction failed") as caught:
         await Swarm(config).run(plan(rounds=1))
     assert_secret_absent(caught.value, secret)
+
+
+async def test_run_end_writes_review_export(finished_run: FinishedRun) -> None:
+    store = LocalStore(Path(finished_run.config.run_root) / finished_run.run_id)
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is not None
+    head = owner[0].head
+    prefix = f"review/e{head.epoch}-{head.seq}/"
+    assert store.read(prefix + "review.csv").data.startswith(
+        b"id,goal,team,agent,scores,verdict,score,notes"
+    )
+    assert b"<table>" in store.read(prefix + "index.html").data
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_review_export_failure_releases_run_services(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, resumed: bool
+) -> None:
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._errors import StorageError
+
+    run_id = "export-cleanup"
+    if resumed:
+        await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
+    board_closed: list[int] = []
+    executor_closed: list[int] = []
+    original_board = run_module._close_board
+    original_executor = run_module._close_executor
+
+    async def board_close(*args: Any, **kwargs: Any) -> None:
+        await original_board(*args, **kwargs)
+        board_closed.append(1)
+
+    async def executor_close(*args: Any, **kwargs: Any) -> None:
+        await original_executor(*args, **kwargs)
+        executor_closed.append(1)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise StorageError("review export unavailable")
+
+    monkeypatch.setattr(run_module, "_close_board", board_close)
+    monkeypatch.setattr(run_module, "_close_executor", executor_close)
+    monkeypatch.setattr(run_module, "write_review_export", fail)
+    operation = (
+        Swarm(run_config).resume(run_id)
+        if resumed
+        else Swarm(run_config).run(plan(rounds=1), run_id=run_id)
+    )
+    with pytest.raises(StorageError, match="review export unavailable"):
+        await operation
+    owner = read_owner(LocalStore(Path(run_config.run_root) / run_id))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+    assert board_closed == [1]
+    assert executor_closed == [1]

@@ -2379,3 +2379,29 @@ def test_repeat_entries_filter(tmp_path: Path) -> None:
     )
     assert [(key, candidate.id) for key, candidate in entries] == [("key", "r2-key")]
     cache.close()
+
+
+def test_review_imported_events_not_indexed(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(
+        run.plan(),
+        run.candidate("c-1"),
+        EventDraft(
+            type=EventType.REVIEW_IMPORTED,
+            payload={
+                "reviewer": "alice",
+                "objects": [],
+                "scores": [
+                    Score(
+                        id="s-human", candidate_id="c-1", judge="human:alice", key=(1,)
+                    ).model_dump(mode="json")
+                ],
+            },
+        ),
+    )
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    try:
+        ingest_run(cache, run.store, "r1", run.run_root, head)
+        assert cache._conn.execute("SELECT count(*) FROM scores").fetchone() == (0,)
+    finally:
+        cache.close()

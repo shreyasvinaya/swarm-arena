@@ -2,8 +2,8 @@
 
 import asyncio
 import os
-import socket
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -23,6 +23,7 @@ from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.executor import Executor
+from swarm_arena._exec.procinfo import host_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -156,6 +157,10 @@ class _ResumeServices:
                         EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
                     )
                     events, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
+                    from swarm_arena._scoring.human_review import _repair_review_objects
+
+                    arena = await anyio.to_thread.run_sync(open_store, config.arena_root)
+                    await _repair_review_objects(state, arena, self.store, lease, journal)
                     clock = RunClock(state.run_elapsed_s)
                     journal.clock = clock
                     continued = _check(state, config)
@@ -326,6 +331,51 @@ class _ResumeServices:
             raise self.failure
 
 
+async def _take_over(
+    config: RunConfig,
+    run_id: str,
+    store: Store,
+    *,
+    force: bool,
+    validate: Callable[[OwnerDoc], None] | None = None,
+    review: bool = False,
+) -> Lease:
+    """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
+    while True:
+        owner = await anyio.to_thread.run_sync(read_owner, store)
+        if owner is None:
+            if review:
+                raise FileNotFoundError(f"run {run_id} has no control/owner.json")
+            raise _core_error(ValueError, "run has no committed owner")
+        doc, _ = owner
+        if doc.head is None:
+            raise _core_error(ValueError, f"run {run_id} has no committed events")
+        if validate is not None:
+            await anyio.to_thread.run_sync(validate, doc)
+        try:
+            return await anyio.to_thread.run_sync(
+                partial(
+                    Lease.take_over,
+                    store,
+                    owner_id=uuid4().hex,
+                    host=host_id(),
+                    ttl_s=config.lease_ttl_s,
+                    force=force,
+                    expect_epoch=doc.epoch,
+                )
+            )
+        except Fenced:
+            current = await anyio.to_thread.run_sync(read_owner, store)
+            if current is None or current[0].epoch != doc.epoch:
+                epoch = current[0].epoch if current else "missing"
+                message = (
+                    f"another owner took the run (epoch {epoch})"
+                    if review
+                    else "a concurrent resume took the run"
+                )
+                raise _core_error(Fenced, f"run {run_id}: {message}") from None
+
+
 async def resume_run(
     config: RunConfig, run_id: str, *, force: bool, replanner: Planner | None
 ) -> run_module.RunRunner:
@@ -368,32 +418,12 @@ async def resume_run(
     await anyio.to_thread.run_sync(check_storage, config)
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
-    while True:
-        owner = await anyio.to_thread.run_sync(read_owner, store)
-        if owner is None:
-            raise _core_error(ValueError, "run has no committed owner")
-        doc, _ = owner
-        _, state = await anyio.to_thread.run_sync(_read, store, doc)
+
+    def validate(doc: OwnerDoc) -> None:
+        _, state = _read(store, doc)
         _check(state, config)
-        try:
-            lease = await anyio.to_thread.run_sync(
-                partial(
-                    Lease.take_over,
-                    store,
-                    owner_id=uuid4().hex,
-                    host=socket.gethostname(),
-                    ttl_s=config.lease_ttl_s,
-                    force=force,
-                    expect_epoch=doc.epoch,
-                )
-            )
-            break
-        except Fenced:
-            current = await anyio.to_thread.run_sync(read_owner, store)
-            if current is None or current[0].epoch != doc.epoch:
-                raise _core_error(
-                    Fenced, f"run {run_id}: a concurrent resume took the run"
-                ) from None
+
+    lease = await _take_over(config, run_id, store, force=force, validate=validate)
     services = _ResumeServices(config, run_id, store, lease, force=force)
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:

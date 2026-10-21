@@ -12,6 +12,7 @@ from typing import Any, TypeVar, cast
 import anyio
 import pytest
 from _fakes.engine import with_executor, with_limits
+from _fakes.finished import FinishedRun
 
 from swarm_arena import (
     AgentSpec,
@@ -33,6 +34,7 @@ from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.repeats import repeat_key
 from swarm_arena._agent.tool_run import Inflight
+from swarm_arena._board.base import Board
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine import resume
@@ -2321,3 +2323,97 @@ async def test_page_repair_hook_errors_are_value_free(
     assert owner is not None
     assert owner[0].expires_at <= utc_now()
     assert not store.exists("goals/g/rounds/round-01.md")
+
+
+async def test_resume_repairs_review_receipt_after_process_exit(
+    finished_run: "FinishedRun", tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csv
+    import io
+    import subprocess
+    import sys
+
+    from swarm_arena._board.human_objects import read_human_object
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._journal.event import EventType
+    from swarm_arena._journal.reader import read_chain
+    from swarm_arena._scoring.human_review import CSV_HEADER, HumanReview
+    from swarm_arena._store.base import open_store
+
+    config, run_id = finished_run.config, finished_run.run_id
+    review = HumanReview("alice")
+    out = await review.export(run_id, config=config, out_dir=tmp_path / "review")
+    rows = list(csv.DictReader(io.StringIO((out / "review.csv").read_text())))
+    rows[0].update(verdict="accept", score="7")
+    with (out / "review.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+    script = """
+import os, sys, anyio
+from pathlib import Path
+from swarm_arena import RunConfig
+import swarm_arena._scoring.human_review as review
+
+def exit_before_objects(*args, **kwargs):
+    os._exit(31)
+
+review.write_human_objects = exit_before_objects
+async def main():
+    await review.HumanReview("alice").import_csv(
+        sys.argv[1], Path(sys.argv[2]), config=RunConfig.load(Path(sys.argv[3])))
+anyio.run(main)
+"""
+    result = await anyio.to_thread.run_sync(
+        partial(
+            subprocess.run,
+            [
+                sys.executable,
+                "-c",
+                script,
+                run_id,
+                str(out / "review.csv"),
+                str(finished_run.config_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    )
+    assert result.returncode == 31, result.stderr
+    store = open_store(config.run_root).child(run_id)
+    arena = open_store(config.arena_root)
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is not None
+    imported_head = owner[0].head
+    events = [e for _, batch in read_chain(store, imported_head) for e in batch]
+    receipt = events[-1]
+    assert receipt.type == EventType.REVIEW_IMPORTED
+    key = receipt.payload["objects"][0]
+    assert not arena.exists(key)
+    start_board = run_module._start_board
+    opened: list[int] = []
+
+    async def checked_start(cfg: RunConfig) -> "Board":
+        opened.append(1)
+        assert [
+            obj.score.model_dump(mode="json") for obj in read_human_object(arena, key) if obj.score
+        ] == receipt.payload["scores"]
+        return await start_board(cfg)
+
+    monkeypatch.setattr(run_module, "_start_board", checked_start)
+    await Swarm(config).resume(run_id, force=True)
+    assert opened == [1]
+    repaired = arena.read(key).data
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is not None
+    head = owner[0].head
+    assert head.epoch == 3
+    assert store.exists(f"review/e{head.epoch}-{head.seq}/review.csv")
+    assert store.exists(f"review/e{head.epoch}-{head.seq}/index.html")
+    assert owner[0].expires_at < utc_now()
+    await Swarm(config).resume(run_id, force=True)
+    assert arena.read(key).data == repaired
+    assert [k for k in arena.list("") if "/reviews/" in k] == [key]

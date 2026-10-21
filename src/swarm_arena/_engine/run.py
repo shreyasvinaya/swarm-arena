@@ -7,6 +7,7 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from fractions import Fraction
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from typing import TYPE_CHECKING, Any
@@ -26,11 +27,18 @@ from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
-from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_signal
+from swarm_arena._errors import (
+    AlreadyExists,
+    Fenced,
+    PlanError,
+    StorageError,
+    _core_error,
+    _rebuild_core_signal,
+)
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
-from swarm_arena._journal.lease import Lease
+from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
@@ -45,7 +53,7 @@ from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._store.base import open_store
+from swarm_arena._store.base import Store, open_store
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
@@ -562,6 +570,11 @@ class RunRunner:
                 watchers.cancel_scope.cancel()
         if deps.journal.fenced.is_set():
             raise _core_error(Fenced)
+        head = await deps.journal.commit()
+        assert head is not None
+        chain = await anyio.to_thread.run_sync(read_chain, deps.store, head)
+        state = RunState.from_events(e for _, batch in chain for e in batch)
+        await write_review_export(state, deps.store, head)
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
@@ -685,3 +698,41 @@ class RunRunner:
                 if queued or active:
                     await anyio.sleep(0.02)
         return {p.goal.id: results[p.goal.id] for p in self.plans}
+
+
+async def write_review_export(state: RunState, store: Store, head: Head) -> None:
+    """
+    Write an immutable review bundle for a committed completion head.
+
+    Parameters
+    ----------
+    state : RunState
+        Replay of exactly the supplied committed head.
+    store : Store
+        Run-scoped storage.
+    head : Head
+        Source head naming this immutable export directory.
+
+    Raises
+    ------
+    StorageError
+        If an existing export file has different bytes.
+
+    Examples
+    --------
+    >>> await write_review_export(state, store, head)  # doctest: +SKIP
+    """
+    from swarm_arena._scoring.human_review import render_review
+
+    files = render_review(state, top=20)
+
+    def write() -> None:
+        for name, data in files.items():
+            key = f"review/e{head.epoch}-{head.seq}/{name}"
+            try:
+                store.create(key, data)
+            except AlreadyExists:
+                if sha256(store.read(key).data).digest() != sha256(data).digest():
+                    raise _core_error(StorageError, "review export bytes differ") from None
+
+    await anyio.to_thread.run_sync(write)

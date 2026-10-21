@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Human review exports CSV, candidate JSON and escaped HTML, imports validated
+  scores under an ended run's lease, and repairs committed review objects on resume.
+
 - Round digests show each group's ranking identity and human verdicts, plus
   namespace-wide learning titles and counts inside untrusted markers under a
   strict UTF-8 byte cap.
