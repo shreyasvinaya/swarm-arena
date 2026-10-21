@@ -1,12 +1,16 @@
 """Read only the journal chain selected by a single committed head."""
 
+from collections.abc import Callable
+from functools import partial
 from typing import Literal
 
-from swarm_arena._errors import ChainError, NotFound
+from swarm_arena._errors import ChainError, NotFound, StorageError
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import Head, OwnerDoc, read_owner
 from swarm_arena._journal.segment import decode_segment, parse_segment_name
-from swarm_arena._store.base import Store
+from swarm_arena._outcomes import _Outcome
+from swarm_arena._store.base import Store, _read_blob
 
 
 def _parse_name(name: str, location: Literal["head", "link", "stop_after"]) -> tuple[int, int]:
@@ -18,7 +22,11 @@ def _parse_name(name: str, location: Literal["head", "link", "stop_after"]) -> t
 
 
 def read_chain(
-    store: Store, head: Head, *, stop_after: str | None = None
+    store: Store,
+    head: Head,
+    *,
+    stop_after: str | None = None,
+    _read: Callable[[str], bytes] | None = None,
 ) -> list[tuple[str, list[Event]]]:
     """
     Follow a committed head's links and return validated segments oldest first.
@@ -26,7 +34,7 @@ def read_chain(
     Segment names, event epochs, and consecutive sequence numbers must agree.
     Each link is checked before reading its target, including the exclusive
     boundary. Storage is never listed. Async callers offload this synchronous
-    operation with ``anyio.to_thread.run_sync``.
+    operation with ``_read_chain`` when holding a lease.
 
     Parameters
     ----------
@@ -37,6 +45,8 @@ def read_chain(
     stop_after : str or None, default=None
         Already known segment to exclude, stopping before reading it. If it is
         not encountered, traversal ends at the first segment's null link.
+    _read : callable or None, default=None
+        Internal backend-byte boundary; validation remains owned by this reader.
 
     Returns
     -------
@@ -69,7 +79,7 @@ def read_chain(
     name = head.segment
     while name != stop_after:
         try:
-            data = store.read(name).data
+            data = store.read(name).data if _read is None else _read(name)
         except NotFound:
             raise ChainError(f"missing segment '{name}'") from None
         try:
@@ -144,3 +154,25 @@ def read_committed(store: Store) -> tuple[OwnerDoc, list[Event]] | None:
     if doc.head is None:
         return doc, []
     return doc, [event for _, events in read_chain(store, doc.head) for event in events]
+
+
+def _read_segment(store: Store, key: str) -> bytes:
+    """Contain and detach one backend read, leaving chain validation outside."""
+    try:
+        return _read_blob(store, key).data
+    except NotFound as error:
+        _Outcome(capture_caller=False).contain(error, NotFound, "journal read")
+    except BaseException as error:
+        _Outcome(capture_caller=False).contain(error, StorageError, "journal read")
+
+
+async def _read_chain(store: Store, head: Head) -> list[tuple[str, list[Event]]]:
+    """Read under caller supervision without wrapping trusted chain diagnostics."""
+    outcome = _Outcome()
+    try:
+        return await run_sync_daemon(
+            partial(read_chain, store, head, _read=partial(_read_segment, store))
+        )
+    except BaseException as error:
+        outcome.propagate_control(error)
+        raise

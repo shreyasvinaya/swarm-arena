@@ -39,7 +39,7 @@ from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
@@ -811,7 +811,7 @@ async def _finish_queued_goal(
     head = await journal.commit()
     await ledger.end_goal(goal_id)
     assert head is not None
-    chain = await run_sync_daemon(read_chain, store, head)
+    chain = await _read_chain(store, head)
     state = RunState.from_events(e for _, events in chain for e in events)
     await views.write(
         f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head
@@ -822,7 +822,7 @@ async def _finish_run(store: Store, journal: JournalWriter) -> RunState:
     """Export the committed run without consulting a board."""
     head = await journal.commit()
     assert head is not None
-    chain = await run_sync_daemon(read_chain, store, head)
+    chain = await _read_chain(store, head)
     state = RunState.from_events(e for _, batch in chain for e in batch)
     await write_review_export(state, store, head)
     return state
@@ -837,7 +837,7 @@ async def _finish_initialization_stop(
             head = journal.head
             if head is None:
                 raise _core_error(RuntimeError, "run initialization stopped before run_started")
-            chain = await run_sync_daemon(read_chain, store, head)
+            chain = await _read_chain(store, head)
             events = [event for _, batch in chain for event in batch]
             if not any(event.type == EventType.RUN_STARTED for event in events):
                 raise _core_error(RuntimeError, "run initialization stopped before run_started")

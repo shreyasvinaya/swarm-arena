@@ -2465,3 +2465,45 @@ async def test_resume_missing_segment_keeps_chain_error(finished_run: FinishedRu
 
     assert str(caught.value) == f"missing segment '{key}'"
     assert store.read("control/owner.json").data == owner
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "group", "cancel", "fenced", "blob"])
+async def test_resume_segment_failure_is_contained(
+    finished_run: FinishedRun, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import asyncio
+    import traceback
+
+    from swarm_arena._errors import StorageError, _is_core_signal
+    from swarm_arena._store.base import Blob
+
+    marker = "private-backend-diagnostic"
+    store = LocalStore(Path(finished_run.config.run_root) / finished_run.run_id)
+    owner = store.read("control/owner.json")
+    original = LocalStore.read
+    reads: list[str] = []
+
+    def read(current: LocalStore, key: str) -> Blob:
+        if key.startswith("journal/"):
+            reads.append(key)
+            if kind == "cancel":
+                raise asyncio.CancelledError(marker)
+            if kind == "group":
+                raise BaseExceptionGroup(marker, [asyncio.CancelledError(marker), OSError(marker)])
+            if kind == "fenced":
+                raise Fenced(marker)
+            if kind == "blob":
+                return Blob(cast(Any, object()), "etag")
+            error = OSError(marker)
+            error.add_note(marker)
+            raise error
+        return original(current, key)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LocalStore, "read", read)
+        with pytest.raises(StorageError) as caught:
+            await Swarm(finished_run.config).resume(finished_run.run_id, force=True)
+    assert reads
+    assert _is_core_signal(caught.value)
+    assert marker not in "".join(traceback.format_exception(caught.value))
+    assert store.read("control/owner.json") == owner

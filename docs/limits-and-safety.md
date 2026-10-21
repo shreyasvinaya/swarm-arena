@@ -223,6 +223,10 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+Backend journal reads are contained and their bytes detached before chain or replay
+validation. Backend diagnostics and backend cancellation cannot impersonate core
+validation or caller cancellation.
+
 An invalid or missing committed journal segment raises `ChainError`, preserving
 the safe diagnostic that identifies the segment. Invalid replay payloads,
 missing committed state, incompatible agent limits, and decreased budget caps

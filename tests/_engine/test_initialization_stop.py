@@ -290,3 +290,69 @@ async def test_resume_initialization_stops_before_worker_release(
         assert owner is not None
         assert owner[0].head == initial_owner[0].head
         assert not any(e.type == "takeover" for e in all_events(config))
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "group", "cancel"])
+async def test_stopped_initialization_contains_segment_failure(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import traceback
+
+    from swarm_arena._errors import StorageError
+    from swarm_arena._store.base import Blob
+
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.5})
+    marker = "private-backend-diagnostic"
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    reads: list[str] = []
+    original_open, original_read = ArenaBoard.open, LocalStore.read
+
+    def open_board(*args: Any, **kwargs: Any) -> None:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(20)
+        original_open(*args, **kwargs)
+
+    def read(store: LocalStore, key: str) -> Blob:
+        if entered.is_set() and key.startswith("journal/"):
+            reads.append(key)
+            if kind == "cancel":
+                raise asyncio.CancelledError(marker)
+            if kind == "group":
+                raise BaseExceptionGroup(marker, [OSError(marker), asyncio.CancelledError(marker)])
+            error = OSError(marker)
+            error.add_note(marker)
+            raise error
+        return original_read(store, key)
+
+    monkeypatch.setattr(ArenaBoard, "open", open_board)
+    monkeypatch.setattr(LocalStore, "read", read)
+    monkeypatch.setattr(
+        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
+    )
+    task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
+    try:
+        with anyio.fail_after(10):
+            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        await request_stop(config.run_root, "r", now=True)
+        done, _ = await asyncio.wait([task], timeout=2)
+        assert done
+        assert not task.cancelled()
+        error = task.exception()
+        assert isinstance(error, StorageError)
+        assert _is_core_signal(error)
+        assert reads
+        assert marker not in "".join(traceback.format_exception(error))
+        owner = read_owner(LocalStore(Path(config.run_root) / "r"))
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()

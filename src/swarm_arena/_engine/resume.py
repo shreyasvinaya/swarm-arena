@@ -33,7 +33,7 @@ from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_segment, read_chain
 from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._model.ids import IdGen
@@ -81,7 +81,11 @@ class ResumeState:
 def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
     if doc.head is None:
         raise _core_error(ValueError, "run has no committed journal")
-    events = [event for _, batch in read_chain(store, doc.head) for event in batch]
+    events = [
+        event
+        for _, batch in read_chain(store, doc.head, _read=partial(_read_segment, store))
+        for event in batch
+    ]
     return events, RunState.from_events(events)
 
 
@@ -444,7 +448,12 @@ async def _take_over(
         if doc.head is None:
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
-            await run_sync_daemon(validate, doc)
+            outcome = _Outcome()
+            try:
+                await run_sync_daemon(validate, doc)
+            except BaseException as error:
+                outcome.propagate_control(error)
+                raise
         try:
             return await _acquire_lease(
                 partial(
