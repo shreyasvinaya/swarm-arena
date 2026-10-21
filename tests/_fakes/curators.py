@@ -204,3 +204,70 @@ class PaidReplanner(Planner):
         call = await scope.tranche.reserve_call(Amount(usd=0.000003))
         await scope.tranche.settle_call(call, Amount(usd=0.000003))
         raise RuntimeError("proposal declined")
+
+
+class RefusingCurator(CountingCurator):
+    """Record invocation before requesting more reserve than the funded run has."""
+
+    async def curate(
+        self, namespace: str, new: Sequence[Learning], view: BoardView
+    ) -> list[Learning]:
+        from swarm_arena._budget.amount import Amount
+        from swarm_arena._budget.llm_scope import current_llm_scope
+
+        await super().curate(namespace, new, view)
+        scope = current_llm_scope()
+        assert scope is not None
+        try:
+            await scope.tranche.reserve_call(Amount(usd=100))
+        finally:
+            assert scope.tranche._ledger.remaining("g/:curator").usd > 0
+            assert not scope.tranche._ledger.run_exhausted()
+        raise AssertionError("unfunded work dispatched")
+
+
+async def refusal_crash_driver(root: str, boundary: str) -> None:
+    """Die after a real refusal control event or receipt is published."""
+    import os
+    from pathlib import Path
+
+    from _engine.test_goal import _curator_plan
+    from _fakes.engine import with_executor
+
+    from swarm_arena import Limits, Ref, Swarm
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.goal import GoalRunner
+    from swarm_arena._journal.writer import JournalWriter
+
+    path = Path(root)
+    config = with_executor(
+        RunConfig(
+            run_root=str(path / "runs"),
+            arena_root=str(path / "arena"),
+            artifact_root=str(path / "artifacts"),
+            limits=Limits(max_usd=10),
+            curator=Ref(
+                path="_fakes.curators:RefusingCurator", config={"marker": str(path / "calls")}
+            ),
+        ),
+        workspace_root=str(path / "ws"),
+    )
+    original_publish = JournalWriter._publish
+    original_close = GoalRunner._close
+
+    async def publish(self: JournalWriter) -> None:
+        hit = any(event.type == boundary for event in self._queue)
+        await original_publish(self)
+        if hit:
+            os._exit(91)
+
+    async def close(self: GoalRunner, tranche: Tranche) -> None:
+        if boundary == "reserve_exhausted":
+            # Force the valid schedule where the control event commits before
+            # receipt admission. The writer still publishes the real journal.
+            await self.deps.journal.commit()
+        await original_close(self, tranche)
+
+    JournalWriter._publish = publish
+    GoalRunner._close = close
+    await Swarm(config, replanner=PaidReplanner()).run(_curator_plan(), run_id="curation")

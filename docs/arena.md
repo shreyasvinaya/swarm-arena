@@ -336,6 +336,10 @@ charged conservatively when the tranche closes.
 A curator reserve refusal ends ordinary rounds with `reserve_exhausted` and
 selects from existing candidates. It does not schedule a replan, even when the
 refused request leaves funds available in the ledger.
+Its `reserve_exhausted` control event carries `reason="reserve_exhausted"`
+before the completion receipt is admitted. Replay restores that terminal reason
+even when the process dies before the receipt or round closure. Recovery closes
+the interrupted round without replanning or another curator/ordinary work call.
 
 A successful preparation publishes all summary `learning` events and one
 `curated` receipt together, without an await between their appends. Its plain

@@ -1706,3 +1706,54 @@ async def test_curator_recovery_preserves_join_retry_phase(tmp_path: Path, bound
     assert len(events(config, "plan_revision")) == 2
     assert [event.round for event in events(config, "round_closed")] == [1, 2]
     assert events(config, "goal_finished")[-1].payload["reason"] is None
+
+
+@pytest.mark.parametrize("boundary", ["reserve_exhausted", "curated"])
+async def test_curator_refusal_survives_process_death(tmp_path: Path, boundary: str) -> None:
+    import os
+    import sys
+
+    import anyio
+    from _fakes.curators import PaidReplanner
+    from _fakes.run import all_events, events
+
+    from swarm_arena import Swarm
+    from swarm_arena._journal.replay import RunState
+
+    environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
+    )
+    script = (
+        "import sys,anyio; from _fakes.curators import refusal_crash_driver; "
+        "anyio.run(refusal_crash_driver,sys.argv[1],sys.argv[2])"
+    )
+    with anyio.fail_after(60):
+        process = await anyio.run_process(
+            [sys.executable, "-c", script, str(tmp_path), boundary], env=environment, check=False
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    config = RunConfig.load(tmp_path / "runs" / "curation" / "run.toml")
+    before = all_events(config)
+    state = RunState.from_events(before).goals["g"]
+    assert len(events(config, "reserve_exhausted")) == 1
+    assert len(events(config, "curated")) == int(boundary == "curated")
+    assert state.rounds_closed == 0
+    assert len(events(config, "tool_start")) == 1
+    assert state.select_only
+    pending_reason = state.pending_reason
+    replanner = PaidReplanner()
+    with anyio.fail_after(60):
+        result = await Swarm(config, replanner=replanner).resume("curation", force=True)
+    assert result["g"]
+    assert pending_reason == "reserve_exhausted"
+    assert events(config, "goal_finished")[-1].payload["reason"] == "reserve_exhausted"
+    assert replanner.calls == 0
+    assert (tmp_path / "calls").read_text().splitlines() == ["called"]
+    assert len(events(config, "tool_start")) == 1
+    assert len(events(config, "round_closed")) == 1
+    assert events(config, "round_closed")[0].payload["replan"] is False
+    assert len(events(config, "curated")) == int(boundary == "curated")
+    later = [event for event in all_events(config) if event.seq > before[-1].seq]
+    assert not [event for event in later if event.type in {"reserve", "settle"}]

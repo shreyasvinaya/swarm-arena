@@ -359,7 +359,7 @@ class GoalRunner:
         )
 
     async def _restore_terminal_decision(self) -> None:
-        """Restore this lifecycle/revision's terminal policy and any owed closure."""
+        """Restore terminal policy/curation state and any owed round closure."""
         latest: tuple[int, Decision] | None = None
         for event in self._events:
             if event.goal_id != self.goal_id:
@@ -378,9 +378,11 @@ class GoalRunner:
             round, decision = latest
             if decision.no_result:
                 self.status, self.reason = "no_result", decision.no_result
-                if round > self.rounds_closed:
-                    self.rounds_closed = round
-                    await self._close_round(round, replan=False)
+            if (
+                decision.no_result or self.reason == "reserve_exhausted"
+            ) and round > self.rounds_closed:
+                self.rounds_closed = round
+                await self._close_round(round, replan=False)
 
     def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
         seen = {candidate.id for _, candidate in self.repeat_entries}
@@ -1086,7 +1088,11 @@ class GoalRunner:
             except LimitReached as error:
                 completed, result = True, ([], [f"curator limit: {error.limit}"])
                 # Only registered limits escape the plugin boundary above.
-                self.deps.journal.append(self._draft(EventType.RESERVE_EXHAUSTED, round=round))
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                    )
+                )
                 self.select_only = True
                 self.status, self.reason = "stopped", "reserve_exhausted"
         finally:
@@ -1266,7 +1272,7 @@ class GoalRunner:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
         await self._restore_terminal_decision()
         self._restore_repeats()
-        if self.status != "no_result":
+        if self.status != "no_result" and self.reason != "reserve_exhausted":
             self.agents = await self._slots(self.plan.teams, reuse=False)
             if not self.state.converge_started and self.join_phase != "replan":
                 await self._run_rounds()

@@ -516,6 +516,7 @@ class RunState:
                 updates["pending_reason"] = payload.get("reason")
             case EventType.RESERVE_EXHAUSTED:
                 updates["select_only"] = True
+                updates["pending_reason"] = payload.get("reason", goal.pending_reason)
             case EventType.FINAL_ORDER:
                 updates["selection_recorded"] = True
                 updates["final_order"] = payload["candidate_ids"]
