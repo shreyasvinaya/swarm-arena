@@ -5,12 +5,13 @@ import html
 import io
 import math
 import os
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from tempfile import gettempdir
-from typing import Final
+from typing import Any, Final, TypeVar
 from urllib.parse import quote
 
 import anyio
@@ -27,7 +28,14 @@ from swarm_arena._board.leaderboard import flatten, format_value, group_judges, 
 from swarm_arena._board.pages import state_positions
 from swarm_arena._board.pointers import _validate_run_id
 from swarm_arena._engine.preflight import check_storage
-from swarm_arena._errors import AlreadyExists, Fenced, LeaseHeld, StorageError, _core_error
+from swarm_arena._errors import (
+    AlreadyExists,
+    Fenced,
+    LeaseHeld,
+    StorageError,
+    _core_error,
+    _rebuild_core_signal,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
@@ -273,6 +281,25 @@ def _write_export(out_dir: Path, files: dict[str, bytes]) -> None:
         ) from None
 
 
+_T = TypeVar("_T")
+
+
+async def _review_io(operation: Callable[..., _T], *args: Any) -> _T:
+    """Await abandonable review I/O with reconstructed storage diagnostics."""
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    try:
+        return await run_sync_daemon(operation, *args)
+    except Exception as error:
+        safe = _rebuild_core_signal(error)
+        if safe is not None:
+            raise safe from None
+        if isinstance(error, AlreadyExists):
+            raise _core_error(AlreadyExists, "review object already exists") from None
+        if isinstance(error, Fenced):
+            raise _core_error(Fenced) from None
+        raise _core_error(StorageError, f"review storage failed: {type(error).__name__}") from None
+
+
 async def _publish_review_object(
     arena: Store,
     store: Store,
@@ -284,7 +311,7 @@ async def _publish_review_object(
     now: datetime,
 ) -> None:
     """Check current authority immediately before one exact create-or-compare."""
-    owner = await run_sync_daemon(read_owner, store)
+    owner = await _review_io(read_owner, store)
     if (
         owner is None
         or owner[0].epoch != lease.doc.epoch
@@ -295,7 +322,7 @@ async def _publish_review_object(
     parts = key.split("/")
     try:
         await anyio.lowlevel.checkpoint_if_cancelled()
-        await run_sync_daemon(
+        await _review_io(
             partial(
                 write_human_objects,
                 arena,
@@ -309,7 +336,7 @@ async def _publish_review_object(
         )
     except AlreadyExists:
         expected = b"".join(canonical_json(obj.model_dump(mode="json")) + b"\n" for obj in objects)
-        existing = await run_sync_daemon(arena.read, key)
+        existing = await _review_io(arena.read, key)
         if existing.data != expected:
             raise _core_error(
                 StorageError, "review object bytes differ from committed receipt"

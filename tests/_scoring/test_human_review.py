@@ -3,6 +3,7 @@
 import csv
 import io
 import re
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from _fakes.secrecy import assert_secret_absent
 import swarm_arena._scoring.human_review as human_review
 from swarm_arena import RunConfig
 from swarm_arena._board.human_objects import read_human_object
-from swarm_arena._errors import ConditionalWritesUnsupported, Fenced, StorageError
+from swarm_arena._errors import ConditionalWritesUnsupported, Fenced, StorageError, _core_error
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -315,7 +316,7 @@ async def test_committed_receipt_repaired_before_next_import(
     real = human_review.write_human_objects
 
     def fail(*args: Any, **kwargs: Any) -> str:
-        raise StorageError("publication interrupted")
+        raise _core_error(StorageError, "publication interrupted")
 
     monkeypatch.setattr(human_review, "write_human_objects", fail)
     with pytest.raises(StorageError, match="publication interrupted"):
@@ -418,7 +419,7 @@ async def test_partial_namespace_publication_repairs_exact_bytes(
 
     def fail_second(*args: Any, **kwargs: Any) -> str:
         if len(seen) == 1:
-            raise StorageError("interrupted second namespace")
+            raise _core_error(StorageError, "interrupted second namespace")
         key = original(*args, **kwargs)
         seen.append((key, arena.read(key).data))
         return key
@@ -592,7 +593,7 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
     path = _file(tmp_path)
 
     def fail(*args: Any, **kwargs: Any) -> str:
-        raise StorageError("interrupted publication")
+        raise _core_error(StorageError, "interrupted publication")
 
     with monkeypatch.context() as patch:
         patch.setattr(human_review, "write_human_objects", fail)
@@ -783,7 +784,62 @@ async def test_cancelled_takeover_releases_undelivered_lease(
         assert await run_sync_daemon(returned.wait, 5)
         for lease in leases:
             with anyio.CancelScope(shield=True):
-                try:
+                with suppress(Fenced):
                     await run_sync_daemon(lease.release)
-                except Fenced:
-                    pass
+
+
+@pytest.mark.parametrize("operation", ["import", "export"])
+@pytest.mark.parametrize("site", ["create", "read"])
+@pytest.mark.parametrize("kind", ["raw", "registered", "fenced"])
+async def test_review_storage_errors_rebuild_safe_diagnostics(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    state: RunState,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    site: str,
+    kind: str,
+) -> None:
+    from uuid import uuid4
+
+    from swarm_arena._engine.run import write_review_export
+    from swarm_arena._store.local import LocalStore
+
+    path = _file(tmp_path)
+    head = review_run.heads[-1]
+    if site == "read":
+        if operation == "import":
+            await HumanReview("alice").import_csv(review_run.run_id, path, config=run_config)
+        else:
+            await write_review_export(state, review_run.store, head)
+    secret = uuid4().hex
+    expected_type = Fenced if kind == "fenced" else StorageError
+    error = (
+        StorageError(secret)
+        if kind == "raw"
+        else _core_error(expected_type, "safe review storage failure")
+    )
+    error.args = (secret,)
+    error.add_note(secret)
+    error.__cause__ = ValueError(secret)
+    original = getattr(LocalStore, site)
+
+    def fail(self: LocalStore, key: str, *args: Any, **kwargs: Any) -> Any:
+        if "/reviews/" in key or key.startswith("review/"):
+            raise error
+        return original(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(LocalStore, site, fail)
+    call = (
+        HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
+        if operation == "import"
+        else write_review_export(state, review_run.store, head)
+    )
+    with pytest.raises(expected_type) as caught:
+        await call
+    assert caught.value is not error
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert str(caught.value) == (
+        "review storage failed: StorageError" if kind == "raw" else "safe review storage failure"
+    )

@@ -743,7 +743,7 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
     --------
     >>> await write_review_export(state, store, head)  # doctest: +SKIP
     """
-    from swarm_arena._scoring.human_review import render_review
+    from swarm_arena._scoring.human_review import _review_io, render_review
 
     files = render_review(state, top=20)
 
@@ -751,8 +751,8 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
         await anyio.lowlevel.checkpoint_if_cancelled()
         key = f"review/e{head.epoch}-{head.seq}/{name}"
         try:
-            await run_sync_daemon(store.create, key, data)
+            await _review_io(store.create, key, data)
         except AlreadyExists:
-            existing = await run_sync_daemon(store.read, key)
+            existing = await _review_io(store.read, key)
             if sha256(existing.data).digest() != sha256(data).digest():
                 raise _core_error(StorageError, "review export bytes differ") from None
