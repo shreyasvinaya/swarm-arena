@@ -1,6 +1,7 @@
 """Inherited reads retain the validated run clock and confirmed ownership bound."""
 
 import asyncio
+import json
 import threading
 from functools import partial
 from pathlib import Path
@@ -12,15 +13,20 @@ from _fakes.leases import force_take_over
 from _fakes.run import all_events, plan
 
 from swarm_arena import RunConfig, Swarm
+from swarm_arena._engine import resume as resume_module
 from swarm_arena._engine import run as run_module
+from swarm_arena._engine import stops as stops_module
 from swarm_arena._engine.control import request_stop
+from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock
 from swarm_arena._errors import Fenced, _is_core_signal
 from swarm_arena._journal import writer as writer_module
+from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._store.base import Blob
 from swarm_arena._store.local import LocalStore
 
 
@@ -145,3 +151,108 @@ async def test_preparation_and_replay_share_remaining_allowance(
         assert deps.clock.elapsed() == before + ticks
     finally:
         await runner.aclose()
+
+
+@pytest.mark.parametrize("race", ["authority_read", "cas_retry"])
+async def test_takeover_clock_uses_inherited_head(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    await Swarm(run_config).run(plan(rounds=1), run_id="r")
+    ticks = 0.0
+    monkeypatch.setattr(stops_module, "monotonic", lambda: ticks)
+    old = await resume_module.resume_run(run_config, "r", force=True, replanner=None)
+    assert old.resumed is not None
+    deps = old.resumed._services.deps
+    assert deps is not None
+    store = LocalStore(Path(run_config.run_root) / "r")
+    committed = read_committed(store)
+    assert committed is not None
+    earlier = RunState.from_events(committed[1]).run_elapsed_s
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original_read = LocalStore.read
+    original_replace = LocalStore.replace
+    armed = True
+
+    def read(current: LocalStore, key: str) -> Blob:
+        nonlocal armed
+        blob = original_read(current, key)
+        if race == "authority_read" and key == "control/owner.json" and armed:
+            armed = False
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(30)
+        return blob
+
+    def replace(current: LocalStore, key: str, data: bytes, *, if_match: str) -> str:
+        nonlocal armed
+        if (
+            race == "cas_retry"
+            and key == "control/owner.json"
+            and armed
+            and json.loads(data)["epoch"] == 3
+        ):
+            armed = False
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(30)
+        return original_replace(current, key, data, if_match=if_match)
+
+    observed: list[tuple[float, float]] = []
+    drive = run_module.RunRunner._drive
+
+    async def capture(runner: run_module.RunRunner, current: EngineDeps, epoch: int) -> Any:
+        assert runner.resumed is not None
+        observed.append((current.clock.elapsed(), runner.resumed.state.run_elapsed_s))
+        return await drive(runner, current, epoch)
+
+    clocks: list[RunClock] = []
+    validated_read = resume_module._read
+
+    class RetainedClock(RunClock):
+        def __init__(self, before: float) -> None:
+            super().__init__(before)
+            clocks.append(self)
+
+    def read_checkpoint(*args: Any, **kwargs: Any) -> Any:
+        nonlocal ticks
+        result = validated_read(*args, **kwargs)
+        if clocks:
+            ticks += 7
+        return result
+
+    monkeypatch.setattr(resume_module, "RunClock", RetainedClock)
+    monkeypatch.setattr(resume_module, "_read", read_checkpoint)
+    monkeypatch.setattr(LocalStore, "read", read)
+    monkeypatch.setattr(LocalStore, "replace", replace)
+    monkeypatch.setattr(run_module.RunRunner, "_drive", capture)
+    # Fifty active seconds since the incumbent last committed an event.
+    ticks = 50.0
+    task = asyncio.create_task(Swarm(run_config).resume("r", force=True))
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        # The incumbent advances active time and commits while the prospective
+        # owner is still reading its older authority snapshot.
+        await deps.journal.append_durable(EventDraft(type=EventType.WATCHDOG))
+        latest = read_committed(store)
+        assert latest is not None
+        checkpoint = RunState.from_events(latest[1]).run_elapsed_s
+        assert checkpoint >= earlier + 50
+        release.set()
+        with anyio.fail_after(20):
+            result = await task
+        assert list(result) == ["g"]
+        assert observed
+        assert len(clocks) == 1
+        assert ticks > 50
+        assert observed[0][0] == checkpoint + ticks - 50
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(20):
+            await asyncio.gather(task, return_exceptions=True)
+            await old.resumed._services._aclose(failed=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()

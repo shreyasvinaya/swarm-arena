@@ -113,6 +113,10 @@ class RunClock:
         self._before = elapsed_before
         self._start = monotonic()
 
+    def _rebase(self, elapsed_before: float) -> None:
+        """Adopt the acquired checkpoint without restarting preparation time."""
+        self._before = elapsed_before
+
     def elapsed(self) -> float:
         """
         Return accumulated active seconds, excluding downtime before resume.

@@ -32,7 +32,7 @@ from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
-from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
+from swarm_arena._journal.lease import Head, Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import _read_segment, read_chain
 from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
@@ -125,10 +125,12 @@ class _ResumeServices:
         *,
         force: bool,
         clock: RunClock,
+        validated_head: Head,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
+        self.validated_head = validated_head
         self.ready, self.close = anyio.Event(), anyio.Event()
         self.failure: BaseException | None = None
         self.resumed: ResumeState | None = None
@@ -160,19 +162,35 @@ class _ResumeServices:
             path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
             stops = StopState()
             clock = self.clock
+            journal = run_module._RunJournal(
+                self.store,
+                lease,
+                run_id=self.run_id,
+                next_seq=head.seq + 1,
+                local_path=path,
+                sync_interval_s=config.sync_interval_s,
+                settle_timeout_s=config.settle_timeout_s,
+            )
+            if head != self.validated_head:
+                validated = False
+                async with run_module._supervise_initialization(
+                    self.store, lease.doc.epoch, stops, clock, config
+                ):
+                    # Reuse the writer's confirmed-expiry bound before it owns entry.
+                    _, acquired = await journal._retry(
+                        partial(_read, self.store, lease.doc), validated=True
+                    )
+                    clock._rebase(acquired.run_elapsed_s)
+                    # Configuration rechecks follow the durable takeover below;
+                    # acquiring a newer valid chain must still leave its receipt.
+                    validated = True
+                if not validated:
+                    raise _core_error(RuntimeError, "resume initialization stopped")
             async with (
                 run_module._supervise_initialization(
                     self.store, lease.doc.epoch, stops, clock, config
                 ) as replay_prepared,
-                run_module._RunJournal(
-                    self.store,
-                    lease,
-                    run_id=self.run_id,
-                    next_seq=head.seq + 1,
-                    local_path=path,
-                    sync_interval_s=config.sync_interval_s,
-                    settle_timeout_s=config.settle_timeout_s,
-                ) as journal,
+                journal,
             ):
                 entered = True
                 journal.clock = clock
@@ -524,17 +542,24 @@ async def resume_run(
     store = open_store(config.run_root).child(run_id)
 
     clock: RunClock | None = None
+    validated_head: Head | None = None
 
     def validate(doc: OwnerDoc) -> None:
-        nonlocal clock
+        nonlocal clock, validated_head
         _, state = _read(store, doc)
         _check(state, config)
         if clock is None:
             clock = RunClock(state.run_elapsed_s)
+        else:
+            clock._rebase(state.run_elapsed_s)
+        validated_head = doc.head
 
     lease = await _take_over(config, run_id, store, force=force, validate=validate)
     assert clock is not None
-    services = _ResumeServices(config, run_id, store, lease, force=force, clock=clock)
+    assert validated_head is not None
+    services = _ResumeServices(
+        config, run_id, store, lease, force=force, clock=clock, validated_head=validated_head
+    )
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:
         await services.ready.wait()
