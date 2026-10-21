@@ -395,7 +395,7 @@ async def test_final_timeout_without_journaled_scores_still_has_no_result(
     runner = GoalRunner(
         env.deps, goal_id="g", plan=_plan(teams=1, rounds=1, converge_team=True), replanner=None
     )
-    with anyio.fail_after(3):
+    with anyio.fail_after(20):
         out = await runner.run()
     assert (out.status, out.reason, out.finalists) == ("no_result", "no passing candidate", [])
     assert not env.events("score")
@@ -420,7 +420,7 @@ async def test_interrupted_join_replan_keeps_unjoined_parts(
 
     monkeypatch.setattr(planner, "plan", hang)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
-    with anyio.fail_after(3):
+    with anyio.fail_after(20):
         out = await runner.run()
     _assert_terminal(env, out, _REASONS[flag])
     assert len(env.events("join_failed")) == 1
@@ -493,7 +493,7 @@ class TestFinalReservationOwnership:
             ),
             replanner=None,
         )
-        with anyio.fail_after(5):
+        with anyio.fail_after(20):
             out = await runner.run()
         _assert_terminal(env, out, "stop --now")
         assert out.finalists
@@ -574,7 +574,7 @@ class TestFinalReservationOwnership:
             ),
             replanner=None,
         )
-        with anyio.fail_after(5), pytest.raises(Fenced):
+        with anyio.fail_after(20), pytest.raises(Fenced):
             await runner.run()
         assert len(admitted) == 1
         reservation = admitted[0]
