@@ -357,6 +357,8 @@ class RepeatIndex:
                     request=request.model_copy(update={"replicate": index}),
                     deterministic=False,
                 )
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:
                 error = _classify_outcome(error)
                 raise _core_signal(

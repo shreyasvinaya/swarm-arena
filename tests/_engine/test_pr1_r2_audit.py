@@ -29,7 +29,7 @@ from swarm_arena.planning import Decision, Policy, RoundState
 from swarm_arena.scoring import Judge, JudgeContext, Lexicographic
 
 
-@pytest.mark.parametrize("kind", ["fenced", "cancel", "group"])
+@pytest.mark.parametrize("kind", ["fenced", "cancel", "group", "interrupt"])
 @pytest.mark.parametrize(
     "site",
     [
@@ -58,10 +58,11 @@ def test_sync_conversion_boundaries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, site: str, kind: str
 ) -> None:
     calls: list[None] = []
+    interrupt = KeyboardInterrupt()
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         calls.append(None)
-        raise failure(kind)
+        raise interrupt if kind == "interrupt" else failure(kind)
 
     class BadConfig(BaseModel):
         @model_validator(mode="before")
@@ -215,6 +216,10 @@ def test_sync_conversion_boundaries(
         invoke()
     except BaseException as error:
         caught = error
+    if kind == "interrupt":
+        monkeypatch.undo()
+        assert caught is interrupt
+        return
     if caught is not None:
         assert isinstance(caught, Fenced if kind == "fenced" else Exception)
         assert SECRET not in "".join(traceback.format_exception(caught))
@@ -275,7 +280,7 @@ async def test_script_judge_child_outcome(
     assert SECRET not in "".join(traceback.format_exception(caught.value))
 
 
-@pytest.mark.parametrize("kind", ["fenced", "cancel", "group"])
+@pytest.mark.parametrize("kind", ["fenced", "cancel", "group", "interrupt"])
 @pytest.mark.parametrize(
     "site",
     [
@@ -300,10 +305,11 @@ def test_remaining_sync_conversions(monkeypatch: pytest.MonkeyPatch, site: str, 
     from swarm_arena.tool import Tool, ToolOutput, ToolRequest
 
     calls: list[None] = []
+    interrupt = KeyboardInterrupt()
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         calls.append(None)
-        raise failure(kind)
+        raise interrupt if kind == "interrupt" else failure(kind)
 
     invoke: Callable[[], Any]
     fallback = False
@@ -367,6 +373,10 @@ def test_remaining_sync_conversions(monkeypatch: pytest.MonkeyPatch, site: str, 
         invoke()
     except BaseException as error:
         caught = error
+    if kind == "interrupt":
+        monkeypatch.undo()
+        assert caught is interrupt
+        return
     if caught is not None:
         assert isinstance(caught, Fenced if kind == "fenced" else Exception)
         assert SECRET not in "".join(traceback.format_exception(caught))

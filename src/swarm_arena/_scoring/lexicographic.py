@@ -103,6 +103,8 @@ class Lexicographic(Judge):
                 except TypeError as error:
                     _propagate_control(error)
                     raise TypeError(f"cannot build judge {ref.path}") from None
+                except KeyboardInterrupt:
+                    raise
                 except BaseException as error:
                     _propagate_control(error)
                     raise ValueError(f"cannot build judge {ref.path}") from None
@@ -178,6 +180,8 @@ class Lexicographic(Judge):
                     ]
                 )
             )
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             _propagate_control(error)
             raise ValueError("cannot encode lexicographic rubric") from None
@@ -416,6 +420,8 @@ class Lexicographic(Judge):
                         ),
                     )
                 )
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:
                 error = _classify_outcome(error)
                 errors[candidate.id] = (

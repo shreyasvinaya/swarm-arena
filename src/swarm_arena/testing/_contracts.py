@@ -23,6 +23,8 @@ def _strict_copy(model: type[_M], value: _M) -> _M | None:
         dump = value.model_dump(warnings=False)
         valid = model.model_validate(dump, strict=True)
         return valid if valid.model_dump(warnings=False) == dump else None
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         _propagate_control(error)
         return None

@@ -55,6 +55,8 @@ def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]:
     _, config = ref._resolve_config(Configurable)
     try:
         result = config.model_dump(mode="json")
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         _propagate_control(error)
         raise ValueError(f"{ref.path}: cannot serialize config") from None

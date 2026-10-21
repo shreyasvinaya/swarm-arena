@@ -317,6 +317,8 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     """Contain user hook failures separately from safe core validation errors."""
     try:
         return hook(*args)
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_signal(
@@ -383,6 +385,8 @@ def _request(
         )
     except ConfigError as error:
         raise _core_signal(SoftError(str(error))) from None
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_signal(
@@ -414,6 +418,8 @@ def _stage_settings(
             max_edit_bytes=rt.limits.max_edit_bytes,
         )
         return files, editable, protected
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
@@ -456,6 +462,8 @@ def _stage(
             edits=request.edits,
             request_json=request_json(request),
         )
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):

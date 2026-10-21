@@ -239,6 +239,8 @@ def _sanitize_validation_error(
         return _SanitizedValidationError.from_exception_data(
             model.__name__, details, hide_input=True
         )
+    except KeyboardInterrupt:
+        raise
     except BaseException as failure:
         _propagate_control(failure)
     return _minimal_validation_error(model)
@@ -272,6 +274,8 @@ def _validation_wrapper(
         )
         try:
             return handler(data)
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
@@ -282,6 +286,8 @@ def _validation_wrapper(
                 )
             except RecursionError:
                 safe = None
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:
                 try:  # noqa: SIM105 - a context manager itself needs spare stack frames
                     _propagate_control(error)

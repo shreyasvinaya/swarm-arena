@@ -117,6 +117,8 @@ def _plan_tool(
     model = built.get_input_model()
     try:
         params = model.model_validate(inputs).model_dump(mode="json")
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _sanitize_validation_error(model, error) from None
@@ -196,6 +198,8 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
         raise _fail(message)
     try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
         valid = ToolOutput.model_validate(out.model_dump(warnings=False))
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         _propagate_control(error)
         raise _fail(message) from None

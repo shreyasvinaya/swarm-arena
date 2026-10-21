@@ -185,6 +185,8 @@ def load_object(path: str) -> object:
         obj: object = importlib.import_module(module)
         for part in qualname.split("."):
             obj = getattr(obj, part)
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         _propagate_control(error)
         raise ValueError(f"cannot import {path}") from None
@@ -233,6 +235,8 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         try:
             return model_cls.model_validate(data)
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
@@ -241,6 +245,8 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
                 safe = _sanitize_validation_error(model_cls, error)
             except RecursionError:
                 safe = None
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:
                 try:  # noqa: SIM105 - a context manager itself needs spare stack frames
                     _propagate_control(error)

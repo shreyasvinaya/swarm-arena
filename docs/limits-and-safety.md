@@ -294,3 +294,7 @@ convergence ranks candidates or launches a team: final scores cannot reselect
 the input batch. The completion key also binds the committed candidate set at
 that boundary, so newly produced candidates invalidate reuse.
 
+
+Synchronous library validation and import helpers propagate `KeyboardInterrupt`
+unchanged. When the engine invokes these helpers in a daemon worker, the awaiting
+engine boundary still contains hook-raised interrupts as type-only failures.

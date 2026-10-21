@@ -14,7 +14,7 @@ from swarm_arena._errors import Fenced
 
 
 @pytest.mark.parametrize(
-    "kind", ["fenced", "cancel", "group", "ordinary", "forged", "forged_group"]
+    "kind", ["fenced", "cancel", "group", "ordinary", "forged", "forged_group", "interrupt"]
 )
 @pytest.mark.parametrize(
     "site",
@@ -39,6 +39,8 @@ async def test_public_startup_and_shutdown_outcomes(
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         calls.append(None)
+        if kind == "interrupt":
+            raise KeyboardInterrupt(SECRET)
         raise ValueError(SECRET) if kind == "ordinary" else failure(kind)
 
     async def fail_async(*args: Any, **kwargs: Any) -> Any:

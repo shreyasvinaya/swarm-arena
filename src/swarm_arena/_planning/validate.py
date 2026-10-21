@@ -98,6 +98,8 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     """Hide arbitrary connector values at the admission boundary."""
     try:
         return action()
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
@@ -134,6 +136,8 @@ def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
             if not issubclass(cls, Configurable):
                 raise TypeError
             safe = _safe_location(cls.Config, tuple(location))
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             _propagate_control(error)
             safe = ("<key>",) * len(location)
@@ -406,6 +410,8 @@ def _rule_configs(
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
             continue
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             error = _classify_outcome(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
@@ -870,6 +876,8 @@ def _validate_round_refs(plan: Plan) -> None:
             effective_tool_ref(ref, overrides)
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             error = _classify_outcome(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
@@ -1001,6 +1009,8 @@ def admit_revision(
         frozen = snapshot_plan(authorized, artifacts)
         frozen = _snapshot_round_refs(frozen, artifacts)
     except PlanError:
+        raise
+    except KeyboardInterrupt:
         raise
     except BaseException as error:
         error = _classify_outcome(error)

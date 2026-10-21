@@ -91,6 +91,8 @@ def _check_catalog_defaults(
         try:
             component = Ref(path=entry.ref).load()
             schema = component.Config if issubclass(component, Configurable) else None
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             _propagate_control(error)
             schema = None
@@ -112,6 +114,8 @@ def _check_catalog_defaults(
                         catalog_form({key: raw}),
                         catalog_form({key: value.model_dump(mode="json")}),
                     )
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:
                 _propagate_control(error)
                 accepted = False

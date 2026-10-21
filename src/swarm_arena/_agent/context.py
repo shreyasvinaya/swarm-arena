@@ -80,6 +80,8 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
             raise TypeError("invalid feedback policy")
         return _ToolMetadata(description, input_model, editable, actions, feedback)
+    except KeyboardInterrupt:
+        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_signal(

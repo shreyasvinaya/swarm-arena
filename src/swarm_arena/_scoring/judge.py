@@ -215,6 +215,8 @@ class Judge(Configurable, ABC):
                     }
                 )
             )
+        except KeyboardInterrupt:
+            raise
         except BaseException as error:
             _propagate_control(error)
             raise ValueError("cannot encode judge rubric") from None
