@@ -9,7 +9,13 @@ from typing import Any
 import anyio
 import pytest
 
-from swarm_arena._errors import ChainError, Fenced, StorageError, WriteOutcomeUnknown
+from swarm_arena._errors import (
+    ChainError,
+    Fenced,
+    StorageError,
+    WriteOutcomeUnknown,
+    _is_core_signal,
+)
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease, read_owner
 from swarm_arena._journal.reader import read_chain
@@ -726,21 +732,24 @@ async def test_inherited_read_retries_transient_failure(
 
 
 @pytest.mark.parametrize("site", ["create", "replace"])
+@pytest.mark.parametrize("deadline", ["lease", "settlement"])
 async def test_blocked_publication_expires_without_late_state_change(
-    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, deadline: str
 ) -> None:
     import asyncio
     import threading
 
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
-    writer = _writer(store, tmp_path, ttl_s=3, group_window_s=0)
+    writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
+    writer._settle_timeout_s = 0.2
     original = getattr(store, site)
 
     def block(*args: object, **kwargs: object) -> str:
-        workers.append(threading.current_thread())
-        entered.set()
-        assert release.wait(20)
+        if not entered.is_set():
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(20)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(store, site, block)
@@ -754,9 +763,22 @@ async def test_blocked_publication_expires_without_late_state_change(
     try:
         with anyio.fail_after(10):
             assert await anyio.to_thread.run_sync(entered.wait, 8)
+        if deadline == "settlement":
+            writer._stop_storage()
         done, _ = await asyncio.wait([task], timeout=4)
-        assert done, "publication wait outlived confirmed ownership"
-        assert isinstance(task.exception(), Fenced)
+        assert done, "publication wait outlived its deadline"
+        error = task.exception()
+        assert error is not None
+        assert _is_core_signal(error)
+        if deadline == "lease":
+            assert isinstance(error, Fenced)
+        else:
+            assert not isinstance(error, Fenced)
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "stop cleanup timed out"
+            assert writer._remaining() > 0
+        with pytest.raises(type(error)):
+            writer.append(EventDraft(type=EventType.RESERVE))
         assert writer.head is None
         assert writer.committed == ()
     finally:
@@ -776,3 +798,66 @@ async def test_blocked_publication_expires_without_late_state_change(
     assert owner is not None
     if site == "create":
         assert owner[0].head is None
+    if deadline == "settlement":
+        assert owner[0].expires_at <= utc_now()
+        successor = Lease.take_over(store, owner_id="successor", host="test", ttl_s=60, force=False)
+        successor.release()
+
+
+async def test_settlement_timeout_bounds_the_release_attempt(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    writer = _writer(store, tmp_path, group_window_s=0)
+    writer._settle_timeout_s = 0.2
+    publishing, releasing, unblock = (threading.Event() for _ in range(3))
+    workers: list[threading.Thread] = []
+    create, replace = store.create, store.replace
+
+    def blocked_create(key: str, data: bytes) -> str:
+        workers.append(threading.current_thread())
+        publishing.set()
+        assert unblock.wait(30)
+        return create(key, data)
+
+    def blocked_release(key: str, data: bytes, *, if_match: str) -> str:
+        workers.append(threading.current_thread())
+        releasing.set()
+        assert unblock.wait(30)
+        return replace(key, data, if_match=if_match)
+
+    monkeypatch.setattr(store, "create", blocked_create)
+    monkeypatch.setattr(store, "replace", blocked_release)
+
+    async def publish() -> None:
+        async with writer:
+            await writer.append_durable(EventDraft(type=EventType.RESERVE))
+
+    task = asyncio.create_task(publish())
+    try:
+        assert await anyio.to_thread.run_sync(publishing.wait, 10)
+        writer._stop_storage()
+        assert await anyio.to_thread.run_sync(releasing.wait, 5)
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "failed writer retained its blocked release"
+        error = task.exception()
+        assert isinstance(error, RuntimeError)
+        assert _is_core_signal(error)
+        assert str(error) == "stop cleanup timed out"
+        assert writer.head is None
+    finally:
+        unblock.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert len(workers) == 2
+    assert writer.head is None
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is None

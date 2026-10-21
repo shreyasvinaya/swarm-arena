@@ -1,6 +1,7 @@
 """Serialize journal publication and lease maintenance in one asynchronous task."""
 
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -18,6 +19,7 @@ from swarm_arena._errors import (
     WriteOutcomeUnknown,
     _core_error,
     _exception_type_name,
+    _stop_cleanup_error,
 )
 from swarm_arena._journal.event import WRITE_THROUGH, Event, EventDraft
 from swarm_arena._journal.lease import Head, Lease, read_owner
@@ -38,7 +40,9 @@ class JournalWriter:
     Publication and lease operations use abandonable daemon workers. Durable appends share a
     group window and wait for the authority head to cover their sequence. A
     transient storage failure suspends renewals and retries only until the
-    last confirmed expiry. Fatal failures wake all waiters with ``Fenced``.
+    last confirmed expiry. Fatal failures disable publication and wake all waiters.
+    Settlement exhaustion raises ``RuntimeError('stop cleanup timed out')``;
+    authority loss and other fatal publication failures raise ``Fenced``.
     Use this object from its owning event loop and within its async context.
 
     Parameters
@@ -115,6 +119,7 @@ class JournalWriter:
         self._stopping = False
         self._entered = False
         self._failure: Exception | None = None
+        self._settlement_expired = False
         self._tasks: TaskGroup | None = None
 
     async def __aenter__(self) -> "JournalWriter":
@@ -219,7 +224,7 @@ class JournalWriter:
         Fenced
             If the writer failed or lost ownership.
         RuntimeError
-            If the writer is outside its active context.
+            If the writer is outside its active context or settlement expired.
 
         Examples
         --------
@@ -271,6 +276,8 @@ class JournalWriter:
         ------
         Fenced
             If ownership expires, changes, or publication fails permanently.
+        RuntimeError
+            If the storage settlement allowance expires before the lease.
 
         Examples
         --------
@@ -295,6 +302,8 @@ class JournalWriter:
         ------
         Fenced
             If the writer failed or lost ownership.
+        RuntimeError
+            If the storage settlement allowance expires before the lease.
 
         Examples
         --------
@@ -357,6 +366,8 @@ class JournalWriter:
         """Expose only exception types and explicitly trusted core storage causes."""
         if self.fenced.is_set():
             error = self._failure
+            if self._settlement_expired:
+                raise _stop_cleanup_error() from None
             cause = (
                 error
                 if isinstance(error, StorageError)
@@ -379,6 +390,25 @@ class JournalWriter:
                 self._io_scope.deadline, anyio.current_time() + self._settle_timeout_s
             )
 
+    def _expired(self) -> Exception:
+        """Distinguish confirmed lease expiry from an exhausted settlement wait."""
+        if self._remaining() <= 0:
+            return _core_error(Fenced, "journal lease expired")
+        self._settlement_expired = True
+        return _stop_cleanup_error()
+
+    async def _release_after_timeout(self) -> None:
+        """Try one bounded release without reopening publication or adopting late state."""
+        remaining = min(self._remaining(), self._settle_timeout_s)
+        if remaining <= 0:
+            return
+        candidate = Lease(self._store, self._lease.doc, self._lease.etag, ttl_s=self._lease.ttl_s)
+        with anyio.move_on_after(remaining):
+            # A lost CAS or unavailable backend must not replace the primary
+            # timeout or authorize any further publication by this writer.
+            with suppress(Exception):
+                await _storage_io(candidate.release)
+
     async def _retry(self, operation: Callable[[], _T], *, validated: bool = False) -> _T:
         """Bound the entire primitive, including retries, by the owner's lifetime."""
         remaining = min(
@@ -387,7 +417,7 @@ class JournalWriter:
             self._settle_timeout_s if self._stopping else float("inf"),
         )
         if remaining <= 0:
-            raise _core_error(Fenced, "journal lease or settlement expired")
+            raise self._expired()
         with anyio.move_on_after(remaining) as lifetime:
             self._io_scope = lifetime
             try:
@@ -406,11 +436,11 @@ class JournalWriter:
                         )
                     else:
                         if self._remaining() <= 0 or lifetime.deadline <= anyio.current_time():
-                            raise _core_error(Fenced, "journal lease or settlement expired")
+                            raise self._expired()
                         return result
             finally:
                 self._io_scope = None
-        raise _core_error(Fenced, "journal lease or settlement expired")
+        raise self._expired()
 
     async def _update_owner(
         self, kind: Literal["advance", "renew", "release"], head: Head | None = None
@@ -515,5 +545,7 @@ class JournalWriter:
                     self._wake = anyio.Event()
             except Exception as error:
                 self._fail(error)
+                if self._settlement_expired:
+                    await self._release_after_timeout()
             finally:
                 self._done.set()

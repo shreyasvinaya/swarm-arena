@@ -183,6 +183,11 @@ def _core_error(cls: type[_SignalT], *args: Any) -> _SignalT:
     return _core_signal(cls(*args))
 
 
+def _stop_cleanup_error() -> RuntimeError:
+    """Build the shared safe error for exhausted stop-storage settlement."""
+    return _core_error(RuntimeError, "stop cleanup timed out")
+
+
 def _core_signal_kinds() -> tuple[type[Exception], ...]:
     """Return exact core types with a lazy import to avoid model cycles."""
     from swarm_arena._agent.manager import LimitReached

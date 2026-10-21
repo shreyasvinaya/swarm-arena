@@ -102,7 +102,6 @@ async def test_driver_signal_abandons_journal_publication(
     from swarm_arena._engine import run as run_module
     from swarm_arena._engine.control import request_stop
     from swarm_arena._engine.round import EngineDeps
-    from swarm_arena._errors import Fenced
 
     entered, release = threading.Event(), threading.Event()
     deadline = anyio.Event()
@@ -138,7 +137,10 @@ async def test_driver_signal_abandons_journal_publication(
             deadline.set()
         done, _ = await asyncio.wait([task], timeout=3)
         assert done, "journal publication ignored its owner's stop/deadline"
-        assert isinstance(task.exception(), Fenced)
+        error = task.exception()
+        assert isinstance(error, RuntimeError)
+        assert _is_core_signal(error)
+        assert str(error) == "stop cleanup timed out"
     finally:
         release.set()
         if not task.done():

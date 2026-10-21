@@ -368,6 +368,13 @@ Startup-stop and driver-stop cleanup share the same bounded failure contract:
 if their settlement allowance expires, they raise the value-free core error
 `stop cleanup timed out`. Normal export failures retain their original public
 exception shape while stop and deadline watchers remain active.
+The same cleanup error applies when a journal storage wait exhausts settlement
+while its confirmed lease remains valid. Confirmed lease expiry or takeover
+still raises `Fenced`. Either failure disables subsequent publication; late
+storage results cannot update the writer's state or start another operation.
+After settlement exhaustion, a writer whose confirmed lease remains valid
+attempts one bounded release so a new owner can resume immediately. A blocked
+or unsuccessful release does not extend cleanup indefinitely or reopen publication.
 
 A driver stop or deadline also bounds an in-progress journal storage primitive,
 including its retries, by the settlement allowance. Healthy graceful-stop work

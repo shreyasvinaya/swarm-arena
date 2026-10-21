@@ -382,8 +382,9 @@ async def test_stopped_initialization_contains_segment_failure(
                 assert not worker.is_alive()
 
 
+@pytest.mark.parametrize("site", ["solution", "journal"])
 async def test_driver_stop_cleanup_timeout_is_a_core_error(
-    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str
 ) -> None:
     from swarm_arena._engine.goal import GoalRunner
 
@@ -397,6 +398,13 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     original = LocalStore.create
+    stopping = False
+    stop_storage = writer_module.JournalWriter._stop_storage
+
+    def stop(writer: writer_module.JournalWriter) -> None:
+        nonlocal stopping
+        stopping = True
+        stop_storage(writer)
 
     async def run_goal(runner: GoalRunner) -> NoReturn:
         driving.set()
@@ -404,13 +412,16 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         raise AssertionError("unreachable")
 
     def create(store: LocalStore, key: str, data: bytes) -> str:
-        if key == "goals/b/solution.json":
+        if (site == "solution" and key == "goals/b/solution.json") or (
+            site == "journal" and stopping and key.startswith("journal/")
+        ):
             workers.append(threading.current_thread())
             entered.set()
             assert release.wait(30)
         return original(store, key, data)
 
     monkeypatch.setattr(GoalRunner, "run", run_goal)
+    monkeypatch.setattr(writer_module.JournalWriter, "_stop_storage", stop)
     monkeypatch.setattr(LocalStore, "create", create)
     monkeypatch.setattr(
         run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
@@ -425,7 +436,7 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         assert await request_stop(config.run_root, "r", now=True) == 1
         assert await anyio.to_thread.run_sync(entered.wait, 10)
         done, _ = await asyncio.wait([task], timeout=3)
-        assert done, "driver cleanup retained the blocked solution write"
+        assert done, "driver cleanup retained the blocked storage write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
         assert _is_core_signal(error)
@@ -433,6 +444,7 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
+        head = owner[0].head
     finally:
         release.set()
         if not task.done():
@@ -442,4 +454,7 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head == head
     assert not store.exists("review")

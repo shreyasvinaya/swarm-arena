@@ -34,6 +34,7 @@ from swarm_arena._errors import (
     StorageError,
     _core_error,
     _exception_type_name,
+    _stop_cleanup_error,
 )
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
@@ -79,15 +80,13 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
             watchers.start_soon(_watch_fence, journal, scope)
             try:
                 await anyio.lowlevel.checkpoint_if_cancelled()
-                if journal.fenced.is_set():
-                    raise _core_error(Fenced)
+                journal._raise_if_fenced()
                 yield
             except BaseException as caught:
                 error = caught
             finally:
                 watchers.cancel_scope.cancel()
-    if journal.fenced.is_set():
-        raise _core_error(Fenced) from None
+    journal._raise_if_fenced()
     if error is not None:
         raise error
 
@@ -853,7 +852,7 @@ def _stop_cleanup(config: RunConfig) -> Generator[None]:
         with anyio.fail_after(config.settle_timeout_s, shield=True):
             yield
     except TimeoutError:
-        raise _core_error(RuntimeError, "stop cleanup timed out") from None
+        raise _stop_cleanup_error() from None
 
 
 async def _finish_queued_goal(
