@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Local `board serve` viewer with search, filters, pagination, evidence and lineage pages, and token-protected pin, hide and add curation.
+
 - Offline arena commands export/import human reviews, rank runs and namespaces,
   search and inspect board evidence, curate learnings, trace provenance and reindex caches.
 

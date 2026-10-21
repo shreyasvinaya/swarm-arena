@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 from _fakes.finished import FinishedRun, run_again
 
+from swarm_arena._board.cache import LearningFilter
 from swarm_arena._cli.main import main
 from swarm_arena._scoring.human_review import CSV_HEADER
 
@@ -572,3 +573,70 @@ def test_review_import_invalid_default_requests_reviewer_without_values(
     assert sentinel not in captured.out + captured.err
     assert store.read(OWNER_KEY).data == before
     assert open_store(review_cli_run.config.arena_root).list("toy/reviews/") == []
+
+
+def test_board_serve_smoke(finished_run: FinishedRun) -> None:
+    import os
+    import selectors
+    import signal
+    import subprocess
+    import sys
+    from urllib.request import urlopen
+
+    from swarm_arena._board.arena import ArenaBoard
+
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    board.open("", "", [finished_run.namespace])
+    try:
+        board.frontier()
+        with board._pin_state() as state:
+            cache = state.readers[finished_run.namespace]
+            learning_id = cache.find(
+                state.frontier, query=None, filters=LearningFilter(), relevance_goal=None, limit=1
+            )[0]
+            candidate_id = cache.candidates(state.frontier)[0][0].id
+    finally:
+        board.close()
+    env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve())}
+    proc = subprocess.Popen(
+        [
+            str(Path(sys.executable).with_name("swarm-arena")),
+            "board",
+            "serve",
+            finished_run.namespace,
+            "--config",
+            str(finished_run.config_path),
+            "--port",
+            "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert proc.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            assert selector.select(timeout=15), "viewer startup timed out"
+        line = proc.stdout.readline()
+        assert line.startswith("Serving http://127.0.0.1:"), line
+        url = line.split()[-1]
+        for path in ("", f"learning/{learning_id}", f"candidate/{candidate_id}"):
+            with urlopen(url + path, timeout=10) as response:
+                assert response.status == 200
+        proc.send_signal(signal.SIGINT)
+        _, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()

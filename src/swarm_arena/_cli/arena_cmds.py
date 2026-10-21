@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from threading import Thread
 
 import anyio
 
@@ -20,6 +21,7 @@ from swarm_arena._board.ingest import run_store
 from swarm_arena._board.leaderboard import format_value, group_rows
 from swarm_arena._board.pointers import _validate_namespace, _validate_run_id
 from swarm_arena._board.reindex import _reindex_with_diagnostics
+from swarm_arena._board.serve import make_server
 from swarm_arena._board.trace import trace
 from swarm_arena._errors import _core_error
 from swarm_arena._exec.threads import run_sync_daemon
@@ -87,6 +89,11 @@ def register(sub: argparse._SubParsersAction) -> None:
     for flag in ("verified", "human", "pinned", "hidden"):
         search.add_argument(f"--{flag}", action="store_true")
     search.add_argument("--limit", type=_non_negative_integer("--limit"), default=10)
+    serve = actions.add_parser("serve", help="serve the local board viewer")
+    serve.add_argument("target")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=_non_negative_integer("--port"), default=8765)
+    serve.add_argument("--author")
     show = actions.add_parser("show")
     show.add_argument("id")
     learnings = sub.add_parser("learnings", help="add, pin or hide a learning")
@@ -112,14 +119,30 @@ def register(sub: argparse._SubParsersAction) -> None:
         scope.add_argument("--run")
     reindex = sub.add_parser("reindex", help="rebuild disposable arena caches")
     reindex.add_argument("--namespace", action="append", default=[])
-    for command in (export, imported, leaderboard, search, show, pin, hide, add, traced, reindex):
+    for command in (
+        export,
+        imported,
+        leaderboard,
+        search,
+        show,
+        serve,
+        pin,
+        hide,
+        add,
+        traced,
+        reindex,
+    ):
         command.add_argument("--config", type=Path, default=Path("run.toml"))
         command.set_defaults(handler=_handle)
 
 
 def _handle(args: argparse.Namespace) -> int:
     """Enter the asyncio boundary without changing root interrupt handling."""
-    anyio.run(_execute, args, backend="asyncio")
+    try:
+        anyio.run(_execute, args, backend="asyncio")
+    except KeyboardInterrupt:
+        if args.command != "board" or args.action != "serve":
+            raise
     return 0
 
 
@@ -206,7 +229,7 @@ async def _execute(args: argparse.Namespace) -> None:
             return
         run_id = getattr(args, "run", None)
         namespace = getattr(args, "namespace", None)
-        if args.command == "leaderboard":
+        if args.command == "leaderboard" or (args.command == "board" and args.action == "serve"):
             run_id = args.target if _RUN_ID.fullmatch(args.target) else None
             namespace = None if run_id else args.target
         names = (
@@ -229,7 +252,9 @@ async def _execute(args: argparse.Namespace) -> None:
         if expanded != names:
             await run_sync_daemon(board.open, "", "", expanded)
             await run_sync_daemon(board.frontier)
-        if args.command == "leaderboard":
+        if args.command == "board" and args.action == "serve":
+            await _serve(board, args, names, run_id, config.settle_timeout_s)
+        elif args.command == "leaderboard":
             _leaderboard(board, args, run_id, namespace)
         elif args.command == "learnings":
             operation = await _apply_human_operation(
@@ -402,3 +427,34 @@ def _show(board: ArenaBoard, identifier: str) -> None:
                 print(f"{candidate_id}: {values or '-'}")
             except (KeyError, ValueError):
                 print(f"{candidate_id}: error: unknown candidate")
+
+
+async def _serve(
+    board: ArenaBoard,
+    args: argparse.Namespace,
+    namespaces: list[str],
+    run_id: str | None,
+    settle_timeout_s: float,
+) -> None:
+    """Own the HTTP listener and stop its accept loop before closing the board."""
+    server = make_server(
+        board,
+        namespaces,
+        author=args.author or getpass.getuser(),
+        host=args.host,
+        port=args.port,
+        run_id=run_id,
+    )
+    thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    try:
+        thread.start()
+        print(f"Serving http://{args.host}:{server.server_port}/", flush=True)
+        await run_sync_daemon(thread.join)
+    finally:
+        try:
+            with anyio.move_on_after(settle_timeout_s, shield=True):
+                if thread.ident is not None:
+                    await run_sync_daemon(server.shutdown)
+                    await run_sync_daemon(thread.join, settle_timeout_s)
+        finally:
+            server.server_close()

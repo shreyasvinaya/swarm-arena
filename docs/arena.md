@@ -490,3 +490,42 @@ PY
 uv run swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN_ID/review.csv" --reviewer alice --config "$ARENA_CONFIG"
 uv run swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
 ```
+
+## Board viewer
+
+From the example setup above, serve its namespace locally:
+
+```bash
+uv run swarm-arena board serve toy --config "$ARENA_CONFIG" --author alice
+```
+
+You can also pass a recorded run ID in place of `toy`; the index then
+filters to that run by default. `--host` defaults to `127.0.0.1`, and `--port`
+to `8765`. Use `--port 0` for an available port; the flushed `Serving http://…/`
+line reports the actual port. Ctrl-C stops this command successfully (exit 0).
+
+The viewer binds locally by default. Explicitly setting a non-loopback `--host`
+exposes it on that interface. Every request must have a `Host` matching
+`127.0.0.1:<bound-port>`, `localhost:<bound-port>`, or the configured host and
+bound port. This check prevents DNS rebinding from exposing the form token.
+The pages use escaped HTML with no JavaScript or external resources.
+
+The index has 50 learnings per page and preserves filters in Previous and Next
+links. Query parameters are `q` (literal text search), `ns`, `goal`, `run`,
+`part`, `team`, `agent`, `round`, and `tag`; `verified=1`, `human=1`, and
+`pinned=1` select those flags. Hidden learnings are excluded by default:
+`hidden=1` selects only hidden items, while `hidden=all` includes both. For
+example, `/?q=viscosity&verified=1&page=2` shows the second page of verified
+matches. Each request uses one published frontier; incoming requests refresh
+it at most once every five seconds.
+
+A learning page shows its text, author, markers, and linked evidence with
+formatted scores or an unknown-candidate error. Candidate pages show a summary,
+linked parents and ancestors, and the committed provenance trace. Hidden
+learning URLs remain available for human curation. Pin, hide, and add forms
+require the per-server token and each write one immutable curation object,
+using the same validation and mutation operations as the terminal commands.
+Add accepts a configured namespace, title, text, optional goal and comma-separated
+tags. New human learnings have an `L-h-…` identifier and a `human:<author>`
+author. Mutations redirect to the learning page; new curation appears after the
+next eligible refresh.
