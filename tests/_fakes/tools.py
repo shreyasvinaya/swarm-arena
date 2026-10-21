@@ -1405,3 +1405,63 @@ class PreparationBarrierPolicy(Policy):
             (root / "barrier-entered").touch()
             _wait_preparation_marker(root / "barrier-release")
         return Decision()
+
+
+def wait_for_file(path: str, timeout_s: float = 60.0) -> dict[str, Any]:
+    """
+    Wait for a published file with a bounded, monotonic readiness poll.
+
+    Parameters
+    ----------
+    path : str
+        File whose existence signals readiness, such as a committed round page.
+    timeout_s : float, default=60.0
+        Maximum waiting time in seconds. Polls occur every 0.1 seconds.
+
+    Returns
+    -------
+    dict[str, Any]
+        Elapsed waiting time under the ``waited_s`` key.
+
+    Raises
+    ------
+    TimeoutError
+        If the file has not appeared by the deadline.
+
+    Examples
+    --------
+    >>> wait_for_file(__file__)["waited_s"] >= 0  # doctest: +SKIP
+    True
+    """
+    started = time.monotonic()
+    target = Path(path)
+    while not target.is_file():
+        remaining = timeout_s - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("file readiness timed out")
+        time.sleep(min(0.1, remaining))
+    return {"waited_s": time.monotonic() - started}
+
+
+def score_one(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Give every candidate the same maximization score.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal being judged.
+    candidate : Candidate
+        Candidate whose successful execution is sufficient for this fixture.
+
+    Returns
+    -------
+    Score
+        Constant maximization score of one.
+
+    Examples
+    --------
+    >>> score_one(GOAL, cand(data={"waited_s": 0.0})).key
+    (1.0,)
+    """
+    return Score.maximize(1.0)
