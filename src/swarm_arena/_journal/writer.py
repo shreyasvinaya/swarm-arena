@@ -390,12 +390,12 @@ class JournalWriter:
                 self._io_scope.deadline, anyio.current_time() + self._settle_timeout_s
             )
 
-    def _expired(self) -> Exception:
-        """Distinguish confirmed lease expiry from an exhausted settlement wait."""
-        if self._remaining() <= 0:
-            return _core_error(Fenced, "journal lease expired")
-        self._settlement_expired = True
-        return _stop_cleanup_error()
+    def _expired(self, lease_deadline: float) -> Exception:
+        """Classify expiry in the monotonic clock that enforced the wait."""
+        if (self._stopping or self._closing) and anyio.current_time() < lease_deadline:
+            self._settlement_expired = True
+            return _stop_cleanup_error()
+        return _core_error(Fenced, "journal lease expired")
 
     async def _release_after_timeout(self) -> None:
         """Try one bounded release without reopening publication or adopting late state."""
@@ -411,14 +411,16 @@ class JournalWriter:
 
     async def _retry(self, operation: Callable[[], _T], *, validated: bool = False) -> _T:
         """Bound the entire primitive, including retries, by the owner's lifetime."""
-        remaining = min(
-            self._remaining(),
-            self._closing_at - anyio.current_time(),
-            self._settle_timeout_s if self._stopping else float("inf"),
+        now = anyio.current_time()
+        lease_deadline = now + self._remaining()
+        deadline = min(
+            lease_deadline,
+            self._closing_at,
+            now + self._settle_timeout_s if self._stopping else float("inf"),
         )
-        if remaining <= 0:
-            raise self._expired()
-        with anyio.move_on_after(remaining) as lifetime:
+        if deadline <= now:
+            raise self._expired(lease_deadline)
+        with anyio.CancelScope(deadline=deadline) as lifetime:
             self._io_scope = lifetime
             try:
                 while True:
@@ -435,12 +437,14 @@ class JournalWriter:
                             max(0, min(1.0, lifetime.deadline - anyio.current_time()))
                         )
                     else:
-                        if self._remaining() <= 0 or lifetime.deadline <= anyio.current_time():
-                            raise self._expired()
+                        if self._remaining() <= 0:
+                            raise _core_error(Fenced, "journal lease expired")
+                        if lifetime.deadline <= anyio.current_time():
+                            raise self._expired(lease_deadline)
                         return result
             finally:
                 self._io_scope = None
-        raise self._expired()
+        raise self._expired(lease_deadline)
 
     async def _update_owner(
         self, kind: Literal["advance", "renew", "release"], head: Head | None = None

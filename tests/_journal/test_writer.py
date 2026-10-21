@@ -733,16 +733,31 @@ async def test_inherited_read_retries_transient_failure(
 
 @pytest.mark.parametrize("site", ["create", "replace"])
 @pytest.mark.parametrize("deadline", ["lease", "settlement"])
+@pytest.mark.parametrize("clock_rate", [1.0, 0.5])
 async def test_blocked_publication_expires_without_late_state_change(
-    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, deadline: str
+    store: LocalStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    deadline: str,
+    clock_rate: float,
 ) -> None:
     import asyncio
     import threading
+    from datetime import datetime, timedelta
+
+    from swarm_arena._journal import writer as writer_module
 
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
     writer._settle_timeout_s = 0.2
+    wall_start, monotonic_start = utc_now(), time.monotonic()
+
+    def slow_utc_now() -> datetime:
+        return wall_start + timedelta(seconds=(time.monotonic() - monotonic_start) * clock_rate)
+
+    monkeypatch.setattr(writer_module, "utc_now", slow_utc_now)
     original = getattr(store, site)
 
     def block(*args: object, **kwargs: object) -> str:
@@ -772,6 +787,8 @@ async def test_blocked_publication_expires_without_late_state_change(
         assert _is_core_signal(error)
         if deadline == "lease":
             assert isinstance(error, Fenced)
+            assert not writer._stopping
+            assert not writer._settlement_expired
         else:
             assert not isinstance(error, Fenced)
             assert isinstance(error, RuntimeError)
