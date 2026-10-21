@@ -183,24 +183,27 @@ async def test_executor_error_cancels_sibling() -> None:
 
 
 @pytest.mark.parametrize(
-    "data",
+    ("data", "expected"),
     [
-        {"value": "ad25cd43a1711e358861c29d157cf8df"},
-        {"key": [], "notes": "ad25cd43a1711e358861c29d157cf8df"},
-        {"key": [float("inf")], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+        ({"value": "ad25cd43a1711e358861c29d157cf8df"}, "invalid judge result: value: float_type"),
+        (
+            {"key": [], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+            "invalid judge result: key: must be nonempty and finite",
+        ),
+        (
+            {"key": [float("inf")], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+            "judge script failed: error",
+        ),
     ],
 )
-async def test_result_errors_hide_secrets(data: dict[str, Any]) -> None:
+async def test_result_errors_hide_secrets(data: dict[str, Any], expected: str) -> None:
     class Results(RecordingExecutor):
         async def submit(self, job: Job) -> ToolOutput:
             return ToolOutput.model_construct(status=RunStatus.OK, data=data)
 
     context = JudgeContext(goal=GOAL, executor=Results(), artifact_root="/a")
     assert await ScriptJudge(command=["x"]).judge(GOAL, [cand()], context) == []
-    assert (
-        "invalid judge result" in context.errors["c1"]
-        or context.errors["c1"] == "judge script failed: error"
-    )
+    assert context.errors == {"c1": expected}
     assert "ad25cd43a1711e358861c29d157cf8df" not in repr(context.errors)
 
 

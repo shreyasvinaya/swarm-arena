@@ -264,16 +264,7 @@ class ScriptJudge(Judge):
         try:
             result = _JudgeResultFile.model_validate(out.data)
         except ValidationError as error:
-            nonfinite_key = any(
-                item["loc"][0:1] == ("key",) and item["type"] == "finite_number"
-                for item in error.errors(include_input=False, include_context=False)
-            )
-            reason = (
-                "invalid judge result: key: must be nonempty and finite"
-                if nonfinite_key
-                else _result_error("judge", _JudgeResultFile, error)
-            )
-            ctx.judge_error(candidate.id, reason)
+            ctx.judge_error(candidate.id, _result_error("judge", _JudgeResultFile, error))
             return None
         if result.key is None and result.value is None:
             ctx.judge_error(candidate.id, "result needs key or value")
