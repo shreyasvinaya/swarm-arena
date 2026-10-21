@@ -1,5 +1,6 @@
 """Run one goal through barriers, revisions, convergence, and durable results."""
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -506,50 +507,67 @@ class GoalRunner:
     ) -> tuple[bool, _T | None]:
         """Supervise hooks and contain nonstandard operation failures.
 
-        Caller cancellation propagates through the task group. Cancellation
-        raised by the operation itself is an untrusted failure outcome, as is
-        any exception group; neither may bypass callers' Exception handlers.
+        The engine supports asyncio only. Check the caller's pending state
+        independently of group exit: that exit can absorb native cancellation
+        racing with the group's own cancellation. External cancellation wins
+        with a fresh value-free exception; user cancellation and groups remain
+        untrusted operation outcomes handled by callers' Exception boundaries.
         """
         results: list[_T] = []
         errors: list[BaseException] = []
-        async with anyio.create_task_group() as group:
+        caller = asyncio.current_task()
+        assert caller is not None
+        task_info = anyio.get_current_task()
+        cancellations_at_entry = caller.cancelling()
+        pending_at_entry = task_info.has_pending_cancellation()
+        try:
+            async with anyio.create_task_group() as group:
 
-            async def invoke() -> None:
+                async def invoke() -> None:
+                    try:
+                        results.append(await operation())
+                    except BaseException as error:
+                        if not (
+                            isinstance(error, anyio.get_cancelled_exc_class())
+                            and group.cancel_scope.cancel_called
+                        ):
+                            errors.append(error)
+                    finally:
+                        group.cancel_scope.cancel()
+
+                group.start_soon(invoke)
+                grace_until: float | None = None
                 try:
-                    results.append(await operation())
-                except BaseException as error:
-                    if not (
-                        isinstance(error, anyio.get_cancelled_exc_class())
-                        and group.cancel_scope.cancel_called
-                    ):
-                        errors.append(error)
+                    while True:
+                        if self.deps.journal.fenced.is_set():
+                            raise Fenced()
+                        stopped = self._stop()
+                        if stopped and not final:
+                            break
+                        delay = 0.05
+                        if final and (self.deps.stops.stop_now or self.deps.stops.run_timeout):
+                            if grace_until is None:
+                                grace_until = (
+                                    anyio.current_time() + self.deps.config.settle_timeout_s
+                                )
+                            left = grace_until - anyio.current_time()
+                            if left <= 0:
+                                break
+                            delay = min(delay, left)
+                        else:
+                            left = self.deps.clock.left(self.deps.config.limits.run_timeout_s)
+                            if left > 0:
+                                delay = min(delay, left)
+                        await anyio.sleep(delay)
                 finally:
                     group.cancel_scope.cancel()
-
-            group.start_soon(invoke)
-            grace_until: float | None = None
-            try:
-                while True:
-                    if self.deps.journal.fenced.is_set():
-                        raise Fenced()
-                    stopped = self._stop()
-                    if stopped and not final:
-                        break
-                    delay = 0.05
-                    if final and (self.deps.stops.stop_now or self.deps.stops.run_timeout):
-                        if grace_until is None:
-                            grace_until = anyio.current_time() + self.deps.config.settle_timeout_s
-                        left = grace_until - anyio.current_time()
-                        if left <= 0:
-                            break
-                        delay = min(delay, left)
-                    else:
-                        left = self.deps.clock.left(self.deps.config.limits.run_timeout_s)
-                        if left > 0:
-                            delay = min(delay, left)
-                    await anyio.sleep(delay)
-            finally:
-                group.cancel_scope.cancel()
+        finally:
+            if (
+                pending_at_entry
+                or caller.cancelling() > cancellations_at_entry
+                or task_info.has_pending_cancellation()
+            ):
+                raise asyncio.CancelledError() from None
         # Reraise outside the task group so fencing keeps its original type.
         if errors:
             error = errors[0]
