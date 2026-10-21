@@ -106,6 +106,11 @@ policy = Chain(KeepTopTeams(2), SuccessiveHalving(keep=0.5), Patience(rounds=2))
 assert len(policy.config.policies) == 3
 ```
 
+Completed barrier judging batches are recorded with their exact membership and
+anchor IDs. After a crash, resume reuses committed scores and errors and pays only
+for missing batches. A later round's anchor evaluation and the uncached final
+judge remain separate evaluations.
+
 ## Convergence and the final judge
 
 `ConvergeSpec(mode="select")` selects up to `top_n` eligible main-goal leaders.

@@ -32,6 +32,7 @@ from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._model.base import CallRole
+from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
@@ -601,21 +602,33 @@ class GoalRunner:
             read_cache=not final,
         )
 
-    def _publish_scores(self, outcome: JudgeOutcome, scope: LLMScope, round: int) -> None:
+    def _publish_scores(
+        self,
+        outcome: JudgeOutcome,
+        scope: LLMScope,
+        round: int,
+        *,
+        barrier_batch: dict[str, Any] | None = None,
+    ) -> None:
+        remaining = len(outcome.scores) + len(outcome.errors)
+
+        def append(kind: EventType, **payload: Any) -> Event:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0 and barrier_batch is not None:
+                payload["barrier_batch"] = barrier_batch
+            return self.deps.journal.append(self._draft(kind, round=round, **payload))
+
         for score in outcome.scores:
             if not score.llm_call_ids:
                 score = score.model_copy(update={"llm_call_ids": list(scope.call_ids)})
-            event = self.deps.journal.append(
-                self._draft(EventType.SCORE, round=round, score=score.model_dump(mode="json"))
-            )
+            event = append(EventType.SCORE, score=score.model_dump(mode="json"))
             self.deps.board.put_score(score, epoch=event.epoch, seq=event.seq)
         for error in outcome.errors:
-            self.deps.journal.append(
-                self._draft(EventType.JUDGE_ERROR, round=round, **error.model_dump())
-            )
+            append(EventType.JUDGE_ERROR, **error.model_dump())
 
     async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
-        """Fund exact batches and publish each group's judges in plan order."""
+        """Reuse committed batches, funding only missing barrier outcomes."""
         tranche = self._tranche("judges")
         reservations: dict[str, tuple[Reservation, Amount, bool]] = {}
         try:
@@ -650,11 +663,37 @@ class GoalRunner:
                 continue
             _, refs, _ = part_scoring(self.plan, part)
             for ref in refs:
+                identity: dict[str, Any] = {
+                    "goal_id": self.goal_id,
+                    "revision": self.plan.revision,
+                    "round": round,
+                    "part": part,
+                    "ref": ref.model_dump(mode="json"),
+                    "candidates": sorted(c.id for c in batch),
+                }
+                key = sha256_hex(canonical_json(identity))
+                if any(
+                    event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
+                    and event.goal_id == self.goal_id
+                    and event.round == round
+                    and isinstance(record := event.payload.get("barrier_batch"), dict)
+                    and record.get("key") == key
+                    for event in self._events
+                ):
+                    continue
+                completion: dict[str, Any] = {
+                    "key": key,
+                    "members": sorted(c.id for c in batch),
+                    "anchors": [],
+                }
                 leaders = [c for c, _ in self._round_state().ranked(part)]
                 scope = self._scope("judge", round, tranche)
                 try:
                     judge = await run_sync_daemon(ref.build, Judge)
                     prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
+                    completion.update(
+                        members=sorted(c.id for c in prepared[0]), anchors=sorted(prepared[1])
+                    )
                     amount = await run_sync_daemon(
                         partial(
                             judge_amount,
@@ -679,7 +718,8 @@ class GoalRunner:
                             for c in batch
                         ],
                     )
-                    self._publish_scores(outcome, scope, round)
+                    self._publish_scores(outcome, scope, round, barrier_batch=completion)
+                    await self._refresh()
                     continue
 
                 def on_admit(admitted: Reservation, amount: Amount = amount) -> None:
@@ -723,7 +763,7 @@ class GoalRunner:
                 if reservation is not None:
                     await self.deps.ledger.settle(reservation.id, amount, estimated=True)
                     reservations.pop(reservation.id)
-                self._publish_scores(outcome, scope, round)
+                self._publish_scores(outcome, scope, round, barrier_batch=completion)
                 await self._refresh()
         return True
 

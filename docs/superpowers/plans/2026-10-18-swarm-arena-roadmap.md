@@ -1760,6 +1760,12 @@ schema_version bump): `plan_revision.join_retry` and
 `join_failed.attempt`; accepted and refused proposals both use the allowance).
 `GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
 owed join-retry transition. Revisions are published only after successful preflight.
+The last `score` or `judge_error` of a completed barrier batch carries optional
+`barrier_batch: {key, members, anchors}`. Its key hashes the main goal, revision,
+round, part, judge ref and base candidate membership. The member and anchor ids
+record the actual evaluation batch. Resume reuses these committed outcomes and
+retries only missing batches. Anchor evaluation in later rounds and final judging
+are separate operations; final-judge events do not carry this marker.
 Every engine-run event may carry `run_elapsed_s: float`, the accumulated active-driver
 checkpoint; replay folds the maximum over all events and excludes downtime.
 `RunState.candidate_goal_keys` maps each candidate to the GoalKey of the part that
