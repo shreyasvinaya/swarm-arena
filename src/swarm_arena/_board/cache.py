@@ -403,7 +403,13 @@ class ArenaCache:
             ).fetchone()
             return row[0] if row else None
 
-    def apply_human_objects(self, names: Sequence[str], objects: Sequence[HumanObject]) -> None:
+    def apply_human_objects(
+        self,
+        names: Sequence[str],
+        objects: Sequence[HumanObject],
+        *,
+        covered: Sequence[str] = (),
+    ) -> None:
         """
         Atomically index complete human objects, retaining their original lines.
 
@@ -414,6 +420,10 @@ class ArenaCache:
             lines. Supply every line of each named object in its original order.
         objects : Sequence[HumanObject]
             Corresponding validated operations. Foreign namespaces are ignored.
+        covered : Sequence[str], default=()
+            Names of completely read objects with no operations. These receive
+            the same durable completion markers as nonempty objects. Repeated
+            names are harmless; a name also in ``names`` retains its operations.
 
         Raises
         ------
@@ -424,7 +434,8 @@ class ArenaCache:
         -----
         Each name is immutable. Reapplying it has no effect. The line number is
         zero-based within that name, even when names are interleaved. Completion
-        markers and indexed rows commit together under the cache lock.
+        markers, including those of empty objects, and indexed rows commit in
+        one transaction under the cache lock and survive reopening the cache.
 
         Examples
         --------
@@ -433,6 +444,9 @@ class ArenaCache:
         if len(names) != len(objects):
             raise _core_error(ValueError, "human object names and operations must align")
         grouped: dict[str, list[HumanObject]] = {}
+        for name in covered:
+            _validate_human_key(name)
+            grouped.setdefault(name, [])
         for name, obj in zip(names, objects, strict=True):
             folder = _validate_human_key(name)
             _check_folder_payload(folder, [obj])

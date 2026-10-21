@@ -1187,6 +1187,81 @@ def test_human_import_ignores_foreign_namespace(tmp_path: Path) -> None:
     cache.close()
 
 
+@pytest.mark.parametrize("name", [REVIEW_NAME, HIDE_NAME])
+def test_empty_human_object_coverage_survives_retry_and_reopen(tmp_path: Path, name: str) -> None:
+    path = tmp_path / "toy.sqlite"
+    cache = ArenaCache(path)
+    frontier = build_frontier(
+        [], [name] if "/reviews/" in name else [], [name] if "/curation/" in name else []
+    )
+    try:
+        for _ in range(2):
+            cache.apply_human_objects([], [], covered=[name, name])
+            assert cache.has_object(name)
+            assert cache.count(frontier, filters=LearningFilter()) == 0
+            for query in (None, "solver"):
+                assert (
+                    cache.find(frontier, query=query, filters=LearningFilter(), relevance_goal=None)
+                    == []
+                )
+        assert cache._conn.execute("SELECT count(*) FROM human_objects").fetchone() == (1,)
+    finally:
+        cache.close()
+    reopened = ArenaCache(path)
+    try:
+        assert reopened.has_object(name)
+        assert reopened.count(frontier, filters=LearningFilter()) == 0
+        assert (
+            reopened.find(frontier, query="solver", filters=LearningFilter(), relevance_goal=None)
+            == []
+        )
+        assert not reopened._conn.in_transaction
+    finally:
+        reopened.close()
+
+
+def test_empty_coverage_and_operations_commit_atomically(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    operation = HumanObject(kind="add", learning=_human_learning(), author="human:a")
+    assert operation.learning is not None
+    try:
+        cache._conn.execute(
+            "CREATE TEMP TRIGGER refuse_completion BEFORE INSERT ON human_objects "
+            "WHEN NEW.name LIKE '%/reviews/%' BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected"):
+            cache.apply_human_objects([PIN_NAME], [operation], covered=[REVIEW_NAME, HIDE_NAME])
+        assert not cache.has_object(PIN_NAME)
+        assert not cache.has_object(HIDE_NAME)
+        assert not cache.has_object(REVIEW_NAME)
+        assert cache._conn.execute("SELECT count(*) FROM learnings").fetchone() == (0,)
+        assert not cache._conn.in_transaction
+        cache._conn.execute("DROP TRIGGER refuse_completion")
+        cache.apply_human_objects([PIN_NAME], [operation], covered=[REVIEW_NAME, HIDE_NAME])
+        frontier = build_frontier([], [REVIEW_NAME], [PIN_NAME, HIDE_NAME])
+        assert cache.count(frontier, filters=LearningFilter()) == 1
+        assert cache.find(
+            frontier, query="Human", filters=LearningFilter(), relevance_goal=None
+        ) == [operation.learning.id]
+    finally:
+        cache.close()
+
+
+def test_empty_coverage_validates_names_and_ignores_foreign_names(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    secret = "SENTINEL_SECRET"
+    try:
+        with pytest.raises(ValueError, match="human object") as caught:
+            cache.apply_human_objects([], [], covered=[PIN_NAME, secret])
+        assert_secret_absent(caught.value, secret)
+        assert not cache.has_object(PIN_NAME)
+        foreign = REVIEW_NAME.replace("toy/", "other/")
+        cache.apply_human_objects([], [], covered=[foreign])
+        assert not cache.has_object(foreign)
+    finally:
+        cache.close()
+
+
 def test_learning_flags_come_only_from_named_curation(tmp_path: Path) -> None:
     run = FakeRun(str(tmp_path / "runs"), "r1")
     draft = run.learning("L-1", "Hint", evidence=["c-1"])
