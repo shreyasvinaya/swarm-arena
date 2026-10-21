@@ -252,7 +252,7 @@ class _ResumeServices:
                         clock=clock,
                         admission=RunAdmission(
                             config.limits.max_agents_total,
-                            [revisions[-1][0] for revisions in state.plans.values()],
+                            [plan for revisions in state.plans.values() for plan, _ in revisions],
                         ),
                     )
                     self.resumed = ResumeState(state, lease, lease.doc.epoch, ledger, killed, self)

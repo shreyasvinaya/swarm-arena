@@ -161,6 +161,11 @@ tool-owned files, including alternate Unicode/case spellings. See
 [Limits and safety](limits-and-safety.md) for the trust boundary and
 [Use your own files and script](own-files.md) for the integrated file example.
 
+Every GoalKey admitted by a goal remains reserved to that goal for the entire
+run, including historical part keys and finished goals. Resume restores those
+reservations and historical board reads from every admitted revision. A later
+revision cannot assign another goal a key that appeared only in an older revision.
+
 ## Later planning modes
 
 Built-in LLM planning, interactive **together** planning, and **autonomous**

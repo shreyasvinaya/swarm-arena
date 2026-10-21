@@ -18,8 +18,8 @@ class RunAdmission:
     max_agents_total : int
         Maximum sum of reserved peaks, including future converge teams.
     plans : Sequence[Plan], optional
-        Admitted plans, including queued and finished goals. Their latest
-        identities remain reserved after capacity is released.
+        Admitted plans and revisions, including queued and finished goals. All
+        historical identities remain reserved after capacity is released.
 
     Attributes
     ----------
@@ -39,7 +39,11 @@ class RunAdmission:
         self._lock = anyio.Lock()
         self.on_change: Callable[[], None] | None = None
         self._peaks: dict[str, int] = {}
-        self._identities = {plan.goal.id: self._keys(plan) for plan in plans}
+        self._identities: dict[str, frozenset[GoalKey]] = {}
+        for plan in plans:
+            self._identities[plan.goal.id] = self._identities.get(
+                plan.goal.id, frozenset()
+            ) | self._keys(plan)
 
     @staticmethod
     def _keys(plan: Plan) -> frozenset[GoalKey]:
@@ -104,7 +108,7 @@ class RunAdmission:
                 previous = self._peaks.get(goal_id, 0)
                 self._peaks[goal_id] = peak
                 if keys is not None:
-                    self._identities[goal_id] = keys
+                    self._identities[goal_id] = self._identities.get(goal_id, frozenset()) | keys
                 if peak < previous and self.on_change is not None:
                     self.on_change()
 

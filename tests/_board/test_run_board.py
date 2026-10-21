@@ -479,8 +479,7 @@ def test_from_state_uses_latest_revision_and_recorded_score_order() -> None:
     )
     board = RunBoard.from_state(state, run_root="/runs", head=lambda: HEAD)
     assert board.snapshot(new_part.key(), _frontier()).goal == new_part.key()
-    with pytest.raises(ValueError, match="unregistered board goal"):
-        board.snapshot(old_part.key(), _frontier())
+    assert board.snapshot(old_part.key(), _frontier()).goal == old_part.key()
     assert board.leaderboard(KEY, judge="program")[0].rubric_hash == "new"
     old_view = board.snapshot(KEY, _frontier(2))
     assert old_view.leaderboard(KEY, judge="program")[0].rubric_hash == "old"

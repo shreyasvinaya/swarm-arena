@@ -774,7 +774,8 @@ class RunBoard(_MemoryReads, Board):
         Parameters
         ----------
         state : RunState
-            Pure replay state with already-snapshotted latest plan revisions.
+            Pure replay state with all already-snapshotted plan revisions. Historical
+            keys remain readable; the latest revision supplies active identities.
         run_root : str
             Storage root containing the run.
         head : Callable[[], Head or None]
@@ -793,12 +794,10 @@ class RunBoard(_MemoryReads, Board):
         """
         board = cls(run_id=state.run_id, run_root=run_root, head=head)
         for revisions in state.plans.values():
-            if not revisions:
-                continue
-            plan = revisions[-1][0]
-            board.register_goal(plan.goal.key(), plan.goal.id, None)
-            for part in plan.parts:
-                board.register_goal(part.goal.key(), plan.goal.id, part.name)
+            for plan, _ in revisions:
+                board.register_goal(plan.goal.key(), plan.goal.id, None)
+                for part in plan.parts:
+                    board.register_goal(part.goal.key(), plan.goal.id, part.name)
         for candidate in sorted(
             state.candidates.values(), key=lambda item: state.positions[item.id]
         ):
