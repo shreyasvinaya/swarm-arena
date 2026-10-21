@@ -93,8 +93,8 @@ async def main() -> None:
     cfg = config(root)
     cfg = cfg.model_copy(
         update={
-            # Keep the old owner live through the one-second observation,
-            # so the baseline also accepts the public stop request.
+            # Keep the owner live while entry/exit events supervise the public
+            # stop request; whole-run CI leases must be at least three seconds.
             "lease_ttl_s": 3.0,
             "limits": cfg.limits.model_copy(
                 update={"default_run_reservation": Estimate(tokens=7, usd=0.000007)}
