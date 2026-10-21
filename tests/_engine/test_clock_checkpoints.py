@@ -91,10 +91,11 @@ async def clock_driver(root: Path, phase: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = commit
-    ProviderJudge.__init__ = init
-    ProviderJudge.judge = score
-    await Swarm(cfg).run(p, run_id="clock")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", commit)
+        patch.setattr(ProviderJudge, "__init__", init)
+        patch.setattr(ProviderJudge, "judge", score)
+        await Swarm(cfg).run(p, run_id="clock")
 
 
 @pytest.mark.parametrize("phase", ["round", "converge", "final"])

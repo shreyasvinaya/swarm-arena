@@ -66,8 +66,10 @@ async def fail(*args, **kwargs):
         error.add_note("{_SECRET}")
         error.__cause__ = ValueError("{_SECRET}")
         raise
-run_cmds._run_async = fail
-{_ENTRY}
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(run_cmds, "_run_async", fail)
+    {_ENTRY}
 '''
     result = _invoke(["run", "--yes", "unused.toml", "unused-plan.toml"], cli_env, code=code)
     assert result.returncode == 1
@@ -190,29 +192,31 @@ def delayed_bootstrap(self: threading.Thread) -> None:
     if self.name == "swarm-arena-daemon-_prompt":
         threading.Event().wait()
     bootstrap(self)
-threading.Thread._bootstrap_inner = delayed_bootstrap
-sent = None
-original_print = print
-def prompt_print(*args: object, **kwargs: object) -> None:
-    global sent
-    original_print(*args, **kwargs)
-    if args and args[0] == "Start the run? [y/N] ":
-        # Deliver at a known boundary, with the Runner handler installed and
-        # before reader startup. No parent/child scheduling race positions it.
-        handler = signal.getsignal(signal.SIGINT)
-        assert callable(handler) and handler is not signal.default_int_handler
-        sent = time.monotonic()
-        os.kill(os.getpid(), signal.SIGINT)
-run_cmds.print = prompt_print
-def exiting() -> None:
-    faulthandler.cancel_dump_traceback_later()
-    assert sent is not None
-    print(f"sigint-to-exit {time.monotonic() - sent}", flush=True)
-atexit.register(exiting)
-# Preserve a stack in TimeoutExpired.stderr before _child's cleanup can send
-# another SIGINT. This watchdog is diagnostic, not the signal-positioning gate.
-faulthandler.dump_traceback_later(10)
-raise SystemExit(main())
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(threading.Thread, "_bootstrap_inner", delayed_bootstrap)
+    sent = None
+    original_print = print
+    def prompt_print(*args: object, **kwargs: object) -> None:
+        global sent
+        original_print(*args, **kwargs)
+        if args and args[0] == "Start the run? [y/N] ":
+            # Deliver at a known boundary, with the Runner handler installed and
+            # before reader startup. No parent/child scheduling race positions it.
+            handler = signal.getsignal(signal.SIGINT)
+            assert callable(handler) and handler is not signal.default_int_handler
+            sent = time.monotonic()
+            os.kill(os.getpid(), signal.SIGINT)
+    patch.setattr(run_cmds, "print", prompt_print, raising=False)
+    def exiting() -> None:
+        faulthandler.cancel_dump_traceback_later()
+        assert sent is not None
+        print(f"sigint-to-exit {time.monotonic() - sent}", flush=True)
+    atexit.register(exiting)
+    # Preserve a stack in TimeoutExpired.stderr before _child's cleanup can send
+    # another SIGINT. This watchdog is diagnostic, not the signal-positioning gate.
+    faulthandler.dump_traceback_later(10)
+    raise SystemExit(main())
 """
     with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
         process,
@@ -268,15 +272,17 @@ def prompt_print(*args: object, **kwargs: object) -> None:
         if {window!r} == "before_prompt":
             os.kill(os.getpid(), signal.SIGINT)
     original_print(*args, **kwargs)
-run_cmds.print = prompt_print
-original_wait = run_cmds.wait_readable
-async def wait(fd: int) -> None:
-    # Run this only after wait_readable has registered stdin and yielded.
-    asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGINT)
-    await original_wait(fd)
-if {window!r} == "await_readable":
-    run_cmds.wait_readable = wait
-{_ENTRY}
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(run_cmds, "print", prompt_print, raising=False)
+    original_wait = run_cmds.wait_readable
+    async def wait(fd: int) -> None:
+        # Run this only after wait_readable has registered stdin and yielded.
+        asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGINT)
+        await original_wait(fd)
+    if {window!r} == "await_readable":
+        patch.setattr(run_cmds, "wait_readable", wait)
+    {_ENTRY}
 """
     with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
         process,
@@ -304,10 +310,12 @@ async def wait(fd: int) -> None:
     # Terminal Ctrl-C can discard the input that made the fd readable.
     termios.tcflush(fd, termios.TCIFLUSH)
     os.kill(os.getpid(), signal.SIGINT)
-run_cmds.wait_readable = wait
-status = main()
-assert os.get_blocking(0) is {blocking!r}
-raise SystemExit(status)
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(run_cmds, "wait_readable", wait)
+    status = main()
+    assert os.get_blocking(0) is {blocking!r}
+    raise SystemExit(status)
 """
     with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
         process,

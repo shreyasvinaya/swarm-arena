@@ -2388,11 +2388,13 @@ import swarm_arena._scoring.human_review as review
 def exit_before_objects(*args, **kwargs):
     os._exit(31)
 
-review.write_human_objects = exit_before_objects
 async def main():
     await review.HumanReview("alice").import_csv(
         sys.argv[1], Path(sys.argv[2]), config=RunConfig.load(Path(sys.argv[3])))
-anyio.run(main)
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(review, "write_human_objects", exit_before_objects)
+    anyio.run(main)
 """
     result = await anyio.to_thread.run_sync(
         partial(

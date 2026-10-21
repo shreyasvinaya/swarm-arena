@@ -409,8 +409,9 @@ async def cross_namespace_crash(config_path: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = publish
-    await Swarm(RunConfig.load(config_path)).run(_cross_namespace_plan(), run_id="split")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", publish)
+        await Swarm(RunConfig.load(config_path)).run(_cross_namespace_plan(), run_id="split")
 
 
 @pytest.mark.parametrize("resume", [False, True])

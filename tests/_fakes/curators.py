@@ -2,6 +2,8 @@
 
 from collections.abc import Sequence
 
+import pytest
+
 from swarm_arena import Goal, Plan, RunConfig, ScriptedManager
 from swarm_arena._board.curator import Curator
 from swarm_arena._model.planning_types import Decision, RoundState
@@ -113,11 +115,12 @@ async def crash_driver(root: str, boundary: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = publish
     plan = _curator_plan()
     if boundary == "terminal_decision":
         plan = plan.model_copy(update={"policy": Ref(path="_fakes.curators:TerminalPolicy")})
-    await Swarm(config).run(plan, run_id="curation")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", publish)
+        await Swarm(config).run(plan, run_id="curation")
 
 
 class TerminalPolicy(Policy):
@@ -184,8 +187,9 @@ async def join_crash_driver(root: str, boundary: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = publish
-    await Swarm(config, replanner=RetryPlanner()).run(plan, run_id="curation")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", publish)
+        await Swarm(config, replanner=RetryPlanner()).run(plan, run_id="curation")
 
 
 class PaidReplanner(Planner):
@@ -268,6 +272,7 @@ async def refusal_crash_driver(root: str, boundary: str) -> None:
             await self.deps.journal.commit()
         await original_close(self, tranche)
 
-    JournalWriter._publish = publish
-    GoalRunner._close = close
-    await Swarm(config, replanner=PaidReplanner()).run(_curator_plan(), run_id="curation")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", publish)
+        patch.setattr(GoalRunner, "_close", close)
+        await Swarm(config, replanner=PaidReplanner()).run(_curator_plan(), run_id="curation")
