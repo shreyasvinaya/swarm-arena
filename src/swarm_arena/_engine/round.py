@@ -840,7 +840,11 @@ class RoundRunner:
                 RuntimeError, f"round preparation failed: {_exception_type_name(error)}"
             ) from None
         if not completed or prepared is None:
-            return RoundOutcome(round, [], [], {}, {}, [])
+            statuses = {}
+            for slot in agents:
+                slot.status = AgentStatus.FINISHED
+                statuses[f"{slot.team.name}/{slot.spec.name}"] = slot.status
+            return RoundOutcome(round, [], [], statuses, {}, [])
         frontier, parents, feedback_policies = prepared
         runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()

@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import threading
 from collections.abc import Sequence
@@ -375,9 +376,10 @@ async def test_round_started_commits_with_its_frontier(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real = env.deps.board.frontier
+    loop = asyncio.get_running_loop()
 
     def committing_frontier() -> Frontier:  # forces a commit while the frontier is built
-        anyio.from_thread.run(env.deps.journal.commit)
+        asyncio.run_coroutine_threadsafe(env.deps.journal.commit(), loop).result(timeout=5)
         return real()
 
     monkeypatch.setattr(env.deps.board, "frontier", committing_frontier)
