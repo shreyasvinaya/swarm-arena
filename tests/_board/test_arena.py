@@ -1063,3 +1063,47 @@ def test_repeat_hints_respect_owner_part_scope(tmp_path: Path, board: ArenaBoard
     assert [(key, c.id) for key, c in past_run_repeat_entries(view, own.run_id)] == [
         ("key", "peer-part")
     ]
+
+
+def test_cross_namespace_groups_keep_candidates_scores_and_siblings(tmp_path: Path) -> None:
+    from swarm_arena import PartSpec
+
+    run = FakeRun(str(tmp_path / "runs"), "own")
+    parts = [
+        PartSpec(name=name, goal=Goal(id=name, namespace=f"other-{name}")) for name in ("a", "b")
+    ]
+    draft = run.plan(parts=["a", "b"])
+    plan = Plan.model_validate(draft.payload["plan"]).model_copy(update={"parts": parts})
+    run.commit(
+        draft.model_copy(
+            update={"payload": {**draft.payload, "plan": plan.model_dump(mode="json")}}
+        ),
+        run.candidate("main"),
+        run.score("score-main", "main", 1),
+        run.candidate("part-a", part="a"),
+        run.score("score-a", "part-a", 2),
+        run.candidate("part-b", part="b"),
+        run.score("score-b", "part-b", 3),
+    )
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open(run.run_id, run.run_root, ["toy", "other-a", "other-b"])
+    try:
+        frontier = board.frontier()
+        main = board.snapshot(plan.goal.key(), frontier)
+        assert main._visible_candidate_ids() == frozenset({"main", "part-a", "part-b"})
+        assert main.scores("part-a")[0].value == 2
+        for part in parts:
+            direct = board.snapshot(part.goal.key(), frontier)
+            sibling = main._sibling_view(part.name)
+            for view in (direct, sibling):
+                assert view.goal == part.goal.key()
+                assert view._cache.namespace == part.goal.namespace
+                assert [c.id for c in view.best(view.goal, 1, judge="j")] == [f"part-{part.name}"]
+                assert view._sibling_view(None).get_candidate("main").id == "main"
+                assert view._sibling_view("b").get_candidate("part-b").id == "part-b"
+            assert [c.id for c, _ in board._cache(part.goal.namespace).candidates(frontier)] == [
+                f"part-{part.name}"
+            ]
+        assert [c.id for c, _ in board._cache("toy").candidates(frontier)] == ["main"]
+    finally:
+        board.close()

@@ -439,7 +439,7 @@ class RoundRunner:
         siblings = {}
         if isinstance(view, ArenaView):
             for part in [None, *(p.name for p in self.plan.parts)]:
-                sibling = view._sibling_view(part)
+                sibling = await anyio.to_thread.run_sync(view._sibling_view, part)
                 siblings[part or ""] = sibling
         if parents:
             view = _SeedView(view, parents)

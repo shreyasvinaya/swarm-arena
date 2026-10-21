@@ -21,6 +21,12 @@ main group. These reads keep the same frontier, charge one board read, and
 record the returned IDs. They do not widen candidate-file or feedback access.
 The offline `check_manager` harness uses a private temporary arena and cache.
 
+A part may use a different namespace from its main goal. Its candidates, scores,
+and learnings are indexed in that part's namespace; declared sibling views keep
+the same recorded frontier while selecting the sibling's namespace. A main view
+can still read its declared parts and join their results. The cache schema is
+version 2; a version 1 cache must be rebuilt so old namespace routing is not reused.
+
 ## What the arena stores
 
 Run journals are the record. The shared arena contains pointers and human

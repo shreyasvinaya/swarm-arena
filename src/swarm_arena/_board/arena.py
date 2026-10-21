@@ -958,6 +958,14 @@ class ArenaView(BoardView):
         self._active_goals: dict[str | None, GoalKey] = {}
         self._candidate_groups: dict[str, str | None] = {}
         self._resolve()
+        namespaces = {goal.namespace, *(key.namespace for key in self._active_goals.values())}
+        self._group_caches = {}
+        for namespace in sorted(namespaces):
+            cache = board._cache(namespace)
+            for mark in _validate_marks(frontier.marks):
+                ensure_covered(cache, mark)
+            board._load_objects(cache, frontier)
+            self._group_caches[namespace] = cache
         self._candidate_ids = frozenset(c.id for c, _ in self._selected())
 
     def _resolve(self) -> None:
@@ -969,8 +977,6 @@ class ArenaView(BoardView):
             state = self._board._plans_at(self._cache, mark)
             for goal_id, revisions in state.revisions.items():
                 for plan in revisions:
-                    if plan.goal.namespace != self.goal.namespace:
-                        continue
                     row = (mark.run_id, goal_id, plan.revision, plan, state)
                     if goal_key_digest(plan.goal.key()) == digest:
                         mains.append(row)
@@ -1029,8 +1035,10 @@ class ArenaView(BoardView):
             return []
         selected: dict[str, tuple[Candidate, Position]] = {}
         for part, key in self._active_goals.items():
-            for candidate, position in self._cache.candidates(
-                self._frontier, goal_key=goal_key_digest(self.goal), part_key=goal_key_digest(key)
+            for candidate, position in self._group_caches[key.namespace].candidates(
+                _namespace_frontier(self.frontier, key.namespace),
+                goal_key=goal_key_digest(self.goal),
+                part_key=goal_key_digest(key),
             ):
                 selected[candidate.id] = (candidate, position)
                 self._candidate_groups[candidate.id] = part
@@ -1047,7 +1055,8 @@ class ArenaView(BoardView):
         with self._board._lock:
             result = copy(self)
             result.goal = self._active_goals[part].model_copy(deep=True)
-            result._frontier = self._frontier.model_copy(deep=True)
+            result._frontier = _namespace_frontier(self.frontier, result.goal.namespace)
+            result._cache = self._group_caches[result.goal.namespace]
             main_goal = self._active_goals[None]
             result.learning_goal = (goal_key_digest(main_goal), main_goal.id)
             if self._candidate_main_key is not None:
@@ -1080,8 +1089,26 @@ class ArenaView(BoardView):
             tags=list(tags),
         )
 
-    def _pairs(self) -> list[tuple[Candidate, Position]]:
-        return self._cache.candidates(self._frontier, ids=tuple(self._candidate_ids))
+    def _pairs(self, ids: Sequence[str] | None = None) -> list[tuple[Candidate, Position]]:
+        selected = tuple(self._candidate_ids) if ids is None else ids
+        pairs = [
+            pair
+            for namespace, cache in self._group_caches.items()
+            for pair in cache.candidates(
+                _namespace_frontier(self.frontier, namespace), ids=selected
+            )
+        ]
+        return sorted(pairs, key=lambda pair: pair[1])
+
+    def _scores(self, ids: Sequence[str]) -> list[tuple[Score, Position]]:
+        scores = [
+            pair
+            for namespace, cache in self._group_caches.items()
+            for pair in cache.scores(
+                _namespace_frontier(self.frontier, namespace), candidate_ids=ids
+            )
+        ]
+        return sorted(scores, key=lambda pair: pair[1])
 
     def _ranking_judges(self) -> dict[str | None, str]:
         """Resolve fixed group names from recorded data without loading plugins."""
@@ -1089,7 +1116,7 @@ class ArenaView(BoardView):
             if self._ranking_plan is None:
                 return {}
             pairs = self._ranking_pairs(self._pairs())
-            scores = self._cache.scores(self._frontier, candidate_ids=tuple(self._candidate_ids))
+            scores = self._scores(tuple(self._candidate_ids))
             names = group_judges(
                 self._ranking_plan, candidates=[c for c, _ in pairs], scores=[s for s, _ in scores]
             )
@@ -1125,7 +1152,7 @@ class ArenaView(BoardView):
         group = self.part if part is None else part
         with self._board._lock:
             pairs = self._pairs()
-            scores = self._cache.scores(self._frontier, candidate_ids=tuple(self._candidate_ids))
+            scores = self._scores(tuple(self._candidate_ids))
             rows = group_rows(
                 self._ranking_pairs(pairs),
                 scores,
@@ -1146,7 +1173,7 @@ class ArenaView(BoardView):
             rows = flatten(
                 group_rows(
                     self._ranking_pairs(pairs),
-                    self._cache.scores(self._frontier, candidate_ids=tuple(self._candidate_ids)),
+                    self._scores(tuple(self._candidate_ids)),
                     judge=judge,
                     identity_run=self._identity_run,
                 )
@@ -1209,7 +1236,7 @@ class ArenaView(BoardView):
         if id not in self._candidate_ids:
             raise KeyError(id)
         with self._board._lock:
-            rows = self._cache.candidates(self._frontier, ids=[id])
+            rows = self._pairs([id])
             if not rows:
                 raise KeyError(id)
             return rows[0][0]
@@ -1226,15 +1253,18 @@ class ArenaView(BoardView):
         """Read marked scores only for a candidate in this view's membership."""
         with self._board._lock:
             self.get_candidate(candidate_id)
-            return [s for s, _ in self._cache.scores(self._frontier, candidate_ids=[candidate_id])]
+            return [s for s, _ in self._scores([candidate_id])]
 
     def lineage(self, candidate_id: str) -> LineageGraph:
         """Traverse only resolvable fixed-view nodes, with cycle detection."""
-        with self._board._lock, self._cache._lock, self._cache._frontier(self._frontier):
+        with self._board._lock, ExitStack() as reads:
+            for namespace, cache in self._group_caches.items():
+                reads.enter_context(cache._lock)
+                reads.enter_context(cache._frontier(_namespace_frontier(self.frontier, namespace)))
 
             def read(ids: Sequence[str]) -> dict[str, Candidate]:
                 selected = [id for id in ids if id in self._candidate_ids]
-                return {c.id: c for c, _ in self._cache.candidates(self._frontier, ids=selected)}
+                return {c.id: c for c, _ in self._pairs(selected)}
 
             return _lineage(read, candidate_id)
 

@@ -243,7 +243,7 @@ class ArenaCache:
     >>> cache.close()  # doctest: +SKIP
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     def __init__(self, path: Path) -> None:
         self.namespace = path.stem
@@ -1536,13 +1536,14 @@ class ArenaCache:
         ).fetchone()
         if goal is None:
             raise _core_error(ChainError, "indexed event has no committed plan")
-        if goal[0] != self.namespace:
-            return
         position = dict(run_id=run_id, epoch=event.epoch, seq=event.seq, ts=ts)
         if event.type == EventType.TOOL_END:
             candidate = Candidate.model_validate(event.payload["candidate"])
             if (candidate.run_id, candidate.goal_id) != (run_id, goal_id):
                 raise _core_error(ChainError, "candidate does not match event routing")
+            producing_key = state.candidate_goal_keys[candidate.id]
+            if producing_key.namespace != self.namespace:
+                return
             repeat_key = event.payload.get("repeat_key")
             if repeat_key is not None and not isinstance(repeat_key, str):
                 raise _core_error(ChainError, "invalid repeat_key")
@@ -1571,6 +1572,10 @@ class ArenaCache:
             )
         elif event.type == EventType.SCORE:
             score = Score.model_validate(event.payload["score"])
+            producing_key = state.candidate_goal_keys.get(score.candidate_id)
+            namespace = goal[0] if producing_key is None else producing_key.namespace
+            if namespace != self.namespace:
+                return
             self._insert(
                 "scores",
                 dict(
@@ -1590,12 +1595,14 @@ class ArenaCache:
             )
         else:
             learning = Learning.model_validate(event.payload["learning"])
-            if (learning.run_id, learning.goal_id, learning.namespace) != (
-                run_id,
-                goal_id,
-                goal[0],
+            plan = state.plan_for_round(goal_id, learning.round)
+            namespaces = {plan.goal.namespace, *(part.goal.namespace for part in plan.parts)}
+            if (learning.run_id, learning.goal_id) != (run_id, goal_id) or (
+                learning.namespace not in namespaces
             ):
                 raise _core_error(ChainError, "learning does not match event routing")
+            if learning.namespace != self.namespace:
+                return
             if self._insert(
                 "learnings",
                 dict(

@@ -373,3 +373,85 @@ async def test_two_goals_refuse_demand_above_shared_budget(run_config: RunConfig
         for settled in settlements
     )
     assert _peak_charged_micro_usd(events) == 6_000_000 <= 10_000_000
+
+
+def _cross_namespace_plan() -> Plan:
+    plan = _parts_plan("g-parts", parts=["a", "b"], rounds=2)
+    plan = plan.model_copy(
+        update={
+            "parts": [
+                part.model_copy(
+                    update={
+                        "goal": part.goal.model_copy(update={"namespace": f"other-{part.name}"})
+                    }
+                )
+                for part in plan.parts
+            ]
+        }
+    )
+    for team in plan.teams:
+        for agent in team.agents:
+            agent.manager.config["post_learnings"] = True
+    return plan
+
+
+async def cross_namespace_crash(config_path: str) -> None:
+    """Exit after the committed second-round frontier of the split plan."""
+    import os
+
+    from swarm_arena._journal.writer import JournalWriter
+
+    original = JournalWriter._publish
+
+    async def publish(self: JournalWriter) -> None:
+        hit = any(event.type == "frontier" and event.round == 2 for event in self._queue)
+        await original(self)
+        if hit:
+            os._exit(91)
+
+    JournalWriter._publish = publish
+    await Swarm(RunConfig.load(config_path)).run(_cross_namespace_plan(), run_id="split")
+
+
+@pytest.mark.parametrize("resume", [False, True])
+async def test_cross_namespace_parts_run_and_resume(
+    run_config: RunConfig, tmp_path: Path, resume: bool
+) -> None:
+    import os
+    import sys
+
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(run_config.dumps())
+    if resume:
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
+        )
+        child = await anyio.run_process(
+            [
+                sys.executable,
+                "-c",
+                "import sys, anyio; from e2e.test_many_goals_parts import cross_namespace_crash; "
+                "anyio.run(cross_namespace_crash, sys.argv[1])",
+                str(config_path),
+            ],
+            env=environment,
+            check=False,
+        )
+        assert child.returncode == 91, child.stderr.decode()
+        result = await Swarm(run_config).resume("split", force=True)
+    else:
+        result = await Swarm(run_config).run(_cross_namespace_plan(), run_id="split")
+    assert len(result["g-parts"]) == 1
+    winner = result["g-parts"][0]
+    assert (winner.team, winner.agent, winner.round, winner.output.data) == (
+        "join",
+        "joiner",
+        3,
+        {"value": 34.0},
+    )
+    assert len(_events(run_config, "tool_end")) == 5
+    learnings = _events(run_config, "learning")
+    assert len(learnings) == 2
+    assert {event.payload["learning"]["namespace"] for event in learnings} == {"other-a", "other-b"}
+    assert not _events(run_config, "no_result")
