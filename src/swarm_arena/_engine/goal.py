@@ -224,7 +224,9 @@ async def _repair_round_pages(
             )
 
             completed, _ = await page_supervisor._supervised_step(
-                partial(_publish_round_page, deps, prefix, id, round, seq), final=True
+                partial(_publish_round_page, deps, prefix, id, round, seq),
+                final=True,
+                settle_on_stop=True,
             )
             if not completed:
                 return
@@ -356,15 +358,19 @@ class GoalRunner:
 
     async def _refresh(self) -> None:
         """Fold only a committed head, including the durable fingerprint map."""
-        head = await self.deps.journal.commit()
-        if head is not None:
-            chain = await self._storage_step(partial(_read_chain, self.deps.store, head))
+
+        async def read() -> list[tuple[str, list[Event]]] | None:
+            head = await self.deps.journal.commit()
+            return await _read_chain(self.deps.store, head) if head is not None else None
+
+        chain = await self._storage_step(read)
+        if chain is not None:
             self._events = [event for _, events in chain for event in events]
             self.recorded = RunState.from_events(self._events)
 
     async def _storage_step(self, operation: Callable[[], Awaitable[_T]]) -> _T:
         """Keep retained storage reads and writes within final-work supervision."""
-        completed, result = await self._supervised_step(operation, final=True)
+        completed, result = await self._supervised_step(operation, final=True, settle_on_stop=True)
         if not completed:
             raise _core_error(RuntimeError, "goal storage settlement timed out")
         return cast(_T, result)
@@ -614,7 +620,7 @@ class GoalRunner:
         await tranche.close()
 
     async def _supervised_step(
-        self, operation: Callable[[], Awaitable[_T]], *, final: bool
+        self, operation: Callable[[], Awaitable[_T]], *, final: bool, settle_on_stop: bool = False
     ) -> tuple[bool, _T | None]:
         """Supervise hooks and contain nonstandard operation failures.
 
@@ -656,7 +662,11 @@ class GoalRunner:
                         if stopped and not final:
                             break
                         delay = 0.05
-                        if final and (self.deps.stops.stop_now or self.deps.stops.run_timeout):
+                        if final and (
+                            self.deps.stops.stop_now
+                            or self.deps.stops.run_timeout
+                            or (settle_on_stop and self.deps.stops.stop)
+                        ):
                             if grace_until is None:
                                 grace_until = (
                                     anyio.current_time() + self.deps.config.settle_timeout_s

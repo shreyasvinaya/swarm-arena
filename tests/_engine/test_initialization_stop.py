@@ -4,7 +4,7 @@ import asyncio
 import threading
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import anyio
 import pytest
@@ -180,7 +180,7 @@ async def test_initialization_stop_cleanup_is_bounded(
         assert done, "stop cleanup waited for a blocked solution write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
-        assert _error_message(error) == "initialization stop cleanup timed out"
+        assert _error_message(error) == "stop cleanup timed out"
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
@@ -379,3 +379,66 @@ async def test_stopped_initialization_contains_segment_failure(
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
+
+
+async def test_driver_stop_cleanup_timeout_is_a_core_error(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.goal import GoalRunner
+
+    config = run_config.model_copy(
+        update={
+            "settle_timeout_s": 0.5,
+            "limits": run_config.limits.model_copy(update={"max_concurrent_goals": 1}),
+        }
+    )
+    driving = anyio.Event()
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = LocalStore.create
+
+    async def run_goal(runner: GoalRunner) -> NoReturn:
+        driving.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    def create(store: LocalStore, key: str, data: bytes) -> str:
+        if key == "goals/b/solution.json":
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(30)
+        return original(store, key, data)
+
+    monkeypatch.setattr(GoalRunner, "run", run_goal)
+    monkeypatch.setattr(LocalStore, "create", create)
+    monkeypatch.setattr(
+        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
+    )
+    task = asyncio.create_task(
+        Swarm(config).run([plan(goal_id="a", rounds=1), plan(goal_id="b", rounds=1)], run_id="r")
+    )
+    store = LocalStore(Path(config.run_root) / "r")
+    try:
+        with anyio.fail_after(20):
+            await driving.wait()
+        assert await request_stop(config.run_root, "r", now=True) == 1
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "driver cleanup retained the blocked solution write"
+        error = task.exception()
+        assert isinstance(error, RuntimeError)
+        assert _is_core_signal(error)
+        assert _error_message(error) == "stop cleanup timed out"
+        owner = read_owner(store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(20):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert not store.exists("review")

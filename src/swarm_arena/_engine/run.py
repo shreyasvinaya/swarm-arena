@@ -4,8 +4,8 @@ import asyncio
 import os
 import socket
 import sys
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
+from contextlib import asynccontextmanager, contextmanager, suppress
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
@@ -676,28 +676,44 @@ class RunRunner:
     async def _drive(self, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
         assert deps.admission is not None
         deps.admission.on_change = self._wake_queue
-        deps.stops.on_change = self._wake_queue
+
+        def changed() -> None:
+            self._wake_queue()
+            if deps.stops.stop or deps.stops.stop_now or deps.stops.run_timeout:
+                deps.journal._stop_storage()
+
+        deps.stops.on_change = changed
+        changed()
         result: dict[str, list[Candidate]] = {}
-        async with _supervise_writer(deps.journal), anyio.create_task_group() as watchers:
-            watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
-            watchers.start_soon(self._watch_clock, deps)
-            result = await self._queue(deps)
-            await self._record_stops(deps)
-            with anyio.CancelScope() as completion:
+        error: BaseException | None = None
+        async with _supervise_writer(deps.journal):
+            async with anyio.create_task_group() as watchers:
+                try:
+                    watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
+                    watchers.start_soon(self._watch_clock, deps)
+                    result = await self._queue(deps)
+                    await self._record_stops(deps)
+                    with anyio.CancelScope() as completion:
 
-                def stopping() -> None:
-                    completion.deadline = min(
-                        completion.deadline,
-                        anyio.current_time() + deps.config.settle_timeout_s,
-                    )
+                        def stopping() -> None:
+                            deps.journal._stop_storage()
+                            completion.deadline = min(
+                                completion.deadline,
+                                anyio.current_time() + deps.config.settle_timeout_s,
+                            )
 
-                deps.stops.on_change = stopping
-                if self._stopping(deps):
-                    stopping()
-                await _finish_run(deps.store, deps.journal)
-            watchers.cancel_scope.cancel()
-            if completion.cancel_called:
-                raise _core_error(RuntimeError, "run completion timed out")
+                        deps.stops.on_change = stopping
+                        if self._stopping(deps):
+                            stopping()
+                        await _finish_run(deps.store, deps.journal)
+                    if completion.cancel_called:
+                        raise _core_error(RuntimeError, "run completion timed out")
+                except BaseException as caught:
+                    error = caught
+                finally:
+                    watchers.cancel_scope.cancel()
+            if error is not None:
+                raise error
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
@@ -708,7 +724,7 @@ class RunRunner:
         self._stop_mode = await _record_stop(deps.journal, deps.stops, self._stop_mode)
 
     async def _queued_result(self, deps: EngineDeps, goal_id: str) -> None:
-        with anyio.fail_after(deps.config.settle_timeout_s, shield=True):
+        with _stop_cleanup(deps.config):
             await _finish_queued_goal(deps.journal, deps.ledger, deps.store, deps.views, goal_id)
 
     def _stopping(self, deps: EngineDeps) -> bool:
@@ -769,45 +785,53 @@ class RunRunner:
             active.pop(runner.goal_id)
             self._wake_queue()
 
+        error: BaseException | None = None
         async with anyio.create_task_group() as goals:
-            while queued or active:
-                changed = self._queue_changed = anyio.Event()
-                await self._record_stops(deps)
-                if self._stopping(deps):
-                    for runner in list(queued):
-                        if state is not None and state.goals[runner.goal_id].status != "queued":
-                            continue
-                        await self._queued_result(deps, runner.goal_id)
-                        results[runner.goal_id] = []
-                        queued.remove(runner)
-                while queued and len(active) < deps.config.limits.max_concurrent_goals:
-                    runner = queued[0]
-                    fresh = state is None or state.goals[runner.goal_id].status == "queued"
-                    if self._stopping(deps) and fresh:
-                        break
-                    if (
-                        sum(g.active_agents() for g in active.values()) + runner.active_agents()
-                        > deps.config.limits.max_agents_total
-                    ):
-                        break
-                    try:
-                        await deps.admission.update(runner.goal_id, runner.active_agents())
-                    except PlanError:
-                        # A revision may have reserved a larger peak during publication.
-                        break
-                    if self._stopping(deps) and fresh:
-                        await deps.admission.release(runner.goal_id)
-                        break
-                    queued.pop(0)
-                    if fresh:
-                        deps.ledger.open_goal(runner.goal_id)
-                        await deps.journal.append_durable(
-                            EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
-                        )
-                    active[runner.goal_id] = runner
-                    goals.start_soon(run_goal, runner)
-                if queued or active:
-                    await changed.wait()
+            try:
+                while queued or active:
+                    changed = self._queue_changed = anyio.Event()
+                    await self._record_stops(deps)
+                    if self._stopping(deps):
+                        for runner in list(queued):
+                            if state is not None and state.goals[runner.goal_id].status != "queued":
+                                continue
+                            await self._queued_result(deps, runner.goal_id)
+                            results[runner.goal_id] = []
+                            queued.remove(runner)
+                    while queued and len(active) < deps.config.limits.max_concurrent_goals:
+                        runner = queued[0]
+                        fresh = state is None or state.goals[runner.goal_id].status == "queued"
+                        if self._stopping(deps) and fresh:
+                            break
+                        if (
+                            sum(g.active_agents() for g in active.values()) + runner.active_agents()
+                            > deps.config.limits.max_agents_total
+                        ):
+                            break
+                        try:
+                            await deps.admission.update(runner.goal_id, runner.active_agents())
+                        except PlanError:
+                            # A revision may have reserved a larger peak during publication.
+                            break
+                        if self._stopping(deps) and fresh:
+                            await deps.admission.release(runner.goal_id)
+                            break
+                        queued.pop(0)
+                        if fresh:
+                            deps.ledger.open_goal(runner.goal_id)
+                            await deps.journal.append_durable(
+                                EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
+                            )
+                        active[runner.goal_id] = runner
+                        goals.start_soon(run_goal, runner)
+                    if queued or active:
+                        await changed.wait()
+            except BaseException as caught:
+                error = caught
+            finally:
+                goals.cancel_scope.cancel()
+        if error is not None:
+            raise error
         return {p.goal.id: results[p.goal.id] for p in self.plans}
 
 
@@ -819,6 +843,16 @@ async def _record_stop(journal: JournalWriter, stops: StopState, mode: int = 0) 
             EventDraft(type=EventType.STOP_REQUESTED, payload={"now": current == 2})
         )
     return max(mode, current)
+
+
+@contextmanager
+def _stop_cleanup(config: RunConfig) -> Generator[None]:
+    """Give both stop cleanup paths one bounded, value-free failure contract."""
+    try:
+        with anyio.fail_after(config.settle_timeout_s, shield=True):
+            yield
+    except TimeoutError:
+        raise _core_error(RuntimeError, "stop cleanup timed out") from None
 
 
 async def _finish_queued_goal(
@@ -855,30 +889,27 @@ async def _finish_initialization_stop(
     store: Store, journal: JournalWriter, stops: StopState, config: RunConfig
 ) -> dict[str, list[Candidate]]:
     """Close committed queued goals while the initializer still owns its lease."""
-    try:
-        with anyio.fail_after(config.settle_timeout_s, shield=True):
-            head = await journal.commit()
-            if head is None:
-                raise _core_error(RuntimeError, "run initialization stopped before run_started")
-            chain = await _read_chain(store, head)
-            events = [event for _, batch in chain for event in batch]
-            if not any(event.type == EventType.RUN_STARTED for event in events):
-                raise _core_error(RuntimeError, "run initialization stopped before run_started")
-            state = RunState.from_events(events)
-            ids = IdGen(state.run_id, journal.epoch, counters=state.id_counters)
-            ledger = Ledger.replay(state, journal=journal, ids=ids)
-            views = ViewWriter(store, journal)
-            await _record_stop(journal, stops)
-            for goal_id, goal in state.goals.items():
-                if goal.status == "queued":
-                    await _finish_queued_goal(journal, ledger, store, views, goal_id)
-            state = await _finish_run(store, journal)
-            return {
-                goal_id: [state.candidates[candidate_id] for candidate_id in goal.final_order]
-                for goal_id, goal in state.goals.items()
-            }
-    except TimeoutError:
-        raise _core_error(RuntimeError, "initialization stop cleanup timed out") from None
+    with _stop_cleanup(config):
+        head = await journal.commit()
+        if head is None:
+            raise _core_error(RuntimeError, "run initialization stopped before run_started")
+        chain = await _read_chain(store, head)
+        events = [event for _, batch in chain for event in batch]
+        if not any(event.type == EventType.RUN_STARTED for event in events):
+            raise _core_error(RuntimeError, "run initialization stopped before run_started")
+        state = RunState.from_events(events)
+        ids = IdGen(state.run_id, journal.epoch, counters=state.id_counters)
+        ledger = Ledger.replay(state, journal=journal, ids=ids)
+        views = ViewWriter(store, journal)
+        await _record_stop(journal, stops)
+        for goal_id, goal in state.goals.items():
+            if goal.status == "queued":
+                await _finish_queued_goal(journal, ledger, store, views, goal_id)
+        state = await _finish_run(store, journal)
+        return {
+            goal_id: [state.candidates[candidate_id] for candidate_id in goal.final_order]
+            for goal_id, goal in state.goals.items()
+        }
 
 
 async def write_review_export(state: RunState, store: Store, head: Head) -> None:

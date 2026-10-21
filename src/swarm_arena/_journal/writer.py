@@ -112,6 +112,7 @@ class JournalWriter:
         self._sync_at: float | None = None
         self._immediate = False
         self._closing = False
+        self._stopping = False
         self._entered = False
         self._failure: Exception | None = None
         self._tasks: TaskGroup | None = None
@@ -370,35 +371,46 @@ class JournalWriter:
         """Compute lifetime using only the last confirmed owner document."""
         return (self._lease.doc.expires_at - utc_now()).total_seconds()
 
+    def _stop_storage(self) -> None:
+        """Bound storage settlement while allowing healthy graceful-stop work."""
+        self._stopping = True
+        if self._io_scope is not None:
+            self._io_scope.deadline = min(
+                self._io_scope.deadline, anyio.current_time() + self._settle_timeout_s
+            )
+
     async def _retry(self, operation: Callable[[], _T], *, validated: bool = False) -> _T:
-        """Retry transient I/O within confirmed ownership and shutdown settlement."""
-        while True:
-            self._raise_if_fenced()
-            remaining = min(self._remaining(), self._closing_at - anyio.current_time())
-            if remaining <= 0:
-                raise _core_error(Fenced, "journal lease or settlement expired")
+        """Bound the entire primitive, including retries, by the owner's lifetime."""
+        remaining = min(
+            self._remaining(),
+            self._closing_at - anyio.current_time(),
+            self._settle_timeout_s if self._stopping else float("inf"),
+        )
+        if remaining <= 0:
+            raise _core_error(Fenced, "journal lease or settlement expired")
+        with anyio.move_on_after(remaining) as lifetime:
+            self._io_scope = lifetime
             try:
-                with anyio.move_on_after(remaining) as lifetime:
-                    self._io_scope = lifetime
-                    boundary = _validated_io if validated else _storage_io
-                    result = await boundary(operation)
-                if (
-                    lifetime.cancel_called
-                    or self._remaining() <= 0
-                    or self._closing_at <= anyio.current_time()
-                ):
-                    raise _core_error(Fenced, "journal lease or settlement expired")
-                return result
-            except ChainError:
-                raise
-            except (OSError, StorageError) as error:
-                if _exception_type_name(error) not in {"OSError", "StorageError"}:
-                    raise
-                await anyio.sleep(
-                    max(0, min(1.0, self._remaining(), self._closing_at - anyio.current_time()))
-                )
+                while True:
+                    self._raise_if_fenced()
+                    try:
+                        boundary = _validated_io if validated else _storage_io
+                        result = await boundary(operation)
+                    except ChainError:
+                        raise
+                    except (OSError, StorageError) as error:
+                        if _exception_type_name(error) not in {"OSError", "StorageError"}:
+                            raise
+                        await anyio.sleep(
+                            max(0, min(1.0, lifetime.deadline - anyio.current_time()))
+                        )
+                    else:
+                        if self._remaining() <= 0 or lifetime.deadline <= anyio.current_time():
+                            raise _core_error(Fenced, "journal lease or settlement expired")
+                        return result
             finally:
                 self._io_scope = None
+        raise _core_error(Fenced, "journal lease or settlement expired")
 
     async def _update_owner(
         self, kind: Literal["advance", "renew", "release"], head: Head | None = None

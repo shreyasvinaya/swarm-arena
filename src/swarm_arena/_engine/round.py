@@ -857,7 +857,9 @@ class RoundRunner:
         outcome = _Outcome()
         completed, prepared = False, None
         try:
-            completed, prepared = await supervisor._supervised_step(prepare, final=self.converge)
+            completed, prepared = await supervisor._supervised_step(
+                prepare, final=self.converge, settle_on_stop=True
+            )
         except BaseException as error:
             outcome.contain(error, RuntimeError, "round preparation")
         if not completed or prepared is None:

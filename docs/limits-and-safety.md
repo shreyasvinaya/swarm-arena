@@ -359,3 +359,14 @@ skips those finished goals.
 A run deadline closes queued goals as stopped, but it does not create a
 `stop_requested` event. The status stop field records explicit `stop` and
 `stop --now` commands only.
+
+Startup-stop and driver-stop cleanup share the same bounded failure contract:
+if their settlement allowance expires, they raise the value-free core error
+`stop cleanup timed out`. Normal export failures retain their original public
+exception shape while stop and deadline watchers remain active.
+
+A driver stop or deadline also bounds an in-progress journal storage primitive,
+including its retries, by the settlement allowance. Healthy graceful-stop work
+may continue: the bound applies to each storage wait, rather than expiring the
+writer after a fixed duration. Goal refresh and view storage use the same
+settlement bound for graceful stop as for immediate stop and deadline.
