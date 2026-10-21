@@ -568,3 +568,6 @@ arena root, matching review import/export and board reads. The top-level
 Round-page rendering returns the Markdown body. Publication adds exactly one
 source-head comment and checks only the newly closed round; resume still repairs
 all missing closed-round pages. Existing page bytes remain untouched.
+
+Engine score batch IDs carry the barrier or final phase and the durable recovery
+key, so ordinary and final judging of the same candidate have distinct provenance.

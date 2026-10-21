@@ -670,7 +670,13 @@ class GoalRunner:
         return (True, results[0]) if results else (False, None)
 
     def _judge_context(
-        self, ref: Ref, batch: Sequence[Candidate], round: int, *, final: bool = False
+        self,
+        ref: Ref,
+        batch: Sequence[Candidate],
+        round: int,
+        *,
+        batch_id: str,
+        final: bool = False,
     ) -> JudgeContext:
         deps = self.deps
         first = batch[0]
@@ -686,6 +692,7 @@ class GoalRunner:
             goal=goal,
             executor=executor,
             artifact_root=deps.config.artifact_root,
+            batch_id=batch_id,
             run_id=deps.run_id,
             round=round,
             part=first.part,
@@ -855,8 +862,8 @@ class GoalRunner:
                         [(ref, judge)],
                         batch,
                         leaders,
-                        lambda _, ref=ref, prepared=prepared: self._judge_context(
-                            ref, prepared[0], round
+                        lambda _, ref=ref, prepared=prepared, key=key: self._judge_context(
+                            ref, prepared[0], round, batch_id=f"barrier-{key}"
                         ),
                         prepared=prepared,
                     )
@@ -957,7 +964,7 @@ class GoalRunner:
                         goal_id=self.goal_id,
                         on_admit=on_admit,
                     )
-                ctx = self._judge_context(ref, finalists, 0, final=True)
+                ctx = self._judge_context(ref, finalists, 0, batch_id=f"final-{key}", final=True)
                 dispatched = True
                 return await final_judge(
                     self.goal_id,
