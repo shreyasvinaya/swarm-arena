@@ -218,8 +218,9 @@ namespace has its own `<namespace>.sqlite` file, opened only on first use.
 
 The cache is disposable and can be rebuilt from reachable recorded storage.
 It is safe to delete only when no swarm-arena process uses it. The reindex
-command's contract is to refuse while any process holds a cache lifetime lock;
-`swarm-arena reindex` CLI integration is delivered separately. `close()` releases
+command refuses while any process holds a cache lifetime lock. Run
+`uv run swarm-arena reindex --config "$ARENA_CONFIG"` after the command-line
+example below to rebuild its caches. `close()` releases
 all cache connections and their locks. Board state and cache operations are
 synchronized across worker and caller threads.
 

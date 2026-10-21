@@ -9,24 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Local `board serve` viewer with search, filters, pagination, evidence and lineage pages, and token-protected pin, hide and add curation.
-
+- Local `board serve` viewer with search, filters, pagination, evidence and lineage
+  pages, and token-protected pin, hide and add curation.
 - Offline arena commands export/import human reviews, rank runs and namespaces,
   search and inspect board evidence, curate learnings, trace provenance and reindex caches.
-
-- Arena cache reindexing rebuilds exact recorded memberships and part identities,
-  preserves human reviews and curation, and refuses to delete caches in use.
-
-- Human review exports CSV, candidate JSON and escaped HTML, imports validated
-  scores under an ended run's lease, and repairs committed review objects on resume.
-
+- Human review exports spreadsheet-safe CSV, canonical candidate JSON and escaped
+  HTML, imports validated scores under an ended run's lease, and repairs committed
+  review objects on resume.
 - Round digests show each group's ranking identity and human verdicts, plus
-  namespace-wide learning titles and counts inside untrusted markers under a
-  strict UTF-8 byte cap.
-
+  namespace-wide learning titles and counts under a strict UTF-8 byte cap.
 - Immutable per-round Markdown pages show the top ten candidates, new learnings,
   and prune reasons, with historical frontier counts and missing-page resume repair.
-
 - Candidate traces show the committed round-applicable plan, tool usage, checks,
   journal and human scores, and citing learnings without importing producer plugins.
 - Learning posts vet visible evidence and refinements before ID allocation,
@@ -34,68 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passing evidence, and include value-free writing guidance on invalid content.
 - Optional configurable curators merge round learnings with supervised normalization,
   reserve accounting, and atomic completion receipts for crash-safe recovery.
-
-- Configured-board open and close share safe diagnostics on run and resume;
-  cancellation stays responsive and shutdown is bounded by the settle timeout.
-- Fixed arena views use separate WAL reader connections and remain responsive
-  while another goal fetches storage or ingests journal events.
-- Arena groups retain their own namespaces across candidate indexing, sibling
-  reads, and fresh or resumed split-plan execution.
-- Arena snapshots resolve owning groups before foreign key matches, keeping
-  part candidates, declared siblings, and goal learning scope consistent.
-- Arena lineage batches ancestor IDs inside one frontier read scope per namespace,
-  avoiding frontier-set rebuilds for each visited candidate.
-- Arena views reuse committed replay checkpoints and memoize per-run plan
-  resolution, avoiding history replay on unchanged reads and sibling lookups.
-- Runs now default to the shared arena board, with fixed sibling rankings and
-  scored past-run repeat hints; the offline manager harness uses an isolated arena.
-  Configured-board lifecycle calls preserve safe diagnostics and cancellation,
-  with shutdown bounded by the settle timeout on run and resume.
-
-- Arena cache reads release temporary membership and ID selections on outermost
-  exit, including failures, while preserving nested-read membership.
+- Runs default to `ArenaBoard`, with fixed sibling rankings, scored past-run repeat
+  hints, and an isolated arena in the offline manager harness. Configured-board
+  lifecycle calls preserve safe diagnostics, responsive cancellation and bounded shutdown.
 - `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling
   views across group namespaces, current producing-key rankings, hidden-safe
-  learning counts, and lazy XDG-aware local caches; empty human objects retain
-  durable coverage. Board and view reads use published state without waiting
-  for storage refresh; call `frontier()` before reading committed data.
-
-- Hide temporary and lock basenames consistently in local and paginated S3 listings.
-
-- Preserve valid raw key characters when opening S3 child stores.
-
-- Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
-  retries in s3fs, the SDK, and the underlying HTTP transport.
-- Explicit candidate and item ID filters share indexed TEMP sets with frontier
-  membership, supporting large selections without SQLite binding limits.
-
-- Learning search and count execute filters, relevance ordering, and pagination
-  in SQLite, avoiding full-corpus Python model hydration on selective reads.
-
-- Fixed-frontier cache reads share indexed connection-local membership tables,
-  including large human-object frontiers beyond SQLite parameter limits.
-
-- Arena cache sequence indexing keeps junction and newest-segment queries bounded
-  as committed history grows, including existing version-1 cache files.
-
-- Open arena caches retain committed replay checkpoints across refreshes, fold
-  only missing events, and discard uncommitted state after rollback.
-- Learning search tokenizes literal text safely and ranks by frontier-local FTS5
-  relevance, curation flags, goal identity, verification, matching tags, and time.
-- Arena leaderboard helpers rank one recorded judge identity per selected goal
-  group, preserve commit-order ties, and resolve offline judges without plugins.
-
-- Arena cache reads use exact recorded frontiers, immutable producing keys, and
-  named human review and curation objects for reproducible snapshot membership.
-
-- Local arena caches incrementally index committed run chains, preserve producing
-  part identities across replans, and validate historical frontier coverage.
-
-- Conditional S3 storage with uncached listings, per-root storage probes, and
-  validation before preflight and resume takeover.
-
-- Write-once arena run pointers and validated human review/curation objects,
-  with versioned loading, deterministic JSONL bytes, and fixed application order.
+  learning counts, and lazy XDG-aware SQLite/FTS5 caches. Published reads remain
+  available during storage refresh; call `frontier()` before reading committed data.
+- Arena caches incrementally index committed chains and exact named human objects,
+  retain producing identities and frontier-aware collision provenance, and rank
+  literal-text learning searches with frontier-local relevance. Reindex rebuilds
+  the same logical memberships and refuses to delete caches in use.
+- Conditional S3 storage provides uncached listings, raw child-key preservation,
+  single-attempt conditional writes with explicit unknown outcomes, per-root
+  storage probes, and validation before preflight and resume takeover.
+- Write-once arena run pointers and validated human review/curation objects use
+  versioned loading, deterministic JSONL bytes, and fixed application order.
 
 - Offline Rosenbrock swarm example with a Getting started guide and README quickstart.
 
@@ -174,7 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Checks, scoring, and records
 
 - `Board` and `BoardView` define journal-backed indexing and fixed snapshot reads;
-  an in-memory run board provides ranked results, namespace learning search,
+  the shared arena provides ranked results, namespace learning search,
   lineage, deterministic frontiers, and digests with a strict UTF-8 byte cap.
 
 - `Policy`, `KeepTopTeams`, `SuccessiveHalving`, `Patience`, and `Chain` provide

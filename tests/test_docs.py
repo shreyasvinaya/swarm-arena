@@ -8,7 +8,6 @@ import subprocess
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
-from textwrap import dedent
 
 import pytest
 
@@ -23,6 +22,15 @@ ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
     ("module", "name"),
     [
         ("_budget.ledger", "Ledger.reserve"),
+        ("_journal.views", "ViewWriter.write"),
+        ("_board.cache", "ArenaCache.apply_human_objects"),
+        ("_scoring.human_review", "HumanReview.export"),
+        ("_scoring.human_review", "HumanReview.import_csv"),
+        ("_board.curator", "Curator.curate"),
+        ("_board.curator", "Curator.models"),
+        ("_board.digest", "build_digest"),
+        ("_board.digest", "estimate_tokens"),
+        ("_board.frontier", "build_frontier"),
         ("_tooling.result_file", "read_regular_file"),
         ("_tooling.materialize", "collect_output_files"),
         ("_planning.catalog_check", "check_catalog"),
@@ -35,13 +43,20 @@ def test_registry_admission_and_byte_budget_signatures(module: str, name: str) -
     for part in name.split("."):
         func = getattr(func, part)
     assert callable(func)
-    header = re.search(
-        rf"(?m)^[ \t]*(?:async )?def {name.split('.')[-1]}\([\s\S]*?\) -> [^\n]+?: \.\.\.",
-        text,
-    )
-    assert header is not None
-    declaration = ast.parse(dedent(header.group())).body[0]
-    assert isinstance(declaration, ast.FunctionDef | ast.AsyncFunctionDef)
+    declarations: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for block in re.findall(r"```python\n(.*?)```", text, re.DOTALL):
+        nodes = ast.parse(block).body
+        for part in name.split("."):
+            selected = [node for node in nodes if getattr(node, "name", None) == part]
+            if len(selected) != 1:
+                break
+            node = selected[0]
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                declarations.append(node)
+            elif isinstance(node, ast.ClassDef):
+                nodes = node.body
+    assert len(declarations) == 1
+    declaration = declarations[0]
     arguments = declaration.args
     signature = inspect.signature(func)
     parameters = list(signature.parameters.values())
@@ -207,3 +222,77 @@ def test_own_files_offline_example_runs(tmp_path: Path) -> None:
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == "ok: loss=0.25, check=True, key=(-0.25,)"
     assert done.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "_errors.py",
+        "_agent/runtime.py",
+        "_budget/tranche.py",
+        "_cli/run_cmds.py",
+        "_journal/views.py",
+        "_model/safe.py",
+    ],
+)
+def test_registry_marks_inherited_m2_modules(module: str) -> None:
+    text = (ROOT / ROADMAP).read_text()
+    row = next(line for line in text.splitlines() if line.startswith(f"| `{module}` |"))
+    assert "+M2" in row
+
+
+def test_registry_includes_shared_human_operations() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    assert "| `_board/human_ops.py` |" in text
+    assert "class Curator(Configurable, ABC):" in text
+
+
+@pytest.mark.parametrize(
+    ("event", "keys"),
+    [
+        ("round_started", {"round", "shares", "converge"}),
+        ("decision", {"round", "decision"}),
+        ("converge_started", {"reason", "select_only"}),
+        ("curated", {"round", "revision", "decision_seq", "summaries", "supersedes", "errors"}),
+        ("review_imported", {"reviewer", "scores", "objects"}),
+    ],
+)
+def test_registry_documents_m2_payload_keys(event: str, keys: set[str]) -> None:
+    text = (ROOT / ROADMAP).read_text().split("### R4.14 Journal event types", 1)[1]
+    row = next((line for line in text.splitlines() if line.startswith(f"| `{event}` |")), "")
+    assert keys <= set(re.findall(r"`([a-z_]+)`", row))
+
+
+def test_registry_documents_page_closure_position() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    assert "closed_seq" in text
+
+
+def test_arena_guide_describes_available_cli() -> None:
+    text = (ROOT / "docs/arena.md").read_text()
+    assert "CLI integration is delivered separately" not in text
+
+
+def test_changelog_has_no_superseded_board_or_fix_round_details() -> None:
+    text = (ROOT / "CHANGELOG.md").read_text()
+    assert "an in-memory run board" not in text
+    assert "Hide temporary and lock basenames" not in text
+    assert "Preserve valid raw key characters" not in text
+    assert text.count("Configured-board lifecycle") + text.count("Configured-board open") <= 1
+
+
+def test_registry_collision_contract_uses_recorded_frontier() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    assert "skips an item whose id it already holds from another run" not in text
+    assert "lexicographically smallest visible producer key" in text
+    assert "`run:<run_id>`" in text
+    assert "`object:<object_name>`" in text
+
+
+def test_source_has_no_dispatch_or_fix_round_markers() -> None:
+    marker = re.compile(r"\b(?:task|wave)\s+\d+|\b(?:fix|review)[ -]round\b|__all__\s*\+=", re.I)
+    assert not [
+        str(path.relative_to(ROOT))
+        for path in (ROOT / "src").rglob("*.py")
+        if marker.search(path.read_text())
+    ]
