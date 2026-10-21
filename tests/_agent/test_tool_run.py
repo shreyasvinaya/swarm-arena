@@ -175,7 +175,8 @@ async def test_admission_closed_while_queued_refuses_start(rt_env: RtEnv) -> Non
     ] = []  # _run_capturing appends the LimitReached that execute_tool_run raises
     async with anyio.create_task_group() as tg:
         tg.start_soon(_run_capturing, rt, {"marker": str(rt_env.marker)}, errors)
-        await queued.entered.wait()
+        with anyio.fail_after(10):
+            await queued.entered.wait()
         rt_env.inflight.close()
         queued.release.set()
     err = errors[0]
@@ -480,8 +481,10 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     monkeypatch.setattr(rt.tool, "providers", lambda: frozenset({"openai"}))
     original_init, original_command = PyTool.__init__, PyTool.command
     workspaces: list[Path] = []
+    workers: list[threading.Thread] = []
 
     def block() -> None:
+        workers.append(threading.current_thread())
         entered.set()
         assert release.wait(10)
 
@@ -517,12 +520,17 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
             assert not rt_env.inflight._scopes
             release.set()
             assert await anyio.to_thread.run_sync(done.wait, 5)
-            await anyio.sleep(0.05)
+            with anyio.fail_after(5):
+                await anyio.to_thread.run_sync(workers[0].join, 5)
+            assert not workers[0].is_alive()
             assert rt_env.committed_types() == before
             assert not rt_env.marker.exists()
             assert workspaces[0].joinpath("late_write").exists()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> None:
@@ -926,7 +934,8 @@ async def test_release_keeps_primary_control_outcome(
         rt = dataclasses.replace(rt, executor=queued)
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, [])
-            await queued.entered.wait()
+            with anyio.fail_after(10):
+                await queued.entered.wait()
             group.cancel_scope.cancel()
     assert not rt.repeats._pending
 
@@ -1051,7 +1060,8 @@ async def test_unstarted_runs_do_not_increment_started_count(rt_env: RtEnv, fail
         errors: list[LimitReached] = []
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, errors)
-            await queued.entered.wait()
+            with anyio.fail_after(10):
+                await queued.entered.wait()
             assert rt.started_runs == 0
             rt_env.inflight.close()
             queued.release.set()
@@ -1082,7 +1092,8 @@ async def test_inflight_tracks_active_job_grace_until_collection(rt_env: RtEnv) 
     rt = dataclasses.replace(rt, executor=queued)
     async with anyio.create_task_group() as group:
         group.start_soon(_run_capturing, rt, {"x": 1}, [])
-        await queued.entered.wait()
+        with anyio.fail_after(10):
+            await queued.entered.wait()
         assert rt_env.inflight.max_grace_s() == tool_grace(rt.tool)
         rt_env.cancel_inflight()
     assert rt_env.inflight.max_grace_s() == 0.0

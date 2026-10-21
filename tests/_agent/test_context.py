@@ -474,7 +474,8 @@ async def test_read_snapshot_is_taken_before_tool_awaits(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         ctx.read_learning("L-2")
         release.set()
     assert result[0].read_ids == ["L-1"]
@@ -678,7 +679,8 @@ async def test_simultaneous_contexts_and_cancellation_keep_charges_independent(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         b.search_learnings("parallel")
         scope.cancel()
     assert (counters_a.turns, counters_a.board_reads) == (2, 2)
@@ -994,7 +996,8 @@ async def test_escaped_action_lifetime_is_revoked(
     )
     parent = asyncio.create_task(ctx.call_action("spawn", {}))
     try:
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         if cancelled:
             parent.cancel()
             with pytest.raises(asyncio.CancelledError):

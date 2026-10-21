@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
+from _fakes.leases import force_take_over
 from _fakes.tools import RecordingExecutor
 
 from swarm_arena import ScriptTool
@@ -17,7 +18,6 @@ from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
-from swarm_arena._errors import Fenced
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_committed
@@ -41,16 +41,9 @@ def take_over_retrying(store: Store, *, owner_id: str = "intruder") -> Lease:
     owner = read_owner(store)
     assert owner is not None
     epoch = owner[0].epoch
-    for _ in range(100):
-        try:
-            return Lease.take_over(
-                store, owner_id=owner_id, host="local", ttl_s=60, force=True, expect_epoch=epoch
-            )
-        except Fenced:
-            current = read_owner(store)
-            if current is None or current[0].epoch != epoch:
-                raise
-    raise AssertionError("takeover did not make progress")
+    return force_take_over(
+        store, owner_id=owner_id, host="local", ttl_s=60, expect_epoch=epoch, attempts=100
+    )
 
 
 @dataclass
@@ -176,12 +169,14 @@ class RtEnv:
         cast(Any, self.rt.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
+                await anyio.sleep(0.01)
 
     async def wait_started(self) -> None:
-        while not await anyio.to_thread.run_sync(self.events, "tool_start"):  # noqa: ASYNC110
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(self.events, "tool_start"):  # noqa: ASYNC110
+                await anyio.sleep(0.01)
 
     def cancel_inflight(self) -> None:
         self.inflight.cancel_all()
@@ -328,8 +323,9 @@ class EngineEnv:
         cast(Any, self.deps.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
+                await anyio.sleep(0.01)
 
     def _configured(self, config: "RunConfig") -> "EngineEnv":
         from swarm_arena._budget.ledger import Ledger
