@@ -13,6 +13,7 @@ from typing import NoReturn
 
 from pydantic import ValidationError
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.diagnostics import validation_summary
@@ -99,7 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Import here before the driver loader sanitizes exception values.
             importlib.import_module(args.function.split(":", 1)[0])
         except (Exception, SystemExit) as exc:
-            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
             traceback.print_exception(exc, file=sys.stderr)
             return 1
         fn = _load_function(args.function)
@@ -115,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = fn(**{name: getattr(inputs, name) for name in type(inputs).model_fields})
         except (Exception, SystemExit) as exc:
-            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
             traceback.print_exception(exc, file=sys.stderr)
             return 1
         if not isinstance(result, dict):
@@ -129,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_result(payload, result_path)
         return 0
     except (Exception, SystemExit) as exc:
-        print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+        print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
         return 1
 
 

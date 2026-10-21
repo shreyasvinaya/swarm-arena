@@ -158,7 +158,7 @@ class _CoreValueError(ValueError):
 
 
 _CORE_SIGNALS: WeakKeyDictionary[
-    Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None]
+    Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None, str]
 ] = WeakKeyDictionary()
 _SignalT = TypeVar("_SignalT", bound=Exception)
 
@@ -206,7 +206,32 @@ def _core_signal(error: _SignalT) -> _SignalT:
             error.args,
             error.limit if isinstance(error, LimitReached) else None,
             tuple(error.errors) if isinstance(error, PlanError) else None,
+            "RuntimeError"
+            if type(error) is _CoreRuntimeError
+            else "ValueError"
+            if type(error) is _CoreValueError
+            else type(error).__name__,
         )
+    return error
+
+
+def _exception_type_name(error: BaseException) -> str:
+    """Read a preserved originating type without trusting exception attributes."""
+    if any(type(error) is kind for kind in _core_signal_kinds()):
+        payload = _CORE_SIGNALS.get(cast(Exception, error))
+        if payload is not None:
+            return payload[4]
+    if type(error) is _CoreRuntimeError:
+        return "RuntimeError"
+    if type(error) is _CoreValueError:
+        return "ValueError"
+    return type(error).__name__
+
+
+def _with_exception_type(error: _SignalT, name: str) -> _SignalT:
+    """Attach an originating type to a freshly registered, sanitized failure."""
+    kind, args, limit, errors, _ = _CORE_SIGNALS[error]
+    _CORE_SIGNALS[error] = kind, args, limit, errors, name
     return error
 
 
@@ -225,11 +250,13 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
     payload = _CORE_SIGNALS.get(cast(Exception, error))
     if payload is None:
         return None
-    kind, args, limit, errors = payload
+    kind, args, limit, errors, name = payload
     if kind is LimitReached:
         assert limit is not None
-        return _core_error(LimitReached, limit, args[0])
-    if kind is PlanError:
+        rebuilt = _core_error(LimitReached, limit, args[0])
+    elif kind is PlanError:
         assert errors is not None
-        return _core_error(PlanError, errors)
-    return _core_error(kind, *args)
+        rebuilt = _core_error(PlanError, errors)
+    else:
+        rebuilt = _core_error(kind, *args)
+    return _with_exception_type(rebuilt, name)

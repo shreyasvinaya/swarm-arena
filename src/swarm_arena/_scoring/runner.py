@@ -3,7 +3,7 @@
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.ref import Ref
@@ -126,7 +126,9 @@ async def run_checks(
             error = outcome.classify(error)
             results.append(
                 CheckResult(
-                    check=name, passed=False, reasons=[f"check error: {type(error).__name__}"]
+                    check=name,
+                    passed=False,
+                    reasons=[f"check error: {_exception_type_name(error)}"],
                 )
             )
             continue
@@ -245,7 +247,7 @@ async def _judge_batch(
     except BaseException as error:
         error = outcome.classify(error)
         stamped = []
-        raised = f"{type(error).__name__}: judge raised"
+        raised = f"{_exception_type_name(error)}: judge raised"
 
     errors: list[JudgeError] = []
     for candidate in batch:

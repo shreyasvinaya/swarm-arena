@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import anyio
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_stage import _Staged
@@ -147,7 +148,7 @@ class _JobRun:
         try:
             output = await anyio.to_thread.run_sync(self._finish, output, times)
         except Exception as exc:  # an upload failure must not replace the cancellation
-            note = f"uploads failed: {type(exc).__name__}"
+            note = f"uploads failed: {_exception_type_name(exc)}"
             await anyio.to_thread.run_sync(note_in_log, self._stderr, note)
             update: dict[str, Any] = {"files": []}  # never hand over refs that were not stored
             if times is not None:
@@ -178,7 +179,7 @@ class _JobRun:
             raise
         except BaseException as error:
             _classify_outcome(error)
-            note_in_log(run.stderr_path, f"collect failed: {type(error).__name__}")
+            note_in_log(run.stderr_path, f"collect failed: {_exception_type_name(error)}")
             return None
         finally:
             _OUTPUT_BYTE_LIMIT.reset(token)

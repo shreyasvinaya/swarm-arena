@@ -6,7 +6,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import _core_error
+from swarm_arena._errors import _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
@@ -100,13 +100,13 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
                 await run_sync_daemon(_run_hook, ref, base, overrides, seen)
         except BaseException as exc:
             exc = outcome.classify(exc)
-            failures.append(f"- {ref.path}: {type(exc).__name__}")
+            failures.append(f"- {ref.path}: {_exception_type_name(exc)}")
     outcome = _Outcome()
     try:
         with anyio.fail_after(config.settle_timeout_s):
             await run_sync_daemon(executor.preflight)
     except BaseException as exc:
         exc = outcome.classify(exc)
-        failures.append(f"- {config.executor.path}: {type(exc).__name__}")
+        failures.append(f"- {config.executor.path}: {_exception_type_name(exc)}")
     if failures:
         raise _core_error(RuntimeError, "preflight failed:\n" + "\n".join(failures)) from None

@@ -21,6 +21,7 @@ from swarm_arena._errors import (
     SoftError,
     _core_error,
     _core_signal,
+    _exception_type_name,
     _rebuild_core_signal,
 )
 from swarm_arena._exec.env import tool_env_vars
@@ -320,7 +321,9 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
+        raise _core_signal(
+            SoftError(f"invalid tool request: {_exception_type_name(error)}")
+        ) from None
 
 
 async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | None = None) -> _T:
@@ -386,7 +389,9 @@ def _request(
         raise _core_signal(SoftError(str(error))) from None
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
+        raise _core_signal(
+            SoftError(f"invalid tool request: {_exception_type_name(error)}")
+        ) from None
 
 
 def _stage_settings(
@@ -420,7 +425,9 @@ def _stage_settings(
         rebuilt = _rebuild_core_signal(error)
         if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
-        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
+        raise _core_signal(
+            SoftError(f"invalid tool stage: {_exception_type_name(error)}")
+        ) from None
 
 
 def _prepare_request(
@@ -463,7 +470,9 @@ def _stage(
         rebuilt = _rebuild_core_signal(error)
         if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
-        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
+        raise _core_signal(
+            SoftError(f"invalid tool stage: {_exception_type_name(error)}")
+        ) from None
 
 
 def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
@@ -658,7 +667,7 @@ async def _run(
         rebuilt = _rebuild_core_signal(error)
         if isinstance(rebuilt, LimitReached):
             raise rebuilt from None
-        warnings.append(f"tool error: {type(error).__name__}")
+        warnings.append(f"tool error: {_exception_type_name(error)}")
         failed = True
     if inflight.closed or generation != inflight._cancel_generation:
         raise _core_signal(LimitReached("stop", "the round is stopping"))
@@ -745,7 +754,7 @@ async def _run(
         rebuilt = _rebuild_core_signal(error)
         if refused and isinstance(rebuilt, LimitReached) and not started:
             raise rebuilt from None
-        warnings.append(f"tool error: {type(error).__name__}")
+        warnings.append(f"tool error: {_exception_type_name(error)}")
         output = ToolOutput(status=RunStatus.ERROR)
 
     # A stopped executor may still deliver partial output during collection.
@@ -794,7 +803,7 @@ async def _run(
                 raise
             except BaseException as error:
                 error = outcome.classify(error)
-                warnings.append(f"tool error: {type(error).__name__}")
+                warnings.append(f"tool error: {_exception_type_name(error)}")
                 output = ToolOutput(status=RunStatus.ERROR)
                 actual, estimated = Amount(), started and providers
         if output.logs_ref is not None:
@@ -805,7 +814,7 @@ async def _run(
                 raise
             except BaseException as error:
                 error = outcome.classify(error)
-                warnings.append(f"tool error: {type(error).__name__}")
+                warnings.append(f"tool error: {_exception_type_name(error)}")
                 output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
     # Optional fingerprint work must remain cancellable before durable completion.
     fingerprint: str | None = None
@@ -821,10 +830,10 @@ async def _run(
         except Fenced:
             raise
         except anyio.get_cancelled_exc_class() as error:
-            warnings.append(f"fingerprint error: {type(error).__name__}")
+            warnings.append(f"fingerprint error: {_exception_type_name(error)}")
         except BaseException as error:
             error = outcome.classify(error)
-            warnings.append(f"fingerprint error: {type(error).__name__}")
+            warnings.append(f"fingerprint error: {_exception_type_name(error)}")
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")
     candidate = Candidate(

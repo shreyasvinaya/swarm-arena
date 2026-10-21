@@ -292,7 +292,7 @@ async def test_replanner_fencing_propagates_and_user_cancellation_is_rejected(
     if cancelled:
         assert not await runner._replan()
         assert env.events("plan_rejected")[-1].payload["errors"] == [
-            "planner error: _CoreRuntimeError"
+            "planner error: CancelledError"
         ]
     else:
         with pytest.raises(error):

@@ -258,7 +258,7 @@ async def test_caller_cancellation_entry_baseline(env: EngineEnv, pending: bool)
         assert parent.cancelling() == 1
         await env.deps.journal.commit()
         assert env.events("plan_rejected")[-1].payload["errors"] == [
-            "planner error: _CoreRuntimeError"
+            "planner error: CancelledError"
         ]
 
 

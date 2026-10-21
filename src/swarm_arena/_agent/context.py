@@ -13,7 +13,14 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
+from swarm_arena._errors import (
+    ConfigError,
+    Fenced,
+    SoftError,
+    _core_signal,
+    _exception_type_name,
+    _rebuild_core_signal,
+)
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import JsonValue
@@ -78,7 +85,9 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_signal(SoftError(f"invalid tool metadata: {type(error).__name__}")) from None
+        raise _core_signal(
+            SoftError(f"invalid tool metadata: {_exception_type_name(error)}")
+        ) from None
 
 
 class AgentContext:
@@ -937,7 +946,7 @@ class AgentContext:
             rebuilt = _rebuild_core_signal(error)
             if isinstance(rebuilt, (SoftError, LimitReached)):
                 raise rebuilt from None
-            raise _core_signal(SoftError(f"action failed: {type(error).__name__}")) from None
+            raise _core_signal(SoftError(f"action failed: {_exception_type_name(error)}")) from None
         finally:
             lifetime.live = False
             _nested.reset(token)

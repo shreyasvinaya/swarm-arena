@@ -25,7 +25,7 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._errors import Fenced, PlanError, _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -708,7 +708,7 @@ class GoalRunner:
                             JudgeError(
                                 candidate_id=c.id,
                                 judge=ref.component_name(),
-                                reason=f"judge error: {type(error).__name__}",
+                                reason=f"judge error: {_exception_type_name(error)}",
                             )
                             for c in batch
                         ],
@@ -844,7 +844,7 @@ class GoalRunner:
                         JudgeError(
                             candidate_id=c.id,
                             judge=name,
-                            reason=f"judge error: {type(error).__name__}",
+                            reason=f"judge error: {_exception_type_name(error)}",
                         )
                         for c in finalists
                     ],
@@ -907,7 +907,7 @@ class GoalRunner:
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
-                    errors=[f"planner error: {type(error).__name__}"],
+                    errors=[f"planner error: {_exception_type_name(error)}"],
                     origin="autonomous",
                     first_round=self.rounds_closed + 1,
                 )
@@ -997,7 +997,7 @@ class GoalRunner:
             raise
         except BaseException as error:
             error = outcome.classify(error)
-            raise PlanError([f"preflight failed: {type(error).__name__}"]) from None
+            raise PlanError([f"preflight failed: {_exception_type_name(error)}"]) from None
 
     def _stop(self) -> bool:
         stops = self.deps.stops
@@ -1045,7 +1045,7 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
-            decision = guard(Decision(policy=f"policy error: {type(error).__name__}"), state)
+            decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(
                 EventType.DECISION,

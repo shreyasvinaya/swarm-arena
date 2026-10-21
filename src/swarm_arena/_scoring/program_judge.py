@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 from typing import ClassVar, cast
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, import_path, load_object
@@ -234,7 +235,7 @@ class ProgramJudge(Judge):
             except KeyboardInterrupt:
                 raise
             except BaseException as error:
-                name = type(error).__name__
+                name = _exception_type_name(error)
                 error = outcome.classify(error)
                 ctx.judge_error(candidate.id, f"{name}: scoring function raised")
                 continue

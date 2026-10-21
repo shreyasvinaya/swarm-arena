@@ -25,7 +25,7 @@ from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
-from swarm_arena._errors import Fenced, PlanError, _core_error
+from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -182,7 +182,7 @@ async def _start_executor(config: RunConfig) -> Executor:
     except BaseException as exc:
         exc = outcome.classify(exc)
         raise _core_error(
-            RuntimeError, f"executor construction failed: {type(exc).__name__}"
+            RuntimeError, f"executor construction failed: {_exception_type_name(exc)}"
         ) from None
 
 
@@ -196,7 +196,7 @@ async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool
             if not failed and not shutdown.cancel_called:
                 exc = outcome.classify(exc)
                 raise _core_error(
-                    RuntimeError, f"executor shutdown failed: {type(exc).__name__}"
+                    RuntimeError, f"executor shutdown failed: {_exception_type_name(exc)}"
                 ) from None
 
 
@@ -340,7 +340,7 @@ class RunRunner:
                 except BaseException as exc:
                     exc = outcome.classify(exc)
                     raise _core_error(
-                        RuntimeError, f"estimate failed: {type(exc).__name__}"
+                        RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
                     ) from None
                 if _exceeds_limit(estimate, self.config):
                     raise _core_error(
@@ -359,7 +359,7 @@ class RunRunner:
                 except BaseException as exc:
                     exc = outcome.classify(exc)
                     raise _core_error(
-                        RuntimeError, f"executor capacity failed: {type(exc).__name__}"
+                        RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
                     ) from None
                 if invalid_capacity:
                     raise _core_error(
@@ -372,7 +372,7 @@ class RunRunner:
                     except BaseException as exc:
                         exc = outcome.classify(exc)
                         raise _core_error(
-                            RuntimeError, f"approval failed: {type(exc).__name__}"
+                            RuntimeError, f"approval failed: {_exception_type_name(exc)}"
                         ) from None
                     if type(approved) is not bool:
                         raise _core_error(

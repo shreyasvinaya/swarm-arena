@@ -5,7 +5,7 @@ from typing import ClassVar, cast
 
 from pydantic import Field, JsonValue
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
@@ -421,5 +421,7 @@ class Lexicographic(Judge):
                 raise
             except BaseException as error:
                 error = _classify_outcome(error)
-                errors[candidate.id] = f"{type(error).__name__}: cannot combine member scores"
+                errors[candidate.id] = (
+                    f"{_exception_type_name(error)}: cannot combine member scores"
+                )
         return scores, errors

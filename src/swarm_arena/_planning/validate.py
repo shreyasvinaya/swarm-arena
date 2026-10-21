@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import ConfigError, PlanError, _core_error
+from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
 from swarm_arena._model.data import json_equal
@@ -100,7 +100,7 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
         return action()
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_error(PlanError, [f"{pointer}: {type(error).__name__}"]) from None
+        raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
 
 
 def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
@@ -408,7 +408,7 @@ def _rule_configs(
             continue
         except BaseException as error:
             error = _classify_outcome(error)
-            errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
+            errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
             continue
         try:
             built[site.pointer] = _safe_call(f"{pointer}: {ref.path}", partial(ref.build, base))
@@ -872,7 +872,7 @@ def _validate_round_refs(plan: Plan) -> None:
             errors.append(f"{pointer}: {error}")
         except BaseException as error:
             error = _classify_outcome(error)
-            errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
+            errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
     if errors:
         raise _core_error(PlanError, errors) from None
 
@@ -1004,7 +1004,7 @@ def admit_revision(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_error(PlanError, [f"/snapshot: {type(error).__name__}"]) from None
+        raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )

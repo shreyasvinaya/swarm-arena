@@ -739,7 +739,7 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
         result = await call
         outcome = result[1] if isinstance(result, tuple) else result
         assert len(outcome.errors) == 1
-        assert outcome.errors[0].reason == "_CoreRuntimeError: judge raised"
+        assert outcome.errors[0].reason == "CancelledError: judge raised"
         assert "ownership or cancellation" not in outcome.model_dump_json()
         assert later.seen == ([] if final else [["c-1"]])
 

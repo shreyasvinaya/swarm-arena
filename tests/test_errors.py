@@ -153,3 +153,36 @@ def test_cli_error_snapshots_are_fresh_weak_and_not_transferable(
     del rebuilt
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("kind", ["cancel", "group"])
+def test_sanitized_outcomes_preserve_original_type_without_transferable_attributes(
+    kind: str,
+) -> None:
+    import gc
+    import weakref
+
+    from _fakes.pr1_r2 import SECRET, failure
+
+    from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
+    from swarm_arena._outcomes import _classify_outcome
+
+    expected = "CancelledError" if kind == "cancel" else "BaseExceptionGroup"
+    safe = _classify_outcome(failure(kind))
+    safe.args = (SECRET,)
+    safe.__dict__["original_type"] = SECRET
+    safe.add_note(SECRET)
+    safe.__cause__ = ValueError(SECRET)
+    rebuilt = _classify_outcome(safe)
+    assert _exception_type_name(rebuilt) == expected
+    assert_secret_absent(rebuilt, SECRET, sanitized=True)
+    again = _classify_outcome(rebuilt)
+    assert _exception_type_name(again) == expected
+    forged = type(safe)(SECRET)
+    forged.__dict__.update(safe.__dict__)
+    assert _rebuild_core_signal(forged) is None
+    assert _exception_type_name(forged) == "RuntimeError"
+    reference = weakref.ref(rebuilt)
+    del rebuilt
+    gc.collect()
+    assert reference() is None

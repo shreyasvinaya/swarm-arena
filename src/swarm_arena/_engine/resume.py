@@ -16,7 +16,7 @@ from swarm_arena._engine import run as run_module
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, PlanError, _core_error
+from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
@@ -186,7 +186,8 @@ class _ResumeServices:
                             except BaseException as error:
                                 error = outcome.classify(error)
                                 raise _core_error(
-                                    RuntimeError, f"orphan recovery failed: {type(error).__name__}"
+                                    RuntimeError,
+                                    f"orphan recovery failed: {_exception_type_name(error)}",
                                 ) from None
                             source = index[id]
                             payload = (
@@ -272,7 +273,7 @@ class _ResumeServices:
                 except Exception as error:
                     if self.failure is None:
                         self.failure = _core_error(
-                            RuntimeError, f"resume cleanup failed: {type(error).__name__}"
+                            RuntimeError, f"resume cleanup failed: {_exception_type_name(error)}"
                         )
                 if executor is not None:
                     try:

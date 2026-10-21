@@ -22,7 +22,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline
-from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
+from swarm_arena._errors import Fenced, _core_error, _exception_type_name, _rebuild_core_signal
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
@@ -814,12 +814,12 @@ class RoundRunner:
                 ):
                     raise _core_error(Fenced, "run ownership lost") from None
                 if contexts[index] is None:
-                    reasons[key] = f"agent error: {type(error).__name__}"
+                    reasons[key] = f"agent error: {_exception_type_name(error)}"
                 else:
                     reasons[key] = (
                         "limit reached"
                         if isinstance(_rebuild_core_signal(error), LimitReached)
-                        else f"manager error: {type(error).__name__}"
+                        else f"manager error: {_exception_type_name(error)}"
                     )
             finally:
                 if contexts[index] is None:

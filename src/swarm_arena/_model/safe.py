@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic.errors import PydanticErrorMixin
 from pydantic_core import ErrorType, InitErrorDetails, PydanticCustomError
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._model.diagnostics import _SanitizedValidationError
 from swarm_arena._model.locations import (
     _VALIDATION_BY_ALIAS,
@@ -229,7 +230,7 @@ def _sanitize_validation_error(
             details.append(
                 InitErrorDetails(
                     type=PydanticCustomError(
-                        "invalid", cast(LiteralString, f"invalid: {type(error).__name__}")
+                        "invalid", cast(LiteralString, f"invalid: {_exception_type_name(error)}")
                     ),
                     loc=(),
                     input=None,

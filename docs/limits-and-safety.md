@@ -170,7 +170,8 @@ settlement wait; work that may have started retains its charge. Actual caller
 cancellation and ownership fencing still propagate. Fencing nested in an exception
 group propagates as a bare ownership-loss error, without group or leaf values;
 pending caller cancellation takes precedence. Hook messages, notes, and causes
-are not rendered by the CLI.
+are not rendered by the CLI. Type-only diagnostics retain the originating
+exception type across sanitized copies; internal exception class names are hidden.
 Request-time estimate and provider hooks run in registered, cancellable
 preparation before reservation. Immediate stop and round deadlines abandon
 these waits without using the executor collection allowance.

@@ -4,7 +4,13 @@ import asyncio
 
 import anyio
 
-from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
+from swarm_arena._errors import (
+    Fenced,
+    _core_error,
+    _exception_type_name,
+    _rebuild_core_signal,
+    _with_exception_type,
+)
 
 
 def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Exception:
@@ -23,7 +29,10 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
     if rebuilt is not None:
         return rebuilt
     if isinstance(error, BaseExceptionGroup) or not isinstance(error, Exception):
-        return _core_error(RuntimeError, f"supervised hook failed: {type(error).__name__}")
+        name = _exception_type_name(error)
+        return _with_exception_type(
+            _core_error(RuntimeError, f"supervised hook failed: {name}"), name
+        )
     return error
 
 
