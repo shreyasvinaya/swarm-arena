@@ -146,14 +146,21 @@ class _ResumeServices:
         assert head is not None
         try:
             path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
-            async with run_module._RunJournal(
-                self.store,
-                lease,
-                run_id=self.run_id,
-                next_seq=head.seq + 1,
-                local_path=path,
-                sync_interval_s=config.sync_interval_s,
-            ) as journal:
+            stops = StopState()
+            clock = RunClock(0)
+            async with (
+                run_module._supervise_initialization(
+                    self.store, lease.doc.epoch, stops, clock, config
+                ) as replay_prepared,
+                run_module._RunJournal(
+                    self.store,
+                    lease,
+                    run_id=self.run_id,
+                    next_seq=head.seq + 1,
+                    local_path=path,
+                    sync_interval_s=config.sync_interval_s,
+                ) as journal,
+            ):
                 entered = True
                 # The journal owns release even if supervision entry is cancelled.
                 async with run_module._supervise_writer(journal):
@@ -163,151 +170,163 @@ class _ResumeServices:
                             EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
                         )
                         events, state = await run_sync_daemon(_read, self.store, lease.doc)
-                        from swarm_arena._scoring.human_review import _repair_review_objects
-
-                        arena_root = await run_sync_daemon(_board_arena_root, config)
-                        arena = await run_sync_daemon(open_store, arena_root)
-                        await _repair_review_objects(state, arena, self.store, lease, journal)
-                        clock = RunClock(state.run_elapsed_s)
+                        replay_prepared()
+                        # Replay restores prior active time; include time spent reading it.
+                        clock = RunClock(state.run_elapsed_s + clock.elapsed())
                         journal.clock = clock
-                        continued = _check(state, config)
-                        self.order = [
-                            g
-                            for g in state.plans
-                            if not state.goals[g].finished and state.goals[g].status != "queued"
-                        ]
-                        self.order.extend(continued)
-                        self.order.extend(
-                            g for g in state.plans if state.goals[g].status == "queued"
-                        )
-                        for revisions in state.plans.values():
-                            directory = str(revisions[0][0].base_dir)
-                            if directory not in sys.path:
-                                sys.path.append(directory)
-                        ids = IdGen(self.run_id, lease.doc.epoch, counters=state.id_counters)
-                        ledger = Ledger.replay(state, journal=journal, ids=ids)
-                        executor = await run_module._start_executor(config)
-                        killed: list[str] = []
-                        starts = {
-                            e.payload["candidate_id"]: e
-                            for e in events
-                            if e.type == EventType.TOOL_START
-                        }
-                        commands = {
-                            e.payload["job_id"]: e
-                            for e in events
-                            if e.type == EventType.COMMAND_START
-                        }
-                        for jobs, index, event_type in (
-                            (state.started, starts, EventType.RUN_LOST),
-                            (state.started_commands, commands, EventType.COMMAND_END),
-                        ):
-                            for id, started in jobs.items():
-                                outcome = _Outcome()
-                                try:
-                                    with anyio.move_on_after(config.settle_timeout_s):
-                                        if await executor.kill_orphan(started):
-                                            killed.append(id)
-                                except BaseException as error:
-                                    error = outcome.classify(error)
-                                    raise _core_error(
-                                        RuntimeError,
-                                        f"orphan recovery failed: {_exception_type_name(error)}",
-                                    ) from None
-                                source = index[id]
-                                payload = (
-                                    {
-                                        "candidate_id": id,
-                                        "reservation_id": source.payload["reservation_id"],
-                                    }
-                                    if event_type == EventType.RUN_LOST
-                                    else {"job_id": id, "status": "lost"}
-                                )
+                        async with run_module._supervise_initialization(
+                            self.store, lease.doc.epoch, stops, clock, config
+                        ) as prepared:
+                            from swarm_arena._scoring.human_review import _repair_review_objects
+
+                            arena_root = await run_sync_daemon(_board_arena_root, config)
+                            arena = await run_sync_daemon(open_store, arena_root)
+                            await _repair_review_objects(state, arena, self.store, lease, journal)
+                            continued = _check(state, config)
+                            self.order = [
+                                g
+                                for g in state.plans
+                                if not state.goals[g].finished and state.goals[g].status != "queued"
+                            ]
+                            self.order.extend(continued)
+                            self.order.extend(
+                                g for g in state.plans if state.goals[g].status == "queued"
+                            )
+                            for revisions in state.plans.values():
+                                directory = str(revisions[0][0].base_dir)
+                                if directory not in sys.path:
+                                    sys.path.append(directory)
+                            ids = IdGen(self.run_id, lease.doc.epoch, counters=state.id_counters)
+                            ledger = Ledger.replay(state, journal=journal, ids=ids)
+                            executor = await run_module._start_executor(config)
+                            killed: list[str] = []
+                            starts = {
+                                e.payload["candidate_id"]: e
+                                for e in events
+                                if e.type == EventType.TOOL_START
+                            }
+                            commands = {
+                                e.payload["job_id"]: e
+                                for e in events
+                                if e.type == EventType.COMMAND_START
+                            }
+                            for jobs, index, event_type in (
+                                (state.started, starts, EventType.RUN_LOST),
+                                (state.started_commands, commands, EventType.COMMAND_END),
+                            ):
+                                for id, started in jobs.items():
+                                    outcome = _Outcome()
+                                    try:
+                                        with anyio.move_on_after(config.settle_timeout_s):
+                                            if await executor.kill_orphan(started):
+                                                killed.append(id)
+                                    except BaseException as error:
+                                        error = outcome.classify(error)
+                                        name = _exception_type_name(error)
+                                        raise _core_error(
+                                            RuntimeError,
+                                            f"orphan recovery failed: {name}",
+                                        ) from None
+                                    source = index[id]
+                                    payload = (
+                                        {
+                                            "candidate_id": id,
+                                            "reservation_id": source.payload["reservation_id"],
+                                        }
+                                        if event_type == EventType.RUN_LOST
+                                        else {"job_id": id, "status": "lost"}
+                                    )
+                                    journal.append(
+                                        EventDraft(
+                                            type=event_type,
+                                            task_id=source.task_id,
+                                            goal_id=source.goal_id,
+                                            team=source.team,
+                                            agent=source.agent,
+                                            round=source.round,
+                                            payload=payload,
+                                        )
+                                    )
+                            shares = weighted_shares(
+                                ledger.free(),
+                                {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
+                            )
+                            for g in continued:
+                                ledger.open_goal(g, pool=shares[g])
                                 journal.append(
                                     EventDraft(
-                                        type=event_type,
-                                        task_id=source.task_id,
-                                        goal_id=source.goal_id,
-                                        team=source.team,
-                                        agent=source.agent,
-                                        round=source.round,
-                                        payload=payload,
+                                        type=EventType.GOAL_STARTED,
+                                        goal_id=g,
+                                        payload={"pool": shares[g].model_dump()},
                                     )
                                 )
-                        shares = weighted_shares(
-                            ledger.free(),
-                            {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
-                        )
-                        for g in continued:
-                            ledger.open_goal(g, pool=shares[g])
-                            journal.append(
-                                EventDraft(
-                                    type=EventType.GOAL_STARTED,
-                                    goal_id=g,
-                                    payload={"pool": shares[g].model_dump()},
+                            if config.limits != state.config.limits:
+                                ledger.change_limits(config.limits)
+                                journal.append(
+                                    EventDraft(
+                                        type=EventType.LIMITS_CHANGED,
+                                        payload={
+                                            "old": state.config.limits.model_dump(mode="json"),
+                                            "new": config.limits.model_dump(mode="json"),
+                                        },
+                                    )
                                 )
+                            await journal.commit()
+                            _, state = await run_sync_daemon(_read, self.store, lease.doc)
+                            board = await run_module._start_board(config)
+                            await run_module._open_board(
+                                board,
+                                config,
+                                self.run_id,
+                                sorted(
+                                    {
+                                        goal.namespace
+                                        for revisions in state.plans.values()
+                                        for plan, _ in revisions
+                                        for goal in [
+                                            plan.goal,
+                                            *(part.goal for part in plan.parts),
+                                        ]
+                                    }
+                                ),
                             )
-                        if config.limits != state.config.limits:
-                            ledger.change_limits(config.limits)
-                            journal.append(
-                                EventDraft(
-                                    type=EventType.LIMITS_CHANGED,
-                                    payload={
-                                        "old": state.config.limits.model_dump(mode="json"),
-                                        "new": config.limits.model_dump(mode="json"),
-                                    },
-                                )
-                            )
-                        await journal.commit()
-                        _, state = await run_sync_daemon(_read, self.store, lease.doc)
-                        board = await run_module._start_board(config)
-                        await run_module._open_board(
-                            board,
-                            config,
-                            self.run_id,
-                            sorted(
-                                {
+                            self.deps = EngineDeps(
+                                run_id=self.run_id,
+                                config=config,
+                                store=self.store,
+                                journal=journal,
+                                ledger=ledger,
+                                board=board,
+                                executor=executor,
+                                artifacts=ArtifactStore(open_store(config.artifact_root)),
+                                ids=ids,
+                                views=ViewWriter(self.store, journal),
+                                board_namespaces={
                                     goal.namespace
                                     for revisions in state.plans.values()
                                     for plan, _ in revisions
                                     for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                                }
-                            ),
-                        )
-                        self.deps = EngineDeps(
-                            run_id=self.run_id,
-                            config=config,
-                            store=self.store,
-                            journal=journal,
-                            ledger=ledger,
-                            board=board,
-                            executor=executor,
-                            artifacts=ArtifactStore(open_store(config.artifact_root)),
-                            ids=ids,
-                            views=ViewWriter(self.store, journal),
-                            board_namespaces={
-                                goal.namespace
-                                for revisions in state.plans.values()
-                                for plan, _ in revisions
-                                for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                            },
-                            stops=StopState(),
-                            clock=clock,
-                            admission=RunAdmission(
-                                config.limits.max_agents_total,
-                                [
-                                    plan
-                                    for revisions in state.plans.values()
-                                    for plan, _ in revisions
-                                ],
-                            ),
-                        )
-                        await _repair_round_pages(self.deps, state)
-                        self.resumed = ResumeState(
-                            state, lease, lease.doc.epoch, ledger, killed, self
-                        )
-                        self.ready.set()
-                        await self.close.wait()
+                                },
+                                stops=stops,
+                                clock=clock,
+                                admission=RunAdmission(
+                                    config.limits.max_agents_total,
+                                    [
+                                        plan
+                                        for revisions in state.plans.values()
+                                        for plan, _ in revisions
+                                    ],
+                                ),
+                            )
+                            await _repair_round_pages(self.deps, state)
+                            self.resumed = ResumeState(
+                                state, lease, lease.doc.epoch, ledger, killed, self
+                            )
+                            prepared()
+                            self.ready.set()
+                            await self.close.wait()
+                        if self.resumed is None:
+                            raise _core_error(RuntimeError, "resume initialization stopped")
                     finally:
                         if board is not None:
                             await run_module._close_board(
@@ -315,6 +334,8 @@ class _ResumeServices:
                                 config,
                                 failed=sys.exc_info()[0] is not None or self.run_failed,
                             )
+            if self.resumed is None:
+                raise _core_error(RuntimeError, "resume initialization stopped")
         except BaseException as error:
             self.failure = error
         finally:
@@ -482,7 +503,7 @@ async def resume_run(
         or has an invalid replay payload, or a budget cap decreases.
     RuntimeError
         A live owner requires force, a competing resume advances the epoch,
-        or a runtime service fails.
+        a runtime service fails, or stop/run expiry interrupts preparation.
 
     Examples
     --------

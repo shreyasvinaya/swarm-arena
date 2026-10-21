@@ -554,6 +554,10 @@ goals receive a durable stopped result, solution files, and a review export;
 resuming does not restart those goals. Publishing these results is bounded by
 `settle_timeout_s`. Before a committed start, interruption raises a clear
 initialization error instead of reporting a completed run.
+Resume preparation also observes the new epoch's stop files and the remaining
+run time, including while replay, review repair, board setup, or page repair is
+blocked. Interrupted preparation releases ownership and reports
+`resume initialization stopped`; it does not start the driver.
 Round preparation does not consume the
 agent round timeout. Storage failures report exception types without exposing
 backend messages or private values.
