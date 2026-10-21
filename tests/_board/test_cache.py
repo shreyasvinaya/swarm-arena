@@ -1,5 +1,7 @@
+import gc
 import sqlite3
 import traceback
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -1917,3 +1919,158 @@ def test_nested_reads_prepare_frontier_once(
     )
     assert cache.membership(frontier)
     cache.close()
+
+
+def _seed_search_corpus(cache: ArenaCache, size: int) -> Frontier:
+    name = "toy/curation/20261018T000000.000Z-00000000.jsonl"
+    names = [name] * size
+    objects = [
+        HumanObject(
+            kind="add",
+            author="human:x",
+            learning=Learning(
+                id=f"L-h-{i:016x}",
+                namespace="toy",
+                run_id="",
+                goal_id="g1",
+                round=0,
+                author="human:x",
+                title="rareword" if i == 0 else "common",
+                text="word " * 240,
+                tags=["tag"],
+            ),
+        )
+        for i in range(size)
+    ]
+    cache.apply_human_objects(names, objects)
+    return Frontier(curation=[name])
+
+
+def test_warm_search_and_count_do_not_hydrate_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    frontier = _seed_search_corpus(cache, 1000)
+    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+        "L-h-0000000000000000"
+    ]
+
+    def refuse(*args: object, **kwargs: object) -> Learning:
+        pytest.fail("a cached ID/count read must not hydrate Learning models")
+
+    monkeypatch.setattr(Learning, "model_validate_json", refuse)
+    another = frontier.model_copy(update={"curation": frontier.curation * 2})
+    assert cache.search("toy", "rareword", frontier=another, goal=None, tags=(), limit=1) == [
+        "L-h-0000000000000000"
+    ]
+    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+        "L-h-0000000000000000"
+    ]
+    assert cache.count(frontier, filters=LearningFilter(goal_id="absent")) == 0
+    assert cache.count(frontier, filters=LearningFilter()) == 1000
+    assert (
+        len(
+            cache.find(
+                frontier, query=None, filters=LearningFilter(), relevance_goal=None, limit=10
+            )
+        )
+        == 10
+    )
+    cache.close()
+
+
+def test_sql_search_work_and_peak_memory(tmp_path: Path) -> None:
+    measurements = []
+    for size in (1_000, 10_000, 50_000):
+        cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
+        frontier = _seed_search_corpus(cache, size)
+        assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+            "L-h-0000000000000000"
+        ]
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 100
+            return 0
+
+        cache._conn.set_progress_handler(tick, 100)
+        assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+            "L-h-0000000000000000"
+        ]
+        search_work = steps
+        steps = 0
+        assert cache.count(frontier, filters=LearningFilter()) == size
+        count_work = steps
+        steps = 0
+        assert cache.count(frontier, filters=LearningFilter(goal_id="absent")) == 0
+        absent_work = steps
+        cache._conn.set_progress_handler(None, 0)
+        gc.collect()
+        tracemalloc.start()
+        try:
+            assert cache.search(
+                "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1
+            ) == ["L-h-0000000000000000"]
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        measurements.append((search_work, count_work, absent_work, peak))
+        assert peak < 2 * 1024 * 1024
+        cache.close()
+    print("SQL work/peak bytes (search, count, empty count; 1k/10k/50k):", measurements)
+    # Fixed one-object membership and one matching row should not scan the corpus.
+    assert measurements[2][0] < 5 * max(measurements[0][0], 100)
+    assert measurements[2][2] < 5 * max(measurements[0][2], 100)
+    # Full counts scale with rows, rather than correlated scans or Python models.
+    assert measurements[1][1] < 15 * measurements[0][1]
+    assert measurements[2][1] < 8 * measurements[1][1]
+
+
+def test_nonmatching_null_goal_has_same_relevance_as_other_goal(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), run.learning("L-z", "Hint", author="human:x"))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    ingest_run(cache, run.store, "r1", run.run_root, head)
+    human = _human_learning("L-a").model_copy(update={"goal_id": "other"})
+    cache.apply_human_objects(
+        [PIN_NAME], [HumanObject(kind="add", learning=human, author="human:x")]
+    )
+    frontier = build_frontier([("r1", run.run_root, head)], [], [PIN_NAME])
+    assert cache.find(
+        frontier, query=None, filters=LearningFilter(), relevance_goal=("absent", "absent")
+    ) == ["L-a", "L-z"]
+    cache.close()
+
+
+def test_scores_join_large_named_frontiers_with_linear_work(tmp_path: Path) -> None:
+    work = []
+    for size in (1_000, 10_000, 50_000):
+        cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
+        names = [f"toy/reviews/alice/20261018T000000.000Z-{i:08x}.jsonl" for i in range(size)]
+        cache.apply_human_objects(names, [_human_review(f"s-{i:08x}") for i in range(size)])
+        frontier = Frontier(reviews=names)
+        cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 1000
+            return 0
+
+        cache._conn.set_progress_handler(tick, 1000)
+        rows = cache.scores(frontier)
+        cache._conn.set_progress_handler(None, 0)
+        assert len(rows) == size
+        assert rows[0][0].id == "s-00000000"
+        assert rows[-1][0].id == f"s-{size - 1:08x}"
+        assert cache.scores(Frontier()) == []
+        assert [score.id for score, _ in cache.scores(Frontier(reviews=names[:1]))] == [
+            "s-00000000"
+        ]
+        assert not cache._conn.in_transaction
+        work.append(steps)
+        cache.close()
+    print("scores named-frontier VM steps (1k/10k/50k):", work)
+    assert 0 < work[1] < 15 * work[0]
+    assert work[2] < 8 * work[1]

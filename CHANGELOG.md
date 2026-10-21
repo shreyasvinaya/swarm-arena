@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
   retries in s3fs, the SDK, and the underlying HTTP transport.
+- Learning search and count execute filters, relevance ordering, and pagination
+  in SQLite, avoiding full-corpus Python model hydration on selective reads.
+
 - Fixed-frontier cache reads share indexed connection-local membership tables,
   including large human-object frontiers beyond SQLite parameter limits.
 

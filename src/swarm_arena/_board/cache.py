@@ -1,6 +1,7 @@
 """Cache committed arena records, retaining replay's producing identities."""
 
 import fcntl
+import json
 import logging
 import os
 import re
@@ -21,7 +22,6 @@ from swarm_arena._board.human_objects import (
     HumanObject,
     _check_folder_payload,
     _validate_human_key,
-    fold_curation,
     human_object_order,
 )
 from swarm_arena._errors import ChainError, _core_error
@@ -225,6 +225,8 @@ class ArenaCache:
     Ingest retains a core replay checkpoint per run, advances only missing events,
     and discards mutated state after rollback. A per-run sequence index supports
     segment junction and newest-head lookups without scanning prior segments.
+    Indexed TEMP membership is filled once per read, including nested lookups.
+    Search filtering, relevance, pagination and counts execute in SQLite.
     Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
 
@@ -279,6 +281,20 @@ class ArenaCache:
                         "CREATE INDEX IF NOT EXISTS segments_run_last_seq "
                         "ON segments(run_id, last_seq)"
                     )
+                    for index, definition in (
+                        ("learning_tags_lookup", "learning_tags(learning_id, tag)"),
+                        (
+                            "learning_evidence_lookup",
+                            "learning_evidence(learning_id, candidate_id)",
+                        ),
+                        (
+                            "learning_superseders_lookup",
+                            "learning_links(target_id, kind, learning_id)",
+                        ),
+                        ("learning_goal_id_lookup", "learnings(goal_id)"),
+                        ("learning_goal_key_lookup", "learnings(goal_key)"),
+                    ):
+                        conn.execute(f"CREATE INDEX IF NOT EXISTS {index} ON {definition}")
                     conn.execute("COMMIT")
                 except BaseException:
                     conn.execute("ROLLBACK")
@@ -778,22 +794,8 @@ class ArenaCache:
         >>> flags = cache.flags(frontier)  # doctest: +SKIP
         """
         with self._lock, self._frontier(frontier):
-            rows = self._conn.execute(
-                "SELECT obj_name, line, c.kind, learning_id FROM curation_ops c "
-                "JOIN _frontier_objects o ON o.kind='curation' AND o.name=c.obj_name"
-            ).fetchall()
-            return fold_curation(
-                (
-                    name,
-                    line,
-                    HumanObject(
-                        kind=kind,
-                        learning_id=lid,
-                        author="human:cache",
-                    ),
-                )
-                for name, line, kind, lid in rows
-            )
+            rows = self._conn.execute(self._flags_sql() + "SELECT learning_id, kind FROM flags")
+            return {lid: (kind == "pin", kind == "hide") for lid, kind in rows}
 
     def _learnings(self, frontier: Frontier, ids: Sequence[str] | None = None) -> list[Learning]:
         """Materialize frontier members, including hidden and superseded records."""
@@ -908,51 +910,44 @@ class ArenaCache:
             }
             return canonical_json(members)
 
-    def _search_members(self, frontier: Frontier) -> list[tuple[int, str | None, str, Learning]]:
-        """Validate complete coverage and materialize the exact immutable corpus."""
+    @staticmethod
+    def _flags_sql() -> str:
+        """Select the last pin/hide using validated curation-name ordering."""
+        # All stored curation names share the namespace/folder prefix, so their
+        # lexical order is timestamp then full name, exactly as fold_curation.
+        return (
+            "WITH flags AS (SELECT learning_id, kind FROM ("
+            "SELECT learning_id, c.kind, row_number() OVER (PARTITION BY learning_id "
+            "ORDER BY obj_name DESC, line DESC) AS ordinal FROM curation_ops c "
+            "JOIN _frontier_objects o ON o.kind='curation' AND o.name=c.obj_name"
+            ") WHERE ordinal=1) "
+        )
+
+    def _search_covered(self) -> None:
+        """Refuse partial human membership before any query or FTS construction."""
         if self._conn.execute(
             "SELECT 1 FROM _frontier_objects o LEFT JOIN human_objects h ON h.name=o.name "
             "WHERE h.name IS NULL LIMIT 1"
         ).fetchone():
             raise _core_error(ChainError, "frontier human object is not covered by cache")
-        rows = self._conn.execute(
-            "SELECT l.rowid, l.id, l.goal_key, l.ts, l.json FROM learnings l "
-            + self._member_join("learnings", "l")
-            + " WHERE "
-            + self._member_condition("learnings")
-            + " ORDER BY l.id"
-        ).fetchall()
-        flags = self.flags(frontier)
-        return [
-            (
-                rowid,
-                goal_key,
-                ts,
-                Learning.model_validate_json(data).model_copy(
-                    update=dict(
-                        zip(("pinned", "hidden"), flags.get(lid, (False, False)), strict=True)
-                    )
-                ),
-            )
-            for rowid, lid, goal_key, ts, data in rows
-        ]
 
-    def _fts_index(
-        self, frontier: Frontier, members: list[tuple[int, str | None, str, Learning]]
-    ) -> str:
-        """Build a complete TEMP corpus once, retaining eight by access order."""
+    def _fts_index(self, frontier: Frontier) -> str:
+        """Build a complete TEMP corpus in SQL, retaining eight by access order."""
         name = "fts_" + frontier.digest()[:16]
         if name in self._fts_tables:
             self._fts_tables.move_to_end(name)
             return name
         self._conn.execute(f"CREATE VIRTUAL TABLE temp.{name} USING fts5(title, text, tags)")
         try:
-            self._conn.executemany(
-                f"INSERT INTO temp.{name}(rowid, title, text, tags) VALUES (?, ?, ?, ?)",
-                [
-                    (rowid, item.title, item.text, " ".join(item.tags))
-                    for rowid, _, _, item in members
-                ],
+            self._conn.execute(
+                f"INSERT INTO temp.{name}(rowid, title, text, tags) "
+                "SELECT l.rowid, json_extract(l.json, '$.title'), json_extract(l.json, '$.text'), "
+                "coalesce((SELECT group_concat(value, ' ') FROM json_each(l.json, '$.tags')), '') "
+                "FROM learnings l "
+                + self._member_join("learnings", "l")
+                + " WHERE "
+                + self._member_condition("learnings")
+                + " ORDER BY l.id"
             )
         except BaseException:
             self._conn.execute(f"DROP TABLE temp.{name}")
@@ -962,6 +957,102 @@ class ArenaCache:
             oldest, _ = self._fts_tables.popitem(last=False)
             self._conn.execute(f"DROP TABLE temp.{oldest}")
         return name
+
+    def _learning_sql(
+        self, filters: LearningFilter, table: str | None = None
+    ) -> tuple[str, list[Any]]:
+        """Compose shared SQL membership and intersected learning predicates."""
+        source = (
+            "learnings l "
+            if table is None
+            else (f"temp.{table} JOIN learnings l ON l.rowid={table}.rowid ")
+        )
+        source += self._member_join("learnings", "l")
+        source += " LEFT JOIN flags f ON f.learning_id=l.id WHERE "
+        clauses = [self._member_condition("learnings")]
+        params: list[Any] = []
+        if filters.goal_key is not None:
+            if filters.goal_id is None:
+                clauses.append("l.goal_key=?")
+                params.append(filters.goal_key)
+            else:
+                clauses.append("(l.goal_key=? OR (l.goal_key IS NULL AND l.goal_id=?))")
+                params.extend((filters.goal_key, filters.goal_id))
+        elif filters.goal_id is not None:
+            clauses.append("l.goal_id=?")
+            params.append(filters.goal_id)
+        for expression, value in (
+            ("l.run_id", filters.run),
+            (
+                "CASE WHEN instr(l.author,'/')=0 THEN l.author ELSE "
+                "substr(l.author,1,instr(l.author,'/')-1) END",
+                filters.team,
+            ),
+            (
+                "CASE WHEN instr(l.author,'/')=0 THEN '' ELSE "
+                "substr(l.author,instr(l.author,'/')+1) END",
+                filters.agent,
+            ),
+            ("json_extract(l.json,'$.round')", filters.round),
+            ("l.verified", filters.verified),
+            ("l.from_human", filters.human),
+            ("coalesce(f.kind='pin',0)", filters.pinned),
+            ("coalesce(f.kind='hide',0)", filters.hidden),
+        ):
+            if value is not None:
+                clauses.append(expression + "=?")
+                params.append(value)
+        if filters.tags:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM learning_tags t JOIN json_each(?) wanted "
+                "ON wanted.value=t.tag WHERE t.learning_id=l.id)"
+            )
+            params.append(json.dumps(filters.tags))
+        if filters.part is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM learning_evidence e "
+                "JOIN candidates c ON c.id=e.candidate_id JOIN _frontier_marks pm "
+                "ON pm.run_id=c.run_id AND c.seq<=pm.seq "
+                "WHERE e.learning_id=l.id AND c.part=?)"
+            )
+            params.append(filters.part)
+        return source + " AND ".join(clauses), params
+
+    def _relevance_sql(
+        self, filters: LearningFilter, relevance_goal: tuple[str, str] | None
+    ) -> tuple[str, list[Any]]:
+        """Order by visible superseders and metadata without loading JSON models."""
+        superseded = (
+            "EXISTS (SELECT 1 FROM learning_links link JOIN learnings s "
+            "ON s.id=link.learning_id "
+            + self._member_join("learnings", "s")
+            + "LEFT JOIN flags sf ON sf.learning_id=s.id "
+            "WHERE link.target_id=l.id AND link.kind='supersedes' AND "
+            + self._member_condition("learnings")
+            + " AND coalesce(sf.kind,'')!='hide')"
+        )
+        params: list[Any] = []
+        goal_match = "0.0"
+        if relevance_goal is not None:
+            goal_match = "coalesce(l.goal_key=? OR (l.goal_key IS NULL AND l.goal_id=?),0)"
+            params.extend(relevance_goal)
+        matching_tags = "0.0"
+        if filters.tags:
+            matching_tags = (
+                "(SELECT count(DISTINCT t.tag) FROM learning_tags t JOIN json_each(?) wanted "
+                "ON wanted.value=t.tag WHERE t.learning_id=l.id)"
+            )
+            params.append(json.dumps(filters.tags))
+        return (
+            "coalesce(f.kind='pin',0) DESC, "
+            + superseded
+            + " ASC, "
+            + goal_match
+            + " DESC, l.verified DESC, "
+            + matching_tags
+            + " DESC, l.ts DESC, l.id ASC",
+            params,
+        )
 
     def find(
         self,
@@ -1006,6 +1097,7 @@ class ArenaCache:
 
         Notes
         -----
+        SQL applies filters, relevance, and pagination before IDs are returned.
         Each connection caches at most eight TEMP FTS corpora by least recent
         use. Corpus statistics include hidden members, but exclude all rows
         outside the fixed frontier. Later ingestion cannot alter that corpus.
@@ -1016,98 +1108,31 @@ class ArenaCache:
         ...     relevance_goal=None)  # doctest: +SKIP
         """
         with self._lock, self._frontier(frontier):
-            members = self._search_members(frontier)
-            ranks: dict[int, float] | None = None
+            self._search_covered()
+            table = None
+            match = None
             if query is not None:
                 match = fts_query(query)
                 if match is None:
                     return []
-                table = self._fts_index(frontier, members)
-                ranks = dict(
-                    self._conn.execute(
-                        f"SELECT rowid, bm25({table}) FROM temp.{table} WHERE {table} MATCH ?",
-                        (match,),
-                    ).fetchall()
-                )
-            superseded = {
-                target for _, _, _, item in members if not item.hidden for target in item.supersedes
-            }
-            part_ids = (
-                None
-                if filters.part is None
-                else {
-                    candidate.id
-                    for candidate, _ in self.candidates(frontier)
-                    if candidate.part == filters.part
-                }
+                table = self._fts_index(frontier)
+            source, params = self._learning_sql(filters, table)
+            if table is not None:
+                source += f" AND {table} MATCH ?"
+                params.append(match)
+            order, order_params = self._relevance_sql(filters, relevance_goal)
+            if table is not None:
+                order = f"bm25({table}) ASC, " + order
+            rows = self._conn.execute(
+                self._flags_sql()
+                + "SELECT l.id FROM "
+                + source
+                + " ORDER BY "
+                + order
+                + " LIMIT ? OFFSET ?",
+                [*params, *order_params, limit, max(offset, 0)],
             )
-            tags = set(filters.tags)
-            matched: list[tuple[int, str | None, str, Learning]] = []
-            for rowid, goal_key, ts, item in members:
-                if ranks is not None and rowid not in ranks:
-                    continue
-                if filters.goal_key is not None:
-                    if not (
-                        goal_key == filters.goal_key
-                        or (
-                            goal_key is None
-                            and filters.goal_id is not None
-                            and item.goal_id == filters.goal_id
-                        )
-                    ):
-                        continue
-                elif filters.goal_id is not None and item.goal_id != filters.goal_id:
-                    continue
-                team, _, agent = item.author.partition("/")
-                if any(
-                    expected is not None and actual != expected
-                    for actual, expected in (
-                        (item.run_id, filters.run),
-                        (team, filters.team),
-                        (agent, filters.agent),
-                        (item.round, filters.round),
-                        (item.verified, filters.verified),
-                        (item.from_human, filters.human),
-                        (item.pinned, filters.pinned),
-                        (item.hidden, filters.hidden),
-                    )
-                ):
-                    continue
-                if tags and not tags.intersection(item.tags):
-                    continue
-                if part_ids is not None and not part_ids.intersection(item.evidence):
-                    continue
-                matched.append((rowid, goal_key, ts, item))
-
-            def key(
-                row: tuple[int, str | None, str, Learning],
-            ) -> tuple[float, bool, bool, bool, bool, int, int, str]:
-                rowid, goal_key, ts, item = row
-                goal_match = relevance_goal is not None and (
-                    goal_key == relevance_goal[0]
-                    or (goal_key is None and item.goal_id == relevance_goal[1])
-                )
-                stamp = datetime.fromisoformat(ts)
-                micros = (
-                    ((stamp.toordinal() * 24 + stamp.hour) * 60 + stamp.minute) * 60 + stamp.second
-                ) * 1_000_000 + stamp.microsecond
-                return (
-                    ranks[rowid] if ranks is not None else 0.0,
-                    not item.pinned,
-                    item.id in superseded,
-                    not goal_match,
-                    not item.verified,
-                    -len(tags.intersection(item.tags)),
-                    -micros,
-                    item.id,
-                )
-
-            matched.sort(key=key)
-            start = max(offset, 0)
-            return [
-                row[3].id
-                for row in (matched[start:] if limit < 0 else matched[start : start + limit])
-            ]
+            return [row[0] for row in rows]
 
     def count(self, frontier: Frontier, *, filters: LearningFilter) -> int:
         """
@@ -1135,9 +1160,11 @@ class ArenaCache:
         >>> total = cache.count(frontier, filters=LearningFilter())  # doctest: +SKIP
         """
         with self._lock, self._frontier(frontier):
-            return len(
-                self.find(frontier, query=None, filters=filters, relevance_goal=None, limit=-1)
-            )
+            self._search_covered()
+            source, params = self._learning_sql(filters)
+            return self._conn.execute(
+                self._flags_sql() + "SELECT count(*) FROM " + source, params
+            ).fetchone()[0]
 
     def search(
         self,
