@@ -943,6 +943,60 @@ class ArenaCache:
             ).fetchall()
             return [(Plan.model_validate_json(data), origin, seq) for data, origin, seq in rows]
 
+    def _plan_projection(
+        self,
+        frontier: Frontier,
+        run_id: str,
+        goal_id: str,
+        *,
+        through_seq: int,
+        revisions: Sequence[Plan],
+    ) -> RunState:
+        """Query historical plan metadata for the core round-applicable selector.
+
+        Use models retained by the published generation, restricted to revisions
+        inside both the covered mark and the candidate source prefix. Only
+        activation rounds and origins are queried; no plan bodies are parsed
+        and no journal events are folded. The core selector retains its
+        initial-revision fallback.
+        """
+        with self._lock, self._frontier(frontier):
+            rows = self._conn.execute(
+                "SELECT p.revision, p.origin, p.first_round FROM plans p "
+                "JOIN _read_sets m ON m.set_name='marks' AND m.id=p.run_id AND p.seq<=m.seq "
+                "WHERE p.run_id=? AND p.goal_id=? AND p.seq<=? ORDER BY p.seq",
+                (run_id, goal_id, through_seq),
+            ).fetchall()
+            if not rows:
+                raise _core_error(ChainError, "no committed plan for goal")
+            retained = {plan.revision: plan for plan in revisions}
+            if any(revision not in retained for revision, _, _ in rows):
+                raise _core_error(ChainError, "published plan revision unavailable")
+            return RunState(
+                plans={goal_id: [(retained[revision], origin) for revision, origin, _ in rows]},
+                plan_first_rounds={goal_id: [first_round for _, _, first_round in rows]},
+            )
+
+    def _citing_learning_ids(self, frontier: Frontier, candidate_id: str) -> list[str]:
+        """Select every visible citation through persisted evidence before hydration.
+
+        Reuse exact run/object membership, human-object coverage and the same
+        frontier-local hidden rules as ordinary learning reads. The evidence
+        subquery returns learning IDs without parsing unrelated model bodies.
+        """
+        with self._lock, self._frontier(frontier):
+            self._search_covered()
+            source, params = self._learning_sql(LearningFilter())
+            rows = self._conn.execute(
+                self._flags_sql()
+                + "SELECT l.id FROM "
+                + source
+                + " AND l.id IN (SELECT learning_id FROM learning_evidence WHERE candidate_id=?)"
+                + " ORDER BY l.id",
+                [*params, candidate_id],
+            )
+            return [row[0] for row in rows]
+
     def membership(self, frontier: Frontier) -> bytes:
         """
         Encode sorted candidate, score, and flagged learning membership.
