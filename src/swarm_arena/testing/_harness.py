@@ -224,7 +224,6 @@ class OfflineHarness:
                         "plan": plan.model_dump(mode="json"),
                         "origin": "human",
                         "first_round": 1,
-                        "preflight_complete": True,
                     },
                 )
             )

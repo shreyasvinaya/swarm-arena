@@ -43,7 +43,10 @@ async def test_curator_cancellation_shaped_errors_are_safe_public_failures(
         handled.append(error)
         return original_error(error)
 
+    from swarm_arena._board import curator as curator_module
+
     monkeypatch.setattr(goal_module, "_curator_error", capture_error)
+    monkeypatch.setattr(curator_module, "_curator_error", capture_error)
 
     async def curate(*args: Any, **kwargs: Any) -> Any:
         invoked.append(kind)
@@ -86,7 +89,11 @@ async def test_curator_cancellation_shaped_errors_are_safe_public_failures(
     assert result["g"]
     receipts = events(config, "curated")
     assert len(receipts) == 1
-    error_type = "RuntimeError" if kind == "ordinary" else "_CoreRuntimeError"
+    error_type = {
+        "ordinary": "RuntimeError",
+        "cancel": "CancelledError",
+        "group": "BaseExceptionGroup",
+    }[kind]
     assert receipts[0].payload["errors"] == [f"curator error: {error_type}"]
     assert receipts[0].payload["summaries"] == []
     assert len(events(config, "round_closed")) == 1
@@ -168,4 +175,4 @@ async def test_curator_native_cancel_at_reserve_admission_refunds_exactly(
     assert sum(amount._micro_usd for amount in replay._charges.values()) == 0
     receipt = env.events("curated")
     assert len(receipt) == 1
-    assert receipt[0].payload["errors"] == ["curator error: _CoreRuntimeError"]
+    assert receipt[0].payload["errors"] == ["curator error: CancelledError"]

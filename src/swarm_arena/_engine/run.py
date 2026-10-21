@@ -35,6 +35,7 @@ from swarm_arena._errors import (
     StorageError,
     _core_error,
     _exception_type_name,
+    _is_core_signal,
 )
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
@@ -215,7 +216,10 @@ async def _start_board(config: RunConfig) -> Board:
     try:
         return await run_sync_daemon(config.board.build, Board)
     except BaseException as error:
+        registered = _is_core_signal(error)
         error = outcome.classify(error)
+        if registered:
+            raise error from None
         raise _core_error(
             RuntimeError, f"board construction failed: {_exception_type_name(error)}"
         ) from None
@@ -241,7 +245,10 @@ async def _open_board(
     try:
         await run_sync_daemon(board.open, run_id, config.run_root, namespaces)
     except BaseException as error:
+        registered = _is_core_signal(error)
         error = outcome.classify(error)
+        if registered:
+            raise error from None
         raise _core_error(
             RuntimeError, f"board open failed: {_exception_type_name(error)}"
         ) from None
@@ -255,7 +262,10 @@ async def _close_board(board: Board, config: RunConfig, *, failed: bool) -> None
             await run_sync_daemon(board.close)
         except BaseException as error:
             if not failed and not shutdown.cancel_called:
+                registered = _is_core_signal(error)
                 error = outcome.classify(error)
+                if registered:
+                    raise error from None
                 raise _core_error(
                     RuntimeError, f"board close failed: {_exception_type_name(error)}"
                 ) from None

@@ -17,7 +17,7 @@ async def test_agent_read_identifiers_are_plain_strings(ctx_env: CtxEnv) -> None
     assert ctx.read_learning(hostile(learning.id)).id == learning.id
     assert ctx.search_learnings("body", tags=[hostile("tag")], scope=hostile("goal")) == [learning]  # ty: ignore[invalid-argument-type]
     assert all(type(key) is str for key in ctx._read_ids)
-    with pytest.raises(SoftError, match="own part"):
+    with pytest.raises(SoftError, match="part outside board snapshot"):
         ctx.best(1, part=hostile("other"))
     with pytest.raises(SoftError, match=r"^unknown candidate: absent$"):
         ctx.get_candidate(hostile("absent"))
@@ -26,7 +26,7 @@ async def test_agent_read_identifiers_are_plain_strings(ctx_env: CtxEnv) -> None
 
 
 async def test_agent_action_and_collection_identifiers(ctx_env: CtxEnv) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     assert await ctx.call_action(hostile("list_files"), {}) == {
         "files": ["problem/a.phyk", "problem/run.py"]
     }
@@ -44,7 +44,7 @@ async def test_agent_action_and_collection_identifiers(ctx_env: CtxEnv) -> None:
 
 
 async def test_agent_edit_names_are_normalized_at_entry(ctx_env: CtxEnv) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     name = HostileString("problem/a.phyk")
     edits: dict[str, str] = {name: "changed"}
     name.armed = True

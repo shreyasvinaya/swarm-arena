@@ -546,6 +546,7 @@ class AgentContext:
         >>> assert hints == [hint] and hints[0] is not hint
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        query = _context_string(query, "query")
         tags = tuple(_context_string(value, "tags") for value in tags)
         normalized_scope = _context_string(scope, "scope")
 

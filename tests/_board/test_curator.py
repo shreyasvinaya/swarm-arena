@@ -158,7 +158,8 @@ async def test_core_signal_is_rebuilt_and_spoof_is_contained() -> None:
         ["curator error: LimitReached"],
     )
     with pytest.raises(Fenced):
-        await run(Returning(Fenced()), [])
+        await run(Returning(_core_error(Fenced, "run ownership lost")), [])
+    assert await run(Returning(Fenced("SECRET")), []) == ([], ["curator error: Fenced"])
 
 
 @pytest.mark.parametrize(

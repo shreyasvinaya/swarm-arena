@@ -375,7 +375,6 @@ def test_part_identity_change_preserves_history_but_not_current_parents(
                 "plan": plan.model_dump(mode="json"),
                 "origin": "human",
                 "first_round": 1,
-                "preflight_complete": True,
             },
         )
     )

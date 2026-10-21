@@ -37,6 +37,7 @@ from swarm_arena._errors import (
     PlanError,
     _core_error,
     _exception_type_name,
+    _is_core_signal,
 )
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
@@ -143,7 +144,10 @@ async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier
         view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
         return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
     except BaseException as error:
+        registered = _is_core_signal(error)
         error = outcome.classify(error)
+        if registered:
+            raise error from None
         raise _core_error(
             RuntimeError, f"round page board read failed: {_exception_type_name(error)}"
         ) from None

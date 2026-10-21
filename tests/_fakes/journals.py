@@ -227,7 +227,6 @@ class FakeRun:
             "origin": "human",
             "planner_call_ids": [],
             "first_round": first_round,
-            "preflight_complete": True,
         }
         if revision == 0:
             payload["base_dir"] = str(Path.cwd())

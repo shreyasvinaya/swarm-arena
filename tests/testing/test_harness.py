@@ -2,7 +2,6 @@ import asyncio
 import sys
 from pathlib import Path
 
-import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, NoopManager
@@ -16,7 +15,7 @@ from swarm_arena import (
     ScriptedManager,
     ScriptJudge,
 )
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.reader import read_committed
 from swarm_arena.executor import Job, LocalExecutor
@@ -124,12 +123,10 @@ async def test_harness_retains_each_failure_and_resets_them_for_a_new_run(
     assert _events(harness, "agent_status") == []
 
 
-@pytest.mark.parametrize("fenced", [False, True])
 async def test_manager_control_flow_propagates_without_error_event(
     monkeypatch: pytest.MonkeyPatch,
-    fenced: bool,
 ) -> None:
-    failure = Fenced("ownership lost") if fenced else anyio.get_cancelled_exc_class()()
+    failure = _core_error(Fenced, "run ownership lost")
     seen: list[int] = []
 
     async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
@@ -147,7 +144,8 @@ async def test_manager_control_flow_propagates_without_error_event(
             limits=Limits(),
             config=RunConfig(),
         )
-    assert caught.value is failure
+    assert caught.value is not failure
+    assert caught.value.args == ("run ownership lost",)
     assert seen == [1]
     assert _events(harness, "agent_status") == []
     assert _events(harness, "round_closed") == []
@@ -346,6 +344,7 @@ async def test_harness_uses_a_temp_arena_board(
             arena_root=str(tmp_path / "real-arena"), board=Ref(path="unavailable:Board")
         ),
     )
+    assert all("preflight_complete" not in e.payload for e in _events(h, "plan_revision"))
     root = Path(h.store.url).parent.parent
     assert (root / "arena" / GOAL.namespace / "runs" / "local.json").exists()
     assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
