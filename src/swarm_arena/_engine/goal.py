@@ -1151,6 +1151,22 @@ class GoalRunner:
                 )
             )
             return False
+        from swarm_arena._engine.run import _attach_board_namespaces
+
+        completed, _ = await self._supervised_step(
+            partial(
+                _attach_board_namespaces,
+                self.deps,
+                {
+                    goal.namespace
+                    for plan in self.history
+                    for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                },
+            ),
+            final=False,
+        )
+        if not completed:
+            return False
         self.agents = await self._slots(self.plan.teams, reuse=True)
         await self._plan_view()
         return True

@@ -1,7 +1,7 @@
 """Run parallel manager rounds against one durable, fixed frontier."""
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import anyio
@@ -87,6 +87,10 @@ class EngineDeps:
         Accumulated active run time.
     admission : RunAdmission or None, default=None
         Shared scheduler capacity service; standalone goals initialize it.
+    board_namespaces : set[str]
+        Successfully attached namespaces across all admitted revisions.
+    board_attach_lock : anyio.Lock
+        Serialize namespace attachment across concurrent goals.
 
     Examples
     --------
@@ -108,6 +112,8 @@ class EngineDeps:
     stops: StopState
     clock: RunClock
     admission: RunAdmission | None = None
+    board_namespaces: set[str] = field(default_factory=set)
+    board_attach_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 @dataclass

@@ -276,6 +276,12 @@ class _ResumeServices:
                             artifacts=ArtifactStore(open_store(config.artifact_root)),
                             ids=ids,
                             views=ViewWriter(self.store, journal),
+                            board_namespaces={
+                                goal.namespace
+                                for revisions in state.plans.values()
+                                for plan, _ in revisions
+                                for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                            },
                             stops=StopState(),
                             clock=clock,
                             admission=RunAdmission(

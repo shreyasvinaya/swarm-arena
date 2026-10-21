@@ -237,6 +237,15 @@ async def _start_executor(config: RunConfig) -> Executor:
         ) from None
 
 
+async def _attach_board_namespaces(deps: EngineDeps, namespaces: set[str]) -> None:
+    """Attach admitted namespaces atomically outside revision publication shields."""
+    async with deps.board_attach_lock:
+        names = deps.board_namespaces | namespaces
+        if names != deps.board_namespaces:
+            await _open_board(deps.board, deps.config, deps.run_id, sorted(names))
+            deps.board_namespaces = names
+
+
 async def _open_board(
     board: Board, config: RunConfig, run_id: str, namespaces: Sequence[str]
 ) -> None:
@@ -594,6 +603,11 @@ class RunRunner:
                     stops=StopState(),
                     clock=clock,
                     admission=RunAdmission(config.limits.max_agents_total, self.plans),
+                    board_namespaces={
+                        goal.namespace
+                        for plan in self.plans
+                        for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                    },
                 )
                 return await self._drive(deps, lease.doc.epoch)
             finally:

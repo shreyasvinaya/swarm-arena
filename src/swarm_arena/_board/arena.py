@@ -343,6 +343,9 @@ class ArenaBoard(Board):
         """
         Attach namespaces and publish write-once pointers for an owning run.
 
+        Reattaching the same live owner extends its namespace set while retaining
+        the published read generation until the next frontier refresh.
+
         Parameters
         ----------
         run_id : str
@@ -372,6 +375,13 @@ class ArenaBoard(Board):
             _validate_run_id(run_id)
         resolved = _resolved_root(run_root) if run_id else ""
         with self._refresh_lock:
+            with self._lock:
+                extending = not self._lifetime.closed and (run_id, resolved) == (
+                    self._run_id,
+                    self._run_root,
+                )
+                if extending:
+                    names = tuple(sorted(set(names) | set(self._namespaces)))
             if run_id:
                 arena = open_store(self.config.arena_root)
                 pointer = RunPointer(run_id=run_id, run_root=resolved)
@@ -399,9 +409,10 @@ class ArenaBoard(Board):
                 if self._lifetime.closed:
                     self._lifetime = _ReadLifetime()
                 self._run_id, self._run_root, self._namespaces = run_id, resolved, names
-                self._published = _Published(
-                    Frontier(), {}, {}, names, run_id or None, self._lifetime
-                )
+                if not extending:
+                    self._published = _Published(
+                        Frontier(), {}, {}, names, run_id or None, self._lifetime
+                    )
 
     def close(self) -> None:
         """

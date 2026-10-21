@@ -552,3 +552,7 @@ Cancellation, immediate stop, and ownership loss can release the run while a
 backend call is still blocked. A cancelled page probe cannot start a later write.
 Page storage failures report only the originating exception type, including
 during resume repair; backend messages, notes, and causes are not exposed.
+
+When a revision introduces a namespace, the running board attaches it before
+agent dispatch. Live and resumed boards retain the union of all admitted revision
+namespaces. Attaching a namespace preserves reads from the published frontier.
