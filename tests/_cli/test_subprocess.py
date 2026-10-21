@@ -107,12 +107,12 @@ def test_missing_resume_owner_subprocess(
 
 @contextmanager
 def _child(
-    argv: list[str], env: dict[str, str], *, terminal: bool = False
+    argv: list[str], env: dict[str, str], *, terminal: bool = False, code: str = _ENTRY
 ) -> Generator[tuple[subprocess.Popen[bytes], int | None]]:
     master, slave = pty.openpty() if terminal else (None, None)
     try:
         with subprocess.Popen(
-            [sys.executable, "-B", "-c", _ENTRY, *argv],
+            [sys.executable, "-B", "-c", code, *argv],
             env=env,
             stdin=slave if terminal else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -165,6 +165,106 @@ def test_terminal_prompt_subprocess(
         stdout, stderr = process.communicate(timeout=20)
         assert process.returncode == (130 if interrupt else 1), (output + stdout, stderr)
         assert stderr == (b"interrupted\n" if interrupt else b"run not approved\n")
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_sigint_with_reader_bootstrap_delayed(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    # Simulate an unscheduled reader thread, before Thread.start() can return.
+    # Hold the barrier forever: SIGINT must exit without needing its release.
+    code = f"""
+import threading
+bootstrap = threading.Thread._bootstrap_inner
+def delayed_bootstrap(self: threading.Thread) -> None:
+    if self.name == "swarm-arena-daemon-_prompt":
+        threading.Event().wait()
+    bootstrap(self)
+threading.Thread._bootstrap_inner = delayed_bootstrap
+{_ENTRY}
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        output = _wait_prompt(process)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 130, (output + stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+@pytest.mark.parametrize("window", ["before_prompt", "await_readable"])
+def test_prompt_sigint_at_readiness_boundaries(
+    inputs: tuple[Path, Path],
+    cli_env: dict[str, str],
+    run_config: RunConfig,
+    window: str,
+) -> None:
+    code = f"""
+import asyncio, os, signal
+from swarm_arena._cli import run_cmds
+original_print = print
+def prompt_print(*args: object, **kwargs: object) -> None:
+    if args and args[0] == "Start the run? [y/N] ":
+        assert signal.getsignal(signal.SIGINT) is not signal.default_int_handler
+        if {window!r} == "before_prompt":
+            os.kill(os.getpid(), signal.SIGINT)
+    original_print(*args, **kwargs)
+run_cmds.print = prompt_print
+original_wait = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    # Run this only after wait_readable has registered stdin and yielded.
+    asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGINT)
+    await original_wait(fd)
+if {window!r} == "await_readable":
+    run_cmds.wait_readable = wait
+{_ENTRY}
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 130, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+def test_prompt_sigint_when_terminal_input_is_flushed(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig, blocking: bool
+) -> None:
+    code = f"""
+import os, signal, termios
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+os.set_blocking(0, {blocking!r})
+original_wait = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    await original_wait(fd)
+    # Terminal Ctrl-C can discard the input that made the fd readable.
+    termios.tcflush(fd, termios.TCIFLUSH)
+    os.kill(os.getpid(), signal.SIGINT)
+run_cmds.wait_readable = wait
+status = main()
+assert os.get_blocking(0) is {blocking!r}
+raise SystemExit(status)
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        master,
+    ):
+        output = _wait_prompt(process)
+        assert master is not None
+        os.write(master, b"y\n")
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 130, (output + stdout, stderr)
+        assert stderr == b"interrupted\n"
     assert not Path(run_config.run_root).exists()
     assert not Path(run_config.artifact_root).exists()
 

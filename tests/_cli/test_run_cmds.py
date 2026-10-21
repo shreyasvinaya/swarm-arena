@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import threading
@@ -5,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import anyio
 import pytest
 from _fakes.run import plan
 
@@ -85,6 +87,17 @@ class _Stdin:
         return 0
 
 
+@pytest.fixture
+def terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ready(fd: int) -> None:
+        assert fd == 0
+
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    monkeypatch.setattr(run_cmds, "wait_readable", ready)
+    monkeypatch.setattr(run_cmds, "get_blocking", lambda fd: True)
+    monkeypatch.setattr(run_cmds, "set_blocking", lambda fd, blocking: None)
+
+
 def test_run_yes_prints_estimate_and_run_dir(
     example: Example, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -104,8 +117,9 @@ def test_run_without_tty_or_yes_exits_2_and_writes_nothing(
     assert not example.artifact_root.exists()
 
 
-def test_run_prompt_declined_exits_1(example: Example, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+def test_run_prompt_declined_exits_1(
+    example: Example, monkeypatch: pytest.MonkeyPatch, terminal: None
+) -> None:
     answer = iter(b"n\n")
     monkeypatch.setattr(run_cmds, "read", lambda fd, size: bytes([next(answer)]))
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
@@ -158,13 +172,13 @@ def test_terminal_approval(
     monkeypatch: pytest.MonkeyPatch,
     answer: str,
     capsys: pytest.CaptureFixture[str],
+    terminal: None,
 ) -> None:
-    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
     reply = iter((answer + "\n").encode())
 
     def respond(fd: int, size: int) -> bytes:
         assert (fd, size) == (0, 1)
-        assert threading.current_thread().daemon
+        assert threading.current_thread() is threading.main_thread()
         assert not example.run_root.exists()
         assert not example.artifact_root.exists()
         return bytes([next(reply)])
@@ -184,13 +198,39 @@ def test_terminal_eof_declines(
     example: Example,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    terminal: None,
 ) -> None:
-    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
     monkeypatch.setattr(run_cmds, "read", lambda fd, size: b"")
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
     assert "Start the run? [y/N] " in capsys.readouterr().out
     assert not example.run_root.exists()
     assert not example.artifact_root.exists()
+
+
+async def test_prompt_cancellation_releases_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    reader, writer = os.pipe()
+    entered = anyio.Event()
+    original_wait = run_cmds.wait_readable
+
+    async def wait(fd: int) -> None:
+        entered.set()
+        await original_wait(fd)
+
+    try:
+        with os.fdopen(reader, "rb") as stdin:
+            monkeypatch.setattr(sys, "stdin", stdin)
+            monkeypatch.setattr(run_cmds, "wait_readable", wait)
+            async with anyio.create_task_group() as group:
+                group.start_soon(run_cmds._prompt)
+                await entered.wait()
+                group.cancel_scope.cancel()
+            assert os.get_blocking(reader)
+            # A leaked readiness registration would reject a second waiter.
+            os.write(writer, b"n\n")
+            assert await run_cmds._prompt() is False
+            assert os.get_blocking(reader)
+    finally:
+        os.close(writer)
 
 
 def _write_solution(run_root: str, run_id: str, goal_id: str, *, status: str = "ok") -> None:

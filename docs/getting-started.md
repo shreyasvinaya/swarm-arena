@@ -48,6 +48,12 @@ The CLI prints a worst-case estimate, the run's location, and finally
 interactive terminal to approve at the prompt. Even when the estimate is
 unlimited, the configured round and action limits still apply.
 
+Press Ctrl-C at the approval prompt or during `run` or `resume` to cancel.
+The CLI finishes bounded cancellation cleanup, prints `interrupted` to stderr,
+and exits with code 130. Cancelling approval leaves the run and artifact roots
+unwritten. The prompt uses nonblocking terminal reads without a reader thread
+or a buffered stdin lock, and restores stdin's mode afterward.
+
 ## Tools, check, and judge
 
 The two `FunctionTool`s return data only. Gradient descent follows local

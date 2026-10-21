@@ -12,15 +12,15 @@ import argparse
 import sys
 from collections.abc import Sequence
 from functools import partial
-from os import read
+from os import get_blocking, read, set_blocking
 from pathlib import Path
 
 import anyio
+from anyio import wait_readable
 
 from swarm_arena._engine.control import format_status, read_status, request_stop
 from swarm_arena._engine.solution import SolutionDocument
 from swarm_arena._engine.swarm import Swarm
-from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.ids import new_run_id
 from swarm_arena._model.plan import Plan
@@ -67,14 +67,25 @@ def register(sub: argparse._SubParsersAction) -> None:
     resume.set_defaults(handler=_resume)
 
 
-def _prompt() -> bool:
-    """Read without holding buffered stdin's lock in an abandoned daemon."""
+async def _prompt() -> bool:
+    """Await terminal readiness without a thread startup or buffered stdin lock."""
     answer = bytearray()
     fd = sys.stdin.fileno()
-    while chunk := read(fd, 1):
-        if chunk == b"\n":
-            break
-        answer.extend(chunk)
+    blocking = get_blocking(fd)
+    try:
+        set_blocking(fd, False)
+        while True:
+            await wait_readable(fd)
+            try:
+                chunk = read(fd, 1)
+            except BlockingIOError:
+                # A terminal signal may flush input after readiness was reported.
+                continue
+            if not chunk or chunk == b"\n":
+                break
+            answer.extend(chunk)
+    finally:
+        set_blocking(fd, blocking)
     return bytes(answer).strip().lower() in {b"y", b"yes"}
 
 
@@ -125,7 +136,7 @@ async def _run_async(args: argparse.Namespace) -> None:
             print(f"warning: {warning}")
         if not args.yes:
             print("Start the run? [y/N] ", end="", flush=True)
-        accepted = args.yes or await run_sync_daemon(_prompt)
+        accepted = args.yes or await _prompt()
         if accepted:
             print(f"run {run_id} at {Path(config.run_root) / run_id}", flush=True)
         return accepted
