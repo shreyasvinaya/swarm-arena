@@ -392,7 +392,7 @@ class Lexicographic(Judge):
                 except BaseException as error:
                     error = _classify_outcome(error)
                     errors[candidate.id] = (
-                        f"{_exception_type_name(error)}: cannot combine member scores"
+                        f"member {name} gave an invalid score: {_exception_type_name(error)}"
                     )
             else:
                 errors[candidate.id] = f"member {name} gave a non-finite key"
