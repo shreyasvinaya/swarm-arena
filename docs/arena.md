@@ -24,9 +24,8 @@ The offline `check_manager` harness uses a private temporary arena and cache.
 A part may use a different namespace from its main goal. Its candidates, scores,
 and learnings are indexed in that part's namespace; declared sibling views keep
 the same recorded frontier while selecting the sibling's namespace. A main view
-can still read its declared parts and join their results. The cache schema is
-version 4; incompatible older caches, including versions 1, 2 and 3, must be
-rebuilt with `swarm-arena reindex`.
+can still read its declared parts and join their results. If the local cache
+schema is incompatible, rebuild the disposable cache with `swarm-arena reindex`.
 
 ## What the arena stores
 
@@ -547,11 +546,11 @@ or arena pointers before treating the target as a namespace. Custom IDs such as
 `my-run` are supported. In the viewer, clearing the Run field includes other runs
 and human learnings; blank optional filter fields impose no restriction.
 
-Board snapshots, curation reads, and round-page storage run in abandonable workers.
-Cancellation, immediate stop, and ownership loss can release the run while a
-backend call is still blocked. A cancelled page probe cannot start a later write.
-Page storage failures report only the originating exception type, including
-during resume repair; backend messages, notes, and causes are not exposed.
+Cancellation, immediate stop, run timeout, and ownership loss can end a run
+while storage is unavailable, including during startup. Once startup stops,
+no later initialization stage begins. Round preparation does not consume the
+agent round timeout. Storage failures report exception types without exposing
+backend messages or private values.
 
 When a revision introduces a namespace, the running board attaches it before
 agent dispatch. Live and resumed boards retain the union of all admitted revision
@@ -565,9 +564,5 @@ Storage preflight and resume receipt repair use the configured `ArenaBoard`
 arena root, matching review import/export and board reads. The top-level
 `arena_root` is the fallback when the board does not supply an arena.
 
-Round-page rendering returns the Markdown body. Publication adds exactly one
-source-head comment and checks only the newly closed round; resume still repairs
-all missing closed-round pages. Existing page bytes remain untouched.
-
-Engine score batch IDs carry the barrier or final phase and the durable recovery
-key, so ordinary and final judging of the same candidate have distinct provenance.
+Resume repairs missing pages for closed rounds while preserving existing pages.
+Ordinary and final judging remain separately identifiable in recorded scores.

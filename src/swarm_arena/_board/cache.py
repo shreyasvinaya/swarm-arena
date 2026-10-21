@@ -233,8 +233,8 @@ class ArenaCache:
     ``run:<run_id>`` for journals or ``object:<object_name>`` for human objects.
     Visibility includes the committed sequence or exact named object, and holder
     selection precedes query filters. Later arrivals cannot change old frontiers.
-    Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
-    sequence and reuse core replay, including future activation boundaries.
+    The private ``_replay`` lookup accepts a committed prefix sequence and
+    reuses core replay, including future activation boundaries.
 
     Parameters
     ----------

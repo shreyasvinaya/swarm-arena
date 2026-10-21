@@ -500,7 +500,12 @@ class Board(Configurable, _Reads):
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
         """
-        Open a run's board resources; the default does nothing.
+        Open or extend a run's board resources; the default does nothing.
+
+        The engine may call this again with the same run identifier and root
+        and a superset of namespaces after admitting a plan revision. Repeated
+        calls must reuse resources and preserve existing snapshot lifetimes.
+        Newly attached namespaces become available on the next frontier refresh.
 
         Parameters
         ----------
@@ -519,6 +524,7 @@ class Board(Configurable, _Reads):
         >>> from swarm_arena.board import Board
         >>> exec(script_from_examples(Board.__doc__))
         >>> board.open("r", "/runs", ["n"])
+        >>> board.open("r", "/runs", ["n", "shared"])
         """
 
     def close(self) -> None:
