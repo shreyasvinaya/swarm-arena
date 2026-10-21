@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve unknown S3 write outcomes by disabling automatic conditional-PUT
   retries in s3fs, the SDK, and the underlying HTTP transport.
+- Explicit candidate and item ID filters share indexed TEMP sets with frontier
+  membership, supporting large selections without SQLite binding limits.
+
 - Learning search and count execute filters, relevance ordering, and pagination
   in SQLite, avoiding full-corpus Python model hydration on selective reads.
 

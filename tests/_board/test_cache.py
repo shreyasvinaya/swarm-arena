@@ -1912,8 +1912,8 @@ def test_nested_reads_prepare_frontier_once(
     cache._conn.set_trace_callback(trace.append)
     assert cache.membership(frontier)
     cache._conn.set_trace_callback(None)
-    assert trace.count("DELETE FROM _frontier_marks") == 1
-    assert trace.count("DELETE FROM _frontier_objects") == 1
+    for name in ("marks", "reviews", "curation"):
+        assert trace.count(f"DELETE FROM _read_sets WHERE set_name='{name}'") == 1
     assert cache.membership(Frontier()) == canonical_json(
         {"candidates": [], "scores": [], "learnings": []}
     )
@@ -2074,3 +2074,146 @@ def test_scores_join_large_named_frontiers_with_linear_work(tmp_path: Path) -> N
     print("scores named-frontier VM steps (1k/10k/50k):", work)
     assert 0 < work[1] < 15 * work[0]
     assert work[2] < 8 * work[1]
+
+
+@pytest.mark.parametrize("kind", ["scores", "candidates", "learnings", "score_ids"])
+def test_large_explicit_id_filters(tmp_path: Path, kind: str) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    h1 = run.commit(
+        run.plan(),
+        run.candidate("c-1"),
+        run.score("s-1", "c-1", 1),
+        run.learning("L-1", "Hint", evidence=["c-1"]),
+    )
+    h2 = run.commit(
+        run.candidate("c-later"),
+        run.score("s-later", "c-later", 2),
+        run.learning("L-later", "Later", evidence=["c-later"]),
+    )
+    ingest_run(cache, run.store, "r1", run.run_root, h2)
+    frontier = build_frontier([("r1", run.run_root, h1)], [], [])
+    cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+    wanted = {"scores": "c-1", "candidates": "c-1", "learnings": "L-1", "score_ids": "s-1"}[kind]
+    later = {
+        "scores": "c-later",
+        "candidates": "c-later",
+        "learnings": "L-later",
+        "score_ids": "s-later",
+    }[kind]
+    selected = [f"absent-{i}" for i in range(49_997)] + [wanted, wanted, later]
+    assert len(selected) == 50_000
+    if kind == "scores":
+        assert [s.id for s, _ in cache.scores(frontier, candidate_ids=selected)] == ["s-1"]
+        assert cache.scores(frontier, candidate_ids=[]) == []
+        assert [s.id for s, _ in cache.scores(frontier)] == ["s-1"]
+    elif kind == "candidates":
+        assert [c.id for c, _ in cache.candidates(frontier, ids=selected, run_id="r1")] == ["c-1"]
+        assert cache.candidates(frontier, ids=[]) == []
+        assert cache.candidates(frontier, ids=selected, run_id="other") == []
+    elif kind == "learnings":
+        assert [learning.id for learning in cache.learnings_by_id(frontier, selected)] == ["L-1"]
+        assert cache.learnings_by_id(frontier, []) == []
+    else:
+        with cache._lock, cache._frontier(frontier):
+            rows = cache._item_rows(frontier, "scores", ids=selected, candidate_ids=["c-1"])
+            assert [Score.model_validate_json(data).id for data, _ in rows] == ["s-1"]
+            assert cache._item_rows(frontier, "scores", ids=selected, candidate_ids=[]) == []
+    assert [s.id for s, _ in cache.scores(frontier)] == ["s-1"]
+    assert not cache._conn.in_transaction
+    cache.close()
+
+
+def test_explicit_id_set_failure_rolls_back_and_keeps_frontier(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    assert len(cache.candidates(frontier, ids=["c-1"])) == 1
+    cache._conn.execute(
+        "CREATE TEMP TRIGGER fail_id_set BEFORE INSERT ON _read_sets "
+        "WHEN NEW.set_name='id' AND NEW.id='explode' "
+        "BEGIN SELECT RAISE(ABORT, 'injected selection failure'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected selection failure"):
+        cache.candidates(frontier, ids=["absent", "explode"])
+    assert not cache._conn.in_transaction
+    assert cache._conn.execute("SELECT id FROM _read_sets WHERE set_name='id'").fetchall() == [
+        ("c-1",)
+    ]
+    assert len(cache.candidates(frontier, ids=["c-1"])) == 1
+    assert cache.search("toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == ["L-log"]
+    assert cache.count(frontier, filters=LearningFilter()) == 2
+    assert cache.candidates(Frontier(), ids=["c-1"]) == []
+    cache.close()
+
+
+def test_explicit_id_filter_work_grows_linearly(tmp_path: Path) -> None:
+    measurements = []
+    for size in (1_000, 10_000, 50_000):
+        cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
+        candidate_ids = [f"c-{i:08x}" for i in range(size)]
+        learning_ids = [f"L-h-{i:016x}" for i in range(size)]
+        score_ids = [f"s-{i:08x}" for i in range(size)]
+        reviews = [
+            HumanObject(
+                kind="review",
+                author="human:alice",
+                score=Score(
+                    id=sid,
+                    candidate_id=cid,
+                    judge="human:alice",
+                    rubric_hash="r1",
+                    key=(1,),
+                ),
+            )
+            for sid, cid in zip(score_ids, candidate_ids, strict=True)
+        ]
+        additions = [
+            HumanObject(kind="add", author="human:alice", learning=_human_learning(lid))
+            for lid in learning_ids
+        ]
+        cache.apply_human_objects([REVIEW_NAME] * size + [PIN_NAME] * size, reviews + additions)
+        del reviews, additions
+        frontier = Frontier(reviews=[REVIEW_NAME], curation=[PIN_NAME])
+        cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+        candidate_ids.reverse()
+        learning_ids.reverse()
+        score_ids.reverse()
+        steps = 0
+
+        def tick() -> int:
+            nonlocal steps
+            steps += 1000
+            return 0
+
+        cache._conn.set_progress_handler(tick, 1000)
+        scores = cache.scores(frontier, candidate_ids=candidate_ids)
+        score_work = steps
+        assert len(scores) == size
+        assert (scores[0][0].id, scores[-1][0].id) == ("s-00000000", f"s-{size - 1:08x}")
+        del scores
+        steps = 0
+        learnings = cache.learnings_by_id(frontier, learning_ids)
+        learning_work = steps
+        assert len(learnings) == size
+        assert (learnings[0].id, learnings[-1].id) == (
+            "L-h-0000000000000000",
+            f"L-h-{size - 1:016x}",
+        )
+        del learnings
+        steps = 0
+        with cache._lock, cache._frontier(frontier):
+            rows = cache._item_rows(frontier, "scores", ids=score_ids, candidate_ids=candidate_ids)
+        both_work = steps
+        cache._conn.set_progress_handler(None, 0)
+        assert len(rows) == size
+        assert Score.model_validate_json(rows[0][0]).id == "s-00000000"
+        assert Score.model_validate_json(rows[-1][0]).id == f"s-{size - 1:08x}"
+        del rows
+        assert not cache._conn.in_transaction
+        measurements.append((score_work, learning_work, both_work))
+        cache.close()
+    print("explicit-ID VM steps (scores, learnings, both ID filters; 1k/10k/50k):", measurements)
+    for column in range(3):
+        assert 0 < measurements[1][column] < 15 * measurements[0][column]
+        assert measurements[2][column] < 8 * measurements[1][column]

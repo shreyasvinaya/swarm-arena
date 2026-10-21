@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -225,7 +225,8 @@ class ArenaCache:
     Ingest retains a core replay checkpoint per run, advances only missing events,
     and discards mutated state after rollback. A per-run sequence index supports
     segment junction and newest-head lookups without scanning prior segments.
-    Indexed TEMP membership is filled once per read, including nested lookups.
+    Named indexed TEMP sets hold frontier membership and explicit ID selections.
+    Frontier sets are filled once per read, including nested lookups.
     Search filtering, relevance, pagination and counts execute in SQLite.
     Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
@@ -559,9 +560,31 @@ class ArenaCache:
                 is not None
             )
 
+    def _replace_sets(self, sets: Sequence[tuple[str, Iterable[tuple[str, int | None]]]]) -> None:
+        """Atomically replace named indexed sets with bounded row bindings."""
+        if not sets:
+            return
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _read_sets "
+            "(set_name TEXT, id TEXT, seq INTEGER, PRIMARY KEY(set_name, id)) WITHOUT ROWID"
+        )
+        self._conn.execute("SAVEPOINT read_sets")
+        try:
+            for name, rows in sets:
+                self._conn.execute("DELETE FROM _read_sets WHERE set_name=?", (name,))
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO _read_sets VALUES (?, ?, ?)",
+                    ((name, item, seq) for item, seq in rows),
+                )
+            self._conn.execute("RELEASE read_sets")
+        except BaseException:
+            self._conn.execute("ROLLBACK TO read_sets")
+            self._conn.execute("RELEASE read_sets")
+            raise
+
     @contextmanager
     def _frontier(self, frontier: Frontier) -> Generator[None, None, None]:
-        """Fill indexed connection-local membership once for an entire read."""
+        """Fill named frontier sets once, sharing storage with explicit ID sets."""
         if self._frontier_depth:
             yield
             return
@@ -574,38 +597,13 @@ class ArenaCache:
                 mark.run_id, Head(epoch=mark.epoch, seq=mark.seq, segment=mark.segment)
             ):
                 raise _core_error(ChainError, "frontier mark is not covered by cache")
-        self._conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _frontier_marks "
-            "(run_id TEXT PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID"
-        )
-        self._conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _frontier_objects "
-            "(kind TEXT, name TEXT, PRIMARY KEY(kind, name)) WITHOUT ROWID"
-        )
-        self._conn.execute("SAVEPOINT frontier_membership")
-        try:
-            self._conn.execute("DELETE FROM _frontier_marks")
-            self._conn.execute("DELETE FROM _frontier_objects")
-            self._conn.executemany(
-                "INSERT INTO _frontier_marks VALUES (?, ?)",
-                ((mark.run_id, mark.seq) for mark in marks),
+        self._replace_sets(
+            (
+                ("marks", ((mark.run_id, mark.seq) for mark in marks)),
+                ("reviews", ((name, None) for name in frontier.reviews)),
+                ("curation", ((name, None) for name in frontier.curation)),
             )
-            self._conn.executemany(
-                "INSERT OR IGNORE INTO _frontier_objects VALUES (?, ?)",
-                (
-                    (kind, name)
-                    for kind, names in (
-                        ("reviews", frontier.reviews),
-                        ("curation", frontier.curation),
-                    )
-                    for name in names
-                ),
-            )
-            self._conn.execute("RELEASE frontier_membership")
-        except BaseException:
-            self._conn.execute("ROLLBACK TO frontier_membership")
-            self._conn.execute("RELEASE frontier_membership")
-            raise
+        )
         self._frontier_depth += 1
         try:
             yield
@@ -615,14 +613,17 @@ class ArenaCache:
     @staticmethod
     def _member_join(table: Literal["candidates", "scores", "learnings"], alias: str) -> str:
         """Join requested marks and source-appropriate human names by their keys."""
-        marked = f" JOIN _frontier_marks m ON m.run_id={alias}.run_id AND {alias}.seq<=m.seq "
+        marked = (
+            f" JOIN _read_sets m ON m.set_name='marks' AND m.id={alias}.run_id "
+            f"AND {alias}.seq<=m.seq "
+        )
         if table == "candidates":
             return marked
         kind = "reviews" if table == "scores" else "curation"
         source = "review" if table == "scores" else "human"
         return (
             " LEFT" + marked + f"AND {alias}.source='run' "
-            f"LEFT JOIN _frontier_objects o ON o.kind='{kind}' AND o.name={alias}.obj_name "
+            f"LEFT JOIN _read_sets o ON o.set_name='{kind}' AND o.id={alias}.obj_name "
             f"AND {alias}.source='{source}' "
         )
 
@@ -630,9 +631,9 @@ class ArenaCache:
     def _member_condition(table: Literal["candidates", "scores", "learnings"]) -> str:
         """Accept either a matched run mark or the proper named human source."""
         return (
-            "m.run_id IS NOT NULL"
+            "m.id IS NOT NULL"
             if table == "candidates"
-            else ("(m.run_id IS NOT NULL OR o.name IS NOT NULL)")
+            else ("(m.id IS NOT NULL OR o.id IS NOT NULL)")
         )
 
     def _item_rows(
@@ -651,18 +652,26 @@ class ArenaCache:
         else:
             origin, ordinal = "coalesce(i.obj_name, i.run_id)", "coalesce(i.line, i.seq)"
         clauses = [self._member_condition(table)]
-        for column, values in (("id", ids), ("candidate_id", candidate_ids)):
-            if values is not None:
-                clauses.append(
-                    f"i.{column} IN (" + ",".join("?" for _ in values) + ")" if values else "0"
-                )
-                params.extend(values)
+        selected = [
+            (column, values)
+            for column, values in (("id", ids), ("candidate_id", candidate_ids))
+            if values is not None
+        ]
+        self._replace_sets(
+            [(column, ((value, None) for value in values)) for column, values in selected]
+        )
+        selection_joins = "".join(
+            f" JOIN _read_sets selected_{column} ON selected_{column}.set_name='{column}' "
+            f"AND selected_{column}.id=i.{column} "
+            for column, _ in selected
+        )
         for column, value in (filters or {}).items():
             clauses.append(f"i.{column}=?")
             params.append(value)
         rows = self._conn.execute(
             f"SELECT i.json, i.ts, {origin}, {ordinal} FROM {table} i "
             + self._member_join(table, "i")
+            + selection_joins
             + " WHERE "
             + " AND ".join(clauses)
             + f" ORDER BY i.ts, {origin}, {ordinal}, i.id",
@@ -687,7 +696,8 @@ class ArenaCache:
         frontier : Frontier
             Covered committed marks; later cached events remain invisible.
         ids : Sequence[str] or None, default=None
-            Candidate IDs to include; an empty sequence selects none.
+            Candidate IDs to include; an empty sequence selects none. Named
+            indexed TEMP sets support selections beyond SQLite binding limits.
         goal_key : str or None, default=None
             Main goal identity digest.
         part_key : str or None, default=None
@@ -742,7 +752,8 @@ class ArenaCache:
         frontier : Frontier
             Covered marks and exact review names. Review receipts add no scores.
         candidate_ids : Sequence[str] or None, default=None
-            Candidate IDs to include; an empty sequence selects none.
+            Candidate IDs to include; an empty sequence selects none. Named
+            indexed TEMP sets support selections beyond SQLite binding limits.
         judge : str or None, default=None
             Exact recorded judge name.
 
@@ -818,6 +829,7 @@ class ArenaCache:
             Covered marks and exact human-object names.
         ids : Sequence[str]
             Requested learning IDs. Unknown and nonmember IDs are omitted.
+            Named indexed TEMP sets avoid a binding limit on selection size.
 
         Returns
         -------
@@ -869,7 +881,7 @@ class ArenaCache:
         with self._lock, self._frontier(frontier):
             rows = self._conn.execute(
                 "SELECT plan_json, origin, p.seq FROM plans p "
-                "JOIN _frontier_marks m ON m.run_id=p.run_id AND p.seq<=m.seq "
+                "JOIN _read_sets m ON m.set_name='marks' AND m.id=p.run_id AND p.seq<=m.seq "
                 "WHERE p.run_id=? AND goal_id=? ORDER BY revision",
                 (run_id, goal_id),
             ).fetchall()
@@ -919,15 +931,15 @@ class ArenaCache:
             "WITH flags AS (SELECT learning_id, kind FROM ("
             "SELECT learning_id, c.kind, row_number() OVER (PARTITION BY learning_id "
             "ORDER BY obj_name DESC, line DESC) AS ordinal FROM curation_ops c "
-            "JOIN _frontier_objects o ON o.kind='curation' AND o.name=c.obj_name"
+            "JOIN _read_sets o ON o.set_name='curation' AND o.id=c.obj_name"
             ") WHERE ordinal=1) "
         )
 
     def _search_covered(self) -> None:
         """Refuse partial human membership before any query or FTS construction."""
         if self._conn.execute(
-            "SELECT 1 FROM _frontier_objects o LEFT JOIN human_objects h ON h.name=o.name "
-            "WHERE h.name IS NULL LIMIT 1"
+            "SELECT 1 FROM _read_sets o LEFT JOIN human_objects h ON h.name=o.id "
+            "WHERE o.set_name IN ('reviews','curation') AND h.name IS NULL LIMIT 1"
         ).fetchone():
             raise _core_error(ChainError, "frontier human object is not covered by cache")
 
@@ -1011,8 +1023,8 @@ class ArenaCache:
         if filters.part is not None:
             clauses.append(
                 "EXISTS (SELECT 1 FROM learning_evidence e "
-                "JOIN candidates c ON c.id=e.candidate_id JOIN _frontier_marks pm "
-                "ON pm.run_id=c.run_id AND c.seq<=pm.seq "
+                "JOIN candidates c ON c.id=e.candidate_id JOIN _read_sets pm "
+                "ON pm.set_name='marks' AND pm.id=c.run_id AND c.seq<=pm.seq "
                 "WHERE e.learning_id=l.id AND c.part=?)"
             )
             params.append(filters.part)
