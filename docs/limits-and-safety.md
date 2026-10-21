@@ -376,6 +376,9 @@ storage results cannot update the writer's state or start another operation.
 After settlement exhaustion, a writer whose confirmed lease remains valid
 attempts one bounded release so a new owner can resume immediately. A blocked
 or unsuccessful release does not extend cleanup indefinitely or reopen publication.
+This release attempt has its own `settle_timeout_s` allowance, capped by the
+remaining confirmed lease. Closing the writer can therefore take up to about
+2 × `settle_timeout_s`: one allowance for the original wait and another for release.
 
 A driver stop or deadline also bounds an in-progress journal storage primitive,
 including its retries, by the settlement allowance. Healthy graceful-stop work

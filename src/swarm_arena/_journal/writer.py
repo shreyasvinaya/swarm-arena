@@ -43,6 +43,9 @@ class JournalWriter:
     last confirmed expiry. Fatal failures disable publication and wake all waiters.
     Settlement exhaustion raises ``RuntimeError('stop cleanup timed out')``;
     authority loss and other fatal publication failures raise ``Fenced``.
+    After settlement exhaustion, a release attempt has its own
+    ``settle_timeout_s`` allowance, capped by the remaining confirmed lease.
+    Closing can therefore take up to about twice ``settle_timeout_s``.
     Use this object from its owning event loop and within its async context.
 
     Parameters
