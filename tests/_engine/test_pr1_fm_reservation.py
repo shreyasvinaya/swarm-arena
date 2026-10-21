@@ -111,4 +111,4 @@ async def test_refund_durability_wait_is_bounded(
     async with asyncio.timeout(10):
         await test_native_cancel_refunds_undispatched(tmp_path, monkeypatch, "command")
     assert len(waits) == 1
-    assert waits[0] < 2
+    assert waits[0] < config(tmp_path).settle_timeout_s + 1
