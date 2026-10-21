@@ -88,7 +88,6 @@ class _JobRun:
 
     async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput:
         """Run the job; on a cancel after the start, deliver its output, then re-raise."""
-        uploading = False
         try:
             run = await sup.run(
                 self._staged.argv,
@@ -110,12 +109,11 @@ class _JobRun:
                 self._post_collect = _DaemonCall(self._collect, run)
                 await self._wait_post_collect()
                 output = self._output or ToolOutput(status=RunStatus.ERROR)
-            uploading = True
             return await self._finish(output, (run.started_at, run.ended_at))
         except anyio.get_cancelled_exc_class():
             if self._started:  # a cancel before the start handshake has no output to give
                 with anyio.CancelScope(shield=True):
-                    await self._deliver_partial(upload=not uploading)
+                    await self._deliver_partial()
             raise
 
     async def fault_output(self, reason: str) -> ToolOutput:
@@ -141,8 +139,8 @@ class _JobRun:
         self._provisional = provisional
         self._output = await run_sync_daemon(self._collect, provisional)
 
-    async def _deliver_partial(self, *, upload: bool) -> None:
-        """Hand the best output to ``job.on_partial`` after a cancel (the caller shields)."""
+    async def _deliver_partial(self) -> None:
+        """Deliver collected data after cancellation without starting artifact uploads."""
         run = self._run
         if run is not None and run.status not in _STOPPED and not self._collected:
             # Rejoin the same collect, with its original deadline; never call it twice.
@@ -156,15 +154,6 @@ class _JobRun:
         if times is not None:
             update["started_at"], update["ended_at"] = times
         partial = output.model_copy(update=update)
-        if upload:
-            try:
-                with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S) as uploads:
-                    partial = await self._finish(output, times)
-                if uploads.cancel_called:
-                    await anyio.to_thread.run_sync(note_in_log, self._stderr, "uploads timed out")
-            except Exception as exc:  # upload failure must not replace caller cancellation
-                note = f"uploads failed: {_exception_type_name(exc)}"
-                await anyio.to_thread.run_sync(note_in_log, self._stderr, note)
         if self._job.on_partial is not None:
             with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S):
                 await self._job.on_partial(partial)

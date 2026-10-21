@@ -206,7 +206,7 @@ async def test_log_upload_contains_backend_failures(
         await executor.aclose()
 
 
-async def test_partial_upload_deadline_keeps_data_without_late_publication(
+async def test_cancel_before_upload_keeps_data_without_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -214,7 +214,7 @@ async def test_partial_upload_deadline_keeps_data_without_late_publication(
 
     from _fakes.tools import make_job
 
-    from swarm_arena._exec import local_run, supervisor
+    from swarm_arena._exec import local_run
     from swarm_arena._model.tooling import Command, RunStatus, ToolOutput
     from swarm_arena.executor import Job, LocalExecutor
 
@@ -241,7 +241,6 @@ async def test_partial_upload_deadline_keeps_data_without_late_publication(
         assert release.wait(30)
         return create(store, key, data)
 
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
     monkeypatch.setattr(local_run._JobRun, "_collect", collect)
     monkeypatch.setattr(LocalStore, "create", upload)
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
@@ -259,9 +258,8 @@ async def test_partial_upload_deadline_keeps_data_without_late_publication(
         with anyio.fail_after(10):
             await started.wait()
         task.cancel()
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
         done, _ = await asyncio.wait([task], timeout=3)
-        assert done, "partial upload outlived its cleanup deadline"
+        assert done, "cancelled executor started a partial upload"
         assert task.cancelled()
         [output] = partials
         assert output.data == {"kept": 1}
@@ -278,4 +276,84 @@ async def test_partial_upload_deadline_keeps_data_without_late_publication(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
         await executor.aclose()
-    assert len(publications) == 1
+    assert publications == []
+
+
+@pytest.mark.parametrize("stop", ["cancel", "fence"])
+async def test_public_run_abandons_partial_uploads(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    from _fakes.leases import force_take_over
+    from _fakes.run import WRITE_THEN_SLEEP, wait_tool_started
+    from _fakes.tools import PyTool
+
+    from swarm_arena._errors import Fenced
+    from swarm_arena._journal.writer import JournalWriter
+
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.5})
+    release = threading.Event()
+    fenced = anyio.Event()
+    workers: list[threading.Thread] = []
+    publications: list[str] = []
+    create, fail = LocalStore.create, JournalWriter._fail
+
+    def upload(store: LocalStore, key: str, data: bytes) -> str:
+        if len(key) == 64:
+            publications.append(key)
+            workers.append(threading.current_thread())
+            assert release.wait(30)
+        return create(store, key, data)
+
+    def record_failure(writer: JournalWriter, error: Exception) -> None:
+        fail(writer, error)
+        if isinstance(error, Fenced):
+            fenced.set()
+
+    monkeypatch.setattr(LocalStore, "create", upload)
+    monkeypatch.setattr(JournalWriter, "_fail", record_failure)
+    task = asyncio.create_task(
+        Swarm(config).run(
+            plan(rounds=1, tool=PyTool({"code": WRITE_THEN_SLEEP, "grace_s": 0})), run_id="r"
+        )
+    )
+    successor = None
+    try:
+        store = await wait_tool_started(config)
+        if stop == "cancel":
+            task.cancel()
+        else:
+            successor = await anyio.to_thread.run_sync(
+                lambda: force_take_over(store, owner_id="successor", host="test", ttl_s=60)
+            )
+            with anyio.fail_after(5):
+                await fenced.wait()
+        done, _ = await asyncio.wait([task], timeout=5)
+        assert done, "partial upload escaped the owning run's lifetime"
+        if stop == "cancel":
+            assert task.cancelled()
+        else:
+            assert isinstance(task.exception(), Fenced)
+        owner = read_owner(store)
+        assert owner is not None
+        if stop == "cancel":
+            assert owner[0].expires_at <= utc_now()
+        else:
+            assert successor is not None
+            assert owner[0].owner_id == successor.doc.owner_id
+        head = owner[0].head
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(15):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+        if successor is not None:
+            successor.release()
+    assert publications == [], "an upload started after cancellation or confirmed fencing"
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head == head
+    assert not any(event.type == "tool_end" for event in all_events(config))

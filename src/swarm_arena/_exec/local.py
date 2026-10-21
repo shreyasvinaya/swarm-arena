@@ -79,9 +79,9 @@ class LocalExecutor(Executor):
     collect that exceeds the bound gives ERROR and an empty result.
     Artifact uploads are awaited one object at a time under caller supervision.
     Cancellation abandons the current upload and starts no later upload. If
-    cancellation interrupts collection, partial-output uploads get at most
-    30 seconds; an interrupted upload delivers collected data without file or
-    log references through ``job.on_partial``. The callback is also bounded to
+    cancellation interrupts the process, collection, or an upload, collected
+    data is delivered without file or log references through ``job.on_partial``;
+    no partial-output uploads start after cancellation. The callback is bounded to
     30 seconds. Every diagnostic is
     appended to the stderr log only while it is a regular file, so a tool that
     replaces a log with a FIFO or a symlink cannot stall the executor.
@@ -245,7 +245,7 @@ class LocalExecutor(Executor):
         result, the output is empty with ``partial=False``, and a note goes to
         the stderr log. On a
         cancel after the start handshake, ``job.on_partial`` gets the best
-        output there is (status CANCELLED), also when the tool had already
+        collected data (status CANCELLED, no file or log references), also when the tool had already
         exited and its collect was still running. A command
         ``cwd`` that is not a directory in the workspace gives status ERROR
         and the command never starts. A declared output file that is missing,

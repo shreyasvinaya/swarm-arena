@@ -276,9 +276,10 @@ releases its slot and ignores late results, but cannot forcibly stop Python
 preparation code. Its workspace is retained with a warning for safe manual
 cleanup. Collection runs once and has a 30 s bound. Output files and logs upload
 one object at a time through the supervised storage boundary. Cancelling an
-upload abandons its wait and prevents later uploads. Partial-output uploads
-after process cancellation have a 30 s bound; if interrupted, the partial result
-keeps collected data but drops file and log references. See the
+upload abandons its wait and prevents later uploads. Cancellation during the
+process or collection also skips artifact uploads: the partial result keeps
+collected data but drops file and log references. Process termination and
+bounded collection still finish before data-only partial delivery. See the
 [executor details](api/executor.md#localexecutor) before cleaning retained workspaces.
 
 Direct `LocalExecutor` preparation preserves the exception object raised by a

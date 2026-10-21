@@ -31,7 +31,6 @@ _ALLOW = {
     ("_tooling/script_tool.py", "_list_files", "_list_files_sync"): "In-memory manifest/view only.",
     ("_exec/local_run.py", "_JobRun.run", "self._stopped_output"): "Local regular-file notes only.",
     ("_exec/local_run.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
-    ("_exec/local_run.py", "_JobRun._deliver_partial", "note_in_log"): "Local regular-file note.",
     ("_exec/local_run.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
     ("_exec/local_run.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "self._run_folder"): "Before acquisition.",
