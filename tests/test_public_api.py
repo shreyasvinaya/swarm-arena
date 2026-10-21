@@ -27,7 +27,12 @@ PUBLIC: dict[str, list[str]] = {
         "swarm_arena.testing",
     )
 }
+PUBLIC["swarm_arena"] += ["Chain", "KeepTopTeams", "Patience", "SuccessiveHalving"]
+PUBLIC["swarm_arena"] += ["ScriptedManager"]
+PUBLIC["swarm_arena"] += ["Swarm"]
+PUBLIC["swarm_arena.testing"] += ["check_manager"]
 PUBLIC["swarm_arena"] += ["Ref"]
+PUBLIC["swarm_arena"] += ["validate_plan"]
 PUBLIC["swarm_arena"] += ["Goal"]
 PUBLIC["swarm_arena"] += [
     "Plan",
@@ -39,8 +44,16 @@ PUBLIC["swarm_arena"] += [
     "Limits",
     "Resources",
 ]
-PUBLIC["swarm_arena.planning"] += ["FlowSpec"]
-PUBLIC["swarm_arena.board"] += ["GoalKey"]
+PUBLIC["swarm_arena.planning"] += [
+    "Decision",
+    "FlowSpec",
+    "History",
+    "Planner",
+    "Policy",
+    "RoundState",
+]
+PUBLIC["swarm_arena.board"] += ["Board", "BoardView"]
+PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",
     "CompletedRun",
@@ -57,7 +70,13 @@ PUBLIC["swarm_arena.tool"] += [
 PUBLIC["swarm_arena"] += ["Score"]
 PUBLIC["swarm_arena.scoring"] += ["CheckResult"]
 PUBLIC["swarm_arena.board"] += ["Candidate", "Learning", "LLMCall"]
-PUBLIC["swarm_arena.manager"] += ["AgentStatus"]
+PUBLIC["swarm_arena.manager"] += [
+    "AgentContext",
+    "AgentStatus",
+    "LimitReached",
+    "Manager",
+    "RoundReport",
+]
 PUBLIC["swarm_arena.protocol"] += [
     "Message",
     "Part",

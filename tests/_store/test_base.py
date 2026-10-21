@@ -4,10 +4,33 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._errors import ConditionalWritesUnsupported
+from swarm_arena._model.run_config import RunConfig
 from swarm_arena._store.base import Blob, Store, open_store
 from swarm_arena._store.local import LocalStore
 
 SECRET = "9537d6d3032b2555b86a3df9fb9abdda"
+
+
+def test_open_store_local_path(tmp_path: Path) -> None:
+    assert isinstance(open_store(str(tmp_path / "r")), LocalStore)
+
+
+@pytest.mark.parametrize("url", ["gs://b/x", "http://h/x", "ftp://h/x", "file:///tmp/r"])
+def test_open_store_refuses_scheme_without_conditional_writes(url: str) -> None:
+    with pytest.raises(ConditionalWritesUnsupported, match="conditional writes"):
+        open_store(url)
+
+
+def test_open_store_s3_needs_extra() -> None:
+    with pytest.raises(ConditionalWritesUnsupported, match=r"swarm-arena\[s3\].*M2"):
+        open_store("s3://bucket/runs")
+
+
+def test_shared_run_config(run_config: RunConfig, tmp_path: Path, artifact_root: str) -> None:
+    assert run_config.run_root == str(tmp_path / "runs")
+    assert run_config.arena_root == str(tmp_path / "arena")
+    assert run_config.artifact_root == artifact_root
+    assert run_config.lease_ttl_s == 60
 
 
 def test_blob() -> None:

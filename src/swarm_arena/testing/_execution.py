@@ -8,8 +8,10 @@ import anyio
 
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.tooling import RunStatus, ToolOutput, parse_logs_ref
+from swarm_arena._scoring.check import _prepare_command_output
 from swarm_arena.testing._state import _artifacts
 
 _LOG_TAIL_BYTES: Final = 2048
@@ -27,7 +29,8 @@ class _Watched(Executor):
     async def submit(self, job: Job) -> ToolOutput:
         """Submit the job to the wrapped executor and keep its output."""
         out = await self._inner.submit(job)
-        self.outputs.append((job.id, out))
+        detached = await run_sync_daemon(_prepare_command_output, out)
+        self.outputs.append((job.id, detached))
         return out
 
     async def capacity(self) -> Resources | None:

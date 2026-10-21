@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-from swarm_arena._errors import ConfigError
+from swarm_arena._errors import ConfigError, _core_error
 from swarm_arena._model.base import Origin, StoredModel, _SafeModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.data import TomlJsonObject, finite_json
@@ -374,7 +374,7 @@ class Plan(StoredModel):
             plan = cls.model_validate(data)
         except ValidationError as err:
             summary = validation_summary(err, root="plan")
-            raise ConfigError(summary) from None
+            raise _core_error(ConfigError, summary) from None
         plan._base_dir = base_dir
         return plan
 
@@ -410,11 +410,11 @@ class Plan(StoredModel):
         try:
             base_dir = path.parent.resolve()
         except (OSError, RuntimeError):
-            raise ConfigError(f"{path}: cannot resolve plan directory") from None
+            raise _core_error(ConfigError, f"{path}: cannot resolve plan directory") from None
         try:
             return cls._from_data(data, base_dir=base_dir)
         except ConfigError as err:
-            raise ConfigError(f"{path}: {err}") from None
+            raise _core_error(ConfigError, f"{path}: {err}") from None
 
     @classmethod
     def loads(cls, text: str, *, base_dir: Path) -> "Plan":

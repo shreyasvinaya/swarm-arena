@@ -4,6 +4,8 @@ from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any, Final
 
+from swarm_arena._errors import _core_error
+
 MigrationFn = Callable[[dict[str, Any]], dict[str, Any]]
 
 CURRENT: Final[Mapping[str, int]] = MappingProxyType(
@@ -20,6 +22,12 @@ CURRENT: Final[Mapping[str, int]] = MappingProxyType(
         "tool_result": 1,
         "check_result": 1,
         "judge_result": 1,
+        "event": 1,
+        "segment": 1,
+        "owner": 1,
+        "frontier": 1,
+        "manifest": 1,
+        "solution": 1,
     }
 )
 _migration_functions: Final[dict[tuple[str, int], MigrationFn]] = {}
@@ -108,7 +116,7 @@ def upgrade(kind: str, raw: dict[str, Any]) -> dict[str, Any]:
     while version < current:
         step = _MIGRATIONS.get((kind, version))
         if step is None:
-            raise RuntimeError(f"no migration for {kind} {version}")
+            raise _core_error(RuntimeError, f"no migration for {kind} {version}")
         data = step(data)
         version += 1
         data["schema_version"] = version

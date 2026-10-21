@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._model.run_config import RunConfig
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
+from swarm_arena._store.local import LocalStore
 
 
 def _missing(dist: str) -> bool:
@@ -63,3 +65,18 @@ def artifacts(artifact_root: str) -> ArtifactStore:
 @pytest.fixture
 def local_executor(tmp_path: Path) -> LocalExecutor:
     return LocalExecutor(workspace_root=str(tmp_path / "ws"))
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> LocalStore:
+    return LocalStore(tmp_path / "run")
+
+
+@pytest.fixture
+def run_config(tmp_path: Path, artifact_root: str) -> RunConfig:
+    return RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=artifact_root,
+        lease_ttl_s=60,
+    )

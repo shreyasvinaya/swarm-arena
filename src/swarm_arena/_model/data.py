@@ -122,3 +122,39 @@ def _toml_json(value: Any) -> Any:
 
 FiniteJsonObject = Annotated[dict[str, Any], AfterValidator(finite_json)]
 TomlJsonObject = Annotated[dict[str, Any], AfterValidator(_toml_json)]
+
+
+def json_equal(left: Any, right: Any) -> bool:
+    """
+    Compare validated JSON values without conflating scalar types.
+
+    Parameters
+    ----------
+    left : Any
+        Validated JSON value.
+    right : Any
+        Validated JSON value to compare.
+
+    Returns
+    -------
+    bool
+        Whether types and values agree recursively, ignoring mapping order.
+
+    Examples
+    --------
+    >>> json_equal({"x": [True, 1.0]}, {"x": [1, 1.0]})
+    False
+    >>> json_equal({"a": 1, "b": 2}, {"b": 2, "a": 1})
+    True
+    """
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            json_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right

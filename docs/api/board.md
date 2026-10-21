@@ -2,7 +2,15 @@
 
 ```{eval-rst}
 .. automodule:: swarm_arena.board
+   :members: Candidate, Frontier, GoalKey, LLMCall, Learning, LineageGraph, Row
+
+.. autoclass:: swarm_arena.board.Board
    :members:
+   :inherited-members: Configurable
+
+.. autoclass:: swarm_arena.board.BoardView
+   :members:
+   :inherited-members: Configurable
 ```
 
 `Candidate` stores a tool request, its output, provenance, and checks. Its

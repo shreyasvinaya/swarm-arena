@@ -13,6 +13,7 @@ from typing import Final
 
 import anyio
 
+from swarm_arena._errors import Fenced, _exception_type_name
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.procinfo import ExitWatch, group_has_live_member, process_start_time
 from swarm_arena._model.base import FrozenModel
@@ -186,8 +187,10 @@ async def _collect(
         tg.start_soon(kill_at_deadline)
         try:
             await before_kill(provisional)
+        except (Fenced, BaseExceptionGroup) as exc:
+            raised = exc
         except Exception as exc:
-            failed = type(exc).__name__  # the type only: a message can carry secret values
+            failed = _exception_type_name(exc)  # the type only: a message can carry secret values
         except BaseException as exc:
             if isinstance(exc, cancelled) and tg.cancel_scope.cancel_called:
                 raise  # the deadline's own cancellation: the task group absorbs it

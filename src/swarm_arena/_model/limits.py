@@ -35,7 +35,8 @@ class Limits(_SafeModel):
     max_tokens : int or None, default=None
         Optional run token cap; LLM plans require a cap during preflight.
     max_usd : float or None, default=None
-        Optional positive run dollar cap.
+        Optional positive run dollar cap, at most 1,000,000,000 USD to preserve
+        exact micro-dollar accounting.
     default_run_reservation : Estimate, optional
         Fallback reservation of 100,000 tokens and 1 USD for unestimated runs.
     llm_tranche_usd : float, default=0.25
@@ -82,7 +83,7 @@ class Limits(_SafeModel):
     max_turns_per_round: int = Field(default=20, ge=1)
     max_tool_runs_per_round: int = Field(default=3, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
-    max_usd: float | None = Field(default=None, gt=0)
+    max_usd: float | None = Field(default=None, gt=0, le=1_000_000_000)
     default_run_reservation: Estimate = Estimate(tokens=100_000, usd=1.0)
     llm_tranche_usd: float = Field(default=0.25, gt=0)
     llm_tranche_tokens: int = Field(default=25_000, ge=1)

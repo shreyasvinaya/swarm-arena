@@ -15,7 +15,7 @@ from pydantic import (
     create_model,
 )
 
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_error, _core_signal
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
@@ -153,12 +153,12 @@ def _read_file_sync(ctx: FileViewContext, args: ReadFileArgs) -> JsonValue:
     """Read strict UTF-8 text only after resolving a path in the agent's view."""
     files = _files(ctx, args.candidate)
     if args.path not in files:
-        raise SoftError(f"no such file: {args.path}")
+        raise _core_signal(SoftError(f"no such file: {args.path}"))
     data = ctx._read_artifact(files[args.path])
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
-        raise SoftError(f"not UTF-8 text: {args.path}") from None
+        raise _core_signal(SoftError(f"not UTF-8 text: {args.path}")) from None
     return {"path": args.path, "content": content}
 
 
@@ -339,7 +339,7 @@ class ScriptTool(Tool):
             try:
                 compiled = compile_object_schema(name, self.config.params)
             except _SchemaError as error:
-                raise ConfigError(str(error)) from None
+                raise _core_error(ConfigError, str(error)) from None
             self._input_model = create_model(name, __base__=(compiled, _ConfigInputModel))
         return self._input_model
 

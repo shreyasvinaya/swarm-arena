@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import _NOT_AN_OUTPUT
 from swarm_arena._model.base import _sanitize_validation_error
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref
@@ -23,7 +24,9 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._store.base import open_store
+from swarm_arena._tooling.files import snapshot_ref
 from swarm_arena._tooling.result_file import NOTE_PREFIX, request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
@@ -33,8 +36,8 @@ from swarm_arena._tooling.staging import (
     tool_root,
     validate_edits,
 )
-from swarm_arena._tooling.tool import Action, Tool
-from swarm_arena.testing._components import _build, _effective_tool_ref
+from swarm_arena._tooling.tool import Action, Tool, effective_tool_ref
+from swarm_arena.testing._components import _build
 from swarm_arena.testing._contracts import _fail, _is_sequence_of, _is_set_of_str
 from swarm_arena.testing._execution import _stderr_tail
 from swarm_arena.testing._state import _artifact_root, _artifacts
@@ -107,12 +110,18 @@ def _plan_tool(
     context = ToolRequest(
         round=round, round_overrides=dict(round_overrides or {}), replicate=replicate
     )
-    ref, built, goal = _build(_effective_tool_ref(tool, context.round_overrides), Tool, goal)
+    base = tool if isinstance(tool, Ref) else Ref.of(tool)
+    effective_tool_ref(base, context.round_overrides)  # reject invalid overrides before file I/O
+    base = snapshot_ref(base, Path.cwd(), _artifacts())
+    ref, built, goal = _build(effective_tool_ref(base, context.round_overrides), Tool, goal)
     _check_tool_methods(built)
     model = built.get_input_model()
     try:
         params = model.model_validate(inputs).model_dump(mode="json")
-    except Exception as error:  # a connector's own model can show input values
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _sanitize_validation_error(model, error) from None
     request = ToolRequest(
         inputs=params,
@@ -140,7 +149,7 @@ def _plan_tool(
         protected=protected,
         private_paths=frozenset(),
         parents=request.parents,
-        receiving_identity=tool_identity(ref, None),
+        receiving_identity=tool_identity(base, None),
         edits=request.edits,
         request_json=request_json(request),
     )
@@ -166,7 +175,10 @@ def _probe_collect(tool: Tool, request: ToolRequest) -> None:
         )
         try:
             out = tool.collect(request, workspace, run)
-        except (Exception, SystemExit):  # a raise is a valid failure; interrupts propagate
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            _propagate_control(error)
             return
     if not isinstance(out, ToolOutput):
         raise _fail("Tool.collect() must return a ToolOutput")
@@ -186,10 +198,13 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     ):
         raise _fail(message)
     try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
-        valid = ToolOutput.model_validate(out.model_dump(warnings=False))
-    except Exception:
+        valid = _detach_model(ToolOutput, out)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
         raise _fail(message) from None
-    # The checks read the validated copy, as the core would; the caller gets ``out`` itself.
+    # All later checks and the caller receive the detached core output.
     store = open_store(_artifact_root())
     for file in valid.files:
         if not store.exists(file.sha256):
@@ -207,4 +222,4 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     estimate = tool.estimate(request)
     if not (estimate is None or isinstance(estimate, Estimate)):
         raise _fail("Tool.estimate() must return None or an Estimate")
-    return out
+    return valid

@@ -5,6 +5,8 @@ A goal fans out to teams of agents, weak branches are pruned, and the good resul
 on answers you can prove.
 """
 
+from swarm_arena._agent.scripted import ScriptedManager
+from swarm_arena._engine.swarm import Swarm
 from swarm_arena._facade import publish as _publish
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.limits import Limits
@@ -20,6 +22,8 @@ from swarm_arena._model.plan import (
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._planning.policies import Chain, KeepTopTeams, Patience, SuccessiveHalving
+from swarm_arena._planning.validate import validate_plan
 from swarm_arena._scoring.program_judge import ProgramJudge
 from swarm_arena._scoring.script_check import ScriptCheck
 from swarm_arena._scoring.script_judge import ScriptJudge
@@ -29,11 +33,14 @@ from swarm_arena._version import __version__ as __version__
 
 __all__: list[str] = [
     "AgentSpec",
+    "Chain",
     "ConvergeSpec",
     "FunctionTool",
     "Goal",
+    "KeepTopTeams",
     "Limits",
     "PartSpec",
+    "Patience",
     "Plan",
     "ProgramJudge",
     "Ref",
@@ -44,7 +51,11 @@ __all__: list[str] = [
     "ScriptCheck",
     "ScriptJudge",
     "ScriptTool",
+    "ScriptedManager",
+    "SuccessiveHalving",
+    "Swarm",
     "TeamSpec",
+    "validate_plan",
 ]
 
 _publish(__name__, __all__)

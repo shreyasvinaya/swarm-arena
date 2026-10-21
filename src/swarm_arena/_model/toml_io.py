@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from swarm_arena._errors import ConfigError
+from swarm_arena._errors import ConfigError, _core_error
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -38,7 +38,7 @@ def read_toml(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text("utf-8")
     except (OSError, UnicodeError):
-        raise ConfigError(f"{path}: cannot read valid UTF-8 TOML") from None
+        raise _core_error(ConfigError, f"{path}: cannot read valid UTF-8 TOML") from None
     return loads_toml(text, where=str(path))
 
 
@@ -78,9 +78,11 @@ def loads_toml(text: str, *, where: str) -> dict[str, Any]:
         else:
             # Python versions that report end-of-document still have a safe position.
             line, column = str(text.count("\n") + 1), str(len(text.rsplit("\n", 1)[-1]) + 1)
-        raise ConfigError(f"{where}: invalid TOML at line {line}, column {column}") from None
+        raise _core_error(
+            ConfigError, f"{where}: invalid TOML at line {line}, column {column}"
+        ) from None
     except UnicodeError:
-        raise ConfigError(f"{where}: cannot read valid UTF-8 TOML") from None
+        raise _core_error(ConfigError, f"{where}: cannot read valid UTF-8 TOML") from None
 
 
 def _quote(value: str) -> str:

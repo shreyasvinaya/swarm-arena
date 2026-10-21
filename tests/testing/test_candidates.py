@@ -195,3 +195,25 @@ def test_explicit_parents_must_match_request_parents() -> None:
             parents=[a],
             request=ToolRequest(parents=[parent_ref(b)]),
         )
+
+
+def test_identity_uses_frozen_base_manifest_with_round_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifacts: ArtifactStore
+) -> None:
+    from swarm_arena._tooling.files import snapshot_ref
+
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "problem/run.py"
+    source.parent.mkdir()
+    source.write_text("print(1)")
+    raw = Ref.of(ScriptTool(command=["python", "problem/run.py"], files=["problem/run.py"]))
+    frozen = snapshot_ref(raw, tmp_path, artifacts)
+    expected = tool_identity(frozen, None)
+    assert expected != tool_identity(raw, None)
+    source.unlink()
+    ok = ToolOutput(status=RunStatus.OK)
+    for timeout in (5, 10):
+        candidate = make_candidate(
+            ok, tool=frozen, request=ToolRequest(round_overrides={"timeout_s": timeout})
+        )
+        assert candidate.tool_identity == expected

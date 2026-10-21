@@ -1,18 +1,23 @@
 import hashlib
+import json
 import math
 import os
 import secrets
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
 from swarm_arena import Goal
+from swarm_arena._agent.context import AgentContext
+from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable, RefField
@@ -28,8 +33,11 @@ from swarm_arena._model.tooling import (
 )
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext
+from swarm_arena._tooling.function_tool import FunctionTool
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.tool import Action, Tool
+from swarm_arena.manager import Manager, RoundReport
+from swarm_arena.planning import Decision, Policy, RoundState
 
 
 class Widget(Configurable):
@@ -699,3 +707,701 @@ class ResultJudge(Judge):
         out = await ctx.execute(Command(argv=["python", "-c", self.config.code]))
         value = out.data["value"]
         return [Score.maximize(value).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+
+class NoopManager(Manager):
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        models: list[str] = []
+
+    @property
+    def config(self) -> Config:
+        return cast(NoopManager.Config, super().config)
+
+    def models(self) -> tuple[str, ...]:
+        return tuple(self.config.models)
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        return RoundReport()
+
+
+class ProviderJudge(Judge):
+    name = "prov"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    def providers(self) -> frozenset[str]:
+        return frozenset({"openai"})
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return [
+            Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
+            for c in candidates
+        ]
+
+
+class AliasedEnvTool(Tool):
+    _human_only: ClassVar[frozenset[str]] = frozenset({"env"})
+
+    class Config(EchoTool.Config):
+        model_config = ConfigDict(
+            extra="forbid", frozen=True, hide_input_in_errors=True, populate_by_name=True
+        )
+        env: list[str] = Field(
+            default_factory=list,
+            validation_alias=AliasChoices(
+                "env_alias",
+                AliasPath("env_path", "names"),
+                "env_choice",
+                AliasPath("env_choice_path", "names"),
+            ),
+        )
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(status=run.status)
+
+
+class AdmissionTool(Tool):
+    """Expose nested refs and controlled hook failures without running processes."""
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        members: list[RefField] = []
+        files: FileSet = FileSet()
+        text: str = ""
+        fail_at: str = ""
+        deterministic: bool = False
+
+    def __init__(self, config: BaseModel | dict[str, Any] | None = None, /) -> None:
+        super().__init__(config)
+        self._fail("constructor")
+
+    @property
+    def config(self) -> Config:
+        return cast(AdmissionTool.Config, super().config)
+
+    def _fail(self, site: str) -> None:
+        if self.config.fail_at == site:
+            raise RuntimeError(self.config.text)
+
+    def is_deterministic(self, request: ToolRequest) -> bool:
+        self._fail("determinism")
+        return self.config.deterministic
+
+    def _own_files(self) -> dict[str, str]:
+        self._fail("files")
+        return self.config.files.manifest
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(status=run.status)
+
+
+class AdmissionManager(Manager):
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        instructions: str = ""
+        fail: bool = False
+        models: list[str] = []
+
+    @property
+    def config(self) -> Config:
+        return cast(AdmissionManager.Config, super().config)
+
+    def models(self) -> tuple[str, ...]:
+        if self.config.fail:
+            raise RuntimeError(self.config.instructions)
+        return tuple(self.config.models)
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        return RoundReport()
+
+
+def square(x: float) -> dict[str, float]:
+    return {"x": x, "y": x * x}
+
+
+def touch(marker: str) -> dict[str, str]:
+    Path(marker).touch()
+    return {"marker": marker}
+
+
+class CommandRaisesTool(PyTool):
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        raise RuntimeError("boom")
+
+
+WRITE_THEN_SLEEP: str = WRITE.format("{'data': {'step': 1}}") + "; import time; time.sleep(600)"
+
+
+def write_then_sleep(marker: Path, seconds: float = 600) -> str:
+    return (
+        WRITE.format("{'data': {'step': 1}}")
+        + f"; from pathlib import Path; Path({str(marker)!r}).touch()"
+        + f"; import time; time.sleep({seconds!r})"
+    )
+
+
+class ContextInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    value: Any
+    defaulted: int = 7
+
+
+class ContextTool(PyTool):
+    input_model = ContextInputs
+
+    def is_deterministic(self, request: ToolRequest) -> bool:
+        return False
+
+
+class AlwaysFailCheck(Check):
+    name = "always-fail"
+
+    class Config(FrozenModel):
+        reason: str = "always fails"
+        feedback: Literal["pass_fail", "reasons"] = "reasons"
+
+    @property
+    def config(self) -> Config:
+        return cast(AlwaysFailCheck.Config, super().config)
+
+    def __init__(self, config: BaseModel | Mapping[str, Any] | None = None) -> None:
+        super().__init__(config)
+        self.feedback = self.config.feedback
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(check=self.name, passed=False, reasons=[self.config.reason])
+
+
+def score_min_y(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(candidate.output.data["y"])
+
+
+def score_max_y(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(candidate.output.data["y"])
+
+
+class CountingTool(PyTool):
+    calls: ClassVar[int] = 0
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        # These fixtures give the parent config's required code field a default.
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        code: str = ""
+        k: int = 1
+
+    def preflight(self) -> None:
+        CountingTool.calls += 1
+
+
+class FailingPreflightTool(PyTool):
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        # These fixtures give the parent config's required code field a default.
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+        code: str = ""
+
+    def preflight(self) -> None:
+        raise RuntimeError("no license")
+
+
+def join_sum() -> dict[str, float]:
+    """Sum the assigned parents' value fields from their staged data files."""
+    return {
+        "value": sum(
+            float(json.loads(path.read_text())["value"])
+            for path in Path("parents").glob("*/data.json")
+        )
+    }
+
+
+SCOPE_PROBE_SEEN: list[LLMScope] = []
+
+
+class ScopeProbeJudge(Judge):
+    name = "probe"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        SCOPE_PROBE_SEEN.append(scope)
+        call = await scope.tranche.reserve_call(Amount(usd=0.01))
+        await scope.tranche.settle_call(call, Amount(usd=0.01))
+        scope.call_ids.append(f"llm-{len(SCOPE_PROBE_SEEN)}")
+        return [
+            Score.minimize(c.output.data["y"]).model_copy(update={"candidate_id": c.id})
+            for c in candidates
+        ]
+
+
+class ConstantFingerprintTool(FunctionTool):
+    """Fingerprint independently of request data for distinct-selection tests."""
+
+    def fingerprint(self, output: ToolOutput) -> str:
+        return f"timeout-{self.config.timeout_s}"
+
+
+class RaisingFingerprintTool(FunctionTool):
+    """Contain a hook failure without making otherwise useful outputs fail."""
+
+    def fingerprint(self, output: ToolOutput) -> str:
+        raise RuntimeError("fingerprint-secret-sentinel")
+
+
+class AnchoredProviderJudge(ProviderJudge):
+    def anchor_count(self) -> int:
+        return 2
+
+
+def goal_part_value(value: float) -> dict[str, float]:
+    return {"value": value}
+
+
+def goal_score_value(goal: Goal, candidate: Candidate) -> Score:
+    return Score.minimize(candidate.output.data["value"])
+
+
+def goal_score_negative_value(goal: Goal, candidate: Candidate) -> Score:
+    return Score.maximize(candidate.output.data["value"])
+
+
+class FailLaterRoundCheck(Check):
+    name = "later"
+
+    class Config(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(
+            check=self.name,
+            passed=candidate.round == 1,
+            reasons=[] if candidate.round == 1 else ["later round failed"],
+        )
+
+
+def line_value(a: float) -> dict[str, float]:
+    """
+    Return a line evaluation using the joiner's value key.
+
+    Parameters
+    ----------
+    a : float
+        Value to evaluate.
+
+    Returns
+    -------
+    dict[str, float]
+        Numeric output suitable for scoring and joining.
+
+    Examples
+    --------
+    >>> line_value(3.0)
+    {'value': 3.0}
+    """
+    return {"value": a}
+
+
+def part_value(part: str, v: float) -> dict[str, float]:
+    """
+    Return one part's value for a later sum join.
+
+    Parameters
+    ----------
+    part : str
+        Part identifier retained in the recorded request.
+    v : float
+        Numeric value contributed by this part.
+
+    Returns
+    -------
+    dict[str, float]
+        Part output using the same key as the joined result.
+
+    Examples
+    --------
+    >>> part_value('a', 12.0)
+    {'value': 12.0}
+    """
+    return {"value": v}
+
+
+def score_value(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Prefer candidates with larger values, for either a part or the main goal.
+
+    Parameters
+    ----------
+    goal : Goal
+        Main or part goal being scored.
+    candidate : Candidate
+        Candidate whose output contains a numeric value.
+
+    Returns
+    -------
+    Score
+        Maximization score on the shared value scale.
+
+    Examples
+    --------
+    >>> score_value(GOAL, cand(data={'value': 12.0})).key
+    (12.0,)
+    """
+    return Score.maximize(candidate.output.data["value"])
+
+
+class FeedbackCheck(AlwaysFailCheck):
+    """Return passing feedback under a configurable visibility policy."""
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(
+            check=self.name,
+            passed=True,
+            reasons=[self.config.reason],
+            details={"private": self.config.reason},
+        )
+
+
+class ThreeDollarTool(Tool):
+    """
+    Charge three dollars for nonzero inputs, ten cents for the default input.
+
+    Preflight estimates the default empty request; actual requests have their
+    own estimates and matching reported usage through the normal engine path.
+
+    Examples
+    --------
+    >>> ThreeDollarTool().estimate(ToolRequest(inputs={'n': 1})).usd
+    3.0
+    """
+
+    name = "paid-value"
+    description = "Evaluate a value at the input's stated price."
+    input_model = PyInputs
+
+    def estimate(self, request: ToolRequest) -> Estimate:
+        """
+        Estimate the selected input's price.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Proposed invocation.
+
+        Returns
+        -------
+        Estimate
+            Three dollars for a nonzero input, otherwise ten cents; zero tokens.
+
+        Examples
+        --------
+        >>> ThreeDollarTool().estimate(ToolRequest()).tokens
+        0
+        >>> ThreeDollarTool().estimate(ToolRequest()).usd
+        0.1
+        """
+        return Estimate(tokens=0, usd=3.0 if request.inputs.get("n", 0) else 0.1)
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        """
+        Execute a real local process without an external provider.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Validated invocation.
+        workspace : Path
+            Staged working directory.
+
+        Returns
+        -------
+        Command
+            A successful no-op command.
+
+        Examples
+        --------
+        >>> ThreeDollarTool().command(ToolRequest(), Path('.')).argv
+        ['true']
+        """
+        return Command(argv=["true"])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        """
+        Report the request value and its actual connector usage.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation containing the numeric value.
+        workspace : Path
+            Completed working directory.
+        run : CompletedRun
+            Real process outcome and timestamps.
+
+        Returns
+        -------
+        ToolOutput
+            Scorable value and explicit actual usage for settlement.
+
+        Examples
+        --------
+        >>> from datetime import UTC, datetime
+        >>> now = datetime(2026, 1, 1, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status=RunStatus.OK,
+        ...     stdout_path=Path('stdout'), stderr_path=Path('stderr'),
+        ...     started_at=now, ended_at=now)
+        >>> ThreeDollarTool().collect(ToolRequest(inputs={'n': 1}), Path('.'), run).usage.usd
+        3.0
+        """
+        from swarm_arena.tool import Usage
+
+        return ToolOutput(
+            status=run.status,
+            data={"value": request.inputs["n"]},
+            usage=Usage(usd=self.estimate(request).usd),
+            started_at=run.started_at,
+            ended_at=run.ended_at,
+        )
+
+
+class ReportRefusalManager(Manager):
+    """
+    Offer two distinct requests and record a public action's refusal identifier.
+
+    Examples
+    --------
+    >>> ReportRefusalManager().models()
+    ()
+    """
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        """
+        Run sequential paid requests until the budget refuses one.
+
+        Parameters
+        ----------
+        ctx : AgentContext
+            Public action context supplied by the engine.
+
+        Returns
+        -------
+        RoundReport
+            Summary after both requests or a recorded limit refusal.
+
+        Examples
+        --------
+        >>> import anyio
+        >>> from unittest.mock import AsyncMock, Mock
+        >>> ctx = Mock(run_tool=AsyncMock())
+        >>> anyio.run(ReportRefusalManager().run_round, ctx).summary
+        'both requests admitted'
+        """
+        from swarm_arena.manager import LimitReached
+
+        evidence: list[str] = []
+        for n in (1, 2):
+            try:
+                candidate = await ctx.run_tool({"n": n})
+            except LimitReached as error:
+                await ctx.post_learning(
+                    title="Tool request refused", text=error.limit, evidence=evidence
+                )
+                return RoundReport(summary="request refused")
+            evidence.append(candidate.id)
+        return RoundReport(summary="both requests admitted")
+
+
+def sleepy(seconds: float, marker: str) -> dict[str, float]:
+    """
+    Publish process identity atomically and sleep only on the first invocation.
+
+    Parameters
+    ----------
+    seconds : float
+        Maximum first-invocation delay in seconds. A sibling ``.release`` file
+        ends the wait early so lifecycle tests can release committed work.
+    marker : str
+        Absolute path to the PID/PGID JSON marker. An existing marker skips sleep.
+
+    Returns
+    -------
+    dict[str, float]
+        Judgeable value data.
+
+    Examples
+    --------
+    >>> sleepy(0.0, "/tmp/sleepy-example.json")  # doctest: +SKIP
+    {'value': 1.0}
+    """
+    path = Path(marker)
+    if not path.exists():
+        pending = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        pending.write_text(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0)}))
+        pending.replace(path)
+        deadline = time.monotonic() + seconds
+        release = path.with_suffix(".release")
+        while not release.exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.02))
+    return {"value": 1.0}
+
+
+def _wait_preparation_marker(path: Path) -> None:
+    """Bound every file barrier so failed tests cannot strand a daemon forever."""
+    deadline = time.monotonic() + 60
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("preparation barrier timed out")
+        time.sleep(0.02)
+
+
+class BlockedPreparationTool(Tool):
+    """
+    Block command preparation until a file releases the executor-owned daemon.
+
+    Examples
+    --------
+    >>> BlockedPreparationTool({"root": "/tmp/probe"}).name
+    'blocked-preparation'
+    """
+
+    name = "blocked-preparation"
+    description = "Coordinate pre-launch cancellation through files."
+    input_model = PyInputs
+
+    class Config(BaseModel):
+        """
+        Locate coordination files for one isolated test.
+
+        Parameters
+        ----------
+        root : str
+            Directory containing entered, release, returned and launch markers.
+
+        Examples
+        --------
+        >>> BlockedPreparationTool.Config(root="/tmp/probe").root
+        '/tmp/probe'
+        """
+
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        root: str
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        """
+        Return a launch-marker command after the preparation release signal.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation being prepared.
+        workspace : Path
+            Executor-owned directory, retained while this callback is blocked.
+
+        Returns
+        -------
+        Command
+            A command that must never launch after cancellation.
+
+        Examples
+        --------
+        >>> tool.command(ToolRequest(), workspace)  # doctest: +SKIP
+        """
+        root = Path(cast(BlockedPreparationTool.Config, self.config).root)
+        entered = root / "preparation-entered.json"
+        pending = root / ".preparation-entered.tmp"
+        pending.write_text(json.dumps(str(workspace)))
+        pending.replace(entered)
+        _wait_preparation_marker(root / "preparation-release")
+        (workspace / "late-write").write_text("retained")
+        command = Command(
+            argv=[
+                "python",
+                "-c",
+                f"from pathlib import Path; Path({str(root / 'late-launch')!r}).touch()",
+            ]
+        )
+        (root / "preparation-returned").touch()
+        return command
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        """
+        Supply value data if an uncancelled invocation finishes.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Invocation being collected.
+        workspace : Path
+            Executor workspace.
+        run : CompletedRun
+            Process outcome.
+
+        Returns
+        -------
+        ToolOutput
+            Judgeable output with the actual process status.
+
+        Examples
+        --------
+        >>> from datetime import UTC, datetime
+        >>> now = datetime(2026, 1, 1, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status=RunStatus.OK,
+        ...     stdout_path=Path('stdout'), stderr_path=Path('stderr'),
+        ...     started_at=now, ended_at=now)
+        >>> tool = BlockedPreparationTool({"root": "/tmp/probe"})
+        >>> tool.collect(ToolRequest(), Path('.'), run).data
+        {'value': 1.0}
+        """
+        return ToolOutput(status=run.status, data={"value": 1.0})
+
+
+class PreparationBarrierPolicy(Policy):
+    """
+    Keep the CLI alive after settlement while abandoned preparation returns.
+
+    Examples
+    --------
+    >>> PreparationBarrierPolicy({"root": "/tmp/probe"}).config.root
+    '/tmp/probe'
+    """
+
+    Config = BlockedPreparationTool.Config
+
+    def after_round(self, state: RoundState) -> Decision:
+        """
+        Wait for explicit release after the first round, then retain all agents.
+
+        Parameters
+        ----------
+        state : RoundState
+            Current round's committed candidate evidence.
+
+        Returns
+        -------
+        Decision
+            An empty pruning decision.
+
+        Examples
+        --------
+        >>> policy.after_round(state)  # doctest: +SKIP
+        """
+        if state.round == 1:
+            root = Path(cast(BlockedPreparationTool.Config, self.config).root)
+            (root / "barrier-entered").touch()
+            _wait_preparation_marker(root / "barrier-release")
+        return Decision()

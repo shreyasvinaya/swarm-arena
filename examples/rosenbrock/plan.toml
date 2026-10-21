@@ -1,0 +1,54 @@
+checks = [{path = "rosen:BoundsCheck"}]
+judges = [{name = "f", path = "swarm_arena:ProgramJudge", config = {function = "rosen:score"}}]
+policy = {path = "swarm_arena:SuccessiveHalving", config = {keep = 0.5}}
+converge = {mode = "select", top_n = 2}
+
+[goal]
+id = "rosenbrock"
+namespace = "toy"
+
+[[teams]]
+name = "descent"
+rationale = "Follow local gradients from different starting points."
+
+[[teams.agents]]
+name = "gd-1"
+rationale = "Explore the valley from a negative starting coordinate."
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:gradient_descent"}}
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [
+  {round = 1, inputs = {lr = 0.001, steps = 1000, x0 = -1.5, y0 = 2.0}},
+  {round = 2, parents = "best", inputs = {lr = 0.001, steps = 4000, x0 = -1.5, y0 = 2.0}},
+]}}
+
+[[teams.agents]]
+name = "gd-2"
+rationale = "Explore the valley from a positive starting coordinate."
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:gradient_descent"}}
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [
+  {round = 1, inputs = {lr = 0.001, steps = 1000, x0 = 0.5, y0 = 0.5}},
+  {round = 2, parents = "best", inputs = {lr = 0.001, steps = 4000, x0 = 0.5, y0 = 0.5}},
+]}}
+
+[[teams]]
+name = "random"
+rationale = "Sample broadly without depending on a local gradient."
+
+[[teams.agents]]
+name = "rs-1"
+rationale = "Try repeated searches with the first reproducible seed."
+replicates = 2
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:random_search", deterministic = false}}
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [
+  {round = 1, inputs = {n = 2000, radius = 2.0, seed = 7}},
+  {round = 2, inputs = {n = 2000, radius = 2.0, seed = 7}},
+]}}
+
+[[teams.agents]]
+name = "rs-2"
+rationale = "Try repeated searches with a different reproducible seed."
+replicates = 2
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:random_search", deterministic = false}}
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [
+  {round = 1, inputs = {n = 2000, radius = 2.0, seed = 19}},
+  {round = 2, inputs = {n = 2000, radius = 2.0, seed = 19}},
+]}}

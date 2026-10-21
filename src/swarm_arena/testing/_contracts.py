@@ -3,11 +3,14 @@
 from collections.abc import Sequence
 from typing import TypeVar
 
+from swarm_arena._model.detach import _detach_model
+from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
-_M = TypeVar("_M", CheckResult, Score)
+_M = TypeVar("_M", CheckResult, Score, RoundReport)
 
 
 def _fail(message: str) -> AssertionError:
@@ -20,8 +23,11 @@ def _strict_copy(model: type[_M], value: _M) -> _M | None:
     try:  # model_copy and model_construct skip validation
         dump = value.model_dump(warnings=False)
         valid = model.model_validate(dump, strict=True)
-        return valid if valid.model_dump(warnings=False) == dump else None
-    except Exception:
+        return _detach_model(model, valid) if valid.model_dump(warnings=False) == dump else None
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
         return None
 
 
@@ -55,13 +61,14 @@ def _check_scores(
     """Assert a judge's scores; record a non-finite key as a judge error (spec 4.4)."""
     if not (isinstance(scores, list) and all(isinstance(score, Score) for score in scores)):
         raise _fail("Judge.judge() must return a list of Score")
-    batch = {candidate.id for candidate in candidates}
+    batch = {str.__str__(c.id): str.__str__(c.id) for c in candidates}
     scored: set[str] = set()
     valid: list[Score] = []
     for score in scores:
         candidate_id = score.candidate_id
         if not isinstance(candidate_id, str) or candidate_id not in batch:
             raise _fail(f"Judge.judge() returned a score for unknown candidate {candidate_id!r}")
+        candidate_id = batch[candidate_id]
         if candidate_id in scored:
             raise _fail(f"Judge.judge() returned more than one score for candidate {candidate_id}")
         scored.add(candidate_id)
@@ -71,7 +78,7 @@ def _check_scores(
         copy = _strict_copy(Score, score)
         if copy is None:  # lax validation would turn value="1.0" into 1.0
             raise _fail("Judge.judge() must return valid Scores")
-        valid.append(copy)
+        valid.append(copy.model_copy(update={"candidate_id": candidate_id}))
     return valid, scored
 
 

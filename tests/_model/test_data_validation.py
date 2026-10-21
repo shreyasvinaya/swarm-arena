@@ -225,3 +225,35 @@ def test_json_data_rejects_integers_the_encoder_cannot_write() -> None:
         ToolOutput(status="ok", data={"count": huge})
     with pytest.raises(ValidationError):
         Goal(id="g", namespace="n", inputs={"count": huge})
+
+
+@pytest.mark.parametrize(("left", "right"), [(True, 1), (False, 0), (1, 1.0), (0, 0.0)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_json_equal_preserves_nested_scalar_types(left: Any, right: Any, reverse: bool) -> None:
+    from swarm_arena._model.data import json_equal
+
+    if reverse:
+        left, right = right, left
+    assert not json_equal(left, right)
+    assert not json_equal({"x": [{"y": left}]}, {"x": [{"y": right}]})
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "equal"),
+    [
+        (None, None, True),
+        (None, False, False),
+        ({"a": [True, 1, 1.0], "b": None}, {"b": None, "a": [True, 1, 1.0]}, True),
+        ([1, 2], [2, 1], False),
+        ([1], [1, 2], False),
+        ({"x": 1}, {"y": 1}, False),
+        ({"x": 1}, {"x": 1, "y": 2}, False),
+        ([], {}, False),
+        ("1", 1, False),
+        (0.0, -0.0, True),
+    ],
+)
+def test_json_equal_container_rules(left: Any, right: Any, equal: bool) -> None:
+    from swarm_arena._model.data import json_equal
+
+    assert json_equal(left, right) is equal

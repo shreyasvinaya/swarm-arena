@@ -609,7 +609,7 @@ For `direction="min"`, that value yields key `(-0.25,)`; for `"max"` (the
 default), it yields `(0.25,)`. Alternatively,
 `{"key": [1, 2], "value": 0.25}` supplies the ranking key directly, unaffected
 by direction; larger keys rank higher lexicographically. `verdict` is optional,
-`notes` defaults to `""`, and extra fields are ignored. Keys must be nonempty
+`notes` defaults to `""`, and unknown fields are rejected. Keys must be nonempty
 and finite. Numeric strings and booleans are rejected, and JSON containing
 NaN or Infinity fails result collection. Neither a non-null key nor a non-null
 value means `result needs key or value`.
@@ -659,3 +659,98 @@ globs, even below a long source directory.
 Use `ScriptTool` or a custom `Tool` when a function's files must become output
 artifacts. Its `env=["ANTHROPIC_API_KEY"]` setting explicitly allows named
 variables into the subprocess and remains human-controlled.
+
+## Run it
+
+The bring-your-own-script example in `examples/own_script/`
+runs a complete two-round line fit with `ScriptedManager`. From the repository
+root, run:
+
+```sh
+uv run swarm-arena run --yes examples/own_script/run.toml examples/own_script/plan.toml
+```
+
+The completion line is `done: line-fit 1 finalists`. The final slope is `2.0`,
+the intercept is `1.0`, and both public and held-out MSE are `0.0`.
+Run artifacts live under `.swarm-arena/` relative to your working directory;
+the final document is `runs/<run-id>/goals/line-fit/solution.json` beneath it.
+
+The first agent edits the slope in round 1. The second agent uses
+`parents = "best"` in round 2 and edits the intercept. Their byte-identical
+base tool configs allow the slope overlay to reach the second workspace.
+`KeepTopTeams(k=1)` retains the single team and both agents through round 2.
+The defaulted `scale` parameter is optional in each scripted request; the tool
+reads it from `params` in `swarm/request.json` and scales both coefficients.
+
+```{literalinclude} ../examples/own_script/plan.toml
+:language: toml
+:caption: plan.toml
+```
+
+```{literalinclude} ../examples/own_script/run.toml
+:language: toml
+:caption: run.toml
+```
+
+Only `problem/model_*.txt` is editable. These files contain one finite numeric
+TOML assignment each, allowing whitespace and comments without executing code.
+
+```{literalinclude} ../examples/own_script/problem/model_a.txt
+:language: toml
+:caption: problem/model_a.txt
+```
+
+```{literalinclude} ../examples/own_script/problem/model_b.txt
+:language: toml
+:caption: problem/model_b.txt
+```
+
+`problem/points.txt` is public training data: whitespace-separated `x y` pairs,
+one per line, with no header. It is snapshotted by the goal glob and protected
+from edits by excluding it from the editable glob. The protected tool script
+computes public `data.fit_error` using these points.
+
+```{literalinclude} ../examples/own_script/problem/points.txt
+:language: text
+:caption: problem/points.txt (public)
+```
+
+```{literalinclude} ../examples/own_script/problem/run.py
+:language: python
+:caption: problem/run.py
+```
+
+The check reads `candidate/output.json` under `data` and writes
+`passed`/`reasons`. The judge reads the coefficients from the same document,
+computes MSE independently on its private CSV, and writes `value`. All three
+scripts write to `SWARM_ARENA_RESULT` using the existing result formats.
+
+```{literalinclude} ../examples/own_script/checks/check.py
+:language: python
+:caption: checks/check.py
+```
+
+```{literalinclude} ../examples/own_script/judge/score.py
+:language: python
+:caption: judge/score.py
+```
+
+The private fixture `judge/hidden/points.csv` contains an `x,y` header and
+held-out points distinct from the public dataset. Only the judge receives
+that file and its script; neither is staged into tool workspaces. This is a
+staging guarantee for trusted scripts, subject to the
+[isolation boundary](#isolation-boundary) above.
+
+Engine candidates publish run-relative log paths under
+`goals/line-fit/logs/`. Read those paths beneath the run folder. The conformance
+kit's public `read_logs` helper reads content-addressed kit results in the same
+Python process, rather than these engine paths.
+
+The example's README also shows the Python API. Its end-to-end test retains
+tool workspaces, verifies both overlay hashes and parent lineage, checks that
+private fixture bytes never occur in a tool workspace, and verifies the final
+solution:
+
+```sh
+uv run pytest tests/e2e/test_own_script.py -v
+```

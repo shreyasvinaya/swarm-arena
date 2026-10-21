@@ -10,12 +10,14 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     Field,
+    TypeAdapter,
+    ValidationError,
     field_validator,
 )
 from pydantic.errors import PydanticErrorMixin
 from pydantic_core import PydanticCustomError
 
-from swarm_arena._errors import ConfigError
+from swarm_arena._errors import ConfigError, _core_error
 from swarm_arena._model.base import (
     _VALIDATION_ACTIVE,
     FrozenModel,
@@ -26,6 +28,7 @@ from swarm_arena._model.base import (
 )
 from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 
 
 class EmptyConfig(_SafeModel):
@@ -182,7 +185,10 @@ def load_object(path: str) -> object:
         obj: object = importlib.import_module(module)
         for part in qualname.split("."):
             obj = getattr(obj, part)
-    except (Exception, SystemExit):
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
         raise ValueError(f"cannot import {path}") from None
     return obj
 
@@ -229,12 +235,23 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         try:
             return model_cls.model_validate(data)
-        except Exception as error:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                error = _classify_outcome(error)
                 safe = _sanitize_validation_error(model_cls, error)
-            except Exception:
+            except RecursionError:
+                safe = None
+            except KeyboardInterrupt:
+                raise
+            except BaseException as error:
+                try:  # noqa: SIM105 - a context manager itself needs spare stack frames
+                    _propagate_control(error)
+                except RecursionError:
+                    pass
                 safe = None
     finally:
         owner.thread_id = None
@@ -242,7 +259,7 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     if safe is None:
         safe = _minimal_validation_error(model_cls)
     summary = validation_summary(safe, codes_only=True)
-    raise ConfigError(f"{where}: {summary}") from None
+    raise _core_error(ConfigError, f"{where}: {summary}") from None
 
 
 class Ref(FrozenModel):
@@ -433,6 +450,41 @@ class Ref(FrozenModel):
         raise TypeError(f"{self.path} has no name; set Ref.name")
 
 
+_REF_PATH_ADAPTER: TypeAdapter[str] = TypeAdapter(Ref.model_fields["path"].rebuild_annotation())
+
+
+def is_ref_path(value: object) -> bool:
+    """
+    Recognize a complete Ref path without importing components or doing I/O.
+
+    Parameters
+    ----------
+    value : object
+        Potential component path in ``module:QualName`` form.
+
+    Returns
+    -------
+    bool
+        Whether the value is a string accepted by the ``Ref.path`` field's
+        Pydantic constraint, including its Unicode word-character semantics.
+        Non-string inputs are rejected without coercion.
+
+    Examples
+    --------
+    >>> is_ref_path("demo.tools:Outer.Inner")
+    True
+    >>> is_ref_path("demo:Thing/other")
+    False
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        _REF_PATH_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
 def coerce_ref(value: object) -> object:
     """
     Convert component instances and subclasses to references.
@@ -460,6 +512,7 @@ def coerce_ref(value: object) -> object:
         try:
             return Ref.of(value)
         except TypeError as error:
+            _propagate_control(error)
             # Only these fixed importability reasons are allowed out of the boundary.
             reason = str(error)
             if reason not in {

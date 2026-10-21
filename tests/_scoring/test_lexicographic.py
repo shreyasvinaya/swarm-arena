@@ -143,7 +143,8 @@ async def test_bad_member_score_is_candidate_error(
     if "key" in update:
         assert judge_ctx.errors["bad"] == "member fixed gave a non-finite key"
     else:
-        assert "cannot combine member scores" in judge_ctx.errors["bad"]
+        expected = "TypeError" if "llm_call_ids" in update else "ValidationError"
+        assert judge_ctx.errors["bad"] == f"member fixed gave an invalid score: {expected}"
     assert SECRET not in repr(judge_ctx.errors)
 
 

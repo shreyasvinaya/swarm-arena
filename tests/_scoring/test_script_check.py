@@ -201,7 +201,7 @@ async def test_construct_bypass_still_rejects_non_json_details(bad: Any) -> None
     result = await ScriptCheck(command=["example"]).check(cand(), context)
     assert result.passed is False
     assert result.details == {}
-    assert result.reasons == ["invalid check result: details: details must be finite JSON"]
+    assert result.reasons == ["check script failed: error"]
     assert SECRET not in result.model_dump_json()
 
 

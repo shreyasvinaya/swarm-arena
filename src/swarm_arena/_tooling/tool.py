@@ -1,7 +1,7 @@
 """Define tool connectors, typed manager actions, and shared timeout rules."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +11,8 @@ from pydantic import BaseModel
 
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._model.ref import Configurable
+from swarm_arena._model.catalog import _field_input_keys, _human_only_inputs
+from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.tooling import (
     DEFAULT_GRACE_S,
     Command,
@@ -20,6 +21,7 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
+from swarm_arena._planning.provenance import is_nested_ref
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
@@ -37,9 +39,9 @@ class Action(Generic[InputT]):
         Explanation of the action's purpose.
     input_model : type[InputT]
         Model that validates the action's arguments.
-    handler : Callable[[Any, InputT], Awaitable[JsonValue]]
-        Handler receiving the agent's AgentContext and validated arguments.
-        AgentContext becomes available in M1b.
+    handler : Callable[[AgentContext, InputT], Awaitable[JsonValue]]
+        Handler receiving the agent's ``AgentContext`` as its first argument
+        and validated inputs as its second argument.
     counts_as : {'board_read', 'none'}, default='none'
         Counter charged when the action runs.
 
@@ -345,6 +347,76 @@ class Tool(Configurable, ABC):
     def _protected(self, root: AbstractSet[str]) -> frozenset[str]:
         """Return protected tool paths; the driver unions these with private paths."""
         return frozenset()
+
+
+def _check_nested_overrides(value: Any) -> None:
+    """Refuse protected inputs in nested configurations supplied by overrides."""
+    if isinstance(value, Ref):
+        cls, config = value._resolve_config(Configurable)
+        for key, name in _human_only_inputs(cls).items():
+            if key in value.config:
+                raise ValueError(
+                    f"round_overrides: {value.path}: human-only field {name} cannot be overridden"
+                )
+        _check_nested_overrides(config)
+    elif isinstance(value, BaseModel):
+        for name in type(value).model_fields:
+            _check_nested_overrides(getattr(value, name))
+    elif is_nested_ref(value):
+        _check_nested_overrides(Ref.model_validate(value))
+    elif isinstance(value, Mapping):
+        for child in value.values():
+            _check_nested_overrides(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _check_nested_overrides(child)
+
+
+def effective_tool_ref(tool: Tool | Ref, overrides: Mapping[str, Any]) -> Ref:
+    """
+    Validate a shallow override merge while preserving raw tool settings.
+
+    Parameters
+    ----------
+    tool : Tool or Ref
+        Base tool configuration. Call only after raw planner authorization.
+    overrides : Mapping[str, Any]
+        Top-level replacements; human-only fields and validation aliases are
+        forbidden even when their values are unchanged. This also applies to
+        nested component configurations supplied by a replacement.
+
+    Returns
+    -------
+    Ref
+        Independent reference validated through Ref and the tool's Config.
+        Raw scalar types, omitted defaults, and frozen manifests are retained.
+
+    Raises
+    ------
+    ValueError
+        If overrides change human-only fields or configuration is invalid.
+    TypeError
+        If the reference does not select a Tool subclass.
+
+    Examples
+    --------
+    >>> ref = Ref(path="swarm_arena:ScriptTool", config={"command": ["run"]})
+    >>> effective_tool_ref(ref, {"timeout_s": 12}).config
+    {'command': ['run'], 'timeout_s': 12}
+    """
+    ref = tool if isinstance(tool, Ref) else Ref.of(tool)
+    cls = ref.load()
+    if not issubclass(cls, Tool):
+        raise TypeError(f"{ref.path} is not a subclass of Tool")
+    for key, name in _human_only_inputs(cls).items():
+        if key in overrides:
+            raise ValueError(f"round_overrides: human-only field {name} cannot be overridden")
+    effective = Ref(path=ref.path, name=ref.name, config={**ref.config, **overrides})
+    _, config = effective._resolve_config(Tool)
+    for name, field in type(config).model_fields.items():
+        if _field_input_keys(name, field).intersection(overrides):
+            _check_nested_overrides(getattr(config, name))
+    return effective.model_copy(deep=True)
 
 
 def cap_timeout(configured: float | None, limit_s: float) -> float:

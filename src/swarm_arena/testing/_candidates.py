@@ -19,8 +19,7 @@ from swarm_arena._tooling.staging import (
     tool_root,
     validate_edits,
 )
-from swarm_arena._tooling.tool import Tool
-from swarm_arena.testing._components import _effective_tool_ref
+from swarm_arena._tooling.tool import Tool, effective_tool_ref
 from swarm_arena.testing._state import _artifacts, _ids
 
 
@@ -42,7 +41,8 @@ def make_candidate(
     identity, editable-path and workspace-layout rules as ``check_tool``.
     Only the first parent contributes an overlay; later parents remain
     read-only references. A refused overlay gives a ``UserWarning``.
-    With ``tool``, the candidate gets that tool's identity. Tool and goal
+    With ``tool``, identity uses its snapshotted base config without round
+    overrides; effective settings still control edit protection. Tool and goal
     files are snapshotted relative to the current working directory. Edit
     text is stored in the kit's artifact store, so a child can itself be a
     base parent and its checks and judges see the complete edit chain.
@@ -122,10 +122,14 @@ def make_candidate(
     }
     built: Tool | None = None
     if tool is not None:
-        ref = _effective_tool_ref(tool, request.round_overrides)
-        ref = snapshot_ref(ref, Path.cwd(), _artifacts())
+        base = tool if isinstance(tool, Ref) else Ref.of(tool)
+        effective_tool_ref(base, request.round_overrides)
+        base = snapshot_ref(base, Path.cwd(), _artifacts())
+        ref = snapshot_ref(
+            effective_tool_ref(base, request.round_overrides), Path.cwd(), _artifacts()
+        )
         built = ref.build(Tool)
-        values["tool_identity"] = tool_identity(ref, None)
+        values["tool_identity"] = tool_identity(base, None)
     if "overlay" not in fields:
         goal_files = (
             {} if goal is None else snapshot_fileset(goal.files, Path.cwd(), _artifacts()).manifest

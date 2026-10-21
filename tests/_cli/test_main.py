@@ -28,3 +28,11 @@ def test_console_script_installed() -> None:
     exe = Path(sys.executable).parent / "swarm-arena"
     done = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=False)
     assert (done.returncode, done.stdout) == (0, f"swarm-arena {swarm_arena.__version__}\n")
+
+
+def test_help_lists_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit, match=r"^0$"):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert all(c in out for c in ("run", "status", "stop", "resume"))
+    assert "130 interrupted (Ctrl-C)" in out

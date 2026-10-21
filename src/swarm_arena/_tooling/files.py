@@ -2,14 +2,15 @@
 
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 
-from pydantic import AliasChoices, AliasPath
+from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic_core import PydanticUndefined
 
+from swarm_arena._errors import PlanError, _core_error
 from swarm_arena._model.compat import _alias_paths
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan, TeamSpec
@@ -228,12 +229,89 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
     return fs.model_copy(update={"manifest": manifest})
 
 
+def _snapshot_value(
+    value: Any,
+    raw: Any,
+    base_dir: Path,
+    artifacts: ArtifactStore,
+    *,
+    field: str,
+    shape_error: str | None = None,
+) -> Any:
+    """Visit validated values once, preserving raw data outside file/ref leaves.
+
+    Carry a changed ancestor shape to its leaves. It matters only if a typed
+    FileSet or Ref is encountered, and then fails before reading its files.
+    """
+    if isinstance(value, (FileSet, Ref)):
+        if shape_error is not None:
+            raise _core_error(PlanError, [shape_error]) from None
+        if isinstance(value, FileSet):
+            return snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
+        return snapshot_ref(value, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
+    if isinstance(value, BaseModel):
+        error = shape_error
+        if not isinstance(raw, dict):
+            error = error or (
+                f"field {field!r}: validation changed the shape of a file or reference mapping"
+            )
+        result = _snapshot_config(
+            value, raw if isinstance(raw, dict) else {}, base_dir, artifacts, shape_error=error
+        )
+        return raw if error else result
+    if isinstance(value, Mapping):
+        same_shape = isinstance(raw, dict) and value.keys() == raw.keys()
+        error = shape_error or (
+            None
+            if same_shape
+            else f"field {field!r}: validation changed the shape of a file or reference mapping"
+        )
+        result = {
+            key: _snapshot_value(
+                item,
+                raw[key] if same_shape else None,
+                base_dir,
+                artifacts,
+                field=field,
+                shape_error=error,
+            )
+            for key, item in value.items()
+        }
+        return result if same_shape else raw
+    if isinstance(value, (list, tuple)):
+        same_shape = isinstance(raw, list) and len(value) == len(raw)
+        error = shape_error or (
+            None
+            if same_shape
+            else f"field {field!r}: validation changed the shape of a file or reference list"
+        )
+        result = [
+            _snapshot_value(
+                item,
+                raw[index] if same_shape else None,
+                base_dir,
+                artifacts,
+                field=field,
+                shape_error=error,
+            )
+            for index, item in enumerate(value)
+        ]
+        return result if same_shape else raw
+    return raw
+
+
 def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     """Snapshot explicit file sets and nested component references in a config.
 
     Validate against the referenced component's Config without constructing the
     component. Only file-set and reference fields present in the raw config are
-    written back; omitted defaults stay omitted and other values stay raw.
+    written back; nonempty FileSet defaults are frozen under their canonical
+    field names. Empty FileSet defaults and other defaults stay omitted.
+    Typed reference mappings retain their keys and unrelated values stay raw.
+    Descent follows validated FileSet and Ref instances, including those in
+    unions with identical outer container types. Validation
+    may normalize unrelated lists and mappings without changing their stored
+    raw values; shape changes in file/reference containers are refused.
     Validation aliases retain their original input paths and precedence.
     Nested references omit absent model fields, and the returned reference is
     validated so its configuration remains reloadable from JSON and TOML.
@@ -256,6 +334,9 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     ------
     TypeError
         If the referenced object is not a Configurable subclass.
+    PlanError
+        If validation changes a file/reference container's shape. The error
+        names the schema field without including configured values.
     ValueError
         If importing, validating configuration, or snapshotting files fails.
         ConfigError diagnostics omit values, validator messages, and data keys.
@@ -277,7 +358,20 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
     True
     """
     _, config = ref._resolve_config(Configurable)
-    updated = deepcopy(ref.config)
+    updated = _snapshot_config(config, ref.config, base_dir, artifacts)
+    return Ref(path=ref.path, config=updated, name=ref.name)
+
+
+def _snapshot_config(
+    config: BaseModel,
+    raw: dict[str, Any],
+    base_dir: Path,
+    artifacts: ArtifactStore,
+    *,
+    shape_error: str | None = None,
+) -> dict[str, Any]:
+    """Write frozen typed values back along their supplying raw input paths."""
+    updated = deepcopy(raw)
     settings = type(config).model_config
     for key, field in type(config).model_fields.items():
         alias = field.validation_alias
@@ -299,32 +393,33 @@ def snapshot_ref(ref: Ref, base_dir: Path, artifacts: ArtifactStore) -> Ref:
             (
                 path
                 for path in paths
-                if AliasPath(cast(str, path[0]), *path[1:]).search_dict_for_path(ref.config)
+                if AliasPath(cast(str, path[0]), *path[1:]).search_dict_for_path(raw)
                 is not PydanticUndefined
             ),
             None,
         )
-        if path is None:
-            continue
         value = getattr(config, key)
-        if isinstance(value, FileSet):
-            frozen: Any = snapshot_fileset(value, base_dir, artifacts).model_dump(mode="json")
-        elif isinstance(value, Ref):
-            frozen = snapshot_ref(value, base_dir, artifacts).model_dump(
-                mode="json", exclude_none=True
-            )
-        elif isinstance(value, list) and value and all(isinstance(item, Ref) for item in value):
-            frozen = [
-                snapshot_ref(item, base_dir, artifacts).model_dump(mode="json", exclude_none=True)
-                for item in value
-            ]
-        else:
-            continue
+        if path is None:
+            if shape_error is not None:
+                _snapshot_value(
+                    value, None, base_dir, artifacts, field=key, shape_error=shape_error
+                )
+                continue
+            if not isinstance(value, FileSet) or not value.globs:
+                continue
+            path = (key,)
         target: Any = updated
         for part in path[:-1]:
             target = target[part]
-        target[path[-1]] = frozen
-    return Ref(path=ref.path, config=updated, name=ref.name)
+        target[path[-1]] = _snapshot_value(
+            value,
+            target.get(path[-1]) if isinstance(target, dict) else target[path[-1]],
+            base_dir,
+            artifacts,
+            field=key,
+            shape_error=shape_error,
+        )
+    return updated
 
 
 def _snapshot_team(team: TeamSpec, base_dir: Path, artifacts: ArtifactStore) -> TeamSpec:

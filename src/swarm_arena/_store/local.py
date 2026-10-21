@@ -1,22 +1,24 @@
-"""Publish complete local objects with an exclusive temporary file and hard link."""
+"""Publish complete local objects with atomic creation and conditional replacement."""
 
 import contextlib
+import fcntl
 import hashlib
 import os
 from collections.abc import Iterable
 from pathlib import Path
 from secrets import token_hex
 
-from swarm_arena._errors import AlreadyExists, NotFound, StorageError
+from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed, StorageError
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._store.base import Blob, Store, _check_key
 
 
 class LocalStore(Store):
-    """Store write-once objects below a local directory.
+    """Store objects below a local directory with conditional writes.
 
     Construction performs no filesystem I/O. Directories are created lazily
-    when an object is written. The backend requires POSIX hard-link support.
+    when an object is created. The backend requires POSIX hard-link and flock
+    support. Replacement locks persist beside their objects.
 
     Parameters
     ----------
@@ -154,32 +156,71 @@ class LocalStore(Store):
             temp.unlink(missing_ok=True)
 
     def replace(self, key: str, data: bytes, *, if_match: str) -> str:
-        """Refuse conditional replacement until M1b.
+        """Atomically replace an object whose current SHA-256 version matches.
+
+        Hold an exclusive lock on the persistent ``<key>.lock`` file while
+        checking the current bytes and publishing the synced replacement.
+        Missing parent directories are never created.
 
         Parameters
         ----------
         key : str
-            Object key.
+            Non-empty relative POSIX key without dot segments.
         data : bytes
             Proposed replacement contents.
         if_match : str
-            Required current version.
+            Required SHA-256 digest of the current bytes.
 
         Returns
         -------
         str
-            Replacement version, once implemented.
+            SHA-256 digest of the replacement bytes.
 
         Raises
         ------
-        NotImplementedError
-            Always in M1a.
+        NotFound
+            If the root, parent directory, or key is missing.
+        PreconditionFailed
+            If the current digest differs from ``if_match``.
+        StorageError
+            If locking, reading, writing, syncing, replacing, or cleanup fails.
 
         Examples
         --------
-        >>> store.replace("example", b"updated", if_match="old")  # doctest: +SKIP
+        >>> etag = store.read("example").etag  # doctest: +SKIP
+        >>> new = store.replace("example", b"updated", if_match=etag)  # doctest: +SKIP
         """
-        raise NotImplementedError("Store.replace arrives in M1b")
+        path = self._root / _check_key(key)
+        lock_path = path.with_name(f"{path.name}.lock")
+        try:
+            try:
+                lock = lock_path.open("a+b")
+            except FileNotFoundError:
+                raise NotFound("store key not found") from None
+            with lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    try:
+                        current = path.read_bytes()
+                    except FileNotFoundError:
+                        raise NotFound("store key not found") from None
+                    if sha256_hex(current) != if_match:
+                        raise PreconditionFailed("store version mismatch")
+                    temp = path.with_name(f"{path.name}.tmp-{token_hex(6)}")
+                    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        with os.fdopen(fd, "wb") as stream:
+                            stream.write(data)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.replace(temp, path)
+                    finally:
+                        temp.unlink(missing_ok=True)
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            raise StorageError("store replace failed") from None
+        return sha256_hex(data)
 
     def exists(self, key: str) -> bool:
         """Check whether the key exists on disk.

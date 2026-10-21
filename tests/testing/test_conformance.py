@@ -53,9 +53,10 @@ from swarm_arena import (
     Ref,
     Score,
     ScriptCheck,
+    ScriptedManager,
     ScriptTool,
 )
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_error
 from swarm_arena._exec.local import _NOT_AN_OUTPUT
 from swarm_arena._model.ids import run_tag
 from swarm_arena._model.tooling import format_logs_ref
@@ -64,6 +65,7 @@ from swarm_arena._store.base import open_store
 from swarm_arena._tooling.result_file import NOTE_PREFIX
 from swarm_arena.board import Candidate
 from swarm_arena.executor import Job, LocalExecutor
+from swarm_arena.manager import AgentContext, Manager, RoundReport
 from swarm_arena.scoring import (
     Check,
     CheckContext,
@@ -72,7 +74,7 @@ from swarm_arena.scoring import (
     JudgeContext,
     Lexicographic,
 )
-from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
+from swarm_arena.testing import check_check, check_judge, check_manager, check_tool, make_candidate
 from swarm_arena.testing._state import _artifact_root
 from swarm_arena.tool import (
     Command,
@@ -290,10 +292,11 @@ async def test_collect_probe_accepts_error_status_and_raising(
         await check_tool(
             OkCollectTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor
         )
-    with pytest.warns(UserWarning, match="RuntimeError: collect broke"):  # collect raises
+    with pytest.warns(UserWarning, match="collect failed: RuntimeError") as captured:
         out = await check_tool(
             BadCollectTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor
         )
+    assert all("collect broke" not in str(warning.message) for warning in captured)
     assert out.status == RunStatus.ERROR
     out = await check_tool(PyTool(PyTool.Config(code=EMPTY_RESULT)), {}, executor=local_executor)
     assert out.status == RunStatus.OK
@@ -640,7 +643,7 @@ async def test_executor_contract_is_asserted(output: object, match: str) -> None
 
 
 async def test_custom_executor_with_microsecond_times_passes() -> None:
-    # The core re-validates a ToolOutput in lax mode; timestamp precision is not a contract.
+    # Detached outputs apply the core UTC-millisecond validation contract.
     when = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
     out = ToolOutput(status=RunStatus.OK, data={"x": 1})
     out = out.model_copy(update={"started_at": when, "ended_at": when})
@@ -649,7 +652,12 @@ async def test_custom_executor_with_microsecond_times_passes() -> None:
         checked = await check_tool(
             PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(out)
         )
-    assert (checked.data, checked.started_at, checked.ended_at) == ({"x": 1}, when, when)
+    normalized = when.replace(microsecond=123000)
+    assert (checked.data, checked.started_at, checked.ended_at) == (
+        {"x": 1},
+        normalized,
+        normalized,
+    )
 
 
 async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
@@ -667,7 +675,7 @@ async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
     assert (checked.status, checked.data) == (RunStatus.OK, {"x": 1})
 
 
-async def test_post_checks_read_the_validated_copy_and_the_original_is_returned(
+async def test_post_checks_and_return_use_the_detached_validated_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An executor that builds its output with model_construct leaves each file a plain dict.
@@ -689,7 +697,9 @@ async def test_post_checks_read_the_validated_copy_and_the_original_is_returned(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         checked = await check_tool(tool, {}, executor=FixedExecutor(out))
-    assert checked is out
+    assert checked is not out
+    assert type(checked) is ToolOutput
+    assert checked.files[0].sha256 == sha256
 
 
 async def test_preflight_runs_before_any_job() -> None:
@@ -1016,3 +1026,180 @@ async def test_candidate_goal_mismatch_is_refused_before_component_runs(kind: st
     with pytest.raises(ValueError, match=r"goal_id another does not match goal (g|check)"):
         await call
     assert executor.jobs == []
+
+
+class _RaisingManager(Manager):
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        raise RuntimeError("manager-secret-sentinel")
+
+
+async def test_check_manager_reports_failure_after_later_rounds_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena.testing import _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    secret = "manager-conformance-isolation-sentinel"
+    failure = RuntimeError(secret)
+    seen: list[int] = []
+    harness = OfflineHarness()
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        await ctx.run_tool({"x": float(ctx.round)})
+        if ctx.round == 2:
+            raise failure
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+    with pytest.raises(AssertionError, match="manager raised RuntimeError") as caught:
+        await check_manager(
+            NoopManager(),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+            rounds=3,
+        )
+    assert seen == [1, 2, 3]
+    assert caught.value.__cause__ is failure
+    assert str(failure) == secret  # The kit explicitly permits the original connector cause.
+    diagnostic = AssertionError(*caught.value.args)
+    for note in getattr(caught.value, "__notes__", ()):
+        diagnostic.add_note(note)
+    assert_secret_absent(diagnostic, secret)
+    committed = read_committed(harness.store)
+    assert committed is not None
+    assert [event.round for event in committed[1] if event.type == "round_closed"] == [1, 2, 3]
+    assert [candidate.round for candidate in harness.candidates] == [1, 2, 3]
+    for event in committed[1]:
+        assert_secret_absent(RuntimeError(event.model_dump_json()), secret)
+
+
+async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import Fenced
+
+    failure = _core_error(Fenced, "run ownership lost")
+
+    async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    with pytest.raises(Fenced) as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert caught.value is not failure
+    assert caught.value.args == ("run ownership lost",)
+
+
+async def test_check_manager_surfaces_manager_exception() -> None:
+    with pytest.raises(AssertionError, match="raised RuntimeError") as caught:
+        await check_manager(_RaisingManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert str(caught.value) == "manager raised RuntimeError"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize("result", [None, "done", RoundReport.model_construct(summary=123)])
+async def test_check_manager_rejects_invalid_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    result: object,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    async def run_round(self: Manager, ctx: AgentContext) -> object:
+        return result
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    with pytest.raises(AssertionError, match="manager raised AssertionError") as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+    assert "Manager.run_round() must return" in str(caught.value.__cause__)
+
+
+async def test_check_manager_returns_detached_reports_and_resets_round_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    original = RoundReport(summary="done")
+    seen: list[int] = []
+
+    async def run_round(self: Manager, ctx: AgentContext) -> RoundReport:
+        seen.append(ctx.round)
+        await ctx.run_tool({"x": float(ctx.round)})
+        return original
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    reports = await check_manager(
+        Ref.of(NoopManager()),
+        goal=GOAL,
+        tool=Ref.of(FunctionTool("_fakes.tools:square")),
+        rounds=2,
+        limits=Limits(max_tool_runs_per_round=1),
+    )
+    assert seen == [1, 2]
+    assert all(
+        report == original and report is not original and type(report) is RoundReport
+        for report in reports
+    )
+
+
+async def test_check_manager_limit_reached_ends_only_the_round() -> None:
+    reports = await check_manager(
+        ScriptedManager(
+            [
+                {"inputs": {"x": 1.0}, "round": 1},
+                {"inputs": {"x": 2.0}, "round": 1},
+                {"inputs": {"x": 3.0}, "round": 2},
+                {"inputs": {"x": 4.0}, "round": 2},
+            ]
+        ),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        rounds=2,
+        limits=Limits(max_tool_runs_per_round=1),
+    )
+    assert reports == [RoundReport(), RoundReport()]
+
+
+@pytest.mark.parametrize("status", [status for status in RunStatus if status != RunStatus.OK])
+async def test_check_manager_preserves_all_non_ok_tails(
+    status: RunStatus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = with_stderr(status, "manager stderr marker")
+
+    async def submit(self: LocalExecutor, job: Job) -> ToolOutput:
+        return output
+
+    monkeypatch.setattr(LocalExecutor, "submit", submit)
+    with pytest.warns(UserWarning, match="manager stderr marker") as caught:
+        reports = await check_manager(
+            ScriptedManager([{"inputs": {"x": 1.0}}]),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+        )
+    assert reports == [RoundReport(summary="ran 1 of 1 requests")]
+    assert len(caught) == 1
+    assert f"status {status}" in str(caught[0].message)
+
+
+async def test_check_manager_exception_keeps_original_cause_and_failed_run_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    async def run_round(self: Manager, ctx: AgentContext) -> RoundReport:
+        await ctx.run_tool({})
+        raise RuntimeError("manager-secret-sentinel")
+
+    monkeypatch.setattr(NoopManager, "run_round", run_round)
+    tool = PyTool({"code": "import sys; sys.stderr.write('original stderr marker'); sys.exit(1)"})
+    with pytest.raises(AssertionError, match="manager raised RuntimeError") as caught:
+        await check_manager(NoopManager(), goal=GOAL, tool=tool)
+    assert str(caught.value) == "manager raised RuntimeError"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "original stderr marker" in notes_of(caught.value.__cause__)
+    assert "manager-secret-sentinel" in str(caught.value.__cause__)

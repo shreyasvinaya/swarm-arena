@@ -357,7 +357,7 @@ async def test_collect_exception_becomes_error(
 ) -> None:
     out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=BadCollectTool))
     assert out.status is RunStatus.ERROR
-    assert b"collect broke" in log(tmp_path, out, 2)
+    assert log(tmp_path, out, 2) == b"swarm-arena: collect failed: RuntimeError\n"
     assert out.started_at is not None  # the executor stamps the run times itself
     assert out.ended_at is not None
     assert out.started_at <= out.ended_at

@@ -7,6 +7,7 @@ from typing import Annotated, Any, Final, cast
 import anyio
 from pydantic import ConfigDict, Field
 
+from swarm_arena._errors import _core_error
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local_run import _NOT_AN_OUTPUT as _NOT_AN_OUTPUT
@@ -181,7 +182,7 @@ class LocalExecutor(Executor):
         >>> LocalExecutor().preflight()
         """
         if os.name != "posix":
-            raise RuntimeError("LocalExecutor needs a POSIX system")
+            raise _core_error(RuntimeError, "LocalExecutor needs a POSIX system")
 
     async def capacity(self) -> Resources:
         """
@@ -221,12 +222,14 @@ class LocalExecutor(Executor):
         jobs) or from its raw ``swarm/result.json`` (command jobs), bounded
         to 30 seconds after collection starts. Cancellation waits for that
         same in-flight collect until its original deadline. A collect
-        that raises (including ``SystemExit``), or returns anything but a ``ToolOutput`` that passes
-        validation again (``model_copy`` and ``model_construct`` skip it), is a
+        that raises an ordinary exception or ``SystemExit``, or returns anything
+        but a ``ToolOutput`` that passes validation again (``model_copy`` and
+        ``model_construct`` skip it), is a
         collect failure: status ERROR after a normal exit, with the reason in
         the stderr log. ``SystemExit`` from ``Tool.command`` also gives ERROR
-        without starting the command. KeyboardInterrupt and cancellation
-        propagate. A stopped run's output has the stop status: after a
+        without starting the command. KeyboardInterrupt, cancellation,
+        exception groups, and Fenced propagate unchanged for the engine or
+        direct caller to classify. A stopped run's output has the stop status: after a
         timeout it is the output collected before SIGKILL, with
         ``partial=True`` when that collect returned a valid ``ToolOutput``
         that says it is partial or keeps data or files, also when those

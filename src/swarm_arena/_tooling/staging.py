@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from pathlib import PurePosixPath
 from typing import Any
 
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_error, _core_signal
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry
@@ -14,6 +14,7 @@ from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import ParentRef, check_parent_id, is_stored_edit_ref
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.paths import (
     PARENT_DATA,
@@ -26,6 +27,7 @@ from swarm_arena._tooling.paths import (
     matches,
     parent_data_conflicts,
 )
+from swarm_arena._tooling.result_file import CandidateOutputFile, CandidateRequestFile
 from swarm_arena._tooling.result_file import request_json as _request_json
 
 
@@ -53,7 +55,10 @@ def fixed_config(ref: Ref, entry: CatalogEntry | None) -> dict[str, Any]:
     _, config = ref._resolve_config(Configurable)
     try:
         result = config.model_dump(mode="json")
-    except Exception:
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
         raise ValueError(f"{ref.path}: cannot serialize config") from None
     return {
         key: value for key, value in result.items() if entry is None or key not in entry.settable
@@ -173,7 +178,7 @@ def validate_edits(
         if reason:
             errors.append(f"{_shown(path)}: {reason}")
     if errors:
-        raise SoftError("\n".join(errors))
+        raise _core_signal(SoftError("\n".join(errors)))
 
 
 def _check_live_edits(edits: Mapping[str, str]) -> None:
@@ -357,14 +362,15 @@ def tool_root(goal_files: Mapping[str, str], tool_files: Mapping[str, str]) -> d
     for layer, files in (("goal", goal_files), ("tool", tool_files)):
         if conflicts := fold_conflicts(files):
             first, second = conflicts[0]
-            raise ConfigError(f"{layer} files conflict: {first} and {second}")
+            raise _core_error(ConfigError, f"{layer} files conflict: {first} and {second}")
     root = {**goal_files, **tool_files}
     if conflicts := fold_conflicts(root):
         first, second = conflicts[0]
         hint = "; spell a replaced goal file exactly as the goal does"
-        raise ConfigError(
+        raise _core_error(
+            ConfigError,
             f"tool files do not fit the goal files: conflicting workspace path: {first} and "
-            f"{second}{hint if _respelled(first, second) else ''}"
+            f"{second}{hint if _respelled(first, second) else ''}",
         )
     return root
 
@@ -461,10 +467,10 @@ def plan_tool_stage(
     root = tool_root(goal_files, tool_files)
     for path in root:
         if fold_key(path) in private_paths:
-            raise RuntimeError(f"private path in tool root: {path}")
+            raise _core_error(RuntimeError, f"private path in tool root: {path}")
     for path in edits:
         if not editable_here(path):
-            raise RuntimeError(f"edit path not editable here: {path}")
+            raise _core_error(RuntimeError, f"edit path not editable here: {path}")
     overlay: dict[str, str] = {}
     warnings: list[str] = []
     if parents and parents[0].overlay:
@@ -491,7 +497,9 @@ def plan_tool_stage(
     root = fold_merge(root, overlay)
     collisions = _layout_collisions(edits, root.keys())
     if collisions:
-        raise SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
+        raise _core_signal(
+            SoftError("\n".join(f"{path}: {reason}" for path, reason in collisions.items()))
+        )
     overlay.update(edit_hashes(edits))
     root = fold_merge(root, overlay)
     return Job.Stage(root=root, parents=list(parents), request_json=request_json), overlay, warnings
@@ -546,19 +554,21 @@ def plan_script_stage(
     return Job.Stage(
         root=dict(own_files),
         candidate=Job.CandidateFiles(
-            request={
-                **_request_json(candidate.request),
-                "schema_version": CURRENT["candidate_request"],
-                "parents": candidate.parent_ids,
-            },
-            output={
-                "schema_version": CURRENT["candidate_output"],
-                "status": output.status.value,
-                "partial": output.partial,
-                "data": output.data,
-                "usage": output.usage.model_dump(mode="json"),
-                "files": [file.path for file in output.files],
-            },
+            request=CandidateRequestFile.model_validate(
+                {
+                    **_request_json(candidate.request),
+                    "schema_version": CURRENT["candidate_request"],
+                    "parents": candidate.parent_ids,
+                }
+            ).model_dump(mode="json"),
+            output=CandidateOutputFile(
+                schema_version=CURRENT["candidate_output"],
+                status=output.status,
+                partial=output.partial,
+                data=output.data,
+                usage=output.usage,
+                files=[file.path for file in output.files],
+            ).model_dump(mode="json"),
             files=fold_merge(
                 effective_files,
                 {file.path: file.sha256 for file in output.files},

@@ -130,19 +130,21 @@ async def test_collection_context_is_daemon_local_and_always_reset(
 ) -> None:
     runner, run = runner_for(tmp_path, 17)
     seen: list[tuple[int | None, bool]] = []
+    error = None if failure is None else failure()
 
     def collect(*args: Any) -> ToolOutput:
         seen.append((result_file._OUTPUT_BYTE_LIMIT.get(), threading.current_thread().daemon))
-        if failure is not None:
-            raise failure()
+        if error is not None:
+            raise error
         return ToolOutput(status=RunStatus.OK)
 
     def invoke() -> None:
         token = result_file._OUTPUT_BYTE_LIMIT.set(91)
         try:
             if failure in (KeyboardInterrupt, asyncio.CancelledError):
-                with pytest.raises(failure):
+                with pytest.raises(failure) as caught:
                     runner._collect(run)
+                assert caught.value is error
             else:
                 output = runner._collect(run)
                 assert (output is None) == (failure is not None)

@@ -8,8 +8,12 @@ import anyio
 import pytest
 from _fakes.secrecy import assert_secret_absent
 
+from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._tooling.result_file import (
+    CandidateOutputFile,
+    CandidateRequestFile,
+    RequestFile,
     ToolResultFile,
     command_output_from_result,
     note_in_log,
@@ -88,6 +92,26 @@ def test_request_json_shape() -> None:
         "round_overrides": {"epochs": 100},
         "replicate": 1,
     }
+
+
+@pytest.mark.parametrize("model", [RequestFile, CandidateRequestFile, CandidateOutputFile])
+@pytest.mark.parametrize("version", [99, 0, True, "private-envelope-sentinel"])
+def test_workspace_model_versions_are_safe(model: type[StoredModel], version: object) -> None:
+    secret = "private-envelope-sentinel"
+    with pytest.raises(ValueError, match="schema_version") as caught:
+        model.model_validate_json(
+            json.dumps({"schema_version": version, "params": {secret: secret}})
+        )
+    assert_secret_absent(caught.value, secret, sanitized=True)
+
+
+@pytest.mark.parametrize("model", [RequestFile, CandidateRequestFile, CandidateOutputFile])
+def test_workspace_model_fields_are_safe(model: type[StoredModel]) -> None:
+    secret = "private-envelope-sentinel"
+    field = "data" if model is CandidateOutputFile else "params"
+    with pytest.raises(ValueError, match=field) as caught:
+        model.model_validate({field: {secret: object()}})
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 def test_ok_with_valid_result(tmp_path: Path) -> None:

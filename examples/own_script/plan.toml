@@ -1,0 +1,49 @@
+rationale = "Fit a line by sharing editable model files across two rounds."
+policy = {path = "swarm_arena:KeepTopTeams", config = {k = 1}}
+
+[goal]
+id = "line-fit"
+namespace = "toy"
+description = "Fit slope and intercept to public points, then score held-out points."
+files = ["problem/*.txt", "problem/run.py"]
+
+[[teams]]
+name = "fit"
+rationale = "Tune one coefficient at a time and preserve the earlier edit."
+
+[[teams.agents]]
+name = "tuner-1"
+rationale = "Set the slope in the first round."
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [{round = 1, edits = {"problem/model_a.txt" = "slope = 2.0\n"}}]}}
+
+[teams.agents.tool]
+path = "swarm_arena:ScriptTool"
+[teams.agents.tool.config]
+command = ["python", "problem/run.py"]
+editable = ["problem/model_*.txt"]
+params = {scale = {type = "number", minimum = 0.1, maximum = 10.0, default = 1.0}}
+
+[[teams.agents]]
+name = "tuner-2"
+rationale = "Build on the best first-round model and set the intercept."
+manager = {path = "swarm_arena:ScriptedManager", config = {requests = [{round = 2, parents = "best", edits = {"problem/model_b.txt" = "intercept = 1.0\n"}}]}}
+
+[teams.agents.tool]
+path = "swarm_arena:ScriptTool"
+[teams.agents.tool.config]
+command = ["python", "problem/run.py"]
+editable = ["problem/model_*.txt"]
+params = {scale = {type = "number", minimum = 0.1, maximum = 10.0, default = 1.0}}
+
+[[checks]]
+path = "swarm_arena:ScriptCheck"
+config = {command = ["python", "checks/check.py"], files = ["checks/check.py"]}
+
+[[judges]]
+name = "mse"
+path = "swarm_arena:ScriptJudge"
+config = {command = ["python", "judge/score.py"], files = ["judge/score.py", "judge/hidden/*.csv"], direction = "min"}
+
+[converge]
+mode = "select"
+top_n = 1

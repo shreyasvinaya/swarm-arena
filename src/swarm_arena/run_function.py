@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import importlib
-import json
 import os
 import sys
 import tempfile
@@ -14,10 +13,13 @@ from typing import NoReturn
 
 from pydantic import ValidationError
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
+from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._tooling.function_tool import _load_function, function_input_model
+from swarm_arena._tooling.result_file import RequestFile
 
 
 class _Parser(argparse.ArgumentParser):
@@ -85,6 +87,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             args = parser.parse_args(argv)
         except SystemExit as exc:
             return 0 if exc.code == 0 else 1
+        reason = "cannot read swarm/request.json"
+        try:
+            request = RequestFile.model_validate_json((swarm_dir / "request.json").read_bytes())
+        except ValidationError as exc:
+            print(f"{reason}: {validation_summary(exc)}", file=sys.stderr)
+            return 1
         if args.import_root is not None:
             sys.path.insert(0, args.import_root)
         reason = f"cannot import {args.function}"
@@ -92,17 +100,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Import here before the driver loader sanitizes exception values.
             importlib.import_module(args.function.split(":", 1)[0])
         except (Exception, SystemExit) as exc:
-            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
             traceback.print_exception(exc, file=sys.stderr)
             return 1
         fn = _load_function(args.function)
         reason = f"FunctionTool {args.function}: unsupported function signature"
         model = function_input_model(fn)
-        reason = "cannot read swarm/request.json"
-        request = json.loads((swarm_dir / "request.json").read_bytes())
         reason = f"FunctionTool {args.function}: invalid request params"
         try:
-            inputs = model.model_validate(request["params"])
+            inputs = model.model_validate(request.params)
         except ValidationError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -110,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = fn(**{name: getattr(inputs, name) for name in type(inputs).model_fields})
         except (Exception, SystemExit) as exc:
-            print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+            print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
             traceback.print_exception(exc, file=sys.stderr)
             return 1
         if not isinstance(result, dict):
@@ -124,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_result(payload, result_path)
         return 0
     except (Exception, SystemExit) as exc:
-        print(f"{reason} ({type(exc).__name__})", file=sys.stderr)
+        print(f"{reason} ({_exception_type_name(exc)})", file=sys.stderr)
         return 1
 
 

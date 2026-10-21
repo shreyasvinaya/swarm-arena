@@ -100,6 +100,12 @@ def test_current_kinds() -> None:
         "tool_result": 1,
         "check_result": 1,
         "judge_result": 1,
+        "event": 1,
+        "segment": 1,
+        "owner": 1,
+        "frontier": 1,
+        "manifest": 1,
+        "solution": 1,
     }
 
 

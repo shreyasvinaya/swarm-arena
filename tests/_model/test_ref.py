@@ -1,5 +1,6 @@
 import importlib
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, Literal
 
@@ -38,6 +39,51 @@ def test_path_format() -> None:
     assert Ref(path="a.b:C.D").path == "a.b:C.D"
     with pytest.raises(ValidationError):
         Ref(path="nocolon")
+
+
+def test_is_ref_path_agrees_with_ref_validation() -> None:
+    from swarm_arena._model.ref import is_ref_path
+
+    samples = [
+        "demo:Thing",
+        "demo.sub:Outer.Inner",
+        "_demo:_Thing",
+        "aé:bλ",
+        "review_a\u0301:Policy",
+        "demo:Poli\u0301cy",
+        "demo.su\u0301b:Outer.Inne\u0301r",
+        "a\u200c:b\u2160",
+        "",
+        "demo",
+        ":Thing",
+        "demo:",
+        "demo:Thing:Other",
+        "demo:Thing/other",
+        "0demo:Thing",
+        "demo.0thing:Thing",
+        "demo:0Thing",
+        "demo:Outer.0Inner",
+        "é:Thing",
+        "demo:\u0301Thing",
+        "demo..sub:Thing",
+        "demo:Outer..Inner",
+    ]
+    for path in samples:
+        for candidate in (path, path + "\n", path + "\r\n", " " + path, path + "\x00"):
+            try:
+                Ref(path=candidate)
+            except ValidationError:
+                accepted = False
+            else:
+                accepted = True
+            assert is_ref_path(candidate) is accepted, ascii(candidate)
+
+
+@pytest.mark.parametrize("value", [None, 1, True, b"demo:Thing", [], {}])
+def test_is_ref_path_requires_a_string(value: object) -> None:
+    from swarm_arena._model.ref import is_ref_path
+
+    assert not is_ref_path(value)
 
 
 def test_of_instance_and_class() -> None:
@@ -528,3 +574,14 @@ def test_reference_of_never_drops_explicit_null_with_nonnull_default(
     monkeypatch.setattr(Widget, "Config", Config)
     with pytest.raises(ValueError, match="null"):
         Ref.of(Widget(Config(timeout_s=None)))
+
+
+def test_sync_import_preserves_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._model.ref import load_object
+
+    (tmp_path / "pr1_r3_interrupt.py").write_text("raise KeyboardInterrupt\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(KeyboardInterrupt):
+        load_object("pr1_r3_interrupt:Tool")
