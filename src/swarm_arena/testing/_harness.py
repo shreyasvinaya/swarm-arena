@@ -17,8 +17,8 @@ from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, command_journal, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.digest import build_digest
-from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
@@ -144,11 +144,11 @@ class OfflineHarness:
         self.candidates, self.learnings = [], []
         self.manager_errors = []
         root = await anyio.to_thread.run_sync(self._run_folder)
-        self.store = LocalStore(root / "local")
+        self.store = LocalStore(root / "runs" / "local")
         config = config.model_copy(
             update={
                 "limits": limits,
-                "run_root": str(root),
+                "run_root": str(root / "runs"),
                 "artifact_root": _artifact_root(),
             }
         )
@@ -204,8 +204,6 @@ class OfflineHarness:
             )
             ledger.open_goal(goal.id)
             await journal.append_durable(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
-            board = RunBoard(run_id="local", run_root=str(root), head=lambda: journal.head)
-            board.register_goal(goal.key(), goal.id, None)
             spec = AgentSpec(
                 name="agent",
                 rationale="Offline manager check",
@@ -215,57 +213,78 @@ class OfflineHarness:
             team = TeamSpec(name="team", rationale="Offline manager check", agents=[spec])
             address = f"{goal.id}/team/agent"
             round_spec = RoundSpec()
-            view = await anyio.to_thread.run_sync(
-                board.snapshot,
-                goal.key(),
-                await anyio.to_thread.run_sync(board.frontier),
+            plan = Plan(goal=goal, teams=[team], judges=[ref for ref, _ in built_judges])
+            await journal.append_durable(
+                EventDraft(
+                    type=EventType.PLAN_REVISION,
+                    goal_id=goal.id,
+                    payload={
+                        "plan": plan.model_dump(mode="json"),
+                        "origin": "human",
+                        "first_round": 1,
+                        "preflight_complete": True,
+                    },
+                )
             )
-            rt = AgentRuntime(
-                address=address,
-                holder=address,
-                goal_id=goal.id,
-                goal=goal,
-                goal_key=goal.key(),
-                part=None,
-                team=team,
-                spec=spec,
-                round=1,
-                round_spec=round_spec,
-                fidelity=round_spec.effective_fidelity(),
-                tool=built_tool,
-                tool_ref=base_ref,
-                execution_ref=execution_ref,
-                tool_identity=tool_identity(base_ref, None),
-                catalog_entry=None,
-                checks=[],
-                view=view,
-                own=[],
-                digest="",
-                notes="",
-                ledger=ledger,
-                tranche=self._tranche(ledger, address, goal.id, limits),
-                limits=limits,
-                counters=AgentCounters(),
-                repeats=RepeatIndex("local"),
-                watchdog=Watchdog(limits),
-                journal=journal,
-                board=board,
-                executor=executor,
-                artifacts=_artifacts(),
-                ids=ids,
-                config=config,
-                resumed=(),
-                rankings={"": ranking},
-                private_paths=judge_private_paths(
-                    Plan(
-                        goal=goal,
-                        teams=[team],
-                        judges=[ref for ref, _ in built_judges],
-                    )
-                ),
-            )
-            with track_inflight(Inflight()):
-                reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
+            board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
+            try:
+                await anyio.to_thread.run_sync(
+                    board.open, "local", str(root / "runs"), [goal.namespace]
+                )
+                view = await anyio.to_thread.run_sync(
+                    board.snapshot,
+                    goal.key(),
+                    await anyio.to_thread.run_sync(board.frontier),
+                )
+                rt = AgentRuntime(
+                    address=address,
+                    holder=address,
+                    goal_id=goal.id,
+                    goal=goal,
+                    goal_key=goal.key(),
+                    part=None,
+                    team=team,
+                    spec=spec,
+                    round=1,
+                    round_spec=round_spec,
+                    fidelity=round_spec.effective_fidelity(),
+                    tool=built_tool,
+                    tool_ref=base_ref,
+                    execution_ref=execution_ref,
+                    tool_identity=tool_identity(base_ref, None),
+                    catalog_entry=None,
+                    checks=[],
+                    view=view,
+                    own=[],
+                    digest="",
+                    notes="",
+                    ledger=ledger,
+                    tranche=self._tranche(ledger, address, goal.id, limits),
+                    limits=limits,
+                    counters=AgentCounters(),
+                    repeats=RepeatIndex("local"),
+                    watchdog=Watchdog(limits),
+                    journal=journal,
+                    board=board,
+                    executor=executor,
+                    artifacts=_artifacts(),
+                    ids=ids,
+                    config=config,
+                    resumed=(),
+                    rankings={"": ranking},
+                    private_paths=judge_private_paths(
+                        Plan(
+                            goal=goal,
+                            teams=[team],
+                            judges=[ref for ref, _ in built_judges],
+                        )
+                    ),
+                )
+                with track_inflight(Inflight()):
+                    reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(board.close)
         notes = await anyio.to_thread.run_sync(_failed_runs, executor.outputs)
         if self.manager_errors:
             for error in self.manager_errors:
@@ -342,6 +361,7 @@ class OfflineHarness:
                 digest=build_digest(
                     view,
                     goal=rt.goal_key,
+                    run_id="local",
                     round=number,
                     ranking=ranking,
                     cap_tokens=rt.limits.digest_tokens,

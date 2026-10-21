@@ -1237,3 +1237,32 @@ class ArenaView(BoardView):
                 return {c.id: c for c, _ in self._cache.candidates(self._frontier, ids=selected)}
 
             return _lineage(read, candidate_id)
+
+
+def past_run_repeat_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate]]:
+    """
+    Read other-run repeat hints from an arena snapshot's namespace projection.
+
+    Parameters
+    ----------
+    view : BoardView
+        Fixed snapshot; other board implementations have no arena repeat hints.
+    run_id : str
+        Owning run excluded from the returned entries.
+
+    Returns
+    -------
+    list[tuple[str, Candidate]]
+        Stored repeat keys and candidates in committed position order.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> past_run_repeat_entries(Mock(spec=BoardView), "r")
+    []
+    """
+    if not isinstance(view, ArenaView):
+        return []
+    return view._cache.repeat_entries(
+        view._frontier, goal_key=goal_key_digest(view.goal), exclude_run=run_id
+    )

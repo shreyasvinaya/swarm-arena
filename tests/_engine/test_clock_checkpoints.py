@@ -36,7 +36,11 @@ class SlowManager(ScriptedManager):
 
 async def clock_driver(root: Path, phase: str) -> None:
     cfg = with_executor(
-        RunConfig(run_root=str(root / "runs"), artifact_root=str(root / "artifacts")),
+        RunConfig(
+            run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
+            artifact_root=str(root / "artifacts"),
+        ),
         workspace_root=str(root / "ws"),
     )
     p = _plan(

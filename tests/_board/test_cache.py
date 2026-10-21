@@ -2356,3 +2356,26 @@ def test_nested_reads_keep_sets_until_outer_exit(
     assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
     assert not cache._conn.in_transaction
     cache.close()
+
+
+def test_repeat_entries_filter(tmp_path: Path) -> None:
+    from swarm_arena import Goal
+
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    runs = [FakeRun(str(tmp_path / "runs"), name) for name in ("r1", "r2")]
+    runs.append(FakeRun(str(tmp_path / "runs"), "r3", goal=Goal(id="other", namespace="toy")))
+    for run in runs:
+        run.commit(
+            run.plan(),
+            run.candidate(f"{run.run_id}-key", repeat_key="key"),
+            run.candidate(f"{run.run_id}-none"),
+        )
+    frontier = build_frontier([(run.run_id, run.run_root, run.heads[-1]) for run in runs], [], [])
+    runs[1].commit(runs[1].candidate("later", repeat_key="later"))
+    for run in runs:
+        ingest_run(cache, run.store, run.run_id, run.run_root, run.heads[-1])
+    entries = cache.repeat_entries(
+        frontier, goal_key=goal_key_digest(runs[0].goal.key()), exclude_run="r1"
+    )
+    assert [(key, candidate.id) for key, candidate in entries] == [("key", "r2-key")]
+    cache.close()

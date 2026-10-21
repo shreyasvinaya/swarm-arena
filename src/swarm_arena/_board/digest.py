@@ -45,6 +45,7 @@ def build_digest(
     view: BoardView,
     *,
     goal: GoalKey,
+    run_id: str,
     round: int,
     ranking: str,
     cap_tokens: int,
@@ -57,7 +58,7 @@ def build_digest(
     the first leaderboard row. The omitted-learning count is updated on every
     drop. If the remaining layout cannot fit, only the count line is returned,
     cut at a complete UTF-8 character boundary. The recent count covers visible
-    learnings from the single run identified by the snapshot frontier, created
+    learnings from the explicit owning run, created
     in the round that just ended. It is omitted when starting round one.
 
     Parameters
@@ -66,6 +67,8 @@ def build_digest(
         Fixed goal snapshot with namespace-wide learning reads.
     goal : GoalKey
         Snapshot goal identity.
+    run_id : str
+        Owning run, independent of frontier ordering or membership.
     round : int
         Round being started, numbered from one. Count this run's visible
         learnings from round minus one, across all goals in the namespace.
@@ -88,36 +91,27 @@ def build_digest(
 
     Examples
     --------
-    >>> from swarm_arena import Goal
-    >>> from swarm_arena._board.run_board import RunBoard
-    >>> key = Goal(id="g", namespace="n").key()
-    >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: None)
-    >>> board.register_goal(key, "g", None)
-    >>> build_digest(board.snapshot(key, board.frontier()), goal=key,
-    ...              round=1, ranking="program", cap_tokens=1500)
-    'No results yet. 0 learnings.'
-    >>> from swarm_arena.board import Learning
-    >>> from swarm_arena._journal.lease import Head
-    >>> head = Head(epoch=1, seq=1, segment="journal/e1-1.jsonl")
-    >>> board = RunBoard(run_id="r", run_root="/runs", head=lambda: head)
-    >>> board.register_goal(key, "g", None)
-    >>> learning = Learning(id="L-1", namespace="n", run_id="r", goal_id="g",
-    ...     round=1, author="human:a", title="Use the baseline", text="Start here")
-    >>> board.put_learning(learning, epoch=1, seq=1)
-    >>> digest = build_digest(board.snapshot(key, board.frontier()), goal=key,
-    ...                       round=2, ranking="program", cap_tokens=1500)
-    >>> digest.splitlines()[-1]
-    '0 more learnings, 1 new since the last round. Use search_learnings.'
+    Reuse the public in-memory board example without storage:
+
+    >>> from doctest import script_from_examples
+    >>> from swarm_arena.board import BoardView
+    >>> exec(script_from_examples(BoardView.__doc__))
+    >>> digest = build_digest(view, goal=view.goal, run_id="r", round=2,
+    ...                       ranking="program", cap_tokens=1500)
+    >>> len(digest.encode("utf-8")) <= 1500
+    True
     """
     if cap_tokens < 0:
         raise ValueError("digest byte cap must be nonnegative")
     rows = view.leaderboard(goal, judge=ranking)[: max(0, k)]
-    learnings = view.learnings(goal.namespace, goal=goal, limit=sys.maxsize)
+    learnings = view.learnings(goal.namespace, limit=sys.maxsize)
     if not rows and not learnings:
         return _clip("No results yet. 0 learnings.", cap_tokens)
-    run_id = next((mark.run_id for mark in view.frontier.marks), None)
     round_count = (
-        sum(item.run_id == run_id and item.round == round - 1 for item in learnings)
+        sum(
+            item.run_id == run_id and item.round == round - 1
+            for item in view.learnings(goal.namespace, limit=sys.maxsize)
+        )
         if round > 1
         else 0
     )

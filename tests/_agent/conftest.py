@@ -22,7 +22,7 @@ from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
@@ -97,8 +97,8 @@ async def rt_env(
                 payload={"round": 1, "shares": {h: a.model_dump() for h, a in grants.items()}},
             )
         )
-        board = RunBoard(run_id=run_id, run_root=config.run_root, head=lambda: journal.head)
-        board.register_goal(goal.key(), "g", None)
+        board = ArenaBoard(arena_root=config.arena_root, cache_dir=str(tmp_path / "cache"))
+        board.open(run_id, config.run_root, ["n"])
         executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
         round_spec = RoundSpec()
         rt = AgentRuntime(
@@ -142,6 +142,7 @@ async def rt_env(
             try:
                 yield RtEnv(rt, store, board, tmp_path / "marker", RecordingExecutor(), registry)
             finally:
+                board.close()
                 await executor.aclose()
 
 

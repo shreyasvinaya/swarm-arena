@@ -141,8 +141,9 @@ class AgentRuntime:
     resumed : tuple[Candidate, ...]
         Own committed candidates of a restarted round.
     rankings : Mapping[str, str], optional
-        Group to ranking judge name; the round runner fills the own group from
-        Plan.ranking_name() or the part ranking. The main group key is empty.
+        Group to ranking judge name for all declared current groups. The main group key is empty.
+    sibling_views : Mapping[str, BoardView], optional
+        Fixed declared sibling capabilities; the main group key is empty.
     started_runs : int, default=0
         Starts whose durable tool_start returned in this round. On resume the
         runner restores the current goal/team/agent/round count from committed
@@ -204,3 +205,4 @@ class AgentRuntime:
     seed_parents: tuple[str, ...] = ()
     private_paths: frozenset[str] = frozenset()
     rankings: Mapping[str, str] = field(default_factory=dict)
+    sibling_views: Mapping[str, BoardView] = field(default_factory=dict)

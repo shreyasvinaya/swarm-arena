@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   avoiding frontier-set rebuilds for each visited candidate.
 - Arena views reuse committed replay checkpoints and memoize per-run plan
   resolution, avoiding history replay on unchanged reads and sibling lookups.
+- Runs now default to the shared arena board, with fixed sibling rankings and
+  scored past-run repeat hints; the offline manager harness uses an isolated arena.
+
 - Arena cache reads release temporary membership and ID selections on outermost
   exit, including failures, while preserving nested-read membership.
 - `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling views, current producing-key rankings, hidden-safe learning counts, and lazy XDG-aware local caches; empty human objects retain durable coverage.

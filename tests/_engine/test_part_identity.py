@@ -24,7 +24,7 @@ from swarm_arena import (
     ScriptedManager,
     Swarm,
 )
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
@@ -142,6 +142,7 @@ async def part_driver(root: Path, kind: str, crash: bool) -> None:
     cfg = with_executor(
         RunConfig(
             run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
             artifact_root=str(root / "artifacts"),
             planner_catalog=PlannerCatalog(entries=entries),
         ),
@@ -204,9 +205,11 @@ async def test_current_part_identity_controls_join_and_board(
     store = LocalStore(Path(cfg.run_root) / "part")
     committed = read_committed(store)
     assert committed
-    board = RunBoard.from_state(state, run_root=cfg.run_root, head=lambda: committed[0].head)
+    board = ArenaBoard(arena_root=cfg.arena_root, cache_dir=str(tmp_path / "cache"))
+    board.open("part", cfg.run_root, ["n"])
     key = state.plans["g"][-1][0].parts[0].goal.key()
     view = board.snapshot(key, board.frontier())
     assert [c.id for c in view.best(key, 5, judge="y")] == [new.id]
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(KeyError):
         view.get_candidate(old.id)
+    board.close()

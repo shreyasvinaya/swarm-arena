@@ -1,4 +1,5 @@
 import dataclasses
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -676,7 +677,9 @@ async def test_hook_failures_do_not_expose_values(
         assert rt_env.events("reserve") == []
 
 
-async def test_past_run_parent_and_overlay_warning_are_retained(rt_env: RtEnv) -> None:
+async def test_past_run_parent_and_overlay_warning_are_retained(
+    rt_env: RtEnv, tmp_path: Path
+) -> None:
     from _fakes.tools import cand
 
     parent = cand(
@@ -685,7 +688,13 @@ async def test_past_run_parent_and_overlay_warning_are_retained(rt_env: RtEnv) -
         tool_identity="another-tool",
         overlay={"notes.txt": rt_env.rt.artifacts.put_bytes(b"notes")},
     )
-    rt_env.board.put_candidate(parent, epoch=1, seq=1)
+    from _fakes.board import records
+    from _fakes.journals import FakeRun, add_pointer
+
+    past = FakeRun(str(tmp_path / "past"), "older-run", goal=rt_env.rt.goal)
+    parent = parent.model_copy(update={"goal_id": rt_env.rt.goal_id})
+    past.commit(past.plan(), *records(parent))
+    add_pointer(rt_env.rt.config.arena_root, past)
     rt = dataclasses.replace(
         rt_env.rt, view=rt_env.board.snapshot(rt_env.rt.goal_key, rt_env.board.frontier())
     )
@@ -885,7 +894,17 @@ async def test_part_runtime_routes_main_goal_and_retains_part_context(rt_env: Rt
 
     sha = rt_env.rt.artifacts.put_bytes(b"part content")
     goal = Goal(id="sub", namespace="n", files=FileSet(manifest={"part.txt": sha}))
-    rt_env.board.register_goal(goal.key(), "g", "part")
+    from swarm_arena import PartSpec, Plan
+    from swarm_arena._engine.goal import r0_revision_draft
+
+    plan = Plan(
+        goal=rt_env.rt.goal,
+        teams=[],
+        judges=[],
+        revision=1,
+        parts=[PartSpec(name="part", goal=goal)],
+    )
+    await rt_env.rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
     rt = dataclasses.replace(
         rt_env.rt,
         goal=goal,
@@ -1850,3 +1869,39 @@ async def test_runtime_config_and_identity_evaluation_use_daemon(
     assert len(result.candidates) == 1
     assert observed
     assert all(thread is not threading.main_thread() and thread.daemon for thread in observed)
+
+
+@pytest.mark.parametrize("scored", [False, True])
+async def test_past_run_hint_in_warnings(rt_env: RtEnv, tmp_path: "Path", scored: bool) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import RepeatIndex, repeat_key
+    from swarm_arena._board.arena import past_run_repeat_entries
+    from swarm_arena.tool import ToolRequest
+
+    rt = rt_env.rt
+    past = FakeRun(str(tmp_path / "past"), "past", goal=rt.goal)
+    key = repeat_key(
+        goal_key=rt.goal_key,
+        tool_ref=rt.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(ranking="rank"), past.candidate("past-c", repeat_key=key))
+    if scored:
+        past.commit(
+            past.score("old", "past-c", 8, judge="rank"),
+            past.score("new", "past-c", 0.25, judge="rank"),
+        )
+    add_pointer(rt.config.arena_root, past)
+    view = rt.board.snapshot(rt.goal_key, rt.board.frontier())
+    rt = dataclasses.replace(
+        rt,
+        view=view,
+        rankings={"": "rank"},
+        repeats=RepeatIndex(rt.repeats.run_id, past_run_repeat_entries(view, rt.repeats.run_id)),
+    )
+    result = await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert result.run_id == rt.repeats.run_id
+    assert result.warnings == [f"past-run match past-c: {'rank=0.25' if scored else 'unscored'}"]
+    assert rt.repeats.added == [(key, result)]

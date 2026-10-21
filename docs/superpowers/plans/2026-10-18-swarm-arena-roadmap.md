@@ -330,7 +330,7 @@ Rules [plan]:
 | `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3) | M1b +M2 +M3 | `tests/_engine/test_run.py` |
 | `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
-| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b | `tests/_engine/test_round.py` |
+| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
 | `_engine/stops.py` | Mid-round stop rules (§6.4); `ProviderStops`, the run's one provider-failure registry (M3, R4.13.10) | M1b +M3 | `tests/_engine/test_stops.py` |
 | `_engine/parts.py` | Part assignment, kept best of a part, join, re-join attempts (groups come from `_scoring/ranking.py`) | M1b | `tests/_engine/test_parts.py` |
 | `_engine/converge.py` | Select and team converge, final judge call | M1b | `tests/_engine/test_converge.py` |
@@ -383,7 +383,7 @@ Rules [plan]:
 | `testing/_contracts.py` | Result validation and shared return-type predicates | M1a | `tests/testing/test_conformance.py` |
 | `testing/_candidates.py` | `make_candidate` | M1a | `tests/testing/test_candidates.py` |
 | `testing/_artifacts.py` | `read_output_file`, `read_logs` | M1a | `tests/testing/test_artifacts.py` |
-| `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b | `tests/testing/test_harness.py` |
+| `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b +M2 | `tests/testing/test_harness.py` |
 | `testing/_fake_model.py` | `FakeModel`, `FakeTurn` (imports `agents` lazily) | M3 | `tests/testing/test_fake_model.py` |
 
 ### R3.2 Other test files (not 1:1 with a module)
@@ -396,6 +396,8 @@ Rules [plan]:
 | `tests/_agent/conftest.py` | Agent fixtures `rt_env` and `ctx_env`; M2 changes their board to `ArenaBoard` | M1b (+M2) |
 | `tests/_engine/conftest.py` | Engine fixture `env` (an `EngineEnv` on a real lease, journal, ledger, board, and executor); M2 Task 9 changes its board to `ArenaBoard` | M1b (+M2) |
 | `tests/_fakes/journals.py` | A committed run journal written without the engine; `FakeRun`, `add_pointer`, and cache observation helpers | M2 |
+| `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
+| `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |

@@ -15,7 +15,7 @@ from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._errors import Fenced
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -57,7 +57,7 @@ def take_over_retrying(store: Store, *, owner_id: str = "intruder") -> Lease:
 class RtEnv:
     rt: AgentRuntime
     run_store: LocalStore
-    board: RunBoard
+    board: ArenaBoard
     marker: Path
     spy: RecordingExecutor
     inflight: Inflight
@@ -233,18 +233,29 @@ class CtxEnv:
         self.counters, self.address = self.rt.counters, self.rt.address
         return AgentContext(self.rt, gate=gate)
 
-    def script_ctx(self) -> AgentContext:
+    async def script_ctx(self) -> AgentContext:
         files = {
             "problem/a.phyk": self.artifacts.put_bytes(b"a = 1\n"),
             "problem/run.py": self.artifacts.put_bytes(b"print(1)\n"),
         }
         goal = self.env.rt.goal.model_copy(update={"files": FileSet(manifest=files)})
-        self.env.board.register_goal(goal.key(), goal.id, None)
+        from swarm_arena import PartSpec, Plan
+        from swarm_arena._engine.goal import r0_revision_draft
+
+        plan = Plan(
+            goal=self.env.rt.goal,
+            teams=[],
+            judges=[],
+            revision=1,
+            parts=[PartSpec(name="script", goal=goal)],
+        )
+        await self.env.rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
         view = self.env.board.snapshot(goal.key(), self.env.board.frontier())
         return self.ctx(
             tool=ScriptTool(command=["python", "problem/run.py"], editable=["problem/a.phyk"]),
             goal=goal,
             goal_key=goal.key(),
+            part="script",
             view=view,
         )
 

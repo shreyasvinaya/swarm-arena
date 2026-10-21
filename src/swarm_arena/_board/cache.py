@@ -754,6 +754,45 @@ class ArenaCache:
                 )
             ]
 
+    def repeat_entries(
+        self, frontier: Frontier, *, goal_key: str, exclude_run: str
+    ) -> list[tuple[str, Candidate]]:
+        """
+        Read other-run repeat identities in committed position order.
+
+        Parameters
+        ----------
+        frontier : Frontier
+            Exactly covered snapshot.
+        goal_key : str
+            Immutable producing goal-key digest.
+        exclude_run : str
+            Owning run to exclude.
+
+        Returns
+        -------
+        list[tuple[str, Candidate]]
+            Stored repeat keys and independent candidates, including all statuses.
+
+        Examples
+        --------
+        >>> from tempfile import TemporaryDirectory
+        >>> with TemporaryDirectory() as root:
+        ...     cache = ArenaCache(Path(root) / "toy.sqlite")
+        ...     cache.repeat_entries(Frontier(), goal_key="key", exclude_run="r")
+        ...     cache.close()
+        []
+        """
+        with self._lock, self._frontier(frontier):
+            rows = self._conn.execute(
+                "SELECT i.repeat_key, i.json FROM candidates i "
+                + self._member_join("candidates", "i")
+                + " WHERE i.part_key=? AND i.run_id!=? AND i.repeat_key IS NOT NULL"
+                + " ORDER BY i.ts, i.run_id, i.seq, i.id",
+                (goal_key, exclude_run),
+            ).fetchall()
+            return [(key, Candidate.model_validate_json(data)) for key, data in rows]
+
     def scores(
         self,
         frontier: Frontier,

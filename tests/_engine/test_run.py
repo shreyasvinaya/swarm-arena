@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import anyio
 import pytest
 from _fakes.engine import take_over_retrying, with_executor, with_limits
+from _fakes.finished import FinishedRun, run_again
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
@@ -434,3 +435,230 @@ async def test_fenced_remains_bare_when_executor_shutdown_fails(
     with pytest.raises(Fenced) as caught:
         await Swarm(run_config).run(plan())
     assert type(caught.value) is Fenced
+
+
+async def test_default_board_is_arena(finished_run: FinishedRun) -> None:
+    from swarm_arena._model.board_types import Frontier
+
+    cfg, run = finished_run.config, finished_run.run_id
+    assert (Path(cfg.arena_root) / finished_run.namespace / "runs" / f"{run}.json").exists()
+    for event in events(cfg, "frontier"):
+        assert run in {
+            mark.run_id for mark in Frontier.model_validate(event.payload["frontier"]).marks
+        }
+
+
+async def test_second_run_sees_first_but_never_selects_it(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._model.board_types import Frontier
+    from swarm_arena._store.base import open_store
+
+    run2 = "second"
+    result = await Swarm(finished_run.config).run(finished_run.plan, run_id=run2)
+    assert result[finished_run.plan.goal.id]
+    assert all(c.run_id == run2 for c in result[finished_run.plan.goal.id])
+    store = open_store(finished_run.config.run_root).child(run2)
+    committed = read_committed(store)
+    assert committed is not None
+    front = next(e for e in committed[1] if e.type == "frontier")
+    frontier = Frontier.model_validate(front.payload["frontier"])
+    assert {m.run_id for m in frontier.marks} == {finished_run.run_id, run2}
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    board.open(run2, finished_run.config.run_root, [finished_run.namespace])
+    try:
+        view = board.snapshot(finished_run.plan.goal.key(), frontier)
+        assert view._visible_candidate_ids()
+        assert all(
+            view.get_candidate(id).run_id == finished_run.run_id
+            for id in view._visible_candidate_ids()
+        )
+    finally:
+        board.close()
+    solution = json.loads(store.read(f"goals/{finished_run.plan.goal.id}/solution.json").data)
+    assert solution["finalists"]
+    assert all(item["candidate"]["run_id"] == run2 for item in solution["finalists"])
+
+
+async def test_past_run_match_runs_again(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.leaderboard import format_value
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._store.base import open_store
+
+    states = []
+    for run_id in (finished_run.run_id, await run_again(finished_run)):
+        committed = read_committed(open_store(finished_run.config.run_root).child(run_id))
+        assert committed is not None
+        states.append(RunState.from_events(committed[1]))
+    first, second = [
+        next(c for c in state.candidates.values() if c.agent == "gd-1" and c.round == 1)
+        for state in states
+    ]
+    scores = [s for s in states[0].scores.values() if s.candidate_id == first.id and s.judge == "f"]
+    assert first.id != second.id
+    assert second.run_id != first.run_id
+    assert f"past-run match {first.id}: f={format_value(scores[-1].value)}" in second.warnings
+    assert all(
+        states[1].candidates[id].run_id == second.run_id
+        for id in states[1].goals[finished_run.plan.goal.id].repeat_keys
+    )
+
+
+async def test_past_run_candidate_as_parent(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._store.artifacts import ArtifactStore
+    from swarm_arena._store.base import open_store
+
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    board.open("", "", [finished_run.namespace])
+    try:
+        view = board.snapshot(finished_run.plan.goal.key(), board.frontier())
+        first = view.best(finished_run.plan.goal.key(), 1, judge="f")[0]
+        plan2 = finished_run.plan.model_copy(deep=True)
+        spec = next(a for t in plan2.teams for a in t.agents if a.name == "gd-1")
+        spec.manager.config["requests"][0]["parents"] = "best"
+        run2 = await run_again(finished_run, plan=plan2)
+        committed = read_committed(open_store(finished_run.config.run_root).child(run2))
+        assert committed is not None
+        state = RunState.from_events(committed[1])
+        second = next(c for c in state.candidates.values() if c.agent == "gd-1" and c.round == 1)
+        assert second.parent_ids == [first.id]
+        assert second.request.parents[0].run_id == finished_run.run_id
+        assert second.request.parents[0].data == first.output.data
+        artifacts = ArtifactStore(open_store(finished_run.config.artifact_root))
+        for file in second.request.parents[0].files:
+            assert artifacts.get_bytes(file.sha256)
+        latest = board.snapshot(finished_run.plan.goal.key(), board.frontier())
+        assert (second.id, first.id) in latest.lineage(second.id).edges
+        assert first.id not in state.goals[finished_run.plan.goal.id].final_order
+    finally:
+        board.close()
+
+
+@pytest.mark.s3
+async def test_run_with_all_roots_on_s3(s3_url: str, run_config: RunConfig) -> None:
+    from swarm_arena._store.base import open_store
+
+    cfg = run_config.model_copy(
+        update={
+            "run_root": f"{s3_url}/runs",
+            "arena_root": f"{s3_url}/arena",
+            "artifact_root": f"{s3_url}/artifacts",
+        }
+    )
+    result = await Swarm(cfg).run(plan(rounds=1), run_id="remote")
+    assert result["g"]
+    assert open_store(cfg.run_root).child("remote").read("goals/g/solution.json").data
+
+
+async def test_custom_board_open_and_close_on_run_and_resume(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Sequence
+
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.lease import read_owner
+    from swarm_arena._store.base import open_store
+
+    opened: list[str] = []
+    closed: list[str] = []
+    original_open, original_close = ArenaBoard.open, ArenaBoard.close
+
+    def open_board(self: ArenaBoard, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
+        owner = read_owner(open_store(run_root).child(run_id))
+        assert owner is not None
+        assert owner[0].head is not None
+        assert namespaces == ["n"]
+        opened.append(run_id)
+        original_open(self, run_id, run_root, namespaces)
+
+    def close_board(self: ArenaBoard) -> None:
+        closed.append(self.config.arena_root)
+        original_close(self)
+
+    monkeypatch.setattr(ArenaBoard, "open", open_board)
+    monkeypatch.setattr(ArenaBoard, "close", close_board)
+    root = str(tmp_path / "custom-arena")
+    cfg = run_config.model_copy(
+        update={
+            "board": Ref(
+                path="swarm_arena.board:ArenaBoard",
+                config={"arena_root": root, "cache_dir": str(tmp_path / "custom-cache")},
+            )
+        }
+    )
+    assert (await Swarm(cfg).run(plan(rounds=1), run_id="custom"))["g"]
+    await Swarm(cfg).resume("custom", force=True)
+    assert opened == ["custom", "custom"]
+    assert closed == [root, root]
+    assert (Path(root) / "n/runs/custom.json").exists()
+    assert not await anyio.to_thread.run_sync(Path(cfg.arena_root).exists)
+
+
+def test_finished_run_supports_sync_consumers(finished_run: FinishedRun) -> None:
+    assert finished_run.config_path.read_text() == finished_run.config.dumps()
+    assert len(finished_run.plan.rounds) == 2
+    assert all(
+        agent.manager.config["post_learnings"]
+        for team in finished_run.plan.teams
+        for agent in team.agents
+    )
+    assert (
+        Path(finished_run.config.run_root) / finished_run.run_id / "control/owner.json"
+    ).exists()
+
+
+async def test_board_open_failure_closes_board(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Sequence
+
+    from swarm_arena._board.arena import ArenaBoard
+
+    closed: list[bool] = []
+    original_open, original_close = ArenaBoard.open, ArenaBoard.close
+
+    def fail_open(self: ArenaBoard, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
+        original_open(self, run_id, run_root, namespaces)
+        raise RuntimeError("board open failed")
+
+    def close(self: ArenaBoard) -> None:
+        closed.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(ArenaBoard, "open", fail_open)
+    monkeypatch.setattr(ArenaBoard, "close", close)
+    with pytest.raises(RuntimeError, match="board open failed"):
+        await Swarm(run_config).run(plan(rounds=1))
+    assert closed == [True]
+
+
+async def test_custom_board_construction_errors_hide_values(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._board.base import Board
+
+    original = Ref.build
+    secret = "BOARD_CONSTRUCTOR_SENTINEL"
+
+    def build(self: Ref, base: type[Any]) -> Any:
+        if base is Board:
+            raise RuntimeError(secret) from ValueError(secret)
+        return original(self, base)
+
+    monkeypatch.setattr(Ref, "build", build)
+    config = run_config.model_copy(
+        update={
+            "board": Ref(
+                path="swarm_arena.board:ArenaBoard", config={"arena_root": run_config.arena_root}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="construction failed") as caught:
+        await Swarm(config).run(plan(rounds=1))
+    assert_secret_absent(caught.value, secret)

@@ -8,13 +8,13 @@ import anyio
 
 from swarm_arena._agent.context import AgentContext, _prepare_metadata, _ToolMetadata
 from swarm_arena._agent.manager import LimitReached, Manager, RoundReport
-from swarm_arena._agent.repeats import RepeatIndex
+from swarm_arena._agent.repeats import COUNTED, RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
+from swarm_arena._board.arena import ArenaView, past_run_repeat_entries
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.digest import build_digest
-from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
@@ -190,11 +190,21 @@ class RoundOutcome:
     repeat_entries: list[tuple[str, Candidate]]
 
 
+def _past_run_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate]]:
+    """Keep the newest counted, complete other-run candidate for each repeat key."""
+    newest = {}
+    for key, candidate in past_run_repeat_entries(view, run_id):
+        if candidate.output.status in COUNTED and not candidate.output.partial:
+            newest[key] = candidate
+    return list(newest.items())
+
+
 class _SeedView(BoardView):
     """Add only assigned, frontier-covered parents to identifier reads."""
 
     def __init__(self, view: BoardView, parents: Mapping[str, BoardView]) -> None:
         self._view, self._parents = view, dict(parents)
+        self.part = getattr(view, "part", None)
         self.goal, self.frontier = view.goal, view.frontier
 
     def best(
@@ -232,6 +242,10 @@ class _SeedView(BoardView):
     ) -> list[Learning]:
         """Delegate scoped learning search."""
         return self._view.search_learnings(namespace, query, tags=tags, goal=goal, limit=limit)
+
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int:
+        """Preserve the wrapped snapshot's optional count capability."""
+        return self._view.count_learnings(namespace, goal=goal)
 
     def get_learning(self, id: str) -> Learning:
         """Delegate learning lookup."""
@@ -421,6 +435,12 @@ class RoundRunner:
     ) -> AgentRuntime:
         deps = self.deps
         view = await anyio.to_thread.run_sync(deps.board.snapshot, slot.goal_key, frontier)
+        past = _past_run_entries(view, deps.run_id)
+        siblings = {}
+        if isinstance(view, ArenaView):
+            for part in [None, *(p.name for p in self.plan.parts)]:
+                sibling = view._sibling_view(part)
+                siblings[part or ""] = sibling
         if parents:
             view = _SeedView(view, parents)
         checks, judges, ranking = part_scoring(self.plan, slot.part)
@@ -463,6 +483,7 @@ class RoundRunner:
             digest=build_digest(
                 view,
                 goal=slot.goal_key,
+                run_id=deps.run_id,
                 round=round,
                 ranking=ranking,
                 cap_tokens=deps.config.limits.digest_tokens,
@@ -480,7 +501,7 @@ class RoundRunner:
             ),
             limits=deps.config.limits,
             counters=AgentCounters(**self._counters.get(key, {})),
-            repeats=RepeatIndex(deps.run_id, [*self.repeat_entries, *pairs]),
+            repeats=RepeatIndex(deps.run_id, [*self.repeat_entries, *pairs, *past]),
             watchdog=slot.watchdog,
             journal=deps.journal,
             board=deps.board,
@@ -490,10 +511,21 @@ class RoundRunner:
             config=deps.config,
             resumed=tuple(c for _, c in pairs),
             private_paths=private_paths,
-            rankings={slot.part or "": ranking},
+            rankings=await run_sync_daemon(self._rankings),
+            sibling_views=siblings,
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),
         )
+
+    def _rankings(self) -> dict[str, str]:
+        """Resolve every live group's ranking within supervised preparation."""
+        rankings = {"": self.plan.ranking_name()}
+        for part in self.plan.parts:
+            _, judges, ranking = part_scoring(self.plan, part.name)
+            rankings[part.name] = ranking or (
+                judges[0].component_name() if len(judges) == 1 else ""
+            )
+        return rankings
 
     async def _feedback_policies(self) -> dict[str, dict[str, str]]:
         """Recover actual producing policies without re-running old check hooks.
@@ -748,11 +780,6 @@ class RoundRunner:
             if slot.status
             not in {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
         ]
-        board = self.deps.board
-        if isinstance(board, RunBoard):
-            board.register_goal(self.plan.goal.key(), self.goal_id, None)
-            for part in self.plan.parts:
-                board.register_goal(part.goal.key(), self.goal_id, part.name)
         frontier = await self._frontier(round, agents)
         deadline = round_deadline(
             anyio.current_time(),

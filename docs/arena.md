@@ -4,6 +4,23 @@
 local SQLite caches and the existing run journals; it does not require a
 database server. See the [board API](api/board.md) for the record types.
 
+The engine uses `ArenaBoard` by default when `RunConfig.board` is `None`.
+Fresh and resumed runs publish their namespace pointers after taking the lease,
+then read other runs through their recorded round-start frontier. Selection and
+budget decisions use only the current run's state.
+
+A repeated request from another run still executes. The returned candidate's
+warnings include `past-run match <id>: <judge>=<value>`, or `unscored` when no
+ranking score exists. The hint uses the newest complete counted match visible
+at round start; a same-run repeat still follows the normal refusal or reuse
+rules. Managers may select visible past-run candidates as parents.
+
+`ctx.best(k)` reads the agent's own group. `ctx.best(k, part="name")` selects a
+declared sibling with that group's ranking judge, and `part=""` selects the
+main group. These reads keep the same frontier, charge one board read, and
+record the returned IDs. They do not widen candidate-file or feedback access.
+The offline `check_manager` harness uses a private temporary arena and cache.
+
 ## What the arena stores
 
 Run journals are the record. The shared arena contains pointers and human

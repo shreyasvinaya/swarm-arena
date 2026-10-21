@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 from _fakes.engine import EngineEnv, with_executor
 
-from swarm_arena import Goal, Plan, Ref, RunConfig
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena import RunConfig
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.round import EngineDeps
@@ -20,7 +20,6 @@ from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.local import LocalStore
-from swarm_arena._tooling.files import snapshot_plan
 
 
 @pytest.fixture
@@ -32,19 +31,6 @@ async def env(
     store = LocalStore(Path(config.run_root) / run_id)
     lease = Lease.acquire_new(store, owner_id="engine", host="local", ttl_s=60)
     ids = IdGen(run_id, lease.doc.epoch)
-    plan = snapshot_plan(
-        Plan(
-            goal=Goal(id="g", namespace="n"),
-            teams=[],
-            judges=[
-                Ref(
-                    path="swarm_arena:ProgramJudge",
-                    config={"function": "_fakes.tools:score_min_y"},
-                )
-            ],
-        ),
-        artifacts,
-    )
     async with JournalWriter(
         store,
         lease,
@@ -73,8 +59,8 @@ async def env(
         )
         ledger.open_goal("g")
         await journal.append_durable(EventDraft(type=EventType.GOAL_STARTED, goal_id="g"))
-        board = RunBoard(run_id=run_id, run_root=config.run_root, head=lambda: journal.head)
-        board.register_goal(plan.goal.key(), "g", None)
+        board = ArenaBoard(arena_root=config.arena_root, cache_dir=str(tmp_path / "cache"))
+        board.open(run_id, config.run_root, ["n"])
         deps = EngineDeps(
             run_id=run_id,
             config=config,
@@ -92,4 +78,5 @@ async def env(
         try:
             yield EngineEnv(deps, store)
         finally:
+            board.close()
             await local_executor.aclose()

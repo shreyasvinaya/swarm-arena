@@ -31,8 +31,9 @@ from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import round as round_module
 from swarm_arena._engine.goal import r0_revision_draft
-from swarm_arena._engine.round import AgentSlot, RoundRunner
+from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundOutcome, RoundRunner
 from swarm_arena._errors import Fenced
+from swarm_arena._journal.event import EventDraft
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
@@ -183,8 +184,25 @@ class _GateExecutor(Executor):
         await self.inner.aclose()
 
 
+class _PreparedRound(RoundRunner):
+    async def run(self, round: int) -> RoundOutcome:
+        await self.deps.journal.commit()
+        return await super().run(round)
+
+
+def _prepared_round(deps: EngineDeps, *, plan: Plan, **kwargs: Any) -> RoundRunner:
+    """Supply the initial committed plan normally owned by RunRunner."""
+    from swarm_arena._journal.reader import read_committed
+
+    committed = read_committed(deps.store)
+    events = [*(committed[1] if committed else []), *deps.journal._queue]
+    if not any(event.type == "plan_revision" for event in events):
+        deps.journal.append(r0_revision_draft(plan, plan.base_dir))
+    return _PreparedRound(deps, plan=plan, **kwargs)
+
+
 def _round(env: EngineEnv, agents: Sequence[AgentSlot], **kw: Any) -> RoundRunner:
-    return RoundRunner(
+    return _prepared_round(
         env.deps, goal_id="g", plan=PLAN, agents=agents, round_spec=RoundSpec(), rounds_left=1, **kw
     )
 
@@ -205,7 +223,7 @@ def _construction_round(
         plan = PLAN.model_copy(update={"parts": [part]})
         slot.team = slot.team.model_copy(update={"part": "p"})
         slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    return RoundRunner(
+    return _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=agents, round_spec=RoundSpec(), rounds_left=1
     )
 
@@ -805,7 +823,6 @@ async def test_converge_stop_now_blocks_tools(env: EngineEnv) -> None:
 
 async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
     from swarm_arena import PartSpec
-    from swarm_arena._errors import SoftError
     from swarm_arena._model.results import Score
 
     part = PartSpec(name="p", goal=Goal(id="sub", namespace="n"))
@@ -814,29 +831,33 @@ async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
     slot = _runner("a")
     slot.team = slot.team.model_copy(update={"part": "p"})
     slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    first = await RoundRunner(
+    first = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(1)
     parent = first.candidates[0]
     assert parent.goal_id == "g"
     assert parent.part == "p"
-    end = env.events("tool_end")[0]
-    env.deps.board.put_score(
-        Score(id="score", candidate_id=parent.id, judge="program", key=(1.0,)),
-        epoch=end.epoch,
-        seq=end.seq,
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="score", candidate_id=parent.id, judge="program", key=(1.0,)
+                ).model_dump(mode="json")
+            },
+        )
     )
 
     class JoinManager(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
             assert ctx.seed_parents == (parent.id,)
             assert ctx.get_candidate(parent.id).id == parent.id
-            with pytest.raises(SoftError, match="own part"):
-                ctx.best(1, part="p")
+            assert ctx.best(1, part="p")[0].candidate_id == parent.id
             await ctx.run_tool({"x": 2}, parents=[parent.id])
             return RoundReport(summary="joined")
 
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=plan,
@@ -861,15 +882,20 @@ async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
     slot = _runner("a")
     slot.team = slot.team.model_copy(update={"part": "p"})
     slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    first = await RoundRunner(
+    first = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(1)
     c = first.candidates[0]
-    end = env.events("tool_end")[0]
-    env.deps.board.put_score(
-        Score(id="score", candidate_id=c.id, judge="program", key=(1.0,)),
-        epoch=end.epoch,
-        seq=end.seq,
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="score", candidate_id=c.id, judge="program", key=(1.0,)
+                ).model_dump(mode="json")
+            },
+        )
     )
 
     class RankingProbe(Manager):
@@ -891,7 +917,7 @@ async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
     await _round(env, [learner]).run(1)
     await env.deps.journal.commit()
     slot.manager = RankingProbe()
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(2)
     assert out.reasons["t/a"] == ""
@@ -1060,7 +1086,7 @@ async def test_effective_tool_uses_base_catalog_identity(env: EngineEnv) -> None
         env.deps, config=config, executor=RecordingExecutor(env.deps.executor)
     )
     override = {"timeout_s": 12.0}
-    out = await RoundRunner(
+    out = await _prepared_round(
         deps,
         goal_id="g",
         plan=PLAN,
@@ -1291,7 +1317,7 @@ async def test_seed_feedback_follows_producer_group_and_revision(
     producer = _runner("a")
     producer.team = producer.team.model_copy(update={"part": "p"})
     producer.part, producer.goal, producer.goal_key = "p", part.goal, part.goal.key()
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=plan,
@@ -1353,7 +1379,7 @@ async def test_seed_feedback_follows_producer_group_and_revision(
         )
     )
     reader = _with_manager("join", Reader())
-    second = await RoundRunner(
+    second = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=revised,
@@ -1374,3 +1400,105 @@ async def test_seed_feedback_follows_producer_group_and_revision(
     assert all(
         e.payload["candidate"]["checks"][0]["reasons"] == [secret] for e in env.events("tool_end")
     )
+
+
+@pytest.mark.parametrize("newest", [False, True])
+async def test_round_gives_past_run_hint(env: EngineEnv, tmp_path: Path, newest: bool) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena._board.leaderboard import format_value
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    ranking = PLAN.ranking_name()
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=slot.goal)
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(ranking=ranking), past.candidate("c-past", repeat_key=key))
+    if newest:
+        past.commit(
+            past.candidate("c-new", repeat_key=key),
+            past.candidate("c-partial", repeat_key=key, partial=True),
+            past.candidate("c-late", repeat_key=key, status=RunStatus.TIMEOUT),
+        )
+    else:
+        past.commit(past.score("s-past", "c-past", 0.25, judge=ranking))
+    add_pointer(env.deps.config.arena_root, past)
+    out = await _round(env, [slot]).run(1)
+    (candidate,) = out.candidates
+    assert candidate.run_id == env.deps.run_id
+    expected = "c-new: unscored" if newest else f"c-past: {ranking}={format_value(0.25)}"
+    assert f"past-run match {expected}" in candidate.warnings
+    assert out.repeat_entries == [(key, candidate)]
+
+
+async def test_round_gives_past_run_hint_for_part_agent(env: EngineEnv, tmp_path: Path) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=PLAN.goal)
+    draft = past.plan(parts=["a"], ranking=PLAN.ranking_name())
+    recorded = Plan.model_validate(draft.payload["plan"])
+    part = recorded.parts[0]
+    slot.part, slot.goal, slot.goal_key = part.name, part.goal, part.goal.key()
+    slot.team = slot.team.model_copy(update={"part": part.name})
+    current = PLAN.model_copy(update={"parts": [part]})
+    await env.deps.journal.append_durable(r0_revision_draft(current, current.base_dir))
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(draft, past.candidate("c-past", part="a", repeat_key=key))
+    add_pointer(env.deps.config.arena_root, past)
+    out = await _prepared_round(
+        env.deps, goal_id="g", plan=current, agents=[slot], round_spec=RoundSpec(), rounds_left=1
+    ).run(1)
+    (candidate,) = out.candidates
+    assert "past-run match c-past: unscored" in candidate.warnings
+    assert out.repeat_entries == [(key, candidate)]
+
+
+async def test_own_match_wins_over_past_run(env: EngineEnv, tmp_path: Path) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=slot.goal)
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(), past.candidate("c-past", repeat_key=key))
+    add_pointer(env.deps.config.arena_root, past)
+    first = await _round(env, [slot]).run(1)
+    out = await _round(env, [slot], repeat_entries=first.repeat_entries).run(2)
+    assert out.candidates == []
+    assert any(e.payload.get("refused") == first.candidates[0].id for e in env.events("watchdog"))
+
+
+def test_seed_view_preserves_part_and_count_capability() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._board.base import BoardView
+    from swarm_arena._engine.round import _SeedView
+
+    view = Mock(spec=BoardView, goal=PLAN.goal.key(), frontier=Frontier(), part="p")
+    view.count_learnings.return_value = 7
+    wrapped = _SeedView(view, {})
+    assert wrapped.part == "p"
+    assert wrapped.count_learnings("n", goal=view.goal) == 7
+    view.count_learnings.assert_called_once_with("n", goal=view.goal)

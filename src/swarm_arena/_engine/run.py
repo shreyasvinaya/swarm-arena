@@ -14,7 +14,8 @@ from uuid import uuid4
 
 import anyio
 
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
+from swarm_arena._board.base import Board
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import final_slice_estimate, make_price_of, worst_case_estimate
 from swarm_arena._budget.ledger import Ledger
@@ -25,7 +26,7 @@ from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
-from swarm_arena._errors import Fenced, PlanError, _core_error
+from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_signal
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -174,6 +175,21 @@ def _has_fenced(error: BaseException) -> bool:
     return isinstance(error, Fenced) or (
         isinstance(error, BaseExceptionGroup) and any(_has_fenced(e) for e in error.exceptions)
     )
+
+
+async def _start_board(config: RunConfig) -> Board:
+    """Build the default or configured board with safe connector diagnostics."""
+    if config.board is None:
+        return ArenaBoard(arena_root=config.arena_root)
+    try:
+        return await run_sync_daemon(config.board.build, Board)
+    except Exception as error:
+        safe = _rebuild_core_signal(error)
+        if safe is not None:
+            raise safe from None
+        raise _core_error(
+            RuntimeError, f"board construction failed: {type(error).__name__}"
+        ) from None
 
 
 async def _start_executor(config: RunConfig) -> Executor:
@@ -462,21 +478,17 @@ class RunRunner:
                 await views.write(
                     f"goals/{plan.goal.id}/plan.r0.toml", plan.dumps().encode(), source=head
                 )
-            board = RunBoard(run_id=run_id, run_root=config.run_root, head=lambda: journal.head)
-            for plan in self.plans:
-                board.register_goal(plan.goal.key(), plan.goal.id, None)
-                for part in plan.parts:
-                    board.register_goal(part.goal.key(), plan.goal.id, part.name)
-            await anyio.to_thread.run_sync(
-                board.open,
-                run_id,
-                config.run_root,
-                sorted(
-                    {p.goal.namespace for p in self.plans}
-                    | {part.goal.namespace for p in self.plans for part in p.parts}
-                ),
-            )
+            board = await _start_board(config)
             try:
+                await anyio.to_thread.run_sync(
+                    board.open,
+                    run_id,
+                    config.run_root,
+                    sorted(
+                        {p.goal.namespace for p in self.plans}
+                        | {part.goal.namespace for p in self.plans for part in p.parts}
+                    ),
+                )
                 deps = EngineDeps(
                     run_id=run_id,
                     config=config,

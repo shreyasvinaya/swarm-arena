@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import anyio
 
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.base import Board
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.split import weighted_shares
 from swarm_arena._engine import run as run_module
@@ -128,7 +128,7 @@ class _ResumeServices:
     async def _serve_owned(self) -> None:
         """Own entered services and shield their existing bounded cleanup paths."""
         executor: Executor | None = None
-        board: RunBoard | None = None
+        board: Board | None = None
         entered = False
         config, lease = self.config, self.lease
         head = lease.doc.head
@@ -242,8 +242,19 @@ class _ResumeServices:
                         )
                     await journal.commit()
                     _, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
-                    board = RunBoard.from_state(
-                        state, run_root=config.run_root, head=lambda: journal.head
+                    board = await run_module._start_board(config)
+                    await anyio.to_thread.run_sync(
+                        board.open,
+                        self.run_id,
+                        config.run_root,
+                        sorted(
+                            {
+                                goal.namespace
+                                for revisions in state.plans.values()
+                                for plan, _ in revisions
+                                for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                            }
+                        ),
                     )
                     self.deps = EngineDeps(
                         run_id=self.run_id,

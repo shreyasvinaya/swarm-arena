@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import anyio
 import pytest
@@ -327,3 +328,25 @@ async def test_harness_carries_notes_and_snapshots_learnings(
     )
     assert observed == [(1, "", []), (2, "Use the baseline", [harness.learnings[0].id])]
     assert _events(harness, "learning")[0].seq < _events(harness, "frontier")[1].seq
+
+
+async def test_harness_uses_a_temp_arena_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    h = OfflineHarness()
+    await h.run_rounds(
+        ScriptedManager([{"inputs": {"x": 1.0}}]),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=1,
+        limits=Limits(),
+        config=RunConfig(
+            arena_root=str(tmp_path / "real-arena"), board=Ref(path="unavailable:Board")
+        ),
+    )
+    root = Path(h.store.url).parent.parent
+    assert (root / "arena" / GOAL.namespace / "runs" / "local.json").exists()
+    assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
+    assert not (tmp_path / "real-arena").exists()
+    assert not (tmp_path / "xdg").exists()

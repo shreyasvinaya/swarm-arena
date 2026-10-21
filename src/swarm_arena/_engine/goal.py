@@ -12,7 +12,6 @@ import anyio
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import judge_amount, make_price_of
 from swarm_arena._budget.ledger import Reservation
@@ -300,11 +299,6 @@ class GoalRunner:
                 )
         if self._recovering_converge and self.plan.converge.team in teams:
             self._recovering_converge = False
-        board = self.deps.board
-        if isinstance(board, RunBoard):
-            board.register_goal(self.plan.goal.key(), self.goal_id, None)
-            for part in self.plan.parts:
-                board.register_goal(part.goal.key(), self.goal_id, part.name)
         return slots
 
     def _restore_watchdog(self, key: str) -> Watchdog:
@@ -1127,9 +1121,9 @@ class GoalRunner:
         records its lifecycle reason independently of the live stop flags.
         A terminal policy checkpoint restores its effect and completes any
         owed round closure before constructing managers or judges. New revisions
-        pass bounded preflight before publication. Recovery checks revisions
-        lacking a completion marker and durably refuses failures, restoring
-        the previous admitted revision before dispatch.
+        pass bounded preflight before publication; failed proposals retain the
+        previous admitted revision. Recovery uses committed admitted revisions
+        without repeating preflight.
 
         Returns
         -------

@@ -1020,3 +1020,24 @@ def test_owner_part_wins_foreign_main_key_collision(
         assert fallback._visible_candidate_ids() == frozenset(
             {"foreign-main", *(f"foreign-{part}" for part in foreign_parts)}
         )
+
+
+def test_past_run_repeat_entries(tmp_path: Path, board: ArenaBoard) -> None:
+    from doctest import script_from_examples
+
+    from swarm_arena._board.arena import past_run_repeat_entries
+    from swarm_arena.board import BoardView
+
+    own = _seed(tmp_path, "r1")
+    other = _seed(tmp_path, "r2")
+    other.commit(other.candidate("keyed", repeat_key="key"))
+    board.open("r1", own.run_root, ["toy"])
+    view = board.snapshot(own.goal.key(), board.frontier())
+    other.commit(other.candidate("future", repeat_key="future"))
+    board.frontier()
+    assert [(key, c.id) for key, c in past_run_repeat_entries(view, "r1")] == [("key", "keyed")]
+    namespace: dict[str, object] = {}
+    exec(script_from_examples(BoardView.__doc__ or ""), namespace)
+    custom = namespace["view"]
+    assert isinstance(custom, BoardView)
+    assert past_run_repeat_entries(custom, "r1") == []

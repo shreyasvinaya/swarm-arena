@@ -9,7 +9,9 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import anyio
 import pytest
+from _fakes.finished import FinishedRun, run_again
 
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._model.run_config import RunConfig
@@ -138,3 +140,38 @@ def s3_url(monkeypatch: pytest.MonkeyPatch, _s3_endpoint: str) -> Iterator[str]:
         yield f"s3://swarm-arena-test/{uuid4().hex}"
     finally:
         type(fs).close_session(fs.loop, fs._s3creator)
+
+
+@pytest.fixture(autouse=True)
+def isolated_board_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every default board cache inside its test's temporary root."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+
+
+@pytest.fixture
+async def finished_run(tmp_path: Path, anyio_backend: str) -> "FinishedRun":
+    """Finish the two-round public Rosenbrock example with posted learnings."""
+    from swarm_arena import Plan, RoundSpec
+
+    example = (
+        (await anyio.to_thread.run_sync(Path(__file__).resolve)).parents[1]
+        / "examples"
+        / "rosenbrock"
+    )
+    plan = Plan.load(example / "plan.toml")
+    plan = plan.model_copy(deep=True, update={"rounds": [RoundSpec(), RoundSpec()]})
+    for team in plan.teams:
+        for spec in team.agents:
+            spec.manager.config["post_learnings"] = True
+    config = RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    path = tmp_path / "run.toml"
+    path.write_text(config.dumps())
+    run = FinishedRun(
+        config=config, config_path=path, plan=plan, run_id="first", namespace=plan.goal.namespace
+    )
+    await run_again(run, run_id=run.run_id)
+    return run

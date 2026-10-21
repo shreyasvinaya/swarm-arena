@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
+from swarm_arena._board.arena import ArenaView
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
 from swarm_arena._journal.a2a import agent_task_id
@@ -484,7 +485,8 @@ class AgentContext:
         Parameters
         ----------
         query : str
-            Case-insensitive title or text substring.
+            Title or text search using the board's matching rules. An empty
+            query lists visible learnings without a text filter.
         tags : Sequence[str], default=()
             Required tags.
         scope : {'goal', 'namespace'}, default='goal'
@@ -527,13 +529,21 @@ class AgentContext:
             if scope not in ("goal", "namespace"):
                 raise _core_signal(SoftError("invalid learning scope"))
             rt = self._rt
-            found = rt.view.search_learnings(
-                rt.goal.namespace,
-                query,
-                tags=tags,
-                goal=rt.goal_key if scope == "goal" else None,
-                limit=limit,
-            )
+            if query == "":
+                found = rt.view.learnings(
+                    rt.goal.namespace,
+                    tags=tags,
+                    goal=rt.goal_key if scope == "goal" else None,
+                    limit=limit,
+                )
+            else:
+                found = rt.view.search_learnings(
+                    rt.goal.namespace,
+                    query,
+                    tags=tags,
+                    goal=rt.goal_key if scope == "goal" else None,
+                    limit=limit,
+                )
             own = [
                 item
                 for item in reversed(rt.own)
@@ -667,15 +677,15 @@ class AgentContext:
 
     def best(self, k: int, *, part: str | None = None) -> list[Row]:
         """
-        Return leaderboard rows from this agent's own group snapshot.
+        Return leaderboard rows from a declared group at the fixed frontier.
 
         Parameters
         ----------
         k : int
             Maximum number of rows.
         part : str or None, default=None
-            This agent's part, or None for its default group. Cross-part reads
-            require the future multi-goal board view.
+            None selects the own group; a declared name selects its sibling group.
+            The empty string selects the main group.
 
         Returns
         -------
@@ -712,12 +722,22 @@ class AgentContext:
         def read() -> list[Row]:
             self._charge(board_read=True)
             rt = self._rt
-            if part is not None and part != rt.part:
-                raise _core_signal(SoftError("best(part=...) can read only this agent's own part"))
-            judge = rt.rankings.get(rt.part or "")
+            group = (rt.part or "") if part is None else part
+            view = rt.view
+            siblings = rt.sibling_views
+            if isinstance(siblings, Mapping) and group in siblings:
+                view = siblings[group]
+            elif group != (rt.part or ""):
+                raise _core_signal(SoftError("part outside board snapshot"))
+            judge = rt.rankings.get(group)
             if judge is None:
                 raise _core_signal(SoftError("missing ranking for agent group"))
-            rows = rt.view.leaderboard(rt.goal_key, judge=judge)[: max(0, k)]
+            goal = rt.goal_key if view is rt.view else view.goal
+            rows = view.leaderboard(goal, judge=judge)
+            if isinstance(view, ArenaView):
+                ids = {candidate.id for candidate in view.best(goal, max(0, k), judge=judge)}
+                rows = [row for row in rows if row.candidate_id in ids]
+            rows = rows[: max(0, k)]
             self._read_ids.update((row.candidate_id, None) for row in rows)
             return rows
 

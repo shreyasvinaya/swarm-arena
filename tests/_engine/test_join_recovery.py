@@ -116,6 +116,7 @@ def retry_config(root: Path) -> RunConfig:
     return with_executor(
         RunConfig(
             run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
             artifact_root=str(root / "artifacts"),
             planner_catalog=PlannerCatalog(entries=entries),
         ),
@@ -157,6 +158,7 @@ async def crash_driver(root: Path, boundary: str) -> None:
 async def launch(root: Path, boundary: str) -> RunConfig:
     await anyio.to_thread.run_sync(lambda: root.mkdir(parents=True))
     environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(root / "cache")
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
     )

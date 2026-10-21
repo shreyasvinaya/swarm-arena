@@ -1678,9 +1678,11 @@ async def test_round_revision_crash_boundaries_match_uninterrupted_run(
 
     async def exercise(crash: bool) -> tuple[tuple[Any, ...], tuple[Event, Event]]:
         root = tmp_path / ("crash" if crash else "control")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
         config = run_config.model_copy(
             update={
                 "run_root": str(root / "runs"),
+                "arena_root": str(root / "arena"),
                 "planner_catalog": PlannerCatalog(entries=entries),
             }
         )
@@ -1864,7 +1866,11 @@ async def _run_published_crash_case(root: Path, mode: str, crash: bool) -> None:
     from swarm_arena._planning.policy import Policy
 
     config = with_executor(
-        RunConfig(run_root=str(root / "runs"), artifact_root=str(root / "artifacts")),
+        RunConfig(
+            run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
+            artifact_root=str(root / "artifacts"),
+        ),
         workspace_root=str(root / "ws"),
     )
     config = with_limits(config, max_usd=1000, max_tokens=None)
@@ -1959,6 +1965,7 @@ async def _published_crash_case(root: Path, mode: str, *, crash: bool) -> tuple[
 
     await anyio.to_thread.run_sync(partial(root.mkdir, parents=True))
     env = dict(os.environ)
+    env["XDG_CACHE_HOME"] = str(root / "cache")
     env["PYTHONPATH"] = os.pathsep.join(
         [
             str(Path(__file__).parent),

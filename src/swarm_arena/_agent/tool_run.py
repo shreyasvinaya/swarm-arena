@@ -10,6 +10,7 @@ import anyio
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.repeats import _is_deterministic, repeat_key
 from swarm_arena._agent.runtime import AgentRuntime
+from swarm_arena._board.leaderboard import format_value
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
@@ -571,6 +572,11 @@ async def execute_tool_run(
                 tool_runs=rt.counters.tool_runs,
             ).model_copy(update={"task_id": agent_task_id(rt.address, rt.round)})
         )
+        if outcome.hint is not None:
+            judge = rt.rankings.get(rt.part or "")
+            scores = [score for score in rt.view.scores(outcome.hint.id) if score.judge == judge]
+            detail = f"{judge}={format_value(scores[-1].value)}" if scores else "unscored"
+            warnings.append(f"past-run match {outcome.hint.id}: {detail}")
         return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
     finally:
         if index is not None:
