@@ -39,6 +39,7 @@ from swarm_arena._model.plan import Plan
 from swarm_arena._model.planning_types import Decision
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Learning, Score
+from swarm_arena._model.run_config import RunConfig
 from swarm_arena._store.base import open_store
 
 _LOG = logging.getLogger("swarm_arena.board")
@@ -1510,3 +1511,12 @@ def past_run_repeat_entries(view: BoardView, run_id: str) -> list[tuple[str, Can
         )
         visible = view._visible_candidate_ids()
         return [(key, candidate) for key, candidate in entries if candidate.id in visible]
+
+
+def _effective_arena_root(config: RunConfig) -> str:
+    """Resolve the arena location from the configured board when it owns one."""
+    if config.board is not None:
+        board = config.board.build(Board)
+        if isinstance(board, ArenaBoard):
+            return board.config.arena_root
+    return config.arena_root

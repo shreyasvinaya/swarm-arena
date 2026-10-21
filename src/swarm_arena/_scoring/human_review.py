@@ -16,6 +16,7 @@ from urllib.parse import quote, urlsplit
 
 import anyio
 
+from swarm_arena._board.arena import _effective_arena_root
 from swarm_arena._board.human_objects import (
     HumanObject,
     _validate_reviewer,
@@ -584,6 +585,7 @@ class HumanReview:
         from swarm_arena._engine.resume import _take_over
         from swarm_arena._engine.run import _supervise_writer
 
+        config = config.model_copy(update={"arena_root": _effective_arena_root(config)})
         _validate_run_id(run_id)
         data = await anyio.to_thread.run_sync(_read_csv, _local_path(csv_path))
         store = await anyio.to_thread.run_sync(run_store, config.run_root, run_id)

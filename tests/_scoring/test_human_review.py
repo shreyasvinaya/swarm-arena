@@ -1201,3 +1201,42 @@ async def test_export_without_reviewer_identity(
     assert directory == tmp_path / "identity-free"
     with (directory / "review.csv").open(newline="") as stream:
         assert len(list(csv.DictReader(stream))) == 1
+
+
+async def test_import_uses_configured_board_arena(
+    review_run: FakeRun, run_config: RunConfig, tmp_path: Path
+) -> None:
+    from swarm_arena import Ref
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._board.pointers import RunPointer, write_pointer
+
+    root = str(tmp_path / "configured-arena")
+    config = run_config.model_copy(
+        update={
+            "board": Ref(
+                path="swarm_arena.board:ArenaBoard",
+                config={"arena_root": root, "cache_dir": str(tmp_path / "cache")},
+            )
+        }
+    )
+    write_pointer(
+        open_store(root),
+        "toy",
+        RunPointer(
+            run_id=review_run.run_id,
+            run_root=run_config.run_root,
+        ),
+    )
+    scores = await HumanReview("alice").import_csv(
+        review_run.run_id, _file(tmp_path), config=config
+    )
+    assert not _reviews(run_config)
+    board = ArenaBoard(arena_root=root, cache_dir=str(tmp_path / "cache"))
+    try:
+        board.open("", "", ["toy"])
+        board.frontier()
+        rows = board.leaderboard(review_run.goal.key(), judge="human:alice")
+        assert [(r.candidate_id, r.value) for r in rows] == [("c-1", 7.0)]
+        assert board.scores("c-1")[-1].id == scores[0].id
+    finally:
+        board.close()

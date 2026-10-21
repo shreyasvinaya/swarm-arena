@@ -236,3 +236,6 @@ Successful fresh and resumed runs also write an immutable bundle under
 `<run_root>/<run-id>/review/e<epoch>-<seq>/` after the final commit. Rewriting
 identical bytes is safe; conflicting bytes fail. Earlier completion bundles
 remain available after resume.
+
+Review imports publish to the configured `ArenaBoard` arena root when supplied;
+otherwise they use `RunConfig.arena_root`.
