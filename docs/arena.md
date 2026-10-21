@@ -423,3 +423,43 @@ head or contents. Other view types retain their conditional replacement policy.
 The segment containing the original close supplies the page's source head.
 Round pages are derived views; the committed journal
 and the recorded frontier remain their source of truth.
+
+## Command line
+
+Every arena command accepts `--config PATH` (default `run.toml`) and works without
+connecting to a running driver. Configure an `ArenaBoard`, or leave `board`
+unset to read `arena_root` with the default local cache. Each invocation refreshes
+its committed frontier before reading. Run selectors use IDs such as
+`2026-10-21T00-00-00Z_123abc`; the existing `status`, `stop`, and `resume`
+commands continue to take a local `RUN_DIR`.
+
+| Command | Behavior |
+| --- | --- |
+| `review export RUN [--goal ID] [--top 20] [--out DIR]` | Export CSV, candidate JSON and HTML; default directory `./review-RUN/`. Print its path. |
+| `review import RUN CSV --reviewer NAME` | Validate all rows before taking the ended run's lease; print `imported N scores as human:NAME`. Reviewers use lowercase slugs of 1–64 characters. |
+| `leaderboard RUN_OR_NAMESPACE [--goal ID] [--by JUDGE]` | Rank each current main/part identity with its own recorded ranking judge, or use the named judge for every group. A run limits rows and uses its improvement threshold; a namespace includes all runs under the newest score identity. |
+| `board search QUERY (--namespace NS \| --run ID) [--goal ID] [--tag TAG] [--verified] [--human] [--pinned] [--hidden] [--limit 10]` | Print matching learning IDs, titles, authors and markers. Tags repeat. `--hidden` selects hidden entries; ordinary searches exclude them. An empty query lists by relevance. |
+| `board show ID (--namespace NS \| --run ID)` | Show a candidate's request, status, checks, scores, parents and changed filenames, or a learning's full text and evidence scores/errors. |
+| `learnings pin ID --namespace NS [--author NAME]` | Create one immutable curation object. Unknown namespace-local IDs fail without a write. |
+| `learnings hide ID --namespace NS [--author NAME]` | Create one immutable hide object. Hidden targets remain available to explicit curation actions. |
+| `learnings add --namespace NS --title TITLE --text TEXT [--goal ID] [--tag TAG] [--evidence ID ...] [--author NAME]` | Create one human learning, print its `L-h-` ID, and verify evidence against the refreshed frontier in that namespace. Author defaults to the login name. |
+| `trace CANDIDATE (--namespace NS \| --run ID)` | Print committed plan provenance, run details, checks, scores and learning citations. |
+| `reindex [--namespace NS ...]` | Rebuild selected disposable caches, print `NS: N runs`, and report cache warnings on stderr. Without namespaces, rebuild existing local caches. |
+
+Leaderboard headers show `namespace/goal[/part]`, judge, and eight-character
+rubric/panel hashes. Tab-separated rows contain rank, candidate ID, run ID,
+`team/agent`, value, and parent IDs (or `-`). Verdict-only human reviews display
+`-` for value and still rank by verdict. With no scores, the command prints
+`no scores for JUDGE`. Board reads and reindex report cache ID-clash warnings
+on stderr. Exit codes are 0 for success, 1 for runtime errors, 2 for usage,
+and 130 for interruption.
+
+```console
+swarm-arena leaderboard toy --config run.toml
+swarm-arena board search "convergence" --namespace toy --verified
+swarm-arena learnings pin L-example --namespace toy --author alice
+swarm-arena review export 2026-10-21T00-00-00Z_123abc --out ./review
+# Edit review/review.csv, setting verdict and optionally a numeric score.
+swarm-arena review import 2026-10-21T00-00-00Z_123abc review/review.csv --reviewer alice
+swarm-arena leaderboard 2026-10-21T00-00-00Z_123abc --by human:alice
+```

@@ -2289,7 +2289,7 @@ class GoalStatus(FrozenModel):
     # Never import components to resolve names, combine parts, or substitute a tuple key coordinate for value.
 class StatusReport(FrozenModel):
     run_id: str; epoch: int; owner_live: bool; head_seq: int
-    stop: Literal["none", "stop", "stop-now"]; goals: dict[str, GoalStatus]; spent: Amount; lost: int
+    stop: Literal["none", "stop", "stop-now"]; goals: dict[str, GoalStatus]; spent: SpendTotal; lost: int
     # spent uses reservation amounts while open/estimated/keep_charged, actual for settled, preserving overflow actuals.
     # stop is committed RunState.stop; lost is len(RunState.lost). One owner read selects the committed chain.
 def format_status(report: StatusReport) -> str: ...  # _engine/control.py

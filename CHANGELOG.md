@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Offline arena commands export/import human reviews, rank runs and namespaces,
+  search and inspect board evidence, curate learnings, trace provenance and reindex caches.
+
 - Arena cache reindexing rebuilds exact recorded memberships and part identities,
   preserves human reviews and curation, and refuses to delete caches in use.
 

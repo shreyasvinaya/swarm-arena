@@ -138,6 +138,26 @@ for custom components, or
 and lexicographic scoring with private judge data.
 
 Example: [Bring your own files and script](examples/own_script/README.md) demonstrates two-round edits, inherited overlays, and private scoring data.
+## The arena
+
+Read committed results across runs, search evidence-backed learnings, and review
+candidates from a laptop without a driver connection:
+
+```console
+swarm-arena leaderboard toy --config run.toml
+swarm-arena board search "convergence" --namespace toy --verified
+swarm-arena learnings pin L-example --namespace toy --author alice
+swarm-arena review export 2026-10-21T00-00-00Z_123abc --out review
+# Fill in verdict and optional numeric score in review/review.csv.
+swarm-arena review import 2026-10-21T00-00-00Z_123abc review/review.csv --reviewer alice
+swarm-arena leaderboard 2026-10-21T00-00-00Z_123abc --by human:alice
+```
+
+All arena commands accept `--config PATH` (default `run.toml`). Run selectors
+are run IDs; `status`, `stop` and `resume` use a local run directory. See
+[The arena](docs/arena.md#command-line) for search filters, human curation,
+provenance tracing, cache rebuilding and output formats.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
