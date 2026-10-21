@@ -38,6 +38,8 @@ from swarm_arena._errors import (
     StorageError,
     _core_error,
     _exception_type_name,
+    _is_core_signal,
+    _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
@@ -163,6 +165,14 @@ async def _page_storage(operation: Callable[[], Awaitable[_T]]) -> _T:
     try:
         return await operation()
     except BaseException as error:
+        outcome.propagate_control(error)
+        if type(error) is StorageError and _is_core_signal(error):
+            # A nested view boundary retains the backend type; the page owns
+            # the public site label. Preserve distinct core errors such as ChainError.
+            name = _exception_type_name(error)
+            raise _with_exception_type(
+                _core_error(StorageError, f"round page storage failed: {name}"), name
+            ) from None
         outcome.contain(error, StorageError, "round page storage")
 
 

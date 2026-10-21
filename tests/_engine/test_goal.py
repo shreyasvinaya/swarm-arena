@@ -2053,3 +2053,26 @@ async def test_live_page_hook_errors_are_value_free(
     assert secret not in "".join(traceback.format_exception(caught.value))
     assert len(env.events("round_closed")) == 1
     assert not env.store.exists("goals/g/rounds/round-01.md")
+
+
+@pytest.mark.parametrize("kind", ["chain", "fenced", "caller_cancel"])
+async def test_page_storage_preserves_control_and_chain_errors(kind: str) -> None:
+    import asyncio
+
+    from swarm_arena._engine.goal import _page_storage
+    from swarm_arena._errors import ChainError, Fenced, _core_error
+
+    expected = {"chain": ChainError, "fenced": Fenced, "caller_cancel": asyncio.CancelledError}[
+        kind
+    ]
+
+    async def operation() -> None:
+        if kind == "caller_cancel":
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+        raise _core_error(ChainError if kind == "chain" else Fenced, "trusted")
+
+    with pytest.raises(expected):
+        await _page_storage(operation)
