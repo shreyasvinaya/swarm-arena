@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Candidate traces show the committed round-applicable plan, tool usage, checks,
+  journal and human scores, and citing learnings without importing producer plugins.
 - Arena snapshots resolve owning groups before foreign key matches, keeping
   part candidates, declared siblings, and goal learning scope consistent.
 - Arena lineage batches ancestor IDs inside one frontier read scope per namespace,
