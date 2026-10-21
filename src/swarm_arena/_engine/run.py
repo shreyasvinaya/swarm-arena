@@ -550,102 +550,104 @@ class RunRunner:
         stops = StopState()
         entered = False
         try:
-            async with (
-                _supervise_initialization(store, lease.doc.epoch, stops, clock, config) as prepared,
-                _RunJournal(
-                    store,
-                    lease,
-                    run_id=run_id,
-                    next_seq=1,
-                    local_path=local_path,
-                    sync_interval_s=config.sync_interval_s,
-                ) as journal,
-            ):
+            async with _RunJournal(
+                store,
+                lease,
+                run_id=run_id,
+                next_seq=1,
+                local_path=local_path,
+                sync_interval_s=config.sync_interval_s,
+            ) as journal:
                 entered = True
                 async with _supervise_writer(journal):
-                    journal.clock = clock
-                    await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
-                    await run_sync_daemon(
-                        store.create,
-                        "manifest.json",
-                        canonical_json(
-                            RunManifest.model_validate(manifest).model_dump(mode="json")
-                        ),
-                    )
-                    ids = IdGen(run_id, lease.doc.epoch)
-                    ledger = Ledger(
-                        config.limits,
-                        reserve_fraction=config.reserve_fraction,
-                        goal_weights=config.goal_weights,
-                        journal=journal,
-                        ids=ids,
-                    )
-                    journal.append(
-                        EventDraft(
-                            type=EventType.RUN_CONFIG,
-                            payload={"config": config.model_dump(mode="json")},
-                        )
-                    )
-                    journal.append(
-                        EventDraft(
-                            type=EventType.RUN_STARTED,
-                            payload={
-                                "estimate": estimate.to_estimate().model_dump(mode="json"),
-                                "warnings": warnings,
-                                "manifest": manifest,
-                                "final_slices": {g: a.model_dump() for g, a in slices.items()},
-                            },
-                        )
-                    )
-                    await ledger.hold_final_slices(slices)
-                    for plan in self.plans:
-                        journal.append(r0_revision_draft(plan, plan.base_dir))
-                        journal.append(EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id))
-                    head = await journal.commit()
-                    assert head is not None
-                    views = ViewWriter(store, journal)
-                    for plan in self.plans:
-                        await views.write(
-                            f"goals/{plan.goal.id}/plan.r0.toml",
-                            plan.dumps().encode(),
-                            source=head,
-                        )
-                    board = await _start_board(config)
-                    try:
-                        await _open_board(
-                            board,
-                            config,
-                            run_id,
-                            sorted(
-                                {p.goal.namespace for p in self.plans}
-                                | {part.goal.namespace for p in self.plans for part in p.parts}
+                    async with _supervise_initialization(
+                        store, lease.doc.epoch, stops, clock, config
+                    ) as prepared:
+                        journal.clock = clock
+                        await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
+                        await run_sync_daemon(
+                            store.create,
+                            "manifest.json",
+                            canonical_json(
+                                RunManifest.model_validate(manifest).model_dump(mode="json")
                             ),
                         )
-                        deps = EngineDeps(
-                            run_id=run_id,
-                            config=config,
-                            store=store,
+                        ids = IdGen(run_id, lease.doc.epoch)
+                        ledger = Ledger(
+                            config.limits,
+                            reserve_fraction=config.reserve_fraction,
+                            goal_weights=config.goal_weights,
                             journal=journal,
-                            ledger=ledger,
-                            board=board,
-                            executor=executor,
-                            artifacts=artifacts,
                             ids=ids,
-                            views=views,
-                            stops=stops,
-                            clock=clock,
-                            admission=RunAdmission(config.limits.max_agents_total, self.plans),
-                            board_namespaces={
-                                goal.namespace
-                                for plan in self.plans
-                                for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                            },
                         )
-                        prepared()
-                        return await self._drive(deps, lease.doc.epoch)
-                    finally:
-                        await _close_board(board, config, failed=sys.exc_info()[0] is not None)
-            return {}
+                        journal.append(
+                            EventDraft(
+                                type=EventType.RUN_CONFIG,
+                                payload={"config": config.model_dump(mode="json")},
+                            )
+                        )
+                        journal.append(
+                            EventDraft(
+                                type=EventType.RUN_STARTED,
+                                payload={
+                                    "estimate": estimate.to_estimate().model_dump(mode="json"),
+                                    "warnings": warnings,
+                                    "manifest": manifest,
+                                    "final_slices": {g: a.model_dump() for g, a in slices.items()},
+                                },
+                            )
+                        )
+                        await ledger.hold_final_slices(slices)
+                        for plan in self.plans:
+                            journal.append(r0_revision_draft(plan, plan.base_dir))
+                            journal.append(
+                                EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id)
+                            )
+                        head = await journal.commit()
+                        assert head is not None
+                        views = ViewWriter(store, journal)
+                        for plan in self.plans:
+                            await views.write(
+                                f"goals/{plan.goal.id}/plan.r0.toml",
+                                plan.dumps().encode(),
+                                source=head,
+                            )
+                        board = await _start_board(config)
+                        try:
+                            await _open_board(
+                                board,
+                                config,
+                                run_id,
+                                sorted(
+                                    {p.goal.namespace for p in self.plans}
+                                    | {part.goal.namespace for p in self.plans for part in p.parts}
+                                ),
+                            )
+                            deps = EngineDeps(
+                                run_id=run_id,
+                                config=config,
+                                store=store,
+                                journal=journal,
+                                ledger=ledger,
+                                board=board,
+                                executor=executor,
+                                artifacts=artifacts,
+                                ids=ids,
+                                views=views,
+                                stops=stops,
+                                clock=clock,
+                                admission=RunAdmission(config.limits.max_agents_total, self.plans),
+                                board_namespaces={
+                                    goal.namespace
+                                    for plan in self.plans
+                                    for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                                },
+                            )
+                            prepared()
+                            return await self._drive(deps, lease.doc.epoch)
+                        finally:
+                            await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+                    return await _finish_initialization_stop(store, journal, stops, config)
         finally:
             if not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
@@ -680,11 +682,7 @@ class RunRunner:
                 result = await self._queue(deps)
                 await self._record_stops(deps)
                 watchers.cancel_scope.cancel()
-            head = await deps.journal.commit()
-            assert head is not None
-            chain = await run_sync_daemon(read_chain, deps.store, head)
-            state = RunState.from_events(e for _, batch in chain for e in batch)
-            await write_review_export(state, deps.store, head)
+            await _finish_run(deps.store, deps.journal)
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
@@ -692,29 +690,11 @@ class RunRunner:
         deps.stops.run_timeout = True
 
     async def _record_stops(self, deps: EngineDeps) -> None:
-        mode = 2 if deps.stops.stop_now else 1 if deps.stops.stop else 0
-        if mode > self._stop_mode:
-            await deps.journal.append_durable(
-                EventDraft(type=EventType.STOP_REQUESTED, payload={"now": mode == 2})
-            )
-            self._stop_mode = mode
+        self._stop_mode = await _record_stop(deps.journal, deps.stops, self._stop_mode)
 
     async def _queued_result(self, deps: EngineDeps, goal_id: str) -> None:
-        deps.journal.append(
-            EventDraft(type=EventType.NO_RESULT, goal_id=goal_id, payload={"reason": "stopped"})
-        )
-        deps.journal.append(
-            EventDraft(type=EventType.GOAL_FINISHED, goal_id=goal_id, payload={"reason": "stopped"})
-        )
-        with anyio.CancelScope(shield=True):
-            head = await deps.journal.commit()
-            await deps.ledger.end_goal(goal_id)
-        assert head is not None
-        chain = await run_sync_daemon(read_chain, deps.store, head)
-        state = RunState.from_events(e for _, events in chain for e in events)
-        await deps.views.write(
-            f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head
-        )
+        with anyio.fail_after(deps.config.settle_timeout_s, shield=True):
+            await _finish_queued_goal(deps.journal, deps.ledger, deps.store, deps.views, goal_id)
 
     def _stopping(self, deps: EngineDeps) -> bool:
         """Recheck live run limits at every goal admission boundary."""
@@ -806,6 +786,76 @@ class RunRunner:
                 if queued or active:
                     await changed.wait()
         return {p.goal.id: results[p.goal.id] for p in self.plans}
+
+
+async def _record_stop(journal: JournalWriter, stops: StopState, mode: int = 0) -> int:
+    """Record each stronger stop once, including timeout's immediate stop."""
+    current = 2 if stops.stop_now or stops.run_timeout else 1 if stops.stop else 0
+    if current > mode:
+        await journal.append_durable(
+            EventDraft(type=EventType.STOP_REQUESTED, payload={"now": current == 2})
+        )
+    return max(mode, current)
+
+
+async def _finish_queued_goal(
+    journal: JournalWriter, ledger: Ledger, store: Store, views: ViewWriter, goal_id: str
+) -> None:
+    """Publish a queued goal's terminal result under the caller's cleanup bound."""
+    journal.append(
+        EventDraft(type=EventType.NO_RESULT, goal_id=goal_id, payload={"reason": "stopped"})
+    )
+    journal.append(
+        EventDraft(type=EventType.GOAL_FINISHED, goal_id=goal_id, payload={"reason": "stopped"})
+    )
+    head = await journal.commit()
+    await ledger.end_goal(goal_id)
+    assert head is not None
+    chain = await run_sync_daemon(read_chain, store, head)
+    state = RunState.from_events(e for _, events in chain for e in events)
+    await views.write(
+        f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head
+    )
+
+
+async def _finish_run(store: Store, journal: JournalWriter) -> RunState:
+    """Export the committed run without consulting a board."""
+    head = await journal.commit()
+    assert head is not None
+    chain = await run_sync_daemon(read_chain, store, head)
+    state = RunState.from_events(e for _, batch in chain for e in batch)
+    await write_review_export(state, store, head)
+    return state
+
+
+async def _finish_initialization_stop(
+    store: Store, journal: JournalWriter, stops: StopState, config: RunConfig
+) -> dict[str, list[Candidate]]:
+    """Close committed queued goals while the initializer still owns its lease."""
+    try:
+        with anyio.fail_after(config.settle_timeout_s, shield=True):
+            head = journal.head
+            if head is None:
+                raise _core_error(RuntimeError, "run initialization stopped before run_started")
+            chain = await run_sync_daemon(read_chain, store, head)
+            events = [event for _, batch in chain for event in batch]
+            if not any(event.type == EventType.RUN_STARTED for event in events):
+                raise _core_error(RuntimeError, "run initialization stopped before run_started")
+            state = RunState.from_events(events)
+            ids = IdGen(state.run_id, journal.epoch, counters=state.id_counters)
+            ledger = Ledger.replay(state, journal=journal, ids=ids)
+            views = ViewWriter(store, journal)
+            await _record_stop(journal, stops)
+            for goal_id, goal in state.goals.items():
+                if goal.status == "queued":
+                    await _finish_queued_goal(journal, ledger, store, views, goal_id)
+            state = await _finish_run(store, journal)
+            return {
+                goal_id: [state.candidates[candidate_id] for candidate_id in goal.final_order]
+                for goal_id, goal in state.goals.items()
+            }
+    except TimeoutError:
+        raise _core_error(RuntimeError, "initialization stop cleanup timed out") from None
 
 
 async def write_review_export(state: RunState, store: Store, head: Head) -> None:

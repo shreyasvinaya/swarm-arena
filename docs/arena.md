@@ -549,7 +549,12 @@ and human learnings; blank optional filter fields impose no restriction.
 Cancellation, immediate stop, run timeout, and ownership loss can end a run
 while storage is unavailable, including during startup and stop-file polling.
 Cancelled stop lookups discard late results. Once startup stops,
-no later initialization stage begins. Round preparation does not consume the
+no later initialization stage begins. If the run has committed its start, queued
+goals receive a durable stopped result, solution files, and a review export;
+resuming does not restart those goals. Publishing these results is bounded by
+`settle_timeout_s`. Before a committed start, interruption raises a clear
+initialization error instead of reporting a completed run.
+Round preparation does not consume the
 agent round timeout. Storage failures report exception types without exposing
 backend messages or private values.
 If a stop-file lookup fails or returns anything other than a boolean, the run

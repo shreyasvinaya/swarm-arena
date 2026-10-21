@@ -90,8 +90,12 @@ async def test_blocked_stop_poll_releases_owner(
         assert not release.is_set()
         if signal == "cancel":
             assert task.cancelled()
+        elif phase == "startup":
+            error = task.exception()
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "run initialization stopped before run_started"
         else:
-            assert task.result() == ({} if phase == "startup" else {"g": []})
+            assert task.result() == {"g": []}
         owner = read_owner(LocalStore(Path(config.run_root) / "r"))
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
