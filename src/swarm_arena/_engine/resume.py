@@ -17,7 +17,7 @@ from swarm_arena._budget.split import weighted_shares
 from swarm_arena._engine import run as run_module
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.goal import _repair_round_pages
-from swarm_arena._engine.preflight import check_storage
+from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
@@ -157,7 +157,8 @@ class _ResumeServices:
                         events, state = await run_sync_daemon(_read, self.store, lease.doc)
                         from swarm_arena._scoring.human_review import _repair_review_objects
 
-                        arena = await run_sync_daemon(open_store, config.arena_root)
+                        arena_root = await run_sync_daemon(_board_arena_root, config)
+                        arena = await run_sync_daemon(open_store, arena_root)
                         await _repair_review_objects(state, arena, self.store, lease, journal)
                         clock = RunClock(state.run_elapsed_s)
                         journal.clock = clock
@@ -464,7 +465,7 @@ async def resume_run(
     >>> runner = await resume_run(config, "run-id", force=False, replanner=None)  # doctest: +SKIP
     >>> results = await runner.run()  # doctest: +SKIP
     """
-    await anyio.to_thread.run_sync(check_storage, config)
+    await _check_storage(config)
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
 

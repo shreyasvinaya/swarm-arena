@@ -560,3 +560,7 @@ namespaces. Attaching a namespace preserves reads from the published frontier.
 Resuming an unfinished round restores each agent's own committed learnings for
 reads, search, duplicate checks, and refinement. Peers still read the original
 round frontier, so another agent's same-round learnings stay private until closure.
+
+Storage preflight and resume receipt repair use the configured `ArenaBoard`
+arena root, matching review import/export and board reads. The top-level
+`arena_root` is the fallback when the board does not supply an arena.
