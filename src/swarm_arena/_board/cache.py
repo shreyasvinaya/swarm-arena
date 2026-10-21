@@ -226,7 +226,8 @@ class ArenaCache:
     and discards mutated state after rollback. A per-run sequence index supports
     segment junction and newest-head lookups without scanning prior segments.
     Named indexed TEMP sets hold frontier membership and explicit ID selections.
-    Frontier sets are filled once per read, including nested lookups.
+    Frontier sets are filled once per read, including nested lookups, and all
+    scratch selection rows are released on successful or failed outermost exit.
     Search filtering, relevance, pagination and counts execute in SQLite.
     Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
@@ -609,6 +610,8 @@ class ArenaCache:
             yield
         finally:
             self._frontier_depth -= 1
+            if self._frontier_depth == 0:
+                self._conn.execute("DELETE FROM temp._read_sets")
 
     @staticmethod
     def _member_join(table: Literal["candidates", "scores", "learnings"], alias: str) -> str:

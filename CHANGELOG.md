@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Arena cache reads release temporary membership and ID selections on outermost
+  exit, including failures, while preserving nested-read membership.
+
 - Hide temporary and lock basenames consistently in local and paginated S3 listings.
 
 - Preserve valid raw key characters when opening S3 child stores.

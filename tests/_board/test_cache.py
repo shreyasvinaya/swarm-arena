@@ -2128,19 +2128,21 @@ def test_explicit_id_set_failure_rolls_back_and_keeps_frontier(
     cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
 ) -> None:
     cache, _, frontier = cache_with_learnings
-    assert len(cache.candidates(frontier, ids=["c-1"])) == 1
-    cache._conn.execute(
-        "CREATE TEMP TRIGGER fail_id_set BEFORE INSERT ON _read_sets "
-        "WHEN NEW.set_name='id' AND NEW.id='explode' "
-        "BEGIN SELECT RAISE(ABORT, 'injected selection failure'); END"
-    )
-    with pytest.raises(sqlite3.IntegrityError, match="injected selection failure"):
-        cache.candidates(frontier, ids=["absent", "explode"])
-    assert not cache._conn.in_transaction
-    assert cache._conn.execute("SELECT id FROM _read_sets WHERE set_name='id'").fetchall() == [
-        ("c-1",)
-    ]
-    assert len(cache.candidates(frontier, ids=["c-1"])) == 1
+    with cache._lock, cache._frontier(frontier):
+        assert len(cache.candidates(frontier, ids=["c-1"])) == 1
+        cache._conn.execute(
+            "CREATE TEMP TRIGGER fail_id_set BEFORE INSERT ON _read_sets "
+            "WHEN NEW.set_name='id' AND NEW.id='explode' "
+            "BEGIN SELECT RAISE(ABORT, 'injected selection failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected selection failure"):
+            cache.candidates(frontier, ids=["absent", "explode"])
+        assert not cache._conn.in_transaction
+        assert cache._conn.execute("SELECT id FROM _read_sets WHERE set_name='id'").fetchall() == [
+            ("c-1",)
+        ]
+        assert len(cache.candidates(frontier, ids=["c-1"])) == 1
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
     assert cache.search("toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == ["L-log"]
     assert cache.count(frontier, filters=LearningFilter()) == 2
     assert cache.candidates(Frontier(), ids=["c-1"]) == []
@@ -2217,3 +2219,65 @@ def test_explicit_id_filter_work_grows_linearly(tmp_path: Path) -> None:
     for column in range(3):
         assert 0 < measurements[1][column] < 15 * measurements[0][column]
         assert measurements[2][column] < 8 * measurements[1][column]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_outer_read_releases_large_selection_sets(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+    fail: bool,
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    cache.apply_human_objects([REVIEW_NAME], [_human_review()])
+    frontier = frontier.model_copy(update={"reviews": [REVIEW_NAME]})
+    ids = ["c-1", *[f"absent-{i}" for i in range(49_999)]]
+    cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+    if fail:
+
+        def failing_read() -> None:
+            with cache._lock, cache._frontier(frontier):
+                assert len(cache.scores(frontier, candidate_ids=ids)) == 1
+                assert cache._conn.execute(
+                    "SELECT count(*) FROM temp._read_sets WHERE set_name='candidate_id'"
+                ).fetchone() == (50_000,)
+                raise RuntimeError("injected read failure")
+
+        with pytest.raises(RuntimeError, match="injected read failure"):
+            failing_read()
+    else:
+        assert len(cache.scores(frontier, candidate_ids=ids)) == 1
+    assert cache._frontier_depth == 0
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+    assert not cache._conn.in_transaction
+    assert cache.candidates(Frontier()) == []
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+    cache.close()
+
+
+def test_nested_reads_keep_sets_until_outer_exit(
+    cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
+) -> None:
+    cache, _, frontier = cache_with_learnings
+    with cache._lock, cache._frontier(frontier):
+        marks = cache._conn.execute(
+            "SELECT id, seq FROM temp._read_sets WHERE set_name='marks'"
+        ).fetchall()
+        assert len(marks) == 1
+        assert [candidate.id for candidate, _ in cache.candidates(frontier, ids=["c-1"])] == ["c-1"]
+        assert cache.count(frontier, filters=LearningFilter()) == 2
+        assert cache.search("toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == [
+            "L-log"
+        ]
+        assert cache._frontier_depth == 1
+        assert (
+            cache._conn.execute(
+                "SELECT id, seq FROM temp._read_sets WHERE set_name='marks'"
+            ).fetchall()
+            == marks
+        )
+        assert cache._conn.execute(
+            "SELECT count(*) FROM temp._read_sets WHERE set_name='id'"
+        ).fetchone() == (1,)
+    assert cache._frontier_depth == 0
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+    assert not cache._conn.in_transaction
+    cache.close()
