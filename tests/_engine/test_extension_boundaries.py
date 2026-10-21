@@ -294,7 +294,7 @@ async def _worker(mode: str, root: Path) -> None:
         # These are watchdogs, not the mechanism that makes a probe succeed.
         # Entry signals control termination; these watchdogs leave time for setup.
         limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
-        lease_ttl_s=1.5,
+        lease_ttl_s=3.0,
         settle_timeout_s=0.2,
     )
     deadline_clock: _RoundClock | None = None
