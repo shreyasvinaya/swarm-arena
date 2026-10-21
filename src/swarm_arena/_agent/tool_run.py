@@ -12,6 +12,7 @@ from swarm_arena._agent.repeats import _is_deterministic, repeat_key
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._budget.amount import USD_LIMIT, Amount
+from swarm_arena._budget.ledger import Reservation
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
@@ -620,7 +621,23 @@ async def _run(
     except Exception as error:
         warnings.append(f"tool error: {type(error).__name__}")
         failed = True
-    res = await rt.ledger.reserve(rt.holder, amount, kind="tool", goal_id=rt.goal_id)
+    admitted: Reservation | None = None
+
+    def on_admit(reservation: Reservation) -> None:
+        nonlocal admitted
+        admitted = reservation
+
+    try:
+        res = await rt.ledger.reserve(
+            rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
+        )
+    except anyio.get_cancelled_exc_class():
+        # No executor dispatch is possible before reserve returns. Retain
+        # ownership at admission so cancellation of durability can refund it.
+        if admitted is not None and not rt.journal.fenced.is_set():
+            with anyio.move_on_after(rt.config.settle_timeout_s, shield=True):
+                await rt.ledger.settle(admitted.id, Amount())
+        raise
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal

@@ -8,7 +8,7 @@ import anyio.lowlevel
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
-from swarm_arena._budget.ledger import Ledger, _nonnegative
+from swarm_arena._budget.ledger import Ledger, Reservation, _nonnegative
 from swarm_arena._errors import _core_signal
 
 _logger = logging.getLogger(__name__)
@@ -36,12 +36,13 @@ class TrancheOutcome:
 
 @dataclass
 class _Batch:
-    """Retain a committed tranche and exact locally available units."""
+    """Retain an admitted tranche and exact locally available units."""
 
     id: str
     tokens: int
     micros: int
     calls: list[str] = field(default_factory=list)
+    durable: bool = False
     settled: bool = False
     overflow: bool = False
 
@@ -79,7 +80,8 @@ class Tranche:
     settlements update local room; closing settles every batch using reported
     actuals and the full estimates of calls still pending. Late settlements
     after closing are ignored, retaining conservative charges.
-    New reservations are shielded through durability and local registration.
+    New reservations are tracked synchronously at ledger admission, before
+    awaiting durability. Dispatch still requires the durable acknowledgement.
     Cancellation before a call identifier is returned leaves its unused
     funding tracked for zero-usage settlement at close.
 
@@ -180,11 +182,14 @@ class Tranche:
             self._ledger._check_usage_overflow()
             estimate = _nonnegative(estimate)
             if not estimate.fits_in(self._size, cap_tokens=True, cap_usd=True):
-                with anyio.CancelScope(shield=True):
-                    res = await self._ledger.reserve(
-                        self._holder, estimate, kind="call", goal_id=self._goal_id
-                    )
-                    call = self._calls[res.id] = _Call(estimate, None, actual=Amount())
+                call = _Call(estimate, None, actual=Amount())
+
+                def own_call(admitted: Reservation) -> None:
+                    self._calls[admitted.id] = call
+
+                res = await self._ledger.reserve(
+                    self._holder, estimate, kind="call", goal_id=self._goal_id, on_admit=own_call
+                )
                 await anyio.lowlevel.checkpoint_if_cancelled()
                 call.actual = None
                 return res.id
@@ -192,7 +197,7 @@ class Tranche:
                 (
                     b
                     for b in reversed(self._batches)
-                    if b.tokens >= estimate.tokens and b.micros >= estimate._micro_usd
+                    if b.durable and b.tokens >= estimate.tokens and b.micros >= estimate._micro_usd
                 ),
                 None,
             )
@@ -209,12 +214,17 @@ class Tranche:
                 )
                 if not estimate.fits_in(size, cap_tokens=True, cap_usd=True):
                     raise _core_signal(LimitReached("budget", f"budget used up for {self._holder}"))
-                with anyio.CancelScope(shield=True):
-                    res = await self._ledger.reserve(
-                        self._holder, size, kind="tranche", goal_id=self._goal_id
-                    )
-                    batch = _Batch(res.id, size.tokens, size._micro_usd)
+
+                def own_batch(admitted: Reservation) -> None:
+                    nonlocal batch
+                    batch = _Batch(admitted.id, size.tokens, size._micro_usd)
                     self._batches.append(batch)
+
+                await self._ledger.reserve(
+                    self._holder, size, kind="tranche", goal_id=self._goal_id, on_admit=own_batch
+                )
+                assert batch is not None
+                batch.durable = True
                 await anyio.lowlevel.checkpoint_if_cancelled()
             assert batch is not None
             cid = f"{batch.id}/call-{len(batch.calls) + 1}"

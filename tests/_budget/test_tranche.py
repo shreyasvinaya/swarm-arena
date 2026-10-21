@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -169,8 +170,9 @@ async def test_settle_after_close_is_noop(env: LedgerEnv) -> None:
 
 @pytest.mark.parametrize("direct", [False, True], ids=["batched", "direct"])
 @pytest.mark.parametrize("after_commit", [False, True], ids=["group-wait", "durable-ack"])
+@pytest.mark.parametrize("native", [False, True], ids=["anyio", "native"])
 async def test_cancelled_reserve_returns_unused_funding_on_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direct: bool, after_commit: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direct: bool, after_commit: bool, native: bool
 ) -> None:
     store = LocalStore(tmp_path / "store")
     lease = Lease.acquire_new(store, owner_id="cancel", host="local", ttl_s=60)
@@ -226,10 +228,20 @@ async def test_cancelled_reserve_returns_unused_funding_on_close(
         if after_commit:
             monkeypatch.setattr(journal, "append_durable", delayed_ack)
         dispatched: list[str] = []
+        callers: list[asyncio.Task[object]] = []
+        cancelled: list[bool] = []
 
         async def request() -> None:
-            with scope:
-                dispatched.append(await tranche.reserve_call(Amount(usd=0.5 if direct else 0.1)))
+            caller = asyncio.current_task()
+            assert caller is not None
+            callers.append(caller)
+            try:
+                with scope:
+                    dispatched.append(
+                        await tranche.reserve_call(Amount(usd=0.5 if direct else 0.1))
+                    )
+            except asyncio.CancelledError:
+                cancelled.append(True)
 
         with anyio.fail_after(5):
             async with anyio.create_task_group() as tasks:
@@ -241,10 +253,14 @@ async def test_cancelled_reserve_returns_unused_funding_on_close(
                     while not ledger._entries:
                         await anyio.lowlevel.checkpoint()
                     assert not any(e.type == "reserve" for e in committed_events())
-                scope.cancel()
+                if native:
+                    callers[0].cancel()
+                else:
+                    scope.cancel()
                 # Let a shielded acquisition finish, while cancellation remains pending.
                 release_ack.set()
-        assert scope.cancelled_caught
+        assert scope.cancelled_caught is not native
+        assert cancelled == ([True] if native else [])
         assert dispatched == []
         await journal.commit()
         outcome = await tranche.close()
@@ -279,6 +295,33 @@ async def test_cancelled_reserve_returns_unused_funding_on_close(
         )
         assert replay.remaining("g/t/a") == ledger.remaining("g/t/a") == Amount(usd=0.9)
         assert all(entry.settled for entry in replay._entries.values())
+
+
+async def test_cancelled_batch_cannot_fund_calls_before_durability_is_confirmed(
+    env: LedgerEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    append = env.journal.append_durable
+    attempts = 0
+
+    async def fail_acknowledgement(draft: EventDraft) -> None:
+        nonlocal attempts
+        await append(draft)
+        if draft.type == "reserve":
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError
+            raise RuntimeError("durability not confirmed")
+
+    monkeypatch.setattr(env.journal, "append_durable", fail_acknowledgement)
+    with pytest.raises(asyncio.CancelledError):
+        await tranche.reserve_call(Amount(usd=0.05))
+    with pytest.raises(RuntimeError, match="durability not confirmed"):
+        await tranche.reserve_call(Amount(usd=0.05))
+    assert attempts == 2
+    await tranche.close()
+    assert env.count("settle") == 2
+    assert env.charged("g1/t/a") == Amount()
 
 
 async def test_new_tranche_shrinks_to_what_is_left() -> None:
