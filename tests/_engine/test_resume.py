@@ -2188,3 +2188,71 @@ async def test_prepare_resume_repairs_page_after_real_close_crash(tmp_path: Path
             await runner.aclose()
     assert (tmp_path / "calls").read_text().splitlines() == ["called"]
     assert [e.type for e in all_events(config) if e.seq > before[-1].seq] == ["takeover"]
+
+
+async def _finished_without_round_page(
+    tmp_path: Path, run_config: RunConfig
+) -> tuple[RunConfig, LocalStore]:
+    """Finish a real run, then remove its derived page for recovery checks."""
+    config = with_executor(run_config, workspace_root=str(tmp_path / "workspace"))
+    await Swarm(config).run(_plan(agents=("a",), rounds=1), run_id="repair")
+    root = Path(config.run_root) / "repair"
+    config = RunConfig.load(root / "run.toml")
+    (root / "goals/g/rounds/round-01.md").unlink()
+    return config, LocalStore(root)
+
+
+@pytest.mark.parametrize("site", ["snapshot", "count"])
+async def test_page_repair_cancellation_releases_owner_before_hook_returns(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    import asyncio
+
+    from swarm_arena._board.arena import ArenaBoard, ArenaView
+
+    config, store = await _finished_without_round_page(tmp_path, run_config)
+    config = config.model_copy(update={"settle_timeout_s": 0.05, "lease_ttl_s": 0.3})
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    scopes: list[anyio.CancelScope] = []
+    owner_type = ArenaBoard if site == "snapshot" else ArenaView
+    method = "snapshot" if site == "snapshot" else "count_learnings"
+    original = getattr(owner_type, method)
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        release.wait()
+        returned.set()
+        return result
+
+    async def prepare() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            runner = await resume_run(config, "repair", force=True, replanner=None)
+            await runner.aclose()
+
+    monkeypatch.setattr(owner_type, method, blocked)
+    task = asyncio.create_task(prepare())
+    try:
+        with anyio.fail_after(5):
+            while not entered.is_set():  # noqa: ASYNC110 - hook entry signal
+                await anyio.sleep(0.01)
+        scopes[0].cancel()
+        with anyio.fail_after(2):
+            await task
+        owner = read_owner(store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+        # Keep the hook blocked through a complete renewal period.
+        await anyio.sleep(config.lease_ttl_s + 0.1)
+        assert read_owner(store) == owner
+        assert not store.exists("goals/g/rounds/round-01.md")
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    with anyio.fail_after(5):
+        while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
+            await anyio.sleep(0.01)
+    assert not store.exists("goals/g/rounds/round-01.md")

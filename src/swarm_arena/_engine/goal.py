@@ -41,6 +41,7 @@ from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._model.base import CallRole
+from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
@@ -129,8 +130,18 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
     )
 
 
+async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier) -> int:
+    """Read the historical count without retaining a cancelled goal or owner."""
+    view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
+    return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
+
+
 async def _repair_round_pages(
-    deps: EngineDeps, state: RunState, *, goal_id: str | None = None
+    deps: EngineDeps,
+    state: RunState,
+    *,
+    goal_id: str | None = None,
+    supervisor: "GoalRunner | None" = None,
 ) -> None:
     """Publish absent pages from recorded frontiers without any paid work."""
     for id, goal in state.goals.items():
@@ -143,8 +154,17 @@ async def _repair_round_pages(
             prefix = _closed_prefix(state, id, round)
             plan = prefix.plan_for_round(id, round)
             frontier = prefix.goals[id].frontiers[round]
-            view = await anyio.to_thread.run_sync(deps.board.snapshot, plan.goal.key(), frontier)
-            count = view.count_learnings(plan.goal.namespace) + sum(
+
+            page_supervisor = supervisor or GoalRunner(
+                deps, goal_id=id, plan=plan, replanner=None, state=goal
+            )
+            completed, recorded_count = await page_supervisor._supervised_step(
+                partial(_page_namespace_count, deps, plan, frontier), final=True
+            )
+            if not completed:
+                return
+            assert recorded_count is not None
+            count = recorded_count + sum(
                 item.goal_id == id
                 and item.run_id == state.run_id
                 and item.round == round
@@ -158,6 +178,9 @@ async def _repair_round_pages(
             epoch, last_seq = parse_segment_name(segment)
             source = Head(epoch=epoch, seq=last_seq, segment=segment)
             content = round_page(prefix, id, round, namespace_learnings=count, source=source)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            if deps.journal.fenced.is_set():
+                raise _core_error(Fenced)
             # ViewWriter embeds the same header itself; pass just the body.
             await deps.views.write(key, content.partition(b"\n")[2], source=source)
 
@@ -1242,7 +1265,7 @@ class GoalRunner:
         )
 
         await self._refresh()
-        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id)
+        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id, supervisor=self)
 
     async def _run_rounds(self) -> None:
         # A crash after closure must not silently skip the pending replanner.
@@ -1336,7 +1359,7 @@ class GoalRunner:
             await self.deps.journal.commit()
             await self._plan_view()
         await self._refresh()
-        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id)
+        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id, supervisor=self)
         if self.state.selection_recorded and not self.state.finished:
             return await self._finish_recovered()
         if not self.history:

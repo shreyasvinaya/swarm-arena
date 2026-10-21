@@ -408,7 +408,10 @@ recorded history is labeled `unavailable` rather than looked up in a newer view.
 
 Resume repairs missing pages for every committed closure, including finished
 goals, terminal policies, and join retries, without new manager, judge, or
-curator work. Existing pages remain untouched. Publication uses the segment
+curator work. Snapshot and count hooks run in abandonable daemon threads under
+goal supervision on both live close and resume. Cancellation releases the owner
+without waiting for a blocked hook; a late result cannot publish a page.
+Existing pages remain untouched. Publication uses the segment
 containing the original close as its source head, so competing repairs cannot
 replace one another's page. Round pages are derived views; the committed journal
 and the recorded frontier remain their source of truth.

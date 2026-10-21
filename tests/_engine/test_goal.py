@@ -1917,3 +1917,58 @@ async def test_competing_page_repair_cannot_replace_original(
         patch.setattr(env.store, "replace", lambda *args, **kwargs: pytest.fail("page replaced"))
         await _repair_round_pages(env.deps, RunState.from_events(env._events()))
         assert env.store.read(key).data == original
+
+
+@pytest.mark.parametrize("site", ["snapshot", "count"])
+@pytest.mark.parametrize("signal", ["stop_now", "fence", "deadline"])
+async def test_live_page_read_abandons_hook_without_late_publication(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, site: str, signal: str
+) -> None:
+    import asyncio
+    import threading
+
+    import anyio
+
+    from swarm_arena._board.arena import ArenaView
+
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.05})
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    target = env.deps.board if site == "snapshot" else ArenaView
+    method = "snapshot" if site == "snapshot" else "count_learnings"
+    original = getattr(target, method)
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        if not env.events("round_closed"):
+            return result
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        release.wait()
+        returned.set()
+        return result
+
+    monkeypatch.setattr(target, method, blocked)
+    runner = GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None)
+    task = asyncio.create_task(runner.run())
+    try:
+        with anyio.fail_after(5):
+            while not entered.is_set():  # noqa: ASYNC110 - page read entry signal
+                await anyio.sleep(0.01)
+        if signal == "fence":
+            env.deps.journal.fenced.set()
+        elif signal == "deadline":
+            monkeypatch.setattr(env.deps.clock, "left", lambda timeout: 0)
+        else:
+            env.deps.stops.stop_now = True
+        done, _ = await asyncio.wait([task], timeout=2)
+        assert done, "page read retained the goal after supervision stopped it"
+        assert not returned.is_set()
+        assert not env.store.exists("goals/g/rounds/round-01.md")
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    with anyio.fail_after(5):
+        while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
+            await anyio.sleep(0.01)
+    assert not env.store.exists("goals/g/rounds/round-01.md")
