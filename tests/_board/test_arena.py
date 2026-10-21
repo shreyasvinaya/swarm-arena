@@ -1041,3 +1041,25 @@ def test_past_run_repeat_entries(tmp_path: Path, board: ArenaBoard) -> None:
     custom = namespace["view"]
     assert isinstance(custom, BoardView)
     assert past_run_repeat_entries(custom, "r1") == []
+
+
+def test_repeat_hints_respect_owner_part_scope(tmp_path: Path, board: ArenaBoard) -> None:
+    from swarm_arena._board.arena import past_run_repeat_entries
+
+    own = FakeRun(str(tmp_path / "runs"), "own")
+    draft = own.plan(parts=["a"])
+    part_goal = Plan.model_validate(draft.payload["plan"]).parts[0].goal
+    own.commit(draft)
+    peer = FakeRun(own.run_root, "peer")
+    peer.commit(peer.plan(parts=["a"]), peer.candidate("peer-part", part="a", repeat_key="key"))
+    foreign = FakeRun(own.run_root, "foreign", goal_id=part_goal.id)
+    assert foreign.goal.key() == part_goal.key()
+    foreign.commit(foreign.plan(), foreign.candidate("foreign-main", repeat_key="key"))
+    for run in (own, peer, foreign):
+        _publish(tmp_path, run)
+    board.open(own.run_id, own.run_root, ["toy"])
+    view = board.snapshot(part_goal.key(), board.frontier())
+    assert view._visible_candidate_ids() == frozenset({"peer-part"})
+    assert [(key, c.id) for key, c in past_run_repeat_entries(view, own.run_id)] == [
+        ("key", "peer-part")
+    ]

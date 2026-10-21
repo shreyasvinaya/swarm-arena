@@ -1241,7 +1241,7 @@ class ArenaView(BoardView):
 
 def past_run_repeat_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate]]:
     """
-    Read other-run repeat hints from an arena snapshot's namespace projection.
+    Read other-run repeat hints from an arena snapshot's resolved membership.
 
     Parameters
     ----------
@@ -1263,6 +1263,8 @@ def past_run_repeat_entries(view: BoardView, run_id: str) -> list[tuple[str, Can
     """
     if not isinstance(view, ArenaView):
         return []
-    return view._cache.repeat_entries(
+    entries = view._cache.repeat_entries(
         view._frontier, goal_key=goal_key_digest(view.goal), exclude_run=run_id
     )
+    visible = view._visible_candidate_ids()
+    return [(key, candidate) for key, candidate in entries if candidate.id in visible]
