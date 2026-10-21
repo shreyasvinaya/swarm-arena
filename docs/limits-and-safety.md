@@ -355,3 +355,7 @@ A stop during the first journal publication settles that admitted batch within
 the cleanup allowance before deciding whether the run started. If `run_started`
 is committed, queued goals receive their stopped result and CLI summary; resume
 skips those finished goals.
+
+A run deadline closes queued goals as stopped, but it does not create a
+`stop_requested` event. The status stop field records explicit `stop` and
+`stop --now` commands only.

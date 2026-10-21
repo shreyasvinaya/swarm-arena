@@ -812,8 +812,8 @@ class RunRunner:
 
 
 async def _record_stop(journal: JournalWriter, stops: StopState, mode: int = 0) -> int:
-    """Record each stronger stop once, including timeout's immediate stop."""
-    current = 2 if stops.stop_now or stops.run_timeout else 1 if stops.stop else 0
+    """Record each stronger explicit stop command once."""
+    current = 2 if stops.stop_now else 1 if stops.stop else 0
     if current > mode:
         await journal.append_durable(
             EventDraft(type=EventType.STOP_REQUESTED, payload={"now": current == 2})

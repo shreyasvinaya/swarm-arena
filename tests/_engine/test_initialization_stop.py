@@ -104,7 +104,7 @@ async def test_initialization_stops_before_worker_release(
         if site in {"board_open", "first_commit"}:
             assert task.result() == {"g": []}
             events = all_events(config)
-            assert any(e.type == "stop_requested" for e in events)
+            assert any(e.type == "stop_requested" for e in events) == (signal != "deadline")
             for event_type in ("no_result", "goal_finished"):
                 matching = [e for e in events if e.type == event_type]
                 assert len(matching) == 1

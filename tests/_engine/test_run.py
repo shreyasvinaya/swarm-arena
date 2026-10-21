@@ -826,3 +826,37 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
             assert not worker.is_alive()
         if successor is not None:
             successor.release()
+
+
+async def test_driving_timeout_is_not_a_stop_command(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.control import read_status
+    from swarm_arena._engine.goal import GoalOutcome, GoalRunner
+    from swarm_arena._engine.round import EngineDeps
+
+    driving = anyio.Event()
+    original = GoalRunner.run
+
+    async def run_goal(runner: GoalRunner) -> GoalOutcome:
+        driving.set()
+        return await original(runner)
+
+    async def expire(runner: RunRunner, deps: EngineDeps) -> None:
+        await driving.wait()
+        deps.stops.run_timeout = True
+
+    monkeypatch.setattr(GoalRunner, "run", run_goal)
+    monkeypatch.setattr(RunRunner, "_watch_clock", expire)
+    config = with_limits(run_config, max_concurrent_goals=1)
+    with anyio.fail_after(20):
+        result = await Swarm(config).run(
+            [plan(goal_id="a", rounds=1), plan(goal_id="b", rounds=1)], run_id="r"
+        )
+    assert driving.is_set()
+    assert result["b"] == []
+    assert not events(config, "stop_requested")
+    assert (await read_status(config.run_root, "r")).stop == "none"
+    assert {e.goal_id: e.payload["reason"] for e in events(config, "goal_finished")}[
+        "b"
+    ] == "stopped"
