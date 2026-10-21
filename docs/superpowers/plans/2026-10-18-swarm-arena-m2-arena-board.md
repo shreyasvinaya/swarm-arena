@@ -1501,7 +1501,7 @@ git commit -m "Add the Curator ABC and its round-end hook" -m "At round end an o
 - Produces:
 ```python
 def page_key(goal_id: str, round: int) -> str: ...      # "goals/<goal-id>/rounds/round-NN.md" (two digits)
-def round_page(state: RunState, goal_id: str, round: int, *, namespace_learnings: int, source: Head) -> bytes: ...
+def round_page(state: RunState, goal_id: str, round: int, *, namespace_learnings: int) -> bytes: ...
 def state_positions(state: RunState, items: Iterable[T], *, until_seq: int | None = None) -> list[tuple[T, Position]]: ...
     # T is Candidate or Score; Position = ("", state.run_id, state.positions[item.id][1]); items with seq > until_seq left out
 # _journal/replay.py (+M2): GoalState gains
@@ -1532,8 +1532,8 @@ Full board: `swarm-arena board serve <run-id>` · <namespace_learnings> learning
 
 ```python
 def test_page_layout(state: RunState) -> None:
-    lines = round_page(state, "ns-viscosity", 2, namespace_learnings=412, source=head).decode().splitlines()
-    assert lines[1] == f"# physika / ns-viscosity · run {state.run_id} · round 2 of 3"     # line 0 is the source-head comment
+    lines = round_page(state, "ns-viscosity", 2, namespace_learnings=412).decode().splitlines()
+    assert lines[0] == f"# physika / ns-viscosity · run {state.run_id} · round 2 of 3"     # publication adds the source-head comment
     assert "Leaderboard (rel-error, lower is better)" in lines
     assert "| 1 | c-0193 | fd-solver / tuner-1 | 0.0041 | c-0112 |" in lines
     assert "| 2 | c-0171 | spectral / author-b | 0.009 | — |" in lines
@@ -1543,8 +1543,8 @@ def test_ignores_later_rounds(state: RunState) -> None: ...        # round-3 ite
 def test_new_learnings_and_pruned(state: RunState) -> None: ...    # "New learnings (1)", "- L-0088 **…** fd-solver/tuner-2 · verified", "Pruned: team `surrogate` (…)."
 def test_table_cells_escape_pipes(state: RunState) -> None: ...    # team "a|b" → "a\|b"
 def test_part_rows_use_part_judge(...) -> None: ...                # part A ranked by "a", scored only by "a" → A's row shows its "a" value
-def test_source_head_embedded(state: RunState) -> None:
-    assert read_source_head("md", round_page(state, "ns-viscosity", 2, namespace_learnings=0, source=head)) == head
+def test_source_head_is_owned_by_publication(state: RunState) -> None:
+    assert read_source_head("md", round_page(state, "ns-viscosity", 2, namespace_learnings=0)) is None
 ```
 `tests/_journal/test_replay.py`: `test_closed_seq_per_round` (round_closed events at seq 7 and 12 → `closed_seq == {1: 7, 2: 12}`).
 `tests/_engine/test_goal.py`: `test_engine_writes_one_page_per_round`. After a 2-round run, `goals/<goal>/rounds/round-01.md` and `round-02.md` exist in the run store, and `round-01.md` does not change after round 2.

@@ -190,14 +190,12 @@ async def _publish_round_page(
     segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
     epoch, last_seq = parse_segment_name(segment)
     source = Head(epoch=epoch, seq=last_seq, segment=segment)
-    content = round_page(prefix, goal_id, round, namespace_learnings=count, source=source)
+    content = round_page(prefix, goal_id, round, namespace_learnings=count)
     await anyio.lowlevel.checkpoint_if_cancelled()
     if deps.journal.fenced.is_set():
         raise _core_error(Fenced)
-    # ViewWriter embeds the same header itself; pass just the body.
-    await _page_storage(
-        partial(deps.views.write, key, content.partition(b"\n")[2], source=source, create_only=True)
-    )
+    # ViewWriter adds provenance without transforming the rendered body.
+    await _page_storage(partial(deps.views.write, key, content, source=source, create_only=True))
 
 
 async def _repair_round_pages(
@@ -205,6 +203,7 @@ async def _repair_round_pages(
     state: RunState,
     *,
     goal_id: str | None = None,
+    closed_round: int | None = None,
     supervisor: "GoalRunner | None" = None,
 ) -> None:
     """Publish absent pages from recorded frontiers without any paid work."""
@@ -212,6 +211,8 @@ async def _repair_round_pages(
         if goal_id is not None and id != goal_id:
             continue
         for round, seq in sorted(goal.closed_seq.items()):
+            if closed_round is not None and round != closed_round:
+                continue
             prefix = _closed_prefix(state, id, round)
             plan = prefix.plan_for_round(id, round)
             page_supervisor = supervisor or GoalRunner(
@@ -1424,7 +1425,9 @@ class GoalRunner:
         )
 
         await self._refresh()
-        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id, supervisor=self)
+        await _repair_round_pages(
+            self.deps, self.recorded, goal_id=self.goal_id, closed_round=round, supervisor=self
+        )
 
     async def _run_rounds(self) -> None:
         # A crash after closure must not silently skip the pending replanner.

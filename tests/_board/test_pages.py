@@ -11,12 +11,10 @@ from swarm_arena._board.pages import page_key, round_page, state_positions
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
-from swarm_arena._journal.views import read_source_head
+from swarm_arena._journal.views import embed_source_head, read_source_head
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
-
-head = Head(epoch=1, seq=100, segment="journal/e1-100.jsonl")
 
 
 def _event(seq: int, kind: str, **payload: Any) -> Event:
@@ -103,12 +101,12 @@ def state() -> RunState:
 
 
 def _page(state: RunState) -> str:
-    return round_page(state, "ns-viscosity", 2, namespace_learnings=412, source=head).decode()
+    return round_page(state, "ns-viscosity", 2, namespace_learnings=412).decode()
 
 
 def test_page_layout(state: RunState) -> None:
     lines = _page(state).splitlines()
-    assert lines[1] == f"# physika / ns-viscosity · run {state.run_id} · round 2 of 3"
+    assert lines[0] == f"# physika / ns-viscosity · run {state.run_id} · round 2 of 3"
     assert "Leaderboard (rel-error, lower is better)" in lines
     assert "| 1 | c-0193 | fd-solver / tuner-1 | 0.0041 | c-0112 |" in lines
     assert "| 2 | c-0171 | spectral / author-b | 0.009 | — |" in lines
@@ -233,10 +231,7 @@ def test_unnamed_judge_does_not_import_plugins() -> None:
 
 def test_source_head_is_owned_by_publication(state: RunState) -> None:
     assert (
-        read_source_head(
-            "md", round_page(state, "ns-viscosity", 2, namespace_learnings=0, source=head)
-        )
-        is None
+        read_source_head("md", round_page(state, "ns-viscosity", 2, namespace_learnings=0)) is None
     )
 
 
@@ -265,10 +260,12 @@ def test_learning_status_and_unscored_evidence(author: str, verified: bool, labe
     assert "Pruned: agent `fd-solver/tuner-2` (done)." in page
 
 
-def test_source_does_not_change_page_body(state: RunState) -> None:
-    newer = Head(epoch=2, seq=200, segment="journal/e2-200.jsonl")
-    page = round_page(state, "ns-viscosity", 2, namespace_learnings=412, source=newer)
-    assert page == _page(state).encode()
+def test_publication_does_not_change_page_body(state: RunState) -> None:
+    head = Head(epoch=2, seq=200, segment="journal/e2-200.jsonl")
+    body = round_page(state, "ns-viscosity", 2, namespace_learnings=412)
+    page = embed_source_head("md", body, head)
+    assert read_source_head("md", page) == head
+    assert page.partition(b"\n")[2] == body
 
 
 def test_evidence_uses_formatter_for_a_score_without_value() -> None:

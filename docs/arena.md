@@ -564,3 +564,7 @@ round frontier, so another agent's same-round learnings stay private until closu
 Storage preflight and resume receipt repair use the configured `ArenaBoard`
 arena root, matching review import/export and board reads. The top-level
 `arena_root` is the fallback when the board does not supply an arena.
+
+Round-page rendering returns the Markdown body. Publication adds exactly one
+source-head comment and checks only the newly closed round; resume still repairs
+all missing closed-round pages. Existing page bytes remain untouched.

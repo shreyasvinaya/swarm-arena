@@ -8,7 +8,6 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from fractions import Fraction
 from functools import partial
-from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from typing import TYPE_CHECKING, Any
@@ -802,5 +801,5 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
             await _review_io(store.create, key, data)
         except AlreadyExists:
             existing = await _review_io(store.read, key)
-            if sha256(existing.data).digest() != sha256(data).digest():
+            if existing.data != data:
                 raise _core_error(StorageError, "review export bytes differ") from None

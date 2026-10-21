@@ -5,7 +5,6 @@ from typing import TypeVar
 
 from swarm_arena._board.cache import Position
 from swarm_arena._board.leaderboard import flatten, format_value, group_judges, group_rows
-from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
 from swarm_arena._model.results import Candidate, Score
 
@@ -83,9 +82,7 @@ def _cell(text: str) -> str:
     return " ".join(text.splitlines()).replace("|", r"\|")
 
 
-def round_page(
-    state: RunState, goal_id: str, round: int, *, namespace_learnings: int, source: Head
-) -> bytes:
+def round_page(state: RunState, goal_id: str, round: int, *, namespace_learnings: int) -> bytes:
     """
     Render the top ten rows, new learnings and prune reasons at a round close.
 
@@ -100,13 +97,11 @@ def round_page(
         Closed ordinary round number.
     namespace_learnings : int
         Count from the recorded round frontier plus its new committed learnings.
-    source : Head
-        Legacy caller source, retained until engine publication owns the header.
 
     Returns
     -------
     bytes
-        UTF-8 Markdown body with a leading blank line. Publication adds provenance.
+        UTF-8 Markdown body. Publication adds its source-head provenance.
 
     Examples
     --------
@@ -119,9 +114,8 @@ def round_page(
     >>> events = [Event(**base, seq=1, type="plan_revision",
     ...                 payload={"plan": plan.model_dump(mode="json"), "origin": "human"}),
     ...           Event(**base, seq=2, type="round_closed", payload={"round": 1})]
-    >>> head = Head(epoch=1, seq=2, segment="journal/e1-2.jsonl")
     >>> page = round_page(RunState.from_events(events), "g", 1,
-    ...                   namespace_learnings=0, source=head)
+    ...                   namespace_learnings=0)
     >>> b"Pruned: nothing." in page
     True
     """
@@ -216,4 +210,4 @@ def round_page(
             f"learnings in namespace `{plan.goal.namespace}`.",
         ]
     )
-    return ("\n" + "\n".join(lines) + "\n").encode()
+    return ("\n".join(lines) + "\n").encode()
