@@ -1,6 +1,7 @@
 """Classify extension outcomes without mistaking user failures for cancellation."""
 
 import asyncio
+from typing import NoReturn
 
 import anyio
 
@@ -53,13 +54,11 @@ def _propagate_control(error: BaseException) -> None:
 class _Outcome:
     """Snapshot caller cancellation before an asynchronous extension boundary."""
 
-    def __init__(self) -> None:
-        task = asyncio.current_task()
-        assert task is not None
-        self._task = task
-        self._info = anyio.get_current_task()
-        self._count = self._task.cancelling()
-        self._pending = self._info.has_pending_cancellation()
+    def __init__(self, *, capture_caller: bool = True) -> None:
+        self._task = asyncio.current_task() if capture_caller else None
+        self._info = anyio.get_current_task() if capture_caller else None
+        self._count = self._task.cancelling() if self._task is not None else 0
+        self._pending = self._info.has_pending_cancellation() if self._info is not None else False
 
     def classify(self, error: BaseException) -> Exception:
         """Let actual pending caller cancellation win over any hook outcome."""
@@ -67,11 +66,21 @@ class _Outcome:
             error,
             cancelled=(
                 self._pending
-                or self._task.cancelling() > self._count
-                or self._info.has_pending_cancellation()
+                or (self._task is not None and self._task.cancelling() > self._count)
+                or (self._info is not None and self._info.has_pending_cancellation())
             ),
         )
 
     def propagate_control(self, error: BaseException) -> None:
         """Propagate controls using this caller's cancellation snapshot."""
         self.classify(error)
+
+    def contain(self, error: BaseException, error_type: type[Exception], site: str) -> NoReturn:
+        """Raise rebuilt core signals or a fresh type-only boundary failure."""
+        registered = _is_core_signal(error)
+        classified = self.classify(error)
+        if registered:
+            raise classified from None
+        raise _core_error(
+            error_type, f"{site} failed: {_exception_type_name(classified)}"
+        ) from None

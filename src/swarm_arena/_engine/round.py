@@ -832,13 +832,7 @@ class RoundRunner:
         try:
             completed, prepared = await supervisor._supervised_step(prepare, final=self.converge)
         except BaseException as error:
-            registered = _is_core_signal(error)
-            error = outcome.classify(error)
-            if registered:
-                raise error from None
-            raise _core_error(
-                RuntimeError, f"round preparation failed: {_exception_type_name(error)}"
-            ) from None
+            outcome.contain(error, RuntimeError, "round preparation")
         if not completed or prepared is None:
             statuses = {}
             for slot in agents:

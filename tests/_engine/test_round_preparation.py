@@ -45,7 +45,8 @@ async def test_round_deadline_starts_after_slow_preparation(
         with anyio.fail_after(10):
             result = await task
         assert starts and starts[0] >= prepared_at
-        assert result.summaries == {"t/a": ""}
+        assert result.reasons == {}
+        assert env.events("round_started")
     finally:
         release.set()
         if not task.done():

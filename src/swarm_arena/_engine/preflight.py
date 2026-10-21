@@ -7,14 +7,14 @@ import anyio
 
 from swarm_arena._agent.manager import Manager
 from swarm_arena._board.arena import _effective_arena_root
-from swarm_arena._errors import ConfigError, _core_error, _exception_type_name, _is_core_signal
+from swarm_arena._errors import ConfigError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.plan import Plan, RoundSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.base import open_store
@@ -120,13 +120,7 @@ def _board_arena_root(config: RunConfig) -> str:
     try:
         return _effective_arena_root(config)
     except BaseException as error:
-        registered = _is_core_signal(error)
-        error = _classify_outcome(error)
-        if registered:
-            raise error from None
-        raise _core_error(
-            RuntimeError, f"board construction failed: {_exception_type_name(error)}"
-        ) from None
+        _Outcome(capture_caller=False).contain(error, RuntimeError, "board construction")
 
 
 async def _check_storage(config: RunConfig) -> None:
