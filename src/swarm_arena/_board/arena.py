@@ -125,8 +125,9 @@ class ArenaBoard(Board):
     """
     Index shared run journals and capture exact, reproducible arena snapshots.
 
-    Construction performs no I/O. Caches open lazily and share one board lock
-    with lifecycle operations, latest-frontier publication, and hint maps.
+    Construction performs no I/O. Storage refresh uses a worker-only lock and
+    writer connections; fixed views use separate WAL reader connections.
+    A short in-memory lock publishes frontiers and protects hint maps.
     Journal heads and named human objects alone determine snapshot membership.
 
     Parameters
@@ -175,7 +176,9 @@ class ArenaBoard(Board):
         """Validate configuration without opening storage or resolving paths."""
         super().__init__(config_or_fields(config, fields))
         self._lock = RLock()
+        self._refresh_lock = RLock()
         self._caches: dict[str, ArenaCache] = {}
+        self._read_caches: dict[str, ArenaCache] = {}
         self._namespaces: tuple[str, ...] = ()
         self._run_id = ""
         self._run_root = ""
@@ -212,15 +215,27 @@ class ArenaBoard(Board):
         return base / "swarm-arena" / sha256_hex(root.encode())[:12]
 
     def _cache(self, namespace: str) -> ArenaCache:
-        """Validate a namespace before a synchronized first cache open."""
+        """Open a writer without holding any fixed-view read lock."""
         _validate_namespace(namespace)
-        with self._lock:
+        with self._refresh_lock:
             if namespace not in self._caches:
-                self._caches[namespace] = ArenaCache(self._cache_dir() / f"{namespace}.sqlite")
+                cache = ArenaCache(self._cache_dir() / f"{namespace}.sqlite")
+                with self._lock:
+                    self._caches[namespace] = cache
             return self._caches[namespace]
 
+    def _read_cache(self, namespace: str) -> ArenaCache:
+        """Prepare a WAL reader whose lock is never taken by ingest or storage."""
+        _validate_namespace(namespace)
+        with self._refresh_lock:
+            if namespace not in self._read_caches:
+                cache = ArenaCache(self._cache_dir() / f"{namespace}.sqlite")
+                with self._lock:
+                    self._read_caches[namespace] = cache
+            return self._read_caches[namespace]
+
     def _plans_at(self, cache: ArenaCache, mark: Frontier.Mark) -> _RunPlans:
-        """Memoize one committed plan projection per run under the board lock.
+        """Memoize one committed plan projection per run under the refresh lock.
 
         Reuse the ingest checkpoint and its suffix catch-up seam under the
         cache lock. Historical reads never rewind a newer ingest checkpoint.
@@ -284,7 +299,7 @@ class ArenaBoard(Board):
         if run_id:
             _validate_run_id(run_id)
         resolved = _resolved_root(run_root) if run_id else ""
-        with self._lock:
+        with self._refresh_lock:
             if run_id:
                 arena = open_store(self.config.arena_root)
                 pointer = RunPointer(run_id=run_id, run_root=resolved)
@@ -312,8 +327,9 @@ class ArenaBoard(Board):
                                 existing.run_root,
                             )
                             warned = True
-            self._run_id, self._run_root, self._namespaces = run_id, resolved, names
-            self._latest = None
+            with self._lock:
+                self._run_id, self._run_root, self._namespaces = run_id, resolved, names
+                self._latest = None
 
     def close(self) -> None:
         """
@@ -325,12 +341,15 @@ class ArenaBoard(Board):
         >>> board.close()
         >>> board.close()
         """
-        with self._lock:
-            for cache in self._caches.values():
+        with self._refresh_lock:
+            with self._lock:
+                caches = [*self._read_caches.values(), *self._caches.values()]
+                self._read_caches.clear()
+                self._caches.clear()
+                self._run_plans.clear()
+                self._latest = None
+            for cache in caches:
                 cache.close()
-            self._caches.clear()
-            self._run_plans.clear()
-            self._latest = None
 
     def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:
         """
@@ -476,7 +495,7 @@ class ArenaBoard(Board):
         ...     assert board.frontier().marks == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             arena = open_store(self.config.arena_root)
             roots: dict[str, str] = {}
             for namespace in self._namespaces:
@@ -517,7 +536,8 @@ class ArenaBoard(Board):
             frontier = build_frontier(reads, reviews, curation)
             for cache in caches:
                 self._load_objects(cache, frontier)
-            self._latest = frontier.model_copy(deep=True)
+            with self._lock:
+                self._latest = frontier.model_copy(deep=True)
             return frontier
 
     def snapshot(self, goal: GoalKey, frontier: Frontier) -> "ArenaView":
@@ -554,7 +574,7 @@ class ArenaBoard(Board):
         """
         frontier = frontier.model_copy(deep=True)
         marks = _validate_marks(frontier.marks)
-        with self._lock:
+        with self._refresh_lock:
             cache = self._cache(goal.namespace)
             for mark in marks:
                 _validate_run_id(mark.run_id)
@@ -563,8 +583,10 @@ class ArenaBoard(Board):
             return ArenaView(self, goal, frontier)
 
     def _latest_frontier(self) -> Frontier:
-        """Capture once on first board read; callers hold the board lock."""
-        return self.frontier() if self._latest is None else self._latest.model_copy(deep=True)
+        """Copy the published frontier or initialize it outside the short lock."""
+        with self._lock:
+            latest = None if self._latest is None else self._latest.model_copy(deep=True)
+        return self.frontier() if latest is None else latest
 
     def best(
         self,
@@ -608,7 +630,7 @@ class ArenaBoard(Board):
         ...     assert board.best(Goal(id="g", namespace="toy").key(), 5, judge="j") == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             return self.snapshot(goal, self._latest_frontier()).best(
                 goal, k, judge=judge, run_id=run_id, part=part, fidelity=fidelity
             )
@@ -648,7 +670,7 @@ class ArenaBoard(Board):
         ...     assert board.learnings("toy") == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             return self._learning_read(namespace, None, tags=tags, goal=goal, limit=limit)
 
     def search_learnings(
@@ -689,7 +711,7 @@ class ArenaBoard(Board):
         ...     assert board.search_learnings("toy", "log(nu)") == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             return self._learning_read(namespace, query, tags=tags, goal=goal, limit=limit)
 
     def _learning_read(
@@ -750,14 +772,15 @@ class ArenaBoard(Board):
         ...         pass
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             frontier = self._latest_frontier()
             for namespace in self._namespaces:
                 rows = self._cache(namespace).candidates(frontier, ids=[id])
                 if rows:
                     return rows[0][0]
-            if id in self._candidates:
-                return self._candidates[id].model_copy(deep=True)
+            with self._lock:
+                if id in self._candidates:
+                    return self._candidates[id].model_copy(deep=True)
             raise KeyError(id)
 
     def get_learning(self, id: str) -> Learning:
@@ -790,7 +813,7 @@ class ArenaBoard(Board):
         ...         pass
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             frontier = self._latest_frontier()
             for namespace in self._namespaces:
                 rows = self._cache(namespace).learnings_by_id(frontier, [id])
@@ -798,7 +821,8 @@ class ArenaBoard(Board):
                     if rows[0].hidden:
                         raise KeyError(id)
                     return rows[0]
-            hint = self._learnings.get(id)
+            with self._lock:
+                hint = self._learnings.get(id)
             if hint is None or hint.hidden:
                 raise KeyError(id)
             cache = self._caches.get(hint.namespace)
@@ -842,7 +866,7 @@ class ArenaBoard(Board):
         ...     assert board.scores(candidate.id) == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             self.get_candidate(candidate_id)
             frontier = self._latest_frontier()
             found: dict[str, Score] = {}
@@ -853,11 +877,12 @@ class ArenaBoard(Board):
                     found[score.id] = score
             if found:
                 return list(found.values())
-            return [
-                s.model_copy(deep=True)
-                for s in self._scores.values()
-                if s.candidate_id == candidate_id
-            ]
+            with self._lock:
+                return [
+                    s.model_copy(deep=True)
+                    for s in self._scores.values()
+                    if s.candidate_id == candidate_id
+                ]
 
     def lineage(self, candidate_id: str) -> LineageGraph:
         """
@@ -889,7 +914,7 @@ class ArenaBoard(Board):
         ...         pass
         ...     board.close()
         """
-        with self._lock, ExitStack() as reads:
+        with self._refresh_lock, ExitStack() as reads:
             frontier = self._latest_frontier()
             caches = []
             for namespace in self._namespaces:
@@ -936,7 +961,7 @@ class ArenaBoard(Board):
         ...     assert board.leaderboard(Goal(id="g", namespace="toy").key(), judge="j") == []
         ...     board.close()
         """
-        with self._lock:
+        with self._refresh_lock:
             return self.snapshot(goal, self._latest_frontier()).leaderboard(goal, judge=judge)
 
 
@@ -945,10 +970,11 @@ class ArenaView(BoardView):
 
     def __init__(self, board: ArenaBoard, goal: GoalKey, frontier: Frontier) -> None:
         self._board = board
+        self._lock = RLock()
         self.goal = goal.model_copy(deep=True)
         self.frontier = frontier.model_copy(deep=True)
         self._frontier = _namespace_frontier(frontier, goal.namespace)
-        self._cache = board._cache(goal.namespace)
+        self._cache = board._read_cache(goal.namespace)
         self._identity_run = board._run_id or None
         self.part: str | None = None
         self.learning_goal = (goal_key_digest(goal), goal.id)
@@ -965,7 +991,7 @@ class ArenaView(BoardView):
             for mark in _validate_marks(frontier.marks):
                 ensure_covered(cache, mark)
             board._load_objects(cache, frontier)
-            self._group_caches[namespace] = cache
+            self._group_caches[namespace] = board._read_cache(namespace)
         self._candidate_ids = frozenset(c.id for c, _ in self._selected())
 
     def _resolve(self) -> None:
@@ -974,7 +1000,7 @@ class ArenaView(BoardView):
         mains: list[tuple[str, str, int, Plan, _RunPlans]] = []
         parts: list[tuple[str, str, int, Plan, _RunPlans, str]] = []
         for mark in _validate_marks(self._frontier.marks):
-            state = self._board._plans_at(self._cache, mark)
+            state = self._board._plans_at(self._board._cache(self.goal.namespace), mark)
             for goal_id, revisions in state.revisions.items():
                 for plan in revisions:
                     row = (mark.run_id, goal_id, plan.revision, plan, state)
@@ -1052,7 +1078,7 @@ class ArenaView(BoardView):
         """Select only a declared group from this frontier's executed revision."""
         if part not in self._active_goals:
             raise _core_error(ValueError, "part outside board snapshot")
-        with self._board._lock:
+        with self._lock:
             result = copy(self)
             result.goal = self._active_goals[part].model_copy(deep=True)
             result._frontier = _namespace_frontier(self.frontier, result.goal.namespace)
@@ -1112,7 +1138,7 @@ class ArenaView(BoardView):
 
     def _ranking_judges(self) -> dict[str | None, str]:
         """Resolve fixed group names from recorded data without loading plugins."""
-        with self._board._lock:
+        with self._lock:
             if self._ranking_plan is None:
                 return {}
             pairs = self._ranking_pairs(self._pairs())
@@ -1150,7 +1176,7 @@ class ArenaView(BoardView):
         if self.part is not None and part not in (None, self.part):
             raise _core_error(ValueError, "part outside board snapshot")
         group = self.part if part is None else part
-        with self._board._lock:
+        with self._lock:
             pairs = self._pairs()
             scores = self._scores(tuple(self._candidate_ids))
             rows = group_rows(
@@ -1167,7 +1193,7 @@ class ArenaView(BoardView):
     def leaderboard(self, goal: GoalKey, *, judge: str) -> list[Row]:
         """Flatten selected groups without filtering a run or applying a margin."""
         self._check_goal(goal)
-        with self._board._lock:
+        with self._lock:
             pairs = self._pairs()
             original_parts = {c.id: c.part for c, _ in pairs}
             rows = flatten(
@@ -1192,7 +1218,7 @@ class ArenaView(BoardView):
         limit: int,
     ) -> list[Learning]:
         filters = self._filters(namespace, goal, tags)
-        with self._board._lock:
+        with self._lock:
             return _find_learnings(
                 self._cache,
                 self._frontier,
@@ -1228,14 +1254,14 @@ class ArenaView(BoardView):
     def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int:
         """Count visible learning membership with the same scope as list reads."""
         filters = self._filters(namespace, goal)
-        with self._board._lock:
+        with self._lock:
             return self._cache.count(self._frontier, filters=filters)
 
     def get_candidate(self, id: str) -> Candidate:
         """Return a candidate only when it belongs to the fixed selected keys."""
         if id not in self._candidate_ids:
             raise KeyError(id)
-        with self._board._lock:
+        with self._lock:
             rows = self._pairs([id])
             if not rows:
                 raise KeyError(id)
@@ -1243,7 +1269,7 @@ class ArenaView(BoardView):
 
     def get_learning(self, id: str) -> Learning:
         """Return a namespace learning only when visible at this frontier."""
-        with self._board._lock:
+        with self._lock:
             rows = self._cache.learnings_by_id(self._frontier, [id])
             if not rows or rows[0].hidden:
                 raise KeyError(id)
@@ -1251,13 +1277,13 @@ class ArenaView(BoardView):
 
     def scores(self, candidate_id: str) -> list[Score]:
         """Read marked scores only for a candidate in this view's membership."""
-        with self._board._lock:
+        with self._lock:
             self.get_candidate(candidate_id)
             return [s for s, _ in self._scores([candidate_id])]
 
     def lineage(self, candidate_id: str) -> LineageGraph:
         """Traverse only resolvable fixed-view nodes, with cycle detection."""
-        with self._board._lock, ExitStack() as reads:
+        with self._lock, ExitStack() as reads:
             for namespace, cache in self._group_caches.items():
                 reads.enter_context(cache._lock)
                 reads.enter_context(cache._frontier(_namespace_frontier(self.frontier, namespace)))

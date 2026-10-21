@@ -539,7 +539,7 @@ def test_large_visible_membership_uses_shared_named_sets(
     run.commit(*events)
     _publish(tmp_path, run)
     view = board.snapshot(run.goal.key(), board.frontier())
-    cache = board._cache("toy")
+    cache = view._cache
     cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
     rows = view.leaderboard(view.goal, judge="j")
     assert len(rows) == 512
@@ -906,7 +906,7 @@ def test_lineage_fills_frontier_once_and_batches_ids(
         other.commit(other.plan())
         _publish(tmp_path, other)
     view = board.snapshot(run.goal.key(), board.frontier())
-    cache = board._cache("toy")
+    cache = view._cache if reader_kind == "view" else board._cache("toy")
     counts: Counter[str] = Counter()
     original = cache._replace_sets
 
@@ -946,7 +946,7 @@ def test_lineage_read_scope_cleans_up_after_failure(
     run.commit(run.plan(), run.candidate("a"), run.candidate("b", parents=["a"]))
     _publish(tmp_path, run)
     view = board.snapshot(run.goal.key(), board.frontier())
-    cache = board._cache("toy")
+    cache = view._cache if reader_kind == "view" else board._cache("toy")
     original = cache.candidates
     calls = 0
 

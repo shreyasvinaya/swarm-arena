@@ -114,6 +114,10 @@ reads still prefer that goal after higher-priority relevance criteria.
 
 Board-level reads reuse the latest frontier, capturing one on the first read.
 Call `frontier()` again to refresh. A previously created view stays fixed.
+Storage reads and ingestion run under a separate refresh lock. Fixed views use
+WAL reader connections, so an event-loop view read does not wait for a worker
+fetching a journal or writing the cache for another goal. Frontier publication
+holds only a short in-memory lock; snapshot preparation belongs on a worker.
 Plan resolution is retained per run and committed mark in the open board.
 Repeated reads at unchanged marks do not replay journal history. Advancement
 reuses committed replay checkpoints and folds only missing events; a cold or
