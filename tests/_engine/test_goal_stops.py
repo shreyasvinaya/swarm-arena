@@ -20,7 +20,7 @@ from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._engine import goal as goal_module
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._errors import Fenced, _core_error, _is_core_signal
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -438,7 +438,7 @@ class TestFinalReservationOwnership:
                 "limits": run_config.limits.model_copy(
                     update={"max_tokens": 1_000_000, "max_usd": 100.0}
                 ),
-                "settle_timeout_s": 0.02,
+                "settle_timeout_s": 2.0,
             }
         )
 
@@ -446,6 +446,8 @@ class TestFinalReservationOwnership:
     async def test_stop_settles_final_reservation_before_completion(
         self, env: EngineEnv, monkeypatch: pytest.MonkeyPatch, phase: str
     ) -> None:
+        clock = _GoalTime(monkeypatch)
+        suspended = anyio.Event()
         admitted: list[Reservation] = []
         dispatched: list[str] = []
         cancelled_ack: list[str] = []
@@ -462,12 +464,19 @@ class TestFinalReservationOwnership:
                 balances.append((ledger._total.tokens, ledger._total._micro_usd))
                 if phase == "acknowledgement":
                     _signal(env, "stop_now")
-                    journal._group_window_s = 1.0
             return real_append(draft)
 
         async def durable(draft: EventDraft) -> Event:
             try:
-                return await real_durable(draft)
+                event = await real_durable(draft)
+                if (
+                    phase == "acknowledgement"
+                    and draft.type == "reserve"
+                    and draft.payload["reservation"]["kind"] == "final"
+                ):
+                    suspended.set()
+                    await anyio.sleep_forever()
+                return event
             except anyio.get_cancelled_exc_class():
                 if draft.type == "reserve" and draft.payload["reservation"]["kind"] == "final":
                     cancelled_ack.append(draft.payload["reservation"]["id"])
@@ -479,6 +488,7 @@ class TestFinalReservationOwnership:
             if ctx.final:
                 dispatched.append(ctx.batch_id)
                 _signal(env, "stop_now")
+                suspended.set()
                 await anyio.sleep_forever()
             return await real_judge(self, goal, candidates, ctx)
 
@@ -493,8 +503,18 @@ class TestFinalReservationOwnership:
             ),
             replanner=None,
         )
+        outcomes: list[GoalOutcome] = []
+
+        async def drive() -> None:
+            outcomes.append(await runner.run())
+
         with anyio.fail_after(20):
-            out = await runner.run()
+            async with anyio.create_task_group() as group:
+                group.start_soon(drive)
+                await suspended.wait()
+                await clock.sampled.wait()
+                clock.now += env.deps.config.settle_timeout_s + 1
+        out = outcomes[0]
         _assert_terminal(env, out, "stop --now")
         assert out.finalists
         assert len(admitted) == 1
@@ -593,3 +613,84 @@ class TestFinalReservationOwnership:
         assert ledger._total == replay._total
         assert ledger.free() == replay.free()
         assert ledger.remaining("g/:final") == replay.remaining("g/:final")
+
+
+@pytest.mark.parametrize("flag", ["stop_now", "deadline"])
+async def test_final_refresh_timeout_is_core_and_recovery_can_finish(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    clock = _GoalTime(monkeypatch)
+    judging, reading = anyio.Event(), anyio.Event()
+    errors: list[Exception] = []
+    completed = anyio.Event()
+    real_judge = ProviderJudge.judge
+    real_read = goal_module._read_chain
+    config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
+    env.deps.config = config
+    plan = _plan(teams=1, rounds=1, judges=[Ref(path="_fakes.tools:ProviderJudge", name="y")])
+
+    async def judge(
+        self: ProviderJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        if ctx.final:
+            judging.set()
+            await anyio.sleep_forever()
+        return await real_judge(self, goal, candidates, ctx)
+
+    async def read(*args: Any, **kwargs: Any) -> Any:
+        if judging.is_set() and not reading.is_set():
+            reading.set()
+            await anyio.sleep_forever()
+        return await real_read(*args, **kwargs)
+
+    monkeypatch.setattr(ProviderJudge, "judge", judge)
+    monkeypatch.setattr(goal_module, "_read_chain", read)
+
+    async def drive() -> None:
+        try:
+            await GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None).run()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as group:
+            group.start_soon(drive)
+            await judging.wait()
+            _signal(env, flag)
+            await clock.sampled.wait()
+            clock.now += config.settle_timeout_s + 1
+            await reading.wait()
+            clock.now += config.settle_timeout_s + 1
+            await completed.wait()
+    await env.deps.journal.commit()
+    assert len(errors) == 1, "a storage timeout must escape final-judge classification"
+    assert isinstance(errors[0], RuntimeError)
+    assert _is_core_signal(errors[0])
+    assert str(errors[0]) == "goal storage settlement timed out"
+    committed = read_committed(env.store)
+    assert committed is not None
+    events = committed[1]
+    assert not [event for event in events if "final_batch" in event.payload]
+    assert not env.events("no_result")
+    assert not env.events("goal_finished")
+    assert not [event for event in env.events("judge_error") if event.round == 0]
+    assert not env.store.exists("goals/g/solution.json")
+    state = RunState.from_events(events)
+    assert not state.goals["g"].finished
+    monkeypatch.setattr(ProviderJudge, "judge", real_judge)
+    monkeypatch.setattr(goal_module, "_read_chain", real_read)
+    with anyio.fail_after(20):
+        recovered = await GoalRunner(
+            env.deps,
+            goal_id="g",
+            plan=plan,
+            replanner=None,
+            state=state.goals["g"],
+            journal_r0=False,
+        ).run()
+    _assert_terminal(env, recovered, _REASONS[flag])
+    assert recovered.finalists
+    assert len(env.events("goal_finished")) == 1
+    assert not env.events("no_result")

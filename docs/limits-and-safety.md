@@ -382,3 +382,8 @@ including its retries, by the settlement allowance. Healthy graceful-stop work
 may continue: the bound applies to each storage wait, rather than expiring the
 writer after a fixed duration. Goal refresh and view storage use the same
 settlement bound for graceful stop as for immediate stop and deadline.
+
+A post-stop final-selection recovery read can exhaust its storage settlement
+allowance. That failure propagates as a core storage-settlement error; it does
+not publish judge errors or a terminal provider-failure result. Resume can
+continue the unfinished goal from the committed journal.

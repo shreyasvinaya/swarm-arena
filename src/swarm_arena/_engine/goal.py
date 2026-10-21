@@ -1010,26 +1010,13 @@ class GoalRunner:
 
         try:
             order: list[Candidate] = []
+            completed = True
             try:
                 completed, result = await self._supervised_step(invoke, final=True)
                 if completed:
                     assert result is not None
                     order, outcome = result
                 else:
-                    await self._refresh()
-                    state = self._round_state()
-                    identity = state.ranking_identity.get(None)
-                    if identity is not None:
-                        order = [
-                            c
-                            for c, _ in ranked(
-                                finalists,
-                                state.scores,
-                                identity=identity,
-                                fidelity=None,
-                                allow_partial=self.plan.converge.allow_partial,
-                            )
-                        ]
                     raise TimeoutError
             except Fenced:
                 raise
@@ -1048,6 +1035,22 @@ class GoalRunner:
                         for c in finalists
                     ],
                 )
+            if not completed:
+                # Recovery storage belongs to the engine, outside judge classification.
+                await self._refresh()
+                state = self._round_state()
+                identity = state.ranking_identity.get(None)
+                if identity is not None:
+                    order = [
+                        c
+                        for c, _ in ranked(
+                            finalists,
+                            state.scores,
+                            identity=identity,
+                            fidelity=None,
+                            allow_partial=self.plan.converge.allow_partial,
+                        )
+                    ]
             if not order and outcome.errors:
                 self.status, self.reason = "no_result", "provider_failed"
             # The last outcome proves completion of this exact batch. Queue it
