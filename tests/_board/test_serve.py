@@ -62,7 +62,7 @@ def server(tmp_path: Path) -> Iterator[Server]:
     add_pointer(str(tmp_path / "arena"), run)
     board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
     board.open("", "", ["toy"])
-    http = make_server(board, ["toy"], author="alice", port=0, refresh_s=0)
+    http = make_server(board, ["toy"], author="alice", port=0)
     thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     try:
@@ -136,12 +136,12 @@ def test_search_and_filters(server: Server) -> None:
 
 
 def test_learning_page_shows_evidence_scores(server: Server) -> None:
+    server.run.commit(server.run.learning("L-missing", "Missing evidence", evidence=["missing"]))
     body = get(server, "/learning/L-1")
     assert 'href="/candidate/c-child"' in body
     assert "0.004123" in body
     assert "verified" in body
     assert "t1/a1" in body
-    server.run.commit(server.run.learning("L-missing", "Missing evidence", evidence=["missing"]))
     assert "unknown candidate" in get(server, "/learning/L-missing")
 
 
@@ -470,3 +470,30 @@ def test_response_write_does_not_block_other_gets(
             finally:
                 release.set()
                 assert writing.result(timeout=5)
+
+
+@pytest.mark.parametrize("action", ["add", "pin", "hide"])
+def test_default_mutation_redirect_publishes_state(server: Server, action: str) -> None:
+    with _default_server(server) as site:
+        token = _token(site)
+        fields = {"token": token, "ns": "toy", "title": "Immediately readable", "text": "New text"}
+        path = "/learnings/add" if action == "add" else f"/learning/L-1/{action}"
+        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=5)
+        try:
+            connection.request("POST", path, body=urlencode(fields))
+            response = connection.getresponse()
+            assert response.status == 303
+            location = response.getheader("Location")
+            response.read()
+            assert location is not None
+            body = get(site, location)
+            marker = {"add": "Immediately readable", "pin": "pinned", "hide": "hidden"}[action]
+            if action == "add":
+                assert marker in body
+            else:
+                flags = re.search(r"<p>(.*?)</p>", body)
+                assert flags is not None
+                assert marker in flags[1]
+            assert len(_objects(site)) == 1
+        finally:
+            connection.close()

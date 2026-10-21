@@ -22,6 +22,7 @@ from swarm_arena._board.leaderboard import format_value
 from swarm_arena._board.pointers import _validate_namespace
 from swarm_arena._board.trace import _lines
 from swarm_arena._errors import _core_error
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.results import Candidate, Learning
 
@@ -257,7 +258,8 @@ def make_server(
     run_id : str or None, default=None
         Default run filter on the index.
     refresh_s : float, default=5.0
-        Minimum interval between request-triggered frontier publications.
+        Minimum interval between periodic background refreshes. A successful
+        mutation publishes its new state before redirecting.
 
     Returns
     -------
@@ -481,6 +483,7 @@ def make_server(
                     namespace, _ = _learning(state, names, identifier)
 
             async def apply() -> str:
+                nonlocal refreshed
                 operation = await _apply_human_operation(
                     board,
                     namespace,
@@ -492,10 +495,14 @@ def make_server(
                     goal_id=value("goal"),
                     tags=[tag.strip() for tag in value("tags").split(",") if tag.strip()],
                 )
+                # POST is a storage operation: wait for its publication while
+                # independent GETs continue reading the last published state.
+                await run_sync_daemon(board.frontier)
+                with lock:
+                    refreshed = time.monotonic()
                 return operation.learning.id if operation.learning is not None else identifier or ""
 
             identifier = anyio.run(apply, backend="asyncio")
-            # The next eligible refresh picks up this object; never refresh twice in one interval.
             self._reply(303, "Saved", location=f"/learning/{quote(identifier, safe='')}")
 
     class Server(ThreadingHTTPServer):

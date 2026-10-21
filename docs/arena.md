@@ -517,7 +517,8 @@ links. Query parameters are `q` (literal text search), `ns`, `goal`, `run`,
 `hidden=1` selects only hidden items, while `hidden=all` includes both. For
 example, `/?q=viscosity&verified=1&page=2` shows the second page of verified
 matches. Each request uses one published frontier; incoming requests refresh
-it at most once every five seconds.
+it in a background worker at most once every five seconds. Once a generation
+exists, GET requests keep reading it during storage refresh or mutation I/O.
 
 A learning page shows its text, author, markers, and linked evidence with
 formatted scores or an unknown-candidate error. Candidate pages show a summary,
@@ -527,5 +528,7 @@ require the per-server token and each write one immutable curation object,
 using the same validation and mutation operations as the terminal commands.
 Add accepts a configured namespace, title, text, optional goal and comma-separated
 tags. New human learnings have an `L-h-…` identifier and a `human:<author>`
-author. Mutations redirect to the learning page; new curation appears after the
-next eligible refresh.
+author. Each successful mutation refreshes the published frontier before its
+303 redirect, so its learning page and updated markers are immediately readable.
+A POST may wait for an in-progress storage refresh; GET requests continue reading
+the published generation during that wait.
