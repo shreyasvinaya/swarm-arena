@@ -5,7 +5,7 @@ import os
 import socket
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
@@ -89,6 +89,46 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
         raise _core_error(Fenced) from None
     if error is not None:
         raise error
+
+
+@asynccontextmanager
+async def _supervise_initialization(
+    store: Store, epoch: int, stops: StopState, clock: RunClock, config: RunConfig
+) -> AsyncGenerator[Callable[[], None]]:
+    """Cancel startup on stop or run expiry until ownership passes to the driver."""
+    outcome = _Outcome()
+    error: BaseException | None = None
+    watcher_scope = anyio.CancelScope()
+    with anyio.CancelScope() as preparation:
+        stops.on_change = preparation.cancel
+
+        async def watch() -> None:
+            with watcher_scope:
+                async with anyio.create_task_group() as watchers:
+                    watchers.start_soon(watch_stop_files, store, epoch, stops)
+                    await anyio.sleep(clock.left(config.limits.run_timeout_s))
+                    stops.run_timeout = True
+
+        def prepared() -> None:
+            stops.on_change = None
+            watcher_scope.cancel()
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(watch)
+            try:
+                await anyio.lowlevel.checkpoint()
+                yield prepared
+            except BaseException as caught:
+                error = caught
+            finally:
+                prepared()
+                tasks.cancel_scope.cancel()
+    # The task group's own cancellation must not hide a concurrent caller cancel.
+    outcome.propagate_control(asyncio.CancelledError())
+    if error is not None:
+        if preparation.cancel_called and isinstance(error, anyio.get_cancelled_exc_class()):
+            return
+        raise outcome.classify(error) from None
 
 
 class _RunJournal(JournalWriter):
@@ -505,93 +545,110 @@ class RunRunner:
         )
         local_path = _local_journal_path(run_id, lease.doc.epoch)
         clock = RunClock(0)
-        async with (
-            _RunJournal(
-                store,
-                lease,
-                run_id=run_id,
-                next_seq=1,
-                local_path=local_path,
-                sync_interval_s=config.sync_interval_s,
-            ) as journal,
-            _supervise_writer(journal),
-        ):
-            journal.clock = clock
-            await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
-            await run_sync_daemon(
-                store.create,
-                "manifest.json",
-                canonical_json(RunManifest.model_validate(manifest).model_dump(mode="json")),
-            )
-            ids = IdGen(run_id, lease.doc.epoch)
-            ledger = Ledger(
-                config.limits,
-                reserve_fraction=config.reserve_fraction,
-                goal_weights=config.goal_weights,
-                journal=journal,
-                ids=ids,
-            )
-            journal.append(
-                EventDraft(
-                    type=EventType.RUN_CONFIG, payload={"config": config.model_dump(mode="json")}
-                )
-            )
-            journal.append(
-                EventDraft(
-                    type=EventType.RUN_STARTED,
-                    payload={
-                        "estimate": estimate.to_estimate().model_dump(mode="json"),
-                        "warnings": warnings,
-                        "manifest": manifest,
-                        "final_slices": {g: a.model_dump() for g, a in slices.items()},
-                    },
-                )
-            )
-            await ledger.hold_final_slices(slices)
-            for plan in self.plans:
-                journal.append(r0_revision_draft(plan, plan.base_dir))
-                journal.append(EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id))
-            head = await journal.commit()
-            assert head is not None
-            views = ViewWriter(store, journal)
-            for plan in self.plans:
-                await views.write(
-                    f"goals/{plan.goal.id}/plan.r0.toml", plan.dumps().encode(), source=head
-                )
-            board = await _start_board(config)
-            try:
-                await _open_board(
-                    board,
-                    config,
-                    run_id,
-                    sorted(
-                        {p.goal.namespace for p in self.plans}
-                        | {part.goal.namespace for p in self.plans for part in p.parts}
-                    ),
-                )
-                deps = EngineDeps(
+        stops = StopState()
+        entered = False
+        try:
+            async with (
+                _supervise_initialization(store, lease.doc.epoch, stops, clock, config) as prepared,
+                _RunJournal(
+                    store,
+                    lease,
                     run_id=run_id,
-                    config=config,
-                    store=store,
-                    journal=journal,
-                    ledger=ledger,
-                    board=board,
-                    executor=executor,
-                    artifacts=artifacts,
-                    ids=ids,
-                    views=views,
-                    stops=StopState(),
-                    clock=clock,
-                    admission=RunAdmission(config.limits.max_agents_total, self.plans),
-                    board_namespaces={
-                        goal.namespace
-                        for plan in self.plans
-                        for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                    },
-                )
-                return await self._drive(deps, lease.doc.epoch)
-            finally:
-                await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+                    next_seq=1,
+                    local_path=local_path,
+                    sync_interval_s=config.sync_interval_s,
+                ) as journal,
+            ):
+                entered = True
+                async with _supervise_writer(journal):
+                    journal.clock = clock
+                    await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
+                    await run_sync_daemon(
+                        store.create,
+                        "manifest.json",
+                        canonical_json(
+                            RunManifest.model_validate(manifest).model_dump(mode="json")
+                        ),
+                    )
+                    ids = IdGen(run_id, lease.doc.epoch)
+                    ledger = Ledger(
+                        config.limits,
+                        reserve_fraction=config.reserve_fraction,
+                        goal_weights=config.goal_weights,
+                        journal=journal,
+                        ids=ids,
+                    )
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_CONFIG,
+                            payload={"config": config.model_dump(mode="json")},
+                        )
+                    )
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_STARTED,
+                            payload={
+                                "estimate": estimate.to_estimate().model_dump(mode="json"),
+                                "warnings": warnings,
+                                "manifest": manifest,
+                                "final_slices": {g: a.model_dump() for g, a in slices.items()},
+                            },
+                        )
+                    )
+                    await ledger.hold_final_slices(slices)
+                    for plan in self.plans:
+                        journal.append(r0_revision_draft(plan, plan.base_dir))
+                        journal.append(EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id))
+                    head = await journal.commit()
+                    assert head is not None
+                    views = ViewWriter(store, journal)
+                    for plan in self.plans:
+                        await views.write(
+                            f"goals/{plan.goal.id}/plan.r0.toml",
+                            plan.dumps().encode(),
+                            source=head,
+                        )
+                    board = await _start_board(config)
+                    try:
+                        await _open_board(
+                            board,
+                            config,
+                            run_id,
+                            sorted(
+                                {p.goal.namespace for p in self.plans}
+                                | {part.goal.namespace for p in self.plans for part in p.parts}
+                            ),
+                        )
+                        deps = EngineDeps(
+                            run_id=run_id,
+                            config=config,
+                            store=store,
+                            journal=journal,
+                            ledger=ledger,
+                            board=board,
+                            executor=executor,
+                            artifacts=artifacts,
+                            ids=ids,
+                            views=views,
+                            stops=stops,
+                            clock=clock,
+                            admission=RunAdmission(config.limits.max_agents_total, self.plans),
+                            board_namespaces={
+                                goal.namespace
+                                for plan in self.plans
+                                for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                            },
+                        )
+                        prepared()
+                        return await self._drive(deps, lease.doc.epoch)
+                    finally:
+                        await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+            return {}
+        finally:
+            if not entered:
+                with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                    with suppress(BaseException):
+                        await run_sync_daemon(lease.release)
 
     async def aclose(self) -> None:
         """
