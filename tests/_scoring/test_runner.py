@@ -7,7 +7,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft, EventType
@@ -711,7 +711,11 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
 ) -> None:
     judge = _RecordingJudge()
     later = _RecordingJudge()
-    failure = failure_type("ownership or cancellation")
+    failure = (
+        _core_error(Fenced, "run ownership lost")
+        if failure_type is Fenced
+        else failure_type("ownership or cancellation")
+    )
 
     def fail() -> Any:
         raise failure
@@ -731,7 +735,8 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
     if failure_type is Fenced:
         with pytest.raises(Fenced) as caught:
             await call
-        assert caught.value is failure
+        assert caught.value is not failure
+        assert caught.value.args == ("run ownership lost",)
         assert later.seen == []
     else:
         # These synchronous hooks raise user cancellation, without a pending

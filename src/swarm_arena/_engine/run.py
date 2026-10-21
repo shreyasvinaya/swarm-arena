@@ -40,6 +40,7 @@ from swarm_arena._model.plan import Plan, Resources, RoundSpec
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import Estimate, ToolRequest
+from swarm_arena._outcomes import _has_core_fenced as _has_fenced
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import stamp
@@ -166,12 +167,6 @@ def _capacity_warning(plans: Sequence[Plan], capacity: Resources | None) -> list
     ):
         return ["peak resource demand exceeds Executor.capacity; work may queue"]
     return []
-
-
-def _has_fenced(error: BaseException) -> bool:
-    return isinstance(error, Fenced) or (
-        isinstance(error, BaseExceptionGroup) and any(_has_fenced(e) for e in error.exceptions)
-    )
 
 
 async def _start_executor(config: RunConfig) -> Executor:

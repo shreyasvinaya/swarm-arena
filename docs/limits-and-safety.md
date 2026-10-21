@@ -275,3 +275,8 @@ constructor or command hook. Collection converts ordinary exceptions and
 interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
 The engine classifies those transported outcomes at its supervised boundary,
 where it can distinguish caller cancellation from a hook-raised failure.
+
+A hook-created `Fenced` exception does not establish ownership loss, whether
+raised directly or nested in an exception group. Only the journal's fenced
+state or a core-registered fencing signal can terminate the run as fenced.
+Caller cancellation takes precedence over even a registered fencing outcome.

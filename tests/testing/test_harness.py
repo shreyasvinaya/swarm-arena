@@ -13,7 +13,7 @@ from swarm_arena import (
     ScriptedManager,
     ScriptJudge,
 )
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.reader import read_committed
 from swarm_arena.executor import Job, LocalExecutor
@@ -124,7 +124,7 @@ async def test_harness_retains_each_failure_and_resets_them_for_a_new_run(
 async def test_manager_control_flow_propagates_without_error_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failure = Fenced("ownership lost")
+    failure = _core_error(Fenced, "run ownership lost")
     seen: list[int] = []
 
     async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
@@ -142,7 +142,8 @@ async def test_manager_control_flow_propagates_without_error_event(
             limits=Limits(),
             config=RunConfig(),
         )
-    assert caught.value is failure
+    assert caught.value is not failure
+    assert caught.value.args == ("run ownership lost",)
     assert seen == [1]
     assert _events(harness, "agent_status") == []
     assert _events(harness, "round_closed") == []

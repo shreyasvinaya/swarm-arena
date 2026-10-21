@@ -18,7 +18,7 @@ from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -285,7 +285,7 @@ async def test_replanner_fencing_propagates_and_user_cancellation_is_rejected(
     planner = SequencePlanner([plan])
 
     async def fail(goal: Goal, config: RunConfig, history: History | None) -> Plan:
-        raise error("hook failure")
+        raise error("hook failure") if cancelled else _core_error(Fenced, "run ownership lost")
 
     monkeypatch.setattr(planner, "plan", fail)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)

@@ -25,7 +25,7 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError, _exception_type_name
+from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -533,7 +533,7 @@ class GoalRunner:
                 try:
                     while True:
                         if self.deps.journal.fenced.is_set():
-                            raise Fenced()
+                            raise _core_error(Fenced, "run ownership lost")
                         stopped = self._stop()
                         if stopped and not final:
                             break
@@ -698,8 +698,6 @@ class GoalRunner:
                             llm=False,
                         )
                     )
-                except Fenced:
-                    raise
                 except BaseException as error:
                     error = preparation.classify(error)
                     outcome = JudgeOutcome(
@@ -993,8 +991,6 @@ class GoalRunner:
         outcome = _Outcome()
         try:
             await run_preflight([plan], self.deps.config, self.deps.executor)
-        except Fenced:
-            raise
         except BaseException as error:
             error = outcome.classify(error)
             raise PlanError([f"preflight failed: {_exception_type_name(error)}"]) from None

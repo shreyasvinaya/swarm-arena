@@ -56,7 +56,7 @@ from swarm_arena import (
     ScriptedManager,
     ScriptTool,
 )
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_error
 from swarm_arena._exec.local import _NOT_AN_OUTPUT
 from swarm_arena._model.ids import run_tag
 from swarm_arena._model.tooling import format_logs_ref
@@ -1076,7 +1076,7 @@ async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch)
 
     from swarm_arena._errors import Fenced
 
-    failure = Fenced("ownership lost")
+    failure = _core_error(Fenced, "run ownership lost")
 
     async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
         raise failure
@@ -1084,7 +1084,8 @@ async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(NoopManager, "run_round", run_round)
     with pytest.raises(Fenced) as caught:
         await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
-    assert caught.value is failure
+    assert caught.value is not failure
+    assert caught.value.args == ("run ownership lost",)
 
 
 async def test_check_manager_surfaces_manager_exception() -> None:

@@ -10,7 +10,7 @@ from _fakes.run import all_events, events, plan
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Plan, Ref, RunConfig, ScriptedManager, Swarm
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena.manager import AgentContext, RoundReport
 
 SECRET = "09e80b84-eae1-44bd-bfaf-4db52c50628b"
@@ -18,12 +18,15 @@ SECRET = "09e80b84-eae1-44bd-bfaf-4db52c50628b"
 
 class FailingRuntimeManager(ScriptedManager):
     failure_type: ClassVar[type[Exception]] = ValueError
+    registered_fence: ClassVar[bool] = False
     armed: ClassVar[bool] = False
     arm_after_preflight: ClassVar[bool] = False
     entered: ClassVar[anyio.Event | None] = None
 
     def __init__(self, config: ScriptedManager.Config) -> None:
         if self.armed:
+            if self.failure_type is Fenced and self.registered_fence:
+                raise _core_error(Fenced, "run ownership lost")
             raise self.failure_type(SECRET)
         super().__init__(config)
 
@@ -114,11 +117,25 @@ async def test_runtime_manager_failure_is_type_only_and_peer_finishes(
     assert any(event.agent == "a1" for event in events(run_config, "tool_start"))
 
 
-async def test_runtime_manager_constructor_preserves_fencing(
-    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("registered", [False, True])
+async def test_runtime_manager_constructor_uses_fencing_authority(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, registered: bool
 ) -> None:
     monkeypatch.setattr(FailingRuntimeManager, "armed", False)
     monkeypatch.setattr(FailingRuntimeManager, "arm_after_preflight", True)
     monkeypatch.setattr(FailingRuntimeManager, "failure_type", Fenced)
-    with pytest.raises(Fenced):
-        await Swarm(run_config).run(_plan())
+    monkeypatch.setattr(FailingRuntimeManager, "registered_fence", registered)
+    if registered:
+        with pytest.raises(Fenced) as caught:
+            await Swarm(run_config).run(_plan())
+        assert SECRET not in "".join(traceback.format_exception(caught.value))
+    else:
+        result = await Swarm(run_config).run(_plan())
+        assert result["g"]
+        assert events(run_config, "goal_finished")
+        assert any(event.agent == "a1" for event in events(run_config, "tool_start"))
+        assert any(
+            event.payload.get("reason") == "agent error: Fenced"
+            for event in events(run_config, "agent_status")
+        )
+    assert SECRET not in repr([event.model_dump() for event in all_events(run_config)])

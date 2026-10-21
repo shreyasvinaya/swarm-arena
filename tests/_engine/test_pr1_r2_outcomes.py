@@ -10,7 +10,7 @@ from swarm_arena import ProgramJudge, Ref, RunConfig, Swarm
 from swarm_arena._errors import Fenced
 
 
-@pytest.mark.parametrize("kind", ["fenced", "cancel", "group"])
+@pytest.mark.parametrize("kind", ["fenced", "cancel", "group", "forged", "forged_group"])
 @pytest.mark.parametrize("stage", ["constructor", "anchor_count", "models", "providers", "score"])
 async def test_judge_boundary_outcomes_through_public_run(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, stage: str, kind: str

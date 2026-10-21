@@ -9,7 +9,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import LimitReached, Manager
-from swarm_arena._errors import Fenced, _exception_type_name
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
@@ -455,7 +455,7 @@ async def check_manager(
         if harness.manager_errors:
             raise harness.manager_errors[0]
         return reports
-    except (LimitReached, Fenced):
+    except LimitReached:
         raise
     except BaseException as error:
         error = outcome.classify(error)

@@ -420,7 +420,8 @@ class Chain(Policy):
                 cls, validated = ref._resolve_config(Policy)
                 try:
                     members.append(cls(validated))
-                except TypeError:
+                except TypeError as error:
+                    _propagate_control(error)
                     raise TypeError(f"cannot build policy {ref.path}") from None
                 except BaseException as error:
                     _propagate_control(error)

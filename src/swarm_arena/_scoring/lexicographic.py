@@ -5,7 +5,7 @@ from typing import ClassVar, cast
 
 from pydantic import Field, JsonValue
 
-from swarm_arena._errors import Fenced, _exception_type_name
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
@@ -100,7 +100,8 @@ class Lexicographic(Judge):
                 cls, validated = ref._resolve_config(Judge)
                 try:
                     members.append(cls(validated))
-                except TypeError:
+                except TypeError as error:
+                    _propagate_control(error)
                     raise TypeError(f"cannot build judge {ref.path}") from None
                 except BaseException as error:
                     _propagate_control(error)
@@ -177,8 +178,6 @@ class Lexicographic(Judge):
                     ]
                 )
             )
-        except Fenced:
-            raise
         except BaseException as error:
             _propagate_control(error)
             raise ValueError("cannot encode lexicographic rubric") from None
@@ -417,8 +416,6 @@ class Lexicographic(Judge):
                         ),
                     )
                 )
-            except Fenced:
-                raise
             except BaseException as error:
                 error = _classify_outcome(error)
                 errors[candidate.id] = (

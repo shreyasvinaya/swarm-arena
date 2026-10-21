@@ -41,7 +41,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _has_core_fenced, _Outcome
 from swarm_arena._planning.catalog_check import find_entry
 from swarm_arena._planning.policy import _INACTIVE
 from swarm_arena._planning.validate import judge_private_paths
@@ -805,8 +805,6 @@ class RoundRunner:
                         ):
                             raise TypeError("invalid manager report")
                         summaries[key] = finite_json(report.summary)
-            except Fenced:
-                raise
             except BaseException as error:
                 error = outcome.classify(error)
                 if self.deps.journal.fenced.is_set():
@@ -838,7 +836,7 @@ class RoundRunner:
                 await done.wait()
                 tasks.cancel_scope.cancel()
         except BaseExceptionGroup as errors:
-            if self.deps.journal.fenced.is_set() or errors.subgroup(Fenced) is not None:
+            if self.deps.journal.fenced.is_set() or _has_core_fenced(errors):
                 raise _core_error(Fenced, "run ownership lost") from None
             raise
         if self.deps.journal.fenced.is_set():

@@ -38,7 +38,7 @@ from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
 from swarm_arena._engine.round import RoundOutcome, RoundRunner
-from swarm_arena._errors import Fenced, LeaseHeld, PlanError, SoftError
+from swarm_arena._errors import Fenced, LeaseHeld, PlanError, SoftError, _core_error
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import Event, EventDraft
@@ -543,7 +543,7 @@ async def test_takeover_retries_when_old_owner_commits_meanwhile(
         attempts.append(1)
         if len(attempts) == 1:
             crashed_live.old_lease.renew()
-            raise Fenced("another owner changed the lease")
+            raise _core_error(Fenced, "run ownership lost")
         return real(cls, store, **kw)
 
     monkeypatch.setattr(Lease, "take_over", classmethod(racing))
@@ -565,7 +565,7 @@ async def test_concurrent_resume_fails_cleanly(
         real(cls, store, **cast(dict[str, Any], other_kw))
         if race_before_call:
             return real(cls, store, **kw)
-        raise Fenced("another owner changed the lease")
+        raise _core_error(Fenced, "run ownership lost")
 
     monkeypatch.setattr(Lease, "take_over", classmethod(other_first))
     with pytest.raises(Fenced, match="concurrent resume"):
@@ -1567,7 +1567,7 @@ async def test_resume_shutdown_bound_and_primary_failure(
 
     async def drive(self: RunRunner, deps: object, epoch: int) -> dict[str, list[Candidate]]:
         if fenced:
-            raise Fenced()
+            raise _core_error(Fenced, "run ownership lost")
         return expected
 
     monkeypatch.setattr(RunRunner, "_drive", drive)

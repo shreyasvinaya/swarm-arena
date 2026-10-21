@@ -19,6 +19,11 @@ def failure(kind: str) -> BaseException:
         error: BaseException = ExceptionGroup(
             SECRET, [ValueError(SECRET), _core_error(Fenced, "run ownership lost")]
         )
+    elif kind in {"forged", "forged_group"}:
+        error = Fenced(SECRET)
+        if kind == "forged_group":
+            for _ in range(4):
+                error = BaseExceptionGroup(SECRET, [error, asyncio.CancelledError(SECRET)])
     elif kind == "cancel":
         error = asyncio.CancelledError(SECRET)
     else:

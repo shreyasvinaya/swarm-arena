@@ -32,7 +32,7 @@ from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import round as round_module
 from swarm_arena._engine.goal import r0_revision_draft
 from swarm_arena._engine.round import AgentSlot, RoundRunner
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
@@ -323,7 +323,7 @@ async def test_runtime_constructor_fenced_propagates_bare(
 
     def fenced(self: Ref, base: type[Any]) -> Any:
         if self.name == "faulty" and base is component:
-            error = Fenced("run ownership lost")
+            error = _core_error(Fenced, "run ownership lost")
             if nested:
                 raise ExceptionGroup("construction failed", [error])
             raise error
@@ -698,7 +698,7 @@ async def test_manager_error_never_exposes_exception_values(env: EngineEnv) -> N
 async def test_fenced_manager_raises_bare_fenced(env: EngineEnv) -> None:
     class FencedManager(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
 
     with pytest.raises(Fenced):
         await _round(env, [_with_manager("a", FencedManager()), _scripted("b", [])]).run(1)
@@ -1103,7 +1103,7 @@ async def test_nested_fenced_manager_raises_bare_fenced(env: EngineEnv) -> None:
     class NestedFencedManager(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
             async def fenced() -> None:
-                raise Fenced("run ownership lost")
+                raise _core_error(Fenced, "run ownership lost")
 
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(fenced)

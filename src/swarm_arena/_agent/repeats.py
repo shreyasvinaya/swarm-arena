@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Literal
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._errors import Fenced, SoftError, _core_signal, _exception_type_name
+from swarm_arena._errors import SoftError, _core_signal, _exception_type_name
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -357,8 +357,6 @@ class RepeatIndex:
                     request=request.model_copy(update={"replicate": index}),
                     deterministic=False,
                 )
-            except Fenced:
-                raise
             except BaseException as error:
                 error = _classify_outcome(error)
                 raise _core_signal(

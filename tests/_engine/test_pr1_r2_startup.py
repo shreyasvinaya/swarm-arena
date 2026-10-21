@@ -13,7 +13,9 @@ from swarm_arena import FunctionTool, RunConfig, Swarm
 from swarm_arena._errors import Fenced
 
 
-@pytest.mark.parametrize("kind", ["fenced", "cancel", "group", "ordinary"])
+@pytest.mark.parametrize(
+    "kind", ["fenced", "cancel", "group", "ordinary", "forged", "forged_group"]
+)
 @pytest.mark.parametrize(
     "site",
     [
@@ -81,9 +83,11 @@ async def test_public_startup_and_shutdown_outcomes(
         await Swarm(run_config).run(current, approve=approve)
     assert SECRET not in "".join(traceback.format_exception(caught.value))
     assert calls
+    if kind != "fenced":
+        assert not isinstance(caught.value, Fenced)
 
 
-@pytest.mark.parametrize("kind", ["ordinary", "cancel", "group"])
+@pytest.mark.parametrize("kind", ["ordinary", "cancel", "group", "forged", "forged_group"])
 def test_cli_startup_outcome_is_type_only(tmp_path: Path, run_config: RunConfig, kind: str) -> None:
     import os
     import subprocess

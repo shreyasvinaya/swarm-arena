@@ -3,7 +3,7 @@
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
-from swarm_arena._errors import Fenced, _exception_type_name
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.ref import Ref
@@ -120,8 +120,6 @@ async def run_checks(
         outcome = _Outcome()
         try:
             result = await check.check(candidate, copy(ctx))
-        except Fenced:
-            raise
         except BaseException as error:
             error = outcome.classify(error)
             results.append(
@@ -134,8 +132,6 @@ async def run_checks(
             continue
         try:
             valid = await run_sync_daemon(_prepare_check_result, result)
-        except Fenced:
-            raise
         except BaseException as error:
             outcome.propagate_control(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
@@ -242,8 +238,6 @@ async def _judge_batch(
             ctx.batch_id,
         )
         stamped = _stamp_score_ids(prepared, ctx.ids)
-    except Fenced:
-        raise
     except BaseException as error:
         error = outcome.classify(error)
         stamped = []

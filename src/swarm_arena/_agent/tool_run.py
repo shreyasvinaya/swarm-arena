@@ -36,7 +36,7 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome
 from swarm_arena._scoring.check import CheckContext
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
@@ -317,8 +317,6 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     """Contain user hook failures separately from safe core validation errors."""
     try:
         return hook(*args)
-    except Fenced:
-        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_signal(
@@ -383,8 +381,6 @@ def _request(
             replicate=0 if replicate is None else replicate,
             edits=dict(edits or {}),
         )
-    except Fenced:
-        raise
     except ConfigError as error:
         raise _core_signal(SoftError(str(error))) from None
     except BaseException as error:
@@ -418,8 +414,6 @@ def _stage_settings(
             max_edit_bytes=rt.limits.max_edit_bytes,
         )
         return files, editable, protected
-    except Fenced:
-        raise
     except BaseException as error:
         error = _classify_outcome(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
@@ -462,8 +456,6 @@ def _stage(
             edits=request.edits,
             request_json=request_json(request),
         )
-    except Fenced:
-        raise
     except BaseException as error:
         error = _classify_outcome(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
@@ -614,10 +606,9 @@ async def execute_tool_run(
         owner = _ToolReservation()
         try:
             return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids), owner)
-        except Fenced:
-            raise
-        except BaseException:
-            await _refund_undispatched(rt, owner)
+        except BaseException as error:
+            if not _has_core_fenced(error):
+                await _refund_undispatched(rt, owner)
             raise
     finally:
         if index is not None:
@@ -658,8 +649,6 @@ async def _run(
 
     try:
         amount, providers = await _prepare_sync(estimate)
-    except Fenced:
-        raise
     except BaseException as error:
         error = outcome.classify(error)
         if _is_core_signal(error) and isinstance(error, LimitReached):
@@ -743,8 +732,6 @@ async def _run(
                     inflight.discard(run_scope)
             if run_scope.cancelled_caught:
                 output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
-    except Fenced:
-        raise
     except BaseException as error:
         refused = error is admission_refusal
         error = outcome.classify(error)
@@ -764,8 +751,6 @@ async def _run(
         inflight._add_completion(output_scope, grace_s=0, generation=inflight._cancel_generation)
         try:
             output = await run_sync_daemon(_prepare_output, output)
-        except Fenced:
-            raise
         except BaseException as error:
             outcome.propagate_control(error)
             warnings.append("tool error: invalid output")
@@ -795,8 +780,6 @@ async def _run(
                 if started:
                     actual = reported
                     estimated = providers and usage.usd is None and usage.total_tokens == 0
-            except Fenced:
-                raise
             except BaseException as error:
                 error = outcome.classify(error)
                 warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -806,8 +789,6 @@ async def _run(
             try:
                 logs_ref = await anyio.to_thread.run_sync(_logs, rt, id, output.logs_ref)
                 output = output.model_copy(update={"logs_ref": logs_ref})
-            except Fenced:
-                raise
             except BaseException as error:
                 error = outcome.classify(error)
                 warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -823,9 +804,11 @@ async def _run(
                 if not isinstance(value, str):
                     raise TypeError("invalid fingerprint")
                 fingerprint = check_utf8(value)
-        except Fenced:
-            raise
         except anyio.get_cancelled_exc_class() as error:
+            # The tool has completed: abandon optional fingerprint work, then
+            # finish its shielded publication/settlement. The caller's scope
+            # still owns cancellation; the ownership check below still wins.
+            error = _classify_outcome(error)
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
         except BaseException as error:
             error = outcome.classify(error)

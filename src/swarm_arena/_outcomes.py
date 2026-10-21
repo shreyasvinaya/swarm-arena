@@ -8,9 +8,22 @@ from swarm_arena._errors import (
     Fenced,
     _core_error,
     _exception_type_name,
+    _is_core_signal,
     _rebuild_core_signal,
     _with_exception_type,
 )
+
+
+def _has_core_fenced(error: BaseException) -> bool:
+    """Find registered ownership loss without trusting exception type alone."""
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, Fenced) and _is_core_signal(current):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    return False
 
 
 def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Exception:
@@ -19,16 +32,12 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
         # A hook can catch genuine cancellation and replace its message. The
         # pending caller state wins, independently of that untrusted outcome.
         raise asyncio.CancelledError() from None
-    if isinstance(error, Fenced):
-        raise error
-    if isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None:
-        # Task groups can wrap ownership loss alongside other hook failures.
-        # Preserve the control signal without retaining group or leaf values.
+    if _has_core_fenced(error):
         raise _core_error(Fenced, "run ownership lost") from None
     rebuilt = _rebuild_core_signal(error)
     if rebuilt is not None:
         return rebuilt
-    if isinstance(error, BaseExceptionGroup) or not isinstance(error, Exception):
+    if isinstance(error, (Fenced, BaseExceptionGroup)) or not isinstance(error, Exception):
         name = _exception_type_name(error)
         return _with_exception_type(
             _core_error(RuntimeError, f"supervised hook failed: {name}"), name

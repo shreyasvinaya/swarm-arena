@@ -506,6 +506,7 @@ def coerce_ref(value: object) -> object:
         try:
             return Ref.of(value)
         except TypeError as error:
+            _propagate_control(error)
             # Only these fixed importability reasons are allowed out of the boundary.
             reason = str(error)
             if reason not in {

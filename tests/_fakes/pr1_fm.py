@@ -9,7 +9,7 @@ import anyio
 from pydantic import BaseModel
 
 from swarm_arena import Goal, Score, ScriptTool
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena.board import Candidate
 from swarm_arena.manager import AgentContext, Manager, RoundReport
 from swarm_arena.scoring import Check, CheckContext, CheckResult
@@ -32,7 +32,11 @@ def failure(kind: str) -> BaseException:
         return asyncio.CancelledError(MARK)
     if kind == "fenced_group":
         return BaseExceptionGroup(
-            MARK, [asyncio.CancelledError(MARK), ExceptionGroup(MARK, [Fenced(MARK), error])]
+            MARK,
+            [
+                asyncio.CancelledError(MARK),
+                ExceptionGroup(MARK, [_core_error(Fenced, "run ownership lost"), error]),
+            ],
         )
     group = BaseExceptionGroup(MARK, [asyncio.CancelledError(MARK), error])
     group.add_note(MARK)

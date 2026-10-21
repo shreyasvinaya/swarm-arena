@@ -15,7 +15,6 @@ from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
-    Fenced,
     SoftError,
     _core_signal,
     _exception_type_name,
@@ -81,8 +80,6 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
             raise TypeError("invalid feedback policy")
         return _ToolMetadata(description, input_model, editable, actions, feedback)
-    except Fenced:
-        raise
     except BaseException as error:
         error = _classify_outcome(error)
         raise _core_signal(
@@ -939,8 +936,6 @@ class AgentContext:
         outcome = _Outcome()
         try:
             return await action.handler(self, validated)
-        except Fenced:
-            raise
         except BaseException as error:
             error = outcome.classify(error)
             if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):

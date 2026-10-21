@@ -352,16 +352,13 @@ class OfflineHarness:
             outcome = _Outcome()
             try:
                 report = await manager.run_round(AgentContext(rt, gate=lambda: None))
-            except LimitReached:
-                report = RoundReport()
-            except Fenced:
-                raise
             except BaseException as error:
                 error = outcome.classify(error)
                 if rt.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
-                self.manager_errors.append(error)
-                manager_error = error
+                if not isinstance(error, LimitReached):
+                    self.manager_errors.append(error)
+                    manager_error = error
                 report = RoundReport()
             finally:
                 self.candidates.extend(c for c in rt.own if isinstance(c, Candidate))

@@ -12,7 +12,7 @@ from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import execute_tool_run
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
-from swarm_arena._errors import Fenced, SoftError
+from swarm_arena._errors import Fenced, SoftError, _core_error
 from swarm_arena._journal.event import EventType
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex
@@ -1270,7 +1270,7 @@ async def test_determinism_fence_keeps_control_meaning(
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
         return False
 
     monkeypatch.setattr(rt_env.rt.tool, "is_deterministic", deterministic)
@@ -1794,7 +1794,7 @@ async def test_staging_container_fencing_propagates(
     from swarm_arena._agent.context import AgentContext
 
     ctx = AgentContext(rt_env.rt)
-    fenced = Fenced("run ownership lost")
+    fenced = _core_error(Fenced, "run ownership lost")
     iterations = 0
 
     class Globs(list[str]):
@@ -1813,7 +1813,8 @@ async def test_staging_container_fencing_propagates(
         return
     with pytest.raises(Fenced) as caught:
         await ctx.run_tool({"x": 1}, edits={"p/a.txt": "x"})
-    assert caught.value is fenced
+    assert caught.value is not fenced
+    assert caught.value.args == ("run ownership lost",)
     assert iterations == fail_on
     assert rt_env.rt.counters.tool_runs == 0
     assert not rt_env.events("reserve")

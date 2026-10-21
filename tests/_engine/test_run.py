@@ -14,7 +14,7 @@ from swarm_arena import Ref, RunConfig
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.run import RunRunner, _require_asyncio
 from swarm_arena._engine.swarm import Swarm
-from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
@@ -425,7 +425,7 @@ async def test_fenced_remains_bare_when_executor_shutdown_fails(
 
     class FencedExecutor(RecordingExecutor):
         async def capacity(self) -> Resources | None:
-            raise ExceptionGroup("lost owner", [Fenced()])
+            raise ExceptionGroup("lost owner", [_core_error(Fenced, "run ownership lost")])
 
         async def aclose(self) -> None:
             raise ValueError("shutdown failed")
