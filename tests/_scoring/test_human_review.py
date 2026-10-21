@@ -376,7 +376,7 @@ async def test_import_missing_owner_on_retry(
 async def test_import_uses_no_engine_services_or_clock(
     review_run: FakeRun, run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from swarm_arena._engine import run
+    from swarm_arena._engine import run, stops
 
     def forbidden(*args: Any, **kwargs: Any) -> None:
         pytest.fail("standalone review import constructed engine services")
@@ -384,6 +384,7 @@ async def test_import_uses_no_engine_services_or_clock(
     monkeypatch.setattr(run, "_start_executor", forbidden)
     monkeypatch.setattr(run, "_start_board", forbidden)
     monkeypatch.setattr(run, "RunClock", forbidden)
+    monkeypatch.setattr(stops, "RunClock", forbidden)
     await HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
     assert all("run_elapsed_s" not in e.payload for e in _events(review_run.store)[-2:])
 
@@ -1301,3 +1302,135 @@ async def test_review_compares_core_owned_storage_bytes(
     else:
         await write_review_export(state, review_run.store, head)
     assert threading.get_ident() not in threads
+
+
+async def test_import_after_run_deadline(run_config: RunConfig, tmp_path: Path) -> None:
+    run = FakeRun(run_config.run_root, "expired-review")
+    run.commit(
+        EventDraft(
+            type=EventType.RUN_CONFIG,
+            payload={
+                "config": run_config.model_dump(mode="json"),
+                "run_elapsed_s": run_config.limits.run_timeout_s + 1,
+            },
+        ),
+        run.plan(),
+        run.candidate("c-1"),
+        EventDraft(type=EventType.GOAL_FINISHED, goal_id="g", payload={"reason": "stopped"}),
+    )
+    run._lease.release()
+    scores = await HumanReview("alice").import_csv(run.run_id, _file(tmp_path), config=run_config)
+    assert [score.key for score in scores] == [(1.0, 7.0)]
+    assert _events(run.store)[-1].type == EventType.REVIEW_IMPORTED
+
+
+@pytest.mark.parametrize("now", [False, True])
+async def test_stop_during_import(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    now: bool,
+) -> None:
+    import asyncio
+    import threading
+    from functools import partial
+
+    import anyio
+
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.control import request_stop
+    from swarm_arena._model.canonical import utc_now
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = human_review._read_state
+
+    def read(store: Store, run_id: str, doc: Any = None) -> RunState:
+        if doc is not None and doc.epoch == 2:
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(30)
+        return original(store, run_id, doc)
+
+    monkeypatch.setattr(human_review, "_read_state", read)
+    monkeypatch.setattr(
+        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
+    )
+    task = asyncio.create_task(
+        HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
+    )
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "review import retained a stopped storage wait"
+        with pytest.raises(RuntimeError, match=r"^review import stopped$"):
+            await task
+        owner = read_owner(review_run.store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
+
+
+async def test_import_after_running_to_deadline(
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anyio
+    from _fakes.run import WRITE_THEN_SLEEP, plan
+    from _fakes.tools import PyTool
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.round import EngineDeps
+
+    candidate_done = anyio.Event()
+    append = run_module._RunJournal.append
+    watch = run_module.RunRunner._watch_clock
+
+    def signal(journal: run_module._RunJournal, draft: EventDraft) -> Event:
+        event = append(journal, draft)
+        if draft.type == EventType.GOAL_FINISHED and draft.goal_id == "a":
+            candidate_done.set()
+        return event
+
+    async def deadline(runner: run_module.RunRunner, deps: EngineDeps) -> None:
+        await candidate_done.wait()
+        deps.clock._rebase(deps.config.limits.run_timeout_s)
+        await watch(runner, deps)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_module._RunJournal, "append", signal)
+        patch.setattr(run_module.RunRunner, "_watch_clock", deadline)
+        with anyio.fail_after(20):
+            await Swarm(run_config).run(
+                [
+                    plan(goal_id="a", rounds=1),
+                    plan(goal_id="b", tool=PyTool({"code": WRITE_THEN_SLEEP})),
+                ],
+                run_id="timed-review",
+            )
+    store = open_store(run_config.run_root).child("timed-review")
+    state = RunState.from_events(_events(store))
+    assert state.run_elapsed_s >= run_config.limits.run_timeout_s
+    review = HumanReview("alice")
+    out = await review.export("timed-review", config=run_config, out_dir=tmp_path / "rev")
+    rows = list(csv.DictReader(io.StringIO((out / "review.csv").read_text())))[:1]
+    assert rows
+    rows[0].update(verdict="accept", score="7")
+    scores = await review.import_csv(
+        "timed-review", _file(tmp_path, _csv(*rows)), config=run_config
+    )
+    assert [score.key for score in scores] == [(1.0, 7.0)]

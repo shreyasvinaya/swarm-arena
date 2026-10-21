@@ -218,7 +218,10 @@ absent for a verdict-only review. Re-rank the arena using
 Run imports **after the run ends**: a live owner prevents takeover. For `s3://`
 roots, valid imports probe conditional writes before taking the lease. The CSV
 is validated again against the final head fixed by takeover, and score IDs use
-that new epoch. Import does not execute goals or start a run clock.
+that new epoch. Import does not execute goals or start a run clock. The run's
+active-time limit does not apply to later human review, including runs that ended
+by that limit. A stop requested during import raises `RuntimeError("review import
+stopped")`; lease and fencing supervision remain active.
 
 Review publication and repair honor cancellation and fencing. An interrupted
 publication resumes from the committed receipt; missing review objects are

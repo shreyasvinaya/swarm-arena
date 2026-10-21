@@ -561,9 +561,15 @@ class HumanReview:
         ValueError
             If CSV rows are invalid or the run has no committed events.
         RuntimeError
-            If the run still has a live owner.
+            If the run still has a live owner, or an import stop is requested
+            (``review import stopped``).
         Fenced
             If another owner wins takeover or publication loses authority.
+
+        Notes
+        -----
+        Import retains stop-file and lease supervision. The ended run's active-time
+        allowance does not limit later human review.
 
         Examples
         --------
@@ -573,7 +579,7 @@ class HumanReview:
         """
         from swarm_arena._engine.resume import _take_over
         from swarm_arena._engine.run import _supervise_initialization, _supervise_writer
-        from swarm_arena._engine.stops import RunClock, StopState
+        from swarm_arena._engine.stops import StopState
 
         config = config.model_copy(
             update={"arena_root": await _review_io(_board_arena_root, config)}
@@ -588,12 +594,8 @@ class HumanReview:
         )
         await anyio.to_thread.run_sync(check_storage, config)
 
-        clock: RunClock | None = None
-
         def validate_locations(doc: OwnerDoc) -> None:
-            nonlocal clock
             current = _read_state(store, run_id, doc)
-            clock = RunClock(current.run_elapsed_s)
             _review_keys(current, self._reviewer, config.arena_root, utc_now(), initial_scores)
 
         try:
@@ -614,10 +616,9 @@ class HumanReview:
                 / "journals"
                 / f"{run_id}-e{lease.doc.epoch}.jsonl"
             )
-            assert clock is not None
             completed = False
             async with (
-                _supervise_initialization(store, lease.doc.epoch, StopState(), clock, config),
+                _supervise_initialization(store, lease.doc.epoch, StopState(), None, config),
                 JournalWriter(
                     store,
                     lease,

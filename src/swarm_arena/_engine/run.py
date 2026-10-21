@@ -94,9 +94,9 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
 
 @asynccontextmanager
 async def _supervise_initialization(
-    store: Store, epoch: int, stops: StopState, clock: RunClock, config: RunConfig
+    store: Store, epoch: int, stops: StopState, clock: RunClock | None, config: RunConfig
 ) -> AsyncGenerator[Callable[[], None]]:
-    """Cancel startup on stop or run expiry until ownership passes to the driver."""
+    """Watch stop files and, when a clock is supplied, the remaining run allowance."""
     outcome = _Outcome()
     error: BaseException | None = None
     watcher_scope = anyio.CancelScope()
@@ -107,8 +107,9 @@ async def _supervise_initialization(
             with watcher_scope:
                 async with anyio.create_task_group() as watchers:
                     watchers.start_soon(watch_stop_files, store, epoch, stops)
-                    await anyio.sleep(clock.left(config.limits.run_timeout_s))
-                    stops.run_timeout = True
+                    if clock is not None:
+                        await anyio.sleep(clock.left(config.limits.run_timeout_s))
+                        stops.run_timeout = True
 
         def prepared() -> None:
             stops.on_change = None
