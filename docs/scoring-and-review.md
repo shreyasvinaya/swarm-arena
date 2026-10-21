@@ -191,7 +191,10 @@ and includes its ranked parts.
 
 The CSV columns are `id`, `goal`, `team`, `agent`, `scores`, `verdict`, `score`,
 and `notes`. Keep the identifier and read-only context columns; edit the last
-three columns. `scores` shows recorded judge/value pairs for reference. A
+three columns. `scores` shows recorded judge/value pairs for reference. Export
+prefixes text cells starting with `=`, `+`, `-`, `@`, a tab, or a carriage return
+with an apostrophe so spreadsheets treat them as text. Canonical candidate/score
+JSON remains unchanged. Context columns remain display-only during import. A
 verdict is `accept`, `reject`, or empty, with any letter case. A score is a
 finite number or empty. Both verdict and score empty means no review for that
 row; notes alone do not create a score. UTF-8 BOMs, CRLF line endings, and quoted

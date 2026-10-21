@@ -135,7 +135,10 @@ def render_review(state: RunState, *, top: int = 20, goal: str | None = None) ->
                 "",
                 "",
             ]
-            writer.writerow(cells)
+            writer.writerow(
+                "'" + cell if cell.startswith(("=", "+", "-", "@", "\t", "\r")) else cell
+                for cell in cells
+            )
             key = f"candidates/{cid}.json"
             files[key] = canonical_json(
                 {

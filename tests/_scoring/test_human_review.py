@@ -896,3 +896,38 @@ async def test_invalid_review_location_fails_before_probe_or_takeover(
     await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
     runner = await resume_run(run_config, review_run.run_id, force=False, replanner=None)
     await runner.aclose()
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_review_csv_neutralizes_text_and_preserves_canonical_json(
+    state: RunState, prefix: str
+) -> None:
+    from swarm_arena._model.canonical import canonical_json
+
+    text = prefix + 'HYPERLINK("https://example.invalid/","click")'
+    candidate = state.candidates["c-1"].model_copy(update={"team": text, "agent": text})
+    state.candidates[candidate.id] = candidate
+    original = state.scores["s-1"]
+    score = original.model_copy(update={"id": "s-0", "judge": text})
+    state.scores[score.id] = score
+    state.positions[score.id] = (state.positions[original.id][0], 0)
+    files = render_review(state)
+    row = next(
+        row
+        for row in csv.DictReader(io.StringIO(files["review.csv"].decode(), newline=""))
+        if row["id"] == candidate.id
+    )
+    assert row["team"] == "'" + text
+    assert row["agent"] == "'" + text
+    assert row["scores"] == "'" + text + "=4; j=4"
+    assert files[f"candidates/{candidate.id}.json"] == canonical_json(
+        {
+            "candidate": candidate.model_dump(mode="json"),
+            "scores": [score.model_dump(mode="json"), original.model_dump(mode="json")],
+        }
+    )
+    row.update(goal="display only", verdict="Accept", score="7")
+    parsed = parse_review_csv(_csv(row), state, judge="human:alice")
+    assert len(parsed) == 1
+    assert parsed[0].candidate_id == candidate.id
+    assert parsed[0].key == (1.0, 7.0)
