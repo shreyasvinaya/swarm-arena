@@ -248,8 +248,9 @@ async def test_base_dir_import_rule(run_config: RunConfig, tmp_path: Path) -> No
             sys.path.remove(str(tmp_path))
 
 
+@pytest.mark.parametrize("converge_team", [False, True])
 async def test_one_admission_shared_by_every_goal(
-    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, converge_team: bool
 ) -> None:
     from swarm_arena._engine.goal import GoalRunner
     from swarm_arena._engine.round import EngineDeps
@@ -262,7 +263,9 @@ async def test_one_admission_shared_by_every_goal(
         original(self, deps, **kwargs)
 
     monkeypatch.setattr(GoalRunner, "__init__", initialize)
-    await Swarm(run_config).run([plan(goal_id=g, rounds=1) for g in ("a", "b", "c")])
+    await Swarm(run_config).run(
+        [plan(goal_id=g, rounds=1, converge_team=converge_team) for g in ("a", "b", "c")]
+    )
     assert len(admissions) == 3
     assert admissions[0] is not None
     assert all(a is admissions[0] for a in admissions)

@@ -1455,6 +1455,7 @@ class GoalRunner:
                     goal_id=self.goal_id,
                     plan=self.plan,
                     agents=self.agents,
+                    supervisor=self,
                     round_spec=spec,
                     rounds_left=self.plan.rounds_total(self.deps.config.limits)
                     - self.rounds_closed,

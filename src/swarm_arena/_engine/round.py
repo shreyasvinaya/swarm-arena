@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
@@ -52,6 +52,9 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+if TYPE_CHECKING:
+    from swarm_arena._engine.goal import GoalRunner
 
 
 @dataclass(kw_only=True)
@@ -357,6 +360,9 @@ class RoundRunner:
     started_runs : Mapping[str, int], optional
         Restored durable starts by team/agent, including lost runs. Without an
         explicit count, a restarted round counts its committed tool_start events.
+    supervisor : GoalRunner or None, default=None
+        Existing goal owner for stop and fence supervision. Standalone rounds
+        create a local supervisor.
 
     Examples
     --------
@@ -383,6 +389,7 @@ class RoundRunner:
         converge: bool = False,
         seed_parents: Sequence[str] = (),
         started_runs: Mapping[str, int] = {},
+        supervisor: "GoalRunner | None" = None,
     ) -> None:
         """Copy incoming round and resume carriers before launching tasks."""
         self.deps, self.goal_id, self.plan = deps, goal_id, plan
@@ -393,6 +400,7 @@ class RoundRunner:
         self.frontier, self.converge = frontier, converge
         self.seed_parents = tuple(dict.fromkeys(seed_parents)) if converge else ()
         self.started_runs = dict(started_runs)
+        self._supervisor = supervisor
         self._counters: dict[str, dict[str, int]] = {}
         self._own_learnings: dict[str, list[Learning]] = {}
 
@@ -821,7 +829,7 @@ class RoundRunner:
             parents = await self._parent_views(frontier)
             return frontier, parents, await self._feedback_policies()
 
-        supervisor = GoalRunner(
+        supervisor = self._supervisor or GoalRunner(
             self.deps, goal_id=self.goal_id, plan=self.plan, replanner=None, journal_r0=False
         )
         outcome = _Outcome()

@@ -37,7 +37,6 @@ from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._board.base import Board
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
-from swarm_arena._engine import resume
 from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
@@ -2131,7 +2130,7 @@ async def test_resume_checks_storage_before_takeover(
         calls.append(config)
         raise ConditionalWritesUnsupported("create did not behave conditionally")
 
-    monkeypatch.setattr(resume, "check_storage", spy)
+    monkeypatch.setattr("swarm_arena._engine.preflight.check_storage", spy)
     before = crashed.store.read("control/owner.json").data
     with pytest.raises(ConditionalWritesUnsupported):
         await Swarm(crashed.config).resume(crashed.run_id, force=True)
