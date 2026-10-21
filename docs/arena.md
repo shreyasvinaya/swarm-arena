@@ -75,6 +75,12 @@ run and goal in identifier order. Declared sibling capabilities retain the
 same frontier and revision; ordinary part-view reads retain their own scope.
 Equal part keys can share candidates across runs even when their part names
 differ. Candidate records and leaderboard rows retain their original provenance.
+When the opening run has a main or part group with the requested key, that
+owning group takes precedence over matches from other runs, including a foreign
+main goal with the same key as an owning part. Its main and producing keys
+determine the candidate pool; its plan determines siblings and learning scope.
+Direct part snapshots and sibling capabilities agree on these scopes. With no
+owning match, main-goal matches still precede part-goal matches.
 
 Rankings use the owning run's recorded judge identity. A reader without an own
 run, or a run with no score for that judge yet, uses the newest recorded identity

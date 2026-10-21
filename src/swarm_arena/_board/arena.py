@@ -954,6 +954,7 @@ class ArenaView(BoardView):
         self.learning_goal = (goal_key_digest(goal), goal.id)
         self._plan: Plan | None = None
         self._ranking_plan: Plan | None = None
+        self._candidate_main_key: str | None = None
         self._active_goals: dict[str | None, GoalKey] = {}
         self._candidate_groups: dict[str, str | None] = {}
         self._resolve()
@@ -976,6 +977,12 @@ class ArenaView(BoardView):
                     for part in plan.parts:
                         if goal_key_digest(part.goal.key()) == digest:
                             parts.append((*row, part.name))
+        own_mains = [row for row in mains if row[0] == self._identity_run]
+        own_parts = [row for row in parts if row[0] == self._identity_run]
+        if own_mains:
+            mains = own_mains
+        elif own_parts:
+            mains, parts = [], own_parts
         matches = mains if mains else [row[:5] for row in parts]
         if not matches:
             return
@@ -985,6 +992,8 @@ class ArenaView(BoardView):
             self.part = resolved[5]
             self.learning_goal = (goal_key_digest(resolved[3].goal.key()), resolved[1])
         anchor = next((row for row in ordered if row[0] == self._identity_run), ordered[0])
+        if anchor[0] == self._identity_run:
+            self._candidate_main_key = goal_key_digest(anchor[3].goal.key())
         _, goal_id, _, _, state = anchor
         self._plan = state.current[goal_id]
         self._ranking_plan = self._plan
@@ -1009,7 +1018,11 @@ class ArenaView(BoardView):
         """Filter immutable producing identities before ranking or visibility."""
         self._candidate_groups = {}
         if self.part is not None:
-            pairs = self._cache.candidates(self._frontier, part_key=goal_key_digest(self.goal))
+            pairs = self._cache.candidates(
+                self._frontier,
+                goal_key=self._candidate_main_key,
+                part_key=goal_key_digest(self.goal),
+            )
             self._candidate_groups = {c.id: self.part for c, _ in pairs}
             return pairs
         if self._plan is None:
@@ -1037,6 +1050,8 @@ class ArenaView(BoardView):
             result._frontier = self._frontier.model_copy(deep=True)
             main_goal = self._active_goals[None]
             result.learning_goal = (goal_key_digest(main_goal), main_goal.id)
+            if self._candidate_main_key is not None:
+                result._candidate_main_key = goal_key_digest(main_goal)
             # The capability belongs to this owner/revision, even when a sibling
             # key also occurs under another run's different main goal.
             result._plan = self._plan

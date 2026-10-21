@@ -737,6 +737,13 @@ def test_main_view_maps_equal_producing_keys_to_current_part_names(
         "current-name",
     ]
     assert [r.rank for r in view.leaderboard(view.goal, judge="j")] == [1, 2]
+    sibling = view._sibling_view("current")
+    direct = board.snapshot(sibling.goal, view.frontier)
+    assert (
+        direct._visible_candidate_ids()
+        == sibling._visible_candidate_ids()
+        == frozenset({"old-name", "current-name"})
+    )
 
 
 def test_part_view_uses_owner_name_and_historical_recorded_judge(
@@ -787,14 +794,18 @@ def test_part_learning_resolution_is_stable_and_main_sibling_has_main_scope(
     board.open("r2", run.run_root, ["toy"])
     part = Goal(id="shared", namespace="toy").key()
     view = board.snapshot(part, board.frontier())
-    assert view.learning_goal == (goal_key_digest(keys[1]), "g1")
-    assert [item.id for item in view.learnings("toy", goal=part)] == ["L-1"]
+    assert view.learning_goal == (goal_key_digest(keys[2]), "g2")
+    assert [item.id for item in view.learnings("toy", goal=part)] == ["L-2"]
     assert view.count_learnings("toy", goal=part) == 1
-    assert [item.id for item in view.search_learnings("toy", "viscosity")] == ["L-1", "L-2"]
+    assert [item.id for item in view.search_learnings("toy", "viscosity")] == ["L-2", "L-1"]
     main = view._sibling_view(None)
     assert main.goal == keys[2]
     assert main.learning_goal == (goal_key_digest(keys[2]), "g2")
     assert [item.id for item in main.learnings("toy", goal=main.goal)] == ["L-2"]
+    board.open("", "", ["toy"])
+    fallback = board.snapshot(part, view.frontier)
+    assert fallback.learning_goal == (goal_key_digest(keys[1]), "g1")
+    assert [item.id for item in fallback.learnings("toy", goal=part)] == ["L-1"]
 
 
 @pytest.mark.parametrize("reopen", [False, True])
@@ -954,3 +965,58 @@ def test_lineage_read_scope_cleans_up_after_failure(
     assert cache._frontier_depth == 0
     assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
     assert reader.lineage("b").edges == [("b", "a")]
+
+
+@pytest.mark.parametrize("foreign_parts", [[], ["foreign"]])
+def test_owner_part_wins_foreign_main_key_collision(
+    tmp_path: Path,
+    board: ArenaBoard,
+    foreign_parts: list[str],
+) -> None:
+    own = FakeRun(str(tmp_path / "runs"), "own")
+    draft = own.plan(parts=["a", "b"])
+    part_goal = Plan.model_validate(draft.payload["plan"]).parts[0].goal
+    own.commit(
+        draft,
+        own.candidate("own-a", part="a"),
+        own.candidate("own-b", part="b"),
+        own.score("own-score", "own-a", 1),
+        own.learning("own-learning", "viscosity", evidence=["own-a"]),
+    )
+    foreign = FakeRun(own.run_root, "foreign", goal_id=part_goal.id)
+    assert foreign.goal.key() == part_goal.key()
+    foreign.commit(
+        foreign.plan(parts=foreign_parts),
+        foreign.candidate("foreign-main"),
+        foreign.learning("foreign-learning", "viscosity", evidence=["foreign-main"]),
+        *(foreign.candidate(f"foreign-{part}", part=part) for part in foreign_parts),
+    )
+    for run in (own, foreign):
+        _publish(tmp_path, run)
+    board.open(own.run_id, own.run_root, ["toy"])
+    frontier = board.frontier()
+    direct = board.snapshot(part_goal.key(), frontier)
+    sibling = board.snapshot(own.goal.key(), frontier)._sibling_view("a")
+    for view in (direct, sibling):
+        assert view.part == "a"
+        assert view._visible_candidate_ids() == frozenset({"own-a"})
+        assert [c.id for c in view.best(view.goal, 5, judge="j")] == ["own-a"]
+        assert view.learning_goal == (goal_key_digest(own.goal.key()), own.goal.id)
+        assert [item.id for item in view.learnings("toy", goal=view.goal)] == ["own-learning"]
+        assert [item.id for item in view.search_learnings("toy", "viscosity", goal=view.goal)] == [
+            "own-learning"
+        ]
+        assert view.count_learnings("toy", goal=view.goal) == 1
+        assert view._sibling_view("b")._visible_candidate_ids() == frozenset({"own-b"})
+        with pytest.raises(ValueError, match="part outside board snapshot"):
+            view._sibling_view("foreign")
+        with pytest.raises(KeyError):
+            view.get_candidate("foreign-main")
+    # Reader-only fallback retains main-first precedence, and owner-main wins too.
+    for identity in ("", foreign.run_id):
+        board.open(identity, foreign.run_root if identity else "", ["toy"])
+        fallback = board.snapshot(part_goal.key(), frontier)
+        assert fallback.part is None
+        assert fallback._visible_candidate_ids() == frozenset(
+            {"foreign-main", *(f"foreign-{part}" for part in foreign_parts)}
+        )
