@@ -303,7 +303,7 @@ class _ResumeServices:
         except BaseException as error:
             self.failure = error
         finally:
-            with anyio.CancelScope(shield=True):
+            with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 try:
                     if not entered:
                         await run_sync_daemon(lease.release)
@@ -343,7 +343,7 @@ class _ResumeServices:
             raise self.failure
 
 
-async def _acquire_lease(acquire: Callable[[], Lease]) -> Lease:
+async def _acquire_lease(acquire: Callable[[], Lease], *, settle_timeout_s: float) -> Lease:
     """Release a successful CAS if cancellation wins its delivery handshake."""
     lock = threading.Lock()
     acquired: list[Lease] = []
@@ -369,7 +369,7 @@ async def _acquire_lease(acquire: Callable[[], Lease]) -> Lease:
             abandoned = True
             lease = acquired.pop() if acquired else None
         if lease is not None:
-            with anyio.CancelScope(shield=True):
+            with anyio.move_on_after(settle_timeout_s, shield=True):
                 with suppress(Fenced):
                     await run_sync_daemon(lease.release)
         raise
@@ -406,7 +406,8 @@ async def _take_over(
                     ttl_s=config.lease_ttl_s,
                     force=force,
                     expect_epoch=doc.epoch,
-                )
+                ),
+                settle_timeout_s=config.settle_timeout_s,
             )
         except Fenced:
             current = await run_sync_daemon(read_owner, store)

@@ -662,6 +662,6 @@ class HumanReview:
             return scores
         finally:
             if not entered:
-                with anyio.CancelScope(shield=True):
+                with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(Fenced):
                         await run_sync_daemon(lease.release)

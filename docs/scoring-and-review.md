@@ -225,7 +225,9 @@ abandonable; an already started write can finish, but cancellation never starts
 the next publication. Once the journal context enters, it alone releases the
 lease, including cancellation while writer supervision enters. Import and
 resume perform fallback release through the abandonable boundary only if the
-journal never entered.
+journal never entered. Shielded fallback and undelivered-takeover cleanup waits
+are bounded by `settle_timeout_s`. A release already running in a daemon may
+finish after that deadline; cleanup never starts a second release attempt.
 
 Retrying a CSV after a receipt committed creates a new
 review batch; recovery itself does not duplicate the original batch.

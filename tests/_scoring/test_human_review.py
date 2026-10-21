@@ -883,6 +883,120 @@ async def test_cancelled_writer_entry_releases_lease_once(
                 assert not worker.is_alive()
 
 
+@pytest.mark.parametrize("operation", ["import", "resume"])
+@pytest.mark.parametrize("stage", ["journal-entry", "takeover-delivery"])
+async def test_cancelled_pre_entry_cleanup_has_deadline(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    stage: str,
+) -> None:
+    import asyncio
+    import threading
+
+    import anyio
+
+    from swarm_arena._engine import resume
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._journal.writer import JournalWriter
+    from swarm_arena._model.canonical import utc_now
+
+    config = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    blocked, unblock = threading.Event(), threading.Event()
+    scopes: list[anyio.CancelScope] = []
+    services: list[resume._ResumeServices] = []
+    leases: list[Lease] = []
+    releases: list[Lease] = []
+    workers: list[threading.Thread] = []
+    original_takeover = Lease.take_over.__func__
+    original_enter = JournalWriter.__aenter__
+    original_release = Lease.release
+    original_serve = resume._ResumeServices._serve_owned
+    before = _events(review_run.store)
+    path = _file(tmp_path)
+
+    def takeover(cls: type[Lease], *args: Any, **kwargs: Any) -> Lease:
+        lease = original_takeover(cls, *args, **kwargs)
+        leases.append(lease)
+        return lease
+
+    async def serve(self: resume._ResumeServices) -> None:
+        services.append(self)
+        await original_serve(self)
+
+    async def enter(self: JournalWriter) -> JournalWriter:
+        if stage == "journal-entry":
+            scope = scopes[0] if operation == "import" else services[0].preparation_scope
+            assert scope is not None
+            scope.cancel()
+        return await original_enter(self)
+
+    async def daemon(fn: Any, *args: Any) -> Any:
+        result = await run_sync_daemon(fn, *args)
+        if (
+            stage == "takeover-delivery"
+            and getattr(fn, "__qualname__", "") == "_acquire_lease.<locals>.work"
+        ):
+            scopes[0].cancel()
+            await anyio.lowlevel.checkpoint()
+        return result
+
+    def release(self: Lease) -> None:
+        if any(self is lease for lease in leases):
+            releases.append(self)
+            workers.append(threading.current_thread())
+            blocked.set()
+            assert unblock.wait(5), "fallback release cleanup deadline"
+        original_release(self)
+
+    async def caller() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            if operation == "import":
+                await HumanReview("alice").import_csv(review_run.run_id, path, config=config)
+            else:
+                runner = await resume.resume_run(
+                    config, review_run.run_id, force=False, replanner=None
+                )
+                await runner.aclose()
+
+    monkeypatch.setattr(Lease, "take_over", classmethod(takeover))
+    monkeypatch.setattr(JournalWriter, "__aenter__", enter)
+    monkeypatch.setattr(Lease, "release", release)
+    monkeypatch.setattr(resume._ResumeServices, "_serve_owned", serve)
+    monkeypatch.setattr(resume, "run_sync_daemon", daemon)
+    task = asyncio.create_task(caller())
+    try:
+        assert await run_sync_daemon(blocked.wait, 5)
+        done, _ = await asyncio.wait([task], timeout=10 * config.settle_timeout_s)
+        assert done, "caller retained an unbounded shield around blocked release"
+        assert all(service.task is not None and service.task.done() for service in services)
+        assert len(services) == int(operation == "resume" and stage == "journal-entry")
+        assert len(leases) == len(releases) == 1
+        assert all(worker.is_alive() and worker.daemon for worker in workers)
+        assert not unblock.is_set()
+        owner = read_owner(review_run.store)
+        assert owner is not None
+        assert owner[0].expires_at > utc_now()
+        assert _events(review_run.store) == before
+    finally:
+        unblock.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        for service in services:
+            assert service.task is not None
+            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+    assert len(releases) == 1, "late cleanup attempted another release"
+    owner = read_owner(review_run.store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert _events(review_run.store) == before
+
+
 @pytest.mark.parametrize("operation", ["import", "export"])
 @pytest.mark.parametrize("site", ["create", "read"])
 @pytest.mark.parametrize("kind", ["raw", "registered", "fenced"])
