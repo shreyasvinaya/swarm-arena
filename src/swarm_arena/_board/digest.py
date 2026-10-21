@@ -59,7 +59,7 @@ class _DigestGroups(Protocol):
 
 
 def _digest_group_views(view: BoardView) -> dict[str | None, BoardView] | None:
-    """Select declared sibling capabilities without changing recorded labels."""
+    """Enumerate fixed declared groups independently of recorded judge names."""
     if isinstance(view, _DigestGroups):
         return view._digest_group_views()
     if not isinstance(view, ArenaView):
@@ -68,7 +68,7 @@ def _digest_group_views(view: BoardView) -> dict[str | None, BoardView] | None:
         return {view.part: view}
     return {
         None: view,
-        **{part: view._sibling_view(part) for part in view._ranking_judges() if part is not None},
+        **{part: view._sibling_view(part) for part in view._active_goals if part is not None},
     }
 
 

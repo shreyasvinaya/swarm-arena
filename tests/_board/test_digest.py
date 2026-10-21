@@ -657,3 +657,61 @@ def test_equal_key_different_part_label(
         ]
     finally:
         board.close()
+
+
+@pytest.mark.parametrize("ranking", ["program", {None: "program", "a": "program"}])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_supplied_ranking_keeps_part_with_ambiguous_recorded_judges(
+    tmp_path: Path, ranking: str | Mapping[str | None, str], wrapped: bool
+) -> None:
+    owner = FakeRun(str(tmp_path / "runs"), "owner")
+    plan = owner.plan(parts=["a"])
+    plan.payload["plan"]["ranking"] = ""
+    plan.payload["plan"]["judges"][0]["name"] = None
+    assert Plan.model_validate(plan.payload["plan"]).ranking_name() == "program"
+    owner.commit(
+        plan,
+        owner.candidate("own", part="a"),
+        owner.score("s-own", "own", 5, judge="program"),
+    )
+    peer = FakeRun(str(tmp_path / "runs"), "peer")
+    peer.commit(
+        peer.plan(parts=["a"], ranking="q"),
+        peer.candidate("peer", part="a"),
+        peer.score("s-peer", "peer", 2, judge="q"),
+    )
+    arena = str(tmp_path / "arena")
+    for run in (owner, peer):
+        add_pointer(arena, run)
+    board = ArenaBoard(arena_root=arena, cache_dir=str(tmp_path / "cache"))
+    board.open("owner", owner.run_root, ["toy"])
+    try:
+        main = board.snapshot(owner.goal.key(), board.frontier())
+        assert main._ranking_judges() == {}
+        part = main._sibling_view("a")
+        assert [c.id for c in part.best(part.goal, 5, judge="program")] == ["own"]
+        selected = _SeedView(main, {}) if wrapped else main
+        text = build_digest(
+            selected,
+            goal=selected.goal,
+            run_id="owner",
+            round=1,
+            ranking=ranking,
+            cap_tokens=10000,
+        )
+        assert "Part a (program, " in text
+        assert "1. own " in text
+        assert "1. peer " not in text
+        assert "own" not in text.split("Part a", 1)[0]
+        omitted = build_digest(
+            selected,
+            goal=selected.goal,
+            run_id="owner",
+            round=1,
+            ranking={None: "program"},
+            cap_tokens=10000,
+        )
+        assert "Part a " not in omitted
+        assert "1. own " not in omitted
+    finally:
+        board.close()
