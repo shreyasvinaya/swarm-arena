@@ -788,7 +788,7 @@ async def _run(
         warnings.append(f"tool error: {anyio.get_cancelled_exc_class().__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
 
-    # Deliver an outer cancellation before entering the core-only completion shield.
+    # Deliver an outer cancellation before accounting and supervised log publication.
     await anyio.lowlevel.checkpoint()
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")
