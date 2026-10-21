@@ -27,7 +27,6 @@ from swarm_arena._errors import (
     StorageError,
     _core_error,
     _exception_type_name,
-    _is_core_signal,
 )
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.procinfo import host_id
@@ -459,9 +458,7 @@ async def _take_over(
                 ),
                 settle_timeout_s=config.settle_timeout_s,
             )
-        except Fenced as error:
-            if not _is_core_signal(error):
-                _Outcome().contain(error, StorageError, "lease takeover")
+        except Fenced:
             current = await _lease_io(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:
                 epoch = current[0].epoch if current else "missing"
