@@ -59,6 +59,18 @@ stays under `.swarm-arena/`. See [Getting started](docs/getting-started.md) for 
 included source, plan, limits, Python API, and `status`/`stop`/`resume` commands,
 or the [example README](examples/rosenbrock/README.md) for a short walkthrough.
 
+## Optional integrations
+
+Install the optional model adapter dependencies, response-cache backends, or
+Langfuse tracing dependencies as needed (combine extras for both model calls
+and caching or tracing):
+
+```sh
+pip install 'swarm-arena[llm]'
+pip install 'swarm-arena[cache]'
+pip install 'swarm-arena[langfuse]'
+```
+
 ## Test one connector
 
 Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,

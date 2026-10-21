@@ -243,3 +243,70 @@ PUBLIC["swarm_arena.testing"] += ["check_tool", "check_check", "check_judge", "m
 PUBLIC["swarm_arena.testing"] += ["read_logs", "read_output_file"]
 
 PUBLIC["swarm_arena.scoring"] += ["HumanReview"]
+
+
+@pytest.mark.parametrize("missing", ["agents", "litellm"])
+def test_llm_facade_names_the_extra_when_missing(missing: str) -> None:
+    code = f"import sys; sys.modules[{missing!r}] = None; import swarm_arena.llm"
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0
+    assert "pip install 'swarm-arena[llm]'" in proc.stderr
+    assert "ModuleNotFoundError" in proc.stderr
+
+
+def test_llm_facade_publishes_its_names() -> None:
+    llm = pytest.importorskip("swarm_arena.llm")
+    assert all(getattr(llm, name).__module__ == "swarm_arena.llm" for name in llm.__all__)
+
+
+@pytest.mark.parametrize(("dist", "module"), [("openai-agents", "agents"), ("litellm", "litellm")])
+def test_llm_facade_checks_distribution_metadata(dist: str, module: str) -> None:
+    code = f"""
+import importlib.metadata
+
+def version(name):
+    if name == {dist!r}:
+        raise importlib.metadata.PackageNotFoundError(name)
+    return "0"
+
+importlib.metadata.version = version
+try:
+    import swarm_arena.llm
+except ModuleNotFoundError as error:
+    assert error.name == {module!r}
+    assert "pip install 'swarm-arena[llm]'" in str(error)
+else:
+    raise AssertionError("missing extra imported")
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "name"),
+    [("ModuleNotFoundError", "transitive_dependency"), ("ImportError", "agents")],
+)
+def test_llm_facade_preserves_other_import_errors(error_type: str, name: str) -> None:
+    pytest.importorskip("swarm_arena.llm")
+    code = f"""
+import builtins
+original = builtins.__import__
+error = {error_type}("upstream failure", name={name!r})
+
+def importing(module, *args, **kwargs):
+    if module == "agents":
+        raise error
+    return original(module, *args, **kwargs)
+
+builtins.__import__ = importing
+try:
+    import swarm_arena.llm
+except ImportError as caught:
+    assert caught is error
+else:
+    raise AssertionError("broken upstream imported")
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )

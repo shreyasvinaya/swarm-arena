@@ -25,6 +25,17 @@ swarm-arena = "swarm_arena._cli.main:main"
 
 [project.optional-dependencies]
 s3 = ["s3fs>=2023.12.1", "aiobotocore>=2.16.0"]
+llm = [
+    "litellm>=1.107.0rc2,<1.108",
+    "openai-agents[litellm]>=0.24,<0.25",
+]
+cache = [
+    "litellm[caching,proxy]>=1.107.0rc2,<1.108",
+]
+langfuse = [
+    "langfuse>=5,<6",
+    "openinference-instrumentation-openai-agents",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -60,6 +71,7 @@ pydocstyle.convention = "numpy"
 "tests/**" = ["D"]
 "examples/**" = ["D"]
 "src/swarm_arena/__init__.py" = ["E402"]   # the core facades are imported after _publish
+"src/swarm_arena/llm/__init__.py" = ["E402"]
 "src/swarm_arena/llm/**" = ["TID251"]
 "src/swarm_arena/ray/**" = ["TID251"]
 "src/swarm_arena/_store/s3.py" = ["TID251"]
@@ -68,6 +80,11 @@ pydocstyle.convention = "numpy"
 "tests/ray/**" = ["TID251"]
 "tests/_store/test_s3.py" = ["TID251"]
 "tests/testing/test_fake_model.py" = ["TID251"]
+"tests/_fakes/llm_components.py" = ["TID251"]
+"tests/e2e/test_rosenbrock_llm.py" = ["TID251"]
+"tests/e2e/test_autonomous_replan.py" = ["TID251"]
+"tests/e2e/test_llm_plan_file.py" = ["TID251"]
+"tests/e2e/test_llm_final_slice.py" = ["TID251"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

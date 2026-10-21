@@ -71,7 +71,7 @@
 - [ ] **Step 1: Create the branch and write the failing tests**
 
 ```bash
-git switch main && git pull && git switch -c m3-llm-layer
+git checkout -B t3/m3-task-1  # controller checkout at 0f8f7d4; no pull
 ```
 
 ```python
@@ -147,7 +147,7 @@ def test_redis_cache_gets_url_through_kwargs(monkeypatch: pytest.MonkeyPatch) ->
 async def test_disk_cache_hit_flag_zero_callback_cost_and_same_request(tmp_path: Path) -> None:
     pytest.importorskip("diskcache"); pytest.importorskip("fastapi")   # cache extra
     # Cache(type="disk", mode="default_off", disk_cache_dir=tmp_path); two identical mock calls with cache={"use-cache": True}
-    assert [k["cache_hit"] for k in seen] == [False, True] and seen[1]["response_cost"] == 0.0
+    assert [k["cache_hit"] for k in seen] == [None, True] and seen[1]["response_cost"] == 0.0
 def test_cost_map_reload_honours_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     assert litellm.get_model_cost_map(url=litellm.model_cost_map_url)["claude-sonnet-4-6"]["input_cost_per_token"] == 3e-06
@@ -209,8 +209,8 @@ Expected: FAIL / collection ERROR with `ModuleNotFoundError: No module named 'ag
 - [ ] **Step 3: Implement**
 
 ```bash
-uv add --optional llm "openai-agents[litellm]>=0.24,<0.25" "litellm>=1.105.1,<1.106"
-uv add --optional cache "litellm[caching,proxy]>=1.105.1,<1.106"
+uv add --optional llm "openai-agents[litellm]>=0.24,<0.25" "litellm>=1.107.0rc2,<1.108"
+uv add --optional cache "litellm[caching,proxy]>=1.107.0rc2,<1.108"
 uv add --optional langfuse "langfuse>=5,<6" "openinference-instrumentation-openai-agents"
 uv sync --all-extras --all-groups
 ```
@@ -230,7 +230,8 @@ Expected: PASS; ruff "All checks passed!"; ty "All checks passed!".
 ```bash
 git add pyproject.toml uv.lock conftest.py tests/conftest.py src/swarm_arena/llm/__init__.py src/swarm_arena/llm/_catalog.py \
   tests/llm/test_upstream_facts.py tests/llm/test_catalog.py tests/test_public_api.py docs/api/llm.md docs/api/index.md README.md \
-  CHANGELOG.md tasks/research/api-agents-sdk-litellm.md tasks/research/api-litellm-caching.md docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md
+  CHANGELOG.md docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md \
+  docs/superpowers/plans/2026-10-18-swarm-arena-m3-llm-layer.md
 git commit -m "Add llm, cache, and langfuse extras with upstream fact tests" \
   -m "Declares the M3 extras, guards swarm_arena.llm with a clear ModuleNotFoundError, pins LiteLLM's local cost map before litellm is imported, and turns every third-party fact M3 relies on into a test against the locked versions. Roadmap R3.2 lists the new fact test file."
 ```
