@@ -110,11 +110,13 @@ async def test_concurrent_goal_returns_match_committed_order(
         real_write = views.write
         real_refresh = first._refresh
 
-        async def slow_write(key: str, content: bytes, *, source: Head) -> None:
+        async def slow_write(
+            key: str, content: bytes, *, source: Head, create_only: bool = False
+        ) -> None:
             if key == "goals/g1/solution.json" and delayed_step == "view":
                 arrived.set()
                 await finished.wait()
-            await real_write(key, content, source=source)
+            await real_write(key, content, source=source, create_only=create_only)
 
         async def slow_refresh() -> None:
             await real_refresh()

@@ -160,6 +160,7 @@ class ViewWriter:
 
     Existing views are replaced only when their head is an earlier member of
     the same chain. Equal, unknown, or malformed heads remain untouched.
+    Create-only publication preserves any existing view without inspecting it.
     Every Store operation runs in an AnyIO worker thread.
 
     Parameters
@@ -179,7 +180,9 @@ class ViewWriter:
         self._store = store
         self._writer = writer
 
-    async def write(self, key: str, content: bytes, *, source: Head) -> None:
+    async def write(
+        self, key: str, content: bytes, *, source: Head, create_only: bool = False
+    ) -> None:
         """
         Create a view or conditionally replace one from an earlier committed head.
 
@@ -195,6 +198,9 @@ class ViewWriter:
             View body to encode with source metadata.
         source : Head
             Canonical head already present on this writer's committed chain.
+        create_only : bool, default=False
+            Preserve any existing view on AlreadyExists, without reading or
+            replacing it. Used for immutable round pages.
 
         Raises
         ------
@@ -226,7 +232,8 @@ class ViewWriter:
             await anyio.to_thread.run_sync(self._store.create, key, data)
             return
         except AlreadyExists:
-            pass
+            if create_only:
+                return
         for _ in range(2):
             existing = await anyio.to_thread.run_sync(self._store.read, key)
             if sha256(existing.data).digest() == digest:

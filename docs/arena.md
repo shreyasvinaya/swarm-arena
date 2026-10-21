@@ -413,7 +413,9 @@ goal supervision on both live close and resume. Cancellation releases the owner
 without waiting for a blocked hook; a late result cannot publish a page.
 Hook failures retain registered core controls; other failures expose only their
 exception type, without hook messages, notes, or causes.
-Existing pages remain untouched. Publication uses the segment
-containing the original close as its source head, so competing repairs cannot
-replace one another's page. Round pages are derived views; the committed journal
+Publication is create-only: any existing page remains untouched, including one
+created by a peer after the initial existence check, regardless of its source
+head or contents. Other view types retain their conditional replacement policy.
+The segment containing the original close supplies the page's source head.
+Round pages are derived views; the committed journal
 and the recorded frontier remain their source of truth.

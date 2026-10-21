@@ -216,6 +216,26 @@ async def test_later_head_replaces_earlier(view_env: ViewEnv) -> None:
     assert json.loads(view_env.store.read("goals/g/solution.json").data)["v"] == 2
 
 
+@pytest.mark.parametrize("existing", ["earlier", "same", "unknown", "malformed"])
+async def test_create_only_keeps_every_existing_view(view_env: ViewEnv, existing: str) -> None:
+    heads = {"earlier": view_env.h1, "same": view_env.h2, "unknown": H1}
+    peer = (
+        b"unparseable peer content"
+        if existing == "malformed"
+        else embed_source_head("json", b'{"v": 1}', heads[existing])
+    )
+    view_env.store.create(KEY, peer)
+    view_env.store.calls.clear()
+    await view_env.views.write(KEY, b'{"v": 2}', source=view_env.h2, create_only=True)
+    assert [op for op, _ in view_env.store.calls] == ["create"]
+    assert view_env.store.read(KEY).data == peer
+
+
+async def test_create_only_publishes_absent_view(view_env: ViewEnv) -> None:
+    await view_env.views.write(KEY, b'{"v": 1}', source=view_env.h1, create_only=True)
+    assert view_env.store.read(KEY).data == embed_source_head("json", b'{"v": 1}', view_env.h1)
+
+
 async def test_earlier_head_never_replaces_later(view_env: ViewEnv) -> None:
     await view_env.views.write("goals/g/solution.json", b'{"v": 2}', source=view_env.h2)
     await view_env.views.write("goals/g/solution.json", b'{"v": 1}', source=view_env.h1)

@@ -1919,6 +1919,56 @@ async def test_competing_page_repair_cannot_replace_original(
         assert env.store.read(key).data == original
 
 
+async def test_peer_page_with_earlier_source_is_preserved(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+
+    from swarm_arena._engine.goal import _repair_round_pages
+    from swarm_arena._journal.lease import Head
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._journal.segment import parse_segment_name
+    from swarm_arena._journal.views import embed_source_head, read_source_head
+
+    await GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None).run()
+    key = "goals/g/rounds/round-01.md"
+    original = env.store.read(key).data
+    root = Path(env.deps.config.run_root) / env.deps.run_id
+    (root / key).unlink()
+    segment = env.deps.journal.committed[0]
+    epoch, seq = parse_segment_name(segment)
+    head = read_source_head("md", original)
+    assert head is not None
+    assert seq < head.seq
+    peer = embed_source_head(
+        "md", original.partition(b"\n")[2], Head(epoch=epoch, seq=seq, segment=segment)
+    )
+    exists = env.store.exists
+
+    def interleave(target: str) -> bool:
+        absent = not exists(target)
+        if target == key and absent:
+            command = (
+                "import sys; from pathlib import Path; "
+                "from swarm_arena._store.local import LocalStore; "
+                "LocalStore(Path(sys.argv[1])).create(sys.argv[2], sys.stdin.buffer.read())"
+            )
+            subprocess.run(
+                [sys.executable, "-c", command, str(root), target],
+                input=peer,
+                check=True,
+                timeout=5,
+                capture_output=True,
+            )
+        return not absent
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.store, "exists", interleave)
+        await _repair_round_pages(env.deps, RunState.from_events(env._events()))
+    assert env.store.read(key).data == peer
+
+
 @pytest.mark.parametrize("site", ["snapshot", "count"])
 @pytest.mark.parametrize("signal", ["stop_now", "fence", "deadline"])
 async def test_live_page_read_abandons_hook_without_late_publication(

@@ -179,9 +179,7 @@ async def _repair_round_pages(
                 and item.namespace == plan.goal.namespace
                 for item in prefix.learnings.values()
             )
-            # Always use the segment that committed this close. Even competing
-            # repair attempts then have equal source heads, so ViewWriter can
-            # only create the page, never replace an existing valid page.
+            # Retain the close's original provenance when repairing a missing page.
             segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
             epoch, last_seq = parse_segment_name(segment)
             source = Head(epoch=epoch, seq=last_seq, segment=segment)
@@ -190,7 +188,9 @@ async def _repair_round_pages(
             if deps.journal.fenced.is_set():
                 raise _core_error(Fenced)
             # ViewWriter embeds the same header itself; pass just the body.
-            await deps.views.write(key, content.partition(b"\n")[2], source=source)
+            await deps.views.write(
+                key, content.partition(b"\n")[2], source=source, create_only=True
+            )
 
 
 class GoalRunner:
