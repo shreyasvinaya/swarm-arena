@@ -166,7 +166,7 @@ class GoalRunner:
         """Copy resume carriers and share the run's admission reservation."""
         self.deps, self.goal_id, self.plan, self.replanner = deps, goal_id, plan, replanner
         if deps.admission is None:
-            deps.admission = RunAdmission(deps.config.limits.max_agents_total)
+            deps.admission = RunAdmission(deps.config.limits.max_agents_total, [plan])
         self.admission = deps.admission
         self.history = list(history)
         self.state = state.model_copy(deep=True) if state is not None else GoalState()
@@ -939,7 +939,7 @@ class GoalRunner:
                 self.plan = admitted
                 self.history.append(admitted)
 
-            await self.admission.update(self.goal_id, peak, publish=publish)
+            await self.admission.update(self.goal_id, peak, publish=publish, plan=admitted)
         except PlanError as error:
             self.deps.journal.append(
                 self._draft(

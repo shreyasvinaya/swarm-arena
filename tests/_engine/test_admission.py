@@ -41,3 +41,46 @@ async def test_failed_publication_retains_previous_peak() -> None:
     with pytest.raises(RuntimeError):
         await admission.update("a", 2, publish=fail)
     await admission.update("b", 1)
+
+
+@pytest.mark.parametrize("origin", ["human", "autonomous"])
+async def test_finished_goal_identity_refuses_any_origin_before_publish(origin: str) -> None:
+    from swarm_arena import Goal, PartSpec, Plan
+
+    first = Plan(goal=Goal(id="a", namespace="n"), teams=[], judges=[])
+    second = Plan(goal=Goal(id="b", namespace="n"), teams=[], judges=[])
+    admission = RunAdmission(2, [first, second])
+    await admission.update("a", 1)
+    await admission.release("a")
+    proposed = second.model_copy(
+        update={
+            "origin": origin,
+            "parts": [PartSpec(name="p", goal=first.goal)],
+        }
+    )
+    published: list[bool] = []
+
+    async def publish() -> None:
+        published.append(True)
+
+    with pytest.raises(PlanError, match="revision identity collision: GoalKey"):
+        await admission.update("b", 1, plan=proposed, publish=publish)
+    assert not published
+
+
+async def test_failed_publication_retains_previous_identities() -> None:
+    from swarm_arena import Goal, PartSpec, Plan
+
+    first = Plan(goal=Goal(id="a", namespace="n"), teams=[], judges=[])
+    second = Plan(goal=Goal(id="b", namespace="n"), teams=[], judges=[])
+    shared = PartSpec(name="p", goal=Goal(id="shared", namespace="n"))
+    admission = RunAdmission(2, [first, second])
+
+    async def fail() -> None:
+        raise RuntimeError("publication failed")
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        await admission.update(
+            "a", 1, plan=first.model_copy(update={"parts": [shared]}), publish=fail
+        )
+    await admission.update("b", 1, plan=second.model_copy(update={"parts": [shared]}))

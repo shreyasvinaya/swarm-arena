@@ -257,7 +257,10 @@ class _ResumeServices:
                         views=ViewWriter(self.store, journal),
                         stops=StopState(),
                         clock=clock,
-                        admission=RunAdmission(config.limits.max_agents_total),
+                        admission=RunAdmission(
+                            config.limits.max_agents_total,
+                            [revisions[-1][0] for revisions in state.plans.values()],
+                        ),
                     )
                     self.resumed = ResumeState(state, lease, lease.doc.epoch, ledger, killed, self)
                     self.ready.set()

@@ -490,7 +490,7 @@ class RunRunner:
                     views=views,
                     stops=StopState(),
                     clock=clock,
-                    admission=RunAdmission(config.limits.max_agents_total),
+                    admission=RunAdmission(config.limits.max_agents_total, self.plans),
                 )
                 return await self._drive(deps, lease.doc.epoch)
             finally:
