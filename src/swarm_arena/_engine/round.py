@@ -35,6 +35,7 @@ from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal, GoalKey
@@ -207,6 +208,8 @@ def _past_run_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate
     """Keep the newest counted, complete other-run candidate for each repeat key."""
     newest = {}
     for key, candidate in past_run_repeat_entries(view, run_id):
+        key = _context_string(key, "repeat key")
+        candidate = _detach_model(Candidate, candidate)
         if candidate.output.status in COUNTED and not candidate.output.partial:
             newest[key] = candidate
     return list(newest.items())
@@ -217,8 +220,10 @@ class _SeedView(BoardView):
 
     def __init__(self, view: BoardView, parents: Mapping[str, BoardView]) -> None:
         self._view, self._parents = view, dict(parents)
-        self.part = getattr(view, "part", None)
-        self.goal, self.frontier = view.goal, view.frontier
+        part = getattr(view, "part", None)
+        self.part = None if part is None else _context_string(part, "part")
+        self.goal = _detach_model(GoalKey, view.goal)
+        self.frontier = _detach_model(Frontier, view.frontier)
 
     def best(
         self,
@@ -459,15 +464,20 @@ class RoundRunner:
         parents: Mapping[str, BoardView],
     ) -> AgentRuntime:
         deps = self.deps
-        view = await run_sync_daemon(deps.board.snapshot, slot.goal_key, frontier)
-        past = _past_run_entries(view, deps.run_id)
-        siblings = {}
-        if isinstance(view, ArenaView):
-            for part in [None, *(p.name for p in self.plan.parts)]:
-                sibling = await run_sync_daemon(view._sibling_view, part)
-                siblings[part or ""] = sibling
+        view = await run_sync_daemon(lambda: deps.board.snapshot(slot.goal_key, frontier))
+        past = await run_sync_daemon(_past_run_entries, view, deps.run_id)
+
+        def sibling_views() -> dict[str, BoardView]:
+            if not isinstance(view, ArenaView):
+                return {}
+            return {
+                part or "": view._sibling_view(part)
+                for part in [None, *(p.name for p in self.plan.parts)]
+            }
+
+        siblings = await run_sync_daemon(sibling_views)
         if parents:
-            view = _SeedView(view, parents)
+            view = await run_sync_daemon(_SeedView, view, parents)
         checks, _, _ = part_scoring(self.plan, slot.part)
         rankings = await run_sync_daemon(self._rankings)
         digest_rankings = group_judges(self.plan)
@@ -501,7 +511,13 @@ class RoundRunner:
             tool_identity=await run_sync_daemon(tool_identity, slot.tool_ref, entry),
             catalog_entry=entry,
             checks=[
-                (ref.component_name(), await run_sync_daemon(ref.build, Check)) for ref in checks
+                await run_sync_daemon(
+                    lambda ref=ref: (
+                        _context_string(ref.component_name(), "check"),
+                        ref.build(Check),
+                    )
+                )
+                for ref in checks
             ],
             view=view,
             own=[
@@ -512,13 +528,15 @@ class RoundRunner:
                     if learning.namespace == slot.goal_key.namespace
                 ],
             ],
-            digest=build_digest(
-                view,
-                goal=slot.goal_key,
-                run_id=deps.run_id,
-                round=round,
-                ranking=digest_rankings,
-                cap_tokens=deps.config.limits.digest_tokens,
+            digest=await run_sync_daemon(
+                lambda: build_digest(
+                    view,
+                    goal=slot.goal_key,
+                    run_id=deps.run_id,
+                    round=round,
+                    ranking=digest_rankings,
+                    cap_tokens=deps.config.limits.digest_tokens,
+                )
             ),
             notes=slot.notes,
             ledger=deps.ledger,
@@ -557,7 +575,10 @@ class RoundRunner:
             rankings[part.name] = ranking or (
                 judges[0].component_name() if len(judges) == 1 else ""
             )
-        return rankings
+        return {
+            _context_string(part, "part"): _context_string(name, "judge")
+            for part, name in rankings.items()
+        }
 
     async def _feedback_policies(self) -> dict[str, dict[str, str]]:
         """Recover actual producing policies without re-running old check hooks.
@@ -589,8 +610,10 @@ class RoundRunner:
     async def _context(
         self, rt: AgentRuntime, policies: Mapping[str, Mapping[str, str]]
     ) -> _RoundContext:
-        """Prepare hooks under slot supervision, keeping all view reads on-loop."""
-        historical = set(rt.view._visible_candidate_ids())
+        """Prepare hooks and detach connector membership under slot supervision."""
+        historical = await run_sync_daemon(
+            lambda: {_context_string(id, "candidate_id") for id in rt.view._visible_candidate_ids()}
+        )
         historical.update(item.id for item in rt.own if isinstance(item, Candidate))
         historical.update(
             candidate.id for candidate in rt.repeats.candidates_of(f"{rt.team.name}/{rt.spec.name}")
@@ -624,10 +647,14 @@ class RoundRunner:
         if not self.seed_parents:
             return parents
         for goal in [self.plan.goal, *(part.goal for part in self.plan.parts)]:
-            view = await run_sync_daemon(self.deps.board.snapshot, goal.key(), frontier)
+            view = await run_sync_daemon(
+                lambda goal=goal: self.deps.board.snapshot(goal.key(), frontier)
+            )
             for id in self.seed_parents:
                 try:
-                    await run_sync_daemon(view.get_candidate, id)
+                    await run_sync_daemon(
+                        lambda view=view, id=id: _detach_model(Candidate, view.get_candidate(id))
+                    )
                 except (KeyError, ValueError):
                     continue
                 parents[id] = view

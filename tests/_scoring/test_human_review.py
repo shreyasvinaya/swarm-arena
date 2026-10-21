@@ -1248,3 +1248,46 @@ async def test_import_writes_only_namespaces_with_scores(
     await HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
     assert len(_reviews(run_config)) == 1
     assert _reviews(run_config)[0].startswith("toy/reviews/")
+
+
+@pytest.mark.parametrize("operation", ["import", "export"])
+async def test_review_compares_core_owned_storage_bytes(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    state: RunState,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import threading
+
+    from swarm_arena._engine.run import write_review_export
+    from swarm_arena._store.base import Blob
+    from swarm_arena._store.local import LocalStore
+
+    path = _file(tmp_path)
+    head = review_run.heads[-1]
+    if operation == "import":
+        await HumanReview("alice").import_csv(review_run.run_id, path, config=run_config)
+    else:
+        await write_review_export(state, review_run.store, head)
+    threads: list[int] = []
+    original = LocalStore.read
+
+    class ReturnedBytes(bytes):
+        def __ne__(self, other: object) -> bool:
+            threads.append(threading.get_ident())
+            raise OSError("private-returned-review-marker")
+
+    def read(store: LocalStore, key: str) -> Blob:
+        blob = original(store, key)
+        if "/reviews/" in key or key.startswith("review/"):
+            return Blob(ReturnedBytes(blob.data), blob.etag)
+        return blob
+
+    monkeypatch.setattr(LocalStore, "read", read)
+    if operation == "import":
+        await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
+    else:
+        await write_review_export(state, review_run.store, head)
+    assert threading.get_ident() not in threads

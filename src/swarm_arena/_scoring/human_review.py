@@ -46,7 +46,7 @@ from swarm_arena._model.ids import IdGen
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._outcomes import _Outcome
-from swarm_arena._store.base import Store, _check_key, open_store
+from swarm_arena._store.base import Store, _check_key, _read_blob, open_store
 
 CSV_HEADER: Final = ("id", "goal", "team", "agent", "scores", "verdict", "score", "notes")
 
@@ -373,7 +373,7 @@ async def _publish_review_object(
         )
     except AlreadyExists:
         expected = b"".join(canonical_json(obj.model_dump(mode="json")) + b"\n" for obj in objects)
-        existing = await _review_io(arena.read, key)
+        existing = await _review_io(_read_blob, arena, key)
         if existing.data != expected:
             raise _core_error(
                 StorageError, "review object bytes differ from committed receipt"

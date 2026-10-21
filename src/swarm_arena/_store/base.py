@@ -27,6 +27,15 @@ class Blob(NamedTuple):
     etag: str
 
 
+def _read_blob(store: "Store", key: str) -> Blob:
+    """Detach a backend read in the worker before bytes or versions reach the loop."""
+    blob = store.read(key)
+    data, etag = blob.data, blob.etag
+    if not isinstance(data, bytes) or not isinstance(etag, str):
+        raise TypeError("invalid storage blob")
+    return Blob(memoryview(data).tobytes(), str.__str__(etag))
+
+
 def _check_key(key: str) -> str:
     """Validate raw key segments before pathlib can normalize them."""
     if not key or key.startswith("/") or "\x00" in key or {".", ".."} & set(key.split("/")):

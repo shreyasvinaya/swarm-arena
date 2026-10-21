@@ -141,8 +141,18 @@ async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier
     """Read the historical count without retaining a cancelled goal or owner."""
     outcome = _Outcome()
     try:
-        view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
-        return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
+
+        def read() -> int:
+            view = deps.board.snapshot(plan.goal.key(), frontier)
+            count = view.count_learnings(plan.goal.namespace)
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError("invalid learning count")
+            count = int.__int__(count)
+            if count < 0:
+                raise ValueError("invalid learning count")
+            return count
+
+        return await run_sync_daemon(read)
     except BaseException as error:
         outcome.contain(error, RuntimeError, "round page board read")
 
@@ -163,7 +173,14 @@ async def _publish_round_page(
     plan = prefix.plan_for_round(goal_id, round)
     frontier = prefix.goals[goal_id].frontiers[round]
     key = page_key(goal_id, round)
-    if await _page_storage(partial(run_sync_daemon, deps.store.exists, key)):
+
+    def exists() -> bool:
+        result = deps.store.exists(key)
+        if type(result) is not bool:
+            raise TypeError("invalid page existence result")
+        return result
+
+    if await _page_storage(partial(run_sync_daemon, exists)):
         return
     recorded_count = await _page_namespace_count(deps, plan, frontier)
     count = recorded_count + sum(
@@ -1289,9 +1306,11 @@ class GoalRunner:
             outcome = _Outcome()
             try:
                 with llm_scope(scope):
-                    frontier = await run_sync_daemon(self.deps.board.frontier)
+                    frontier = await run_sync_daemon(
+                        lambda: _detach_model(Frontier, self.deps.board.frontier())
+                    )
                     view = await run_sync_daemon(
-                        self.deps.board.snapshot, self.plan.goal.key(), frontier
+                        lambda: self.deps.board.snapshot(self.plan.goal.key(), frontier)
                     )
 
                     # Human hide operations belong to the snapshot, not the run

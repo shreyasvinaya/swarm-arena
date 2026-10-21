@@ -56,7 +56,7 @@ from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._store.base import Store, open_store
+from swarm_arena._store.base import Store, _read_blob, open_store
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
@@ -838,6 +838,6 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
         try:
             await _review_io(store.create, key, data)
         except AlreadyExists:
-            existing = await _review_io(store.read, key)
+            existing = await _review_io(_read_blob, store, key)
             if existing.data != data:
                 raise _core_error(StorageError, "review export bytes differ") from None

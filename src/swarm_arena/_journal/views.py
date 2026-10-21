@@ -11,14 +11,15 @@ from typing import Any, Literal
 import anyio
 import anyio.lowlevel
 
-from swarm_arena._errors import AlreadyExists, PreconditionFailed, _core_error
+from swarm_arena._errors import AlreadyExists, PreconditionFailed, StorageError, _core_error
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
-from swarm_arena._store.base import Store
+from swarm_arena._outcomes import _Outcome
+from swarm_arena._store.base import Store, _read_blob
 
 _Format = Literal["json", "toml", "md"]
 _FORMATS: dict[str, _Format] = {".json": "json", ".toml": "toml", ".md": "md"}
@@ -240,7 +241,11 @@ class ViewWriter:
                 return
         for _ in range(2):
             await anyio.lowlevel.checkpoint_if_cancelled()
-            existing = await run_sync_daemon(self._store.read, key)
+            outcome = _Outcome()
+            try:
+                existing = await run_sync_daemon(_read_blob, self._store, key)
+            except BaseException as error:
+                outcome.contain(error, StorageError, "view storage")
             if sha256(existing.data).digest() == digest:
                 return
             previous = read_source_head(fmt, existing.data)
