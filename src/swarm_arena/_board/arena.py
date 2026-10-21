@@ -5,6 +5,8 @@ import os
 from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, cast
@@ -31,7 +33,6 @@ from swarm_arena._board.pointers import (
 )
 from swarm_arena._errors import StorageError, _core_error
 from swarm_arena._journal.lease import Head, read_owner
-from swarm_arena._journal.replay import RunState
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import GoalKey
@@ -42,6 +43,14 @@ from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._store.base import open_store
 
 _LOG = logging.getLogger("swarm_arena.board")
+
+
+@dataclass(frozen=True)
+class _RunPlans:
+    """Retain fixed plan resolution without aliasing mutable replay progress."""
+
+    revisions: dict[str, tuple[Plan, ...]]
+    current: dict[str, Plan]
 
 
 def _resolved_root(root: str) -> str:
@@ -162,6 +171,7 @@ class ArenaBoard(Board):
         self._scores: dict[str, Score] = {}
         self._learnings: dict[str, Learning] = {}
         self._decisions: dict[tuple[str, int], Decision] = {}
+        self._run_plans: dict[tuple[str, str], tuple[Frontier.Mark, _RunPlans]] = {}
 
     @property
     def config(self) -> Config:
@@ -195,6 +205,39 @@ class ArenaBoard(Board):
             if namespace not in self._caches:
                 self._caches[namespace] = ArenaCache(self._cache_dir() / f"{namespace}.sqlite")
             return self._caches[namespace]
+
+    def _plans_at(self, cache: ArenaCache, mark: Frontier.Mark) -> _RunPlans:
+        """Memoize one committed plan projection per run under the board lock.
+
+        Reuse the ingest checkpoint and its suffix catch-up seam under the
+        cache lock. Historical reads never rewind a newer ingest checkpoint.
+        Retain independent plans, not the state that later ingest mutates.
+        """
+        key = (cache.namespace, mark.run_id)
+        previous = self._run_plans.get(key)
+        if previous is not None and previous[0] == mark:
+            return previous[1]
+        with cache._lock:
+            checkpoint = cache._ingest_states.get(mark.run_id)
+            if checkpoint is not None and checkpoint[1] > mark.seq:
+                state = cache._replay(mark.run_id, through_seq=mark.seq)
+            else:
+                state = cache._ingest_state(mark.run_id, mark.seq)
+                # Coverage was validated before resolution. This fold contains
+                # only committed cached events, so it can seed later ingestion.
+                cache._ingest_states[mark.run_id] = (mark.segment, mark.seq, state)
+            revisions = {
+                goal_id: tuple(plan.model_copy(deep=True) for plan, _ in plans)
+                for goal_id, plans in state.plans.items()
+            }
+            current = {}
+            for goal_id in revisions:
+                progress = state.goals[goal_id]
+                round = max(1, progress.round, progress.rounds_closed + 1)
+                current[goal_id] = state.plan_for_round(goal_id, round).model_copy(deep=True)
+            result = _RunPlans(revisions, current)
+        self._run_plans[key] = (mark.model_copy(deep=True), result)
+        return result
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
         """
@@ -273,6 +316,7 @@ class ArenaBoard(Board):
             for cache in self._caches.values():
                 cache.close()
             self._caches.clear()
+            self._run_plans.clear()
             self._latest = None
 
     def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:
@@ -895,12 +939,12 @@ class ArenaView(BoardView):
     def _resolve(self) -> None:
         """Resolve fixed identities using the producer's core replay selector."""
         digest = goal_key_digest(self.goal)
-        mains: list[tuple[str, str, int, Plan, RunState]] = []
-        parts: list[tuple[str, str, int, Plan, RunState, str]] = []
+        mains: list[tuple[str, str, int, Plan, _RunPlans]] = []
+        parts: list[tuple[str, str, int, Plan, _RunPlans, str]] = []
         for mark in _validate_marks(self._frontier.marks):
-            state = self._cache._replay(mark.run_id, through_seq=mark.seq)
-            for goal_id, revisions in state.plans.items():
-                for plan, _ in revisions:
+            state = self._board._plans_at(self._cache, mark)
+            for goal_id, revisions in state.revisions.items():
+                for plan in revisions:
                     if plan.goal.namespace != self.goal.namespace:
                         continue
                     row = (mark.run_id, goal_id, plan.revision, plan, state)
@@ -919,9 +963,7 @@ class ArenaView(BoardView):
             self.learning_goal = (goal_key_digest(resolved[3].goal.key()), resolved[1])
         anchor = next((row for row in ordered if row[0] == self._identity_run), ordered[0])
         _, goal_id, _, _, state = anchor
-        progress = state.goals[goal_id]
-        round = max(1, progress.round, progress.rounds_closed + 1)
-        self._plan = state.plan_for_round(goal_id, round)
+        self._plan = state.current[goal_id]
         self._ranking_plan = self._plan
         if not mains:
             current = next(
@@ -967,7 +1009,11 @@ class ArenaView(BoardView):
         if part not in self._active_goals:
             raise _core_error(ValueError, "part outside board snapshot")
         with self._board._lock:
-            result = ArenaView(self._board, self._active_goals[part], self._frontier)
+            result = copy(self)
+            result.goal = self._active_goals[part].model_copy(deep=True)
+            result._frontier = self._frontier.model_copy(deep=True)
+            main_goal = self._active_goals[None]
+            result.learning_goal = (goal_key_digest(main_goal), main_goal.id)
             # The capability belongs to this owner/revision, even when a sibling
             # key also occurs under another run's different main goal.
             result._plan = self._plan

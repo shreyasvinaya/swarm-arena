@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Arena views reuse committed replay checkpoints and memoize per-run plan
+  resolution, avoiding history replay on unchanged reads and sibling lookups.
 - Arena cache reads release temporary membership and ID selections on outermost
   exit, including failures, while preserving nested-read membership.
 - `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling views, current producing-key rankings, hidden-safe learning counts, and lazy XDG-aware local caches; empty human objects retain durable coverage.

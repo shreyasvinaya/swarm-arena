@@ -795,3 +795,68 @@ def test_part_learning_resolution_is_stable_and_main_sibling_has_main_scope(
     assert main.goal == keys[2]
     assert main.learning_goal == (goal_key_digest(keys[2]), "g2")
     assert [item.id for item in main.learnings("toy", goal=main.goal)] == ["L-2"]
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_repeated_reads_reuse_committed_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reopen: bool
+) -> None:
+    from collections import Counter
+
+    from swarm_arena._journal.event import Event
+    from swarm_arena._journal.replay import RunState
+
+    runs = [FakeRun(str(tmp_path / "runs"), f"r{i}") for i in range(2)]
+    for run in runs:
+        run.commit(
+            run.plan(parts=["a"]),
+            run.candidate(f"c-{run.run_id}", part="a"),
+            run.score(f"s-{run.run_id}", f"c-{run.run_id}", 1),
+            *(EventDraft(type=EventType.WATCHDOG, payload={}) for _ in range(100)),
+        )
+        _publish(tmp_path, run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("r0", runs[0].run_root, ["toy"])
+    frontier = board.frontier()
+    if reopen:
+        board.close()
+        board.open("r0", runs[0].run_root, ["toy"])
+        board.frontier()
+    folds: Counter[str] = Counter()
+    original = RunState._apply
+
+    def counted(state: RunState, event: Event) -> None:
+        folds[event.run_id] += 1
+        original(state, event)
+
+    monkeypatch.setattr(RunState, "_apply", counted)
+    try:
+        frozen = board.snapshot(runs[0].goal.key(), frontier)
+        expected = {"r0": 103, "r1": 103} if reopen else {}
+        assert dict(folds) == expected
+        for _ in range(100):
+            assert len(board.best(runs[0].goal.key(), 2, judge="j", part="a")) == 2
+            assert frozen._sibling_view("a")._visible_candidate_ids() == frozenset({"c-r0", "c-r1"})
+        assert dict(folds) == expected
+        runs[0].commit(_round(runs[0], 1, closed=True), runs[0].plan(revision=1, parts=["b"]))
+        folds.clear()
+        current = board.snapshot(runs[0].goal.key(), board.frontier())
+        assert dict(folds) == {"r0": 2}
+        assert current._sibling_view("b").part == "b"
+        assert frozen._sibling_view("a")._visible_candidate_ids() == frozenset({"c-r0", "c-r1"})
+        with pytest.raises(ValueError, match="part outside board snapshot"):
+            current._sibling_view("a")
+        for _ in range(100):
+            assert board.best(runs[0].goal.key(), 2, judge="j", part="b") == []
+        assert dict(folds) == {"r0": 2}
+        historical = board.snapshot(runs[0].goal.key(), frontier)
+        assert historical._visible_candidate_ids() == frozen._visible_candidate_ids()
+        assert historical._sibling_view("a").part == "a"
+        after_historical = folds.copy()
+        for _ in range(100):
+            assert board.snapshot(runs[0].goal.key(), frontier)._visible_candidate_ids() == (
+                frozen._visible_candidate_ids()
+            )
+        assert folds == after_historical
+    finally:
+        board.close()

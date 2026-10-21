@@ -85,6 +85,11 @@ reads still prefer that goal after higher-priority relevance criteria.
 
 Board-level reads reuse the latest frontier, capturing one on the first read.
 Call `frontier()` again to refresh. A previously created view stays fixed.
+Plan resolution is retained per run and committed mark in the open board.
+Repeated reads at unchanged marks do not replay journal history. Advancement
+reuses committed replay checkpoints and folds only missing events; a cold or
+historical prefix may require one reconstruction. Siblings reuse the fixed
+resolved plan, so later ingestion cannot change their authority.
 
 ## The local cache
 
