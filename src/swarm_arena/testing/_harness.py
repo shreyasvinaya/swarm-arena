@@ -142,6 +142,17 @@ class OfflineHarness:
         list[RoundReport]
             Detached, strictly validated base ``RoundReport`` copies in round order.
 
+        Raises
+        ------
+        RuntimeError
+            If the active run deadline expires (``offline harness stopped``).
+
+        Notes
+        -----
+        ``limits.run_timeout_s`` bounds the harness's active work, including
+        preparation after lease acquisition. Expiry interrupts the work and
+        releases owned services through their bounded cleanup paths.
+
         Examples
         --------
         >>> from swarm_arena import FunctionTool, Goal, Limits, RunConfig, ScriptedManager

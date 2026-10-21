@@ -432,3 +432,31 @@ async def test_harness_cancellation_abandons_board_storage(
             if worker.name.startswith("swarm-arena-daemon-"):
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
+
+
+async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import anyio
+
+    async def wait(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(NoopManager, "run_round", wait)
+    harness = OfflineHarness()
+    with anyio.fail_after(10), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+        await harness.run_rounds(
+            NoopManager(),
+            goal=GOAL,
+            tool=SQUARE,
+            rounds=1,
+            limits=Limits(run_timeout_s=1),
+            config=RunConfig(),
+        )
+
+
+def test_harness_documents_run_deadline() -> None:
+    doc = OfflineHarness.run_rounds.__doc__
+    assert doc is not None
+    assert "Raises" in doc
+    assert "Notes" in doc
+    assert "run_timeout_s" in doc
+    assert "offline harness stopped" in doc
