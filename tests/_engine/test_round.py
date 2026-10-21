@@ -1502,3 +1502,61 @@ def test_seed_view_preserves_part_and_count_capability() -> None:
     assert wrapped.part == "p"
     assert wrapped.count_learnings("n", goal=view.goal) == 7
     view.count_learnings.assert_called_once_with("n", goal=view.goal)
+
+
+async def test_digest_ranks_parts_by_their_judges(env: EngineEnv) -> None:
+    from swarm_arena import Score
+
+    part = PartSpec(
+        name="a",
+        goal=Goal(id="sub", namespace="n"),
+        judges=[
+            Ref(
+                path="swarm_arena:ProgramJudge",
+                name="a",
+                config={"function": "_fakes.tools:score_min_y"},
+            )
+        ],
+    )
+    plan = PLAN.model_copy(update={"parts": [part]})
+    slot = _runner("part")
+    slot.team = slot.team.model_copy(update={"part": "a"})
+    slot.part, slot.goal, slot.goal_key = "a", part.goal, part.goal.key()
+    first = await _prepared_round(
+        env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=2
+    ).run(1)
+    candidate = first.candidates[0]
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="a-score",
+                    candidate_id=candidate.id,
+                    judge="a",
+                    key=(1.0,),
+                    value=1,
+                ).model_dump(mode="json")
+            },
+        )
+    )
+    seen: list[str] = []
+
+    class DigestProbe(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            seen.append(ctx.digest)
+            return RoundReport(summary="read digest")
+
+    out = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        agents=[_with_manager("main", DigestProbe())],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+    ).run(2)
+    assert out.reasons["t/main"] == ""
+    assert len(seen) == 1
+    assert any(line.startswith("Part a (a, ") for line in seen[0].splitlines())
+    assert candidate.id in seen[0]

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round digests show each group's ranking identity and human verdicts, plus
+  namespace-wide learning titles and counts inside untrusted markers under a
+  strict UTF-8 byte cap.
+
 - Candidate traces show the committed round-applicable plan, tool usage, checks,
   journal and human scores, and citing learnings without importing producer plugins.
 - Learning posts vet visible evidence and refinements before ID allocation,

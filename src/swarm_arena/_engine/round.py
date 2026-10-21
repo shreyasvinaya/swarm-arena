@@ -15,6 +15,7 @@ from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.arena import ArenaView, past_run_repeat_entries
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.digest import build_digest
+from swarm_arena._board.leaderboard import group_judges
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
@@ -443,11 +444,11 @@ class RoundRunner:
                 siblings[part or ""] = sibling
         if parents:
             view = _SeedView(view, parents)
-        checks, judges, ranking = part_scoring(self.plan, slot.part)
-        if slot.part is None:
-            ranking = self.plan.ranking_name()
-        elif not ranking and len(judges) == 1:
-            ranking = judges[0].component_name()
+        checks, _, _ = part_scoring(self.plan, slot.part)
+        rankings = await run_sync_daemon(self._rankings)
+        digest_rankings = group_judges(self.plan)
+        # Live execution has already resolved sole unnamed judges under supervision.
+        digest_rankings.update({part or None: name for part, name in rankings.items()})
         execution_ref = await run_sync_daemon(
             effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
         )
@@ -485,7 +486,7 @@ class RoundRunner:
                 goal=slot.goal_key,
                 run_id=deps.run_id,
                 round=round,
-                ranking=ranking,
+                ranking=digest_rankings,
                 cap_tokens=deps.config.limits.digest_tokens,
             ),
             notes=slot.notes,
@@ -511,7 +512,7 @@ class RoundRunner:
             config=deps.config,
             resumed=tuple(c for _, c in pairs),
             private_paths=private_paths,
-            rankings=await run_sync_daemon(self._rankings),
+            rankings=rankings,
             sibling_views=siblings,
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),

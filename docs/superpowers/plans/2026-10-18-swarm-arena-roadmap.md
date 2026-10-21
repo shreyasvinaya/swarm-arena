@@ -2321,9 +2321,11 @@ def mark_planning_session(plan: Plan, scope: LLMScope) -> Plan: ...
 ```python
 def build_frontier(board_reads: Sequence[tuple[str, str, Head]], reviews: Sequence[str],
                    curation: Sequence[str]) -> Frontier: ...
-def build_digest(view: BoardView, *, goal: GoalKey, round: int, ranking: str, cap_tokens: int, k: int = 5) -> str: ...
-    # [M2] multi-run views (ArenaBoard) add a keyword-only run_id: the "new since the last round" count is per owning run;
-    # M1b reads the run from RunBoard's single frontier mark
+def build_digest(view: BoardView, *, goal: GoalKey, run_id: str, round: int,
+                 ranking: str | Mapping[str | None, str], cap_tokens: int, k: int = 5) -> str: ...
+    # A str ranks every group under one judge; a mapping selects each group's judge (None is the main group),
+    # omitting groups without a mapping entry. The "new since the last round" count is namespace-wide for the explicit
+    # owning run in round minus one, independent of frontier mark ordering; it is omitted in round one.
     # [plan] estimate_tokens(the whole returned string: markers, headers, rows, titles, and the counts line) <= cap_tokens.
     # When even the markers and the counts line do not fit, it returns the counts line only, cut to at most cap_tokens
     # UTF-8 bytes at a character boundary.
