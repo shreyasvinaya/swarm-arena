@@ -1972,3 +1972,34 @@ async def test_live_page_read_abandons_hook_without_late_publication(
         while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
             await anyio.sleep(0.01)
     assert not env.store.exists("goals/g/rounds/round-01.md")
+
+
+@pytest.mark.parametrize("site", ["snapshot", "count"])
+async def test_live_page_hook_errors_are_value_free(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    import traceback
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._board.arena import ArenaView
+
+    target = env.deps.board if site == "snapshot" else ArenaView
+    method = "snapshot" if site == "snapshot" else "count_learnings"
+    original = getattr(target, method)
+    secret = "private-live-page-hook-43f7c9a1"
+
+    def fail_after_close(*args: Any, **kwargs: Any) -> Any:
+        if not env.events("round_closed"):
+            return original(*args, **kwargs)
+        failure = RuntimeError(secret)
+        failure.add_note(secret)
+        raise failure from ValueError(secret)
+
+    monkeypatch.setattr(target, method, fail_after_close)
+    with pytest.raises(RuntimeError) as caught:
+        await GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None).run()
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert secret not in "".join(traceback.format_exception(caught.value))
+    assert len(env.events("round_closed")) == 1
+    assert not env.store.exists("goals/g/rounds/round-01.md")

@@ -132,8 +132,16 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
 
 async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier) -> int:
     """Read the historical count without retaining a cancelled goal or owner."""
-    view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
-    return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
+    try:
+        view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
+        return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
+    except Exception as error:
+        safe = _rebuild_core_signal(error)
+        if safe is not None:
+            raise safe from None
+        raise _core_error(
+            RuntimeError, f"round page board read failed: {type(error).__name__}"
+        ) from None
 
 
 async def _repair_round_pages(

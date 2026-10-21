@@ -411,6 +411,8 @@ goals, terminal policies, and join retries, without new manager, judge, or
 curator work. Snapshot and count hooks run in abandonable daemon threads under
 goal supervision on both live close and resume. Cancellation releases the owner
 without waiting for a blocked hook; a late result cannot publish a page.
+Hook failures retain registered core controls; other failures expose only their
+exception type, without hook messages, notes, or causes.
 Existing pages remain untouched. Publication uses the segment
 containing the original close as its source head, so competing repairs cannot
 replace one another's page. Round pages are derived views; the committed journal

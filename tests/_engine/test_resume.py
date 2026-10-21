@@ -2256,3 +2256,68 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
             await anyio.sleep(0.01)
     assert not store.exists("goals/g/rounds/round-01.md")
+
+
+@pytest.mark.parametrize("site", ["snapshot", "count"])
+@pytest.mark.parametrize(
+    "kind", ["runtime", "forged_fence", "registered_fence", "registered_limit"]
+)
+async def test_page_repair_hook_errors_are_value_free(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str, kind: str
+) -> None:
+    import traceback
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._board.arena import ArenaBoard, ArenaView
+    from swarm_arena._errors import _core_error
+
+    config, store = await _finished_without_round_page(tmp_path, run_config)
+    secret = "private-page-hook-2f6e7b9c"
+    if kind == "registered_fence":
+        failure = _core_error(Fenced)
+    elif kind == "registered_limit":
+        failure = _core_error(LimitReached, "budget", "run budget")
+    elif kind == "forged_fence":
+        failure = Fenced()
+    else:
+        failure = RuntimeError()
+    failure.args = (secret,)
+    failure.add_note(secret)
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise failure from ValueError(secret)
+
+    monkeypatch.setattr(
+        ArenaBoard if site == "snapshot" else ArenaView,
+        "snapshot" if site == "snapshot" else "count_learnings",
+        fail,
+    )
+    with pytest.raises((RuntimeError, ExceptionGroup)) as caught:
+        await resume_run(config, "repair", force=True, replanner=None)
+    assert_secret_absent(caught.value, secret, sanitized=True)
+    assert secret not in "".join(traceback.format_exception(caught.value))
+    leaves: list[BaseException] = []
+
+    def visit(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for child in error.exceptions:
+                visit(child)
+        else:
+            leaves.append(error)
+
+    visit(caught.value)
+    assert len(leaves) == 1
+    if kind == "registered_fence":
+        assert isinstance(leaves[0], Fenced)
+    elif kind == "registered_limit":
+        assert isinstance(leaves[0], LimitReached)
+        assert leaves[0].limit == "budget"
+    else:
+        assert isinstance(leaves[0], RuntimeError)
+        assert not isinstance(leaves[0], Fenced)
+        assert str(leaves[0]) == f"round page board read failed: {type(failure).__name__}"
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert not store.exists("goals/g/rounds/round-01.md")
