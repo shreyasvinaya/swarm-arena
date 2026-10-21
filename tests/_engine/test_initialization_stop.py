@@ -27,7 +27,7 @@ from swarm_arena._scoring import human_review as review_module
 from swarm_arena._store.local import LocalStore
 
 
-@pytest.mark.parametrize("site", ["run.toml", "manifest.json", "board_open"])
+@pytest.mark.parametrize("site", ["run.toml", "manifest.json", "board_open", "first_commit"])
 @pytest.mark.parametrize("signal", ["stop", "stop_now", "deadline"])
 async def test_initialization_stops_before_worker_release(
     tmp_path: Path,
@@ -37,6 +37,16 @@ async def test_initialization_stops_before_worker_release(
     signal: str,
 ) -> None:
     config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    if site == "first_commit":
+        config = config.model_copy(update={"settle_timeout_s": RunConfig().settle_timeout_s})
+    cleanup_entered = anyio.Event()
+    original_cleanup = run_module._finish_initialization_stop
+
+    async def cleanup(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        cleanup_entered.set()
+        return await original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "_finish_initialization_stop", cleanup)
     monkeypatch.setattr(
         run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
     )
@@ -56,7 +66,15 @@ async def test_initialization_stops_before_worker_release(
     original = ArenaBoard.open if site == "board_open" else LocalStore.create
 
     def block(*args: Any, **kwargs: Any) -> Any:
-        if site == "board_open" or args[1] == site:
+        if (
+            site == "board_open"
+            or args[1] == site
+            or (
+                site == "first_commit"
+                and args[1].startswith("journal/e1-")
+                and not entered.is_set()
+            )
+        ):
             workers.append(threading.current_thread())
             entered.set()
             assert release.wait(20)
@@ -76,9 +94,14 @@ async def test_initialization_stops_before_worker_release(
             deadline.set()
         else:
             assert await request_stop(config.run_root, "r", now=signal == "stop_now") == 1
+        if site == "first_commit":
+            with anyio.fail_after(10):
+                await cleanup_entered.wait()
+            # Settle the already-admitted batch within the cleanup allowance.
+            release.set()
         done, _ = await asyncio.wait([task], timeout=2)
         assert done, "initialization ignored its stop/deadline while the worker was held"
-        if site == "board_open":
+        if site in {"board_open", "first_commit"}:
             assert task.result() == {"g": []}
             events = all_events(config)
             assert any(e.type == "stop_requested" for e in events)
@@ -109,7 +132,7 @@ async def test_initialization_stops_before_worker_release(
     assert not store.exists("goals/g/rounds/round-01.md")
     if site == "run.toml":
         assert not store.exists("manifest.json")
-    if site != "board_open":
+    if site not in {"board_open", "first_commit"}:
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].head is None

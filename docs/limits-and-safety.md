@@ -350,3 +350,8 @@ still finish remotely, but its return cannot trigger another driver operation.
 Live edits and log files use a separate awaited boundary per object.
 Synchronous published `BoardView` reads and owner-loop `Board.put_*` calls
 retain their in-memory contracts.
+
+A stop during the first journal publication settles that admitted batch within
+the cleanup allowance before deciding whether the run started. If `run_started`
+is committed, queued goals receive their stopped result and CLI summary; resume
+skips those finished goals.

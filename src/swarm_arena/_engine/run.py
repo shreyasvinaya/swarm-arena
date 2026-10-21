@@ -857,7 +857,7 @@ async def _finish_initialization_stop(
     """Close committed queued goals while the initializer still owns its lease."""
     try:
         with anyio.fail_after(config.settle_timeout_s, shield=True):
-            head = journal.head
+            head = await journal.commit()
             if head is None:
                 raise _core_error(RuntimeError, "run initialization stopped before run_started")
             chain = await _read_chain(store, head)
