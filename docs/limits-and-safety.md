@@ -174,6 +174,9 @@ are not rendered by the CLI.
 Request-time estimate and provider hooks run in registered, cancellable
 preparation before reservation. Immediate stop and round deadlines abandon
 these waits without using the executor collection allowance.
+Startup estimates, provider declarations, executor hooks, and preflight failures
+are also reported by type without hook values. A hook-raised cancellation is a
+startup failure; cancellation requested by the caller still cancels the run.
 Built-in provider probing and model-provider recovery are M3 work.
 
 ## Stop modes and resume

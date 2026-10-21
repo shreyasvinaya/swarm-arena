@@ -20,7 +20,7 @@ from swarm_arena._budget.amount import Amount
 from swarm_arena._engine import run as run_module
 from swarm_arena._engine.stops import StopState
 from swarm_arena._engine.swarm import Swarm
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import read_owner
@@ -230,9 +230,9 @@ async def test_startup_preserves_core_signals(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, boundary: str, signal: str
 ) -> None:
     error = (
-        Fenced()
+        _core_error(Fenced, "run ownership lost")
         if signal == "fenced"
-        else ExceptionGroup("ownership", [Fenced()])
+        else ExceptionGroup("ownership", [_core_error(Fenced, "run ownership lost")])
         if signal == "grouped_fenced"
         else asyncio.CancelledError()
     )
@@ -252,12 +252,12 @@ async def test_startup_preserves_core_signals(
         raise error
 
     monkeypatch.setattr(run_module, "_build_executor", build)
-    expected = asyncio.CancelledError if signal == "cancel" else Fenced
+    expected = RuntimeError if signal == "cancel" else Fenced
     with pytest.raises(expected) as caught:
         await Swarm(run_config).run(
             plan(rounds=1), approve=approve if boundary == "approval" else None
         )
-    assert type(caught.value) is expected
+    assert isinstance(caught.value, expected)
     assert not await anyio.to_thread.run_sync(Path(run_config.run_root).exists)
 
 

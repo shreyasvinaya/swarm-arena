@@ -40,6 +40,7 @@ from swarm_arena._model.plan import Plan, Resources, RoundSpec
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import Estimate, ToolRequest
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
@@ -85,35 +86,32 @@ def _build_executor(config: RunConfig) -> Executor:
 def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[str, Amount]]:
     """Bound each address by all its known effective variants and empty inputs."""
     tools: dict[str, Sequence[tuple[Tool, ToolRequest]]] = {}
-    try:
-        for plan in plans:
-            rounds = plan.rounds or [RoundSpec() for _ in range(plan.rounds_total(config.limits))]
-            teams = [(team, list(enumerate(rounds, 1))) for team in plan.teams]
-            if plan.converge.mode == "team" and plan.converge.team is not None:
-                teams.append(
-                    (
-                        plan.converge.team,
-                        [
-                            (number, plan.converge.round or rounds[-1])
-                            for number in range(1, len(rounds) + 2)
-                        ],
-                    )
+    for plan in plans:
+        rounds = plan.rounds or [RoundSpec() for _ in range(plan.rounds_total(config.limits))]
+        teams = [(team, list(enumerate(rounds, 1))) for team in plan.teams]
+        if plan.converge.mode == "team" and plan.converge.team is not None:
+            teams.append(
+                (
+                    plan.converge.team,
+                    [
+                        (number, plan.converge.round or rounds[-1])
+                        for number in range(1, len(rounds) + 2)
+                    ],
                 )
-            for team, specs in teams:
-                for agent in team.agents:
-                    tools[f"{plan.goal.id}/{team.name}/{agent.name}"] = [
-                        (
-                            effective_tool_ref(agent.tool, spec.tool_overrides).build(Tool),
-                            ToolRequest(round=number, round_overrides=spec.tool_overrides),
-                        )
-                        for number, spec in specs
-                    ]
-        price_of = make_price_of(config.models)
-        return worst_case_estimate(plans, config, tools, price_of), {
-            p.goal.id: final_slice_estimate(p, config, tools, price_of) for p in plans
-        }
-    except Exception as exc:
-        raise _core_error(RuntimeError, f"estimate failed: {type(exc).__name__}") from None
+            )
+        for team, specs in teams:
+            for agent in team.agents:
+                tools[f"{plan.goal.id}/{team.name}/{agent.name}"] = [
+                    (
+                        effective_tool_ref(agent.tool, spec.tool_overrides).build(Tool),
+                        ToolRequest(round=number, round_overrides=spec.tool_overrides),
+                    )
+                    for number, spec in specs
+                ]
+    price_of = make_price_of(config.models)
+    return worst_case_estimate(plans, config, tools, price_of), {
+        p.goal.id: final_slice_estimate(p, config, tools, price_of) for p in plans
+    }
 
 
 def _exceeds_limit(amount: Amount, config: RunConfig, fraction: Fraction = Fraction(1)) -> bool:
@@ -178,11 +176,11 @@ def _has_fenced(error: BaseException) -> bool:
 
 async def _start_executor(config: RunConfig) -> Executor:
     """Construct an executor within the shared user-code diagnostic boundary."""
+    outcome = _Outcome()
     try:
         return await run_sync_daemon(_build_executor, config)
-    except Exception as exc:
-        if _has_fenced(exc):
-            raise
+    except BaseException as exc:
+        exc = outcome.classify(exc)
         raise _core_error(
             RuntimeError, f"executor construction failed: {type(exc).__name__}"
         ) from None
@@ -191,12 +189,12 @@ async def _start_executor(config: RunConfig) -> Executor:
 async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool) -> None:
     """Bound shielded shutdown while preserving an already-raised exception."""
     with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
+        outcome = _Outcome()
         try:
             await executor.aclose()
-        except Exception as exc:
+        except BaseException as exc:
             if not failed and not shutdown.cancel_called:
-                if _has_fenced(exc):
-                    raise _core_error(Fenced) from None
+                exc = outcome.classify(exc)
                 raise _core_error(
                     RuntimeError, f"executor shutdown failed: {type(exc).__name__}"
                 ) from None
@@ -336,7 +334,14 @@ class RunRunner:
                 if collisions := _goal_key_errors(admitted):
                     raise _core_error(PlanError, collisions)
                 self.plans = admitted
-                estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
+                outcome = _Outcome()
+                try:
+                    estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
+                except BaseException as exc:
+                    exc = outcome.classify(exc)
+                    raise _core_error(
+                        RuntimeError, f"estimate failed: {type(exc).__name__}"
+                    ) from None
                 if _exceeds_limit(estimate, self.config):
                     raise _core_error(
                         RuntimeError, "worst-case estimate exceeds the configured run limit"
@@ -345,14 +350,14 @@ class RunRunner:
                 if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
                     raise _core_error(RuntimeError, "reserve cannot hold the final slices")
                 executor = await _start_executor(self.config)
+                outcome = _Outcome()
                 try:
                     capacity = await executor.capacity()
                     invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
                     if not invalid_capacity:
                         warnings.extend(_capacity_warning(admitted, capacity))
-                except Exception as exc:
-                    if _has_fenced(exc):
-                        raise
+                except BaseException as exc:
+                    exc = outcome.classify(exc)
                     raise _core_error(
                         RuntimeError, f"executor capacity failed: {type(exc).__name__}"
                     ) from None
@@ -361,11 +366,11 @@ class RunRunner:
                         RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
                     ) from None
                 if self.approve is not None:
+                    outcome = _Outcome()
                     try:
                         approved = await self.approve(estimate.to_estimate(), warnings)
-                    except Exception as exc:
-                        if _has_fenced(exc):
-                            raise
+                    except BaseException as exc:
+                        exc = outcome.classify(exc)
                         raise _core_error(
                             RuntimeError, f"approval failed: {type(exc).__name__}"
                         ) from None
