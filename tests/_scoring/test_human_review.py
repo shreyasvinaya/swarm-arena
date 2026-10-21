@@ -834,7 +834,10 @@ async def test_cancelled_writer_entry_releases_lease_once(
         return writer
 
     def release(self: Lease) -> None:
-        if any(self is lease for lease in leases):
+        if any(
+            (self.doc.epoch, self.doc.owner_id) == (lease.doc.epoch, lease.doc.owner_id)
+            for lease in leases
+        ):
             releases.append(self)
             if len(releases) > 1:
                 workers.append(threading.current_thread())
@@ -944,7 +947,10 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
         return result
 
     def release(self: Lease) -> None:
-        if any(self is lease for lease in leases):
+        if any(
+            (self.doc.epoch, self.doc.owner_id) == (lease.doc.epoch, lease.doc.owner_id)
+            for lease in leases
+        ):
             releases.append(self)
             workers.append(threading.current_thread())
             blocked.set()

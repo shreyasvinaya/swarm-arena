@@ -4,6 +4,7 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from threading import Lock, get_ident
+from typing import Any
 
 import anyio
 import pytest
@@ -50,6 +51,7 @@ class FlakyStore(Store):
         self.thread_ids: list[int] = []
         self.lock = Lock()
         self.create_started: anyio.Event | None = None
+        self.token = anyio.lowlevel.current_token()
         for key, data in (prewrite or {}).items():
             inner.create(key, data)
 
@@ -81,7 +83,7 @@ class FlakyStore(Store):
             self.max_concurrent_creates = max(self.max_concurrent_creates, self.active_creates)
         try:
             if self.create_started is not None:
-                anyio.from_thread.run_sync(self.create_started.set)
+                anyio.from_thread.run_sync(self.create_started.set, token=self.token)
             time.sleep(self.create_delay_s)
             if self.create_raises is not None:
                 raise self.create_raises
@@ -651,8 +653,6 @@ async def test_inherited_read_failure_is_contained(
     from _fakes.leases import force_take_over
     from _fakes.secrecy import assert_secret_absent
 
-    from swarm_arena._journal import writer as writer_module
-
     async with _writer(store, tmp_path, group_window_s=0) as first:
         await first.append_durable(EventDraft(type=EventType.RESERVE))
     lease = force_take_over(store, owner_id="o2", host="h", ttl_s=60)
@@ -673,10 +673,14 @@ async def test_inherited_read_failure_is_contained(
     }
     errors[kind].add_note(marker)
 
-    def fail(*args: object) -> None:
-        raise errors[kind]
+    original = store.read
 
-    monkeypatch.setattr(writer_module, "read_chain", fail)
+    def fail(key: str) -> Blob:
+        if key.startswith("journal/"):
+            raise errors[kind]
+        return original(key)
+
+    monkeypatch.setattr(store, "read", fail)
     try:
         with pytest.raises(Fenced) as caught:
             await writer.__aenter__()
@@ -708,14 +712,67 @@ async def test_inherited_read_retries_transient_failure(
     attempts = 0
     original = writer_module.read_chain
 
-    def read(current_store: Store, head: Head) -> list[tuple[str, list[Event]]]:
+    def read(current_store: Store, head: Head, **kwargs: Any) -> list[tuple[str, list[Event]]]:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise OSError("transient read failure")
-        return original(current_store, head)
+        return original(current_store, head, **kwargs)
 
     monkeypatch.setattr(writer_module, "read_chain", read)
     async with writer:
         assert attempts == 2
         assert writer.committed == first.committed
+
+
+@pytest.mark.parametrize("site", ["create", "replace"])
+async def test_blocked_publication_expires_without_late_state_change(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    import asyncio
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    writer = _writer(store, tmp_path, ttl_s=3, group_window_s=0)
+    original = getattr(store, site)
+
+    def block(*args: object, **kwargs: object) -> str:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, site, block)
+
+    async def publish() -> None:
+        async with writer:
+            await writer.append_durable(EventDraft(type=EventType.RESERVE))
+
+    task = asyncio.create_task(publish())
+    before = writer._lease.doc
+    try:
+        with anyio.fail_after(10):
+            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        done, _ = await asyncio.wait([task], timeout=4)
+        assert done, "publication wait outlived confirmed ownership"
+        assert isinstance(task.exception(), Fenced)
+        assert writer.head is None
+        assert writer.committed == ()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 5)
+                    assert not worker.is_alive()
+    assert writer._lease.doc == before
+    assert writer.head is None
+    assert writer.committed == ()
+    owner = read_owner(store)
+    assert owner is not None
+    if site == "create":
+        assert owner[0].head is None

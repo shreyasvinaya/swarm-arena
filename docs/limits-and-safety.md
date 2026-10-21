@@ -333,3 +333,20 @@ Non-string identifiers raise `TypeError` naming only the parameter and required
 type, without formatting the supplied value. Optional identifiers still accept
 `None` where documented. For example, `ctx.judge_error("c1", "invalid result")`
 records the same first-error diagnostic as before.
+
+
+## Lease-owned storage
+
+The driver awaits storage in abandonable daemon workers under its existing
+stop, remaining run time and ownership supervision. Shutdown uses the configured
+settlement allowance. Backend exceptions become value-free core errors;
+trusted chain and replay validation keeps its own diagnostics. Returned blob
+bytes and version identifiers are detached before the owner uses them.
+
+Journal publication waits end at the last confirmed lease expiry.
+Owner updates run against a private lease copy; only a timely result can update
+the writer's live document and committed head. An abandoned storage request may
+still finish remotely, but its return cannot trigger another driver operation.
+Live edits and log files use a separate awaited boundary per object.
+Synchronous published `BoardView` reads and owner-loop `Board.put_*` calls
+retain their in-memory contracts.

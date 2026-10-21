@@ -11,15 +11,14 @@ from typing import Any, Literal
 import anyio
 import anyio.lowlevel
 
-from swarm_arena._errors import AlreadyExists, PreconditionFailed, StorageError, _core_error
-from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._errors import AlreadyExists, PreconditionFailed, _core_error
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
-from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store, _read_blob
+from swarm_arena._store.io import _create, _replace, _storage_io
 
 _Format = Literal["json", "toml", "md"]
 _FORMATS: dict[str, _Format] = {".json": "json", ".toml": "toml", ".md": "md"}
@@ -214,8 +213,6 @@ class ViewWriter:
             If the key suffix or document is invalid.
         StorageError
             If a Store operation fails outside a conditional-write conflict.
-        OSError
-            If the backend's create operation fails.
 
         Examples
         --------
@@ -234,18 +231,14 @@ class ViewWriter:
         digest = sha256(data).digest()
         await anyio.lowlevel.checkpoint_if_cancelled()
         try:
-            await run_sync_daemon(self._store.create, key, data)
+            await _storage_io(_create, self._store, key, data, site="view storage")
             return
         except AlreadyExists:
             if create_only:
                 return
         for _ in range(2):
             await anyio.lowlevel.checkpoint_if_cancelled()
-            outcome = _Outcome()
-            try:
-                existing = await run_sync_daemon(_read_blob, self._store, key)
-            except BaseException as error:
-                outcome.contain(error, StorageError, "view storage")
+            existing = await _storage_io(_read_blob, self._store, key, site="view storage")
             if sha256(existing.data).digest() == digest:
                 return
             previous = read_source_head(fmt, existing.data)
@@ -253,8 +246,9 @@ class ViewWriter:
                 return
             await anyio.lowlevel.checkpoint_if_cancelled()
             try:
-                await run_sync_daemon(
-                    partial(self._store.replace, key, data, if_match=existing.etag)
+                await _storage_io(
+                    partial(_replace, self._store, key, data, if_match=existing.etag),
+                    site="view storage",
                 )
                 return
             except PreconditionFailed:

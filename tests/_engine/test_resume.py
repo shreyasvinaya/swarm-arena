@@ -506,7 +506,9 @@ async def test_seq_continues_and_takeover_logged(crashed: Crashed) -> None:
     take = next(e for e in ev if e.type == "takeover")
     assert take.epoch == 2
     assert take.seq == crashed.head_seq + 1
-    assert take.payload == {"force": True}
+    assert take.payload["force"] is True
+    assert isinstance(take.payload["run_elapsed_s"], float)
+    assert take.payload["run_elapsed_s"] >= 0
 
 
 async def test_in_flight_runs_lost_and_charged(crashed: Crashed) -> None:

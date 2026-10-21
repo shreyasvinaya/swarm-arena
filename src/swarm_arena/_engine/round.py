@@ -29,7 +29,7 @@ from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
@@ -589,7 +589,7 @@ class RoundRunner:
         """
         if self.deps.journal.head is None:
             return {}
-        chain = await run_sync_daemon(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await _read_chain(self.deps.store, self.deps.journal.head)
         policies: dict[str, dict[str, str]] = {}
         for _, events in chain:
             for event in events:
@@ -723,7 +723,7 @@ class RoundRunner:
         """Recover the matching round's committed allowances and private learnings."""
         if (self.frontier is None and not self.converge) or self.deps.journal.head is None:
             return
-        chain = await run_sync_daemon(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await _read_chain(self.deps.store, self.deps.journal.head)
         events = [event for _, batch in chain for event in batch]
         if self.converge and self.frontier is None:
             state = RunState.from_events(events)

@@ -43,6 +43,7 @@ from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.validate import _rule_max_agents_total
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store, open_store
+from swarm_arena._store.io import _storage_io, _validated_io
 
 
 @dataclass
@@ -170,6 +171,7 @@ class _ResumeServices:
                     next_seq=head.seq + 1,
                     local_path=path,
                     sync_interval_s=config.sync_interval_s,
+                    settle_timeout_s=config.settle_timeout_s,
                 ) as journal,
             ):
                 entered = True
@@ -181,7 +183,7 @@ class _ResumeServices:
                         await journal.append_durable(
                             EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
                         )
-                        events, state = await run_sync_daemon(_read, self.store, lease.doc)
+                        events, state = await _validated_io(_read, self.store, lease.doc)
                         replay_prepared()
                         async with run_module._supervise_initialization(
                             self.store, lease.doc.epoch, stops, clock, config
@@ -189,7 +191,7 @@ class _ResumeServices:
                             from swarm_arena._scoring.human_review import _repair_review_objects
 
                             arena_root = await run_sync_daemon(_board_arena_root, config)
-                            arena = await run_sync_daemon(open_store, arena_root)
+                            arena = await _storage_io(open_store, arena_root)
                             await _repair_review_objects(state, arena, self.store, lease, journal)
                             continued = _check(state, config)
                             self.order = [
@@ -281,7 +283,7 @@ class _ResumeServices:
                                     )
                                 )
                             await journal.commit()
-                            _, state = await run_sync_daemon(_read, self.store, lease.doc)
+                            _, state = await _validated_io(_read, self.store, lease.doc)
                             board = await run_module._start_board(config)
                             await run_module._open_board(
                                 board,
@@ -307,7 +309,9 @@ class _ResumeServices:
                                 ledger=ledger,
                                 board=board,
                                 executor=executor,
-                                artifacts=ArtifactStore(open_store(config.artifact_root)),
+                                artifacts=ArtifactStore(
+                                    await _storage_io(open_store, config.artifact_root)
+                                ),
                                 ids=ids,
                                 views=ViewWriter(self.store, journal),
                                 board_namespaces={
@@ -351,7 +355,7 @@ class _ResumeServices:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 try:
                     if not entered:
-                        await run_sync_daemon(lease.release)
+                        await _storage_io(lease.release)
                 except Exception as error:
                     if self.failure is None:
                         self.failure = _core_error(
@@ -418,7 +422,7 @@ async def _acquire_lease(acquire: Callable[[], Lease], *, settle_timeout_s: floa
             with anyio.move_on_after(settle_timeout_s, shield=True):
                 # Cleanup cannot replace the original outcome, including caller cancellation.
                 with suppress(BaseException):
-                    await run_sync_daemon(lease.release)
+                    await _storage_io(lease.release)
         outcome.contain(error, StorageError, "lease acquisition")
 
 
@@ -427,11 +431,7 @@ _T = TypeVar("_T")
 
 async def _lease_io(operation: Callable[..., _T], *args: Any) -> _T:
     """Read takeover authority under the shared storage outcome boundary."""
-    outcome = _Outcome()
-    try:
-        return await run_sync_daemon(operation, *args)
-    except BaseException as error:
-        outcome.contain(error, StorageError, "lease preparation")
+    return await _storage_io(operation, *args, site="lease preparation")
 
 
 async def _take_over(
@@ -454,12 +454,7 @@ async def _take_over(
         if doc.head is None:
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
-            outcome = _Outcome()
-            try:
-                await run_sync_daemon(validate, doc)
-            except BaseException as error:
-                outcome.propagate_control(error)
-                raise
+            await _validated_io(validate, doc)
         try:
             return await _acquire_lease(
                 partial(

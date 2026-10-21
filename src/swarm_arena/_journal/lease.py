@@ -13,7 +13,8 @@ from swarm_arena._errors import (
 )
 from swarm_arena._model.base import FrozenModel, StoredModel
 from swarm_arena._model.canonical import UtcDatetime, canonical_json, utc_now
-from swarm_arena._store.base import Store
+from swarm_arena._store.base import Store, _read_blob
+from swarm_arena._store.io import _create, _replace
 
 OWNER_KEY = "control/owner.json"
 
@@ -108,7 +109,7 @@ def read_owner(store: Store) -> tuple[OwnerDoc, str] | None:
     1
     """
     try:
-        blob = store.read(OWNER_KEY)
+        blob = _read_blob(store, OWNER_KEY)
     except NotFound:
         return None
     return OwnerDoc.model_validate_json(blob.data), blob.etag
@@ -119,7 +120,8 @@ class Lease:
     Serialize lease changes against the last confirmed owner ETag.
 
     One writer owns this synchronous object and serializes its operations.
-    Async consumers offload calls to an AnyIO worker. Failed writes leave the
+    Async consumers use supervised daemon workers. The journal writer changes
+    a private lease copy and adopts only timely results. Failed writes leave the
     local document and ETag unchanged, including when the storage outcome is
     unknown; recovery may explicitly adopt a confirmed authority read.
 
@@ -194,7 +196,7 @@ class Lease:
             host=host,
             expires_at=utc_now() + timedelta(seconds=ttl_s),
         )
-        etag = store.create(OWNER_KEY, canonical_json(doc.model_dump(mode="json")))
+        etag = _create(store, OWNER_KEY, canonical_json(doc.model_dump(mode="json")))
         return cls(store, doc, etag, ttl_s=ttl_s)
 
     @classmethod
@@ -359,8 +361,11 @@ class Lease:
     def _replace(self, doc: OwnerDoc) -> None:
         """Adopt proposed state only after storage confirms the replacement."""
         try:
-            etag = self._store.replace(
-                OWNER_KEY, canonical_json(doc.model_dump(mode="json")), if_match=self.etag
+            etag = _replace(
+                self._store,
+                OWNER_KEY,
+                canonical_json(doc.model_dump(mode="json")),
+                if_match=self.etag,
             )
         except PreconditionFailed as error:
             if not _is_core_signal(error):

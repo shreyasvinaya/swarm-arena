@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from functools import partial
 from inspect import isawaitable, iscoroutinefunction
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
 import anyio.lowlevel
@@ -43,7 +43,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._model.base import CallRole
@@ -358,14 +358,25 @@ class GoalRunner:
         """Fold only a committed head, including the durable fingerprint map."""
         head = await self.deps.journal.commit()
         if head is not None:
-            chain = await run_sync_daemon(read_chain, self.deps.store, head)
+            chain = await self._storage_step(partial(_read_chain, self.deps.store, head))
             self._events = [event for _, events in chain for event in events]
             self.recorded = RunState.from_events(self._events)
+
+    async def _storage_step(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Keep retained storage reads and writes within final-work supervision."""
+        completed, result = await self._supervised_step(operation, final=True)
+        if not completed:
+            raise _core_error(RuntimeError, "goal storage settlement timed out")
+        return cast(_T, result)
+
+    async def _write_view(self, key: str, content: bytes, *, source: Head) -> None:
+        """Publish a retained view under the same deadline and ownership checks."""
+        await self._storage_step(partial(self.deps.views.write, key, content, source=source))
 
     async def _plan_view(self) -> None:
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/plan.r{self.plan.revision}.toml",
             self.plan.dumps().encode(),
             source=head,
@@ -441,7 +452,7 @@ class GoalRunner:
         await self._refresh()
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/solution.json",
             solution_view(self.recorded, self.goal_id, head),
             source=head,
@@ -1585,7 +1596,7 @@ class GoalRunner:
         await self._refresh()
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/solution.json",
             solution_view(self.recorded, self.goal_id, head),
             source=head,

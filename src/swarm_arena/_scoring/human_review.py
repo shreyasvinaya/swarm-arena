@@ -38,15 +38,15 @@ from swarm_arena._errors import (
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease, OwnerDoc, read_owner
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_segment, read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store, _check_key, _read_blob, open_store
+from swarm_arena._store.io import _storage_io, _validated_io
 
 CSV_HEADER: Final = ("id", "goal", "team", "agent", "scores", "verdict", "score", "notes")
 
@@ -258,7 +258,11 @@ def _read_state(store: Store, run_id: str, doc: OwnerDoc | None = None) -> RunSt
         doc = owner[0]
     if doc.head is None:
         raise _core_error(ValueError, f"run {run_id} has no committed events")
-    return RunState.from_events(e for _, batch in read_chain(store, doc.head) for e in batch)
+    return RunState.from_events(
+        e
+        for _, batch in read_chain(store, doc.head, _read=partial(_read_segment, store))
+        for e in batch
+    )
 
 
 def _local_path(path: Path) -> Path:
@@ -330,11 +334,7 @@ _T = TypeVar("_T")
 
 async def _review_io(operation: Callable[..., _T], *args: Any) -> _T:
     """Await abandonable review I/O with reconstructed storage diagnostics."""
-    outcome = _Outcome()
-    try:
-        return await run_sync_daemon(operation, *args)
-    except BaseException as error:
-        outcome.contain(error, StorageError, "review storage")
+    return await _storage_io(operation, *args, site="review storage")
 
 
 async def _publish_review_object(
@@ -572,7 +572,8 @@ class HumanReview:
         ...     "r", Path("review.csv"), config=config)
         """
         from swarm_arena._engine.resume import _take_over
-        from swarm_arena._engine.run import _supervise_writer
+        from swarm_arena._engine.run import _supervise_initialization, _supervise_writer
+        from swarm_arena._engine.stops import RunClock, StopState
 
         config = config.model_copy(
             update={"arena_root": await _review_io(_board_arena_root, config)}
@@ -587,8 +588,12 @@ class HumanReview:
         )
         await anyio.to_thread.run_sync(check_storage, config)
 
+        clock: RunClock | None = None
+
         def validate_locations(doc: OwnerDoc) -> None:
+            nonlocal clock
             current = _read_state(store, run_id, doc)
+            clock = RunClock(current.run_elapsed_s)
             _review_keys(current, self._reviewer, config.arena_root, utc_now(), initial_scores)
 
         try:
@@ -609,23 +614,29 @@ class HumanReview:
                 / "journals"
                 / f"{run_id}-e{lease.doc.epoch}.jsonl"
             )
-            async with JournalWriter(
-                store,
-                lease,
-                run_id=run_id,
-                next_seq=head.seq + 1,
-                local_path=path,
-                sync_interval_s=config.sync_interval_s,
-            ) as writer:
+            assert clock is not None
+            completed = False
+            async with (
+                _supervise_initialization(store, lease.doc.epoch, StopState(), clock, config),
+                JournalWriter(
+                    store,
+                    lease,
+                    run_id=run_id,
+                    next_seq=head.seq + 1,
+                    local_path=path,
+                    sync_interval_s=config.sync_interval_s,
+                    settle_timeout_s=config.settle_timeout_s,
+                ) as writer,
+            ):
                 entered = True
                 # The journal owns release even if supervision entry is cancelled.
                 async with _supervise_writer(writer):
-                    state = await run_sync_daemon(_read_state, store, run_id, lease.doc)
+                    state = await _validated_io(_read_state, store, run_id, lease.doc)
                     scores = parse_review_csv(data, state, judge=self.judge_name)
-                    arena = await run_sync_daemon(open_store, config.arena_root)
+                    arena = await _review_io(open_store, config.arena_root)
                     await _repair_review_objects(state, arena, store, lease, writer)
                     now = utc_now()
-                    keys = await run_sync_daemon(
+                    keys = await _validated_io(
                         _review_keys, state, self._reviewer, config.arena_root, now, scores
                     )
                     ids = IdGen(run_id, lease.doc.epoch, counters=state.id_counters)
@@ -653,9 +664,12 @@ class HumanReview:
                     await _repair_review_objects(
                         RunState.from_events([receipt]), arena, store, lease, writer
                     )
+                    completed = True
+            if not completed:
+                raise _core_error(RuntimeError, "review import stopped")
             return scores
         finally:
             if not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(Fenced):
-                        await run_sync_daemon(lease.release)
+                        await _review_io(lease.release)

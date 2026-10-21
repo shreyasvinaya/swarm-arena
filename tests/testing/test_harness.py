@@ -380,3 +380,55 @@ async def test_nonstandard_manager_reason_uses_originating_type(
     [event] = _events(harness, "agent_status")
     assert event.payload["reason"] == f"manager error: {type(failure).__name__}"
     assert_secret_absent(RuntimeError(event.model_dump_json()), secret)
+
+
+async def test_harness_cancellation_abandons_board_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._board.frontier import Frontier
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = ArenaBoard.frontier
+
+    def frontier(board: ArenaBoard) -> Frontier:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        return original(board)
+
+    monkeypatch.setattr(ArenaBoard, "frontier", frontier)
+    cancelled = anyio.Event()
+    scope = anyio.CancelScope()
+
+    async def run() -> None:
+        with scope:
+            await OfflineHarness().run_rounds(
+                ScriptedManager([]),
+                goal=GOAL,
+                tool=SQUARE,
+                rounds=1,
+                limits=Limits(),
+                config=RunConfig(),
+            )
+        cancelled.set()
+
+    task = asyncio.create_task(run())
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        scope.cancel()
+        with anyio.move_on_after(3):
+            await cancelled.wait()
+        assert cancelled.is_set(), "harness retained its board storage worker"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()

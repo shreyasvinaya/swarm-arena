@@ -1960,3 +1960,47 @@ async def test_past_run_hint_in_warnings(rt_env: RtEnv, tmp_path: "Path", scored
     assert result.run_id == rt.repeats.run_id
     assert result.warnings == [f"past-run match past-c: {'rank=0.25' if scored else 'unscored'}"]
     assert rt.repeats.added == [(key, result)]
+
+
+async def test_blocked_log_publication_is_abandoned_on_round_stop(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from swarm_arena._store.local import LocalStore
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = LocalStore.create
+    writes: list[str] = []
+
+    def create(store: LocalStore, key: str, data: bytes) -> str:
+        if "/logs/" in key:
+            writes.append(key)
+            if key.endswith(".out"):
+                workers.append(threading.current_thread())
+                entered.set()
+                assert release.wait(30)
+        return original(store, key, data)
+
+    monkeypatch.setattr(LocalStore, "create", create)
+    task = asyncio.create_task(
+        execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    )
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        rt_env.cancel_inflight()
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "log publication ignored the round's cancellation"
+        candidate = task.result()
+        assert candidate.output.logs_ref is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert len(writes) == 1, "abandoned log write published another file"

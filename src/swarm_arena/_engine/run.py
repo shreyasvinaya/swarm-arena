@@ -57,6 +57,7 @@ from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store, _read_blob, open_store
+from swarm_arena._store.io import _create, _storage_io
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
@@ -557,6 +558,7 @@ class RunRunner:
                 next_seq=1,
                 local_path=local_path,
                 sync_interval_s=config.sync_interval_s,
+                settle_timeout_s=config.settle_timeout_s,
             ) as journal:
                 entered = True
                 async with _supervise_writer(journal):
@@ -564,9 +566,10 @@ class RunRunner:
                         store, lease.doc.epoch, stops, clock, config
                     ) as prepared:
                         journal.clock = clock
-                        await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
-                        await run_sync_daemon(
-                            store.create,
+                        await _storage_io(_create, store, "run.toml", config.dumps().encode())
+                        await _storage_io(
+                            _create,
+                            store,
                             "manifest.json",
                             canonical_json(
                                 RunManifest.model_validate(manifest).model_dump(mode="json")
@@ -652,7 +655,7 @@ class RunRunner:
             if not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(BaseException):
-                        await run_sync_daemon(lease.release)
+                        await _storage_io(lease.release)
 
     async def aclose(self) -> None:
         """
@@ -675,14 +678,26 @@ class RunRunner:
         deps.admission.on_change = self._wake_queue
         deps.stops.on_change = self._wake_queue
         result: dict[str, list[Candidate]] = {}
-        async with _supervise_writer(deps.journal):
-            async with anyio.create_task_group() as watchers:
-                watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
-                watchers.start_soon(self._watch_clock, deps)
-                result = await self._queue(deps)
-                await self._record_stops(deps)
-                watchers.cancel_scope.cancel()
-            await _finish_run(deps.store, deps.journal)
+        async with _supervise_writer(deps.journal), anyio.create_task_group() as watchers:
+            watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
+            watchers.start_soon(self._watch_clock, deps)
+            result = await self._queue(deps)
+            await self._record_stops(deps)
+            with anyio.CancelScope() as completion:
+
+                def stopping() -> None:
+                    completion.deadline = min(
+                        completion.deadline,
+                        anyio.current_time() + deps.config.settle_timeout_s,
+                    )
+
+                deps.stops.on_change = stopping
+                if self._stopping(deps):
+                    stopping()
+                await _finish_run(deps.store, deps.journal)
+            watchers.cancel_scope.cancel()
+            if completion.cancel_called:
+                raise _core_error(RuntimeError, "run completion timed out")
         return result
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
@@ -735,7 +750,15 @@ class RunRunner:
             for g, goal in state.goals.items():
                 if g not in order:
                     results[g] = [state.candidates[id] for id in goal.final_order]
-                    await deps.views.write(
+                    completed = GoalRunner(
+                        deps,
+                        goal_id=g,
+                        plan=state.plans[g][-1][0],
+                        replanner=None,
+                        state=goal,
+                        journal_r0=False,
+                    )
+                    await completed._write_view(
                         f"goals/{g}/solution.json", solution_view(state, g, head), source=head
                     )
         assert deps.admission is not None
@@ -888,7 +911,7 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
         await anyio.lowlevel.checkpoint_if_cancelled()
         key = f"review/e{head.epoch}-{head.seq}/{name}"
         try:
-            await _review_io(store.create, key, data)
+            await _review_io(_create, store, key, data)
         except AlreadyExists:
             existing = await _review_io(_read_blob, store, key)
             if existing.data != data:

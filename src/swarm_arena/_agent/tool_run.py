@@ -42,6 +42,7 @@ from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
+from swarm_arena._store.io import _create, _storage_io
 from swarm_arena._tooling.result_file import request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
@@ -329,7 +330,9 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
         ) from None
 
 
-async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | None = None) -> _T:
+async def _prepare_sync(
+    hook: Callable[..., _T], *args: Any, generation: int | None = None, storage: bool = False
+) -> _T:
     """Supervise preparation; admitted commands may finish during graceful stop."""
     inflight = _inflight.get()
     with anyio.CancelScope() as scope:
@@ -340,7 +343,7 @@ async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | N
                 raise _core_signal(LimitReached("stop", "the round is stopping"))
         outcome = _Outcome()
         try:
-            result = await run_sync_daemon(hook, *args)
+            result = await (_storage_io(hook, *args) if storage else run_sync_daemon(hook, *args))
         except BaseException as error:
             raise outcome.classify(error) from None
         finally:
@@ -476,14 +479,15 @@ def _stage(
         ) from None
 
 
-def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
-    """Read both verified executor blobs before publishing run-relative logs."""
+async def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
+    """Read and publish each log through a separate supervised storage boundary."""
     stdout_sha, stderr_sha = parse_logs_ref(ref)
-    stdout, stderr = rt.artifacts.get_bytes(stdout_sha), rt.artifacts.get_bytes(stderr_sha)
-    store = open_store(rt.config.run_root).child(rt.repeats.run_id)
+    stdout = await _storage_io(rt.artifacts.get_bytes, stdout_sha)
+    stderr = await _storage_io(rt.artifacts.get_bytes, stderr_sha)
+    store = await _storage_io(lambda: open_store(rt.config.run_root).child(rt.repeats.run_id))
     stem = f"goals/{rt.goal_id}/logs/{id}"
-    store.create(stem + ".out", stdout)
-    store.create(stem + ".err", stderr)
+    await _storage_io(_create, store, stem + ".out", stdout)
+    await _storage_io(_create, store, stem + ".err", stderr)
     return stem
 
 
@@ -709,7 +713,13 @@ async def _run(
 
     try:
         if not failed:
-            await anyio.to_thread.run_sync(put_edits, request.edits, rt.artifacts)
+            for edit in [{path: content} for path, content in request.edits.items()] or [{}]:
+                try:
+                    await _prepare_sync(put_edits, edit, rt.artifacts, storage=True)
+                except LimitReached as error:
+                    if inflight.closed or generation != inflight._cancel_generation:
+                        admission_refusal = error
+                    raise
             job = Job(
                 id=id,
                 kind="tool",
@@ -780,36 +790,47 @@ async def _run(
 
     # Deliver an outer cancellation before entering the core-only completion shield.
     await anyio.lowlevel.checkpoint()
-    with anyio.CancelScope(shield=True):
-        if rt.journal.fenced.is_set():
-            raise _core_error(Fenced, "run ownership lost")
-        actual = Amount()
-        estimated = False
-        usage = output.usage
-        overflow = usage.usd is not None and usage.usd > USD_LIMIT
-        if overflow:
-            warnings.append("tool error: usage exceeds supported range")
-            output = output.model_copy(update={"status": RunStatus.ERROR})
-            actual = Amount(tokens=max(0, usage.total_tokens), usd=USD_LIMIT)
+    if rt.journal.fenced.is_set():
+        raise _core_error(Fenced, "run ownership lost")
+    actual = Amount()
+    estimated = False
+    usage = output.usage
+    overflow = usage.usd is not None and usage.usd > USD_LIMIT
+    if overflow:
+        warnings.append("tool error: usage exceeds supported range")
+        output = output.model_copy(update={"status": RunStatus.ERROR})
+        actual = Amount(tokens=max(0, usage.total_tokens), usd=USD_LIMIT)
+    else:
+        try:
+            reported = Amount(tokens=usage.total_tokens, usd=usage.usd or 0.0)
+            if started:
+                actual = reported
+                estimated = providers and usage.usd is None and usage.total_tokens == 0
+        except BaseException as error:
+            error = outcome.classify(error)
+            warnings.append(f"tool error: {_exception_type_name(error)}")
+            output = ToolOutput(status=RunStatus.ERROR)
+            actual, estimated = Amount(), started and providers
+    if output.logs_ref is not None:
+        logs_ref = None
+        deadline = (
+            anyio.current_time() + rt.config.settle_timeout_s
+            if generation != inflight._cancel_generation
+            else float("inf")
+        )
+        with anyio.CancelScope(deadline=deadline) as logs_scope:
+            inflight._add_completion(logs_scope, grace_s=0, generation=inflight._cancel_generation)
+            try:
+                logs_ref = await _logs(rt, id, output.logs_ref)
+            except BaseException as error:
+                outcome.propagate_control(error)
+                warnings.append(f"tool error: {_exception_type_name(error)}")
+            finally:
+                inflight.discard(logs_scope)
+        if logs_ref is None:
+            output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
         else:
-            try:
-                reported = Amount(tokens=usage.total_tokens, usd=usage.usd or 0.0)
-                if started:
-                    actual = reported
-                    estimated = providers and usage.usd is None and usage.total_tokens == 0
-            except BaseException as error:
-                error = outcome.classify(error)
-                warnings.append(f"tool error: {_exception_type_name(error)}")
-                output = ToolOutput(status=RunStatus.ERROR)
-                actual, estimated = Amount(), started and providers
-        if output.logs_ref is not None:
-            try:
-                logs_ref = await anyio.to_thread.run_sync(_logs, rt, id, output.logs_ref)
-                output = output.model_copy(update={"logs_ref": logs_ref})
-            except BaseException as error:
-                error = outcome.classify(error)
-                warnings.append(f"tool error: {_exception_type_name(error)}")
-                output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
+            output = output.model_copy(update={"logs_ref": logs_ref})
     # Optional fingerprint work must remain cancellable before durable completion.
     fingerprint: str | None = None
     if output.status == RunStatus.OK or (

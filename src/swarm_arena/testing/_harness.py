@@ -2,6 +2,7 @@
 
 import atexit
 import shutil
+import sys
 import tempfile
 import warnings
 from collections.abc import Sequence
@@ -22,13 +23,22 @@ from swarm_arena._board.digest import build_digest
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
+from swarm_arena._engine.run import (
+    _close_board,
+    _open_board,
+    _supervise_initialization,
+    _supervise_writer,
+)
+from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._errors import Fenced, _core_error, _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.limits import Limits
@@ -41,6 +51,7 @@ from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.runner import judge_round
+from swarm_arena._store.io import _storage_io
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
@@ -172,6 +183,7 @@ class OfflineHarness:
                 ttl_s=config.lease_ttl_s,
             )
         )
+        completed = False
         async with (
             _executor(None) as executor,
             _failed_runs_on(executor),
@@ -182,7 +194,12 @@ class OfflineHarness:
                 next_seq=1,
                 local_path=root / "journal.jsonl",
                 sync_interval_s=config.sync_interval_s,
+                settle_timeout_s=config.settle_timeout_s,
             ) as journal,
+            _supervise_writer(journal),
+            _supervise_initialization(
+                self.store, lease.doc.epoch, StopState(), RunClock(0), config
+            ),
         ):
             ledger = Ledger(
                 limits,
@@ -229,13 +246,11 @@ class OfflineHarness:
             )
             board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
             try:
-                await anyio.to_thread.run_sync(
-                    board.open, "local", str(root / "runs"), [goal.namespace]
-                )
-                view = await anyio.to_thread.run_sync(
+                await _open_board(board, config, "local", [goal.namespace])
+                view = await _storage_io(
                     board.snapshot,
                     goal.key(),
-                    await anyio.to_thread.run_sync(board.frontier),
+                    await _storage_io(lambda: _detach_model(Frontier, board.frontier())),
                 )
                 rt = AgentRuntime(
                     address=address,
@@ -283,9 +298,11 @@ class OfflineHarness:
                 )
                 with track_inflight(Inflight()):
                     reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
+                completed = True
             finally:
-                with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(board.close)
+                await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+        if not completed:
+            raise _core_error(RuntimeError, "offline harness stopped")
         notes = await anyio.to_thread.run_sync(_failed_runs, executor.outputs)
         if self.manager_errors:
             for error in self.manager_errors:
@@ -327,7 +344,7 @@ class OfflineHarness:
         """Advance snapshots and judge each completed round before the next."""
         reports: list[RoundReport] = []
         for number in range(1, rounds + 1):
-            frontier = await anyio.to_thread.run_sync(rt.board.frontier)
+            frontier = await _storage_io(lambda rt=rt: _detach_model(Frontier, rt.board.frontier()))
             await rt.journal.append_durable(
                 EventDraft(
                     type=EventType.FRONTIER,
@@ -336,7 +353,7 @@ class OfflineHarness:
                     payload={"round": number, "frontier": frontier.model_dump(mode="json")},
                 )
             )
-            view = await anyio.to_thread.run_sync(rt.board.snapshot, rt.goal_key, frontier)
+            view = await _storage_io(rt.board.snapshot, rt.goal_key, frontier)
             grants = rt.ledger.open_round(
                 rt.goal_id, number, [rt.holder], rounds_left=rounds - number + 1
             )

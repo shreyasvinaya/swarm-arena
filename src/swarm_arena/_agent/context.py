@@ -183,6 +183,10 @@ class AgentContext:
     ) -> None:
         """Bind runtime state and already prepared metadata on the owner loop."""
         self._rt, self._gate, self._thread = rt, gate, get_ident()
+        try:
+            self._loop_token = anyio.lowlevel.current_token()
+        except RuntimeError:
+            self._loop_token = None
         self._read_ids: dict[str, None] = {}
         self._feedback = dict(metadata.feedback)
         self._feedback_for = feedback_for
@@ -199,7 +203,11 @@ class AgentContext:
 
     def _on_loop(self, fn: Callable[[], _T]) -> _T:
         """Marshal an AnyIO worker's complete lookup and accounting operation."""
-        return fn() if get_ident() == self._thread else anyio.from_thread.run_sync(fn)
+        return (
+            fn()
+            if get_ident() == self._thread
+            else anyio.from_thread.run_sync(fn, token=self._loop_token)
+        )
 
     def _event(self, type: EventType, payload: dict[str, Any]) -> EventDraft:
         """Stamp the owning agent task on an ordinary event."""
