@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional configurable curators merge round learnings with supervised normalization,
   reserve accounting, and atomic completion receipts for crash-safe recovery.
 
+- Configured-board open and close share safe diagnostics on run and resume;
+  cancellation stays responsive and shutdown is bounded by the settle timeout.
 - Fixed arena views use separate WAL reader connections and remain responsive
   while another goal fetches storage or ingests journal events.
 - Arena groups retain their own namespaces across candidate indexing, sibling

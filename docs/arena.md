@@ -181,6 +181,13 @@ command's contract is to refuse while any process holds a cache lifetime lock;
 all cache connections and their locks. Board state and cache operations are
 synchronized across worker and caller threads.
 
+Configured boards use the same lifecycle boundary on run and resume. Construction,
+`open()`, and `close()` report only exception types for connector failures;
+registered core signals retain their vetted meaning. Opening can be cancelled.
+Closing is shielded for at most `RunConfig.settle_timeout_s`, preserves a primary
+run failure, and abandons a blocking connector call when that deadline expires.
+The synchronous call runs in a daemon thread and may continue after abandonment.
+
 ## Storage on S3
 
 Each of `run_root`, `arena_root`, and `artifact_root` can be a local path or an

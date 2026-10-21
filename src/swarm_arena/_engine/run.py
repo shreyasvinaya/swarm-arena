@@ -204,6 +204,34 @@ async def _start_executor(config: RunConfig) -> Executor:
         ) from None
 
 
+async def _open_board(
+    board: Board, config: RunConfig, run_id: str, namespaces: Sequence[str]
+) -> None:
+    """Open a board through the same safe, cancellable boundary as construction."""
+    try:
+        await run_sync_daemon(board.open, run_id, config.run_root, namespaces)
+    except Exception as error:
+        safe = _rebuild_core_signal(error)
+        if safe is not None:
+            raise safe from None
+        raise _core_error(RuntimeError, f"board open failed: {type(error).__name__}") from None
+
+
+async def _close_board(board: Board, config: RunConfig, *, failed: bool) -> None:
+    """Bound shielded board cleanup and retain an already-raised primary error."""
+    with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
+        try:
+            await run_sync_daemon(board.close)
+        except Exception as error:
+            if not failed and not shutdown.cancel_called:
+                safe = _rebuild_core_signal(error)
+                if safe is not None:
+                    raise safe from None
+                raise _core_error(
+                    RuntimeError, f"board close failed: {type(error).__name__}"
+                ) from None
+
+
 async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool) -> None:
     """Bound shielded shutdown while preserving an already-raised exception."""
     with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
@@ -289,7 +317,8 @@ class RunRunner:
         Preapproval snapshots use a temporary store removed on refusal. Approved
         snapshots are promoted without rereading sources. Estimate hooks run in
         abandonable daemon threads and assume empty, unknown future inputs.
-        Executor shutdown is shielded for at most ``config.settle_timeout_s``.
+        Board and executor shutdown each use a shielded
+        ``config.settle_timeout_s`` deadline.
         On expiry the original result or exception is preserved; shutdown
         failures never replace an exception already raised by the run.
 
@@ -480,10 +509,10 @@ class RunRunner:
                 )
             board = await _start_board(config)
             try:
-                await anyio.to_thread.run_sync(
-                    board.open,
+                await _open_board(
+                    board,
+                    config,
                     run_id,
-                    config.run_root,
                     sorted(
                         {p.goal.namespace for p in self.plans}
                         | {part.goal.namespace for p in self.plans for part in p.parts}
@@ -506,8 +535,7 @@ class RunRunner:
                 )
                 return await self._drive(deps, lease.doc.epoch)
             finally:
-                with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(board.close)
+                await _close_board(board, config, failed=sys.exc_info()[0] is not None)
 
     async def aclose(self) -> None:
         """

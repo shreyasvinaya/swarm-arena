@@ -631,7 +631,7 @@ async def test_board_open_failure_closes_board(
 
     monkeypatch.setattr(ArenaBoard, "open", fail_open)
     monkeypatch.setattr(ArenaBoard, "close", close)
-    with pytest.raises(RuntimeError, match="board open failed"):
+    with pytest.raises(RuntimeError, match="board open failed: RuntimeError"):
         await Swarm(run_config).run(plan(rounds=1))
     assert closed == [True]
 

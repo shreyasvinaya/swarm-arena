@@ -243,10 +243,10 @@ class _ResumeServices:
                     await journal.commit()
                     _, state = await anyio.to_thread.run_sync(_read, self.store, lease.doc)
                     board = await run_module._start_board(config)
-                    await anyio.to_thread.run_sync(
-                        board.open,
+                    await run_module._open_board(
+                        board,
+                        config,
                         self.run_id,
-                        config.run_root,
                         sorted(
                             {
                                 goal.namespace
@@ -275,9 +275,12 @@ class _ResumeServices:
                     self.ready.set()
                     await self.close.wait()
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        if board is not None:
-                            await anyio.to_thread.run_sync(board.close)
+                    if board is not None:
+                        await run_module._close_board(
+                            board,
+                            config,
+                            failed=sys.exc_info()[0] is not None or self.run_failed,
+                        )
         except BaseException as error:
             self.failure = error
         finally:
