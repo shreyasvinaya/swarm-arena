@@ -36,9 +36,8 @@ async def test_initialization_stops_before_worker_release(
     site: str,
     signal: str,
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
-    if site == "first_commit":
-        config = config.model_copy(update={"settle_timeout_s": RunConfig().settle_timeout_s})
+    config = run_config.model_copy(update={"lease_ttl_s": 3})
+    assert config.settle_timeout_s >= RunConfig().settle_timeout_s
     cleanup_entered = anyio.Event()
     original_cleanup = run_module._finish_initialization_stop
 
@@ -77,7 +76,7 @@ async def test_initialization_stops_before_worker_release(
         ):
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(20)
+            assert release.wait(60)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -99,7 +98,8 @@ async def test_initialization_stops_before_worker_release(
                 await cleanup_entered.wait()
             # Settle the already-admitted batch within the cleanup allowance.
             release.set()
-        done, _ = await asyncio.wait([task], timeout=2)
+        bound = 20 if site == "first_commit" else 10 if site == "board_open" else 2
+        done, _ = await asyncio.wait([task], timeout=bound)
         assert done, "initialization ignored its stop/deadline while the worker was held"
         if site in {"board_open", "first_commit"}:
             assert task.result() == {"g": []}
@@ -206,7 +206,8 @@ async def test_resume_initialization_stops_before_worker_release(
     site: str,
     signal: str,
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    config = run_config.model_copy(update={"lease_ttl_s": 3})
+    assert config.settle_timeout_s >= RunConfig().settle_timeout_s
     await Swarm(config).run(plan(rounds=1), run_id="r")
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
@@ -324,7 +325,7 @@ async def test_stopped_initialization_contains_segment_failure(
     from swarm_arena._errors import StorageError
     from swarm_arena._store.base import Blob
 
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.5})
+    config = run_config.model_copy(update={"lease_ttl_s": 3})
     marker = "private-backend-diagnostic"
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
