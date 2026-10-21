@@ -1,13 +1,10 @@
 """Take ownership of a committed run and retain its reconstructed services."""
 
 import asyncio
-import os
 import socket
 import sys
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
-from tempfile import gettempdir
 from uuid import uuid4
 
 import anyio
@@ -133,12 +130,7 @@ class _ResumeServices:
         head = lease.doc.head
         assert head is not None
         try:
-            path = (
-                Path(gettempdir())
-                / f"swarm-arena-{os.getuid()}"
-                / "journals"
-                / f"{self.run_id}-e{lease.doc.epoch}.jsonl"
-            )
+            path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
             async with run_module._RunJournal(
                 self.store,
                 lease,

@@ -172,6 +172,22 @@ def _core_error(cls: type[_SignalT], *args: Any) -> _SignalT:
     return _core_signal(cls(*args))
 
 
+def _core_signal_kinds() -> tuple[type[Exception], ...]:
+    """Return exact core types with a lazy import to avoid model cycles."""
+    from swarm_arena._agent.manager import LimitReached
+
+    return (
+        SoftError,
+        LimitReached,
+        PlanError,
+        ConfigError,
+        LeaseHeld,
+        Fenced,
+        _CoreRuntimeError,
+        _CoreValueError,
+    )
+
+
 def _core_signal(error: _SignalT) -> _SignalT:
     """Register a freshly core-created signal and snapshot its vetted payload.
 
@@ -182,17 +198,7 @@ def _core_signal(error: _SignalT) -> _SignalT:
     """
     from swarm_arena._agent.manager import LimitReached
 
-    kinds = (
-        SoftError,
-        LimitReached,
-        PlanError,
-        ConfigError,
-        LeaseHeld,
-        Fenced,
-        _CoreRuntimeError,
-        _CoreValueError,
-    )
-    if not any(type(error) is kind for kind in kinds):
+    if not any(type(error) is kind for kind in _core_signal_kinds()):
         raise TypeError("expected a core error")
     if error not in _CORE_SIGNALS:
         _CORE_SIGNALS[error] = (
@@ -214,17 +220,7 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
     """
     from swarm_arena._agent.manager import LimitReached
 
-    kinds = (
-        SoftError,
-        LimitReached,
-        PlanError,
-        ConfigError,
-        LeaseHeld,
-        Fenced,
-        _CoreRuntimeError,
-        _CoreValueError,
-    )
-    if not any(type(error) is kind for kind in kinds):
+    if not any(type(error) is kind for kind in _core_signal_kinds()):
         return None
     payload = _CORE_SIGNALS.get(cast(Exception, error))
     if payload is None:

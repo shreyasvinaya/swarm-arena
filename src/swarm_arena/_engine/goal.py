@@ -38,7 +38,7 @@ from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate
 from swarm_arena._model.tooling import RunStatus
 from swarm_arena._planning.planner import Planner
-from swarm_arena._planning.policy import Policy, guard
+from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import stamp
 from swarm_arena._planning.validate import admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
@@ -51,7 +51,6 @@ from swarm_arena._scoring.runner import (
     prepare_judge_batch,
 )
 
-_INACTIVE = {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
 _T = TypeVar("_T")
 
 

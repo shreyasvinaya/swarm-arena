@@ -208,6 +208,13 @@ def _promote(stage: Path, artifacts: ArtifactStore) -> None:
         artifacts.put_bytes(staged.get_bytes(path.name))
 
 
+def _local_journal_path(run_id: str, epoch: int) -> Path:
+    """Locate the local write-ahead journal for one run ownership epoch."""
+    return (
+        Path(gettempdir()) / f"swarm-arena-{os.getuid()}" / "journals" / f"{run_id}-e{epoch}.jsonl"
+    )
+
+
 class RunRunner:
     """
     Coordinate approval, startup, queued goals and run-wide cancellation.
@@ -406,12 +413,7 @@ class RunRunner:
                 ttl_s=config.lease_ttl_s,
             )
         )
-        local_path = (
-            Path(gettempdir())
-            / f"swarm-arena-{os.getuid()}"
-            / "journals"
-            / f"{run_id}-e{lease.doc.epoch}.jsonl"
-        )
+        local_path = _local_journal_path(run_id, lease.doc.epoch)
         clock = RunClock(0)
         async with _RunJournal(
             store,

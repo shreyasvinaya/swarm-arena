@@ -42,6 +42,7 @@ from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.catalog_check import find_entry
+from swarm_arena._planning.policy import _INACTIVE
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.check import Check
 from swarm_arena._store.artifacts import ArtifactStore
@@ -742,12 +743,7 @@ class RoundRunner:
         >>> outcome = await runner.run(1)  # doctest: +SKIP
         """
         await self._restore(round)
-        agents = [
-            slot
-            for slot in self.agents
-            if slot.status
-            not in {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
-        ]
+        agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
         board = self.deps.board
         if isinstance(board, RunBoard):
             board.register_goal(self.plan.goal.key(), self.goal_id, None)
