@@ -1,3 +1,4 @@
+import asyncio
 import sys
 
 import pytest
@@ -325,3 +326,33 @@ async def test_harness_carries_notes_and_snapshots_learnings(
     )
     assert observed == [(1, "", []), (2, "Use the baseline", [harness.learnings[0].id])]
     assert _events(harness, "learning")[0].seq < _events(harness, "frontier")[1].seq
+
+
+@pytest.mark.parametrize("kind", ["group", "cancel"])
+async def test_nonstandard_manager_reason_uses_originating_type(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    secret = "harness-manager-secret"
+    failure = (
+        ExceptionGroup(secret, [ValueError(secret)])
+        if kind == "group"
+        else asyncio.CancelledError(secret)
+    )
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    harness = OfflineHarness()
+    await harness.run_rounds(
+        NoopManager(),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=1,
+        limits=Limits(),
+        config=RunConfig(),
+        judges=[],
+    )
+    [event] = _events(harness, "agent_status")
+    assert event.payload["reason"] == f"manager error: {type(failure).__name__}"
+    assert_secret_absent(RuntimeError(event.model_dump_json()), secret)

@@ -22,7 +22,7 @@ from swarm_arena._board.run_board import RunBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
-from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._errors import Fenced, _core_error, _exception_type_name
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
@@ -366,7 +366,7 @@ class OfflineHarness:
                 with anyio.CancelScope(shield=True):
                     await rt.tranche.close()
             if manager_error is not None:
-                reason = f"manager error: {type(manager_error).__name__}"
+                reason = f"manager error: {_exception_type_name(manager_error)}"
                 rt.journal.append(
                     EventDraft(
                         type=EventType.AGENT_STATUS,
