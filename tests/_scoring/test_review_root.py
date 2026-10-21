@@ -26,5 +26,6 @@ async def test_import_contains_root_constructor_off_loop(
     monkeypatch.setattr(ArenaBoard, "__init__", fail)
     with pytest.raises(RuntimeError, match="board construction failed: OSError") as caught:
         await HumanReview("alice").import_csv("r", tmp_path / "unused.csv", config=config)
-    assert threads and threading.get_ident() not in threads
+    assert threads
+    assert threading.get_ident() not in threads
     assert_secret_absent(caught.value, secret)

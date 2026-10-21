@@ -128,7 +128,9 @@ async def _supervise_initialization(
     if error is not None:
         if preparation.cancel_called and isinstance(error, anyio.get_cancelled_exc_class()):
             return
-        raise outcome.classify(error) from None
+        # Extension boundaries already classify failures; preserve driver errors
+        # and cancellation even after nested task groups clear their cancel count.
+        raise error
 
 
 class _RunJournal(JournalWriter):

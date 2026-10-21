@@ -205,6 +205,10 @@ def test_failed_replace_preserves_local_state(
 
     def fail(key: str, data: bytes, *, if_match: str) -> str:
         calls.append((key, data, if_match))
+        if failure is PreconditionFailed:
+            from swarm_arena._errors import _core_error
+
+            raise _core_error(PreconditionFailed, secret)
         raise failure(secret)
 
     monkeypatch.setattr(store, "replace", fail)

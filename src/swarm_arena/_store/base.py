@@ -267,7 +267,7 @@ def open_store(url: str) -> Store:
             from swarm_arena._store.s3 import S3Store
 
             return S3Store(url)
-        label = f"{scheme}://" if scheme in {"s3", "gs", "file"} else "URL"
+        label = f"{scheme}://" if scheme in {"gs", "file"} else "URL"
         raise _core_error(
             ConditionalWritesUnsupported,
             f"{label} has no conditional writes; swarm-arena refuses to run on it",

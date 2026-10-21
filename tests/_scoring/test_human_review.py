@@ -1050,7 +1050,11 @@ async def test_review_storage_errors_rebuild_safe_diagnostics(
     assert caught.value is not error
     assert_secret_absent(caught.value, secret, sanitized=True)
     assert str(caught.value) == (
-        "review storage failed: StorageError" if kind == "raw" else "safe review storage failure"
+        "review storage failed: StorageError"
+        if kind == "raw"
+        else "run ownership lost"
+        if kind == "fenced"
+        else "safe review storage failure"
     )
 
 

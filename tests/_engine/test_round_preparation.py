@@ -5,7 +5,7 @@ import threading
 
 import anyio
 import pytest
-from _engine.test_round import _RoundTime, _round, _scripted
+from _engine.test_round import _round, _RoundTime, _scripted
 from _fakes.engine import EngineEnv
 
 from swarm_arena._engine import round as round_module
@@ -44,7 +44,8 @@ async def test_round_deadline_starts_after_slow_preparation(
         release.set()
         with anyio.fail_after(10):
             result = await task
-        assert starts and starts[0] >= prepared_at
+        assert starts
+        assert starts[0] >= prepared_at
         assert result.reasons == {"t/a": ""}
         assert env.events("round_started")
     finally:

@@ -2128,7 +2128,7 @@ async def test_resume_checks_storage_before_takeover(
     def spy(config: RunConfig) -> None:
         assert threading.get_ident() != loop_thread
         calls.append(config)
-        raise ConditionalWritesUnsupported("create did not behave conditionally")
+        raise _core_error(ConditionalWritesUnsupported, "create did not behave conditionally")
 
     monkeypatch.setattr("swarm_arena._engine.preflight.check_storage", spy)
     before = crashed.store.read("control/owner.json").data
