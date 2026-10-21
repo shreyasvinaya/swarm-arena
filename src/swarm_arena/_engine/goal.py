@@ -30,7 +30,7 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError, _core_error
+from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -504,7 +504,12 @@ class GoalRunner:
     async def _supervised_step(
         self, operation: Callable[[], Awaitable[_T]], *, final: bool
     ) -> tuple[bool, _T | None]:
-        """Supervise user hooks with one stop, fence and deadline boundary."""
+        """Supervise hooks and contain nonstandard operation failures.
+
+        Caller cancellation propagates through the task group. Cancellation
+        raised by the operation itself is an untrusted failure outcome, as is
+        any exception group; neither may bypass callers' Exception handlers.
+        """
         results: list[_T] = []
         errors: list[BaseException] = []
         async with anyio.create_task_group() as group:
@@ -547,7 +552,15 @@ class GoalRunner:
                 group.cancel_scope.cancel()
         # Reraise outside the task group so fencing keeps its original type.
         if errors:
-            raise errors[0]
+            error = errors[0]
+            if isinstance(error, Fenced):
+                raise error
+            rebuilt = _rebuild_core_signal(error)
+            if rebuilt is not None:
+                raise rebuilt from None
+            if isinstance(error, BaseExceptionGroup) or not isinstance(error, Exception):
+                raise _core_error(RuntimeError, "supervised hook failed") from None
+            raise error
         return (True, results[0]) if results else (False, None)
 
     def _judge_context(

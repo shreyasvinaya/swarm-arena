@@ -275,7 +275,7 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_replanner_fencing_and_cancellation_propagate(
+async def test_replanner_fencing_propagates_and_user_cancellation_is_rejected(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, cancelled: bool
 ) -> None:
     from swarm_arena._errors import Fenced
@@ -289,9 +289,15 @@ async def test_replanner_fencing_and_cancellation_propagate(
 
     monkeypatch.setattr(planner, "plan", fail)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
-    with pytest.raises(error):
-        await runner._replan()
-    assert not env.events("plan_rejected")
+    if cancelled:
+        assert not await runner._replan()
+        assert env.events("plan_rejected")[-1].payload["errors"] == [
+            "planner error: _CoreRuntimeError"
+        ]
+    else:
+        with pytest.raises(error):
+            await runner._replan()
+        assert not env.events("plan_rejected")
     assert not env.events("plan_revision")
 
 
