@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Arena cache reindexing rebuilds exact recorded memberships and part identities,
+  preserves human reviews and curation, and refuses to delete caches in use.
+
 - Human review exports CSV, candidate JSON and escaped HTML, imports validated
   scores under an ended run's lease, and repairs committed review objects on resume.
 
