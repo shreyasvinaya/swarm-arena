@@ -552,6 +552,9 @@ Cancelled stop lookups discard late results. Once startup stops,
 no later initialization stage begins. Round preparation does not consume the
 agent round timeout. Storage failures report exception types without exposing
 backend messages or private values.
+If a stop-file lookup fails or returns anything other than a boolean, the run
+fails with a contained storage error; polling cannot silently disappear while
+the run continues.
 
 When a revision introduces a namespace, the running board attaches it before
 agent dispatch. Live and resumed boards retain the union of all admitted revision
