@@ -31,7 +31,7 @@ def block() -> None:
     released = threading.Event()
 
     def release() -> None:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60  # backstop only; the test writes `release`
         while not (root / "release").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         released.set()

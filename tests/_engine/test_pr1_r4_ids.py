@@ -48,7 +48,8 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
         owner = tmp_path / "runs/r/control/owner.json"
         before = json.loads(owner.read_text())["expires_at"]
         heartbeat = (tmp_path / "heartbeat").read_text()
-        with anyio.move_on_after(1):
+        # A 3 s lease renews about every second; allow several renewal periods.
+        with anyio.move_on_after(5):
             while (  # noqa: ASYNC110 - observes another process
                 json.loads(owner.read_text())["expires_at"] == before
                 or (tmp_path / "heartbeat").read_text() == heartbeat
@@ -61,7 +62,8 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
         swarm = Swarm(config(tmp_path))
         swarm.run_id = "r"
         await swarm.stop(now=True)
-        with anyio.move_on_after(3):
+        # Stop files are polled every 2 s; the hook stays blocked until `release`.
+        with anyio.move_on_after(10):
             while not (tmp_path / "done.json").exists():  # noqa: ASYNC110 - observes another process
                 await anyio.sleep(0.01)
         evidence["done_before_release"] = (tmp_path / "done.json").exists()
