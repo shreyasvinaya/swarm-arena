@@ -6,6 +6,7 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 import anyio
 from pydantic import ConfigDict, Field, ValidationError
 
+from swarm_arena._errors import _core_error, _exception_type_name, _with_exception_type
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import FileSet, Goal
@@ -231,7 +232,17 @@ class ScriptJudge(Judge):
                 for index, candidate in enumerate(candidates):
                     group.start_soon(run, index, candidate)
         except BaseExceptionGroup as errors:
-            raise _classify_outcome(errors) from None
+            error = _classify_outcome(errors)
+            if len(errors.exceptions) == 1 and not isinstance(
+                errors.exceptions[0], BaseExceptionGroup
+            ):
+                # Preserve the child type without exposing an ordinary exception's
+                # message. Classify the whole transport first for core fencing.
+                name = _exception_type_name(errors.exceptions[0])
+                error = _with_exception_type(
+                    _core_error(RuntimeError, f"{name}: judge raised"), name
+                )
+            raise error from None
         return [score for score in scores if score is not None]
 
     async def _score(self, candidate: Candidate, ctx: JudgeContext) -> Score | None:

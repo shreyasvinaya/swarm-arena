@@ -298,3 +298,5 @@ that boundary, so newly produced candidates invalidate reuse.
 Synchronous library validation and import helpers propagate `KeyboardInterrupt`
 unchanged. When the engine invokes these helpers in a daemon worker, the awaiting
 engine boundary still contains hook-raised interrupts as type-only failures.
+ScriptJudge reports the originating exception type for a single failed child;
+multiple failures retain the exception-group type. Messages remain value-free.
