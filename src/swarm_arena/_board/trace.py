@@ -78,18 +78,18 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     >>> lines[0].startswith("plan     ")  # doctest: +SKIP
     True
     """
-    state = board._read_state()
-    for namespace in state.namespaces:
-        cache = state.readers.get(namespace)
-        if cache is None:
-            continue
-        scoped = _namespace_frontier(state.frontier, namespace)
-        with cache._lock, cache._frontier(scoped):
-            candidates = cache.candidates(scoped, ids=[candidate_id])
-            if candidates:
-                candidate, position = candidates[0]
-                revisions = state.plans[candidate.run_id].revisions[candidate.goal_id]
-                return _lines(cache, scoped, candidate, position[2], revisions)
+    with board._pin_state() as state:
+        for namespace in state.namespaces:
+            cache = state.readers.get(namespace)
+            if cache is None:
+                continue
+            scoped = _namespace_frontier(state.frontier, namespace)
+            with cache._lock, cache._frontier(scoped):
+                candidates = cache.candidates(scoped, ids=[candidate_id])
+                if candidates:
+                    candidate, position = candidates[0]
+                    revisions = state.plans[candidate.run_id].revisions[candidate.goal_id]
+                    return _lines(cache, scoped, candidate, position[2], revisions)
     raise KeyError(candidate_id)
 
 

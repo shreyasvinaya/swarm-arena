@@ -1,6 +1,7 @@
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event as ThreadEvent
 from typing import Any
@@ -600,7 +601,7 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
     board = _work_board(tmp_path)
     entered, release = ThreadEvent(), ThreadEvent()
     prepare = board._prepare_published
-    capture = board._read_state
+    capture = board._pin_state
     captures = 0
 
     def blocked(frontier: Frontier) -> Any:
@@ -619,7 +620,7 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
     try:
         expected = trace(board, "target")
         monkeypatch.setattr(board, "_prepare_published", blocked)
-        monkeypatch.setattr(board, "_read_state", counted_capture)
+        monkeypatch.setattr(board, "_pin_state", counted_capture)
         with ThreadPoolExecutor(max_workers=2) as pool:
             refreshed = pool.submit(board.frontier)
             try:
@@ -635,6 +636,33 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
             refreshed.result(timeout=5)
     finally:
         board.close()
+
+
+def test_trace_pins_its_generation_against_concurrent_close(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    board.frontier()
+    expected = trace(board, "c-1")
+    entered, release = ThreadEvent(), ThreadEvent()
+    candidates = ArenaCache.candidates
+
+    def paused(self: ArenaCache, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(5)
+        return candidates(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patched, ThreadPoolExecutor(max_workers=2) as pool:
+        patched.setattr(ArenaCache, "candidates", paused)
+        result = pool.submit(trace, board, "c-1")
+        assert entered.wait(5)
+        closed = pool.submit(board.close)
+        assert not closed.done()
+        release.set()
+        assert result.result(timeout=5) == expected
+        closed.result(timeout=5)
+    with pytest.raises(RuntimeError, match="arena board is closed"):
+        trace(board, "c-1")
 
 
 def test_trace_keeps_captured_generation_across_publication(
@@ -653,16 +681,18 @@ def test_trace_keeps_captured_generation_across_publication(
             run.learning("L-later", "Later citation", evidence=["c-1"]),
         )
         board.frontier()
-        published = board._read_state()
+        pin = board._pin_state
         captures = 0
 
-        def captured() -> Any:
+        @contextmanager
+        def captured() -> Generator[Any]:
             nonlocal captures
             captures += 1
-            return previous if captures == 1 else published
+            with pin() as published:
+                yield previous if captures == 1 else published
 
         with monkeypatch.context() as fixed:
-            fixed.setattr(board, "_read_state", captured)
+            fixed.setattr(board, "_pin_state", captured)
             assert trace(board, "c-1") == expected
             assert captures == 1
             current = trace(board, "c-1")
