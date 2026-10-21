@@ -141,16 +141,40 @@ Example: [Bring your own files and script](examples/own_script/README.md) demons
 ## The arena
 
 Read committed results across runs, search evidence-backed learnings, and review
-candidates from a laptop without a driver connection:
+candidates from a laptop without a driver connection. From the source checkout
+root, after the Quickstart environment setup, run this complete example:
 
-```console
-swarm-arena leaderboard toy --config run.toml
-swarm-arena board search "convergence" --namespace toy --verified
-swarm-arena learnings pin L-example --namespace toy --author alice
-swarm-arena review export 2026-10-21T00-00-00Z_123abc --out review
-# Fill in verdict and optional numeric score in review/review.csv.
-swarm-arena review import 2026-10-21T00-00-00Z_123abc review/review.csv --reviewer alice
-swarm-arena leaderboard 2026-10-21T00-00-00Z_123abc --by human:alice
+```sh
+ARENA_CONFIG=examples/rosenbrock/run.toml
+ARENA_RUN_OUTPUT=$(uv run swarm-arena run --yes "$ARENA_CONFIG" examples/rosenbrock/plan.toml)
+printf '%s\n' "$ARENA_RUN_OUTPUT"
+# The CLI's "run ID at DIRECTORY" line supplies the generated run ID.
+ARENA_RUN_ID=$(printf '%s\n' "$ARENA_RUN_OUTPUT" | awk '$1 == "run" {print $2}')
+uv run swarm-arena leaderboard "$ARENA_RUN_ID" --config "$ARENA_CONFIG"
+ARENA_LEARNING_ID=$(uv run swarm-arena learnings add --namespace toy --title "Rosenbrock baseline" --text "Compare gradient descent and random search." --author alice --config "$ARENA_CONFIG")
+uv run swarm-arena learnings pin "$ARENA_LEARNING_ID" --namespace toy --author alice --config "$ARENA_CONFIG"
+uv run swarm-arena board search "Rosenbrock baseline" --namespace toy --human --pinned --config "$ARENA_CONFIG"
+uv run swarm-arena review export "$ARENA_RUN_ID" --out ".swarm-arena/review-$ARENA_RUN_ID" --config "$ARENA_CONFIG"
+# For this demonstration, accept every exported candidate with score 1.
+# For a real review, edit those verdict/score cells in a spreadsheet instead.
+uv run python - "$ARENA_RUN_ID" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+path = Path(".swarm-arena") / f"review-{sys.argv[1]}" / "review.csv"
+with path.open(newline="") as stream:
+    reader = csv.DictReader(stream)
+    columns, rows = reader.fieldnames, list(reader)
+for row in rows:
+    row["verdict"], row["score"] = "accept", "1"
+with path.open("w", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(rows)
+PY
+uv run swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN_ID/review.csv" --reviewer alice --config "$ARENA_CONFIG"
+uv run swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
 ```
 
 All arena commands accept `--config PATH` (default `run.toml`). Run selectors
