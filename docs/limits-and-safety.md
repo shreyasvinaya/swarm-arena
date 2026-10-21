@@ -270,7 +270,8 @@ cleanup. Collection runs once and has a 30 s bound. See the
 [executor details](api/executor.md#localexecutor) before cleaning retained workspaces.
 
 Direct `LocalExecutor` preparation preserves the exception object raised by a
-constructor or command hook. Collection converts ordinary exceptions and
+constructor or command hook, except the documented `SystemExit` command failure
+that produces an error output. Collection converts ordinary exceptions and
 `SystemExit` to an error output with a type-only note, while cancellation,
 interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
 The engine classifies those transported outcomes at its supervised boundary,
@@ -280,3 +281,12 @@ A hook-created `Fenced` exception does not establish ownership loss, whether
 raised directly or nested in an exception group. Only the journal's fenced
 state or a core-registered fencing signal can terminate the run as fenced.
 Caller cancellation takes precedence over even a registered fencing outcome.
+
+Final judging records its complete order with the last score or judge error,
+using the goal lifecycle, plan revision, judge reference, and exact candidate
+membership as its batch identity. If a process exits after that batch and its
+settlement commit but before final selection is published, resume reuses the
+recorded order without another judge call or reservation. Error-only batches
+also retain their no-result reason. A different lifecycle, revision, judge, or
+candidate set requires a new final batch; ordinary barrier scores cannot stand
+in for final completion.

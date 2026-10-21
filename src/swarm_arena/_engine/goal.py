@@ -602,14 +602,18 @@ class GoalRunner:
         round: int,
         *,
         barrier_batch: dict[str, Any] | None = None,
+        final_batch: dict[str, Any] | None = None,
     ) -> None:
         remaining = len(outcome.scores) + len(outcome.errors)
 
         def append(kind: EventType, **payload: Any) -> Event:
             nonlocal remaining
             remaining -= 1
-            if remaining == 0 and barrier_batch is not None:
-                payload["barrier_batch"] = barrier_batch
+            if remaining == 0:
+                if barrier_batch is not None:
+                    payload["barrier_batch"] = barrier_batch
+                if final_batch is not None:
+                    payload["final_batch"] = final_batch
             return self.deps.journal.append(self._draft(kind, round=round, **payload))
 
         for score in outcome.scores:
@@ -761,11 +765,39 @@ class GoalRunner:
         return True
 
     async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
-        """Rescore within stop grace, falling back only to committed rankings."""
+        """Reuse this lifecycle's completed final batch, or rescore within stop grace."""
         if not finalists:
             return []
         name = self._ranking_name(None)
         ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
+        lifecycle = next(
+            (
+                [event.epoch, event.seq]
+                for event in reversed(self._events)
+                if event.goal_id == self.goal_id and event.type == EventType.GOAL_STARTED
+            ),
+            None,
+        )
+        batch_identity: dict[str, Any] = {
+            "goal_id": self.goal_id,
+            "lifecycle": lifecycle,
+            "revision": self.plan.revision,
+            "ref": ref.model_dump(mode="json"),
+            "members": sorted(c.id for c in finalists),
+        }
+        key = sha256_hex(canonical_json(batch_identity))
+        for event in reversed(self._events):
+            if (
+                event.goal_id == self.goal_id
+                and event.round == 0
+                and event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
+                and isinstance(record := event.payload.get("final_batch"), dict)
+                and record.get("key") == key
+            ):
+                by_id = {candidate.id: candidate for candidate in finalists}
+                self.status, self.reason = record["status"], record["reason"]
+                self._stop()
+                return [by_id[id] for id in record["order"]]
         tranche = self._tranche("final")
         scope = self._scope("judge", 0, tranche, final=True)
         reservation: Reservation | None = None
@@ -847,9 +879,22 @@ class GoalRunner:
                         for c in finalists
                     ],
                 )
-            self._publish_scores(outcome, scope, 0)
             if not order and outcome.errors:
                 self.status, self.reason = "no_result", "provider_failed"
+            # The last outcome proves completion of this exact batch. Queue it
+            # before settlement so a committed score/settle head includes order.
+            self._publish_scores(
+                outcome,
+                scope,
+                0,
+                final_batch={
+                    "key": key,
+                    **batch_identity,
+                    "order": [candidate.id for candidate in order],
+                    "status": self.status,
+                    "reason": self.reason,
+                },
+            )
             return order
         finally:
             if reservation is not None:
