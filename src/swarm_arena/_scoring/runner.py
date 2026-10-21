@@ -196,18 +196,26 @@ def _prepare_judge_result(
         or any(not isinstance(score, Score) for score in scores)
     ):
         raise TypeError("invalid judge result")
+    canonical = {str.__str__(id): str.__str__(id) for id in members}
     seen: set[str] = set()
     nonfinite: set[str] = set()
     accepted: list[Score] = []
+    accepted_ids: list[str] = []
     for score in scores:
-        if score.candidate_id not in members or score.candidate_id in seen:
+        candidate_id = canonical.get(score.candidate_id)
+        if candidate_id is None or candidate_id in seen:
             continue
-        seen.add(score.candidate_id)
+        seen.add(candidate_id)
         if not is_finite_score(score):
-            nonfinite.add(score.candidate_id)
-        elif score.candidate_id not in failed:
+            nonfinite.add(candidate_id)
+        elif candidate_id not in failed:
             accepted.append(score)
+            accepted_ids.append(candidate_id)
     prepared = _prepare_score_stamps(accepted, judge, name, batch_id) if accepted else []
+    prepared = [
+        score.model_copy(update={"candidate_id": candidate_id})
+        for score, candidate_id in zip(prepared, accepted_ids, strict=True)
+    ]
     return prepared, seen, nonfinite
 
 
