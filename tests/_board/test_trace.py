@@ -405,6 +405,62 @@ def test_trace_warm_reads_do_not_refold_history(
         board.close()
 
 
+@pytest.mark.parametrize("unrelated", [0, 1000])
+def test_trace_hydrates_only_citing_learnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unrelated: int
+) -> None:
+    board = _work_board(tmp_path, unrelated=unrelated)
+    try:
+        expected = trace(board, "target")
+        assert [line for line in expected if line.startswith("learning ")] == [
+            "learning citing Target citation"
+        ]
+        counts = _count_work(monkeypatch)
+        for _ in range(3):
+            assert trace(board, "target") == expected
+        assert counts["hydrated"] == 3, dict(counts)
+    finally:
+        board.close()
+
+
+def test_trace_fills_frontier_once_per_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _work_board(tmp_path)
+    try:
+        expected = trace(board, "target")
+        counts = _count_work(monkeypatch)
+        for _ in range(3):
+            assert trace(board, "target") == expected
+        assert counts["mark_fills"] == 3, dict(counts)
+    finally:
+        board.close()
+
+
+def test_trace_releases_frontier_after_hydration_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _work_board(tmp_path)
+    try:
+        expected = trace(board, "target")
+        cache = board._read_state().readers["toy"]
+
+        def fail(frontier: Frontier, ids: Sequence[str]) -> list[Learning]:
+            raise RuntimeError("hydration unavailable")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(cache, "learnings_by_id", fail)
+            with pytest.raises(RuntimeError, match="hydration unavailable"):
+                trace(board, "target")
+        assert cache._frontier_depth == 0
+        assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+        counts = _count_work(monkeypatch)
+        assert trace(board, "target") == expected
+        assert counts["mark_fills"] == 1
+    finally:
+        board.close()
+
+
 def test_trace_does_not_hold_board_lock_during_cache_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -471,6 +527,46 @@ def test_historical_plan_query_matches_core_prefixes(tmp_path: Path) -> None:
         )
         with pytest.raises(ChainError, match="no committed plan"):
             cache._plan_projection(frontier, "r1", "g1", through_seq=0, revisions=revisions)
+    finally:
+        board.close()
+
+
+def test_citation_query_uses_fixed_human_membership_and_visibility(tmp_path: Path) -> None:
+    run = _seed(tmp_path)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        old = board.frontier()
+        cache = board._cache("toy")
+        human = Learning.model_validate(
+            run.learning(
+                "L-human", "Human citation", evidence=["c-1"], author="human:alice"
+            ).payload["learning"]
+        )
+        write_human_objects(
+            open_store(str(tmp_path / "arena")),
+            "toy",
+            "curation",
+            [HumanObject(kind="add", author="human:alice", learning=human)],
+            now=START,
+        )
+        added = board.frontier()
+        assert cache._citing_learning_ids(old, "c-1") == ["L-1"]
+        assert cache._citing_learning_ids(added, "c-1") == ["L-1", "L-human"]
+        write_human_objects(
+            open_store(str(tmp_path / "arena")),
+            "toy",
+            "curation",
+            [HumanObject(kind="hide", author="human:alice", learning_id="L-1")],
+            now=START.replace(year=2027),
+        )
+        hidden = board.frontier()
+        assert cache._citing_learning_ids(hidden, "c-1") == ["L-human"]
+        assert cache._citing_learning_ids(added, "c-1") == ["L-1", "L-human"]
+        assert cache._citing_learning_ids(hidden, "unknown") == []
+        missing_objects = Frontier(marks=hidden.marks, curation=["toy/curation/missing.jsonl"])
+        with pytest.raises(ChainError):
+            cache._citing_learning_ids(missing_objects, "c-1")
     finally:
         board.close()
 

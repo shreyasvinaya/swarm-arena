@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 
 from swarm_arena._board.arena import ArenaBoard, _namespace_frontier
-from swarm_arena._board.cache import ArenaCache, LearningFilter
+from swarm_arena._board.cache import ArenaCache
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.plan import Plan
@@ -69,6 +69,8 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     Retained plan models come from one captured generation; exact committed
     mark and candidate source prefix restrict their round-applicable selection.
     Reads do not replay history, refresh storage or initialize cache readers.
+    One outer frontier scope covers the composite read; only visible citing
+    learnings are selected and hydrated, with no citation limit.
 
     Examples
     --------
@@ -129,10 +131,9 @@ def _lines(
             f"score    {score.judge} {format_value(score.value)} key={score.key} "
             f"rubric={score.rubric_hash[:8]} panel={score.panel_hash[:8] or '-'}"
         )
-    ids = cache.find(frontier, query=None, filters=LearningFilter(), relevance_goal=None, limit=-1)
+    ids = cache._citing_learning_ids(frontier, candidate.id)
     lines.extend(
         f"learning {learning.id} {learning.title}"
         for learning in cache.learnings_by_id(frontier, ids)
-        if candidate.id in learning.evidence
     )
     return lines
