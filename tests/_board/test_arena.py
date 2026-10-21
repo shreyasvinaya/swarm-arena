@@ -860,3 +860,97 @@ def test_repeated_reads_reuse_committed_replay(
         assert folds == after_historical
     finally:
         board.close()
+
+
+@pytest.mark.parametrize("reader_kind", ["view", "board"])
+@pytest.mark.parametrize("shape", ["chain", "wide"])
+def test_lineage_fills_frontier_once_and_batches_ids(
+    tmp_path: Path,
+    board: ArenaBoard,
+    monkeypatch: pytest.MonkeyPatch,
+    reader_kind: str,
+    shape: str,
+) -> None:
+    from collections import Counter
+    from collections.abc import Iterable, Sequence
+
+    size = 1000
+    run = FakeRun(str(tmp_path / "runs"), "r0000")
+    run.commit(
+        run.plan(),
+        *(
+            run.candidate(f"c-{i}", parents=[f"c-{i - 1}"] if i and shape == "chain" else [])
+            for i in range(size - 1)
+        ),
+        run.candidate(
+            f"c-{size - 1}",
+            parents=(
+                [f"c-{size - 2}"] if shape == "chain" else [f"c-{i}" for i in range(size - 1)]
+            ),
+        ),
+    )
+    _publish(tmp_path, run)
+    for i in range(1, size):
+        other = FakeRun(run.run_root, f"r{i:04}")
+        other.commit(other.plan())
+        _publish(tmp_path, other)
+    view = board.snapshot(run.goal.key(), board.frontier())
+    cache = board._cache("toy")
+    counts: Counter[str] = Counter()
+    original = cache._replace_sets
+
+    def counted(sets: Sequence[tuple[str, Iterable[tuple[str, int | None]]]]) -> None:
+        materialized = [(name, list(rows)) for name, rows in sets]
+        for name, rows in materialized:
+            counts[name + "_rows"] += len(rows)
+            counts[name + "_fills"] += 1
+        original(materialized)
+
+    monkeypatch.setattr(cache, "_replace_sets", counted)
+    cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+    reader = view if reader_kind == "view" else board
+    graph = reader.lineage(f"c-{size - 1}")
+    assert len(graph.nodes) == size
+    assert len(graph.edges) == size - 1
+    assert counts["marks_fills"] == 1
+    assert counts["marks_rows"] == size
+    assert counts["id_rows"] == size
+    assert counts["id_fills"] == (size if shape == "chain" else 2)
+    assert cache._frontier_depth == 0
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("reader_kind", ["view", "board"])
+def test_lineage_read_scope_cleans_up_after_failure(
+    tmp_path: Path,
+    board: ArenaBoard,
+    monkeypatch: pytest.MonkeyPatch,
+    reader_kind: str,
+) -> None:
+    from typing import Any
+
+    from swarm_arena._board.cache import Position
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    run.commit(run.plan(), run.candidate("a"), run.candidate("b", parents=["a"]))
+    _publish(tmp_path, run)
+    view = board.snapshot(run.goal.key(), board.frontier())
+    cache = board._cache("toy")
+    original = cache.candidates
+    calls = 0
+
+    def failing(*args: Any, **kwargs: Any) -> list[tuple[Candidate, Position]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected traversal failure")
+        return original(*args, **kwargs)
+
+    reader = view if reader_kind == "view" else board
+    with monkeypatch.context() as patch:
+        patch.setattr(cache, "candidates", failing)
+        with pytest.raises(RuntimeError, match="injected traversal failure"):
+            reader.lineage("b")
+    assert cache._frontier_depth == 0
+    assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
+    assert reader.lineage("b").edges == [("b", "a")]

@@ -2,9 +2,8 @@
 
 import logging
 import os
-from collections import deque
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,25 +85,39 @@ def _find_learnings(
     return [by_id[id] for id in ids]
 
 
-def _lineage(read: Callable[[str], Candidate], candidate_id: str) -> LineageGraph:
-    """Traverse resolvable parents breadth first, terminating even on cycles."""
-    root = read(candidate_id)
+def _lineage(
+    read: Callable[[Sequence[str]], dict[str, Candidate]], candidate_id: str
+) -> LineageGraph:
+    """Batch each breadth-first level and look up every parent ID at most once."""
+    known = read([candidate_id])
+    if candidate_id not in known:
+        raise KeyError(candidate_id)
+    attempted = {candidate_id}
     nodes: dict[str, Candidate] = {}
     edges: list[tuple[str, str]] = []
-    queue = deque([root])
-    while queue:
-        candidate = queue.popleft()
-        if candidate.id in nodes:
-            continue
-        nodes[candidate.id] = candidate
-        for parent_id in candidate.parent_ids:
-            try:
-                parent = read(parent_id)
-            except KeyError:
-                continue
-            edges.append((candidate.id, parent_id))
-            if parent_id not in nodes:
-                queue.append(parent)
+    level = {candidate_id: known[candidate_id]}
+    while level:
+        nodes.update(level)
+        ids = list(
+            dict.fromkeys(
+                parent
+                for candidate in level.values()
+                for parent in candidate.parent_ids
+                if parent not in attempted
+            )
+        )
+        if ids:
+            attempted.update(ids)
+            known.update(read(ids))
+        following: dict[str, Candidate] = {}
+        for candidate in level.values():
+            for parent_id in candidate.parent_ids:
+                if parent_id not in known:
+                    continue
+                edges.append((candidate.id, parent_id))
+                if parent_id not in nodes:
+                    following[parent_id] = known[parent_id]
+        level = following
     return LineageGraph(root=candidate_id, nodes=nodes, edges=edges)
 
 
@@ -876,15 +889,25 @@ class ArenaBoard(Board):
         ...         pass
         ...     board.close()
         """
-        with self._lock:
+        with self._lock, ExitStack() as reads:
             frontier = self._latest_frontier()
+            caches = []
+            for namespace in self._namespaces:
+                cache = self._cache(namespace)
+                selected = _namespace_frontier(frontier, namespace)
+                reads.enter_context(cache._lock)
+                reads.enter_context(cache._frontier(selected))
+                caches.append((cache, selected))
 
-            def read(id: str) -> Candidate:
-                for namespace in self._namespaces:
-                    rows = self._cache(namespace).candidates(frontier, ids=[id])
-                    if rows:
-                        return rows[0][0]
-                raise KeyError(id)
+            def read(ids: Sequence[str]) -> dict[str, Candidate]:
+                found: dict[str, Candidate] = {}
+                missing = list(ids)
+                for cache, selected in caches:
+                    found.update((c.id, c) for c, _ in cache.candidates(selected, ids=missing))
+                    missing = [id for id in missing if id not in found]
+                    if not missing:
+                        break
+                return found
 
             return _lineage(read, candidate_id)
 
@@ -1192,5 +1215,10 @@ class ArenaView(BoardView):
 
     def lineage(self, candidate_id: str) -> LineageGraph:
         """Traverse only resolvable fixed-view nodes, with cycle detection."""
-        with self._board._lock:
-            return _lineage(self.get_candidate, candidate_id)
+        with self._board._lock, self._cache._lock, self._cache._frontier(self._frontier):
+
+            def read(ids: Sequence[str]) -> dict[str, Candidate]:
+                selected = [id for id in ids if id in self._candidate_ids]
+                return {c.id: c for c, _ in self._cache.candidates(self._frontier, ids=selected)}
+
+            return _lineage(read, candidate_id)

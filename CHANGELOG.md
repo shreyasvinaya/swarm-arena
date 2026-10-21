@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Arena lineage batches ancestor IDs inside one frontier read scope per namespace,
+  avoiding frontier-set rebuilds for each visited candidate.
 - Arena views reuse committed replay checkpoints and memoize per-run plan
   resolution, avoiding history replay on unchanged reads and sibling lookups.
 - Arena cache reads release temporary membership and ID selections on outermost

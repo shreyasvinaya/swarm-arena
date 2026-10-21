@@ -90,6 +90,9 @@ Repeated reads at unchanged marks do not replay journal history. Advancement
 reuses committed replay checkpoints and folds only missing events; a cold or
 historical prefix may require one reconstruction. Siblings reuse the fixed
 resolved plan, so later ingestion cannot change their authority.
+Lineage holds one shared frontier read scope per namespace and queries ancestor
+IDs in breadth-first batches. Each requested ancestor is looked up at most once,
+including missing parents and cycles; temporary sets are released on exit.
 
 ## The local cache
 
