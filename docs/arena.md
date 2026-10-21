@@ -537,3 +537,8 @@ the published generation during that wait.
 Foreign, corrupt, unreadable, or newer-version review and curation objects are
 skipped with a warning when capturing a new frontier. Recorded snapshots still
 require every object named by their frontier.
+
+When candidate IDs collide, journal scores for a discarded producer do not
+rank the retained candidate. Scores recorded for external visible candidates
+and named human reviews remain available. Historical frontiers resolve their
+own retained producer.

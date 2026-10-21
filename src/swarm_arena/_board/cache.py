@@ -652,6 +652,23 @@ class ArenaCache:
             f"AND {alias}.source='{source}' "
         )
 
+    @staticmethod
+    def _score_provenance(alias: str) -> str:
+        """Keep own-candidate scores only while their producer holds that ID.
+
+        A score recorded before any local candidate with this ID is an external
+        score and remains valid. Named human reviews bind to the retained ID.
+        Compare producing rows before goal filters, using this read's marks.
+        """
+        return (
+            f"({alias}.source!='run' OR NOT EXISTS (SELECT 1 FROM candidates own "
+            f"WHERE own.id={alias}.candidate_id AND own.run_id={alias}.run_id "
+            f"AND own.seq<={alias}.seq) OR NOT EXISTS (SELECT 1 FROM candidates rival "
+            "JOIN _read_sets rival_mark ON rival_mark.set_name='marks' "
+            "AND rival_mark.id=rival.run_id AND rival.seq<=rival_mark.seq "
+            f"WHERE rival.id={alias}.candidate_id AND rival.producer<'run:'||{alias}.run_id))"
+        )
+
     @classmethod
     def _member_condition(
         cls, table: Literal["candidates", "scores", "learnings"], alias: str = "i"
@@ -662,12 +679,16 @@ class ArenaCache:
             if table == "candidates"
             else ("(m.id IS NOT NULL OR o.id IS NOT NULL)")
         )
+        holder_visible = visible
+        if table == "scores":
+            visible += " AND " + cls._score_provenance(alias)
+            holder_visible += " AND " + cls._score_provenance("holder")
         return (
             visible
             + f" AND NOT EXISTS (SELECT 1 FROM {table} holder "
             + cls._member_join(table, "holder")
             + f" WHERE holder.id={alias}.id AND holder.producer<{alias}.producer AND "
-            + visible
+            + holder_visible
             + ")"
         )
 

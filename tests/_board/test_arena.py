@@ -1157,3 +1157,55 @@ def test_frontier_omits_unreadable_human_objects(
     if kind != "foreign":
         with pytest.raises((OSError, ValueError)):
             board.snapshot(run.goal.key(), frontier.model_copy(update={"curation": [name]}))
+
+
+@pytest.mark.parametrize("same_goal", [False, True])
+def test_colliding_candidate_scores_keep_producer_at_each_frontier(
+    tmp_path: Path, board: ArenaBoard, same_goal: bool
+) -> None:
+    a = FakeRun(str(tmp_path / "runs"), "a-run")
+    z = FakeRun(
+        a.run_root,
+        "z-run",
+        start=START + timedelta(hours=1),
+        goal=a.goal if same_goal else Goal(id="g1", namespace="toy", inputs={"task": 2}),
+    )
+    z.commit(z.plan(), z.candidate("shared"), z.score("score-z", "shared", 100))
+    _publish(tmp_path, z)
+    earlier = board.frontier()
+    assert (
+        board.snapshot(z.goal.key(), earlier).leaderboard(z.goal.key(), judge="j")[0].value == 100
+    )
+    a.commit(a.plan(), a.candidate("shared"), a.score("score-a", "shared", 1))
+    _publish(tmp_path, a)
+    later = board.frontier()
+    # A separate recording run may legitimately score a visible external candidate.
+    peer = FakeRun(a.run_root, "peer", goal=a.goal, start=START + timedelta(hours=2))
+    peer.commit(peer.plan(), peer.score("score-peer", "shared", 2))
+    _publish(tmp_path, peer)
+    newest = board.frontier()
+    for cache_dir in ("cache", "rebuilt"):
+        reader = (
+            board
+            if cache_dir == "cache"
+            else ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / cache_dir))
+        )
+        try:
+            reader.open("", "", ["toy"])
+            reader.frontier()
+            for frontier, value in ((earlier, 100), (later, 1), (newest, 2)):
+                key = z.goal.key() if frontier == earlier else a.goal.key()
+                view = reader.snapshot(key, frontier)
+                rows = view.leaderboard(key, judge="j")
+                assert rows[0].value == value
+                assert {s.id for s in view.scores("shared")} == (
+                    {"score-z"}
+                    if frontier == earlier
+                    else {"score-a"}
+                    if frontier == later
+                    else {"score-a", "score-peer"}
+                )
+            assert {s.id for s in reader.scores("shared")} == {"score-a", "score-peer"}
+        finally:
+            if reader is not board:
+                reader.close()
