@@ -167,8 +167,34 @@ async def _wait_for_signal(event: threading.Event, label: str) -> None:
     )
 
 
+class _RoundClock:
+    """Control only the round runner's time; executor and lease clocks stay real."""
+
+    def __init__(self, timeout_s: float) -> None:
+        self.now = anyio.current_time()
+        self.deadline = self.now + timeout_s
+        self.deadline_observed = False
+        self.changed = anyio.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(anyio, name)
+
+    def current_time(self) -> float:
+        self.deadline_observed |= self.now > self.deadline
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self.changed.set()
+        self.changed = anyio.Event()
+
+    async def sleep_until(self, deadline: float) -> None:
+        while self.now < deadline:
+            await self.changed.wait()
+
+
 async def _worker(mode: str, root: Path) -> None:
-    # Observe the real extension/lease/journal signals before requesting a stop.
+    # Observe real extension/lease/journal signals before stopping or expiring work.
     from swarm_arena._journal.lease import Lease
     from swarm_arena._journal.reader import read_committed
     from swarm_arena._store.local import LocalStore
@@ -255,14 +281,21 @@ async def _worker(mode: str, root: Path) -> None:
             )(workspace_root=str(root / "ws"))
         ),
         # These are watchdogs, not the mechanism that makes a probe succeed.
-        # A stop is requested only after the specific progress signal is observed.
+        # Entry signals control termination; these watchdogs leave time for setup.
         limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
         lease_ttl_s=1.5,
         settle_timeout_s=0.2,
     )
+    deadline_clock: _RoundClock | None = None
+    if mode.endswith("serializer") and variant != "stop":
+        from swarm_arena._engine import round as round_module
+
+        deadline_clock = _RoundClock(config.limits.effective_round_timeout_s())
+        round_module.anyio = deadline_clock  # ty: ignore[invalid-assignment]
     swarm = Swarm(config)
     live_store = LocalStore(root / "runs" / "boundary-run")
     stop_started: float | None = None
+    deadline_started: float | None = None
     run_finished = anyio.Event()
 
     async def wait_for_event(kind: str, *, agent: str | None = None) -> None:
@@ -283,7 +316,15 @@ async def _worker(mode: str, root: Path) -> None:
         stop_started = time.monotonic()
         await swarm.stop(now=True)
 
-    async def stop_on_signal() -> None:
+    def expire_round(label: str, seconds: float) -> None:
+        nonlocal deadline_started
+        assert deadline_clock is not None
+        if deadline_started is None:
+            deadline_started = time.monotonic()
+        deadline_clock.advance(seconds)
+        print(label, flush=True)
+
+    async def end_on_signal() -> None:
         if mode == "hook":
             await _wait_for_signal(_HOOK_ENTERED, "hook entry")
             await _wait_for_signal(_HOOK_RENEWED, "lease renewal after hook entry")
@@ -294,7 +335,15 @@ async def _worker(mode: str, root: Path) -> None:
         elif mode == "partial-serializer":
             # The fallback serializer is entered only after submit is interrupted.
             await _wait_for_signal(_PARTIAL_READY, "partial output delivery")
-            await stop()
+            if deadline_clock is None:
+                await stop()
+            else:
+                # The real round deadline must interrupt submit before the
+                # engine can enter its partial-output fallback serializer.
+                expire_round(
+                    "ROUND_DEADLINE_AFTER_PARTIAL_READY",
+                    config.limits.effective_round_timeout_s() + 1,
+                )
         else:
             await _wait_for_signal(_SERIALIZER_ENTERED, "serializer entry")
         if mode.endswith("serializer"):
@@ -303,7 +352,16 @@ async def _worker(mode: str, root: Path) -> None:
             # does not own the loop; no heartbeat sleep races the run deadline.
             await anyio.lowlevel.checkpoint()
             print("LOOP_RESPONSIVE", flush=True)
-        if stop_started is None:
+        if deadline_clock is not None:
+            # For partial output the deadline already interrupted submit; wake
+            # the real watcher again only after fallback serializer entry.
+            expire_round(
+                "ROUND_DEADLINE_AFTER_SERIALIZER_ENTRY",
+                1
+                if deadline_started is not None
+                else config.limits.effective_round_timeout_s() + 1,
+            )
+        elif stop_started is None:
             await stop()
         with anyio.fail_after(_STOP_TIMEOUT_S):
             await run_finished.wait()
@@ -341,20 +399,30 @@ async def _worker(mode: str, root: Path) -> None:
         return
     if mode in {"hook", "check", "check-serializer", "output-serializer", "partial-serializer"}:
         async with anyio.create_task_group() as tasks:
-            tasks.start_soon(stop_on_signal)
+            tasks.start_soon(end_on_signal)
             result = await swarm.run(plans, run_id="boundary-run")
             run_finished.set()
             # Let the observer finish rather than cancelling an unobserved signal.
     else:
         result = await swarm.run(plans, run_id="boundary-run")
     elapsed_after_stop = None if stop_started is None else time.monotonic() - stop_started
+    elapsed_after_deadline = (
+        None if deadline_started is None else time.monotonic() - deadline_started
+    )
     store = LocalStore(root / "runs" / "boundary-run")
     committed = read_committed(store)
     assert committed is not None
     events = [event.model_dump(mode="json") for event in committed[1]]
     print(
         json.dumps(
-            {"elapsed_after_stop": elapsed_after_stop, "result": list(result), "events": events}
+            {
+                "elapsed_after_stop": elapsed_after_stop,
+                "elapsed_after_deadline": elapsed_after_deadline,
+                "round_deadline_observed": deadline_clock is not None
+                and deadline_clock.deadline_observed,
+                "result": list(result),
+                "events": events,
+            }
         ),
         flush=True,
     )
@@ -412,14 +480,31 @@ def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("mode", ["check-serializer", "output-serializer", "partial-serializer"])
-def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str) -> None:
-    data, stdout = _probe(mode, tmp_path)
+@pytest.mark.parametrize("stop", [False, True], ids=["deadline", "stop-now"])
+def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str, stop: bool) -> None:
+    data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
     assert "SERIALIZER_THREAD swarm-arena-daemon-" in stdout
     assert "SERIALIZER_THREAD MainThread" not in stdout
     assert "LOOP_RESPONSIVE" in stdout
-    assert data["elapsed_after_stop"] < 7
-    assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in data["events"])
     events = data["events"]
+    if stop:
+        assert data["elapsed_after_stop"] < 7
+        assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in events)
+    else:
+        assert not any(e["type"] == "stop_requested" for e in events)
+        assert data["elapsed_after_stop"] is None
+        assert data["round_deadline_observed"]
+        assert stdout.index("SERIALIZER_THREAD") < stdout.index(
+            "ROUND_DEADLINE_AFTER_SERIALIZER_ENTRY"
+        )
+        if mode == "partial-serializer":
+            assert stdout.index("PARTIAL_READY") < stdout.index(
+                "ROUND_DEADLINE_AFTER_PARTIAL_READY"
+            )
+            assert stdout.index("ROUND_DEADLINE_AFTER_PARTIAL_READY") < stdout.index(
+                "SERIALIZER_THREAD"
+            )
+        assert data["elapsed_after_deadline"] < 7
     ends = [event for event in events if event["type"] == "tool_end"]
     assert len(ends) == 1
     candidate = ends[0]["payload"]["candidate"]
