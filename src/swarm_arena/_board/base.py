@@ -1,5 +1,6 @@
 """Define synchronous board indexing and snapshot read contracts."""
 
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
@@ -405,6 +406,32 @@ class BoardView(_Reads):
 
     goal: GoalKey
     frontier: Frontier
+
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int:
+        """
+        Count visible learnings using the optional connector override.
+
+        Parameters
+        ----------
+        namespace : str
+            Namespace of the learnings to count.
+        goal : GoalKey or None, default=None
+            Optional goal scope, validated by the view's learning reader.
+
+        Returns
+        -------
+        int
+            Visible learning count; hidden items are never included.
+
+        Examples
+        --------
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.count_learnings("n")
+        1
+        """
+        return len(self.learnings(namespace, goal=goal, limit=sys.maxsize))
 
     def _visible_candidate_ids(self) -> frozenset[str]:
         """Return fixed, goal-scoped candidate membership without I/O or charges."""

@@ -1232,6 +1232,8 @@ class BoardView(ABC):                           # one goal's round-start snapsho
     goal: GoalKey
     frontier: Frontier
     def _visible_candidate_ids(self) -> frozenset[str]: ...  # private seam: fixed snapshot goal/part membership, no I/O or charges; M2 views implement it too
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int: ...
+        # optional: defaults to len(self.learnings(namespace, goal=goal, limit=sys.maxsize)); hidden items never count
     # abstract read methods with signatures identical to Board's below, limited to the snapshot:
     # best, learnings, search_learnings, get_learning, get_candidate, scores, lineage, leaderboard.
     # A namespace or goal argument that differs from the view's raises ValueError [plan].
@@ -1290,7 +1292,7 @@ class Curator(ABC):
 class ArenaBoard(Board):
     class Config(BaseModel):
         arena_root: str
-        cache_dir: str | None = None            # None → ~/.cache/swarm-arena/<sha256(arena_root)[:12]> [plan]
+        cache_dir: str | None = None            # None → $XDG_CACHE_HOME (default ~/.cache)/swarm-arena/<sha256(resolved arena_root)[:12]> [plan]
     def __init__(self, config: "ArenaBoard.Config | None" = None, /, **fields: Any) -> None: ...
 ```
 

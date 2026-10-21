@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Arena cache reads release temporary membership and ID selections on outermost
   exit, including failures, while preserving nested-read membership.
+- `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling views, current producing-key rankings, hidden-safe learning counts, and lazy XDG-aware local caches; empty human objects retain durable coverage.
 
 - Hide temporary and lock basenames consistently in local and paginated S3 listings.
 

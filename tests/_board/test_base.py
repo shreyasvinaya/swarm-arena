@@ -56,6 +56,15 @@ def test_abstract_methods_are_required() -> None:
     } <= Board.__abstractmethods__
 
 
+def test_count_learnings_default_counts_learnings() -> None:
+    namespace: dict[str, object] = {}
+    exec(doctest.script_from_examples(BoardView.__doc__ or ""), namespace)
+    view = namespace["view"]
+    assert isinstance(view, BoardView)
+    assert view.count_learnings("n") == 1
+    assert view.count_learnings("n", goal=view.goal) == len(view.learnings("n", goal=view.goal))
+
+
 def test_open_and_close_default_to_no_ops() -> None:
     class Minimal(Board):
         def put_candidate(self, candidate: Candidate, *, epoch: int, seq: int) -> None:

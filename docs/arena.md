@@ -1,7 +1,105 @@
 # The arena
 
-The shared arena service is planned for a later release. For the records
-available now, see the [board API](api/board.md).
+`ArenaBoard` reads committed results from runs that share a namespace. It uses
+local SQLite caches and the existing run journals; it does not require a
+database server. See the [board API](api/board.md) for the record types.
+
+## What the arena stores
+
+Run journals are the record. The shared arena contains pointers and human
+review and curation objects:
+
+```text
+run_root/<run-id>/
+  owner.json
+  journal/e<epoch>-<seq>.jsonl
+arena_root/<namespace>/
+  runs/<run-id>.json
+  reviews/<reviewer>/<timestamp>-<8-hex>.jsonl
+  curation/<timestamp>-<8-hex>.jsonl
+```
+
+Pointers, journal segments, reviews, and curation objects are write-once. The
+run's mutable `owner.json` names its committed journal head. Only the chain
+reachable from that head counts; orphan segments never enter a view. Empty
+review and curation objects are valid and remain part of recorded frontiers.
+
+`put_candidate`, `put_score`, `put_learning`, and `put_decision` retain local
+hints after the core journals an item. They do not write the journal or publish
+items to snapshots. Only board-level candidate, learning, and score lookups
+can fall back to hints. Hidden learnings are excluded from normal reads,
+including those fallbacks.
+
+## Snapshots and frontiers
+
+`frontier()` makes one authority read per run and records its exact committed
+head along with the names of the included human objects. Broken neighboring
+runs produce warnings and are skipped. An owning run's read errors propagate;
+an owning run with no commit yet simply contributes no mark.
+
+The same frontier gives the same view when reopened with the same goal and
+owning-run context, including on a machine with a fresh cache. Later commits,
+reviews, and curation cannot change its membership or search corpus. Deleting
+a pointer removes the run from later snapshots only: an existing frontier
+retains its recorded root and head. Those recorded roots must remain reachable
+when rebuilding a missing cache.
+
+A run resumed from another local path is read through its new path by its own
+driver. Pointers are write-once, so other readers keep its first pointer and
+see the run only while that path is reachable. Keep a shared local run_root at
+one stable path.
+
+```python
+from swarm_arena import Goal
+from swarm_arena.board import ArenaBoard
+
+board = ArenaBoard(arena_root="./arena")
+board.open("", "", ["toy"])  # attach a reader without publishing a pointer
+try:
+    frontier = board.frontier()
+    key = Goal(id="optimization", namespace="toy").key()
+    view = board.snapshot(key, frontier)
+    candidates = view.best(key, 5, judge="quality")
+    hints = view.search_learnings("toy", "convergence")
+    visible_count = view.count_learnings("toy")
+finally:
+    board.close()
+```
+
+Main views select part identities from the owning run's applicable committed
+revision at the frontier. A changed input or file manifest creates a new part
+identity: old evidence stays readable by its explicit historical key, but does
+not enter the current part's rankings or parent membership. Removed parts are
+not current siblings. A reader without an owning run uses the first matching
+run and goal in identifier order. Declared sibling capabilities retain the
+same frontier and revision; ordinary part-view reads retain their own scope.
+Equal part keys can share candidates across runs even when their part names
+differ. Candidate records and leaderboard rows retain their original provenance.
+
+Rankings use the owning run's recorded judge identity. A reader without an own
+run, or a run with no score for that judge yet, uses the newest recorded identity
+in the selected group. A caller's `run_id` filter limits candidates, independently
+of that identity choice. Hidden learnings never appear in lists, searches, or
+counts. Part-scoped learning reads use the resolving main goal; namespace-wide
+reads still prefer that goal after higher-priority relevance criteria.
+
+Board-level reads reuse the latest frontier, capturing one on the first read.
+Call `frontier()` again to refresh. A previously created view stays fixed.
+
+## The local cache
+
+Pass `cache_dir` to choose the directory. Otherwise the board uses
+`$XDG_CACHE_HOME/swarm-arena/<hash>`; when `XDG_CACHE_HOME` is unset, its base is
+`~/.cache`. The hash is the first 12 hexadecimal characters of SHA-256 over the
+arena root, with local roots resolved to absolute paths before hashing. Each
+namespace has its own `<namespace>.sqlite` file, opened only on first use.
+
+The cache is disposable and can be rebuilt from reachable recorded storage.
+It is safe to delete only when no swarm-arena process uses it. The reindex
+command's contract is to refuse while any process holds a cache lifetime lock;
+`swarm-arena reindex` CLI integration is delivered separately. `close()` releases
+all cache connections and their locks. Board state and cache operations are
+synchronized across worker and caller threads.
 
 ## Storage on S3
 
