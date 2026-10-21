@@ -10,8 +10,9 @@ from dataclasses import dataclass, replace
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from types import SimpleNamespace
+from typing import Any, cast
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -256,14 +257,17 @@ def test_refresh_is_throttled_and_synchronized(
     monkeypatch.setattr("swarm_arena._board.serve.time", SimpleNamespace(monotonic=lambda: 100.0))
     original = server.board.frontier
     calls = []
+    updated = Event()
 
     def frontier() -> object:
         calls.append(1)
-        return original()
+        result = original()
+        updated.set()
+        return result
 
     monkeypatch.setattr(server.board, "frontier", frontier)
     # Configure a fresh server with the same board; no read happens until its first request.
-    http = make_server(server.board, ["toy"], author="alice", port=0, refresh_s=5)
+    http = make_server(server.board, ["toy"], author="alice", port=0)
     thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     url = f"http://127.0.0.1:{http.server_port}/"
@@ -281,6 +285,9 @@ def test_refresh_is_throttled_and_synchronized(
         monkeypatch.setattr(
             "swarm_arena._board.serve.time", SimpleNamespace(monotonic=lambda: 106.0)
         )
+        updated.clear()
+        fetch(0)
+        assert updated.wait(3)
         assert "Newly published" in fetch(0)
         assert len(calls) == 2
     finally:
@@ -404,3 +411,62 @@ def test_protocol_errors_are_fixed(server: Server, failure: str) -> None:
             assert response.startswith(b"HTTP/1.0 501 Not Implemented\r\n")
         elif failure == "syntax":
             assert response.startswith(b"HTTP/1.0 400 Bad Request\r\n")
+
+
+def test_refresh_never_blocks_published_gets(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import swarm_arena._board.arena as arena
+
+    clock = [100.0]
+    monkeypatch.setattr(
+        "swarm_arena._board.serve.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    entered, release = Event(), Event()
+    original = arena.read_owner
+
+    def read_owner(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    with _default_server(server) as site:
+        assert "Learning" in get(site, "/")
+        monkeypatch.setattr(arena, "read_owner", read_owner)
+        clock[0] = 106.0
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            refreshing = pool.submit(get, site, "/")
+            assert entered.wait(3)
+            try:
+                assert "Learning" in refreshing.result(timeout=0.5)
+                for path in ("/", "/learning/L-1", "/candidate/c-child"):
+                    assert pool.submit(get, site, path).result(timeout=0.5)
+            finally:
+                release.set()
+                refreshing.result(timeout=5)
+
+
+def test_response_write_does_not_block_other_gets(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _default_server(server) as site:
+        get(site, "/")
+        entered, release = Event(), Event()
+        handler = cast(Any, site.http.RequestHandlerClass)
+        original = handler._reply
+
+        def reply(self: Any, status: int, body: str, *, location: str | None = None) -> None:
+            if self.path == "/learning/L-1":
+                entered.set()
+                assert release.wait(5)
+            original(self, status, body, location=location)
+
+        monkeypatch.setattr(handler, "_reply", reply)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writing = pool.submit(get, site, "/learning/L-1")
+            assert entered.wait(3)
+            try:
+                assert "Learning" in pool.submit(get, site, "/").result(timeout=0.5)
+            finally:
+                release.set()
+                assert writing.result(timeout=5)

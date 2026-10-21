@@ -6,9 +6,10 @@ import re
 import secrets
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import RLock
+from threading import Event, Lock, Thread
 from typing import Literal
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
@@ -284,8 +285,58 @@ def make_server(
     if not math.isfinite(refresh_s) or refresh_s < 0:
         raise _core_error(ValueError, "refresh_s must be finite and non-negative")
     token = secrets.token_urlsafe(16)
-    lock = RLock()
+    lock = Lock()
     refreshed: float | None = None
+    refreshing = False
+    finished = Event()
+    refresh_thread: Thread | None = None
+    closed = False
+
+    def publish() -> None:
+        nonlocal refreshed, refreshing
+        succeeded = False
+        try:
+            board.frontier()
+            succeeded = True
+        finally:
+            with lock:
+                if succeeded or refreshed is not None:
+                    refreshed = time.monotonic()
+                refreshing = False
+                finished.set()
+
+    def background_publish() -> None:
+        # Published readers remain usable; never log storage exception values.
+        with suppress(Exception):
+            publish()
+
+    def ensure_frontier() -> None:
+        nonlocal refreshing, finished, refresh_thread
+        initial_owner = False
+        waiting: Event | None = None
+        with lock:
+            if closed:
+                raise _core_error(RuntimeError, "viewer is closed")
+            if refreshed is None:
+                if refreshing:
+                    waiting = finished
+                else:
+                    refreshing = True
+                    finished = Event()
+                    initial_owner = True
+            elif not refreshing and time.monotonic() - refreshed >= refresh_s:
+                refreshing = True
+                finished = Event()
+                refresh_thread = Thread(target=background_publish, daemon=True)
+                refresh_thread.start()
+        if initial_owner:
+            # Only startup waits: there is no published generation to read yet.
+            publish()
+        elif waiting is not None:
+            waiting.wait()
+            with lock:
+                if refreshed is None:
+                    raise _core_error(RuntimeError, "viewer frontier unavailable")
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -352,7 +403,6 @@ def make_server(
             self._route(post=True)
 
         def _route(self, *, post: bool) -> None:
-            nonlocal refreshed
             try:
                 parsed = urlsplit(self.path)
                 params = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=100)
@@ -373,31 +423,24 @@ def make_server(
                     ):
                         self._reply(403, "Forbidden")
                         return
-                # Serializing viewer refreshes and requests prevents mixed refresh bookkeeping.
-                with lock:
-                    now = time.monotonic()
-                    if refreshed is None or now - refreshed >= refresh_s:
-                        board.frontier()
-                        refreshed = time.monotonic()
-                    if post:
-                        self._mutate(parsed.path, fields)
-                        return
-                    with board._pin_state() as state:
-                        if parsed.path == "/":
-                            body = _index(state, names, params, run_id)
-                            body += self._add_form()
-                        elif parsed.path.startswith("/learning/"):
-                            _, item = _learning(
-                                state, names, unquote(parsed.path[len("/learning/") :])
-                            )
-                            body = _learning_page(state, names, item, token)
-                        elif parsed.path.startswith("/candidate/"):
-                            body = _candidate_page(
-                                state, names, unquote(parsed.path[len("/candidate/") :])
-                            )
-                        else:
-                            raise KeyError("route")
-                        self._reply(200, body)
+                ensure_frontier()
+                if post:
+                    self._mutate(parsed.path, fields)
+                    return
+                with board._pin_state() as state:
+                    if parsed.path == "/":
+                        body = _index(state, names, params, run_id)
+                        body += self._add_form()
+                    elif parsed.path.startswith("/learning/"):
+                        _, item = _learning(state, names, unquote(parsed.path[len("/learning/") :]))
+                        body = _learning_page(state, names, item, token)
+                    elif parsed.path.startswith("/candidate/"):
+                        body = _candidate_page(
+                            state, names, unquote(parsed.path[len("/candidate/") :])
+                        )
+                    else:
+                        raise KeyError("route")
+                self._reply(200, body)
             except KeyError:
                 self._reply(404, "Not found")
             except (ValueError, UnicodeError):
@@ -458,6 +501,16 @@ def make_server(
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         block_on_close = False
+
+        def server_close(self) -> None:
+            """Stop scheduling refreshes and bound shutdown of the tracked daemon."""
+            nonlocal closed
+            with lock:
+                closed = True
+                worker = refresh_thread
+            super().server_close()
+            if worker is not None:
+                worker.join(timeout=1.0)
 
         def handle_error(self, request: object, client_address: object) -> None:
             """Do not print request-bearing exception tracebacks."""
