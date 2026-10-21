@@ -449,3 +449,126 @@ def test_reindex_uses_resolved_arena_root_and_cache(
             == []
         )
     assert not (tmp_path / "unused-arena").exists()
+
+
+@pytest.fixture
+def review_cli_run(tmp_path: Path) -> FinishedRun:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena import Plan, RunConfig
+
+    config = RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    run = FakeRun(config.run_root, "2026-10-21T00-00-00Z_123abc")
+    plan = run.plan()
+    run.commit(plan, run.candidate("c-one"), run.score("s-one", "c-one", 1))
+    run._lease.release()
+    add_pointer(config.arena_root, run)
+    path = tmp_path / "run.toml"
+    path.write_text(config.dumps())
+    return FinishedRun(
+        config=config,
+        config_path=path,
+        plan=Plan.model_validate(plan.payload["plan"]),
+        run_id=run.run_id,
+        namespace=run.goal.namespace,
+    )
+
+
+def test_review_export_never_looks_up_reviewer(
+    review_cli_run: FinishedRun, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "swarm_arena._cli.arena_cmds.getpass.getuser",
+        Mock(side_effect=AssertionError("export needs no identity")),
+    )
+    out = tmp_path / "export"
+    assert _call(review_cli_run, "review", "export", review_cli_run.run_id, "--out", str(out)) == 0
+    assert (out / "review.csv").is_file()
+
+
+@pytest.mark.parametrize("login", ["Alice", "PRIVATE_LOGIN/INVALID"])
+def test_installed_export_accepts_every_login(
+    review_cli_run: FinishedRun, tmp_path: Path, login: str
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [
+            str(Path(sys.executable).parent / "swarm-arena"),
+            "review",
+            "export",
+            review_cli_run.run_id,
+            "--out",
+            str(tmp_path / "export"),
+            "--config",
+            str(review_cli_run.config_path),
+        ],
+        env=dict(os.environ, LOGNAME=login),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "export" / "review.csv").is_file()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_review_import_uses_valid_default_or_explicit_reviewer(
+    review_cli_run: FinishedRun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    explicit: bool,
+) -> None:
+    login = (
+        Mock(side_effect=AssertionError("explicit reviewer needs no login"))
+        if explicit
+        else Mock(return_value="alice")
+    )
+    monkeypatch.setattr("swarm_arena._cli.arena_cmds.getpass.getuser", login)
+    csv_path = tmp_path / "review.csv"
+    with csv_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        writer.writerow({"id": "c-one", "verdict": "accept", "score": "7"})
+    reviewer = ["--reviewer", "bob"] if explicit else []
+    assert (
+        _call(review_cli_run, "review", "import", review_cli_run.run_id, str(csv_path), *reviewer)
+        == 0
+    )
+    name = "bob" if explicit else "alice"
+    assert f"imported 1 scores as human:{name}" in capsys.readouterr().out
+
+
+def test_review_import_invalid_default_requests_reviewer_without_values(
+    review_cli_run: FinishedRun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from swarm_arena._board.ingest import run_store
+    from swarm_arena._journal.lease import OWNER_KEY
+    from swarm_arena._store.base import open_store
+
+    sentinel = "PRIVATE_LOGIN/INVALID"
+    monkeypatch.setattr("swarm_arena._cli.arena_cmds.getpass.getuser", Mock(return_value=sentinel))
+    store = run_store(review_cli_run.config.run_root, review_cli_run.run_id)
+    before = store.read(OWNER_KEY).data
+    assert (
+        _call(
+            review_cli_run, "review", "import", review_cli_run.run_id, str(tmp_path / "missing.csv")
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "--reviewer" in captured.err
+    assert sentinel not in captured.out + captured.err
+    assert store.read(OWNER_KEY).data == before
+    assert open_store(review_cli_run.config.arena_root).list("toy/reviews/") == []

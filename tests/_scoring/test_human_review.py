@@ -1186,3 +1186,17 @@ async def test_complete_proposed_receipt_is_validated_before_admission(
     assert owner is not None
     assert owner[0].expires_at <= human_review.utc_now()
     await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
+
+
+async def test_export_without_reviewer_identity(
+    review_run: FakeRun, run_config: RunConfig, tmp_path: Path
+) -> None:
+    directory = await HumanReview.export(
+        review_run.run_id,
+        config=run_config,
+        out_dir=tmp_path / "identity-free",
+        top=1,
+    )
+    assert directory == tmp_path / "identity-free"
+    with (directory / "review.csv").open(newline="") as stream:
+        assert len(list(csv.DictReader(stream))) == 1

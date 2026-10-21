@@ -436,7 +436,7 @@ commands continue to take a local `RUN_DIR`.
 | Command | Behavior |
 | --- | --- |
 | `review export RUN [--goal ID] [--top 20] [--out DIR]` | Export CSV, candidate JSON and HTML; default directory `./review-RUN/`. Print its path. |
-| `review import RUN CSV --reviewer NAME` | Validate all rows before taking the ended run's lease; print `imported N scores as human:NAME`. Reviewers use lowercase slugs of 1–64 characters. |
+| `review import RUN CSV [--reviewer NAME]` | Validate all rows before taking the ended run's lease; print `imported N scores as human:NAME`. Reviewers use lowercase slugs of 1–64 characters; the login name is the default only when it is a valid slug, otherwise supply `--reviewer`. Export needs no reviewer identity. |
 | `leaderboard RUN_OR_NAMESPACE [--goal ID] [--by JUDGE]` | Rank each current main/part identity with its own recorded ranking judge, or use the named judge for every group. A run limits rows and uses its improvement threshold; a namespace includes all runs under the newest score identity. |
 | `board search QUERY (--namespace NS \| --run ID) [--goal ID] [--tag TAG] [--verified] [--human] [--pinned] [--hidden] [--limit 10]` | Print matching learning IDs, titles, authors and markers. Tags repeat. `--hidden` selects hidden entries; ordinary searches exclude them. An empty query lists by relevance. |
 | `board show ID (--namespace NS \| --run ID)` | Show a candidate's request, status, checks, scores, parents and changed filenames, or a learning's full text and evidence scores/errors. |

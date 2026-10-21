@@ -504,8 +504,8 @@ class HumanReview:
         """
         return f"human:{self._reviewer}"
 
+    @staticmethod
     async def export(
-        self,
         run_id: str,
         *,
         config: RunConfig,
@@ -514,7 +514,7 @@ class HumanReview:
         goal: str | None = None,
     ) -> Path:
         """
-        Write a local review bundle from a single committed run head.
+        Write a local review bundle without requiring a reviewer identity.
 
         Parameters
         ----------
@@ -536,8 +536,7 @@ class HumanReview:
 
         Examples
         --------
-        >>> review = HumanReview("alice")
-        >>> out = await review.export(  # doctest: +SKIP
+        >>> out = await HumanReview.export(  # doctest: +SKIP
         ...     "r", config=config, out_dir=Path("review"))
         """
         _validate_run_id(run_id)

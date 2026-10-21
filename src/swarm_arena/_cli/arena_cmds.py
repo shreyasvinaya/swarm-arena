@@ -14,6 +14,7 @@ import anyio
 from swarm_arena._board.arena import ArenaBoard, ArenaView, _namespace_frontier
 from swarm_arena._board.base import Board
 from swarm_arena._board.cache import LearningFilter
+from swarm_arena._board.human_objects import _validate_reviewer
 from swarm_arena._board.human_ops import _apply_human_operation
 from swarm_arena._board.ingest import run_store
 from swarm_arena._board.leaderboard import format_value, group_rows
@@ -72,7 +73,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     imported = actions.add_parser("import")
     imported.add_argument("run")
     imported.add_argument("csv", type=Path)
-    imported.add_argument("--reviewer", required=True)
+    imported.add_argument("--reviewer", help="reviewer slug (default: valid login name)")
     leaderboard = sub.add_parser("leaderboard", help="rank a run or namespace")
     leaderboard.add_argument("target")
     leaderboard.add_argument("--goal")
@@ -155,15 +156,26 @@ def _plan_namespaces(plans: list[Plan]) -> list[str]:
     )
 
 
+def _import_reviewer(reviewer: str | None) -> str:
+    """Use an explicit identity or require a valid login-derived reviewer slug."""
+    if reviewer is not None:
+        return reviewer
+    try:
+        return _validate_reviewer(getpass.getuser())
+    except (ValueError, OSError, KeyError):
+        raise _core_error(
+            ValueError, "login name is not a valid reviewer slug; pass --reviewer"
+        ) from None
+
+
 async def _execute(args: argparse.Namespace) -> None:
     """Keep every board lifetime bounded and publish before the first read."""
     config = await run_sync_daemon(RunConfig.load, args.config)
     board = await run_sync_daemon(_make_board, config)
     try:
         if args.command == "review":
-            review = HumanReview(args.reviewer if args.action == "import" else getpass.getuser())
             if args.action == "export":
-                out = await review.export(
+                out = await HumanReview.export(
                     args.run,
                     config=config,
                     out_dir=args.out or Path(f"review-{args.run}"),
@@ -172,6 +184,7 @@ async def _execute(args: argparse.Namespace) -> None:
                 )
                 print(out)
             else:
+                review = HumanReview(_import_reviewer(args.reviewer))
                 scores = await review.import_csv(args.run, args.csv, config=config)
                 print(f"imported {len(scores)} scores as {review.judge_name}")
             return
