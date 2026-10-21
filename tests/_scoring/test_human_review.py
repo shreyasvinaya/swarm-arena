@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from _fakes.finished import FinishedRun
 from _fakes.journals import FakeRun
+from _fakes.leases import force_take_over
 from _fakes.secrecy import assert_secret_absent
 
 import swarm_arena._scoring.human_review as human_review
@@ -668,8 +669,8 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
         if interrupt == "cancel":
             scopes[0].cancel()
         else:
-            successor = Lease.take_over(
-                review_run.store, owner_id="successor", host="local", ttl_s=60, force=True
+            successor = force_take_over(
+                review_run.store, owner_id="successor", host="local", ttl_s=60
             )
         done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
         assert done, "caller retained by stalled receipt I/O"

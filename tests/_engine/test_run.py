@@ -8,6 +8,7 @@ import anyio
 import pytest
 from _fakes.engine import take_over_retrying, with_executor, with_limits
 from _fakes.finished import FinishedRun, run_again
+from _fakes.leases import force_take_over
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
@@ -790,9 +791,7 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
         if interrupt == "cancel":
             scopes[0].cancel()
         else:
-            successor = Lease.take_over(
-                store, owner_id="successor", host="local", ttl_s=60, force=True
-            )
+            successor = force_take_over(store, owner_id="successor", host="local", ttl_s=60)
         done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
         assert done, "caller retained by stalled completion export"
         assert anyio.current_time() - started < 3 * config.settle_timeout_s
