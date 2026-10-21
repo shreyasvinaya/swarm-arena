@@ -105,7 +105,7 @@ class OfflineHarness:
         ``manager_errors`` with failed-run log notes and journaled by type only;
         their rounds still receive barrier judging and closure, return empty
         reports, and do not prevent later rounds. Cancellation and fencing
-        propagate. Returned reports pass strict validation and retain their identity.
+        propagate. Returned reports are detached, strictly validated base copies.
         Tranche outcomes may be ignored here: durable ``settle.usage_overflow``
         and ledger exhaustion remain authoritative for subsequent admission.
 
@@ -129,7 +129,7 @@ class OfflineHarness:
         Returns
         -------
         list[RoundReport]
-            Original valid reports in round order.
+            Detached, strictly validated base ``RoundReport`` copies in round order.
 
         Examples
         --------

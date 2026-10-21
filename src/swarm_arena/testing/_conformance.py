@@ -117,7 +117,8 @@ async def check_tool(
     Returns
     -------
     ToolOutput
-        The executor's own output object, also when its status is not ``ok``.
+        A detached, validated base ``ToolOutput``, including core normalization,
+        also when its status is not ``ok``.
 
     Raises
     ------
@@ -423,7 +424,7 @@ async def check_manager(
     Returns
     -------
     list[RoundReport]
-        Detached valid manager reports in round order.
+        Detached, strictly validated base ``RoundReport`` copies in round order.
 
     Raises
     ------
