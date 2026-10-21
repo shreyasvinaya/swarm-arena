@@ -132,7 +132,9 @@ final score. `top_n` and distinct selection apply to this final order.
 Final judging uses the protected final slice. After an immediate stop or run
 deadline it is bounded by `settle_timeout_s`; if interrupted, only available
 committed ranking evidence can supply a fallback order and judge errors are
-recorded. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
+recorded. If final judging fails and supplies no final order, the goal records
+`NO_RESULT` with reason `provider_failed`; judge-error events retain type-only
+diagnostics. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
 
 ## No result and solution records
 

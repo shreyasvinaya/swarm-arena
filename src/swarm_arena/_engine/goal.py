@@ -816,6 +816,8 @@ class GoalRunner:
                     ],
                 )
             self._publish_scores(outcome, scope, 0)
+            if not order and outcome.errors:
+                self.status, self.reason = "no_result", "provider_failed"
             return order
         finally:
             if reservation is not None:
