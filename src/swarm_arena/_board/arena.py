@@ -374,10 +374,8 @@ class ArenaBoard(Board):
                             raise
                         if not warned:
                             _LOG.warning(
-                                "run %s resumed at %s; keeping original pointer %s",
+                                "run %s resumed at a different root; keeping original pointer",
                                 run_id,
-                                resolved,
-                                existing.run_root,
                             )
                             warned = True
             with self._lock:

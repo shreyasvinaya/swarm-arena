@@ -55,7 +55,7 @@ def _reindex_with_diagnostics(
                 except BlockingIOError:
                     raise _core_error(
                         RuntimeError,
-                        f"{path} is in use by another swarm-arena process; stop it first",
+                        "arena cache is in use by another swarm-arena process; stop it first",
                     ) from None
             for path in paths:
                 for suffix in ("", "-wal", "-shm"):

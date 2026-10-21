@@ -644,3 +644,24 @@ def test_board_serve_smoke(finished_run: FinishedRun) -> None:
                     proc.wait(timeout=5)
             if proc.stdout is not None:
                 proc.stdout.close()
+
+
+def test_reindex_lock_diagnostic_does_not_expose_configured_path(
+    finished_run: FinishedRun, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._model.canonical import sha256_hex
+
+    # The normal CLI cache is held by an ordinary board attachment.
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    try:
+        board.open("", "", [finished_run.namespace])
+        board.frontier()
+        assert _call(finished_run, "reindex", "--namespace", finished_run.namespace) == 1
+        output = capsys.readouterr()
+        assert "in use" in output.err
+        assert str(tmp_path) not in output.err
+        assert sha256_hex(finished_run.config.arena_root.encode())[:12] not in output.err
+        assert str(board._cache_dir()) not in output.err
+    finally:
+        board.close()

@@ -97,7 +97,10 @@ def test_reindex_refuses_while_cache_open(run_config: RunConfig, tmp_path: Path)
     try:
         with pytest.raises(RuntimeError, match="in use") as exc:
             reindex(run_config, ["toy"], cache_dir=path.parent)
-        assert str(exc.value) == f"{path} is in use by another swarm-arena process; stop it first"
+        assert (
+            str(exc.value) == "arena cache is in use by another swarm-arena process; stop it first"
+        )
+        assert_secret_absent(exc.value, str(path))
         assert (path.read_bytes(), wal.read_bytes()) == before
     finally:
         held.close()

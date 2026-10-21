@@ -114,8 +114,8 @@ def test_open_resume_with_other_run_root_warns(
     original = {ns: arena.read(pointer_key(ns, "r1")).data for ns in ("toy", "phys")}
     board.open("r1", str(tmp_path / "b"), ["toy", "phys"])
     assert len([r for r in caplog.records if r.name == "swarm_arena.board"]) == 1
-    assert str(tmp_path / "a") in caplog.text
-    assert str(tmp_path / "b") in caplog.text
+    assert str(tmp_path / "a") not in caplog.text
+    assert str(tmp_path / "b") not in caplog.text
     assert original == {ns: arena.read(pointer_key(ns, "r1")).data for ns in original}
 
 
