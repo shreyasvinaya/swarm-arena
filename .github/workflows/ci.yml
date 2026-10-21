@@ -2,15 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main, "m[0-9]*-*"]
+    # Every branch of this repository is tested on push, so its pull request
+    # does not need a second run (see the job conditions below).
+    branches: ["**"]
   pull_request:
 
 permissions:
   contents: read
 
-# One run per commit: a newer push to the same branch or PR cancels the older run.
+# A newer push to the same branch (or a new commit on the same PR) cancels the older run.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.ref || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
