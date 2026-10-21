@@ -11,7 +11,7 @@ from swarm_arena._model.goal import FileSet
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.ref import Configurable, Ref, _validate_config
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._planning.provenance import (
     RefSite,
     diff_revision,
@@ -92,7 +92,7 @@ def _check_catalog_defaults(
             component = Ref(path=entry.ref).load()
             schema = component.Config if issubclass(component, Configurable) else None
         except BaseException as error:
-            _classify_outcome(error)
+            _propagate_control(error)
             schema = None
         for key in fields:
             raw = site.ref.config[key]
@@ -113,7 +113,7 @@ def _check_catalog_defaults(
                         catalog_form({key: value.model_dump(mode="json")}),
                     )
             except BaseException as error:
-                _classify_outcome(error)
+                _propagate_control(error)
                 accepted = False
             if not accepted:
                 errors.append(f"{site.pointer}: field '<field>' is not in the planner catalog")

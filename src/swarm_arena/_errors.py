@@ -235,6 +235,14 @@ def _with_exception_type(error: _SignalT, name: str) -> _SignalT:
     return error
 
 
+def _is_core_signal(error: BaseException) -> bool:
+    """Check exact-type provenance without allocating another signal."""
+    return (
+        any(type(error) is kind for kind in _core_signal_kinds())
+        and cast(Exception, error) in _CORE_SIGNALS
+    )
+
+
 def _rebuild_core_signal(error: BaseException) -> Exception | None:
     """Reconstruct a registered signal from its snapshot, never user changes.
 

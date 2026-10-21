@@ -8,14 +8,13 @@ from typing import TYPE_CHECKING, Any, Final
 
 import anyio
 
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import Fenced, _exception_type_name
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_stage import _Staged
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
 from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, format_logs_ref
-from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files
 from swarm_arena._tooling.result_file import (
@@ -167,7 +166,7 @@ class _JobRun:
             await anyio.to_thread.run_sync(note_in_log, self._stderr, "collect timed out")
 
     def _collect(self, run: CompletedRun) -> ToolOutput | None:
-        """Collect and validate the output; on any failure, note it and return None."""
+        """Convert ordinary collection failures; transport nonstandard outcomes unchanged."""
         token = _OUTPUT_BYTE_LIMIT.set(self._max_output)
         try:
             output: object
@@ -175,10 +174,9 @@ class _JobRun:
                 output = self._staged.tool.collect(self._staged.request, self._workspace, run)
             else:
                 output = command_output_from_result(self._workspace, run)
-        except KeyboardInterrupt:
+        except (Fenced, BaseExceptionGroup):
             raise
-        except BaseException as error:
-            _classify_outcome(error)
+        except (Exception, SystemExit) as error:
             note_in_log(run.stderr_path, f"collect failed: {_exception_type_name(error)}")
             return None
         finally:
@@ -191,10 +189,9 @@ class _JobRun:
                 return None
             # model_copy and model_construct skip validation (the finite-JSON rule too).
             return ToolOutput.model_validate(output.model_dump(warnings=False))
-        except KeyboardInterrupt:
+        except (Fenced, BaseExceptionGroup):
             raise
-        except BaseException as error:
-            _classify_outcome(error)
+        except (Exception, SystemExit):
             note_in_log(run.stderr_path, _NOT_AN_OUTPUT)  # the reason only: no values
             return None
 

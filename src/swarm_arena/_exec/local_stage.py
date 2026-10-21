@@ -1,6 +1,5 @@
 """Materialize a local job and resolve its command, limits, and environment."""
 
-import asyncio
 import os
 import sys
 import threading
@@ -11,7 +10,6 @@ from swarm_arena._exec.env import build_env
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_workspace import _DIR_FLAGS
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import materialize
 from swarm_arena._tooling.tool import Tool
@@ -59,8 +57,6 @@ class _Preparation:
         """Prepare once, marking workspace access finished even on a user error."""
         try:
             return _stage(self.job, self.workspace, self.artifacts)
-        except (BaseExceptionGroup, asyncio.CancelledError) as error:
-            raise _classify_outcome(error) from None
         finally:
             self.finished.set()
 

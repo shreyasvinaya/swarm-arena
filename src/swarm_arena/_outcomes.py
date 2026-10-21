@@ -36,6 +36,11 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
     return error
 
 
+def _propagate_control(error: BaseException) -> None:
+    """Raise control outcomes when a boundary intentionally discards failure details."""
+    _classify_outcome(error)
+
+
 class _Outcome:
     """Snapshot caller cancellation before an asynchronous extension boundary."""
 
@@ -57,3 +62,7 @@ class _Outcome:
                 or self._info.has_pending_cancellation()
             ),
         )
+
+    def propagate_control(self, error: BaseException) -> None:
+        """Propagate controls using this caller's cancellation snapshot."""
+        self.classify(error)

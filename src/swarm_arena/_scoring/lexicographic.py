@@ -11,7 +11,7 @@ from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel
 from swarm_arena._model.results import Candidate, Score
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -103,7 +103,7 @@ class Lexicographic(Judge):
                 except TypeError:
                     raise TypeError(f"cannot build judge {ref.path}") from None
                 except BaseException as error:
-                    _classify_outcome(error)
+                    _propagate_control(error)
                     raise ValueError(f"cannot build judge {ref.path}") from None
             self._members = members
         return self._members
@@ -180,7 +180,7 @@ class Lexicographic(Judge):
         except Fenced:
             raise
         except BaseException as error:
-            _classify_outcome(error)
+            _propagate_control(error)
             raise ValueError("cannot encode lexicographic rubric") from None
 
     def panel_hash(self) -> str:

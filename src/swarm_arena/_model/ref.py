@@ -28,7 +28,7 @@ from swarm_arena._model.base import (
 )
 from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 
 
 class EmptyConfig(_SafeModel):
@@ -186,7 +186,7 @@ def load_object(path: str) -> object:
         for part in qualname.split("."):
             obj = getattr(obj, part)
     except BaseException as error:
-        _classify_outcome(error)
+        _propagate_control(error)
         raise ValueError(f"cannot import {path}") from None
     return obj
 
@@ -243,7 +243,7 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
                 safe = None
             except BaseException as error:
                 try:  # noqa: SIM105 - a context manager itself needs spare stack frames
-                    _classify_outcome(error)
+                    _propagate_control(error)
                 except RecursionError:
                     pass
                 safe = None

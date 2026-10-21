@@ -268,3 +268,10 @@ releases its slot and ignores late results, but cannot forcibly stop Python
 preparation code. Its workspace is retained with a warning for safe manual
 cleanup. Collection runs once and has a 30 s bound. See the
 [executor details](api/executor.md#localexecutor) before cleaning retained workspaces.
+
+Direct `LocalExecutor` preparation preserves the exception object raised by a
+constructor or command hook. Collection converts ordinary exceptions and
+`SystemExit` to an error output with a type-only note, while cancellation,
+interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
+The engine classifies those transported outcomes at its supervised boundary,
+where it can distinguish caller cancellation from a hook-raised failure.

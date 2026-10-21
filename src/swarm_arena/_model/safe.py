@@ -19,7 +19,7 @@ from swarm_arena._model.locations import (
     _schema_index,
     _sequence_paths,
 )
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 
 # One allowlist for all models: custom codes and messages cannot carry user data.
 _VALIDATION_ERROR_TYPES: Final = frozenset(get_args(ErrorType))
@@ -285,7 +285,7 @@ def _validation_wrapper(
                 safe = None
             except BaseException as error:
                 try:  # noqa: SIM105 - a context manager itself needs spare stack frames
-                    _classify_outcome(error)
+                    _propagate_control(error)
                 except RecursionError:
                     pass
                 safe = None

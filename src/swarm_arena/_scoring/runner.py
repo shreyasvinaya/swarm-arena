@@ -137,7 +137,7 @@ async def run_checks(
         except Fenced:
             raise
         except BaseException as error:
-            outcome.classify(error)
+            outcome.propagate_control(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
         results.append(valid.model_copy(update={"check": name}))
     return results

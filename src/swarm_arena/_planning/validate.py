@@ -19,7 +19,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
 from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
@@ -135,7 +135,7 @@ def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
                 raise TypeError
             safe = _safe_location(cls.Config, tuple(location))
         except BaseException as error:
-            _classify_outcome(error)
+            _propagate_control(error)
             safe = ("<key>",) * len(location)
         tokens = [
             "<key>" if part == "<…>" else str(part).replace("~", "~0").replace("/", "~1")

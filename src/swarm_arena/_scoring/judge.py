@@ -10,7 +10,7 @@ from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate, Score, _finite_key
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._scoring.check import CheckContext
 
 
@@ -216,7 +216,7 @@ class Judge(Configurable, ABC):
                 )
             )
         except BaseException as error:
-            _classify_outcome(error)
+            _propagate_control(error)
             raise ValueError("cannot encode judge rubric") from None
 
     def panel_hash(self) -> str:

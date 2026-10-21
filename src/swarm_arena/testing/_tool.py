@@ -23,7 +23,7 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
-from swarm_arena._outcomes import _classify_outcome
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_ref
 from swarm_arena._tooling.result_file import NOTE_PREFIX, request_json
@@ -175,7 +175,7 @@ def _probe_collect(tool: Tool, request: ToolRequest) -> None:
         except KeyboardInterrupt:
             raise
         except BaseException as error:
-            _classify_outcome(error)
+            _propagate_control(error)
             return
     if not isinstance(out, ToolOutput):
         raise _fail("Tool.collect() must return a ToolOutput")
@@ -197,7 +197,7 @@ def _check_tool_output(tool: Tool, request: ToolRequest, out: object) -> ToolOut
     try:  # lax, as the core re-validates it: another executor may pass it on unvalidated
         valid = ToolOutput.model_validate(out.model_dump(warnings=False))
     except BaseException as error:
-        _classify_outcome(error)
+        _propagate_control(error)
         raise _fail(message) from None
     # The checks read the validated copy, as the core would; the caller gets ``out`` itself.
     store = open_store(_artifact_root())

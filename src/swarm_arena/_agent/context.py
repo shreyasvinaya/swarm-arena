@@ -19,7 +19,7 @@ from swarm_arena._errors import (
     SoftError,
     _core_signal,
     _exception_type_name,
-    _rebuild_core_signal,
+    _is_core_signal,
 )
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
@@ -943,9 +943,8 @@ class AgentContext:
             raise
         except BaseException as error:
             error = outcome.classify(error)
-            rebuilt = _rebuild_core_signal(error)
-            if isinstance(rebuilt, (SoftError, LimitReached)):
-                raise rebuilt from None
+            if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+                raise error from None
             raise _core_signal(SoftError(f"action failed: {_exception_type_name(error)}")) from None
         finally:
             lifetime.live = False

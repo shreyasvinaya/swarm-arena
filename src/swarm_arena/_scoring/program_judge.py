@@ -249,7 +249,7 @@ class ProgramJudge(Judge):
                         {**result.model_dump(warnings=False), "candidate_id": candidate.id}
                     )
                 except BaseException as error:
-                    outcome.classify(error)
+                    outcome.propagate_control(error)
                     ctx.judge_error(candidate.id, "invalid Score returned")
                 else:
                     scores.append(score)

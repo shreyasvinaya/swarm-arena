@@ -22,7 +22,7 @@ from swarm_arena._errors import (
     _core_error,
     _core_signal,
     _exception_type_name,
-    _rebuild_core_signal,
+    _is_core_signal,
 )
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
@@ -422,9 +422,8 @@ def _stage_settings(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        rebuilt = _rebuild_core_signal(error)
-        if isinstance(rebuilt, (SoftError, LimitReached)):
-            raise rebuilt from None
+        if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            raise error from None
         raise _core_signal(
             SoftError(f"invalid tool stage: {_exception_type_name(error)}")
         ) from None
@@ -467,9 +466,8 @@ def _stage(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        rebuilt = _rebuild_core_signal(error)
-        if isinstance(rebuilt, (SoftError, LimitReached)):
-            raise rebuilt from None
+        if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            raise error from None
         raise _core_signal(
             SoftError(f"invalid tool stage: {_exception_type_name(error)}")
         ) from None
@@ -664,9 +662,8 @@ async def _run(
         raise
     except BaseException as error:
         error = outcome.classify(error)
-        rebuilt = _rebuild_core_signal(error)
-        if isinstance(rebuilt, LimitReached):
-            raise rebuilt from None
+        if _is_core_signal(error) and isinstance(error, LimitReached):
+            raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
         failed = True
     if inflight.closed or generation != inflight._cancel_generation:
@@ -751,9 +748,8 @@ async def _run(
     except BaseException as error:
         refused = error is admission_refusal
         error = outcome.classify(error)
-        rebuilt = _rebuild_core_signal(error)
-        if refused and isinstance(rebuilt, LimitReached) and not started:
-            raise rebuilt from None
+        if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
+            raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
         output = ToolOutput(status=RunStatus.ERROR)
 
@@ -771,7 +767,7 @@ async def _run(
         except Fenced:
             raise
         except BaseException as error:
-            outcome.classify(error)
+            outcome.propagate_control(error)
             warnings.append("tool error: invalid output")
             output = ToolOutput(status=RunStatus.ERROR)
         finally:
