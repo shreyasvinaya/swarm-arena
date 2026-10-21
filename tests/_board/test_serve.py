@@ -596,3 +596,15 @@ def test_run_viewer_blank_run_filter_includes_human_and_other_runs(server: Serve
         http.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_first_reader_open_publishes_namespaces_before_frontier(tmp_path: Path) -> None:
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    try:
+        board.open("", "", ["toy"])
+        with board._read_namespace() as reader:
+            assert reader.namespaces() == ("toy",)
+        http = make_server(board, ["toy"], author="alice", port=0)
+        http.server_close()
+    finally:
+        board.close()

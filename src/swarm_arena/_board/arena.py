@@ -229,6 +229,7 @@ class ArenaBoard(Board):
         self._caches: dict[str, ArenaCache] = {}
         self._read_caches: dict[str, ArenaCache] = {}
         self._namespaces: tuple[str, ...] = ()
+        self._attached = False
         self._run_id = ""
         self._run_root = ""
         self._lifetime = _ReadLifetime()
@@ -376,9 +377,14 @@ class ArenaBoard(Board):
         resolved = _resolved_root(run_root) if run_id else ""
         with self._refresh_lock:
             with self._lock:
-                extending = not self._lifetime.closed and (run_id, resolved) == (
-                    self._run_id,
-                    self._run_root,
+                extending = (
+                    self._attached
+                    and not self._lifetime.closed
+                    and (run_id, resolved)
+                    == (
+                        self._run_id,
+                        self._run_root,
+                    )
                 )
                 if extending:
                     names = tuple(sorted(set(names) | set(self._namespaces)))
@@ -408,6 +414,7 @@ class ArenaBoard(Board):
             with self._lock:
                 if self._lifetime.closed:
                     self._lifetime = _ReadLifetime()
+                self._attached = True
                 self._run_id, self._run_root, self._namespaces = run_id, resolved, names
                 if not extending:
                     self._published = _Published(
