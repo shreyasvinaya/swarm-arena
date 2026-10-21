@@ -153,6 +153,35 @@ async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier
         ) from None
 
 
+async def _publish_round_page(
+    deps: EngineDeps, prefix: RunState, goal_id: str, round: int, seq: int
+) -> None:
+    """Publish one recorded page within its owner's supervised lifetime."""
+    plan = prefix.plan_for_round(goal_id, round)
+    frontier = prefix.goals[goal_id].frontiers[round]
+    key = page_key(goal_id, round)
+    if await run_sync_daemon(deps.store.exists, key):
+        return
+    recorded_count = await _page_namespace_count(deps, plan, frontier)
+    count = recorded_count + sum(
+        item.goal_id == goal_id
+        and item.run_id == prefix.run_id
+        and item.round == round
+        and item.namespace == plan.goal.namespace
+        for item in prefix.learnings.values()
+    )
+    # Retain the close's original provenance when repairing a missing page.
+    segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
+    epoch, last_seq = parse_segment_name(segment)
+    source = Head(epoch=epoch, seq=last_seq, segment=segment)
+    content = round_page(prefix, goal_id, round, namespace_learnings=count, source=source)
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    if deps.journal.fenced.is_set():
+        raise _core_error(Fenced)
+    # ViewWriter embeds the same header itself; pass just the body.
+    await deps.views.write(key, content.partition(b"\n")[2], source=source, create_only=True)
+
+
 async def _repair_round_pages(
     deps: EngineDeps,
     state: RunState,
@@ -165,41 +194,17 @@ async def _repair_round_pages(
         if goal_id is not None and id != goal_id:
             continue
         for round, seq in sorted(goal.closed_seq.items()):
-            key = page_key(id, round)
-            if await anyio.to_thread.run_sync(deps.store.exists, key):
-                continue
             prefix = _closed_prefix(state, id, round)
             plan = prefix.plan_for_round(id, round)
-            frontier = prefix.goals[id].frontiers[round]
-
             page_supervisor = supervisor or GoalRunner(
                 deps, goal_id=id, plan=plan, replanner=None, state=goal
             )
-            completed, recorded_count = await page_supervisor._supervised_step(
-                partial(_page_namespace_count, deps, plan, frontier), final=True
+
+            completed, _ = await page_supervisor._supervised_step(
+                partial(_publish_round_page, deps, prefix, id, round, seq), final=True
             )
             if not completed:
                 return
-            assert recorded_count is not None
-            count = recorded_count + sum(
-                item.goal_id == id
-                and item.run_id == state.run_id
-                and item.round == round
-                and item.namespace == plan.goal.namespace
-                for item in prefix.learnings.values()
-            )
-            # Retain the close's original provenance when repairing a missing page.
-            segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
-            epoch, last_seq = parse_segment_name(segment)
-            source = Head(epoch=epoch, seq=last_seq, segment=segment)
-            content = round_page(prefix, id, round, namespace_learnings=count, source=source)
-            await anyio.lowlevel.checkpoint_if_cancelled()
-            if deps.journal.fenced.is_set():
-                raise _core_error(Fenced)
-            # ViewWriter embeds the same header itself; pass just the body.
-            await deps.views.write(
-                key, content.partition(b"\n")[2], source=source, create_only=True
-            )
 
 
 class GoalRunner:
@@ -330,7 +335,7 @@ class GoalRunner:
         """Fold only a committed head, including the durable fingerprint map."""
         head = await self.deps.journal.commit()
         if head is not None:
-            chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, head)
+            chain = await run_sync_daemon(read_chain, self.deps.store, head)
             self._events = [event for _, events in chain for event in events]
             self.recorded = RunState.from_events(self._events)
 
@@ -1255,16 +1260,20 @@ class GoalRunner:
             outcome = _Outcome()
             try:
                 with llm_scope(scope):
-                    frontier = await anyio.to_thread.run_sync(self.deps.board.frontier)
-                    view = await anyio.to_thread.run_sync(
+                    frontier = await run_sync_daemon(self.deps.board.frontier)
+                    view = await run_sync_daemon(
                         self.deps.board.snapshot, self.plan.goal.key(), frontier
                     )
+
                     # Human hide operations belong to the snapshot, not the run
                     # replay. Never reintroduce hidden items through the new list.
+                    def visible_learning(id: str) -> Learning:
+                        return _detach_model(Learning, view.get_learning(id))
+
                     visible_new: list[Learning] = []
                     for item in new:
                         try:
-                            visible_new.append(view.get_learning(item.id).model_copy(deep=True))
+                            visible_new.append(await run_sync_daemon(visible_learning, item.id))
                         except KeyError:
                             continue
                     if not visible_new:
@@ -1411,6 +1420,8 @@ class GoalRunner:
                 ).run(round)
                 self._merge_repeats(out.repeat_entries)
                 await self._refresh()
+                if round not in self.recorded.goals[self.goal_id].frontiers:
+                    break
                 funded = await self._barrier([*recovered, *out.candidates], round)
                 self.rounds_closed = round
                 if funded:

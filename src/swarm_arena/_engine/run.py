@@ -499,31 +499,37 @@ class RunRunner:
         warnings: list[str],
         manifest: dict[str, Any],
     ) -> dict[str, list[Candidate]]:
+        from swarm_arena._engine.resume import _acquire_lease
+
         assert self.run_id is not None
         config, run_id = self.config, self.run_id
         store = open_store(config.run_root).child(run_id)
-        lease = await anyio.to_thread.run_sync(
+        lease = await _acquire_lease(
             partial(
                 Lease.acquire_new,
                 store,
                 owner_id=uuid4().hex,
                 host=socket.gethostname(),
                 ttl_s=config.lease_ttl_s,
-            )
+            ),
+            settle_timeout_s=config.settle_timeout_s,
         )
         local_path = _local_journal_path(run_id, lease.doc.epoch)
         clock = RunClock(0)
-        async with _RunJournal(
-            store,
-            lease,
-            run_id=run_id,
-            next_seq=1,
-            local_path=local_path,
-            sync_interval_s=config.sync_interval_s,
-        ) as journal:
+        async with (
+            _RunJournal(
+                store,
+                lease,
+                run_id=run_id,
+                next_seq=1,
+                local_path=local_path,
+                sync_interval_s=config.sync_interval_s,
+            ) as journal,
+            _supervise_writer(journal),
+        ):
             journal.clock = clock
-            await anyio.to_thread.run_sync(store.create, "run.toml", config.dumps().encode())
-            await anyio.to_thread.run_sync(
+            await run_sync_daemon(store.create, "run.toml", config.dumps().encode())
+            await run_sync_daemon(
                 store.create,
                 "manifest.json",
                 canonical_json(RunManifest.model_validate(manifest).model_dump(mode="json")),
@@ -651,7 +657,7 @@ class RunRunner:
             head = await deps.journal.commit()
             await deps.ledger.end_goal(goal_id)
         assert head is not None
-        chain = await anyio.to_thread.run_sync(read_chain, deps.store, head)
+        chain = await run_sync_daemon(read_chain, deps.store, head)
         state = RunState.from_events(e for _, events in chain for e in events)
         await deps.views.write(
             f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head

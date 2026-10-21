@@ -9,8 +9,10 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import anyio
+import anyio.lowlevel
 
 from swarm_arena._errors import AlreadyExists, PreconditionFailed, _core_error
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._journal.writer import JournalWriter
@@ -161,7 +163,8 @@ class ViewWriter:
     Existing views are replaced only when their head is an earlier member of
     the same chain. Equal, unknown, or malformed heads remain untouched.
     Create-only publication preserves any existing view without inspecting it.
-    Every Store operation runs in an AnyIO worker thread.
+    Every Store operation runs in an abandonable daemon worker. The owning
+    run supervises the wait; an abandoned read cannot start a later write.
 
     Parameters
     ----------
@@ -228,21 +231,24 @@ class ViewWriter:
             raise ValueError("view key requires .json, .toml, or .md suffix") from None
         data = embed_source_head(fmt, content, head)
         digest = sha256(data).digest()
+        await anyio.lowlevel.checkpoint_if_cancelled()
         try:
-            await anyio.to_thread.run_sync(self._store.create, key, data)
+            await run_sync_daemon(self._store.create, key, data)
             return
         except AlreadyExists:
             if create_only:
                 return
         for _ in range(2):
-            existing = await anyio.to_thread.run_sync(self._store.read, key)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            existing = await run_sync_daemon(self._store.read, key)
             if sha256(existing.data).digest() == digest:
                 return
             previous = read_source_head(fmt, existing.data)
             if previous is None or previous.segment not in committed[:source_index]:
                 return
+            await anyio.lowlevel.checkpoint_if_cancelled()
             try:
-                await anyio.to_thread.run_sync(
+                await run_sync_daemon(
                     partial(self._store.replace, key, data, if_match=existing.etag)
                 )
                 return

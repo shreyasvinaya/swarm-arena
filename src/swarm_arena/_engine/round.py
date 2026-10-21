@@ -407,7 +407,9 @@ class RoundRunner:
     async def _frontier(self, round: int, agents: Sequence[AgentSlot]) -> Frontier:
         if self.frontier is not None:
             return self.frontier
-        frontier = await anyio.to_thread.run_sync(self.deps.board.frontier)
+        frontier = await run_sync_daemon(
+            lambda: _detach_model(Frontier, self.deps.board.frontier())
+        )
         shares = (
             {}
             if self.converge
@@ -442,12 +444,12 @@ class RoundRunner:
         parents: Mapping[str, BoardView],
     ) -> AgentRuntime:
         deps = self.deps
-        view = await anyio.to_thread.run_sync(deps.board.snapshot, slot.goal_key, frontier)
+        view = await run_sync_daemon(deps.board.snapshot, slot.goal_key, frontier)
         past = _past_run_entries(view, deps.run_id)
         siblings = {}
         if isinstance(view, ArenaView):
             for part in [None, *(p.name for p in self.plan.parts)]:
-                sibling = await anyio.to_thread.run_sync(view._sibling_view, part)
+                sibling = await run_sync_daemon(view._sibling_view, part)
                 siblings[part or ""] = sibling
         if parents:
             view = _SeedView(view, parents)
@@ -544,7 +546,7 @@ class RoundRunner:
         """
         if self.deps.journal.head is None:
             return {}
-        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await run_sync_daemon(read_chain, self.deps.store, self.deps.journal.head)
         policies: dict[str, dict[str, str]] = {}
         for _, events in chain:
             for event in events:
@@ -600,10 +602,10 @@ class RoundRunner:
         if not self.seed_parents:
             return parents
         for goal in [self.plan.goal, *(part.goal for part in self.plan.parts)]:
-            view = await anyio.to_thread.run_sync(self.deps.board.snapshot, goal.key(), frontier)
+            view = await run_sync_daemon(self.deps.board.snapshot, goal.key(), frontier)
             for id in self.seed_parents:
                 try:
-                    view.get_candidate(id)
+                    await run_sync_daemon(view.get_candidate, id)
                 except (KeyError, ValueError):
                     continue
                 parents[id] = view
@@ -672,7 +674,7 @@ class RoundRunner:
         """Recover only the latest matching round's committed action allowance."""
         if (self.frontier is None and not self.converge) or self.deps.journal.head is None:
             return
-        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await run_sync_daemon(read_chain, self.deps.store, self.deps.journal.head)
         events = [event for _, batch in chain for event in batch]
         if self.converge and self.frontier is None:
             state = RunState.from_events(events)
@@ -781,17 +783,43 @@ class RoundRunner:
         --------
         >>> outcome = await runner.run(1)  # doctest: +SKIP
         """
-        await self._restore(round)
+        from swarm_arena._engine.goal import GoalRunner
+
         agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
-        frontier = await self._frontier(round, agents)
         deadline = round_deadline(
             anyio.current_time(),
             self.deps.config.limits.effective_round_timeout_s(),
             self.deps.clock.left(self.deps.config.limits.run_timeout_s),
         )
         private_paths = judge_private_paths(self.plan)
-        parents = await self._parent_views(frontier)
-        feedback_policies = await self._feedback_policies()
+
+        async def prepare() -> tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]]:
+            await self._restore(round)
+            frontier = await self._frontier(round, agents)
+            parents = await self._parent_views(frontier)
+            return frontier, parents, await self._feedback_policies()
+
+        supervisor = GoalRunner(
+            self.deps, goal_id=self.goal_id, plan=self.plan, replanner=None, journal_r0=False
+        )
+        outcome = _Outcome()
+        completed, prepared = False, None
+        try:
+            with anyio.move_on_after(max(0, deadline - anyio.current_time())):
+                completed, prepared = await supervisor._supervised_step(
+                    prepare, final=self.converge
+                )
+        except BaseException as error:
+            registered = _is_core_signal(error)
+            error = outcome.classify(error)
+            if registered:
+                raise error from None
+            raise _core_error(
+                RuntimeError, f"round preparation failed: {_exception_type_name(error)}"
+            ) from None
+        if not completed or prepared is None:
+            return RoundOutcome(round, [], [], {}, {}, [])
+        frontier, parents, feedback_policies = prepared
         runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]

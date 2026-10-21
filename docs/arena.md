@@ -546,3 +546,7 @@ A run ID supplied to `leaderboard` or `board serve` is resolved from stored runs
 or arena pointers before treating the target as a namespace. Custom IDs such as
 `my-run` are supported. In the viewer, clearing the Run field includes other runs
 and human learnings; blank optional filter fields impose no restriction.
+
+Board snapshots, curation reads, and round-page storage run in abandonable workers.
+Cancellation, immediate stop, and ownership loss can release the run while a
+backend call is still blocked. A cancelled page probe cannot start a later write.

@@ -12,6 +12,7 @@ from swarm_arena._board.base import BoardView
 from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.context_strings import _context_string
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Learning
@@ -174,13 +175,20 @@ async def _prepare_curator(
         namespace = _context_string(namespace, "namespace")
         run_id = _context_string(run_id, "run_id")
         goal_id = _context_string(goal_id, "goal_id")
-        # Board access stays on the loop. Snapshot evidence before exposing inputs
-        # to the plugin, and never give the normalizing daemon a board or IdGen.
-        sources = {
-            item.id: (tuple(item.evidence), item.verified)
-            for item in [*view.learnings(namespace, limit=sys.maxsize), *new]
-            if item.namespace == namespace and not item.hidden
-        }
+
+        def read_sources() -> dict[str, tuple[tuple[str, ...], bool]]:
+            # Connector reads and returned models belong to the supervised worker.
+            items = [
+                _detach_model(Learning, item)
+                for item in [*view.learnings(namespace, limit=sys.maxsize), *new]
+            ]
+            return {
+                item.id: (tuple(item.evidence), item.verified)
+                for item in items
+                if item.namespace == namespace and not item.hidden
+            }
+
+        sources = await run_sync_daemon(read_sources)
         await run_sync_daemon(lambda: curator.models())
         result = await run_sync_daemon(lambda: curator.curate(namespace, new, view))
         if isawaitable(result):
