@@ -8,8 +8,14 @@ on:
 permissions:
   contents: read
 
+# One run per commit: a newer push to the same branch or PR cancels the older run.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     # No extras: proves that the core imports and passes with no optional dependency.
     # No ty: ty checks every import, and the extra-only modules import optional packages.
     runs-on: ubuntu-latest
@@ -25,9 +31,10 @@ jobs:
       - run: uv sync --all-groups
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest
+      - run: uv run pytest --durations=25
 
   extras:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -40,9 +47,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --all-groups
       - run: uv run ty check
-      - run: uv run pytest
+      - run: uv run pytest --durations=25
 
   docs:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -53,6 +61,7 @@ jobs:
       - run: uv run sphinx-build -W --keep-going -b html docs docs/_build/html
 
   lowest-direct:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -60,18 +69,20 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv sync --all-groups --resolution lowest-direct --upgrade
-      - run: uv run --no-sync pytest -q
+      - run: uv run --no-sync pytest -q --durations=25
 
   macos:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        # Branch pushes test macOS on the newest Python; main also covers the oldest.
+        python-version: ${{ github.ref == 'refs/heads/main' && fromJSON('["3.11", "3.13"]') || fromJSON('["3.13"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-groups
-      - run: uv run pytest -q
+      - run: uv run pytest -q --durations=25
