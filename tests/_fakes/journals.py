@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+from _fakes.leases import force_take_over
+
 from swarm_arena import Goal, PartSpec, Plan, Ref, Score
 from swarm_arena._board.pointers import RunPointer, write_pointer
 from swarm_arena._journal.a2a import agent_task_id, task_to_json, tool_run_task
@@ -125,12 +127,11 @@ class FakeRun:
         >>> run.take_over()  # doctest: +SKIP
         """
         self._old_epoch = self._lease.doc.epoch
-        self._lease = Lease.take_over(
+        self._lease = force_take_over(
             self.store,
             owner_id="replacement",
             host="local",
             ttl_s=3600,
-            force=True,
             expect_epoch=self._old_epoch,
         )
 

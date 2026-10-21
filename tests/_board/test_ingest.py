@@ -65,6 +65,31 @@ def test_takeover_chain_ignores_fenced_segment(tmp_path: Path) -> None:
     cache.close()
 
 
+def test_fixture_takeover_retries_owner_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), run.candidate("c-1"))
+    original = run.store.replace
+    renewed = False
+
+    def replace(key: str, data: bytes, *, if_match: str) -> str:
+        nonlocal renewed
+        if not renewed:
+            renewed = True
+            # Change the real owner version between takeover's read and conditional write.
+            run._lease.renew()
+        return original(key, data, if_match=if_match)
+
+    monkeypatch.setattr(run.store, "replace", replace)
+    run.take_over()
+    assert renewed
+    assert run._lease.doc.owner_id == "replacement"
+    assert run._lease.doc.epoch == 2
+    assert run._lease.doc.head == head
+    run._lease.release()
+
+
 def test_older_mark_is_covered_by_newer_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
