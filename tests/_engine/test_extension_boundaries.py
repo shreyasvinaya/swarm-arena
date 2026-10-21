@@ -1,4 +1,14 @@
-"""Public-run regressions, isolated so a blocked extension cannot hang pytest."""
+"""Public-run regressions, isolated so a blocked extension cannot hang pytest.
+
+Controller ruling N-I1 explicitly replaces the former total-runtime < 7 s
+contract with two real-monotonic bounds. From calling Swarm.run to trigger
+readiness, allow < 20 s when waiting for a lease renewal, otherwise < 7 s.
+From the first stop request, round-clock advance, or judge cancellation to
+Swarm.run exit, require < 7 s. Journal inspection and observer cleanup are
+outside that second interval. The runner-only clock never measures latency.
+Partial-output readiness means delivery before the blocked submit is interrupted;
+its fallback serializer is observed after that first termination trigger.
+"""
 
 import json
 import os
@@ -29,6 +39,7 @@ from swarm_arena import (
     Swarm,
     TeamSpec,
 )
+from swarm_arena._model.results import Candidate
 from swarm_arena.executor import Job, LocalExecutor
 from swarm_arena.manager import Manager, RoundReport
 from swarm_arena.scoring import Check, CheckResult, Judge, JudgeContext, Lexicographic
@@ -162,7 +173,7 @@ def score(goal: Goal, candidate: Any) -> Score:
 
 
 async def _wait_for_signal(event: threading.Event, label: str) -> None:
-    assert await anyio.to_thread.run_sync(event.wait, _SIGNAL_TIMEOUT_S), (
+    assert await anyio.to_thread.run_sync(event.wait, _SIGNAL_TIMEOUT_S, abandon_on_cancel=True), (
         f"timed out waiting for {label}"
     )
 
@@ -297,6 +308,44 @@ async def _worker(mode: str, root: Path) -> None:
     stop_started: float | None = None
     deadline_started: float | None = None
     run_finished = anyio.Event()
+    run_started_signal = anyio.Event()
+    trigger_observed = anyio.Event()
+    run_started: float | None = None
+    run_ended: float | None = None
+    elapsed_to_trigger: float | None = None
+    trigger_limit_s = 20 if mode in {"hook", "rubric", "panel", "lex-rubric", "lex-panel"} else 7
+
+    async def run() -> dict[str, list[Candidate]]:
+        nonlocal run_started, run_ended
+        run_started = time.monotonic()
+        run_started_signal.set()
+        try:
+            return await swarm.run(plans, run_id="boundary-run")
+        finally:
+            run_ended = time.monotonic()
+            run_finished.set()
+
+    def record_trigger() -> None:
+        nonlocal elapsed_to_trigger
+        if elapsed_to_trigger is None:
+            assert run_started is not None
+            elapsed = time.monotonic() - run_started
+            assert elapsed < trigger_limit_s, (
+                f"{mode}: pre-trigger readiness took {elapsed:.3f}s; must be < {trigger_limit_s}s"
+            )
+            elapsed_to_trigger = elapsed
+            trigger_observed.set()
+
+    async def watch_trigger() -> None:
+        await run_started_signal.wait()
+        assert run_started is not None
+        remaining = trigger_limit_s - (time.monotonic() - run_started)
+        with anyio.move_on_after(max(0, remaining)):
+            await trigger_observed.wait()
+        assert elapsed_to_trigger is not None, (
+            f"{mode}: pre-trigger readiness timed out after "
+            f"{time.monotonic() - run_started:.3f}s; must be < {trigger_limit_s}s"
+        )
 
     async def wait_for_event(kind: str, *, agent: str | None = None) -> None:
         with anyio.fail_after(_SIGNAL_TIMEOUT_S):
@@ -313,6 +362,7 @@ async def _worker(mode: str, root: Path) -> None:
 
     async def stop() -> None:
         nonlocal stop_started
+        record_trigger()
         stop_started = time.monotonic()
         await swarm.stop(now=True)
 
@@ -320,6 +370,7 @@ async def _worker(mode: str, root: Path) -> None:
         nonlocal deadline_started
         assert deadline_clock is not None
         if deadline_started is None:
+            record_trigger()
             deadline_started = time.monotonic()
         deadline_clock.advance(seconds)
         print(label, flush=True)
@@ -369,11 +420,9 @@ async def _worker(mode: str, root: Path) -> None:
     if mode in {"rubric", "panel", "lex-rubric", "lex-panel"}:
         # Lifecycle termination belongs to the separate barrier-supervision fix.
         # This probe owns only thread isolation and live loop/lease/stop progress.
-        async def run() -> None:
-            await swarm.run(plans, run_id="boundary-run")
-
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(run)
+            tasks.start_soon(watch_trigger)
             await _wait_for_signal(_JUDGE_ENTERED, "judge metadata entry")
             await _wait_for_signal(_JUDGE_RENEWED, "lease renewal after judge entry")
             stop_recorded = False
@@ -383,15 +432,18 @@ async def _worker(mode: str, root: Path) -> None:
                     await wait_for_event("stop_requested")
                 stop_recorded = True
             else:
+                record_trigger()
                 stop_started = time.monotonic()
             tasks.cancel_scope.cancel()
         assert stop_started is not None
+        assert run_ended is not None
         print(
             json.dumps(
                 {
                     "renewed": True,
                     "stop_recorded": stop_recorded,
-                    "elapsed_after_stop": time.monotonic() - stop_started,
+                    "elapsed_after_stop": run_ended - stop_started,
+                    "elapsed_to_trigger": elapsed_to_trigger,
                 }
             ),
             flush=True,
@@ -400,15 +452,14 @@ async def _worker(mode: str, root: Path) -> None:
     if mode in {"hook", "check", "check-serializer", "output-serializer", "partial-serializer"}:
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(end_on_signal)
-            result = await swarm.run(plans, run_id="boundary-run")
-            run_finished.set()
+            tasks.start_soon(watch_trigger)
+            result = await run()
             # Let the observer finish rather than cancelling an unobserved signal.
     else:
-        result = await swarm.run(plans, run_id="boundary-run")
-    elapsed_after_stop = None if stop_started is None else time.monotonic() - stop_started
-    elapsed_after_deadline = (
-        None if deadline_started is None else time.monotonic() - deadline_started
-    )
+        result = await run()
+    assert run_ended is not None
+    elapsed_after_stop = None if stop_started is None else run_ended - stop_started
+    elapsed_after_deadline = None if deadline_started is None else run_ended - deadline_started
     store = LocalStore(root / "runs" / "boundary-run")
     committed = read_committed(store)
     assert committed is not None
@@ -416,6 +467,7 @@ async def _worker(mode: str, root: Path) -> None:
     print(
         json.dumps(
             {
+                "elapsed_to_trigger": elapsed_to_trigger,
                 "elapsed_after_stop": elapsed_after_stop,
                 "elapsed_after_deadline": elapsed_after_deadline,
                 "round_deadline_observed": deadline_clock is not None
@@ -453,6 +505,7 @@ def _probe(mode: str, root: Path) -> tuple[dict[str, Any], str]:
 
 def test_blocked_request_hook_abandoned_with_peer_and_renewal(tmp_path: Path) -> None:
     data, stdout = _probe("hook", tmp_path)
+    assert data["elapsed_to_trigger"] < 20
     assert "HOOK_THREAD swarm-arena-daemon-" in stdout
     assert "HOOK_THREAD MainThread" not in stdout
     assert "RENEWED_AFTER_HOOK" in stdout
@@ -464,6 +517,7 @@ def test_blocked_request_hook_abandoned_with_peer_and_renewal(tmp_path: Path) ->
 
 def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> None:
     data, stdout = _probe("check", tmp_path)
+    assert data["elapsed_to_trigger"] < 7
     assert "CHECK_ENTERED" in stdout
     assert data["elapsed_after_stop"] < 7
     assert any(e["type"] == "stop_requested" and e["payload"]["now"] for e in data["events"])
@@ -483,6 +537,7 @@ def test_blocked_check_keeps_output_and_durable_settlement(tmp_path: Path) -> No
 @pytest.mark.parametrize("stop", [False, True], ids=["deadline", "stop-now"])
 def test_blocked_result_serializer_is_supervised(tmp_path: Path, mode: str, stop: bool) -> None:
     data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
+    assert data["elapsed_to_trigger"] < 7
     assert "SERIALIZER_THREAD swarm-arena-daemon-" in stdout
     assert "SERIALIZER_THREAD MainThread" not in stdout
     assert "LOOP_RESPONSIVE" in stdout
@@ -562,6 +617,7 @@ def test_blocked_judge_metadata_keeps_loop_responsive(
     tmp_path: Path, mode: str, stop: bool
 ) -> None:
     data, stdout = _probe(mode + (":stop" if stop else ""), tmp_path)
+    assert data["elapsed_to_trigger"] < 20
     assert "JUDGE_THREAD swarm-arena-daemon-" in stdout
     assert "JUDGE_THREAD MainThread" not in stdout
     assert data["elapsed_after_stop"] < 7
