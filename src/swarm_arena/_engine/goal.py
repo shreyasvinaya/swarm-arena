@@ -10,7 +10,7 @@ from typing import Any, Literal, TypeVar
 
 import anyio
 
-from swarm_arena._agent.manager import LimitReached, Manager
+from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.run_board import RunBoard
@@ -277,11 +277,7 @@ class GoalRunner:
                 key = f"{team.name}/{spec.name}"
                 old = previous.get(address)
                 goal = team_goal(self.plan, team)
-                manager = (
-                    old.manager
-                    if old and old.spec.manager == spec.manager
-                    else await run_sync_daemon(spec.manager.build, Manager)
-                )
+                manager = old.manager if old and old.spec.manager == spec.manager else None
                 slots.append(
                     AgentSlot(
                         address=address,

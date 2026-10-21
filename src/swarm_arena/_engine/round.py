@@ -119,8 +119,8 @@ class AgentSlot:
         Team definition.
     spec : AgentSpec
         Agent definition.
-    manager : Manager
-        Built manager instance.
+    manager : Manager or None
+        Reused instance, or None until per-agent runtime preparation.
     tool_ref : Ref
         Admitted base tool reference, before round overrides.
     goal : Goal
@@ -146,7 +146,7 @@ class AgentSlot:
     address: str
     team: TeamSpec
     spec: AgentSpec
-    manager: Manager
+    manager: Manager | None
     tool_ref: Ref
     goal: Goal
     goal_key: GoalKey
@@ -778,6 +778,8 @@ class RoundRunner:
             try:
                 with scopes[index], track_inflight(inflight):
                     await anyio.lowlevel.checkpoint()
+                    if slot.manager is None:
+                        slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
                     rt = await self._runtime(slot, round, frontier, private_paths, parents)
                     runtimes[index] = rt
                     ctx = await self._context(rt, feedback_policies)
