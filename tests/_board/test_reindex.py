@@ -3,6 +3,7 @@
 import fcntl
 import importlib
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,9 @@ from swarm_arena._board.reindex import (
 )
 from swarm_arena._errors import ChainError
 from swarm_arena._journal.event import Event, EventDraft, EventType
+from swarm_arena._journal.reader import read_chain
 from swarm_arena._model.board_types import Frontier
+from swarm_arena._model.goal import GoalKey
 
 
 def _seed(config: RunConfig, namespace: str = "toy", run_id: str = "r1") -> FakeRun:
@@ -366,3 +369,109 @@ def test_docstring_examples() -> None:
     result = doctest.testmod(module, raise_on_error=True)
     assert result.failed == 0
     assert result.attempted > 0
+
+
+def _logical_rows(directory: Path) -> dict[str, list[tuple[Any, ...]]]:
+    """Compare every persisted column except database-local surrogate rowids."""
+    connection = sqlite3.connect(directory / "toy.sqlite")
+    try:
+        tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        result = {}
+        for (table,) in tables:
+            columns = [
+                row[1]
+                for row in connection.execute(f'PRAGMA table_info("{table}")')
+                if row[1] != "rowid"
+            ]
+            projection = ", ".join(f'"{column}"' for column in columns)
+            result[table] = sorted(
+                connection.execute(f'SELECT {projection} FROM "{table}"').fetchall(), key=repr
+            )
+        return result
+    finally:
+        connection.close()
+
+
+def _snapshot_rows(board: ArenaBoard, goal: GoalKey, frontier: Frontier) -> dict[str, Any]:
+    """Retain full model contents and provenance, not just ID membership."""
+    view = board.snapshot(goal, frontier)
+    with view._read():
+        cache = view._cache
+        return {
+            "membership": snapshot_membership(board, goal, frontier),
+            "candidates": [(c.model_dump(), p) for c, p in cache.candidates(frontier)],
+            "scores": [(s.model_dump(), p) for s, p in cache.scores(frontier)],
+            "learnings": [learning.model_dump() for learning in cache._learnings(frontier)],
+            "shared": view.get_candidate("shared").model_dump(),
+        }
+
+
+@pytest.mark.parametrize("collide_all", [False, True])
+def test_reindex_collisions_preserve_rows_and_every_recorded_frontier(
+    tmp_path: Path, collide_all: bool
+) -> None:
+    config = RunConfig(run_root=str(tmp_path / "runs"), arena_root=str(tmp_path / "arena"))
+    incremental = tmp_path / "incremental"
+    rebuilt = tmp_path / "rebuilt"
+    board = ArenaBoard(arena_root=config.arena_root, cache_dir=str(incremental))
+    fresh = ArenaBoard(arena_root=config.arena_root, cache_dir=str(rebuilt))
+    runs = [FakeRun(config.run_root, rid) for rid in ("z-run", "a-run")]
+    snapshots = []
+
+    def record(number: int) -> None:
+        frontier = board.frontier()
+        snapshots.append(_snapshot_rows(board, runs[0].goal.key(), frontier))
+        runs[0].commit(
+            EventDraft(
+                type=EventType.FRONTIER,
+                goal_id=runs[0].goal.id,
+                payload={"round": number, "frontier": frontier.model_dump(mode="json")},
+            )
+        )
+
+    def items(run: FakeRun, value: int) -> list[EventDraft]:
+        suffix = "shared" if collide_all else run.run_id
+        return [
+            run.candidate("shared", team=run.run_id),
+            run.score(f"score-{suffix}", "shared", value),
+            run.learning(
+                f"learning-{suffix}",
+                "Hint",
+                evidence=["shared"],
+                text=f"SECRET_COLLISION_CONTENT-{run.run_id}",
+                tags=[run.run_id],
+            ),
+        ]
+
+    try:
+        board.open("", "", ["toy"])
+        runs[0].commit(runs[0].plan(), *items(runs[0], 1))
+        add_pointer(config.arena_root, runs[0])
+        record(1)
+        # The smaller run is marked before its colliding row is committed.
+        runs[1].commit(runs[1].plan())
+        add_pointer(config.arena_root, runs[1])
+        record(2)
+        runs[1].commit(*items(runs[1], 2))
+        record(3)
+        final = board.frontier()
+        events = [e for _, batch in read_chain(runs[0].store, runs[0].heads[-1]) for e in batch]
+        frontiers = recorded_frontiers(events)
+        assert len(frontiers) == 3
+        before = _logical_rows(incremental)
+        assert reindex(config, ["toy"], cache_dir=rebuilt) == final
+        after = _logical_rows(rebuilt)
+        assert before == after
+        for index, (_, _, frontier) in enumerate(frontiers):
+            actual = _snapshot_rows(board, runs[0].goal.key(), frontier)
+            assert actual == snapshots[index]
+            assert _snapshot_rows(fresh, runs[0].goal.key(), frontier) == actual
+            assert actual["shared"]["run_id"] == ("a-run" if index == 2 else "z-run")
+        assert "SECRET_COLLISION_CONTENT" not in repr(board._caches["toy"].warnings)
+    finally:
+        board.close()
+        fresh.close()
+        for run in runs:
+            run._lease.release()

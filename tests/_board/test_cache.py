@@ -176,9 +176,10 @@ def test_producing_identity_matches_core_and_rebuild(tmp_path: Path, change: str
     rebuilt.close()
 
 
-def test_id_from_other_run_is_skipped_with_warning(tmp_path: Path) -> None:
+def test_id_from_other_run_is_retained_with_frontier_holder(tmp_path: Path) -> None:
     cache = ArenaCache(tmp_path / "toy.sqlite")
-    for rid in ("r1", "r2"):
+    marks = []
+    for rid in ("r2", "r1"):
         run = FakeRun(str(tmp_path / "runs"), rid)
         head = run.commit(
             run.plan(),
@@ -188,20 +189,31 @@ def test_id_from_other_run_is_skipped_with_warning(tmp_path: Path) -> None:
         )
         ingest_run(cache, run.store, rid, run.run_root, head)
         ingest_run(cache, run.store, rid, run.run_root, head)
+        marks.append((rid, run.run_root, head))
+        run._lease.release()
     assert cache.warnings == [
-        f"{kind} {id} of run r2 skipped: the cache holds it from run r1"
+        f"{kind} {id} has multiple producers; holder selected at each frontier"
         for kind, id in [("candidate", "c-1"), ("score", "s-1"), ("learning", "L-1")]
     ]
-    assert cache._conn.execute("SELECT run_id FROM candidates").fetchall() == [("r1",)]
-    assert cache._conn.execute("SELECT * FROM learning_tags").fetchall() == [("L-1", "tag")]
+    assert cache._conn.execute("SELECT run_id FROM candidates ORDER BY run_id").fetchall() == [
+        ("r1",),
+        ("r2",),
+    ]
+    assert cache._conn.execute("SELECT * FROM learning_tags ORDER BY producer").fetchall() == [
+        ("L-1", "run:r1", "tag"),
+        ("L-1", "run:r2", "tag"),
+    ]
+    assert cache.candidates(build_frontier(marks[:1], [], []))[0][0].run_id == "r2"
+    assert cache.candidates(build_frontier(marks, [], []))[0][0].run_id == "r1"
     cache.close()
 
 
-def test_schema_version_mismatch_raises(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 99])
+def test_schema_version_mismatch_raises(tmp_path: Path, version: int) -> None:
     path = tmp_path / "toy.sqlite"
     ArenaCache(path).close()
     with sqlite3.connect(path) as conn:
-        conn.execute("PRAGMA user_version = 99")
+        conn.execute(f"PRAGMA user_version = {version}")
     with pytest.raises(RuntimeError, match="reindex"):
         ArenaCache(path)
 
@@ -905,10 +917,12 @@ def test_human_added_learning_needs_its_object(tmp_path: Path) -> None:
         }
     )
     assert cache._conn.execute("SELECT goal_key FROM learnings").fetchone() == (None,)
-    assert cache._conn.execute("SELECT * FROM learning_tags").fetchall() == [(learning.id, "tag")]
-    assert cache._conn.execute("SELECT * FROM learning_evidence").fetchall() == [
-        (learning.id, "c-1")
+    assert cache._conn.execute("SELECT learning_id, tag FROM learning_tags").fetchall() == [
+        (learning.id, "tag")
     ]
+    assert cache._conn.execute(
+        "SELECT learning_id, candidate_id FROM learning_evidence"
+    ).fetchall() == [(learning.id, "c-1")]
     assert cache._conn.execute(
         "SELECT kind, target_id FROM learning_links ORDER BY kind"
     ).fetchall() == [
@@ -2405,3 +2419,133 @@ def test_review_imported_events_not_indexed(tmp_path: Path) -> None:
         assert cache._conn.execute("SELECT count(*) FROM scores").fetchone() == (0,)
     finally:
         cache.close()
+
+
+def test_collision_holder_precedes_filters_and_owns_learning_children(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    runs = [FakeRun(str(tmp_path / "runs"), rid) for rid in ("z-run", "a-run")]
+    marks = []
+    try:
+        for run, part in zip(runs, ("b", "a"), strict=True):
+            events = [
+                run.plan(parts=["a", "b"]),
+                run.candidate("shared", part=part, repeat_key=run.run_id),
+                run.candidate(f"c-{part}", part=part),
+                run.score("shared-score", "shared", 1, judge=part),
+                run.learning(
+                    "L-shared",
+                    f"hint{part}",
+                    text=f"SECRET_COLLISION_{part}",
+                    evidence=[f"c-{part}"],
+                    tags=[part],
+                    supersedes=["L-target"] if part == "b" else [],
+                ),
+            ]
+            if part == "b":
+                events.append(run.learning("L-target", "Target", author="human:x"))
+            head = run.commit(*events)
+            ingest_run(cache, run.store, run.run_id, run.run_root, head)
+            marks.append((run.run_id, run.run_root, head))
+        old = build_frontier(marks[:1], [], [])
+        current = build_frontier(marks, [], [])
+        key = cache.candidates(current, ids=["shared"])[0][0]
+        assert key.run_id == "a-run"
+        assert cache.candidates(current, ids=["shared"], run_id="z-run") == []
+        assert cache.scores(current, judge="b") == []
+        assert cache.scores(old, judge="b")[0][1][1] == "z-run"
+        for frontier, tag, absent in ((old, "b", "a"), (current, "a", "b")):
+            assert cache.learnings_by_id(frontier, ["L-shared"])[0].tags == [tag]
+            assert cache.count(frontier, filters=LearningFilter(tags=[tag])) == 1
+            assert cache.count(frontier, filters=LearningFilter(tags=[absent])) == 0
+            assert cache.find(
+                frontier, query=f"hint{tag}", filters=LearningFilter(), relevance_goal=None
+            ) == ["L-shared"]
+            assert (
+                cache.find(
+                    frontier, query=f"hint{absent}", filters=LearningFilter(), relevance_goal=None
+                )
+                == []
+            )
+            assert cache.find(
+                frontier, query=None, filters=LearningFilter(part=tag), relevance_goal=None
+            ) == ["L-shared"]
+            assert (
+                cache.find(
+                    frontier, query=None, filters=LearningFilter(part=absent), relevance_goal=None
+                )
+                == []
+            )
+            assert cache._citing_learning_ids(frontier, f"c-{tag}") == ["L-shared"]
+            assert cache._citing_learning_ids(frontier, f"c-{absent}") == []
+        assert cache.find(current, query=None, filters=LearningFilter(), relevance_goal=None) == [
+            "L-target",
+            "L-shared",
+        ]
+        assert cache.find(old, query=None, filters=LearningFilter(), relevance_goal=None) == [
+            "L-shared",
+            "L-target",
+        ]
+        old_part = cache._conn.execute(
+            "SELECT part_key FROM candidates WHERE id='shared' AND run_id='z-run'"
+        ).fetchone()[0]
+        assert cache.repeat_entries(current, goal_key=old_part, exclude_run="a-run") == []
+        assert (
+            cache.repeat_entries(old, goal_key=old_part, exclude_run="a-run")[0][1].run_id
+            == "z-run"
+        )
+        assert "SECRET_COLLISION" not in repr(cache.warnings)
+    finally:
+        cache.close()
+        for run in runs:
+            run._lease.release()
+
+
+def test_human_collisions_resolve_only_named_producers(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    try:
+        head = run.commit(
+            run.plan(),
+            run.candidate("c-1"),
+            run.score("s", "c-1", 9),
+            run.learning("L", "Journal", evidence=["c-1"], tags=["journal"]),
+        )
+        ingest_run(cache, run.store, run.run_id, run.run_root, head)
+        marks = [(run.run_id, run.run_root, head)]
+        old = build_frontier(marks, [], [])
+        curation = [PIN_NAME, HIDE_NAME]
+        reviews = [REVIEW_NAME, REVIEW_NAME.replace("-00000001", "-00000002")]
+        assert reviews[0] != reviews[1]
+        for i in (1, 0):
+            learning = _human_learning("L").model_copy(
+                update={"title": f"Human{i}", "tags": [f"human{i}"]}
+            )
+            score = Score(id="s", candidate_id="c-1", judge="human:alice", key=(i,), value=i)
+            cache.apply_human_objects(
+                [curation[i], reviews[i]],
+                [
+                    HumanObject(kind="add", author="human:alice", learning=learning),
+                    HumanObject(kind="review", author="human:alice", score=score),
+                ],
+            )
+        for i in (0, 1):
+            frontier = build_frontier(marks, [reviews[i]], [curation[i]])
+            assert cache.scores(frontier)[0][0].value == i
+            assert cache.learnings_by_id(frontier, ["L"])[0].title == f"Human{i}"
+            assert cache.count(frontier, filters=LearningFilter(tags=[f"human{i}"])) == 1
+            assert cache.count(frontier, filters=LearningFilter(tags=[f"human{1 - i}"])) == 0
+            assert cache.search(
+                "toy", f"Human{i}", frontier=frontier, goal=None, tags=(), limit=10
+            ) == ["L"]
+        together = build_frontier(marks, reviews, curation)
+        assert cache.scores(together)[0][0].value == 0
+        assert cache.learnings_by_id(together, ["L"])[0].title == "Human0"
+        assert cache.learnings_by_id(old, ["L"])[0].title == "Journal"
+        assert cache.scores(old)[0][0].value == 9
+        assert cache.scores(build_frontier(marks, [], curation))[0][0].value == 9
+        assert (
+            cache.learnings_by_id(build_frontier(marks, reviews, []), ["L"])[0].title == "Journal"
+        )
+    finally:
+        cache.close()
+        run._lease.release()

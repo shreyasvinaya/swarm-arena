@@ -54,24 +54,27 @@ _SCHEMA = (
         "PRIMARY KEY(run_id, goal_id, revision, part))"
     ),
     (
-        "candidates(id TEXT PRIMARY KEY, run_id TEXT, epoch INTEGER, seq INTEGER, ts TEXT, "
+        "candidates(id TEXT, producer TEXT NOT NULL, run_id TEXT, epoch INTEGER, seq INTEGER, "
+        "ts TEXT, "
         "goal_id TEXT, goal_key TEXT, part_key TEXT, part TEXT, team TEXT, agent TEXT, round "
         "INTEGER, fidelity TEXT, partial INTEGER, gated_out INTEGER, repeat_key TEXT, json "
-        "TEXT)"
+        "TEXT, PRIMARY KEY(id, producer))"
     ),
     (
-        "scores(id TEXT PRIMARY KEY, source TEXT, run_id TEXT, epoch INTEGER, seq INTEGER, ts "
-        "TEXT, obj_name TEXT, line INTEGER, candidate_id TEXT, judge TEXT, rubric_hash TEXT, "
-        "panel_hash TEXT, json TEXT)"
+        "scores(id TEXT, producer TEXT NOT NULL, source TEXT, run_id TEXT, epoch INTEGER, "
+        "seq INTEGER, ts TEXT, obj_name TEXT, line INTEGER, candidate_id TEXT, "
+        "judge TEXT, rubric_hash TEXT, "
+        "panel_hash TEXT, json TEXT, PRIMARY KEY(id, producer))"
     ),
     (
-        "learnings(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE, source TEXT, run_id TEXT, epoch "
-        "INTEGER, seq INTEGER, ts TEXT, obj_name TEXT, line INTEGER, goal_id TEXT, goal_key "
-        "TEXT, author TEXT, verified INTEGER, from_human INTEGER, json TEXT)"
+        "learnings(rowid INTEGER PRIMARY KEY, id TEXT, producer TEXT NOT NULL, source TEXT, "
+        "run_id TEXT, epoch INTEGER, seq INTEGER, ts TEXT, obj_name TEXT, line INTEGER, "
+        "goal_id TEXT, goal_key TEXT, author TEXT, verified INTEGER, from_human INTEGER, "
+        "json TEXT, UNIQUE(id, producer))"
     ),
-    "learning_tags(learning_id TEXT, tag TEXT)",
-    "learning_links(learning_id TEXT, kind TEXT, target_id TEXT)",
-    "learning_evidence(learning_id TEXT, candidate_id TEXT)",
+    "learning_tags(learning_id TEXT, producer TEXT, tag TEXT)",
+    "learning_links(learning_id TEXT, producer TEXT, kind TEXT, target_id TEXT)",
+    "learning_evidence(learning_id TEXT, producer TEXT, candidate_id TEXT)",
     "curation_ops(obj_name TEXT, line INTEGER, kind TEXT, learning_id TEXT)",
     "human_objects(name TEXT PRIMARY KEY)",
     # Lossless events let every reader use core activation and lifecycle semantics.
@@ -229,6 +232,11 @@ class ArenaCache:
     Frontier sets are filled once per read, including nested lookups, and all
     scratch selection rows are released on successful or failed outermost exit.
     Search filtering, relevance, pagination and counts execute in SQLite.
+    Colliding IDs retain the first row from each producer. At a frontier, the
+    holder is the visible row with the lexicographically smallest producer key:
+    ``run:<run_id>`` for journals or ``object:<object_name>`` for human objects.
+    Visibility includes the committed sequence or exact named object, and holder
+    selection precedes query filters. Later arrivals cannot change old frontiers.
     Private ``_replay`` and ``_plan_for_round`` lookups accept a committed prefix
     sequence and reuse core replay, including future activation boundaries.
 
@@ -243,7 +251,7 @@ class ArenaCache:
     >>> cache.close()  # doctest: +SKIP
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 2
+    SCHEMA_VERSION: ClassVar[int] = 3
 
     def __init__(self, path: Path) -> None:
         self.namespace = path.stem
@@ -284,14 +292,14 @@ class ArenaCache:
                         "ON segments(run_id, last_seq)"
                     )
                     for index, definition in (
-                        ("learning_tags_lookup", "learning_tags(learning_id, tag)"),
+                        ("learning_tags_lookup", "learning_tags(learning_id, producer, tag)"),
                         (
                             "learning_evidence_lookup",
-                            "learning_evidence(learning_id, candidate_id)",
+                            "learning_evidence(learning_id, producer, candidate_id)",
                         ),
                         (
                             "learning_superseders_lookup",
-                            "learning_links(target_id, kind, learning_id)",
+                            "learning_links(target_id, kind, learning_id, producer)",
                         ),
                         ("learning_goal_id_lookup", "learnings(goal_id)"),
                         ("learning_goal_key_lookup", "learnings(goal_key)"),
@@ -473,20 +481,20 @@ class ArenaCache:
             for warning in pending:
                 _LOG.warning("%s", warning)
 
-    def _insert_learning_children(self, learning: Learning) -> None:
+    def _insert_learning_children(self, learning: Learning, producer: str) -> None:
         """Project child rows after parent insertion within the caller's transaction."""
         self._conn.executemany(
-            "INSERT INTO learning_tags VALUES (?, ?)",
-            [(learning.id, tag) for tag in learning.tags],
+            "INSERT INTO learning_tags VALUES (?, ?, ?)",
+            [(learning.id, producer, tag) for tag in learning.tags],
         )
         self._conn.executemany(
-            "INSERT INTO learning_evidence VALUES (?, ?)",
-            [(learning.id, cid) for cid in learning.evidence],
+            "INSERT INTO learning_evidence VALUES (?, ?, ?)",
+            [(learning.id, producer, cid) for cid in learning.evidence],
         )
         self._conn.executemany(
-            "INSERT INTO learning_links VALUES (?, ?, ?)",
+            "INSERT INTO learning_links VALUES (?, ?, ?, ?)",
             [
-                (learning.id, kind, target)
+                (learning.id, producer, kind, target)
                 for kind in ("refines", "supersedes")
                 for target in getattr(learning, kind)
             ],
@@ -527,7 +535,7 @@ class ArenaCache:
         else:
             assert obj.learning is not None
             learning = obj.learning
-            if self._insert(
+            if producer := self._insert(
                 "learnings",
                 dict(
                     id=learning.id,
@@ -548,7 +556,7 @@ class ArenaCache:
                 "learning",
                 pending,
             ):
-                self._insert_learning_children(learning)
+                self._insert_learning_children(learning, producer)
 
     def has_object(self, name: str) -> bool:
         """
@@ -644,13 +652,23 @@ class ArenaCache:
             f"AND {alias}.source='{source}' "
         )
 
-    @staticmethod
-    def _member_condition(table: Literal["candidates", "scores", "learnings"]) -> str:
-        """Accept either a matched run mark or the proper named human source."""
-        return (
+    @classmethod
+    def _member_condition(
+        cls, table: Literal["candidates", "scores", "learnings"], alias: str = "i"
+    ) -> str:
+        """Select the smallest visible producer per ID before any query filters."""
+        visible = (
             "m.id IS NOT NULL"
             if table == "candidates"
             else ("(m.id IS NOT NULL OR o.id IS NOT NULL)")
+        )
+        return (
+            visible
+            + f" AND NOT EXISTS (SELECT 1 FROM {table} holder "
+            + cls._member_join(table, "holder")
+            + f" WHERE holder.id={alias}.id AND holder.producer<{alias}.producer AND "
+            + visible
+            + ")"
         )
 
     def _item_rows(
@@ -787,7 +805,9 @@ class ArenaCache:
             rows = self._conn.execute(
                 "SELECT i.repeat_key, i.json FROM candidates i "
                 + self._member_join("candidates", "i")
-                + " WHERE i.part_key=? AND i.run_id!=? AND i.repeat_key IS NOT NULL"
+                + " WHERE "
+                + self._member_condition("candidates")
+                + " AND i.part_key=? AND i.run_id!=? AND i.repeat_key IS NOT NULL"
                 + " ORDER BY i.ts, i.run_id, i.seq, i.id",
                 (goal_key, exclude_run),
             ).fetchall()
@@ -988,10 +1008,8 @@ class ArenaCache:
             self._search_covered()
             source, params = self._learning_sql(LearningFilter())
             rows = self._conn.execute(
-                self._flags_sql()
-                + "SELECT l.id FROM "
-                + source
-                + " AND l.id IN (SELECT learning_id FROM learning_evidence WHERE candidate_id=?)"
+                self._flags_sql() + "SELECT l.id FROM " + source + " AND (l.id, l.producer) IN "
+                "(SELECT learning_id, producer FROM learning_evidence WHERE candidate_id=?)"
                 + " ORDER BY l.id",
                 [*params, candidate_id],
             )
@@ -1068,7 +1086,7 @@ class ArenaCache:
                 "FROM learnings l "
                 + self._member_join("learnings", "l")
                 + " WHERE "
-                + self._member_condition("learnings")
+                + self._member_condition("learnings", "l")
                 + " ORDER BY l.id"
             )
         except BaseException:
@@ -1091,7 +1109,7 @@ class ArenaCache:
         )
         source += self._member_join("learnings", "l")
         source += " LEFT JOIN flags f ON f.learning_id=l.id WHERE "
-        clauses = [self._member_condition("learnings")]
+        clauses = [self._member_condition("learnings", "l")]
         params: list[Any] = []
         if filters.goal_key is not None:
             if filters.goal_id is None:
@@ -1127,15 +1145,17 @@ class ArenaCache:
         if filters.tags:
             clauses.append(
                 "EXISTS (SELECT 1 FROM learning_tags t JOIN json_each(?) wanted "
-                "ON wanted.value=t.tag WHERE t.learning_id=l.id)"
+                "ON wanted.value=t.tag WHERE t.learning_id=l.id AND t.producer=l.producer)"
             )
             params.append(json.dumps(filters.tags))
         if filters.part is not None:
             clauses.append(
                 "EXISTS (SELECT 1 FROM learning_evidence e "
-                "JOIN candidates c ON c.id=e.candidate_id JOIN _read_sets pm "
-                "ON pm.set_name='marks' AND pm.id=c.run_id AND c.seq<=pm.seq "
-                "WHERE e.learning_id=l.id AND c.part=?)"
+                "JOIN candidates c ON c.id=e.candidate_id "
+                + self._member_join("candidates", "c")
+                + "WHERE e.learning_id=l.id AND e.producer=l.producer AND c.part=? AND "
+                + self._member_condition("candidates", "c")
+                + ")"
             )
             params.append(filters.part)
         return source + " AND ".join(clauses), params
@@ -1146,11 +1166,11 @@ class ArenaCache:
         """Order by visible superseders and metadata without loading JSON models."""
         superseded = (
             "EXISTS (SELECT 1 FROM learning_links link JOIN learnings s "
-            "ON s.id=link.learning_id "
+            "ON s.id=link.learning_id AND s.producer=link.producer "
             + self._member_join("learnings", "s")
             + "LEFT JOIN flags sf ON sf.learning_id=s.id "
             "WHERE link.target_id=l.id AND link.kind='supersedes' AND "
-            + self._member_condition("learnings")
+            + self._member_condition("learnings", "s")
             + " AND coalesce(sf.kind,'')!='hide')"
         )
         params: list[Any] = []
@@ -1162,7 +1182,7 @@ class ArenaCache:
         if filters.tags:
             matching_tags = (
                 "(SELECT count(DISTINCT t.tag) FROM learning_tags t JOIN json_each(?) wanted "
-                "ON wanted.value=t.tag WHERE t.learning_id=l.id)"
+                "ON wanted.value=t.tag WHERE t.learning_id=l.id AND t.producer=l.producer)"
             )
             params.append(json.dumps(filters.tags))
         return (
@@ -1517,25 +1537,31 @@ class ArenaCache:
             raise _core_error(ChainError, "segment epoch moves backwards")
         return False
 
-    def _insert(self, table: str, values: dict[str, Any], kind: str, pending: list[str]) -> bool:
-        """Insert an ID once and defer collision warnings until transaction commit."""
-        row = self._conn.execute(
-            f"SELECT run_id FROM {table} WHERE id=?", (values["id"],)
-        ).fetchone()
-        if row is not None:
-            if row[0] != values["run_id"]:
-                pending.append(
-                    f"{kind} {values['id']} of run {values['run_id']} skipped: "
-                    f"the cache holds it from run {row[0]}"
-                )
-            return False
+    def _insert(
+        self, table: str, values: dict[str, Any], kind: str, pending: list[str]
+    ) -> str | None:
+        """Retain each producer and defer identifier-only warnings until commit."""
+        producer = (
+            f"object:{values['obj_name']}"
+            if values.get("obj_name") is not None
+            else f"run:{values['run_id']}"
+        )
+        if self._conn.execute(
+            f"SELECT 1 FROM {table} WHERE id=? AND producer=?", (values["id"], producer)
+        ).fetchone():
+            return None
+        if self._conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (values["id"],)).fetchone():
+            pending.append(
+                f"{kind} {values['id']} has multiple producers; holder selected at each frontier"
+            )
+        values["producer"] = producer
         columns = ", ".join(values)
         placeholders = ", ".join("?" for _ in values)
         self._conn.execute(
             f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})",
             tuple(values.values()),
         )
-        return True
+        return producer
 
     def _index(self, event: Event, state: RunState, pending: list[str]) -> None:
         """Project indexable models; all lifecycle interpretation stays in replay."""
@@ -1657,7 +1683,7 @@ class ArenaCache:
                 raise _core_error(ChainError, "learning does not match event routing")
             if learning.namespace != self.namespace:
                 return
-            if self._insert(
+            if producer := self._insert(
                 "learnings",
                 dict(
                     id=learning.id,
@@ -1675,4 +1701,4 @@ class ArenaCache:
                 "learning",
                 pending,
             ):
-                self._insert_learning_children(learning)
+                self._insert_learning_children(learning, producer)
