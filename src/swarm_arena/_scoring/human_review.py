@@ -5,7 +5,7 @@ import html
 import io
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
@@ -288,14 +288,11 @@ def _write_export(out_dir: Path, files: dict[str, bytes]) -> None:
         ) from None
 
 
-def _review_keys(state: RunState, reviewer: str, arena_root: str, now: datetime) -> dict[str, str]:
+def _review_keys(
+    state: RunState, reviewer: str, arena_root: str, now: datetime, scores: Sequence[Score]
+) -> dict[str, str]:
     """Validate all derived locations without probing or mutating storage."""
-    namespaces = {
-        g.namespace
-        for revisions in state.plans.values()
-        for p, _ in revisions
-        for g in [p.goal, *(part.goal for part in p.parts)]
-    }
+    namespaces = {state.candidate_goal_keys[score.candidate_id].namespace for score in scores}
     keys = {
         ns: human_object_key(ns, "reviews", human_object_name(now), reviewer=reviewer)
         for ns in sorted(namespaces)
@@ -590,13 +587,15 @@ class HumanReview:
         data = await anyio.to_thread.run_sync(_read_csv, _local_path(csv_path))
         store = await anyio.to_thread.run_sync(run_store, config.run_root, run_id)
         state = await anyio.to_thread.run_sync(_read_state, store, run_id)
-        parse_review_csv(data, state, judge=self.judge_name)
-        await run_sync_daemon(_review_keys, state, self._reviewer, config.arena_root, utc_now())
+        initial_scores = parse_review_csv(data, state, judge=self.judge_name)
+        await run_sync_daemon(
+            _review_keys, state, self._reviewer, config.arena_root, utc_now(), initial_scores
+        )
         await anyio.to_thread.run_sync(check_storage, config)
 
         def validate_locations(doc: OwnerDoc) -> None:
             current = _read_state(store, run_id, doc)
-            _review_keys(current, self._reviewer, config.arena_root, utc_now())
+            _review_keys(current, self._reviewer, config.arena_root, utc_now(), initial_scores)
 
         try:
             lease = await _take_over(
@@ -633,7 +632,7 @@ class HumanReview:
                     await _repair_review_objects(state, arena, store, lease, writer)
                     now = utc_now()
                     keys = await run_sync_daemon(
-                        _review_keys, state, self._reviewer, config.arena_root, now
+                        _review_keys, state, self._reviewer, config.arena_root, now, scores
                     )
                     ids = IdGen(run_id, lease.doc.epoch, counters=state.id_counters)
                     scores = [

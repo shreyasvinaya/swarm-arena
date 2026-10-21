@@ -117,20 +117,10 @@ reads still prefer that goal after higher-priority relevance criteria.
 Call `frontier()` on a worker to publish committed data before board-level reads,
 and again to refresh it. Before the first publication, committed reads are empty;
 candidate, learning and score ID lookups can still use process-local hints.
-A previously created view stays fixed. Storage reads and ingestion run under a
-separate refresh lock. Board and view reads use prepared WAL reader connections
-and plan projections, so an event-loop read does not wait for a worker fetching
-a journal or writing the cache. The frontier and its prepared reader state are
-published together under a short in-memory lock. A failed refresh leaves the
-previous generation readable; snapshot preparation also belongs on a worker.
-Each public Board or view read pins its captured reader lifetime for the entire
-operation, including queries performed after candidate validation. Publication
-swaps stop new Board reads from capturing the previous generation. Generations
-and fixed views share one reader per namespace; a swap does not close that pool.
-`close()` stops new reads and waits for active reads before releasing connections,
-without holding the refresh or publication lock during the wait. Subsequent reads
-raise `RuntimeError("arena board is closed")`. Calling `open()` again starts a new
-lifetime; views from the closed lifetime remain closed.
+A previously created view stays fixed. Refreshes leave the published data
+readable, and a failed refresh preserves the previous view. Snapshot preparation
+also belongs on a worker. Close the board after use; reads after close raise
+`RuntimeError`. Reopening starts a new lifetime, while old views remain closed.
 Plan resolution is retained per run and committed mark in the open board.
 Repeated reads at unchanged marks do not replay journal history. Advancement
 reuses committed replay checkpoints and folds only missing events; a cold or
@@ -258,7 +248,7 @@ S3 `arena_root` is refused because other readers need access to the run journal.
 The endpoint must enforce both `If-None-Match` creation and `If-Match`
 replacement. Preflight verifies these conditions once per distinct S3 root.
 `resume` probes again before taking over a run, since it may run on a different
-host or endpoint. The planned `review import` command has the same requirement
+host or endpoint. The `review import` command has the same requirement
 before takeover. `S3Store` also refuses each write if the installed botocore model
 would discard its required conditional parameter. Listings bypass s3fs caches
 so newly published run pointers are visible on the next listing.
@@ -334,7 +324,7 @@ dropped, including summaries of human learnings that have no evidence.
 
 Superseded learnings remain searchable but rank below their visible summaries
 in the normal learning list. Search still prioritizes text-match relevance.
-Hiding a mistaken summary with the planned `learnings hide <summary-id>` command
+Hiding a mistaken summary with the `learnings hide <summary-id>` command
 undoes the merge's ranking effect; the original learnings remain intact.
 
 Curation follows the committed nonterminal policy decision and precedes round
@@ -542,5 +532,17 @@ require every object named by their frontier.
 
 When candidate IDs collide, journal scores for a discarded producer do not
 rank the retained candidate. Scores recorded for external visible candidates
-and named human reviews remain available. Historical frontiers resolve their
-own retained producer.
+and named human reviews remain available. External scores stay with the producer
+selected by their recorded scoring frontier; ambiguous references without a
+recorded frontier are omitted. Historical frontiers resolve their own retained
+producer.
+
+Large arenas still retain committed event/replay data in memory, and fixed views
+materialize candidate models. Refresh I/O can repeat across namespace caches.
+Memory and I/O therefore grow with arena history; reducing these costs is planned
+for M3/M4.
+
+A run ID supplied to `leaderboard` or `board serve` is resolved from stored runs
+or arena pointers before treating the target as a namespace. Custom IDs such as
+`my-run` are supported. In the viewer, clearing the Run field includes other runs
+and human learnings; blank optional filter fields impose no restriction.

@@ -16,16 +16,14 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import anyio
 
-from swarm_arena._board.arena import ArenaBoard, _namespace_frontier, _Published
-from swarm_arena._board.cache import ArenaCache, LearningFilter
+from swarm_arena._board.arena import ArenaBoard, _ArenaReader
+from swarm_arena._board.cache import LearningFilter
 from swarm_arena._board.human_ops import _apply_human_operation
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._board.pointers import _validate_namespace
-from swarm_arena._board.trace import _lines
 from swarm_arena._errors import _core_error
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._model.board_types import Frontier
-from swarm_arena._model.results import Candidate, Learning
+from swarm_arena._model.results import Learning
 
 _PAGE_SIZE = 50
 _MAX_FORM = 65536
@@ -55,36 +53,8 @@ def _markers(item: Learning) -> str:
     )
 
 
-def _learning(
-    state: _Published, namespaces: Sequence[str], identifier: str
-) -> tuple[str, Learning]:
-    """Find even a hidden item without weakening public board filtering."""
-    for ns in namespaces:
-        cache = state.readers.get(ns)
-        if cache is not None:
-            items = cache.learnings_by_id(_namespace_frontier(state.frontier, ns), [identifier])
-            if items:
-                return ns, items[0]
-    raise KeyError(identifier)
-
-
-def _candidate(
-    state: _Published, namespaces: Sequence[str], identifier: str
-) -> tuple[ArenaCache, Frontier, Candidate, int]:
-    """Resolve explicit historical evidence within one captured generation."""
-    for ns in namespaces:
-        cache = state.readers.get(ns)
-        if cache is not None:
-            frontier = _namespace_frontier(state.frontier, ns)
-            pairs = cache.candidates(frontier, ids=[identifier])
-            if pairs:
-                item, position = pairs[0]
-                return cache, frontier, item, position[2]
-    raise KeyError(identifier)
-
-
 def _index(
-    state: _Published, namespaces: Sequence[str], params: dict[str, list[str]], run_id: str | None
+    state: _ArenaReader, namespaces: Sequence[str], params: dict[str, list[str]], run_id: str | None
 ) -> str:
     """Filter in SQL, hydrating only the current page and preserving query links."""
 
@@ -106,46 +76,13 @@ def _index(
         hidden=None if value("hidden") == "all" else value("hidden") == "1",
     )
     query = value("q") or None
-    skip = (page - 1) * _PAGE_SIZE
-    selected: list[Learning] = []
-    for ns in namespaces:
-        if value("ns") and value("ns") != ns:
-            continue
-        cache = state.readers.get(ns)
-        if cache is None:
-            continue
-        frontier = _namespace_frontier(state.frontier, ns)
-        if query is None:
-            count = cache.count(frontier, filters=filters)
-            if skip >= count:
-                skip -= count
-                continue
-            ids = cache.find(
-                frontier,
-                query=None,
-                filters=filters,
-                relevance_goal=None,
-                offset=skip,
-                limit=_PAGE_SIZE + 1 - len(selected),
-            )
-        else:
-            # count() intentionally has no text argument; select only IDs for skipped rows.
-            ids = cache.find(
-                frontier,
-                query=query,
-                filters=filters,
-                relevance_goal=None,
-                limit=skip + _PAGE_SIZE + 1 - len(selected),
-            )
-            if skip >= len(ids):
-                skip -= len(ids)
-                continue
-            ids = ids[skip:]
-        skip = 0
-        items = {item.id: item for item in cache.learnings_by_id(frontier, ids)}
-        selected.extend(items[identifier] for identifier in ids)
-        if len(selected) > _PAGE_SIZE:
-            break
+    selected = state.find(
+        [ns for ns in namespaces if not value("ns") or value("ns") == ns],
+        query=query,
+        filters=filters,
+        offset=(page - 1) * _PAGE_SIZE,
+        limit=_PAGE_SIZE + 1,
+    )
     body = '<h1>Learnings</h1><form method="get">'
     for name in (
         "q",
@@ -162,7 +99,8 @@ def _index(
         "pinned",
         "hidden",
     ):
-        body += f'<label>{name} <input name="{name}" value="{_e(value(name) if name != "run" or "run" in params else run_id or "")}"></label> '
+        field = value(name) if name != "run" or "run" in params else run_id or ""
+        body += f'<label>{name} <input name="{name}" value="{_e(field)}"></label> '
     body += "<button>Search</button></form><ul>"
     for item in selected[:_PAGE_SIZE]:
         body += (
@@ -177,7 +115,9 @@ def _index(
     return body
 
 
-def _learning_page(state: _Published, namespaces: Sequence[str], item: Learning, token: str) -> str:
+def _learning_page(
+    state: _ArenaReader, namespaces: Sequence[str], item: Learning, token: str
+) -> str:
     """Show evidence values using the shared score display policy."""
     body = (
         f"<h1>{_e(item.title)}</h1><pre>{_e(item.text)}</pre>"
@@ -185,9 +125,8 @@ def _learning_page(state: _Published, namespaces: Sequence[str], item: Learning,
     )
     for identifier in item.evidence:
         try:
-            cache, frontier, _, _ = _candidate(state, namespaces, identifier)
-            scores = cache.scores(frontier, candidate_ids=[identifier])
-            values = ", ".join(f"{score.judge}: {format_value(score.value)}" for score, _ in scores)
+            scores = state.scores(namespaces, identifier)
+            values = ", ".join(f"{score.judge}: {format_value(score.value)}" for score in scores)
             values = values or "-"
         except KeyError:
             values = "error: unknown candidate"
@@ -202,9 +141,9 @@ def _learning_page(state: _Published, namespaces: Sequence[str], item: Learning,
     return body
 
 
-def _candidate_page(state: _Published, namespaces: Sequence[str], identifier: str) -> str:
+def _candidate_page(state: _ArenaReader, namespaces: Sequence[str], identifier: str) -> str:
     """Render historical lineage and the shared committed trace from the same state."""
-    cache, frontier, item, seq = _candidate(state, namespaces, identifier)
+    item = state.candidate(namespaces, identifier)
     body = f"<h1>{_e(item.id)}</h1><pre>{_e(item.model_dump_json())}</pre><h2>Parents</h2>"
     body += " ".join(_link("candidate", parent) for parent in item.parent_ids) or "-"
     body += "<h2>Ancestors</h2>"
@@ -218,16 +157,10 @@ def _candidate_page(state: _Published, namespaces: Sequence[str], identifier: st
         visited.update(batch)
         ancestors.extend(batch)
         pending = []
-        for ns in namespaces:
-            reader = state.readers.get(ns)
-            if reader is not None:
-                for parent, _ in reader.candidates(
-                    _namespace_frontier(state.frontier, ns), ids=batch
-                ):
-                    pending.extend(parent.parent_ids)
+        for parent in state.candidates(namespaces, batch):
+            pending.extend(parent.parent_ids)
     body += " ".join(_link("candidate", parent) for parent in ancestors) or "-"
-    revisions = state.plans[item.run_id].revisions[item.goal_id]
-    lines = _lines(cache, frontier, item, seq, revisions)
+    lines = state.trace(namespaces, identifier)
     return body + f"<h2>Trace</h2><pre>{_e(chr(10).join(lines))}</pre>"
 
 
@@ -279,8 +212,9 @@ def make_server(
     >>> server.server_close()  # doctest: +SKIP
     """
     names = tuple(dict.fromkeys(_validate_namespace(ns) for ns in namespaces))
-    if not names or any(ns not in board._namespaces for ns in names):
-        raise _core_error(ValueError, "namespace outside board")
+    with board._read_namespace() as reader:
+        if not names or any(ns not in reader.namespaces() for ns in names):
+            raise _core_error(ValueError, "namespace outside board")
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", host):
         raise _core_error(ValueError, "invalid host")
     if not 0 <= port <= 65535:
@@ -430,12 +364,12 @@ def make_server(
                 if post:
                     self._mutate(parsed.path, fields)
                     return
-                with board._pin_state() as state:
+                with board._read_namespace() as state:
                     if parsed.path == "/":
                         body = _index(state, names, params, run_id)
                         body += self._add_form()
                     elif parsed.path.startswith("/learning/"):
-                        _, item = _learning(state, names, unquote(parsed.path[len("/learning/") :]))
+                        item = state.learning(names, unquote(parsed.path[len("/learning/") :]))
                         body = _learning_page(state, names, item, token)
                     elif parsed.path.startswith("/candidate/"):
                         body = _candidate_page(
@@ -480,8 +414,8 @@ def make_server(
                     raise KeyError("route")
                 identifier = unquote(pieces[2])
                 kind = "pin" if pieces[3] == "pin" else "hide"
-                with board._pin_state() as state:
-                    namespace, _ = _learning(state, names, identifier)
+                with board._read_namespace() as state:
+                    namespace = state.learning(names, identifier).namespace
 
             async def apply() -> str:
                 nonlocal refreshed

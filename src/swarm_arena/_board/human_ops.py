@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from functools import partial
 from typing import Literal
 
-from swarm_arena._board.arena import ArenaBoard, _namespace_frontier
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.human_objects import HumanObject, write_human_objects
 from swarm_arena._board.learnings import is_verified
 from swarm_arena._board.pointers import _validate_namespace
@@ -31,17 +31,17 @@ def _prepare_human_operation(
 ) -> HumanObject:
     """Validate against one published generation, including hidden target membership."""
     namespace = _validate_namespace(namespace)
-    with board._pin_state() as state:
-        if namespace not in state.namespaces:
+    with board._read_namespace() as reader:
+        if namespace not in reader.namespaces():
             raise _core_error(ValueError, "namespace outside board")
-        cache = state.readers.get(namespace)
-        frontier = _namespace_frontier(state.frontier, namespace)
         if kind != "add":
-            if cache is None or not cache.learnings_by_id(frontier, [learning_id or ""]):
-                raise _core_error(ValueError, f"unknown learning {learning_id}")
+            try:
+                reader.learning([namespace], learning_id or "")
+            except KeyError:
+                raise _core_error(ValueError, f"unknown learning {learning_id}") from None
             return HumanObject(kind=kind, learning_id=learning_id, author=f"human:{author}")
-        candidates = [] if cache is None else cache.candidates(frontier, ids=list(evidence))
-        found = {candidate.id: candidate for candidate, _ in candidates}
+        candidates = reader.candidates([namespace], list(evidence))
+        found = {candidate.id: candidate for candidate in candidates}
         for identifier in evidence:
             if identifier not in found:
                 raise _core_error(ValueError, f"unknown candidate {identifier}")

@@ -51,7 +51,8 @@ class _Reads(ABC):
         Raises
         ------
         ValueError
-            If the goal is unknown or outside this view.
+            If the goal lies outside a fixed view. ArenaBoard returns an empty
+            list for an unknown board-level goal.
 
         Examples
         --------
@@ -81,7 +82,7 @@ class _Reads(ABC):
         namespace : str
             Problem family.
         tags : Sequence[str], default=()
-            Tags used to prefer matching learnings.
+            ArenaBoard filters by any supplied tag; in-memory boards may prefer matches.
         goal : GoalKey or None, default=None
             Goal whose learnings are preferred after pinned items.
         limit : int, default=50
@@ -120,16 +121,17 @@ class _Reads(ABC):
         limit: int = 10,
     ) -> list[Learning]:
         """
-        Search titles and bodies by case-insensitive substring, newest first.
+        Search visible learning text using the board implementation's ordering.
 
         Parameters
         ----------
         namespace : str
             Problem family.
         query : str
-            Substring to find in a title or body.
+            Literal search text. ArenaBoard tokenizes it and ranks with FTS5 bm25;
+            in-memory boards use a case-insensitive substring.
         tags : Sequence[str], default=()
-            Required tags; every supplied tag must be present.
+            ArenaBoard uses any-of tag filtering; in-memory boards require all tags.
         goal : GoalKey or None, default=None
             Optional goal scope, validated against a snapshot's goal.
         limit : int, default=10
@@ -138,7 +140,8 @@ class _Reads(ABC):
         Returns
         -------
         list[Learning]
-            Visible matches in descending journal order.
+            Visible matches in text relevance order for ArenaBoard, then learning
+            relevance; in-memory boards return newest matches first.
 
         Raises
         ------
@@ -308,7 +311,8 @@ class _Reads(ABC):
         Raises
         ------
         ValueError
-            If the goal is unknown or outside this view.
+            If the goal lies outside a fixed view. ArenaBoard returns an empty
+            list for an unknown board-level goal.
 
         Examples
         --------

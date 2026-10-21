@@ -2357,9 +2357,11 @@ class ArenaCache:                                    # M2; SQLite (WAL) file per
     def apply_human_objects(self, names: Sequence[str], objects: Sequence[HumanObject], *,
                             covered: Sequence[str] = ()) -> None: ...
         # covered records fully read names atomically even when their JSONL contains no operations.
-    def search(self, namespace: str, query: str, *, frontier: Frontier, goal: GoalKey | None,
-               tags: Sequence[str], limit: int) -> list[str]: ...
-        # FTS5 bm25 over a per-frontier index of the frontier's learnings only, then §6.3 relevance
+    def find(self, frontier: Frontier, *, query: str | None, filters: LearningFilter,
+             relevance_goal: tuple[str, str] | None, offset: int = 0, limit: int = 10) -> list[str]: ...
+        # FTS5 bm25 over the fixed frontier corpus, then learning relevance; predicates and pagination in SQL.
+    def count(self, frontier: Frontier, *, filters: LearningFilter) -> int: ...
+        # Non-text match count in SQL without model hydration.
 class RunPointer(StoredModel):  run_id: str; run_root: str
 class HumanObject(StoredModel):                      # reviews/ and curation/ objects (one JSONL line each)
     kind: Literal["pin", "hide", "add", "review"]

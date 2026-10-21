@@ -9,6 +9,7 @@ from threading import Event as ThreadEvent
 import anyio
 import pytest
 from _fakes import tools
+from _fakes.arena import recorded_frontiers
 from _fakes.curators import PostingManager
 
 from swarm_arena import (
@@ -27,7 +28,6 @@ from swarm_arena import (
 )
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.learnings import DUPLICATE_JACCARD, jaccard, title_tokens
-from _fakes.arena import recorded_frontiers
 from swarm_arena._errors import AlreadyExists, PreconditionFailed
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import read_owner

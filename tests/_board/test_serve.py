@@ -351,7 +351,7 @@ def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.Mon
         server.board.frontier()
         return _lines(cache, frontier, candidate, seq, revisions)
 
-    monkeypatch.setattr("swarm_arena._board.serve._lines", lines)
+    monkeypatch.setattr("swarm_arena._board.trace._lines", lines)
     assert "late-score" not in get(server, "/candidate/c-child")
 
 

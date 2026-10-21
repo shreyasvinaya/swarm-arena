@@ -398,8 +398,7 @@ async def test_empty_review_import_is_valid(
         == []
     )
     keys = _reviews(run_config)
-    assert len(keys) == 1
-    assert open_store(run_config.arena_root).read(keys[0]).data == b""
+    assert keys == []
 
 
 def _add_namespace(run: FakeRun) -> None:
@@ -591,7 +590,7 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
     _add_namespace(review_run)
     # Setup retains the normal lease; only the stalled phase needs fast fence detection.
     config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 1.5})
-    path = _file(tmp_path)
+    path = _file(tmp_path, _csv({"id": "c-1", "score": "7"}, {"id": "c-second", "score": "8"}))
 
     def fail(*args: Any, **kwargs: Any) -> str:
         raise _core_error(StorageError, "interrupted publication")
@@ -1240,3 +1239,12 @@ async def test_import_uses_configured_board_arena(
         assert board.scores("c-1")[-1].id == scores[0].id
     finally:
         board.close()
+
+
+async def test_import_writes_only_namespaces_with_scores(
+    review_run: FakeRun, run_config: RunConfig, tmp_path: Path
+) -> None:
+    _add_namespace(review_run)
+    await HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
+    assert len(_reviews(run_config)) == 1
+    assert _reviews(run_config)[0].startswith("toy/reviews/")

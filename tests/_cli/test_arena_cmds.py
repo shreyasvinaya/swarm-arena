@@ -665,3 +665,72 @@ def test_reindex_lock_diagnostic_does_not_expose_configured_path(
         assert str(board._cache_dir()) not in output.err
     finally:
         board.close()
+
+
+def test_custom_run_identifier_resolves_by_stored_run(
+    finished_run: FinishedRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert finished_run.run_id == "first"
+    assert _call(finished_run, "leaderboard", finished_run.run_id) == 0
+    assert {row[2] for row in _rows(capsys.readouterr().out)} == {finished_run.run_id}
+
+
+def test_run_pointer_resolves_target_outside_configured_run_root(
+    review_cli_run: FinishedRun, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = review_cli_run.config.model_copy(update={"run_root": str(tmp_path / "other-runs")})
+    review_cli_run.config_path.write_text(config.dumps())
+    assert _call(review_cli_run, "leaderboard", review_cli_run.run_id) == 0
+    assert {row[2] for row in _rows(capsys.readouterr().out)} == {review_cli_run.run_id}
+
+
+def test_cli_human_ranking_keeps_fidelities_and_ignores_plan_margin(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena import RunConfig
+
+    config = RunConfig(run_root=str(tmp_path / "runs"), arena_root=str(tmp_path / "arena"))
+    run = FakeRun(config.run_root, "my-run")
+    run.commit(
+        run.plan(min_improvement=0.5),
+        run.candidate("c-cheap", round=1, fidelity="cheap"),
+        run.candidate("c-full", round=2, fidelity="full"),
+    )
+    run._lease.release()
+    add_pointer(config.arena_root, run)
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(config.dumps())
+    csv_path = tmp_path / "review.csv"
+    with csv_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"id": "c-cheap", "verdict": "accept", "score": "1"},
+                {"id": "c-full", "verdict": "accept", "score": "9"},
+            ]
+        )
+    assert (
+        main(
+            [
+                "review",
+                "import",
+                "my-run",
+                str(csv_path),
+                "--reviewer",
+                "alice",
+                "--config",
+                str(config_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    for target in ("my-run", "toy"):
+        assert (
+            main(["leaderboard", target, "--by", "human:alice", "--config", str(config_path)]) == 0
+        )
+        rows = _rows(capsys.readouterr().out)
+        assert [row[1] for row in rows] == ["c-full", "c-cheap"]

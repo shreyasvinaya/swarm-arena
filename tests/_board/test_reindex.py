@@ -1,7 +1,6 @@
 """Rebuild caches safely and preserve recorded snapshot identities."""
 
 import fcntl
-import importlib
 import os
 import sqlite3
 from pathlib import Path
@@ -362,15 +361,6 @@ def test_snapshot_membership_rejects_forged_cached_marks(
             snapshot_membership(board, run.goal.key(), conflict)
     finally:
         board.close()
-
-
-def test_docstring_examples() -> None:
-    import doctest
-
-    module = importlib.import_module("swarm_arena._board.reindex")
-    result = doctest.testmod(module, raise_on_error=True)
-    assert result.failed == 0
-    assert result.attempted == 0
 
 
 def _logical_rows(directory: Path) -> dict[str, list[tuple[Any, ...]]]:

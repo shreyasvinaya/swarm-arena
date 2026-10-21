@@ -32,7 +32,7 @@ def _reindex_with_diagnostics(
         arena_root=config.arena_root, cache_dir=None if cache_dir is None else str(cache_dir)
     )
     try:
-        directory = board._cache_dir()
+        _, directory = board._cache_settings()
         if not names:
             names = tuple(sorted({_validate_namespace(p.stem) for p in directory.glob("*.sqlite")}))
         paths = [directory / f"{ns}.sqlite" for ns in names]
@@ -61,13 +61,7 @@ def _reindex_with_diagnostics(
         # ArenaCache takes shared lifetime locks, so release exclusives first.
         board.open("", "", names)
         frontier = board.frontier()
-        counts = {}
-        warnings = []
-        for namespace in names:
-            cache = board._caches[namespace]
-            with cache._lock:
-                counts[namespace] = cache._conn.execute("SELECT count(*) FROM runs").fetchone()[0]
-                warnings.extend(cache.warnings)
+        counts, warnings = board._diagnostics()
         return _ReindexResult(frontier, counts, tuple(warnings))
     finally:
         board.close()

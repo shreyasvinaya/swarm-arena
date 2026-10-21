@@ -213,21 +213,11 @@ roots, valid imports probe conditional writes before taking the lease. The CSV
 is validated again against the final head fixed by takeover, and score IDs use
 that new epoch. Import does not execute goals or start a run clock.
 
-The committed `review_imported` receipt records `reviewer`, complete `scores`
-(including each object's key in `batch_id`), and `objects`. Review JSONL objects
-in the arena are the sole source of human scores for board reads; the receipt
-is for recovery. Resume repairs missing objects before opening the board, and
-a later import repairs them before committing another review. Recovery uses
-the original names, IDs and canonical bytes. An existing object with different
-bytes stops recovery. Receipt repair, import publication, and completion export
-share the owning writer's fencing and cancellation lifetime. Blocking I/O is
-abandonable; an already started write can finish, but cancellation never starts
-the next publication. Once the journal context enters, it alone releases the
-lease, including cancellation while writer supervision enters. Import and
-resume perform fallback release through the abandonable boundary only if the
-journal never entered. Shielded fallback and undelivered-takeover cleanup waits
-are bounded by `settle_timeout_s`. A release already running in a daemon may
-finish after that deadline; cleanup never starts a second release attempt.
+Review publication and repair honor cancellation and fencing. An interrupted
+publication resumes from the committed receipt; missing review objects are
+recreated with their original names and bytes. Imports create arena objects only
+for namespaces that receive scores. An empty import records no arena objects.
+
 
 Retrying a CSV after a receipt committed creates a new
 review batch; recovery itself does not duplicate the original batch.

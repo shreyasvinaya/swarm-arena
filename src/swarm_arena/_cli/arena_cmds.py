@@ -2,24 +2,22 @@
 
 import argparse
 import getpass
-import re
 import sys
 from collections.abc import Callable
-from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from threading import Thread
 
 import anyio
 
-from swarm_arena._board.arena import ArenaBoard, ArenaView, _namespace_frontier
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.base import Board
 from swarm_arena._board.cache import LearningFilter
 from swarm_arena._board.human_objects import _validate_reviewer
 from swarm_arena._board.human_ops import _apply_human_operation
 from swarm_arena._board.ingest import run_store
-from swarm_arena._board.leaderboard import format_value, group_rows
-from swarm_arena._board.pointers import _validate_namespace, _validate_run_id
+from swarm_arena._board.leaderboard import format_value
+from swarm_arena._board.pointers import RunPointer, _validate_namespace, _validate_run_id
 from swarm_arena._board.reindex import _reindex_with_diagnostics
 from swarm_arena._board.serve import make_server
 from swarm_arena._board.trace import trace
@@ -30,8 +28,7 @@ from swarm_arena._journal.replay import RunState
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._scoring.human_review import HumanReview
-
-_RUN_ID = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z_[0-9a-f]{6}$")
+from swarm_arena._store.base import open_store
 
 
 def _non_negative_integer(option: str) -> Callable[[str], int]:
@@ -191,6 +188,26 @@ def _import_reviewer(reviewer: str | None) -> str:
         ) from None
 
 
+def _resolve_target(
+    config: RunConfig, board: ArenaBoard, target: str
+) -> tuple[str | None, str | None, RunConfig]:
+    """Prefer an existing run directory or arena pointer to a namespace label."""
+    _validate_run_id(target)
+    if run_store(config.run_root, target).exists("control/owner.json"):
+        return target, None, config
+    arena = open_store(board.config.arena_root)
+    for key in arena.list(""):
+        parts = key.split("/")
+        if len(parts) == 3 and parts[1:] == ["runs", target + ".json"]:
+            try:
+                pointer = RunPointer.model_validate_json(arena.read(key).data)
+                if pointer.run_id == target:
+                    return target, None, config.model_copy(update={"run_root": pointer.run_root})
+            except (ValueError, OSError):
+                continue
+    return None, _validate_namespace(target), config
+
+
 async def _execute(args: argparse.Namespace) -> None:
     """Keep every board lifetime bounded and publish before the first read."""
     config = await run_sync_daemon(RunConfig.load, args.config)
@@ -212,8 +229,8 @@ async def _execute(args: argparse.Namespace) -> None:
                 print(f"imported {len(scores)} scores as {review.judge_name}")
             return
         if args.command == "reindex":
-            effective = config.model_copy(update={"arena_root": board.config.arena_root})
-            cache_dir = await run_sync_daemon(board._cache_dir)
+            arena_root, cache_dir = await run_sync_daemon(board._cache_settings)
+            effective = config.model_copy(update={"arena_root": arena_root})
             rebuilt = await run_sync_daemon(
                 partial(
                     _reindex_with_diagnostics,
@@ -230,8 +247,9 @@ async def _execute(args: argparse.Namespace) -> None:
         run_id = getattr(args, "run", None)
         namespace = getattr(args, "namespace", None)
         if args.command == "leaderboard" or (args.command == "board" and args.action == "serve"):
-            run_id = args.target if _RUN_ID.fullmatch(args.target) else None
-            namespace = None if run_id else args.target
+            run_id, namespace, config = await run_sync_daemon(
+                _resolve_target, config, board, args.target
+            )
         names = (
             _plan_namespaces(await run_sync_daemon(_run_plans, config, run_id))
             if run_id
@@ -240,15 +258,8 @@ async def _execute(args: argparse.Namespace) -> None:
         await run_sync_daemon(board.open, "", "", names)
         await run_sync_daemon(board.frontier)
         # A main view also needs its declared parts' namespace readers.
-        with board._pin_state() as state:
-            expanded = sorted(
-                set(names)
-                | set(
-                    _plan_namespaces(
-                        [plan for run in state.plans.values() for plan in run.current.values()]
-                    )
-                )
-            )
+        with board._read_namespace() as reader:
+            expanded = sorted(set(names) | set(reader.plan_namespaces()))
         if expanded != names:
             await run_sync_daemon(board.open, "", "", expanded)
             await run_sync_daemon(board.frontier)
@@ -277,74 +288,34 @@ async def _execute(args: argparse.Namespace) -> None:
             _search(board, args, names)
         else:
             _show(board, args.id)
-        for warning in await run_sync_daemon(_warnings, board):
+        for warning in (await run_sync_daemon(board._diagnostics))[1]:
             print(warning, file=sys.stderr)
     finally:
         with anyio.move_on_after(config.settle_timeout_s, shield=True):
             await run_sync_daemon(board.close)
 
 
-def _warnings(board: ArenaBoard) -> list[str]:
-    """Return writer-cache diagnostics without rebuilding a generation."""
-    return [warning for cache in board._caches.values() for warning in cache.warnings]
-
-
 def _leaderboard(
     board: ArenaBoard, args: argparse.Namespace, run_id: str | None, namespace: str | None
 ) -> None:
     """Rank current producing identities using each owning group's recorded judge."""
-    with board._pin_state() as state:
-        newest: dict[tuple[str, str], tuple[str, Plan]] = {}
-        for identifier, run in sorted(state.plans.items()):
-            if run_id is not None and identifier != run_id:
-                continue
-            for goal_id, plan in run.current.items():
-                if namespace is not None and namespace not in _plan_namespaces([plan]):
-                    continue
-                if args.goal is None or goal_id == args.goal:
-                    newest[(plan.goal.namespace, goal_id)] = (identifier, plan)
-        any_rows = False
-        judges: set[str] = set()
-        for identifier, plan in newest.values():
-            view = ArenaView(
-                board, plan.goal.key(), state.frontier, published=replace(state, run_id=identifier)
+    with board._read_namespace() as reader:
+        groups, judges = reader.leaderboards(
+            run_id=run_id, namespace=namespace, goal=args.goal, judge=args.by
+        )
+        for group_ns, goal_id, part, rows in groups:
+            row = rows[0]
+            suffix = f"/{part}" if part is not None else ""
+            print(
+                f"== {group_ns}/{goal_id}{suffix} ({row.judge}, "
+                f"rubric {row.rubric_hash[:8]}, panel {row.panel_hash[:8] or '-'}) =="
             )
-            names = view._ranking_judges()
-            if args.by:
-                names = dict.fromkeys(view._active_goals, args.by)
-            if namespace is not None:
-                names = {
-                    part: judge
-                    for part, judge in names.items()
-                    if view._active_goals[part].namespace == namespace
-                }
-            judges.update(names.values())
-            pairs = view._ranking_pairs(view._pairs())
-            groups = group_rows(
-                pairs,
-                view._scores(tuple(view._visible_candidate_ids())),
-                judge=names,
-                run_id=run_id,
-                identity_run=run_id,
-                min_improvement=plan.converge.min_improvement if run_id else None,
-            )
-            for part, rows in groups.items():
-                if not rows:
-                    continue
-                any_rows = True
-                row = rows[0]
-                suffix = f"/{part}" if part is not None else ""
-                group_ns = view._active_goals[part].namespace
+            for row in rows:
                 print(
-                    f"== {group_ns}/{plan.goal.id}{suffix} ({row.judge}, "
-                    f"rubric {row.rubric_hash[:8]}, panel {row.panel_hash[:8] or '-'}) =="
+                    f"{row.rank}\t{row.candidate_id}\t{row.run_id}\t{row.team}/{row.agent}"
+                    f"\t{format_value(row.value)}\t{','.join(row.built_on) or '-'}"
                 )
-                for row in rows:
-                    print(
-                        f"{row.rank}\t{row.candidate_id}\t{row.run_id}\t{row.team}/{row.agent}"
-                        f"\t{format_value(row.value)}\t{','.join(row.built_on) or '-'}"
-                    )
-        if not any_rows:
+        if not groups:
             for judge in sorted(judges or {args.by or "ranking judge"}):
                 print(f"no scores for {judge}")
 
@@ -354,54 +325,33 @@ def _search(board: ArenaBoard, args: argparse.Namespace, namespaces: list[str]) 
     remaining = args.limit
     if remaining < 0:
         raise _core_error(ValueError, "limit must be nonnegative")
-    with board._pin_state() as state:
-        for namespace in namespaces:
-            cache = state.readers.get(namespace)
-            if cache is None or remaining == 0:
-                continue
-            frontier = _namespace_frontier(state.frontier, namespace)
-            ids = cache.find(
-                frontier,
-                query=args.query or None,
-                filters=LearningFilter(
-                    goal_id=args.goal,
-                    tags=args.tag,
-                    verified=args.verified or None,
-                    human=args.human or None,
-                    pinned=args.pinned or None,
-                    hidden=args.hidden,
-                ),
-                relevance_goal=None,
-                limit=remaining,
-            )
-            found = {learning.id: learning for learning in cache.learnings_by_id(frontier, ids)}
-            for identifier in ids:
-                item = found[identifier]
-                markers = [
-                    name
-                    for name, enabled in (
-                        ("verified", item.verified),
-                        ("human", item.from_human),
-                        ("pinned", item.pinned),
-                        ("hidden", item.hidden),
-                    )
-                    if enabled
-                ]
-                with cache._lock, cache._frontier(frontier):
-                    source, params = cache._learning_sql(LearningFilter(hidden=False))
-                    superseded = cache._conn.execute(
-                        cache._flags_sql()
-                        + "SELECT 1 FROM "
-                        + source
-                        + " AND EXISTS (SELECT 1 FROM learning_links link "
-                        "WHERE link.learning_id=l.id AND link.kind='supersedes' "
-                        "AND link.target_id=?) LIMIT 1",
-                        [*params, identifier],
-                    ).fetchone()
-                if superseded:
-                    markers.append("superseded")
-                print(f"{item.id}\t{item.title}\t{item.author}\t{','.join(markers)}")
-            remaining -= len(ids)
+    with board._read_namespace() as reader:
+        found = reader.search_markers(
+            namespaces,
+            query=args.query or None,
+            limit=remaining,
+            filters=LearningFilter(
+                goal_id=args.goal,
+                tags=args.tag,
+                verified=args.verified or None,
+                human=args.human or None,
+                pinned=args.pinned or None,
+                hidden=args.hidden,
+            ),
+        )
+        for item, superseded in found:
+            markers = [
+                name
+                for name, enabled in (
+                    ("verified", item.verified),
+                    ("human", item.from_human),
+                    ("pinned", item.pinned),
+                    ("hidden", item.hidden),
+                    ("superseded", superseded),
+                )
+                if enabled
+            ]
+            print(f"{item.id}\t{item.title}\t{item.author}\t{','.join(markers)}")
 
 
 def _show(board: ArenaBoard, identifier: str) -> None:

@@ -58,6 +58,7 @@ _SCHEMA = (
     (
         "scores(id TEXT, producer TEXT NOT NULL, source TEXT, run_id TEXT, epoch INTEGER, "
         "seq INTEGER, ts TEXT, obj_name TEXT, line INTEGER, candidate_id TEXT, "
+        "candidate_marks TEXT, "
         "judge TEXT, rubric_hash TEXT, "
         "panel_hash TEXT, json TEXT, PRIMARY KEY(id, producer))"
     ),
@@ -327,6 +328,42 @@ class ArenaCache:
                     self._closed = True
                     self._ingest_states.clear()
 
+    def _diagnostics(self) -> tuple[int, tuple[str, ...]]:
+        """Return committed run counts and cached identifier-only warnings."""
+        with self._lock:
+            return self._conn.execute("SELECT count(*) FROM runs").fetchone()[0], tuple(
+                self.warnings
+            )
+
+    @contextmanager
+    def _read_scope(self, frontier: Frontier) -> Generator[None]:
+        """Reuse one TEMP membership set across a composite committed read."""
+        with self._lock, self._frontier(frontier):
+            yield
+
+    def _superseded(self, frontier: Frontier, ids: Sequence[str]) -> set[str]:
+        """Resolve superseded markers for a result page in one indexed query."""
+        with self._read_scope(frontier):
+            self._replace_sets([("marker_ids", ((identifier, None) for identifier in ids))])
+            source, params = self._learning_sql(LearningFilter(hidden=False))
+            return {
+                row[0]
+                for row in self._conn.execute(
+                    self._flags_sql()
+                    + "SELECT DISTINCT link.target_id FROM "
+                    + source.replace(
+                        " WHERE ",
+                        " JOIN learning_links link ON link.learning_id=l.id "
+                        "AND link.producer=l.producer "
+                        "JOIN _read_sets selected ON selected.set_name='marker_ids' "
+                        "AND selected.id=link.target_id WHERE ",
+                        1,
+                    )
+                    + " AND link.kind='supersedes'",
+                    params,
+                )
+            }
+
     def newest_segment(self, run_id: str) -> str | None:
         """
         Return the newest locally committed segment for a run.
@@ -465,6 +502,7 @@ class ArenaCache:
                     obj_name=name,
                     line=line,
                     candidate_id=score.candidate_id,
+                    candidate_marks=None,
                     judge=score.judge,
                     rubric_hash=score.rubric_hash,
                     panel_hash=score.panel_hash,
@@ -595,19 +633,36 @@ class ArenaCache:
 
     @staticmethod
     def _score_provenance(alias: str) -> str:
-        """Keep own-candidate scores only while their producer holds that ID.
+        """Bind journal scores to their own or recorded-frontier candidate holder.
 
-        A score recorded before any local candidate with this ID is an external
-        score and remains valid. Named human reviews bind to the retained ID.
-        Compare producing rows before goal filters, using this read's marks.
+        External scores use their round's fixed marks, independent of ingestion
+        order and later collisions. Unrecorded legacy external scores are usable
+        only while the candidate ID is unambiguous. Named reviews retain their
+        documented ID-based association.
         """
-        return (
-            f"({alias}.source!='run' OR NOT EXISTS (SELECT 1 FROM candidates own "
+        own = (
+            "SELECT 1 FROM candidates own "
             f"WHERE own.id={alias}.candidate_id AND own.run_id={alias}.run_id "
-            f"AND own.seq<={alias}.seq) OR NOT EXISTS (SELECT 1 FROM candidates rival "
-            "JOIN _read_sets rival_mark ON rival_mark.set_name='marks' "
-            "AND rival_mark.id=rival.run_id AND rival.seq<=rival_mark.seq "
-            f"WHERE rival.id={alias}.candidate_id AND rival.producer<'run:'||{alias}.run_id))"
+            f"AND own.seq<={alias}.seq"
+        )
+        visible = (
+            "FROM candidates target JOIN _read_sets target_mark "
+            "ON target_mark.set_name='marks' AND target_mark.id=target.run_id "
+            f"AND target.seq<=target_mark.seq WHERE target.id={alias}.candidate_id"
+        )
+        original = (
+            "SELECT min(origin.producer) FROM candidates origin "
+            f"JOIN json_each({alias}.candidate_marks) recorded "
+            "ON origin.run_id=json_extract(recorded.value,'$.run_id') "
+            "AND origin.seq<=json_extract(recorded.value,'$.seq') "
+            f"WHERE origin.id={alias}.candidate_id"
+        )
+        return (
+            f"({alias}.source!='run' OR (EXISTS ({own}) AND "
+            f"(SELECT min(target.producer) {visible})='run:'||{alias}.run_id) "
+            f"OR (NOT EXISTS ({own}) AND (({alias}.candidate_marks IS NOT NULL AND "
+            f"(SELECT min(target.producer) {visible})=({original})) OR "
+            f"({alias}.candidate_marks IS NULL AND (SELECT count(*) {visible})<=1))))"
         )
 
     @classmethod
@@ -1503,6 +1558,16 @@ class ArenaCache:
             namespace = goal[0] if producing_key is None else producing_key.namespace
             if namespace != self.namespace:
                 return
+            progress = state.goals[goal_id]
+            scoring_round = event.round or progress.round or max(progress.frontiers, default=0)
+            scoring_frontier = progress.frontiers.get(scoring_round)
+            candidate_marks = (
+                json.dumps(
+                    [{"run_id": mark.run_id, "seq": mark.seq} for mark in scoring_frontier.marks]
+                )
+                if scoring_frontier is not None
+                else None
+            )
             self._insert(
                 "scores",
                 dict(
@@ -1512,6 +1577,7 @@ class ArenaCache:
                     obj_name=None,
                     line=None,
                     candidate_id=score.candidate_id,
+                    candidate_marks=candidate_marks,
                     judge=score.judge,
                     rubric_hash=score.rubric_hash,
                     panel_hash=score.panel_hash,

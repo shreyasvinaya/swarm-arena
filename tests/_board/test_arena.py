@@ -1181,7 +1181,16 @@ def test_colliding_candidate_scores_keep_producer_at_each_frontier(
     later = board.frontier()
     # A separate recording run may legitimately score a visible external candidate.
     peer = FakeRun(a.run_root, "peer", goal=a.goal, start=START + timedelta(hours=2))
-    peer.commit(peer.plan(), peer.score("score-peer", "shared", 2))
+    peer.commit(
+        peer.plan(),
+        EventDraft(
+            type=EventType.FRONTIER,
+            goal_id=peer.goal.id,
+            round=1,
+            payload={"round": 1, "frontier": later.model_dump(mode="json")},
+        ),
+        peer.score("score-peer", "shared", 2),
+    )
     _publish(tmp_path, peer)
     newest = board.frontier()
     for cache_dir in ("cache", "rebuilt"):
@@ -1218,3 +1227,126 @@ def test_board_does_not_keep_unused_decision_or_frontier_copies(board: ArenaBoar
     board.frontier()
     assert not hasattr(board, "_decisions")
     assert not hasattr(board, "_latest")
+
+
+def test_open_reconciles_a_committed_pointer_with_unknown_outcome(
+    tmp_path: Path, board: ArenaBoard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import swarm_arena._board.arena as arena_module
+    from swarm_arena._errors import WriteOutcomeUnknown
+
+    original = arena_module.write_pointer
+
+    def write_then_lose_reply(store: Store, namespace: str, pointer: RunPointer) -> None:
+        original(store, namespace, pointer)
+        raise WriteOutcomeUnknown("private-transport-value")
+
+    monkeypatch.setattr(arena_module, "write_pointer", write_then_lose_reply)
+    board.open("r1", str(tmp_path / "runs"), ["toy"])
+    board.open("r1", str(tmp_path / "runs"), ["toy"])
+
+
+def test_collision_loser_score_hints_do_not_attach_to_unscored_holder(
+    tmp_path: Path, board: ArenaBoard
+) -> None:
+    a = FakeRun(str(tmp_path / "runs"), "a-run")
+    z = FakeRun(a.run_root, "z-run")
+    a.commit(a.plan(), a.candidate("shared"))
+    z.commit(z.plan(), z.candidate("shared"), z.score("losing-score", "shared", 100))
+    _publish(tmp_path, a)
+    _publish(tmp_path, z)
+    board.open(z.run_id, z.run_root, ["toy"])
+    board.put_candidate(
+        Candidate.model_validate(z.candidate("shared").payload["candidate"]), epoch=1, seq=2
+    )
+    board.put_score(
+        Score.model_validate(z.score("losing-score", "shared", 100).payload["score"]),
+        epoch=1,
+        seq=3,
+    )
+    board.frontier()
+    assert board.get_candidate("shared").run_id == "a-run"
+    assert board.scores("shared") == []
+
+
+def test_named_search_reader_batches_superseded_markers(tmp_path: Path, board: ArenaBoard) -> None:
+    from swarm_arena._board.cache import LearningFilter
+
+    run = _seed(tmp_path)
+    run.commit(
+        run.learning("L-old", "Observation old", evidence=["c-r1"]),
+        run.learning("L-summary", "Observation summary", evidence=["c-r1"], supersedes=["L-old"]),
+    )
+    board.frontier()
+    with board._read_namespace() as reader:
+        assert {
+            item.id: superseded
+            for item, superseded in reader.search_markers(
+                ["toy"],
+                query="Observation",
+                filters=LearningFilter(),
+                limit=10,
+            )
+        } == {"L-old": True, "L-summary": False}
+
+
+def test_external_score_stays_with_its_recorded_candidate_holder(
+    tmp_path: Path, board: ArenaBoard
+) -> None:
+    z = FakeRun(str(tmp_path / "runs"), "z-run")
+    z.commit(z.plan(), z.candidate("shared"), z.score("score-z", "shared", 100))
+    _publish(tmp_path, z)
+    scored_frontier = board.frontier()
+    peer = FakeRun(z.run_root, "peer", start=START + timedelta(hours=1))
+    peer.commit(
+        peer.plan(),
+        EventDraft(
+            type=EventType.FRONTIER,
+            goal_id=peer.goal.id,
+            round=1,
+            payload={"round": 1, "frontier": scored_frontier.model_dump(mode="json")},
+        ),
+        peer.score("external-score", "shared", 150),
+    )
+    _publish(tmp_path, peer)
+    old = board.frontier()
+    assert {s.id for s in board.scores("shared")} == {"score-z", "external-score"}
+    a = FakeRun(z.run_root, "a-run", start=START + timedelta(hours=2))
+    a.commit(a.plan(), a.candidate("shared"), a.score("score-a", "shared", 1))
+    _publish(tmp_path, a)
+    board.frontier()
+    assert board.get_candidate("shared").run_id == "a-run"
+    assert {s.id for s in board.scores("shared")} == {"score-a"}
+    assert {s.id for s in board.snapshot(z.goal.key(), old).scores("shared")} == {
+        "score-z",
+        "external-score",
+    }
+    write_human_objects(
+        open_store(board.config.arena_root),
+        "toy",
+        "reviews",
+        [
+            HumanObject(
+                kind="review",
+                author="human:alice",
+                score=Score(
+                    id="human-score",
+                    candidate_id="shared",
+                    judge="human:alice",
+                    key=(1, 7),
+                    value=7,
+                ),
+            )
+        ],
+        now=START + timedelta(hours=3),
+        reviewer="alice",
+    )
+    board.frontier()
+    assert {s.id for s in board.scores("shared")} == {"score-a", "human-score"}
+    fresh = ArenaBoard(arena_root=board.config.arena_root, cache_dir=str(tmp_path / "fresh"))
+    try:
+        fresh.open("", "", ["toy"])
+        fresh.frontier()
+        assert {s.id for s in fresh.scores("shared")} == {"score-a", "human-score"}
+    finally:
+        fresh.close()

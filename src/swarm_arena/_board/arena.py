@@ -5,7 +5,7 @@ import os
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Condition, RLock, get_ident
 from typing import Any, cast
@@ -263,6 +263,27 @@ class ArenaBoard(Board):
         base = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
         return base / "swarm-arena" / sha256_hex(root.encode())[:12]
 
+    def _cache_settings(self) -> tuple[str, Path]:
+        """Return the resolved storage and local-cache locations for maintenance."""
+        return self.config.arena_root, self._cache_dir()
+
+    def _diagnostics(self) -> tuple[dict[str, int], tuple[str, ...]]:
+        """Collect committed cache counts and value-free warnings on a worker."""
+        with self._refresh_lock:
+            counts = {}
+            warnings = []
+            for namespace, cache in self._caches.items():
+                count, messages = cache._diagnostics()
+                counts[namespace] = count
+                warnings.extend(messages)
+            return counts, tuple(warnings)
+
+    @contextmanager
+    def _read_namespace(self) -> Generator["_ArenaReader"]:
+        """Pin one committed read capability for CLI, viewer and trace consumers."""
+        with self._pin_state() as state:
+            yield _ArenaReader(self, state)
+
     def _cache(self, namespace: str) -> ArenaCache:
         """Open a writer without holding any fixed-view read lock."""
         _validate_namespace(namespace)
@@ -364,12 +385,10 @@ class ArenaBoard(Board):
                             existing = RunPointer.model_validate_json(
                                 arena.read(pointer_key(namespace, run_id)).data
                             )
-                        if (
-                            existing is None
-                            or existing.run_id != run_id
-                            or existing.run_root == resolved
-                        ):
+                        if existing is None or existing.run_id != run_id:
                             raise
+                        if existing == pointer:
+                            continue
                         if not warned:
                             _LOG.warning(
                                 "run %s resumed at a different root; keeping original pointer",
@@ -1015,7 +1034,7 @@ class ArenaBoard(Board):
         ...     board.close()
         """
         with self._pin_state() as state:
-            self._candidate_at(candidate_id, state)
+            retained = self._candidate_at(candidate_id, state)
             found: dict[str, Score] = {}
             for namespace in state.namespaces:
                 cache = state.readers.get(namespace)
@@ -1028,6 +1047,9 @@ class ArenaBoard(Board):
             if found:
                 return list(found.values())
             with self._lock:
+                hinted = self._candidates.get(candidate_id)
+                if hinted is not None and hinted.run_id != retained.run_id:
+                    return []
                 return [
                     s.model_copy(deep=True)
                     for s in self._scores.values()
@@ -1511,3 +1533,207 @@ def _effective_arena_root(config: RunConfig) -> str:
         if isinstance(board, ArenaBoard):
             return board.config.arena_root
     return config.arena_root
+
+
+class _ArenaReader:
+    """Expose named committed reads while keeping cache/view details in the board."""
+
+    def __init__(self, board: ArenaBoard, state: _Published) -> None:
+        self._board = board
+        self._state = state
+
+    def namespaces(self) -> tuple[str, ...]:
+        """Return the namespaces explicitly attached by the caller."""
+        return self._state.namespaces
+
+    def plan_namespaces(self) -> list[str]:
+        """Include namespaces declared by every current main and part group."""
+        return sorted(
+            {
+                goal.namespace
+                for run in self._state.plans.values()
+                for plan in run.current.values()
+                for goal in [plan.goal, *(part.goal for part in plan.parts)]
+            }
+        )
+
+    def candidates(self, namespaces: Sequence[str], ids: Sequence[str]) -> list[Candidate]:
+        """Read selected committed candidates, including explicit historical IDs."""
+        return [
+            candidate
+            for ns in namespaces
+            if (cache := self._state.readers.get(ns)) is not None
+            for candidate, _ in cache.candidates(
+                _namespace_frontier(self._state.frontier, ns), ids=ids
+            )
+        ]
+
+    def _candidate_source(
+        self, namespaces: Sequence[str], identifier: str
+    ) -> tuple[ArenaCache, Frontier, Candidate, int]:
+        """Resolve a committed candidate and its fixed source prefix."""
+        for ns in namespaces:
+            cache = self._state.readers.get(ns)
+            if cache is not None:
+                frontier = _namespace_frontier(self._state.frontier, ns)
+                pairs = cache.candidates(frontier, ids=[identifier])
+                if pairs:
+                    candidate, position = pairs[0]
+                    return cache, frontier, candidate, position[2]
+        raise KeyError(identifier)
+
+    def candidate(self, namespaces: Sequence[str], identifier: str) -> Candidate:
+        """Read an explicit committed candidate without consulting local hints."""
+        return self._candidate_source(namespaces, identifier)[2]
+
+    def learning(self, namespaces: Sequence[str], identifier: str) -> Learning:
+        """Read a committed learning, including hidden mutation targets."""
+        for ns in namespaces:
+            cache = self._state.readers.get(ns)
+            if cache is not None:
+                items = cache.learnings_by_id(
+                    _namespace_frontier(self._state.frontier, ns), [identifier]
+                )
+                if items:
+                    return items[0]
+        raise KeyError(identifier)
+
+    def scores(self, namespaces: Sequence[str], identifier: str) -> list[Score]:
+        """Read scores bound to a retained candidate in this generation."""
+        cache, frontier, _, _ = self._candidate_source(namespaces, identifier)
+        return [score for score, _ in cache.scores(frontier, candidate_ids=[identifier])]
+
+    def trace(self, namespaces: Sequence[str], identifier: str) -> list[str]:
+        """Render committed provenance under one namespace frontier scope."""
+        from swarm_arena._board.trace import _lines
+
+        for namespace in namespaces:
+            cache = self._state.readers.get(namespace)
+            if cache is None:
+                continue
+            frontier = _namespace_frontier(self._state.frontier, namespace)
+            with cache._read_scope(frontier):
+                pairs = cache.candidates(frontier, ids=[identifier])
+                if pairs:
+                    candidate, position = pairs[0]
+                    revisions = self._state.plans[candidate.run_id].revisions[candidate.goal_id]
+                    return _lines(cache, frontier, candidate, position[2], revisions)
+        raise KeyError(identifier)
+
+    def find(
+        self,
+        namespaces: Sequence[str],
+        *,
+        query: str | None,
+        filters: LearningFilter,
+        limit: int,
+        offset: int = 0,
+    ) -> list[Learning]:
+        """Filter and paginate across namespaces, hydrating returned rows only."""
+        selected: list[Learning] = []
+        skip = max(0, offset)
+        for ns in namespaces:
+            cache = self._state.readers.get(ns)
+            if cache is None or len(selected) >= limit:
+                continue
+            frontier = _namespace_frontier(self._state.frontier, ns)
+            if query is None:
+                count = cache.count(frontier, filters=filters)
+                if skip >= count:
+                    skip -= count
+                    continue
+                ids = cache.find(
+                    frontier,
+                    query=None,
+                    filters=filters,
+                    relevance_goal=None,
+                    offset=skip,
+                    limit=limit - len(selected),
+                )
+            else:
+                ids = cache.find(
+                    frontier,
+                    query=query,
+                    filters=filters,
+                    relevance_goal=None,
+                    limit=skip + limit - len(selected),
+                )
+                if skip >= len(ids):
+                    skip -= len(ids)
+                    continue
+                ids = ids[skip:]
+            skip = 0
+            items = {item.id: item for item in cache.learnings_by_id(frontier, ids)}
+            selected.extend(items[identifier] for identifier in ids)
+        return selected
+
+    def search_markers(
+        self, namespaces: Sequence[str], *, query: str | None, filters: LearningFilter, limit: int
+    ) -> list[tuple[Learning, bool]]:
+        """Return ordered search results and batched superseded markers."""
+        items = self.find(namespaces, query=query, filters=filters, limit=limit)
+        superseded: set[str] = set()
+        for ns in namespaces:
+            cache = self._state.readers.get(ns)
+            if cache is not None:
+                superseded.update(
+                    cache._superseded(
+                        _namespace_frontier(self._state.frontier, ns),
+                        [item.id for item in items if item.namespace == ns],
+                    )
+                )
+        return [(item, item.id in superseded) for item in items]
+
+    def leaderboards(
+        self, *, run_id: str | None, namespace: str | None, goal: str | None, judge: str | None
+    ) -> tuple[list[tuple[str, str, str | None, list[Row]]], set[str]]:
+        """Rank current producing groups through the board's shared row policy."""
+        newest: dict[tuple[str, str], tuple[str, Plan]] = {}
+        for identifier, run in sorted(self._state.plans.items()):
+            if run_id is not None and identifier != run_id:
+                continue
+            for goal_id, plan in run.current.items():
+                if namespace is not None and namespace not in {
+                    plan.goal.namespace,
+                    *(p.goal.namespace for p in plan.parts),
+                }:
+                    continue
+                if goal is None or goal_id == goal:
+                    newest[(plan.goal.namespace, goal_id)] = identifier, plan
+        result = []
+        judges: set[str] = set()
+        for identifier, plan in newest.values():
+            view = ArenaView(
+                self._board,
+                plan.goal.key(),
+                self._state.frontier,
+                published=replace(self._state, run_id=identifier),
+            )
+            ranking = view._ranking_judges()
+            names = dict.fromkeys(view._active_goals, judge) if judge else ranking
+            if namespace is not None:
+                names = {
+                    part: name
+                    for part, name in names.items()
+                    if view._active_goals[part].namespace == namespace
+                }
+            judges.update(names.values())
+            pairs = view._ranking_pairs(view._pairs())
+            scores = view._scores(tuple(view._visible_candidate_ids()))
+            for part, name in names.items():
+                groups = group_rows(
+                    [pair for pair in pairs if pair[0].part == part],
+                    scores,
+                    judge={part: name},
+                    run_id=run_id,
+                    identity_run=run_id,
+                    min_improvement=(
+                        plan.converge.min_improvement
+                        if run_id and name == ranking.get(part)
+                        else None
+                    ),
+                )
+                rows = groups.get(part, [])
+                if rows:
+                    result.append((view._active_goals[part].namespace, plan.goal.id, part, rows))
+        return result, judges

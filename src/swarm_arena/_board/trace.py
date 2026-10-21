@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 
-from swarm_arena._board.arena import ArenaBoard, _namespace_frontier
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.cache import ArenaCache
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._model.board_types import Frontier
@@ -78,19 +78,8 @@ def trace(board: ArenaBoard, candidate_id: str) -> list[str]:
     >>> lines[0].startswith("plan     ")  # doctest: +SKIP
     True
     """
-    with board._pin_state() as state:
-        for namespace in state.namespaces:
-            cache = state.readers.get(namespace)
-            if cache is None:
-                continue
-            scoped = _namespace_frontier(state.frontier, namespace)
-            with cache._lock, cache._frontier(scoped):
-                candidates = cache.candidates(scoped, ids=[candidate_id])
-                if candidates:
-                    candidate, position = candidates[0]
-                    revisions = state.plans[candidate.run_id].revisions[candidate.goal_id]
-                    return _lines(cache, scoped, candidate, position[2], revisions)
-    raise KeyError(candidate_id)
+    with board._read_namespace() as reader:
+        return reader.trace(reader.namespaces(), candidate_id)
 
 
 def _lines(
