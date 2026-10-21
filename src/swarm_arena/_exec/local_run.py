@@ -17,7 +17,9 @@ from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, format_logs_ref
 from swarm_arena._store.artifacts import ArtifactStore
-from swarm_arena._tooling.materialize import collect_output_files
+from swarm_arena._store.io import _storage_io, _validated_io
+from swarm_arena._tooling.materialize import _stage_layout, collect_output_files
+from swarm_arena._tooling.paths import output_paths
 from swarm_arena._tooling.result_file import (
     _OUTPUT_BYTE_LIMIT,
     MAX_DECLARED_FILES,
@@ -86,6 +88,7 @@ class _JobRun:
 
     async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput:
         """Run the job; on a cancel after the start, deliver its output, then re-raise."""
+        uploading = False
         try:
             run = await sup.run(
                 self._staged.argv,
@@ -107,21 +110,24 @@ class _JobRun:
                 self._post_collect = _DaemonCall(self._collect, run)
                 await self._wait_post_collect()
                 output = self._output or ToolOutput(status=RunStatus.ERROR)
-            return await anyio.to_thread.run_sync(
-                self._finish, output, (run.started_at, run.ended_at)
-            )
+            uploading = True
+            return await self._finish(output, (run.started_at, run.ended_at))
         except anyio.get_cancelled_exc_class():
             if self._started:  # a cancel before the start handshake has no output to give
                 with anyio.CancelScope(shield=True):
-                    await self._deliver_partial()
+                    await self._deliver_partial(upload=not uploading)
             raise
 
-    def fault_output(self, reason: str) -> ToolOutput:
-        """Return an ERROR output for a job that cannot start, with the reason in stderr."""
+    async def fault_output(self, reason: str) -> ToolOutput:
+        """Upload an unstarted job's diagnostics under the caller's supervision."""
+        await _validated_io(self._fault_logs, reason)
+        return await self._finish(ToolOutput(status=RunStatus.ERROR), None)
+
+    def _fault_logs(self, reason: str) -> None:
+        """Prepare local diagnostics without publishing any artifacts."""
         for rel in (_STDOUT, _STDERR):
             os.close(open_log(self._workspace / rel, truncate=True))
         note_in_log(self._stderr, reason)
-        return self._finish(ToolOutput(status=RunStatus.ERROR), None)
 
     async def _on_started(self, started: Job.Started) -> None:
         """Mark the start, then commit it through ``job.on_started`` with the job id."""
@@ -135,7 +141,7 @@ class _JobRun:
         self._provisional = provisional
         self._output = await run_sync_daemon(self._collect, provisional)
 
-    async def _deliver_partial(self) -> None:
+    async def _deliver_partial(self, *, upload: bool) -> None:
         """Hand the best output to ``job.on_partial`` after a cancel (the caller shields)."""
         run = self._run
         if run is not None and run.status not in _STOPPED and not self._collected:
@@ -145,17 +151,23 @@ class _JobRun:
         output = await anyio.to_thread.run_sync(self._stopped_output, RunStatus.CANCELLED)
         timed = run or self._provisional
         times = None if timed is None else (timed.started_at, timed.ended_at)
-        try:
-            output = await anyio.to_thread.run_sync(self._finish, output, times)
-        except Exception as exc:  # an upload failure must not replace the cancellation
-            note = f"uploads failed: {_exception_type_name(exc)}"
-            await anyio.to_thread.run_sync(note_in_log, self._stderr, note)
-            update: dict[str, Any] = {"files": []}  # never hand over refs that were not stored
-            if times is not None:
-                update["started_at"], update["ended_at"] = times
-            output = output.model_copy(update=update)
+        # Preserve collected data, but never publish refs from an abandoned upload.
+        update: dict[str, Any] = {"files": [], "logs_ref": None}
+        if times is not None:
+            update["started_at"], update["ended_at"] = times
+        partial = output.model_copy(update=update)
+        if upload:
+            try:
+                with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S) as uploads:
+                    partial = await self._finish(output, times)
+                if uploads.cancel_called:
+                    await anyio.to_thread.run_sync(note_in_log, self._stderr, "uploads timed out")
+            except Exception as exc:  # upload failure must not replace caller cancellation
+                note = f"uploads failed: {_exception_type_name(exc)}"
+                await anyio.to_thread.run_sync(note_in_log, self._stderr, note)
         if self._job.on_partial is not None:
-            await self._job.on_partial(output)
+            with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S):
+                await self._job.on_partial(partial)
 
     async def _wait_post_collect(self) -> None:
         """Wait for the one post-exit collect until its original deadline."""
@@ -255,23 +267,61 @@ class _JobRun:
             if total > self._max_output:
                 raise ValueError(f"{ref.path} crosses max_output_bytes")
 
-    def _finish(self, output: ToolOutput, times: tuple[datetime, datetime] | None) -> ToolOutput:
-        """Upload declared files, then both logs, one at a time; set ``logs_ref`` and times."""
-        update: dict[str, Any] = {}
+    def _output_paths(self, files: Sequence[FileRef]) -> list[str]:
+        """Check the complete declaration before the first per-object upload."""
+        self._check_output_sizes(files)
+        layout = _stage_layout(self._job.stage)
+        return output_paths(
+            [ref.path for ref in files],
+            effective_files=[*layout.files, *layout.metadata],
+            directories=sorted(layout.directories),
+        )
+
+    def _upload_file(self, path: str, left: int) -> FileRef | str:
+        """Upload one checked output; retain trusted path diagnostics as data."""
         try:
-            self._check_output_sizes(output.files)
-            update["files"] = collect_output_files(
+            [ref] = collect_output_files(
                 self._workspace,
-                [ref.path for ref in output.files],
+                [path],
                 self._artifacts,
                 stage=self._job.stage,
-                max_bytes=self._max_output,
+                max_bytes=left,
             )
+        except ValueError as error:
+            # collect_output_files has already replaced backend details with
+            # a fixed diagnostic naming only the declared workspace path.
+            return str(error)
+        return ref
+
+    def _upload_log(self, rel: str) -> str:
+        """Read and publish exactly one bounded log in the storage worker."""
+        return self._artifacts.put_bytes(self._read_log(rel))
+
+    async def _finish(
+        self, output: ToolOutput, times: tuple[datetime, datetime] | None
+    ) -> ToolOutput:
+        """Await each object separately so abandonment cannot publish the next one."""
+        update: dict[str, Any] = {}
+        try:
+            paths = await _validated_io(self._output_paths, output.files)
+            files: list[FileRef] = []
+            left = self._max_output
+            for path in paths:
+                ref = await _storage_io(self._upload_file, path, left)
+                if isinstance(ref, str):
+                    raise ValueError(ref)
+                files.append(ref)
+                left -= ref.size
+            update["files"] = files
         except ValueError as exc:
-            note_in_log(self._stderr, f"output files not uploaded: {exc}")
+            await anyio.to_thread.run_sync(
+                note_in_log, self._stderr, f"output files not uploaded: {exc}"
+            )
             update |= {"status": RunStatus.ERROR, "files": []}
         # stdout first: a note about it must reach stderr before stderr is read.
-        hashes = [self._artifacts.put_bytes(self._read_log(rel)) for rel in (_STDOUT, _STDERR)]
+        hashes = []
+        for rel in (_STDOUT, _STDERR):
+            hashes.append(await _storage_io(self._upload_log, rel))
         update["logs_ref"] = format_logs_ref(hashes[0], hashes[1])
         if times is not None:
             update["started_at"], update["ended_at"] = times

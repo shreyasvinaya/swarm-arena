@@ -438,7 +438,8 @@ async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> N
     import anyio
 
     async def wait(self: NoopManager, ctx: AgentContext) -> RoundReport:
-        await anyio.sleep_forever()
+        await anyio.Event().wait()
+        return RoundReport()
 
     monkeypatch.setattr(NoopManager, "run_round", wait)
     harness = OfflineHarness()
