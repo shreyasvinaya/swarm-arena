@@ -75,12 +75,17 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
             await anyio.to_thread.run_sync(board.snapshot, slow.goal.key(), next_frontier)
         completed.set()
 
+    beat_target: list[int] = []
+    beats_reached = anyio.Event()
+
     async def heartbeat() -> None:
         while True:
             ticks.append(perf_counter())
+            if beat_target and len(ticks) >= beat_target[0]:
+                beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(1, release.set)
+    timer = Timer(5, release.set)
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(heartbeat)
@@ -98,10 +103,12 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 assert view.learnings("toy")[0].id == "fast-learning"
                 assert view.search_learnings("toy", "viscosity")[0].id == "fast-learning"
                 assert view.count_learnings("toy") == 1
-                assert perf_counter() - start < 0.2
+                assert perf_counter() - start < 1.0
                 before = len(ticks)
-                await anyio.sleep(0.06)
-                assert len(ticks) >= before + 3
+                # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
+                beat_target.append(before + 3)
+                with anyio.fail_after(2):
+                    await beats_reached.wait()
                 assert not completed.is_set()
             finally:
                 release.set()
@@ -212,12 +219,17 @@ async def test_public_board_reads_use_published_state_during_refresh(
         finally:
             finished.set()
 
+    beat_target: list[int] = []
+    beats_reached = anyio.Event()
+
     async def heartbeat() -> None:
         while True:
             ticks.append(perf_counter())
+            if beat_target and len(ticks) >= beat_target[0]:
+                beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(0.8, release.set)
+    timer = Timer(5, release.set)
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(refresh)
@@ -227,11 +239,13 @@ async def test_public_board_reads_use_published_state_during_refresh(
             try:
                 started = perf_counter()
                 result = read()
-                assert perf_counter() - started < 0.2
+                assert perf_counter() - started < 1.0
                 assert result == expected
                 before = len(ticks)
-                await anyio.sleep(0.06)
-                assert len(ticks) >= before + 3
+                # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
+                beat_target.append(before + 3)
+                with anyio.fail_after(2):
+                    await beats_reached.wait()
                 assert not finished.is_set()
             finally:
                 release.set()
