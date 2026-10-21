@@ -6,6 +6,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import anyio
@@ -175,7 +176,16 @@ async def _execute(args: argparse.Namespace) -> None:
                 print(f"imported {len(scores)} scores as {review.judge_name}")
             return
         if args.command == "reindex":
-            rebuilt = await run_sync_daemon(_reindex_with_diagnostics, config, args.namespace)
+            effective = config.model_copy(update={"arena_root": board.config.arena_root})
+            cache_dir = await run_sync_daemon(board._cache_dir)
+            rebuilt = await run_sync_daemon(
+                partial(
+                    _reindex_with_diagnostics,
+                    effective,
+                    args.namespace,
+                    cache_dir=cache_dir,
+                )
+            )
             for ns, count in rebuilt.run_counts.items():
                 print(f"{ns}: {count} runs")
             for warning in rebuilt.warnings:

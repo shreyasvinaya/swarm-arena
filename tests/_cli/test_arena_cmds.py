@@ -405,3 +405,47 @@ def test_numeric_options_accept_non_negative_integers(value: str) -> None:
         ["board", "search", "query", "--namespace", "toy", "--limit", value]
     )
     assert arguments.limit == int(value)
+
+
+@pytest.mark.parametrize("namespaces", [[], ["--namespace", "toy"]])
+def test_reindex_uses_resolved_arena_root_and_cache(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], namespaces: list[str]
+) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena import Ref, RunConfig
+
+    arena = tmp_path / "actual-arena"
+    cache = tmp_path / "actual-cache"
+    run = FakeRun(str(tmp_path / "runs"), "2026-10-21T00-00-00Z_123abc")
+    run.commit(run.plan(), run.candidate("c-one"), run.score("s-one", "c-one", 1))
+    run._lease.release()
+    add_pointer(str(arena), run)
+    config = RunConfig(
+        run_root=run.run_root,
+        arena_root=str(tmp_path / "unused-arena"),
+        board=Ref(
+            path="swarm_arena.board:ArenaBoard",
+            config={"arena_root": str(arena), "cache_dir": str(cache)},
+        ),
+    )
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(config.dumps())
+    cfg = ["--config", str(config_path)]
+    assert main(["leaderboard", "toy", *cfg]) == 0
+    assert "c-one" in capsys.readouterr().out
+    database = cache / "toy.sqlite"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("CREATE TABLE stale_cache (marker TEXT)")
+    assert main(["reindex", *namespaces, *cfg]) == 0
+    assert capsys.readouterr().out == "toy: 1 runs\n"
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT id FROM candidates").fetchall() == [("c-one",)]
+        assert (
+            connection.execute("SELECT name FROM sqlite_master WHERE name='stale_cache'").fetchall()
+            == []
+        )
+    assert not (tmp_path / "unused-arena").exists()
