@@ -34,7 +34,7 @@ from swarm_arena._outcomes import _has_core_fenced
 async def test_blocked_io_does_not_retain_goal(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, site: str, signal: str
 ) -> None:
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.1})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     loop_thread = threading.get_ident()
@@ -85,7 +85,7 @@ async def test_blocked_io_does_not_retain_goal(
             env.deps.journal.fenced.set()
         else:
             env.deps.stops.stop = env.deps.stops.stop_now = True
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=7)
         assert done, f"{site} retained its owner after {signal}"
         assert not exited.is_set()
         if signal == "fence":

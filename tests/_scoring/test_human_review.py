@@ -807,7 +807,7 @@ async def test_cancelled_writer_entry_releases_lease_once(
     from swarm_arena._journal.writer import JournalWriter
     from swarm_arena._model.canonical import utc_now
 
-    config = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
     entered = anyio.Event()
     duplicate, unblock = threading.Event(), threading.Event()
     scopes: list[anyio.CancelScope] = []

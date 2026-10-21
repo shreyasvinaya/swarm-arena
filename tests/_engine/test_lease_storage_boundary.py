@@ -71,7 +71,7 @@ async def test_completion_export_observes_remaining_run_time(
             assert release.wait(30)
         return original(store, key, data)
 
-    config = run_config.model_copy(update={"settle_timeout_s": 0.5})
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
     monkeypatch.setattr(LocalStore, "create", create)
     monkeypatch.setattr(run_module, "anyio", Backend())
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))

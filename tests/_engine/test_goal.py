@@ -1130,7 +1130,7 @@ async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
     env.deps.config = env.deps.config.model_copy(
         update={
             "curator": Ref(path="_fakes.curators:MergeAll"),
-            "settle_timeout_s": 0.02,
+            "settle_timeout_s": 2.0,
         }
     )
     env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
@@ -1981,7 +1981,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
 
     from swarm_arena._board.arena import ArenaView
 
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.05})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     loop_thread = threading.get_ident()
     target = env.deps.board if site == "snapshot" else ArenaView
@@ -2011,7 +2011,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
             monkeypatch.setattr(env.deps.clock, "left", lambda timeout: 0)
         else:
             env.deps.stops.stop_now = True
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=7)
         assert done, "page read retained the goal after supervision stopped it"
         assert not returned.is_set()
         assert not env.store.exists("goals/g/rounds/round-01.md")

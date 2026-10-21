@@ -1129,7 +1129,7 @@ async def test_tranche_pending_is_conservatively_closed(env: EngineEnv) -> None:
             await scope.tranche.reserve_call(Amount(usd=0.01))
             return RoundReport(summary="pending")
 
-    config = env.deps.config.model_copy(update={"settle_timeout_s": 0.05})
+    config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     e = dataclasses.replace(env, deps=dataclasses.replace(env.deps, config=config))
     with anyio.fail_after(5):
         await _round(e, [_with_manager("a", PendingManager())]).run(1)

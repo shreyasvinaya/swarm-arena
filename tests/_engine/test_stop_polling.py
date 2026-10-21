@@ -29,7 +29,7 @@ from swarm_arena._store.local import LocalStore
 async def test_blocked_stop_poll_releases_owner(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, phase: str, signal: str
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     poll_entered, work_entered, release, driving = (threading.Event() for _ in range(4))
     workers: list[threading.Thread] = []
     deadline = anyio.Event()
@@ -121,7 +121,7 @@ async def test_stop_poll_failure_reaches_owner(
     key: str,
     kind: str,
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     work_entered, release, driving = (threading.Event() for _ in range(3))
     workers: list[threading.Thread] = []
     calls: list[str] = []

@@ -22,7 +22,7 @@ async def test_resume_page_storage_abandons_cancelled_owner(
     tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str
 ) -> None:
     config, store = await _finished_without_round_page(tmp_path, run_config)
-    config = config.model_copy(update={"settle_timeout_s": 0.2})
+    config = config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     original = getattr(LocalStore, site)

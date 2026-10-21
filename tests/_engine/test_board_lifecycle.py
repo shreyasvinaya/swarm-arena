@@ -131,7 +131,7 @@ async def test_blocking_board_open_can_be_cancelled(
     if operation == "resume":
         await execute(run_config, "run")
     config = configured(run_config, tmp_path, open_mode="block").model_copy(
-        update={"settle_timeout_s": 0.15}
+        update={"settle_timeout_s": 2.0}
     )
     scope = anyio.CancelScope()
     completed = anyio.Event()

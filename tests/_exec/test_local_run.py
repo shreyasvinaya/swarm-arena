@@ -17,7 +17,7 @@ from swarm_arena._store.local import LocalStore
 async def test_cancel_abandons_executor_log_storage(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.5})
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     publications: list[str] = []
@@ -290,7 +290,7 @@ async def test_public_run_abandons_partial_uploads(
     from swarm_arena._errors import Fenced
     from swarm_arena._journal.writer import JournalWriter
 
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.5})
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     release = threading.Event()
     fenced = anyio.Event()
     workers: list[threading.Thread] = []

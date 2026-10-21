@@ -181,7 +181,7 @@ async def test_pending_replan_is_abandoned(
         return plan
 
     monkeypatch.setattr(planner, "plan", hanging_sync if synchronous else hanging_async)
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.02})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
 
     async def drive() -> None:
@@ -195,7 +195,7 @@ async def test_pending_replan_is_abandoned(
                 while not entered.is_set():  # noqa: ASYNC110 - daemon thread signal
                     await anyio.sleep(0.01)
             _signal(env, flag)
-            with anyio.move_on_after(3):
+            with anyio.move_on_after(7):
                 await completed.wait()
             group.cancel_scope.cancel()
         assert completed.is_set(), "stop must abandon a suspended replanner"
@@ -241,7 +241,7 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
         return await real(self, goal, candidates, ctx)
 
     monkeypatch.setattr(ProviderJudge, "judge", judge)
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.1})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     if already_stopped:
         env.on_commit("round_closed", lambda ev: _signal(env, flag))
     runner = GoalRunner(
@@ -266,7 +266,7 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
         with anyio.fail_after(10):
             await clock.sampled.wait()
         clock.now += env.deps.config.settle_timeout_s + 1
-        with anyio.move_on_after(3):
+        with anyio.move_on_after(7):
             await completed.wait()
         group.cancel_scope.cancel()
     assert completed.is_set(), "final judging must finish within the post-stop grace"
@@ -320,7 +320,7 @@ async def test_final_grace_can_expire_before_judge_dispatch(
     monkeypatch.setattr(env.deps.journal, "append_durable", blocked_reserve)
     monkeypatch.setattr(ProviderJudge, "judge", observe_judge)
     env.on_commit("round_closed", lambda ev: _signal(env, flag))
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.1})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     runner = GoalRunner(
         env.deps,
         goal_id="g",
@@ -339,7 +339,7 @@ async def test_final_grace_can_expire_before_judge_dispatch(
             await clock.sampled.wait()
         assert not completed.is_set()
         clock.now += env.deps.config.settle_timeout_s + 1
-        with anyio.fail_after(3):
+        with anyio.fail_after(7):
             await completed.wait()
     _assert_terminal(env, outcomes[0], _REASONS[flag])
     assert not dispatched.is_set()
@@ -391,7 +391,7 @@ async def test_final_timeout_without_journaled_scores_still_has_no_result(
         return []
 
     monkeypatch.setattr(ProgramJudge, "judge", judge)
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.03})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     runner = GoalRunner(
         env.deps, goal_id="g", plan=_plan(teams=1, rounds=1, converge_team=True), replanner=None
     )

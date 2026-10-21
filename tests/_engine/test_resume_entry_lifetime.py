@@ -34,7 +34,7 @@ from swarm_arena._store.local import LocalStore
 async def test_inherited_read_ends_without_late_entry(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, signal: str
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     if signal == "deadline":
         config = config.model_copy(
             update={

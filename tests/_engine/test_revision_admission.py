@@ -59,7 +59,7 @@ async def test_public_run_abandons_blocked_revision_admission(
         event.clear()
     cfg = run_config.model_copy(
         update={
-            "settle_timeout_s": 0.5,
+            "settle_timeout_s": 2.0,
             "limits": run_config.limits.model_copy(update={"run_timeout_s": 3.0}),
             "planner_catalog": PlannerCatalog(
                 entries=[

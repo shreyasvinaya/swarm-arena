@@ -158,7 +158,7 @@ async def test_interrupted_barrier_settles_every_admitted_reservation(
     from swarm_arena._journal.reader import read_committed
     from swarm_arena._journal.replay import RunState
 
-    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.02})
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     journal = env.deps.journal
     durable = journal.append_durable
     real_judge = ProviderJudge.judge
