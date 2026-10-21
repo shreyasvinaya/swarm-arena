@@ -118,7 +118,10 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
 def _board_arena_root(config: RunConfig) -> str:
     """Resolve the shared root through the board construction error boundary."""
     try:
-        return _effective_arena_root(config)
+        root = _effective_arena_root(config)
+        if not isinstance(root, str):
+            raise TypeError("arena root must be a string")
+        return str.__str__(root)
     except BaseException as error:
         _Outcome(capture_caller=False).contain(error, RuntimeError, "board construction")
 

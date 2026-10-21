@@ -16,7 +16,6 @@ from urllib.parse import quote, urlsplit
 
 import anyio
 
-from swarm_arena._board.arena import _effective_arena_root
 from swarm_arena._board.human_objects import (
     HumanObject,
     _validate_reviewer,
@@ -28,7 +27,7 @@ from swarm_arena._board.ingest import run_store
 from swarm_arena._board.leaderboard import flatten, format_value, group_judges, group_rows
 from swarm_arena._board.pages import state_positions
 from swarm_arena._board.pointers import _validate_run_id
-from swarm_arena._engine.preflight import check_storage
+from swarm_arena._engine.preflight import _board_arena_root, check_storage
 from swarm_arena._errors import (
     AlreadyExists,
     Fenced,
@@ -575,7 +574,9 @@ class HumanReview:
         from swarm_arena._engine.resume import _take_over
         from swarm_arena._engine.run import _supervise_writer
 
-        config = config.model_copy(update={"arena_root": _effective_arena_root(config)})
+        config = config.model_copy(
+            update={"arena_root": await _review_io(_board_arena_root, config)}
+        )
         _validate_run_id(run_id)
         data = await anyio.to_thread.run_sync(_read_csv, _local_path(csv_path))
         store = await anyio.to_thread.run_sync(run_store, config.run_root, run_id)
