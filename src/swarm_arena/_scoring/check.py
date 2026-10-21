@@ -138,7 +138,8 @@ class CheckContext:
         Returns
         -------
         ToolOutput
-            Executor result with parsed ``swarm/result.json`` data.
+            Detached executor result with parsed ``swarm/result.json`` data.
+            Invalid executor outputs become ``ToolOutput(status="error")``.
 
         Examples
         --------
