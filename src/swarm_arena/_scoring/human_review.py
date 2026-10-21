@@ -187,6 +187,9 @@ def parse_review_csv(data: bytes, state: RunState, *, judge: str) -> list[Score]
     >>> parse_review_csv((",".join(CSV_HEADER) + "\n").encode(), RunState(), judge="human:a")
     []
     """
+    if not isinstance(judge, str) or not judge.startswith("human:"):
+        raise _core_error(ValueError, "judge must identify a human reviewer")
+    _validate_reviewer(judge.removeprefix("human:"))
     try:
         text = data.decode("utf-8-sig")
     except UnicodeError:
@@ -387,6 +390,62 @@ async def _publish_review_object(
             ) from None
 
 
+def _receipt_objects(
+    payload: dict[str, Any], *, state: RunState | None = None
+) -> tuple[str, dict[str, list[HumanObject]]]:
+    """Validate a whole receipt before admission or the first repair write."""
+    try:
+        reviewer = _validate_reviewer(payload["reviewer"])
+        raw_scores, keys = payload["scores"], payload["objects"]
+        if not isinstance(raw_scores, list) or not isinstance(keys, list):
+            raise ValueError
+        if any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(keys):
+            raise ValueError
+        objects: dict[str, list[HumanObject]] = {}
+        for key in keys:
+            parts = key.split("/")
+            if len(parts) != 4 or key != human_object_key(
+                parts[0], "reviews", parts[-1], reviewer=reviewer
+            ):
+                raise ValueError
+            objects[key] = []
+        scores = [Score.model_validate(s) for s in raw_scores]
+        if len({s.id for s in scores}) != len(scores) or len(
+            {s.candidate_id for s in scores}
+        ) != len(scores):
+            raise ValueError
+        for score in scores:
+            if (
+                not score.id
+                or not score.candidate_id
+                or score.batch_id not in objects
+                or score.judge != f"human:{reviewer}"
+                or score.rubric_hash
+                or score.panel_hash
+                or score.llm_call_ids
+                or score.verdict not in {"accept", "reject", None}
+                or score.key
+                != ({"accept": 1.0, None: 0.0, "reject": -1.0}[score.verdict], score.value or 0.0)
+            ):
+                raise ValueError
+            if state is not None and (
+                score.candidate_id not in state.candidates
+                or state.candidate_goal_keys[score.candidate_id].namespace
+                != score.batch_id.split("/")[0]
+            ):
+                raise ValueError
+            objects[score.batch_id].append(
+                HumanObject(kind="review", score=score, author=f"human:{reviewer}")
+            )
+        # Exercise the exact canonical representation before journal admission.
+        for batch in objects.values():
+            for obj in batch:
+                canonical_json(obj.model_dump(mode="json"))
+    except (ValueError, TypeError, KeyError):
+        raise _core_error(StorageError, "invalid review receipt") from None
+    return reviewer, objects
+
+
 async def _repair_review_objects(
     state: RunState, arena: Store, store: Store, lease: Lease, writer: JournalWriter
 ) -> None:
@@ -394,22 +453,8 @@ async def _repair_review_objects(
     for event in state._events:
         if event.type != EventType.REVIEW_IMPORTED:
             continue
-        reviewer = _validate_reviewer(event.payload["reviewer"])
-        scores = [Score.model_validate(s) for s in event.payload["scores"]]
-        keys = event.payload["objects"]
-        if any(s.batch_id not in keys or s.judge != f"human:{reviewer}" for s in scores):
-            raise _core_error(StorageError, "invalid review receipt")
-        for key in keys:
-            parts = key.split("/")
-            if len(parts) != 4 or key != human_object_key(
-                parts[0], "reviews", parts[-1], reviewer=reviewer
-            ):
-                raise _core_error(StorageError, "invalid review receipt location")
-            objects = [
-                HumanObject(kind="review", score=s, author=f"human:{reviewer}")
-                for s in scores
-                if s.batch_id == key
-            ]
+        reviewer, batches = _receipt_objects(event.payload)
+        for key, objects in batches.items():
             if writer.fenced.is_set():
                 raise _core_error(Fenced)
             await _publish_review_object(
@@ -441,7 +486,23 @@ class HumanReview:
 
     def __init__(self, reviewer: str) -> None:
         self._reviewer = _validate_reviewer(reviewer)
-        self.judge_name = f"human:{self._reviewer}"
+
+    @property
+    def judge_name(self) -> str:
+        """
+        Return the read-only judge identity derived from the reviewer.
+
+        Returns
+        -------
+        str
+            Human judge identifier for this reviewer.
+
+        Examples
+        --------
+        >>> HumanReview("alice").judge_name
+        'human:alice'
+        """
+        return f"human:{self._reviewer}"
 
     async def export(
         self,
@@ -584,17 +645,15 @@ class HumanReview:
                     )
                     for s in scores
                 ]
+                payload = {
+                    "reviewer": self._reviewer,
+                    "scores": [s.model_dump(mode="json") for s in scores],
+                    "objects": list(keys.values()),
+                }
+                _receipt_objects(payload, state=state)
+                proposed = EventDraft(type=EventType.REVIEW_IMPORTED, payload=payload)
                 writer.append(EventDraft(type=EventType.TAKEOVER, payload={"force": False}))
-                receipt = writer.append(
-                    EventDraft(
-                        type=EventType.REVIEW_IMPORTED,
-                        payload={
-                            "reviewer": self._reviewer,
-                            "scores": [s.model_dump(mode="json") for s in scores],
-                            "objects": list(keys.values()),
-                        },
-                    )
-                )
+                receipt = writer.append(proposed)
                 await writer.commit()
                 await _repair_review_objects(
                     RunState.from_events([receipt]), arena, store, lease, writer

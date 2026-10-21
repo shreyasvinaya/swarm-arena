@@ -931,3 +931,49 @@ def test_review_csv_neutralizes_text_and_preserves_canonical_json(
     assert len(parsed) == 1
     assert parsed[0].candidate_id == candidate.id
     assert parsed[0].key == (1.0, 7.0)
+
+
+def test_judge_name_is_read_only_and_parser_requires_human_judge(state: RunState) -> None:
+    review = HumanReview("alice")
+    with pytest.raises(AttributeError):
+        setattr(review, "judge_name", "program:forged")  # noqa: B010 - exercise read-only property
+    assert review.judge_name == "human:alice"
+    with pytest.raises(ValueError, match="judge"):
+        parse_review_csv(_csv({"id": "c-1", "score": "7"}), state, judge="program:forged")
+
+
+@pytest.mark.parametrize("kind", ["judge", "score", "duplicate_id"])
+async def test_complete_proposed_receipt_is_validated_before_admission(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    original = human_review.parse_review_csv
+    parses = 0
+    before = _events(review_run.store)
+    path = _file(tmp_path, _csv({"id": "c-1", "score": "7"}, {"id": "c-2", "score": "8"}))
+
+    def parse(data: bytes, state: RunState, *, judge: str) -> list[human_review.Score]:
+        nonlocal parses
+        parses += 1
+        scores = original(data, state, judge=judge)
+        if parses == 2:
+            change = {"judge": "program:forged"} if kind == "judge" else {"value": float("nan")}
+            if kind != "duplicate_id":
+                scores[0] = scores[0].model_copy(update=change)
+        return scores
+
+    with monkeypatch.context() as patch:
+        patch.setattr(human_review, "parse_review_csv", parse)
+        if kind == "duplicate_id":
+            patch.setattr(human_review.IdGen, "next", lambda self, prefix: "s-duplicate")
+        with pytest.raises(StorageError, match="invalid review receipt"):
+            await HumanReview("alice").import_csv(review_run.run_id, path, config=run_config)
+    assert _events(review_run.store) == before
+    assert not _reviews(run_config)
+    owner = read_owner(review_run.store)
+    assert owner is not None
+    assert owner[0].expires_at <= human_review.utc_now()
+    await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)

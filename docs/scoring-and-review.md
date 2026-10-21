@@ -202,7 +202,8 @@ multiline notes from spreadsheet programs are accepted. Missing columns,
 unknown or duplicate IDs, bad verdicts and invalid/non-finite scores are
 reported together with their row numbers before any storage probe or takeover.
 
-Imports use judge `human:alice`, with key `(verdict_rank, score_or_zero)`:
+`judge_name` is read-only and derives from the reviewer. The complete receipt is
+validated before journal admission. Imports use judge `human:alice`, with key `(verdict_rank, score_or_zero)`:
 accept is `1`, empty is `0`, and reject is `-1`. The numeric `value` remains
 absent for a verdict-only review. Re-rank the arena using
 `leaderboard --by human:alice` in the arena CLI.
