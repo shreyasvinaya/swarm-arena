@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 from typing import Any
 
@@ -541,6 +542,48 @@ async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> 
     assert rt_env.events("tool_end") == []
     assert rt_env.events("settle") == []
     assert not rt_env.inflight._scopes
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["anyio", "native"])
+async def test_cancelled_reserve_admission_settles_undispatched_tool_at_zero(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    rt = rt_env.rt_with_spy_executor()
+    before = rt.ledger.remaining(rt.holder)
+    wait_for = rt.journal._wait_for
+    injected = False
+
+    async def cancel_at_wait(seq: int) -> None:
+        nonlocal injected
+        if not injected and any(
+            event.type == "reserve" and event.seq == seq for event in rt.journal._queue
+        ):
+            injected = True
+            if native:
+                caller = asyncio.current_task()
+                assert caller is not None
+                caller.cancel()
+            else:
+                scope.cancel()
+        await wait_for(seq)
+
+    monkeypatch.setattr(rt.journal, "_wait_for", cancel_at_wait)
+    with anyio.fail_after(5):
+        with anyio.CancelScope() as scope:
+            with pytest.raises(asyncio.CancelledError):
+                await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        await rt.journal.commit()
+    reserves = rt_env.events("reserve")
+    settlements = rt_env.events("settle")
+    assert len(reserves) == len(settlements) == 1
+    assert not rt_env.events("tool_start")
+    assert not rt_env.events("tool_end")
+    assert not rt_env.spy.jobs
+    assert settlements[0].payload["id"] == reserves[0].payload["reservation"]["id"]
+    assert Amount.model_validate(settlements[0].payload["actual"]) == Amount()
+    assert settlements[0].payload["estimated"] is False
+    assert all(entry.settled for entry in rt.ledger._entries.values())
+    assert rt.ledger.remaining(rt.holder) == before
 
 
 @pytest.mark.parametrize("failure", ["raise", "invalid", "nonfinite", "logs"])
