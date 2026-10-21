@@ -20,8 +20,11 @@ _Folder = Literal["reviews", "curation"]
 
 def _validate_reviewer(reviewer: str | None) -> str:
     """Require the shared lowercase reviewer slug."""
-    if reviewer is None or re.fullmatch(r"[a-z0-9][a-z0-9._-]*", reviewer) is None:
-        raise _core_error(ValueError, "reviewer must be a lowercase slug")
+    if (
+        not isinstance(reviewer, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", reviewer) is None
+    ):
+        raise _core_error(ValueError, "reviewer must be a lowercase slug of 1 to 64 characters")
     return reviewer
 
 
@@ -165,7 +168,7 @@ def human_object_key(
     basename : str
         UTC-millisecond timestamp and eight-hex suffix with JSONL extension.
     reviewer : str or None, default=None
-        Required lowercase slug for reviews; forbidden for curation.
+        Required 1-64 character lowercase slug for reviews; forbidden for curation.
 
     Returns
     -------

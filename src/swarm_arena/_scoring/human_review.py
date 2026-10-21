@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import gettempdir
 from typing import Any, Final, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import anyio
 
@@ -46,7 +46,7 @@ from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._store.base import Store, open_store
+from swarm_arena._store.base import Store, _check_key, open_store
 
 CSV_HEADER: Final = ("id", "goal", "team", "agent", "scores", "verdict", "score", "notes")
 
@@ -281,6 +281,47 @@ def _write_export(out_dir: Path, files: dict[str, bytes]) -> None:
         ) from None
 
 
+def _review_keys(state: RunState, reviewer: str, arena_root: str, now: datetime) -> dict[str, str]:
+    """Validate all derived locations without probing or mutating storage."""
+    namespaces = {
+        g.namespace
+        for revisions in state.plans.values()
+        for p, _ in revisions
+        for g in [p.goal, *(part.goal for part in p.parts)]
+    }
+    keys = {
+        ns: human_object_key(ns, "reviews", human_object_name(now), reviewer=reviewer)
+        for ns in sorted(namespaces)
+    }
+    try:
+        for key in keys.values():
+            _check_key(key)
+        if arena_root.startswith("s3://"):
+            prefix = urlsplit(arena_root).path.lstrip("/").rstrip("/")
+            if any(
+                len((prefix + "/" + key if prefix else key).encode()) > 1024
+                for key in keys.values()
+            ):
+                raise ValueError
+        else:
+            root = Path(arena_root).expanduser().resolve()
+            ancestor = root
+            while not ancestor.exists():
+                ancestor = ancestor.parent
+            name_max = os.pathconf(ancestor, "PC_NAME_MAX")
+            path_max = os.pathconf(ancestor, "PC_PATH_MAX")
+            for key in keys.values():
+                # LocalStore creates a sibling with a .tmp-<12 hex> suffix.
+                temporary = Path(str(root / key) + ".tmp-" + "0" * 12)
+                if (path_max > 0 and len(os.fsencode(temporary)) >= path_max) or (
+                    name_max > 0 and any(len(os.fsencode(p)) > name_max for p in temporary.parts)
+                ):
+                    raise ValueError
+    except (OSError, ValueError):
+        raise _core_error(ValueError, "review object location exceeds storage limits") from None
+    return keys
+
+
 _T = TypeVar("_T")
 
 
@@ -382,7 +423,7 @@ class HumanReview:
     Parameters
     ----------
     reviewer : str
-        Lowercase slug matching ``[a-z0-9][a-z0-9._-]*``.
+        1-64 character lowercase slug matching ``[a-z0-9][a-z0-9._-]*``.
 
     Attributes
     ----------
@@ -485,9 +526,17 @@ class HumanReview:
         store = await anyio.to_thread.run_sync(run_store, config.run_root, run_id)
         state = await anyio.to_thread.run_sync(_read_state, store, run_id)
         parse_review_csv(data, state, judge=self.judge_name)
+        await run_sync_daemon(_review_keys, state, self._reviewer, config.arena_root, utc_now())
         await anyio.to_thread.run_sync(check_storage, config)
+
+        def validate_locations(doc: OwnerDoc) -> None:
+            current = _read_state(store, run_id, doc)
+            _review_keys(current, self._reviewer, config.arena_root, utc_now())
+
         try:
-            lease = await _take_over(config, run_id, store, force=False, review=True)
+            lease = await _take_over(
+                config, run_id, store, force=False, review=True, validate=validate_locations
+            )
         except LeaseHeld:
             raise _core_error(
                 RuntimeError, f"run {run_id} has a live owner; run review import after the run ends"
@@ -519,18 +568,9 @@ class HumanReview:
                 arena = await run_sync_daemon(open_store, config.arena_root)
                 await _repair_review_objects(state, arena, store, lease, writer)
                 now = utc_now()
-                namespaces = {
-                    g.namespace
-                    for revisions in state.plans.values()
-                    for p, _ in revisions
-                    for g in [p.goal, *(part.goal for part in p.parts)]
-                }
-                keys = {
-                    ns: human_object_key(
-                        ns, "reviews", human_object_name(now), reviewer=self._reviewer
-                    )
-                    for ns in sorted(namespaces)
-                }
+                keys = await run_sync_daemon(
+                    _review_keys, state, self._reviewer, config.arena_root, now
+                )
                 ids = IdGen(run_id, lease.doc.epoch, counters=state.id_counters)
                 scores = [
                     s.model_copy(

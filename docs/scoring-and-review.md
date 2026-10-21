@@ -183,7 +183,9 @@ out = await review.export("my-run", config=config, out_dir=Path("review"), top=2
 scores = await review.import_csv("my-run", out / "review.csv", config=config)
 ```
 
-Reviewer names are lowercase slugs: `[a-z0-9][a-z0-9._-]*`. Use `goal="goal-id"`
+Reviewer names are 1–64 character lowercase slugs: `[a-z0-9][a-z0-9._-]*`.
+Derived review object locations must fit the storage key and local path limits;
+invalid locations are refused before takeover or receipt admission. Use `goal="goal-id"`
 on export to select one main goal; `top` applies separately to each main goal
 and includes its ranked parts.
 
@@ -213,8 +215,10 @@ in the arena are the sole source of human scores for board reads; the receipt
 is for recovery. Resume repairs missing objects before opening the board, and
 a later import repairs them before committing another review. Recovery uses
 the original names, IDs and canonical bytes. An existing object with different
-bytes stops recovery. Receipt repair, import publication, and completion export share the owning writer's fencing and cancellation lifetime. Blocking I/O is abandonable; an already
-started write can finish, but cancellation never starts the next publication.
+bytes stops recovery. Receipt repair, import publication, and completion export
+share the owning writer's fencing and cancellation lifetime. Blocking I/O is
+abandonable; an already started write can finish, but cancellation never starts
+the next publication.
 
 Retrying a CSV after a receipt committed creates a new
 review batch; recovery itself does not duplicate the original batch.

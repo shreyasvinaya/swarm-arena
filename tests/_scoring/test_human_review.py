@@ -843,3 +843,56 @@ async def test_review_storage_errors_rebuild_safe_diagnostics(
     assert str(caught.value) == (
         "review storage failed: StorageError" if kind == "raw" else "safe review storage failure"
     )
+
+
+@pytest.mark.parametrize("length", [65, 256])
+async def test_unsupported_reviewer_leaves_owner_and_recovery_unchanged(
+    review_run: FakeRun, run_config: RunConfig, tmp_path: Path, length: int
+) -> None:
+    from swarm_arena._engine.resume import resume_run
+
+    before = read_owner(review_run.store)
+    path = _file(tmp_path)
+    with pytest.raises(ValueError, match="reviewer"):
+        await HumanReview("a" * length).import_csv(review_run.run_id, path, config=run_config)
+    assert read_owner(review_run.store) == before
+    assert not _reviews(run_config)
+    await HumanReview("b" * 64).import_csv(review_run.run_id, path, config=run_config)
+    runner = await resume_run(run_config, review_run.run_id, force=False, replanner=None)
+    await runner.aclose()
+
+
+@pytest.mark.parametrize("location", ["local_component", "local_path", "s3_key"])
+async def test_invalid_review_location_fails_before_probe_or_takeover(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    from swarm_arena._engine.resume import resume_run
+
+    root = {
+        "local_component": str(tmp_path / ("a" * 256)),
+        "local_path": str(tmp_path / Path(*["a" * 100] * 45)),
+        "s3_key": "s3://bucket/" + "é" * 512,
+    }[location]
+    config = run_config.model_copy(update={"arena_root": root})
+    before = read_owner(review_run.store)
+    path = _file(tmp_path)
+    probes: list[int] = []
+
+    def probe(config: RunConfig) -> None:
+        probes.append(1)
+        raise AssertionError("invalid location reached storage probe")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(human_review, "check_storage", probe)
+        with pytest.raises(ValueError, match=r"review.*location"):
+            await HumanReview("alice").import_csv(review_run.run_id, path, config=config)
+    assert not probes
+    assert read_owner(review_run.store) == before
+    assert not _reviews(run_config)
+    await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
+    runner = await resume_run(run_config, review_run.run_id, force=False, replanner=None)
+    await runner.aclose()
