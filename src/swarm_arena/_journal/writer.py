@@ -17,6 +17,7 @@ from swarm_arena._errors import (
     StorageError,
     WriteOutcomeUnknown,
     _core_error,
+    _exception_type_name,
 )
 from swarm_arena._journal.event import WRITE_THROUGH, Event, EventDraft
 from swarm_arena._journal.lease import Head, Lease, read_owner
@@ -336,7 +337,8 @@ class JournalWriter:
         if self.fenced.is_set():
             error = self._failure
             cause = error if isinstance(error, StorageError) else None
-            raise _core_error(Fenced, f"journal writer failed: {type(error).__name__}") from cause
+            name = _exception_type_name(error) if error is not None else "NoneType"
+            raise _core_error(Fenced, f"journal writer failed: {name}") from cause
 
     def _remaining(self) -> float:
         """Compute lifetime using only the last confirmed owner document."""

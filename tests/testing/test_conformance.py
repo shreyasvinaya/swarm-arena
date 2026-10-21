@@ -56,7 +56,7 @@ from swarm_arena import (
     ScriptedManager,
     ScriptTool,
 )
-from swarm_arena._errors import ConfigError, SoftError
+from swarm_arena._errors import ConfigError, SoftError, _core_error
 from swarm_arena._exec.local import _NOT_AN_OUTPUT
 from swarm_arena._model.ids import run_tag
 from swarm_arena._model.tooling import format_logs_ref
@@ -643,7 +643,7 @@ async def test_executor_contract_is_asserted(output: object, match: str) -> None
 
 
 async def test_custom_executor_with_microsecond_times_passes() -> None:
-    # The core re-validates a ToolOutput in lax mode; timestamp precision is not a contract.
+    # Detached outputs apply the core UTC-millisecond validation contract.
     when = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
     out = ToolOutput(status=RunStatus.OK, data={"x": 1})
     out = out.model_copy(update={"started_at": when, "ended_at": when})
@@ -652,7 +652,12 @@ async def test_custom_executor_with_microsecond_times_passes() -> None:
         checked = await check_tool(
             PyTool(PyTool.Config(code="pass")), {}, executor=FixedExecutor(out)
         )
-    assert (checked.data, checked.started_at, checked.ended_at) == ({"x": 1}, when, when)
+    normalized = when.replace(microsecond=123000)
+    assert (checked.data, checked.started_at, checked.ended_at) == (
+        {"x": 1},
+        normalized,
+        normalized,
+    )
 
 
 async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
@@ -670,7 +675,7 @@ async def test_custom_executor_output_is_validated_in_lax_mode() -> None:
     assert (checked.status, checked.data) == (RunStatus.OK, {"x": 1})
 
 
-async def test_post_checks_read_the_validated_copy_and_the_original_is_returned(
+async def test_post_checks_and_return_use_the_detached_validated_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An executor that builds its output with model_construct leaves each file a plain dict.
@@ -692,7 +697,9 @@ async def test_post_checks_read_the_validated_copy_and_the_original_is_returned(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         checked = await check_tool(tool, {}, executor=FixedExecutor(out))
-    assert checked is out
+    assert checked is not out
+    assert type(checked) is ToolOutput
+    assert checked.files[0].sha256 == sha256
 
 
 async def test_preflight_runs_before_any_job() -> None:
@@ -1076,7 +1083,7 @@ async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch)
 
     from swarm_arena._errors import Fenced
 
-    failure = Fenced("ownership lost")
+    failure = _core_error(Fenced, "run ownership lost")
 
     async def run_round(self: NoopManager, ctx: AgentContext) -> RoundReport:
         raise failure
@@ -1084,7 +1091,8 @@ async def test_check_manager_propagates_fencing(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(NoopManager, "run_round", run_round)
     with pytest.raises(Fenced) as caught:
         await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
-    assert caught.value is failure
+    assert caught.value is not failure
+    assert caught.value.args == ("run ownership lost",)
 
 
 async def test_check_manager_surfaces_manager_exception() -> None:
@@ -1110,7 +1118,7 @@ async def test_check_manager_rejects_invalid_reports(
     assert "Manager.run_round() must return" in str(caught.value.__cause__)
 
 
-async def test_check_manager_returns_original_reports_and_resets_round_limits(
+async def test_check_manager_returns_detached_reports_and_resets_round_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from _fakes.tools import NoopManager
@@ -1132,7 +1140,10 @@ async def test_check_manager_returns_original_reports_and_resets_round_limits(
         limits=Limits(max_tool_runs_per_round=1),
     )
     assert seen == [1, 2]
-    assert all(report is original for report in reports)
+    assert all(
+        report == original and report is not original and type(report) is RoundReport
+        for report in reports
+    )
 
 
 async def test_check_manager_limit_reached_ends_only_the_round() -> None:

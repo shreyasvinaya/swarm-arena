@@ -3,6 +3,7 @@
 import json
 import threading
 from collections.abc import Sequence
+from typing import Any
 
 import anyio
 import pytest
@@ -16,9 +17,10 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
 from swarm_arena._budget.llm_scope import current_llm_scope
+from swarm_arena._engine import goal as goal_module
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -40,6 +42,22 @@ _REASONS = {
 @pytest.fixture(autouse=True)
 def fast_commits(env: EngineEnv) -> None:
     env.deps.journal._group_window_s = 0.001
+
+
+class _GoalTime:
+    """Control grace expiry without changing journal or AnyIO timeout clocks."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 0.0
+        self.sampled = anyio.Event()
+        monkeypatch.setattr(goal_module, "anyio", self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(anyio, name)
+
+    def current_time(self) -> float:
+        self.sampled.set()
+        return self.now
 
 
 def _signal(env: EngineEnv, flag: str) -> None:
@@ -203,6 +221,7 @@ async def test_pending_replan_is_abandoned(
 async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, flag: str, already_stopped: bool
 ) -> None:
+    clock = _GoalTime(monkeypatch)
     entered = anyio.Event()
     completed = anyio.Event()
     outcomes: list[GoalOutcome] = []
@@ -217,13 +236,6 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
             assert scope is not None
             scopes.append(scope)
             await scope.tranche.reserve_call(Amount(usd=0.01))
-            if not already_stopped and flag == "deadline":
-                env.deps.config = env.deps.config.model_copy(
-                    update={
-                        "limits": env.deps.config.limits.model_copy(update={"run_timeout_s": 0.03})
-                    }
-                )
-                env.deps.clock = RunClock(0)
             entered.set()
             await anyio.sleep_forever()
         return await real(self, goal, candidates, ctx)
@@ -247,8 +259,13 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
         group.start_soon(drive)
         with anyio.fail_after(10):
             await entered.wait()
-        if not already_stopped and flag == "stop_now":
+        if not already_stopped:
             _signal(env, flag)
+        # Grace includes construction and durable reservation. Expire it only
+        # after the judge is suspended and the supervisor has latched the stop.
+        with anyio.fail_after(10):
+            await clock.sampled.wait()
+        clock.now += env.deps.config.settle_timeout_s + 1
         with anyio.move_on_after(3):
             await completed.wait()
         group.cancel_scope.cancel()
@@ -274,6 +291,67 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
     assert not runner.admission._peaks
 
 
+@pytest.mark.parametrize("flag", ["stop_now", "deadline"])
+async def test_final_grace_can_expire_before_judge_dispatch(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    clock = _GoalTime(monkeypatch)
+    reserving = anyio.Event()
+    dispatched = anyio.Event()
+    completed = anyio.Event()
+    outcomes: list[GoalOutcome] = []
+    append = env.deps.journal.append_durable
+    judge = ProviderJudge.judge
+
+    async def blocked_reserve(draft: EventDraft) -> Event:
+        event = await append(draft)
+        if draft.type == "reserve" and draft.payload["reservation"]["kind"] == "final":
+            reserving.set()
+            await anyio.sleep_forever()
+        return event
+
+    async def observe_judge(
+        self: ProviderJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        if ctx.final:
+            dispatched.set()
+        return await judge(self, goal, candidates, ctx)
+
+    monkeypatch.setattr(env.deps.journal, "append_durable", blocked_reserve)
+    monkeypatch.setattr(ProviderJudge, "judge", observe_judge)
+    env.on_commit("round_closed", lambda ev: _signal(env, flag))
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.1})
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=_plan(teams=1, rounds=1, judges=[Ref(path="_fakes.tools:ProviderJudge", name="y")]),
+        replanner=None,
+    )
+
+    async def drive() -> None:
+        outcomes.append(await runner.run())
+        completed.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(drive)
+        with anyio.fail_after(10):
+            await reserving.wait()
+            await clock.sampled.wait()
+        assert not completed.is_set()
+        clock.now += env.deps.config.settle_timeout_s + 1
+        with anyio.fail_after(3):
+            await completed.wait()
+    _assert_terminal(env, outcomes[0], _REASONS[flag])
+    assert not dispatched.is_set()
+    assert [c.id for c in outcomes[0].finalists] == [env.candidates()[0].id]
+    assert not [e for e in env.events("score") if e.round == 0]
+    assert {e.payload["reason"] for e in env.events("judge_error") if e.round == 0} == {
+        "judge error: TimeoutError"
+    }
+    assert all(r.state != "open" for r in runner.recorded.reservations.values())
+    assert not runner.admission._peaks
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 async def test_replanner_fencing_propagates_and_user_cancellation_is_rejected(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, cancelled: bool
@@ -285,14 +363,14 @@ async def test_replanner_fencing_propagates_and_user_cancellation_is_rejected(
     planner = SequencePlanner([plan])
 
     async def fail(goal: Goal, config: RunConfig, history: History | None) -> Plan:
-        raise error("hook failure")
+        raise error("hook failure") if cancelled else _core_error(Fenced, "run ownership lost")
 
     monkeypatch.setattr(planner, "plan", fail)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
     if cancelled:
         assert not await runner._replan()
         assert env.events("plan_rejected")[-1].payload["errors"] == [
-            "planner error: _CoreRuntimeError"
+            "planner error: CancelledError"
         ]
     else:
         with pytest.raises(error):

@@ -9,7 +9,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import LimitReached, Manager
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
@@ -22,6 +22,7 @@ from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolOutput
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import Judge, JudgeContext, stamp_scores
 from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
@@ -116,7 +117,8 @@ async def check_tool(
     Returns
     -------
     ToolOutput
-        The executor's own output object, also when its status is not ``ok``.
+        A detached, validated base ``ToolOutput``, including core normalization,
+        also when its status is not ``ok``.
 
     Raises
     ------
@@ -181,12 +183,12 @@ async def check_tool(
     )
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         out = await runner.submit(job)
-        checked = await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
+        checked = await run_sync_daemon(_check_tool_output, plan.tool, plan.request, out)
         with anyio.move_on_after(BEFORE_KILL_TIMEOUT_S) as probe_scope:
             await run_sync_daemon(_probe_collect, plan.tool, plan.request)
         if probe_scope.cancel_called:
             raise _fail("Tool.collect() did not return before the failed-run probe deadline")
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return checked
 
@@ -260,8 +262,9 @@ async def check_check(
         raise _fail("Check.feedback must be 'pass_fail' or 'reasons'")
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         ctx = CheckContext(goal=goal, executor=runner, artifact_root=_artifact_root(), ids=_ids())
-        result = _check_result(await built.check(candidate, ctx))
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+        returned = await built.check(candidate, ctx)
+        result = await run_sync_daemon(_check_result, returned)
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return result.model_copy(update={"check": ref.component_name()})
 
@@ -356,11 +359,19 @@ async def check_judge(
             ids=_ids(),
             batch_id="b-" + secrets.token_hex(4),
         )
-        valid, scored = _check_scores(await built.judge(goal, candidates, ctx), candidates, ctx)
-        stamped = stamp_scores(
-            valid, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
+        returned = await built.judge(goal, candidates, ctx)
+        valid, scored = await run_sync_daemon(_check_scores, returned, candidates, ctx)
+        stamped = await run_sync_daemon(
+            partial(
+                stamp_scores,
+                valid,
+                judge=built,
+                judge_name=ref.component_name(),
+                ids=_ids(),
+                batch_id=ctx.batch_id,
+            )
         )
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     for candidate_id, reason in ctx.errors.items():
         warnings.warn(f"judge error for {candidate_id}: {reason}", UserWarning, stacklevel=2)
@@ -388,7 +399,7 @@ async def check_manager(
     No judges are supplied: score reads are empty, including ``best``.
     ``LimitReached`` ends a round normally, supplying an empty ``RoundReport``;
     later rounds still run with fresh action counters. Every returned report
-    must already be valid in strict mode, and original report objects are
+    must already be valid in strict mode, and detached base report models are
     returned. Ordinary manager exceptions end only their round; judging and
     closure complete and later rounds run before the first failure becomes a
     type-only ``AssertionError`` with its original cause and failed-run stderr
@@ -413,7 +424,7 @@ async def check_manager(
     Returns
     -------
     list[RoundReport]
-        Original valid manager reports in round order.
+        Detached, strictly validated base ``RoundReport`` copies in round order.
 
     Raises
     ------
@@ -441,6 +452,7 @@ async def check_manager(
     config = RunConfig() if config is None else config
     limits = config.limits if limits is None else limits
     harness = OfflineHarness()
+    outcome = _Outcome()
     try:
         reports = await harness.run_rounds(
             built_manager,
@@ -453,7 +465,8 @@ async def check_manager(
         if harness.manager_errors:
             raise harness.manager_errors[0]
         return reports
-    except (LimitReached, Fenced):
+    except LimitReached:
         raise
-    except Exception as error:
-        raise AssertionError(f"manager raised {type(error).__name__}") from error
+    except BaseException as error:
+        error = outcome.classify(error)
+        raise AssertionError(f"manager raised {_exception_type_name(error)}") from error

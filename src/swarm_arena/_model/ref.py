@@ -28,6 +28,7 @@ from swarm_arena._model.base import (
 )
 from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 
 
 class EmptyConfig(_SafeModel):
@@ -184,7 +185,10 @@ def load_object(path: str) -> object:
         obj: object = importlib.import_module(module)
         for part in qualname.split("."):
             obj = getattr(obj, part)
-    except (Exception, SystemExit):
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
         raise ValueError(f"cannot import {path}") from None
     return obj
 
@@ -231,12 +235,23 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
     try:
         try:
             return model_cls.model_validate(data)
-        except Exception as error:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                error = _classify_outcome(error)
                 safe = _sanitize_validation_error(model_cls, error)
-            except Exception:
+            except RecursionError:
+                safe = None
+            except KeyboardInterrupt:
+                raise
+            except BaseException as error:
+                try:  # noqa: SIM105 - a context manager itself needs spare stack frames
+                    _propagate_control(error)
+                except RecursionError:
+                    pass
                 safe = None
     finally:
         owner.thread_id = None
@@ -497,6 +512,7 @@ def coerce_ref(value: object) -> object:
         try:
             return Ref.of(value)
         except TypeError as error:
+            _propagate_control(error)
             # Only these fixed importability reasons are allowed out of the boundary.
             reason = str(error)
             if reason not in {

@@ -140,6 +140,14 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
     --------
     >>> finalists = await converge(runner, select_only=True)  # doctest: +SKIP
     """
+    recovered = goal._recover_final()
+    if recovered is not None:
+        return select_finalists(
+            [(candidate, Score.maximize(0)) for candidate in recovered],
+            top_n=goal.plan.converge.top_n,
+            distinct=goal.plan.converge.distinct,
+            fingerprint=lambda c: goal.recorded.fingerprints.get(c.id),
+        )
     while True:
         if goal.join_phase == "replan" and not await _retry_join(goal):
             return []

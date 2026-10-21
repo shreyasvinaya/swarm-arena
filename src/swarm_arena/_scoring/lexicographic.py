@@ -5,12 +5,14 @@ from typing import ClassVar, cast
 
 from pydantic import Field, JsonValue
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel
 from swarm_arena._model.results import Candidate, Score
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -99,9 +101,13 @@ class Lexicographic(Judge):
                 cls, validated = ref._resolve_config(Judge)
                 try:
                     members.append(cls(validated))
-                except TypeError:
+                except TypeError as error:
+                    _propagate_control(error)
                     raise TypeError(f"cannot build judge {ref.path}") from None
-                except Exception:
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as error:
+                    _propagate_control(error)
                     raise ValueError(f"cannot build judge {ref.path}") from None
             self._members = members
         return self._members
@@ -175,9 +181,10 @@ class Lexicographic(Judge):
                     ]
                 )
             )
-        except Fenced:
+        except KeyboardInterrupt:
             raise
-        except Exception:
+        except BaseException as error:
+            _propagate_control(error)
             raise ValueError("cannot encode lexicographic rubric") from None
 
     def panel_hash(self) -> str:
@@ -348,27 +355,8 @@ class Lexicographic(Judge):
         by_member: list[dict[str, Score]] = []
         for ref, member in zip(self.config.judges, members, strict=True):
             name = ref.name if ref.name is not None else member.name
-            raw: dict[str, Score] = {}
-            invalid_item = False
-            for score in await member.judge(goal, candidates, ctx):
-                if not isinstance(score, Score) or not isinstance(score.candidate_id, str):
-                    invalid_item = True
-                    continue
-                raw[score.candidate_id] = score
-            valid: dict[str, Score] = {}
-            errors: dict[str, str] = {}
-            for candidate in candidates:
-                score = raw.get(candidate.id)
-                if score is None:
-                    reason = "an invalid score" if invalid_item else "no score"
-                    errors[candidate.id] = f"member {name} gave {reason}"
-                elif is_finite_score(score):
-                    valid[candidate.id] = score
-                else:
-                    errors[candidate.id] = f"member {name} gave a non-finite key"
-            if len({len(score.key) for score in valid.values()}) > 1:
-                valid.clear()
-                errors = {c.id: f"member {name} gave keys of different lengths" for c in candidates}
+            returned = await member.judge(goal, candidates, ctx)
+            valid, errors = await run_sync_daemon(self._prepare_member, returned, candidates, name)
             for candidate_id, reason in errors.items():
                 ctx.judge_error(candidate_id, reason)
             by_member.append(valid)
@@ -376,6 +364,42 @@ class Lexicographic(Judge):
         for candidate_id, reason in errors.items():
             ctx.judge_error(candidate_id, reason)
         return scores
+
+    @staticmethod
+    def _prepare_member(
+        scores: Sequence[Score], candidates: Sequence[Candidate], name: str
+    ) -> tuple[dict[str, Score], dict[str, str]]:
+        """Inspect, validate and detach member scores without loop-side subclass calls."""
+        raw: dict[str, Score] = {}
+        invalid_item = False
+        for score in scores:
+            if not isinstance(score, Score) or not isinstance(score.candidate_id, str):
+                invalid_item = True
+                continue
+            raw[score.candidate_id] = score
+        valid: dict[str, Score] = {}
+        errors: dict[str, str] = {}
+        for candidate in candidates:
+            score = raw.get(candidate.id)
+            if score is None:
+                reason = "an invalid score" if invalid_item else "no score"
+                errors[candidate.id] = f"member {name} gave {reason}"
+            elif is_finite_score(score):
+                try:
+                    valid[candidate.id] = _detach_model(Score, score)
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as error:
+                    error = _classify_outcome(error)
+                    errors[candidate.id] = (
+                        f"member {name} gave an invalid score: {_exception_type_name(error)}"
+                    )
+            else:
+                errors[candidate.id] = f"member {name} gave a non-finite key"
+        if len({len(score.key) for score in valid.values()}) > 1:
+            valid.clear()
+            errors = {c.id: f"member {name} gave keys of different lengths" for c in candidates}
+        return valid, errors
 
     @staticmethod
     def _combine_scores(
@@ -414,8 +438,11 @@ class Lexicographic(Judge):
                         ),
                     )
                 )
-            except Fenced:
+            except KeyboardInterrupt:
                 raise
-            except Exception as error:
-                errors[candidate.id] = f"{type(error).__name__}: cannot combine member scores"
+            except BaseException as error:
+                error = _classify_outcome(error)
+                errors[candidate.id] = (
+                    f"{_exception_type_name(error)}: cannot combine member scores"
+                )
         return scores, errors

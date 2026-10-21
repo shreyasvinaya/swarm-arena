@@ -15,8 +15,40 @@ from _fakes.run import all_events, events, plan
 from swarm_arena import Goal, Plan, RunConfig, Swarm
 from swarm_arena._engine.goal import GoalRunner
 from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena.manager import LimitReached
 from swarm_arena.planning import History, Planner
+
+
+async def test_supervised_nested_fencing_is_bare_and_value_free(env: EngineEnv) -> None:
+    secret = str(uuid4())
+
+    async def invoke() -> None:
+        raise BaseExceptionGroup(
+            secret,
+            [
+                asyncio.CancelledError(secret),
+                ExceptionGroup(secret, [_core_error(Fenced, "run ownership lost")]),
+            ],
+        ) from ValueError(secret)
+
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan(), replanner=None)
+    with pytest.raises(Fenced) as caught:
+        await runner._supervised_step(invoke, final=False)
+    assert caught.value.args == ("run ownership lost",)
+    assert caught.value.__cause__ is None
+    assert secret not in "".join(traceback.format_exception(caught.value))
+
+
+def test_pending_caller_cancellation_precedes_nested_fencing() -> None:
+    secret = str(uuid4())
+    with pytest.raises(asyncio.CancelledError) as caught:
+        _classify_outcome(
+            ExceptionGroup(secret, [_core_error(Fenced, "run ownership lost")]), cancelled=True
+        )
+    assert caught.value.args == ()
+    assert caught.value.__cause__ is None
+    assert secret not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize("kind", ["ordinary", "mixed_group", "cancelled"])
@@ -121,7 +153,11 @@ async def test_supervised_outcome_is_fresh_value_free_core_error(env: EngineEnv,
 
 @pytest.mark.parametrize("kind", ["fenced", "limit"])
 async def test_supervised_outcome_preserves_core_controls(env: EngineEnv, kind: str) -> None:
-    error = Fenced() if kind == "fenced" else _core_error(LimitReached, "budget", "budget used up")
+    error = (
+        _core_error(Fenced, "run ownership lost")
+        if kind == "fenced"
+        else _core_error(LimitReached, "budget", "budget used up")
+    )
     if kind == "limit":
         error.args = (str(uuid4()),)
         error.add_note(str(uuid4()))
@@ -133,7 +169,8 @@ async def test_supervised_outcome_preserves_core_controls(env: EngineEnv, kind: 
     with pytest.raises(type(error)) as caught:
         await runner._supervised_step(invoke, final=False)
     if kind == "fenced":
-        assert caught.value is error
+        assert caught.value is not error
+        assert caught.value.args == ("run ownership lost",)
     else:
         assert caught.value is not error
         assert caught.value.args == ("budget used up",)
@@ -231,7 +268,7 @@ async def test_caller_cancellation_entry_baseline(env: EngineEnv, pending: bool)
         assert parent.cancelling() == 1
         await env.deps.journal.commit()
         assert env.events("plan_rejected")[-1].payload["errors"] == [
-            "planner error: _CoreRuntimeError"
+            "planner error: CancelledError"
         ]
 
 

@@ -23,7 +23,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
 from swarm_arena._engine.stops import RunClock, StopState, round_deadline
-from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
+from swarm_arena._errors import Fenced, _core_error, _exception_type_name, _is_core_signal
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
@@ -36,13 +36,16 @@ from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.data import finite_json
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal, GoalKey
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _has_core_fenced, _Outcome
 from swarm_arena._planning.catalog_check import find_entry
+from swarm_arena._planning.policy import _INACTIVE
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.check import Check
 from swarm_arena._store.artifacts import ArtifactStore
@@ -120,8 +123,8 @@ class AgentSlot:
         Team definition.
     spec : AgentSpec
         Agent definition.
-    manager : Manager
-        Built manager instance.
+    manager : Manager or None
+        Reused instance, or None until per-agent runtime preparation.
     tool_ref : Ref
         Admitted base tool reference, before round overrides.
     goal : Goal
@@ -147,7 +150,7 @@ class AgentSlot:
     address: str
     team: TeamSpec
     spec: AgentSpec
-    manager: Manager
+    manager: Manager | None
     tool_ref: Ref
     goal: Goal
     goal_key: GoalKey
@@ -779,12 +782,7 @@ class RoundRunner:
         >>> outcome = await runner.run(1)  # doctest: +SKIP
         """
         await self._restore(round)
-        agents = [
-            slot
-            for slot in self.agents
-            if slot.status
-            not in {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
-        ]
+        agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
         frontier = await self._frontier(round, agents)
         deadline = round_deadline(
             anyio.current_time(),
@@ -807,9 +805,12 @@ class RoundRunner:
             nonlocal remaining
             key = f"{slot.team.name}/{slot.spec.name}"
             rt: AgentRuntime | None = None
+            outcome = _Outcome()
             try:
                 with scopes[index], track_inflight(inflight):
                     await anyio.lowlevel.checkpoint()
+                    if slot.manager is None:
+                        slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
                     rt = await self._runtime(slot, round, frontier, private_paths, parents)
                     runtimes[index] = rt
                     ctx = await self._context(rt, feedback_policies)
@@ -832,25 +833,19 @@ class RoundRunner:
                         )
                     ):
                         report = await slot.manager.run_round(ctx)
-                        if not isinstance(report, RoundReport) or not isinstance(
-                            report.summary, str
-                        ):
-                            raise TypeError("invalid manager report")
+                        report = await run_sync_daemon(_detach_model, RoundReport, report)
                         summaries[key] = finite_json(report.summary)
-            except Fenced:
-                raise
-            except Exception as error:
-                if self.deps.journal.fenced.is_set() or (
-                    isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None
-                ):
+            except BaseException as error:
+                error = outcome.classify(error)
+                if self.deps.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
                 if contexts[index] is None:
-                    reasons[key] = f"agent error: {type(error).__name__}"
+                    reasons[key] = f"agent error: {_exception_type_name(error)}"
                 else:
                     reasons[key] = (
                         "limit reached"
-                        if isinstance(_rebuild_core_signal(error), LimitReached)
-                        else f"manager error: {type(error).__name__}"
+                        if _is_core_signal(error) and isinstance(error, LimitReached)
+                        else f"manager error: {_exception_type_name(error)}"
                     )
             finally:
                 if contexts[index] is None:
@@ -871,7 +866,7 @@ class RoundRunner:
                 await done.wait()
                 tasks.cancel_scope.cancel()
         except BaseExceptionGroup as errors:
-            if self.deps.journal.fenced.is_set() or errors.subgroup(Fenced) is not None:
+            if self.deps.journal.fenced.is_set() or _has_core_fenced(errors):
                 raise _core_error(Fenced, "run ownership lost") from None
             raise
         if self.deps.journal.fenced.is_set():

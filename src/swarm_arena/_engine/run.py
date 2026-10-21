@@ -34,7 +34,7 @@ from swarm_arena._errors import (
     PlanError,
     StorageError,
     _core_error,
-    _rebuild_core_signal,
+    _exception_type_name,
 )
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
@@ -45,13 +45,16 @@ from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, utc_now
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ids import IdGen, new_run_id
 from swarm_arena._model.plan import Plan, Resources, RoundSpec
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import Estimate, ToolRequest
+from swarm_arena._outcomes import _has_core_fenced as _has_fenced
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
-from swarm_arena._planning.provenance import stamp
+from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store, open_store
@@ -122,35 +125,32 @@ def _build_executor(config: RunConfig) -> Executor:
 def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[str, Amount]]:
     """Bound each address by all its known effective variants and empty inputs."""
     tools: dict[str, Sequence[tuple[Tool, ToolRequest]]] = {}
-    try:
-        for plan in plans:
-            rounds = plan.rounds or [RoundSpec() for _ in range(plan.rounds_total(config.limits))]
-            teams = [(team, list(enumerate(rounds, 1))) for team in plan.teams]
-            if plan.converge.mode == "team" and plan.converge.team is not None:
-                teams.append(
-                    (
-                        plan.converge.team,
-                        [
-                            (number, plan.converge.round or rounds[-1])
-                            for number in range(1, len(rounds) + 2)
-                        ],
-                    )
+    for plan in plans:
+        rounds = plan.rounds or [RoundSpec() for _ in range(plan.rounds_total(config.limits))]
+        teams = [(team, list(enumerate(rounds, 1))) for team in plan.teams]
+        if plan.converge.mode == "team" and plan.converge.team is not None:
+            teams.append(
+                (
+                    plan.converge.team,
+                    [
+                        (number, plan.converge.round or rounds[-1])
+                        for number in range(1, len(rounds) + 2)
+                    ],
                 )
-            for team, specs in teams:
-                for agent in team.agents:
-                    tools[f"{plan.goal.id}/{team.name}/{agent.name}"] = [
-                        (
-                            effective_tool_ref(agent.tool, spec.tool_overrides).build(Tool),
-                            ToolRequest(round=number, round_overrides=spec.tool_overrides),
-                        )
-                        for number, spec in specs
-                    ]
-        price_of = make_price_of(config.models)
-        return worst_case_estimate(plans, config, tools, price_of), {
-            p.goal.id: final_slice_estimate(p, config, tools, price_of) for p in plans
-        }
-    except Exception as exc:
-        raise _core_error(RuntimeError, f"estimate failed: {type(exc).__name__}") from None
+            )
+        for team, specs in teams:
+            for agent in team.agents:
+                tools[f"{plan.goal.id}/{team.name}/{agent.name}"] = [
+                    (
+                        effective_tool_ref(agent.tool, spec.tool_overrides).build(Tool),
+                        ToolRequest(round=number, round_overrides=spec.tool_overrides),
+                    )
+                    for number, spec in specs
+                ]
+    price_of = make_price_of(config.models)
+    return worst_case_estimate(plans, config, tools, price_of), {
+        p.goal.id: final_slice_estimate(p, config, tools, price_of) for p in plans
+    }
 
 
 def _exceeds_limit(amount: Amount, config: RunConfig, fraction: Fraction = Fraction(1)) -> bool:
@@ -207,36 +207,29 @@ def _capacity_warning(plans: Sequence[Plan], capacity: Resources | None) -> list
     return []
 
 
-def _has_fenced(error: BaseException) -> bool:
-    return isinstance(error, Fenced) or (
-        isinstance(error, BaseExceptionGroup) and any(_has_fenced(e) for e in error.exceptions)
-    )
-
-
 async def _start_board(config: RunConfig) -> Board:
     """Build the default or configured board with safe connector diagnostics."""
     if config.board is None:
         return ArenaBoard(arena_root=config.arena_root)
+    outcome = _Outcome()
     try:
         return await run_sync_daemon(config.board.build, Board)
-    except Exception as error:
-        safe = _rebuild_core_signal(error)
-        if safe is not None:
-            raise safe from None
+    except BaseException as error:
+        error = outcome.classify(error)
         raise _core_error(
-            RuntimeError, f"board construction failed: {type(error).__name__}"
+            RuntimeError, f"board construction failed: {_exception_type_name(error)}"
         ) from None
 
 
 async def _start_executor(config: RunConfig) -> Executor:
     """Construct an executor within the shared user-code diagnostic boundary."""
+    outcome = _Outcome()
     try:
         return await run_sync_daemon(_build_executor, config)
-    except Exception as exc:
-        if _has_fenced(exc):
-            raise
+    except BaseException as exc:
+        exc = outcome.classify(exc)
         raise _core_error(
-            RuntimeError, f"executor construction failed: {type(exc).__name__}"
+            RuntimeError, f"executor construction failed: {_exception_type_name(exc)}"
         ) from None
 
 
@@ -244,41 +237,41 @@ async def _open_board(
     board: Board, config: RunConfig, run_id: str, namespaces: Sequence[str]
 ) -> None:
     """Open a board through the same safe, cancellable boundary as construction."""
+    outcome = _Outcome()
     try:
         await run_sync_daemon(board.open, run_id, config.run_root, namespaces)
-    except Exception as error:
-        safe = _rebuild_core_signal(error)
-        if safe is not None:
-            raise safe from None
-        raise _core_error(RuntimeError, f"board open failed: {type(error).__name__}") from None
+    except BaseException as error:
+        error = outcome.classify(error)
+        raise _core_error(
+            RuntimeError, f"board open failed: {_exception_type_name(error)}"
+        ) from None
 
 
 async def _close_board(board: Board, config: RunConfig, *, failed: bool) -> None:
     """Bound shielded board cleanup and retain an already-raised primary error."""
     with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
+        outcome = _Outcome()
         try:
             await run_sync_daemon(board.close)
-        except Exception as error:
+        except BaseException as error:
             if not failed and not shutdown.cancel_called:
-                safe = _rebuild_core_signal(error)
-                if safe is not None:
-                    raise safe from None
+                error = outcome.classify(error)
                 raise _core_error(
-                    RuntimeError, f"board close failed: {type(error).__name__}"
+                    RuntimeError, f"board close failed: {_exception_type_name(error)}"
                 ) from None
 
 
 async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool) -> None:
     """Bound shielded shutdown while preserving an already-raised exception."""
     with anyio.move_on_after(config.settle_timeout_s, shield=True) as shutdown:
+        outcome = _Outcome()
         try:
             await executor.aclose()
-        except Exception as exc:
+        except BaseException as exc:
             if not failed and not shutdown.cancel_called:
-                if _has_fenced(exc):
-                    raise _core_error(Fenced) from None
+                exc = outcome.classify(exc)
                 raise _core_error(
-                    RuntimeError, f"executor shutdown failed: {type(exc).__name__}"
+                    RuntimeError, f"executor shutdown failed: {_exception_type_name(exc)}"
                 ) from None
 
 
@@ -286,6 +279,13 @@ def _promote(stage: Path, artifacts: ArtifactStore) -> None:
     staged = ArtifactStore(LocalStore(stage))
     for path in stage.iterdir():
         artifacts.put_bytes(staged.get_bytes(path.name))
+
+
+def _local_journal_path(run_id: str, epoch: int) -> Path:
+    """Locate the local write-ahead journal for one run ownership epoch."""
+    return (
+        Path(gettempdir()) / f"swarm-arena-{os.getuid()}" / "journals" / f"{run_id}-e{epoch}.jsonl"
+    )
 
 
 class RunRunner:
@@ -329,6 +329,7 @@ class RunRunner:
         self._stop_mode = 0
         self.resumed = resumed
         self._used = False
+        self._queue_changed = anyio.Event()
 
     async def run(self) -> dict[str, list[Candidate]]:
         """
@@ -341,12 +342,11 @@ class RunRunner:
 
         Raises
         ------
-        PlanError
+        ValueError
             If admission fails or goal identifiers repeat.
         RuntimeError
-            If the backend, estimates, approval or preflight refuses the run.
-        Fenced
-            If ownership is lost. In-flight work is cancelled before returning.
+            If the backend, estimates, approval or preflight refuses the run,
+            or ownership is lost. In-flight work is cancelled before returning.
 
         Notes
         -----
@@ -380,6 +380,12 @@ class RunRunner:
                 raise
             finally:
                 await services._aclose(failed=failed)
+        outcome = _Outcome()
+        try:
+            self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
+        except BaseException as error:
+            error = outcome.classify(error)
+            raise _core_error(PlanError, [f"invalid plan: {_exception_type_name(error)}"]) from None
         seen: set[str] = set()
         for plan in self.plans:
             if plan.goal.id in seen:
@@ -410,7 +416,14 @@ class RunRunner:
                 if collisions := _goal_key_errors(admitted):
                     raise _core_error(PlanError, collisions)
                 self.plans = admitted
-                estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
+                outcome = _Outcome()
+                try:
+                    estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
+                except BaseException as exc:
+                    exc = outcome.classify(exc)
+                    raise _core_error(
+                        RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
+                    ) from None
                 if _exceeds_limit(estimate, self.config):
                     raise _core_error(
                         RuntimeError, "worst-case estimate exceeds the configured run limit"
@@ -419,29 +432,31 @@ class RunRunner:
                 if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
                     raise _core_error(RuntimeError, "reserve cannot hold the final slices")
                 executor = await _start_executor(self.config)
+                outcome = _Outcome()
                 try:
                     capacity = await executor.capacity()
                     invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
                     if not invalid_capacity:
+                        if capacity is not None:
+                            capacity = await run_sync_daemon(_detach_model, Resources, capacity)
                         warnings.extend(_capacity_warning(admitted, capacity))
-                except Exception as exc:
-                    if _has_fenced(exc):
-                        raise
+                except BaseException as exc:
+                    exc = outcome.classify(exc)
                     raise _core_error(
-                        RuntimeError, f"executor capacity failed: {type(exc).__name__}"
+                        RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
                     ) from None
                 if invalid_capacity:
                     raise _core_error(
                         RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
                     ) from None
                 if self.approve is not None:
+                    outcome = _Outcome()
                     try:
                         approved = await self.approve(estimate.to_estimate(), warnings)
-                    except Exception as exc:
-                        if _has_fenced(exc):
-                            raise
+                    except BaseException as exc:
+                        exc = outcome.classify(exc)
                         raise _core_error(
-                            RuntimeError, f"approval failed: {type(exc).__name__}"
+                            RuntimeError, f"approval failed: {_exception_type_name(exc)}"
                         ) from None
                     if type(approved) is not bool:
                         raise _core_error(
@@ -486,12 +501,7 @@ class RunRunner:
                 ttl_s=config.lease_ttl_s,
             )
         )
-        local_path = (
-            Path(gettempdir())
-            / f"swarm-arena-{os.getuid()}"
-            / "journals"
-            / f"{run_id}-e{lease.doc.epoch}.jsonl"
-        )
+        local_path = _local_journal_path(run_id, lease.doc.epoch)
         clock = RunClock(0)
         async with _RunJournal(
             store,
@@ -567,7 +577,7 @@ class RunRunner:
                     views=views,
                     stops=StopState(),
                     clock=clock,
-                    admission=RunAdmission(config.limits.max_agents_total),
+                    admission=RunAdmission(config.limits.max_agents_total, self.plans),
                 )
                 return await self._drive(deps, lease.doc.epoch)
             finally:
@@ -586,7 +596,13 @@ class RunRunner:
         if self.resumed is not None:
             await self.resumed._services._aclose()
 
+    def _wake_queue(self) -> None:
+        self._queue_changed.set()
+
     async def _drive(self, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
+        assert deps.admission is not None
+        deps.admission.on_change = self._wake_queue
+        deps.stops.on_change = self._wake_queue
         result: dict[str, list[Candidate]] = {}
         async with _supervise_writer(deps.journal):
             async with anyio.create_task_group() as watchers:
@@ -679,9 +695,11 @@ class RunRunner:
             out = await runner.run()
             results[runner.goal_id] = out.finalists
             active.pop(runner.goal_id)
+            self._wake_queue()
 
         async with anyio.create_task_group() as goals:
             while queued or active:
+                changed = self._queue_changed = anyio.Event()
                 await self._record_stops(deps)
                 if self._stopping(deps):
                     for runner in list(queued):
@@ -717,7 +735,7 @@ class RunRunner:
                     active[runner.goal_id] = runner
                     goals.start_soon(run_goal, runner)
                 if queued or active:
-                    await anyio.sleep(0.02)
+                    await changed.wait()
         return {p.goal.id: results[p.goal.id] for p in self.plans}
 
 

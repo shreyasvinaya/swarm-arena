@@ -39,9 +39,9 @@ class Action(Generic[InputT]):
         Explanation of the action's purpose.
     input_model : type[InputT]
         Model that validates the action's arguments.
-    handler : Callable[[Any, InputT], Awaitable[JsonValue]]
-        Handler receiving the agent's AgentContext and validated arguments.
-        AgentContext becomes available in M1b.
+    handler : Callable[[AgentContext, InputT], Awaitable[JsonValue]]
+        Handler receiving the agent's ``AgentContext`` as its first argument
+        and validated inputs as its second argument.
     counts_as : {'board_read', 'none'}, default='none'
         Counter charged when the action runs.
 

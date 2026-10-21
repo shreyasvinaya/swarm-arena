@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from swarm_arena._cli import arena_cmds
 from swarm_arena._cli.run_cmds import register
-from swarm_arena._errors import _rebuild_core_signal
+from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
 from swarm_arena._version import __version__
 
 
@@ -26,7 +26,7 @@ def _parser() -> argparse.ArgumentParser:
 def _error_message(error: Exception) -> str:
     """Retain sanitized core diagnostics, hiding unforeseen exception values."""
     rebuilt = _rebuild_core_signal(error)
-    return str(rebuilt) if rebuilt is not None else type(error).__name__
+    return str(rebuilt) if rebuilt is not None else _exception_type_name(error)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -7,7 +7,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft, EventType
@@ -493,16 +493,18 @@ async def test_fenced_from_command_start_propagates(
     local_executor: LocalExecutor, artifact_root: str
 ) -> None:
     async def fenced(_: Job.Started) -> None:
-        raise Fenced("another owner")
+        from swarm_arena._errors import _core_error
 
-    with pytest.raises(Fenced, match="another owner"):
+        raise _core_error(Fenced, "run ownership lost")
+
+    with pytest.raises(Fenced, match="run ownership lost"):
         await run_checks(
             _cand(),
             [("s", _script_check())],
             _check_ctx(executor=local_executor, artifact_root=artifact_root, on_started=fenced),
         )
     sj = _script_judge()
-    with pytest.raises(Fenced, match="another owner"):
+    with pytest.raises(Fenced, match="run ownership lost"):
         await judge_round(
             "g",
             [(Ref.of(sj), sj)],
@@ -512,7 +514,7 @@ async def test_fenced_from_command_start_propagates(
                 executor=local_executor, artifact_root=artifact_root, on_started=fenced
             ),
         )
-    with pytest.raises(Fenced, match="another owner"):
+    with pytest.raises(Fenced, match="run ownership lost"):
         await final_judge(
             "g",
             (Ref.of(sj), sj),
@@ -709,7 +711,11 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
 ) -> None:
     judge = _RecordingJudge()
     later = _RecordingJudge()
-    failure = failure_type("ownership or cancellation")
+    failure = (
+        _core_error(Fenced, "run ownership lost")
+        if failure_type is Fenced
+        else failure_type("ownership or cancellation")
+    )
 
     def fail() -> Any:
         raise failure
@@ -726,10 +732,21 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
             lambda current: _judge_ctx(),
         )
     )
-    with pytest.raises(failure_type) as caught:
-        await call
-    assert caught.value is failure
-    assert later.seen == []
+    if failure_type is Fenced:
+        with pytest.raises(Fenced) as caught:
+            await call
+        assert caught.value is not failure
+        assert caught.value.args == ("run ownership lost",)
+        assert later.seen == []
+    else:
+        # These synchronous hooks raise user cancellation, without a pending
+        # caller cancellation. PR1-7 requires a contained, type-only failure.
+        result = await call
+        outcome = result[1] if isinstance(result, tuple) else result
+        assert len(outcome.errors) == 1
+        assert outcome.errors[0].reason == "CancelledError: judge raised"
+        assert "ownership or cancellation" not in outcome.model_dump_json()
+        assert later.seen == ([] if final else [["c-1"]])
 
 
 async def test_prepared_batch_funded_size_equals_submitted_batch() -> None:
@@ -814,7 +831,8 @@ async def test_complete_score_validation_contains_invalid_metadata(field: str, v
     assert len(out.scores) == len(out.errors) == 1
     assert out.scores[0].judge == "recording"
     assert out.errors[0].judge == "bad"
-    assert out.errors[0].reason == "ValidationError: judge raised"
+    expected = "TypeError" if field == "llm_call_ids" else "ValidationError"
+    assert out.errors[0].reason == f"{expected}: judge raised"
     assert BOUNDARY_SECRET not in out.model_dump_json()
 
 

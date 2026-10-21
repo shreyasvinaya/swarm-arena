@@ -149,7 +149,7 @@ async def test_execute_errors_propagate() -> None:
 
     with pytest.raises(RuntimeError, match="fenced"):
         await ScriptCheck(command=["x"]).check(cand(), CheckContext(**ctx_args()))
-    with pytest.raises(RuntimeError, match="fenced"):
+    with pytest.raises(RuntimeError, match="ExceptionGroup"):
         await ScriptJudge(command=["x"]).judge(
             GOAL, [cand(id="c1"), cand(id="c2")], JudgeContext(**ctx_args())
         )
@@ -176,28 +176,34 @@ async def test_executor_error_cancels_sibling() -> None:
 
     context = JudgeContext(goal=GOAL, executor=Refusing(), artifact_root="/a")
     cands = [cand(id=cid, request=ToolRequest(inputs={"cid": cid})) for cid in ("bad", "waiting")]
-    with anyio.fail_after(2), pytest.raises(RuntimeError, match="fenced"):
+    with anyio.fail_after(2), pytest.raises(RuntimeError, match="RuntimeError"):
         await ScriptJudge(command=["x"]).judge(GOAL, cands, context)
     assert cancelled.is_set()
     assert context.errors == {}
 
 
 @pytest.mark.parametrize(
-    "data",
+    ("data", "expected"),
     [
-        {"value": "ad25cd43a1711e358861c29d157cf8df"},
-        {"key": [], "notes": "ad25cd43a1711e358861c29d157cf8df"},
-        {"key": [float("inf")], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+        ({"value": "ad25cd43a1711e358861c29d157cf8df"}, "invalid judge result: value: float_type"),
+        (
+            {"key": [], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+            "invalid judge result: key: must be nonempty and finite",
+        ),
+        (
+            {"key": [float("inf")], "notes": "ad25cd43a1711e358861c29d157cf8df"},
+            "judge script failed: error",
+        ),
     ],
 )
-async def test_result_errors_hide_secrets(data: dict[str, Any]) -> None:
+async def test_result_errors_hide_secrets(data: dict[str, Any], expected: str) -> None:
     class Results(RecordingExecutor):
         async def submit(self, job: Job) -> ToolOutput:
             return ToolOutput.model_construct(status=RunStatus.OK, data=data)
 
     context = JudgeContext(goal=GOAL, executor=Results(), artifact_root="/a")
     assert await ScriptJudge(command=["x"]).judge(GOAL, [cand()], context) == []
-    assert "invalid judge result" in context.errors["c1"]
+    assert context.errors == {"c1": expected}
     assert "ad25cd43a1711e358861c29d157cf8df" not in repr(context.errors)
 
 
@@ -226,11 +232,7 @@ async def test_nonfinite_result_is_per_candidate_error(number: float, field: str
     candidates = [cand(id=cid, request=ToolRequest(inputs={"cid": cid})) for cid in ("bad", "good")]
     scores = await ScriptJudge(command=["x"]).judge(GOAL, candidates, context)
     assert [score.candidate_id for score in scores] == ["good"]
-    expected = (
-        "invalid judge result: key: must be nonempty and finite"
-        if field == "key"
-        else "invalid judge result: value: finite_number"
-    )
+    expected = "judge script failed: error"
     assert context.errors == {"bad": expected}
 
 
@@ -295,3 +297,28 @@ async def test_judge_result_schema_version(jctx: JudgeContext, version: Any) -> 
     if version == 99:
         assert "schema_version" in repr(jctx.errors)
         assert "newer" in repr(jctx.errors)
+
+
+@pytest.mark.parametrize("failure_type", [OSError, TimeoutError])
+async def test_single_child_failure_keeps_real_type_in_judge_reason(
+    failure_type: type[Exception],
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena import Ref
+    from swarm_arena._scoring.runner import final_judge
+
+    secret = "script-executor-secret"
+
+    class Refusing(RecordingExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            raise failure_type(secret)
+
+    judge = ScriptJudge(command=["unused"])
+    ctx = JudgeContext(goal=GOAL, executor=Refusing(), artifact_root="/a")
+    _, outcome = await final_judge("g", (Ref.of(judge), judge), [cand()], ctx)
+    assert [error.reason for error in outcome.errors] == [f"{failure_type.__name__}: judge raised"]
+    assert_secret_absent(RuntimeError(outcome.model_dump_json()), secret)
+    with pytest.raises(RuntimeError, match=failure_type.__name__) as caught:
+        await judge.judge(GOAL, [cand()], ctx)
+    assert_secret_absent(caught.value, secret)

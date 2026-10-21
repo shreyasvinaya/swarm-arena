@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic.errors import PydanticErrorMixin
 from pydantic_core import ErrorType, InitErrorDetails, PydanticCustomError
 
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._model.diagnostics import _SanitizedValidationError
 from swarm_arena._model.locations import (
     _VALIDATION_BY_ALIAS,
@@ -18,6 +19,7 @@ from swarm_arena._model.locations import (
     _schema_index,
     _sequence_paths,
 )
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 
 # One allowlist for all models: custom codes and messages cannot carry user data.
 _VALIDATION_ERROR_TYPES: Final = frozenset(get_args(ErrorType))
@@ -231,7 +233,7 @@ def _sanitize_validation_error(
             details.append(
                 InitErrorDetails(
                     type=PydanticCustomError(
-                        "invalid", cast(LiteralString, f"invalid: {type(error).__name__}")
+                        "invalid", cast(LiteralString, f"invalid: {_exception_type_name(error)}")
                     ),
                     loc=(),
                     input=None,
@@ -240,8 +242,10 @@ def _sanitize_validation_error(
         return _SanitizedValidationError.from_exception_data(
             model.__name__, details, hide_input=True
         )
-    except Exception:
-        pass
+    except KeyboardInterrupt:
+        raise
+    except BaseException as failure:
+        _propagate_control(failure)
     return _minimal_validation_error(model)
 
 
@@ -273,14 +277,25 @@ def _validation_wrapper(
         )
         try:
             return handler(data)
-        except Exception as error:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                error = _classify_outcome(error)
                 safe = _sanitize_validation_error(
                     model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
                 )
-            except Exception:
+            except RecursionError:
+                safe = None
+            except KeyboardInterrupt:
+                raise
+            except BaseException as error:
+                try:  # noqa: SIM105 - a context manager itself needs spare stack frames
+                    _propagate_control(error)
+                except RecursionError:
+                    pass
                 safe = None
         finally:
             owner.thread_id = None

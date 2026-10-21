@@ -160,6 +160,24 @@ round through `LimitReached`. Exceeding the learning publication cap is a soft
 action error and does not itself end the round. Other policy pruning happens
 between rounds. Tool exceptions
 become error candidates; a manager exception ends only that agent's round.
+User-raised cancellation and exception groups are contained at manager, action,
+check, tool, and judge boundaries with type-only diagnostics. Judge construction,
+batch preparation, anchor selection, and configuration validation use the same
+classification before recording a failure. Healthy peers continue
+and the goal can finish. Cancellation before dispatch refunds the tool reservation
+exactly once, including command preparation and edit uploads. Cleanup has a bounded
+settlement wait; work that may have started retains its charge. Actual caller
+cancellation and ownership fencing still propagate. Fencing nested in an exception
+group propagates as a bare ownership-loss error, without group or leaf values;
+pending caller cancellation takes precedence. Hook messages, notes, and causes
+are not rendered by the CLI. Type-only diagnostics retain the originating
+exception type across sanitized copies; internal exception class names are hidden.
+Request-time estimate and provider hooks run in registered, cancellable
+preparation before reservation. Immediate stop and round deadlines abandon
+these waits without using the executor collection allowance.
+Startup estimates, provider declarations, executor hooks, and preflight failures
+are also reported by type without hook values. A hook-raised cancellation is a
+startup failure; cancellation requested by the caller still cancels the run.
 Built-in provider probing and model-provider recovery are M3 work.
 
 ## Stop modes and resume
@@ -174,6 +192,11 @@ exhaustion affects that goal. Goals still queued at any early ending never
 start and report `NO_RESULT` with reason `stopped`. A stop arriving during
 convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
+
+A graceful stop that preempts the round policy journals the default `Decision()`
+without pruning. If a stop or deadline cuts a judging barrier short, candidates
+that have no ranking score stay unranked even after resume. The round closes,
+and later rounds judge their own outputs without rejudging those candidates.
 
 After `stop --now` or the run deadline, final judging gets at most
 `settle_timeout_s` (60 s by default). If cut short, selection uses available
@@ -245,3 +268,60 @@ releases its slot and ignores late results, but cannot forcibly stop Python
 preparation code. Its workspace is retained with a warning for safe manual
 cleanup. Collection runs once and has a 30 s bound. See the
 [executor details](api/executor.md#localexecutor) before cleaning retained workspaces.
+
+Direct `LocalExecutor` preparation preserves the exception object raised by a
+constructor or command hook, except the documented `SystemExit` command failure
+that produces an error output. Collection converts ordinary exceptions and
+`SystemExit` to an error output with a type-only note, while cancellation,
+interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
+The engine classifies those transported outcomes at its supervised boundary,
+where it can distinguish caller cancellation from a hook-raised failure.
+
+A hook-created `Fenced` exception does not establish ownership loss, whether
+raised directly or nested in an exception group. Only the journal's fenced
+state or a core-registered fencing signal can terminate the run as fenced.
+Caller cancellation takes precedence over even a registered fencing outcome.
+
+Final judging records its complete order with the last score or judge error,
+using the goal lifecycle, plan revision, judge reference, and exact candidate
+membership as its batch identity. If a process exits after that batch and its
+settlement commit but before final selection is published, resume reuses the
+recorded order without another judge call or reservation. Error-only batches
+also retain their no-result reason. A different lifecycle, revision, judge, or
+candidate set requires a new final batch; ordinary barrier scores cannot stand
+in for final completion. Recovery checks the recorded final inputs before
+convergence ranks candidates or launches a team: final scores cannot reselect
+the input batch. The completion key also binds the committed candidate set at
+that boundary, so newly produced candidates invalidate reuse.
+
+Synchronous library validation and import helpers propagate `KeyboardInterrupt`
+unchanged. When the engine invokes these helpers in a daemon worker, the awaiting
+engine boundary still contains hook-raised interrupts as type-only failures.
+ScriptJudge reports the originating exception type for a single failed child;
+multiple failures retain the exception-group type. Messages remain value-free.
+
+Returned extension models are untrusted until preparation finishes. Score and
+check results, executor outputs, plans, policy decisions, and manager reports
+are detached and validated in abandonable daemon workers before the event loop
+reads or serializes them. The prepared values use core model classes and copied
+payloads, so subclass serializers and attribute hooks cannot block stop-now,
+lease renewal, or fencing detection. The same rule applies to local executor
+collection and conformance helpers. Learning records are constructed by core
+code from the posting API and reconstructed by journal replay; there is no
+extension-returned Learning hook. Detachment applies the core validation rules,
+including UTC-millisecond timestamp normalization.
+
+### Context identifier inputs
+
+Public `AgentContext`, `JudgeContext` and `CheckContext` entry points copy
+identifier and name arguments to exact strings using `str.__str__` before core
+lookups, hashing, action admission or loop marshaling. This includes collection
+elements (parents, evidence, refinements, tags and anchors), action and part
+names, context run/batch/fidelity identifiers, and staging/edit paths.
+`JudgeContext.judge_error(candidate_id, reason)` copies both strings and keeps
+the first reason for each candidate. A string subclass therefore cannot supply
+equality, hashing, conversion or formatting hooks to subsequent core operations.
+Non-string identifiers raise `TypeError` naming only the parameter and required
+type, without formatting the supplied value. Optional identifiers still accept
+`None` where documented. For example, `ctx.judge_error("c1", "invalid result")`
+records the same first-error diagnostic as before.

@@ -1777,14 +1777,36 @@ ordinary round; `RunState.plan_for_round` selects its committed revision, and
 `plan_first_rounds` retains activation alongside each plan. `plan_rejected.first_round`
 records the refused proposal boundary without creating a revision.
 `round_closed` carries `round`, `replan: bool`, and `reason: str | None`; closure
-precedes the next proposal. `plan_revision.preflight_complete: bool` is true only after
-the shared component preflight succeeded for that revision (startup revisions carry
-true); a revision is published only after its preflight succeeds, and a failing
-preflight refuses the revision like an admission failure. `plan_revision.join_retry` and
+precedes the next proposal. `plan_revision.join_retry` and
 `plan_rejected.join_retry` count completed retry proposals (one-based, independent of
 `join_failed.attempt`; accepted and refused proposals both use the allowance).
 `GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
-owed join-retry transition; `preflight_revisions` replays preflight completion.
+owed join-retry transition. Revisions are published only after successful preflight.
+The last `score` or `judge_error` of a completed barrier batch carries optional
+`barrier_batch: {key, members, anchors}`. Its key hashes the main goal, revision,
+round, part, judge ref and base candidate membership. The member and anchor ids
+record the actual evaluation batch. Resume reuses these committed outcomes and
+retries only missing batches. Anchor evaluation in later rounds and final judging
+are separate operations; final-judge events do not carry this marker.
+The last round-0 `score` or `judge_error` of a completed final batch instead carries
+`final_batch: {key, goal_id, lifecycle, revision, ref, members, candidates, order,
+status, reason}`. `lifecycle` is `[epoch, seq]` of the latest `goal_started`;
+`ref` is the complete JSON judge reference; `members` is the sorted final input
+membership; `candidates` is the sorted set of all committed candidates for that
+goal at the pre-final boundary. `key` is SHA-256 of canonical JSON containing
+`goal_id`, `lifecycle`, `revision`, `ref`, `members` and `candidates`. `order`
+contains the resulting candidate ids in final order (possibly empty), and
+`status`/`reason` retain the completion outcome. The marker is queued before
+settlement and is separate from ordinary barrier completion.
+Resume recovers this recorded operation before convergence ranks candidates or
+launches a converge team. It uses the recorded input members, checks their
+existence and the current lifecycle/revision/judge/candidate boundary against the
+key, restores order/status/reason, and applies only the final top_n/distinct
+filter before publishing the terminal result. It never reselects input members
+using final scores. A changed lifecycle, revision, judge, explicit final input
+membership or candidate boundary cannot reuse the operation. An incomplete
+batch has no completion marker and may run again. Journal v1 is unreleased:
+this schema is authoritative without a compatibility shim.
 Every engine-run event may carry `run_elapsed_s: float`, the accumulated active-driver
 checkpoint; replay folds the maximum over all events and excludes downtime.
 `RunState.candidate_goal_keys` maps each candidate to the GoalKey of the part that

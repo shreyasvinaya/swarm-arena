@@ -75,7 +75,6 @@ async def rt_env(
                 payload={
                     "plan": Plan(goal=goal, teams=[team], judges=[]).model_dump(mode="json"),
                     "origin": "human",
-                    "preflight_complete": True,
                     "first_round": 1,
                 },
             )

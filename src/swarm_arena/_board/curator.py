@@ -9,11 +9,12 @@ from inspect import isawaitable
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._board.base import BoardView
-from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
+from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Learning
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 
 
 class Curator(Configurable, ABC):
@@ -94,14 +95,13 @@ class Curator(Configurable, ABC):
         """
 
 
-def _curator_error(error: Exception) -> str:
+def _curator_error(error: BaseException) -> str:
     """Preserve rebuilt core controls and contain untrusted exception values."""
+    error = _classify_outcome(error)
     safe = _rebuild_core_signal(error)
-    if isinstance(safe, (Fenced, LimitReached)):
+    if isinstance(safe, LimitReached):
         raise safe from None
-    if isinstance(error, Fenced):
-        raise _core_error(Fenced) from None
-    return f"curator error: {type(error).__name__}"
+    return f"curator error: {_exception_type_name(error)}"
 
 
 def _normalize_summaries(
@@ -168,6 +168,7 @@ async def _prepare_curator(
     view: BoardView,
 ) -> tuple[list[Learning], list[str]]:
     """Run hooks and detach a complete batch; the owning goal supervises this await."""
+    outcome = _Outcome()
     try:
         # Board access stays on the loop. Snapshot evidence before exposing inputs
         # to the plugin, and never give the normalizing daemon a board or IdGen.
@@ -191,8 +192,8 @@ async def _prepare_curator(
                 round=round,
             )
         )
-    except Exception as error:
-        return [], [_curator_error(error)]
+    except BaseException as error:
+        return [], [_curator_error(outcome.classify(error))]
 
 
 def _stamp_summaries(summaries: Sequence[Learning], ids: IdGen) -> list[Learning]:

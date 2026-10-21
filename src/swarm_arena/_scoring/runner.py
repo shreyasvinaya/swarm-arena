@@ -3,11 +3,13 @@
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
-from swarm_arena._errors import Fenced
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import (
     Judge,
@@ -67,7 +69,7 @@ def _prepare_check_result(result: object) -> CheckResult:
     """Detach subclass serializers and validate the complete Python-mode result."""
     if not isinstance(result, CheckResult):
         raise TypeError("invalid check result")
-    return CheckResult.model_validate(result.model_dump(mode="python", warnings=False))
+    return _detach_model(CheckResult, result)
 
 
 async def run_checks(
@@ -116,22 +118,23 @@ async def run_checks(
     """
     results: list[CheckResult] = []
     for name, check in checks:
+        outcome = _Outcome()
         try:
             result = await check.check(candidate, copy(ctx))
-        except Fenced:
-            raise
-        except Exception as error:
+        except BaseException as error:
+            error = outcome.classify(error)
             results.append(
                 CheckResult(
-                    check=name, passed=False, reasons=[f"check error: {type(error).__name__}"]
+                    check=name,
+                    passed=False,
+                    reasons=[f"check error: {_exception_type_name(error)}"],
                 )
             )
             continue
         try:
             valid = await run_sync_daemon(_prepare_check_result, result)
-        except Fenced:
-            raise
-        except Exception:
+        except BaseException as error:
+            outcome.propagate_control(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
         results.append(valid.model_copy(update={"check": name}))
     return results
@@ -193,18 +196,26 @@ def _prepare_judge_result(
         or any(not isinstance(score, Score) for score in scores)
     ):
         raise TypeError("invalid judge result")
+    canonical = {str.__str__(id): str.__str__(id) for id in members}
     seen: set[str] = set()
     nonfinite: set[str] = set()
     accepted: list[Score] = []
+    accepted_ids: list[str] = []
     for score in scores:
-        if score.candidate_id not in members or score.candidate_id in seen:
+        candidate_id = canonical.get(score.candidate_id)
+        if candidate_id is None or candidate_id in seen:
             continue
-        seen.add(score.candidate_id)
+        seen.add(candidate_id)
         if not is_finite_score(score):
-            nonfinite.add(score.candidate_id)
-        elif score.candidate_id not in failed:
+            nonfinite.add(candidate_id)
+        elif candidate_id not in failed:
             accepted.append(score)
+            accepted_ids.append(candidate_id)
     prepared = _prepare_score_stamps(accepted, judge, name, batch_id) if accepted else []
+    prepared = [
+        score.model_copy(update={"candidate_id": candidate_id})
+        for score, candidate_id in zip(prepared, accepted_ids, strict=True)
+    ]
     return prepared, seen, nonfinite
 
 
@@ -221,6 +232,7 @@ async def _judge_batch(
     raised: str | None = None
     seen: set[str] = set()
     nonfinite: set[str] = set()
+    outcome = _Outcome()
     try:
         if leaders is not None:
             batch, ctx.anchors = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
@@ -235,11 +247,10 @@ async def _judge_batch(
             ctx.batch_id,
         )
         stamped = _stamp_score_ids(prepared, ctx.ids)
-    except Fenced:
-        raise
-    except Exception as error:
+    except BaseException as error:
+        error = outcome.classify(error)
         stamped = []
-        raised = f"{type(error).__name__}: judge raised"
+        raised = f"{_exception_type_name(error)}: judge raised"
 
     errors: list[JudgeError] = []
     for candidate in batch:

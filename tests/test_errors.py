@@ -227,3 +227,51 @@ def test_storage_subclass_cannot_impersonate_a_registered_error() -> None:
     assert _rebuild_core_signal(forged) is None
     with pytest.raises(TypeError, match="expected a core error"):
         _core_signal(forged)
+
+
+@pytest.mark.parametrize("kind", ["cancel", "group"])
+def test_sanitized_outcomes_preserve_original_type_without_transferable_attributes(
+    kind: str,
+) -> None:
+    import gc
+    import weakref
+
+    from _fakes.pr1_r2 import SECRET, failure
+
+    from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
+    from swarm_arena._outcomes import _classify_outcome
+
+    expected = "CancelledError" if kind == "cancel" else "BaseExceptionGroup"
+    safe = _classify_outcome(failure(kind))
+    safe.args = (SECRET,)
+    safe.__dict__["original_type"] = SECRET
+    safe.add_note(SECRET)
+    safe.__cause__ = ValueError(SECRET)
+    rebuilt = _classify_outcome(safe)
+    assert _exception_type_name(rebuilt) == expected
+    assert_secret_absent(rebuilt, SECRET, sanitized=True)
+    again = _classify_outcome(rebuilt)
+    assert _exception_type_name(again) == expected
+    forged = type(safe)(SECRET)
+    forged.__dict__.update(safe.__dict__)
+    assert _rebuild_core_signal(forged) is None
+    assert _exception_type_name(forged) == "RuntimeError"
+    reference = weakref.ref(rebuilt)
+    del rebuilt
+    gc.collect()
+    assert reference() is None
+
+
+def test_core_provenance_predicate_does_not_trust_subclasses() -> None:
+    from swarm_arena._errors import _core_error, _is_core_signal
+
+    class Impostor(Fenced):
+        def __hash__(self) -> int:
+            raise AssertionError("untrusted hash called")
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("untrusted equality called")
+
+    assert _is_core_signal(_core_error(Fenced, "run ownership lost"))
+    assert not _is_core_signal(Fenced("forged"))
+    assert not _is_core_signal(Impostor())

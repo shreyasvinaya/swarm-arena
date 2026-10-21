@@ -6,14 +6,18 @@ from typing import Annotated, Any, ClassVar, Literal, cast
 import anyio
 from pydantic import ConfigDict, Field, ValidationError
 
+from swarm_arena._errors import _core_error, _exception_type_name, _with_exception_type
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import DEFAULT_GRACE_S, EnvName, GraceS, RunStatus, TimeoutS
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.script_check import _preflight_files, _result_error
 from swarm_arena._tooling.script_tool import script_command
@@ -219,17 +223,31 @@ class ScriptJudge(Judge):
         scores: list[Score | None] = [None] * len(candidates)
 
         async def run(index: int, candidate: Candidate) -> None:
-            scores[index] = await self._score(candidate, ctx)
+            outcome = _Outcome()
+            try:
+                result = await self._score(candidate, ctx)
+                scores[index] = (
+                    None if result is None else await run_sync_daemon(_detach_model, Score, result)
+                )
+            except BaseException as error:
+                raise outcome.classify(error) from None
 
         try:
             async with anyio.create_task_group() as group:
                 for index, candidate in enumerate(candidates):
                     group.start_soon(run, index, candidate)
-        except ExceptionGroup as errors:
-            first: Exception = errors
-            while isinstance(first, ExceptionGroup):
-                first = first.exceptions[0]
-            raise first from None
+        except BaseExceptionGroup as errors:
+            error = _classify_outcome(errors)
+            if len(errors.exceptions) == 1 and not isinstance(
+                errors.exceptions[0], BaseExceptionGroup
+            ):
+                # Preserve the child type without exposing an ordinary exception's
+                # message. Classify the whole transport first for core fencing.
+                name = _exception_type_name(errors.exceptions[0])
+                error = _with_exception_type(
+                    _core_error(RuntimeError, f"{name}: judge raised"), name
+                )
+            raise error from None
         return [score for score in scores if score is not None]
 
     async def _score(self, candidate: Candidate, ctx: JudgeContext) -> Score | None:
@@ -246,16 +264,7 @@ class ScriptJudge(Judge):
         try:
             result = _JudgeResultFile.model_validate(out.data)
         except ValidationError as error:
-            nonfinite_key = any(
-                item["loc"][0:1] == ("key",) and item["type"] == "finite_number"
-                for item in error.errors(include_input=False, include_context=False)
-            )
-            reason = (
-                "invalid judge result: key: must be nonempty and finite"
-                if nonfinite_key
-                else _result_error("judge", _JudgeResultFile, error)
-            )
-            ctx.judge_error(candidate.id, reason)
+            ctx.judge_error(candidate.id, _result_error("judge", _JudgeResultFile, error))
             return None
         if result.key is None and result.value is None:
             ctx.judge_error(candidate.id, "result needs key or value")

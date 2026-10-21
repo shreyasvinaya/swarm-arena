@@ -137,14 +137,12 @@ class Swarm:
 
         Raises
         ------
-        PlanError
-            A goal's peak exceeds max_agents_total.
         ValueError
-            A budget cap decreases or committed state is invalid.
-        LeaseHeld
-            The old owner is live and force was not requested.
-        Fenced
-            A competing resume wins ownership.
+            A goal's peak exceeds max_agents_total, a budget cap decreases,
+            or committed state is invalid.
+        RuntimeError
+            The old owner is live without force, a competing resume wins
+            ownership, or a runtime service fails.
 
         Notes
         -----

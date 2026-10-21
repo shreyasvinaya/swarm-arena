@@ -1,5 +1,6 @@
 import importlib
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, Literal
 
@@ -573,3 +574,14 @@ def test_reference_of_never_drops_explicit_null_with_nonnull_default(
     monkeypatch.setattr(Widget, "Config", Config)
     with pytest.raises(ValueError, match="null"):
         Ref.of(Widget(Config(timeout_s=None)))
+
+
+def test_sync_import_preserves_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._model.ref import load_object
+
+    (tmp_path / "pr1_r3_interrupt.py").write_text("raise KeyboardInterrupt\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(KeyboardInterrupt):
+        load_object("pr1_r3_interrupt:Tool")

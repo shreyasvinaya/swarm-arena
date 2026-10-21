@@ -48,6 +48,7 @@ from swarm_arena._errors import (
     LeaseHeld,
     PlanError,
     SoftError,
+    _core_error,
 )
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.local import LocalExecutor
@@ -553,7 +554,7 @@ async def test_takeover_retries_when_old_owner_commits_meanwhile(
         attempts.append(1)
         if len(attempts) == 1:
             crashed_live.old_lease.renew()
-            raise Fenced("another owner changed the lease")
+            raise _core_error(Fenced, "run ownership lost")
         return real(cls, store, **kw)
 
     monkeypatch.setattr(Lease, "take_over", classmethod(racing))
@@ -575,7 +576,7 @@ async def test_concurrent_resume_fails_cleanly(
         real(cls, store, **cast(dict[str, Any], other_kw))
         if race_before_call:
             return real(cls, store, **kw)
-        raise Fenced("another owner changed the lease")
+        raise _core_error(Fenced, "run ownership lost")
 
     monkeypatch.setattr(Lease, "take_over", classmethod(other_first))
     with pytest.raises(Fenced, match="concurrent resume"):
@@ -1323,11 +1324,24 @@ async def test_action_counter_producer_retains_counted_prestart_error(
     assert not _events(c, "tool_start")
 
 
-@pytest.mark.parametrize("failure_site", ["build", "orphan"])
+@pytest.mark.parametrize(
+    ("failure_site", "failure_kind"),
+    [
+        ("build", "ordinary"),
+        ("orphan", "ordinary"),
+        ("orphan", "fenced"),
+        ("orphan", "cancel"),
+        ("orphan", "group"),
+    ],
+)
 async def test_preparation_failure_closes_and_sanitizes(
-    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, failure_site: str
+    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, failure_site: str, failure_kind: str
 ) -> None:
     import traceback
+
+    from _fakes.pr1_r2 import SECRET, failure
+
+    from swarm_arena._errors import Fenced
 
     sentinel = "private-resume-value-732"
     spy = _SpyExecutor(Path(crashed.config.run_root) / "spy")
@@ -1338,14 +1352,17 @@ async def test_preparation_failure_closes_and_sanitizes(
         return spy
 
     async def orphan(started: Job.Started) -> bool:
+        if failure_kind != "ordinary":
+            raise failure(failure_kind)
         raise ValueError(sentinel)
 
     monkeypatch.setattr("swarm_arena._engine.run._build_executor", build)
     monkeypatch.setattr(spy, "kill_orphan", orphan)
-    with pytest.raises(RuntimeError) as err:
+    with pytest.raises(Fenced if failure_kind == "fenced" else RuntimeError) as err:
         await resume_run(crashed.config, crashed.run_id, force=True, replanner=None)
     assert sentinel not in "".join(traceback.format_exception(err.value))
     assert sentinel not in repr(err.value.args)
+    assert SECRET not in "".join(traceback.format_exception(err.value))
     assert spy.closed_count == (0 if failure_site == "build" else 1)
     assert len(_events(crashed, "takeover")) == 1
     owner = read_owner(crashed.store)
@@ -1561,7 +1578,7 @@ async def test_resume_shutdown_bound_and_primary_failure(
 
     async def drive(self: RunRunner, deps: object, epoch: int) -> dict[str, list[Candidate]]:
         if fenced:
-            raise Fenced()
+            raise _core_error(Fenced, "run ownership lost")
         return expected
 
     monkeypatch.setattr(RunRunner, "_drive", drive)

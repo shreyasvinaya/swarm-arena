@@ -5,7 +5,7 @@ from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Literal
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._errors import Fenced, SoftError, _core_signal
+from swarm_arena._errors import SoftError, _core_signal, _exception_type_name
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -13,6 +13,7 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import RunStatus, ToolRequest
+from swarm_arena._outcomes import _classify_outcome
 
 if TYPE_CHECKING:
     from swarm_arena._agent.runtime import AgentRuntime
@@ -356,11 +357,12 @@ class RepeatIndex:
                     request=request.model_copy(update={"replicate": index}),
                     deterministic=False,
                 )
-            except Fenced:
+            except KeyboardInterrupt:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = _classify_outcome(error)
                 raise _core_signal(
-                    SoftError(f"invalid tool request: {type(error).__name__}")
+                    SoftError(f"invalid tool request: {_exception_type_name(error)}")
                 ) from None
             own = next(
                 (c for c in self._entries.get(key, ()) if self._own(c, agent) and self._counted(c)),

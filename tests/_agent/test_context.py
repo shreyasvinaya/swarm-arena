@@ -17,7 +17,7 @@ from swarm_arena._board.base import BoardView
 from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import SoftError, _core_error
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -898,7 +898,6 @@ async def test_part_context_routes_learnings_events_and_read_ids(ctx_env: CtxEnv
                     revision=1,
                 ).model_dump(mode="json"),
                 "origin": "human",
-                "preflight_complete": True,
                 "first_round": 1,
             },
         )
@@ -1074,7 +1073,7 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
         if control == "soft":
             return context.get_candidate("c-absent").id
         if control == "fenced":
-            raise Fenced("run ownership lost")
+            raise _core_error(Fenced, "run ownership lost")
         if control == "gate":
             blocked = True
         else:

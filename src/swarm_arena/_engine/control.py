@@ -288,6 +288,8 @@ async def read_status(run_root: str, run_id: str) -> StatusReport:
     ------
     RuntimeError
         If the run has no authority document or its committed chain is invalid.
+    ValueError
+        If a committed replay payload is invalid.
 
     Examples
     --------

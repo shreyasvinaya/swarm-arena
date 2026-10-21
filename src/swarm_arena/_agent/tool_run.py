@@ -1,8 +1,10 @@
 """Validate, reserve, execute, and durably publish one agent tool request."""
 
+import asyncio
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import anyio
@@ -20,7 +22,8 @@ from swarm_arena._errors import (
     SoftError,
     _core_error,
     _core_signal,
-    _rebuild_core_signal,
+    _exception_type_name,
+    _is_core_signal,
 )
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
@@ -30,11 +33,13 @@ from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.data import check_utf8
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
-from swarm_arena._scoring.check import CheckContext
+from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome
+from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.result_file import request_json
@@ -215,6 +220,7 @@ class _CommandJournal(Executor):
 
     async def submit(self, job: Job) -> ToolOutput:
         output = await self._executor.submit(job)
+        output = await _prepare_sync(_prepare_command_output, output)
         self._journal.append(
             EventDraft(
                 type=EventType.COMMAND_END,
@@ -297,14 +303,14 @@ def _prepare_started(value: object) -> Job.Started:
     """Detach executor start-event serializers before touching the journal."""
     if not isinstance(value, Job.Started):
         raise TypeError("invalid started event")
-    return Job.Started.model_validate(value.model_dump(mode="python", warnings=False))
+    return _detach_model(Job.Started, value)
 
 
 def _prepare_output(value: object) -> ToolOutput:
     """Detach executor output serializers and validate before core completion."""
     if not isinstance(value, ToolOutput):
         raise TypeError("invalid tool output")
-    return ToolOutput.model_validate(value.model_dump(mode="python", warnings=False))
+    return _detach_model(ToolOutput, value)
 
 
 _T = TypeVar("_T")
@@ -314,10 +320,13 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     """Contain user hook failures separately from safe core validation errors."""
     try:
         return hook(*args)
-    except Fenced:
+    except KeyboardInterrupt:
         raise
-    except Exception as error:
-        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
+    except BaseException as error:
+        error = _classify_outcome(error)
+        raise _core_signal(
+            SoftError(f"invalid tool request: {_exception_type_name(error)}")
+        ) from None
 
 
 async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | None = None) -> _T:
@@ -329,8 +338,11 @@ async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | N
                 inflight.add(scope, grace_s=0)
             elif not inflight._add_completion(scope, grace_s=0, generation=generation):
                 raise _core_signal(LimitReached("stop", "the round is stopping"))
+        outcome = _Outcome()
         try:
             result = await run_sync_daemon(hook, *args)
+        except BaseException as error:
+            raise outcome.classify(error) from None
         finally:
             if inflight is not None:
                 inflight.discard(scope)
@@ -374,12 +386,15 @@ def _request(
             replicate=0 if replicate is None else replicate,
             edits=dict(edits or {}),
         )
-    except Fenced:
-        raise
     except ConfigError as error:
         raise _core_signal(SoftError(str(error))) from None
-    except Exception as error:
-        raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        error = _classify_outcome(error)
+        raise _core_signal(
+            SoftError(f"invalid tool request: {_exception_type_name(error)}")
+        ) from None
 
 
 def _stage_settings(
@@ -406,13 +421,15 @@ def _stage_settings(
             max_edit_bytes=rt.limits.max_edit_bytes,
         )
         return files, editable, protected
-    except Fenced:
+    except KeyboardInterrupt:
         raise
-    except Exception as error:
-        rebuilt = _rebuild_core_signal(error)
-        if isinstance(rebuilt, (SoftError, LimitReached)):
-            raise rebuilt from None
-        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
+    except BaseException as error:
+        error = _classify_outcome(error)
+        if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            raise error from None
+        raise _core_signal(
+            SoftError(f"invalid tool stage: {_exception_type_name(error)}")
+        ) from None
 
 
 def _prepare_request(
@@ -448,13 +465,15 @@ def _stage(
             edits=request.edits,
             request_json=request_json(request),
         )
-    except Fenced:
+    except KeyboardInterrupt:
         raise
-    except Exception as error:
-        rebuilt = _rebuild_core_signal(error)
-        if isinstance(rebuilt, (SoftError, LimitReached)):
-            raise rebuilt from None
-        raise _core_signal(SoftError(f"invalid tool stage: {type(error).__name__}")) from None
+    except BaseException as error:
+        error = _classify_outcome(error)
+        if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            raise error from None
+        raise _core_signal(
+            SoftError(f"invalid tool stage: {_exception_type_name(error)}")
+        ) from None
 
 
 def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
@@ -466,6 +485,28 @@ def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
     store.create(stem + ".out", stdout)
     store.create(stem + ".err", stderr)
     return stem
+
+
+@dataclass
+class _ToolReservation:
+    """Retain admission ownership until dispatch or normal completion."""
+
+    admitted: Reservation | None = None
+    started: bool = False
+
+
+async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> None:
+    """Book zero once before dispatch, bounding even the ledger's inner shield."""
+    if owner.admitted is None or owner.started or rt.journal.fenced.is_set():
+        return
+    with anyio.CancelScope(shield=True):
+        try:
+            # Native timeout cancellation crosses the ledger durability shield.
+            # The writer retains any admitted settlement after this waiter exits.
+            async with asyncio.timeout(rt.config.settle_timeout_s):
+                await rt.ledger.settle(owner.admitted.id, Amount())
+        except TimeoutError:
+            pass
 
 
 async def execute_tool_run(
@@ -578,7 +619,14 @@ async def execute_tool_run(
             scores = [score for score in rt.view.scores(outcome.hint.id) if score.judge == judge]
             detail = f"{judge}={format_value(scores[-1].value)}" if scores else "unscored"
             warnings.append(f"past-run match {outcome.hint.id}: {detail}")
-        return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
+
+        owner = _ToolReservation()
+        try:
+            return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids), owner)
+        except BaseException as error:
+            if not _has_core_fenced(error):
+                await _refund_undispatched(rt, owner)
+            raise
     finally:
         if index is not None:
             rt.repeats.release(rt, allocation_request, index)
@@ -592,6 +640,7 @@ async def _run(
     overlay: dict[str, str],
     warnings: list[str],
     read_ids: Sequence[str],
+    owner: _ToolReservation,
 ) -> Candidate:
     """Own reservation, executor lifecycle, and the shielded completion sequence."""
     id = rt.ids.next("c")
@@ -599,6 +648,7 @@ async def _run(
     if inflight is None:
         raise _core_error(RuntimeError, "tool run requires track_inflight")
     generation = inflight._cancel_generation
+    outcome = _Outcome()
     started = False
     admission_refusal: LimitReached | None = None
     partial: list[ToolOutput] = []
@@ -615,29 +665,22 @@ async def _run(
         )
 
     try:
-        amount, providers = await run_sync_daemon(estimate)
-    except Fenced:
-        raise
-    except Exception as error:
-        warnings.append(f"tool error: {type(error).__name__}")
+        amount, providers = await _prepare_sync(estimate)
+    except BaseException as error:
+        error = outcome.classify(error)
+        if _is_core_signal(error) and isinstance(error, LimitReached):
+            raise error from None
+        warnings.append(f"tool error: {_exception_type_name(error)}")
         failed = True
-    admitted: Reservation | None = None
+    if inflight.closed or generation != inflight._cancel_generation:
+        raise _core_signal(LimitReached("stop", "the round is stopping"))
 
     def on_admit(reservation: Reservation) -> None:
-        nonlocal admitted
-        admitted = reservation
+        owner.admitted = reservation
 
-    try:
-        res = await rt.ledger.reserve(
-            rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
-        )
-    except anyio.get_cancelled_exc_class():
-        # No executor dispatch is possible before reserve returns. Retain
-        # ownership at admission so cancellation of durability can refund it.
-        if admitted is not None and not rt.journal.fenced.is_set():
-            with anyio.move_on_after(rt.config.settle_timeout_s, shield=True):
-                await rt.ledger.settle(admitted.id, Amount())
-        raise
+    res = await rt.ledger.reserve(
+        rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
+    )
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
@@ -658,7 +701,7 @@ async def _run(
                 started=event.model_dump(mode="json"),
             ).model_copy(update={"task_id": id})
         )
-        started = True
+        started = owner.started = True
         rt.started_runs += 1
 
     async def on_partial(value: ToolOutput) -> None:
@@ -706,15 +749,12 @@ async def _run(
                     inflight.discard(run_scope)
             if run_scope.cancelled_caught:
                 output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
-    except Fenced:
-        raise
-    except Exception as error:
-        rebuilt = _rebuild_core_signal(error)
-        if error is admission_refusal and isinstance(rebuilt, LimitReached) and not started:
-            with anyio.CancelScope(shield=True):
-                await rt.ledger.settle(res.id, Amount())
-            raise rebuilt from None
-        warnings.append(f"tool error: {type(error).__name__}")
+    except BaseException as error:
+        refused = error is admission_refusal
+        error = outcome.classify(error)
+        if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
+            raise error from None
+        warnings.append(f"tool error: {_exception_type_name(error)}")
         output = ToolOutput(status=RunStatus.ERROR)
 
     # A stopped executor may still deliver partial output during collection.
@@ -728,9 +768,8 @@ async def _run(
         inflight._add_completion(output_scope, grace_s=0, generation=inflight._cancel_generation)
         try:
             output = await run_sync_daemon(_prepare_output, output)
-        except Fenced:
-            raise
-        except Exception:
+        except BaseException as error:
+            outcome.propagate_control(error)
             warnings.append("tool error: invalid output")
             output = ToolOutput(status=RunStatus.ERROR)
         finally:
@@ -758,20 +797,18 @@ async def _run(
                 if started:
                     actual = reported
                     estimated = providers and usage.usd is None and usage.total_tokens == 0
-            except Fenced:
-                raise
-            except Exception as error:
-                warnings.append(f"tool error: {type(error).__name__}")
+            except BaseException as error:
+                error = outcome.classify(error)
+                warnings.append(f"tool error: {_exception_type_name(error)}")
                 output = ToolOutput(status=RunStatus.ERROR)
                 actual, estimated = Amount(), started and providers
         if output.logs_ref is not None:
             try:
                 logs_ref = await anyio.to_thread.run_sync(_logs, rt, id, output.logs_ref)
                 output = output.model_copy(update={"logs_ref": logs_ref})
-            except Fenced:
-                raise
-            except Exception as error:
-                warnings.append(f"tool error: {type(error).__name__}")
+            except BaseException as error:
+                error = outcome.classify(error)
+                warnings.append(f"tool error: {_exception_type_name(error)}")
                 output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
     # Optional fingerprint work must remain cancellable before durable completion.
     fingerprint: str | None = None
@@ -784,12 +821,14 @@ async def _run(
                 if not isinstance(value, str):
                     raise TypeError("invalid fingerprint")
                 fingerprint = check_utf8(value)
-        except Fenced:
-            raise
         except anyio.get_cancelled_exc_class() as error:
-            warnings.append(f"fingerprint error: {type(error).__name__}")
-        except Exception as error:
-            warnings.append(f"fingerprint error: {type(error).__name__}")
+            # The tool has completed: abandon optional fingerprint work, then
+            # finish its shielded publication/settlement. The caller's scope
+            # still owns cancellation; the ownership check below still wins.
+            warnings.append(f"fingerprint error: {_exception_type_name(error)}")
+        except BaseException as error:
+            error = outcome.classify(error)
+            warnings.append(f"fingerprint error: {_exception_type_name(error)}")
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")
     candidate = Candidate(

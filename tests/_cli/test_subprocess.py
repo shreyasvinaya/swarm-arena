@@ -3,11 +3,12 @@
 import os
 import pty
 import select
+import selectors
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -169,30 +170,83 @@ def test_terminal_prompt_subprocess(
     assert not Path(run_config.artifact_root).exists()
 
 
+@pytest.mark.parametrize("parent_delayed", [False, True], ids=["on_time", "parent_delayed"])
 def test_prompt_sigint_with_reader_bootstrap_delayed(
-    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+    inputs: tuple[Path, Path],
+    cli_env: dict[str, str],
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
+    parent_delayed: bool,
 ) -> None:
     # Simulate an unscheduled reader thread, before Thread.start() can return.
     # Hold the barrier forever: SIGINT must exit without needing its release.
-    code = f"""
-import threading
+    code = """
+import atexit, faulthandler, os, signal, threading, time
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
 bootstrap = threading.Thread._bootstrap_inner
 def delayed_bootstrap(self: threading.Thread) -> None:
     if self.name == "swarm-arena-daemon-_prompt":
         threading.Event().wait()
     bootstrap(self)
 threading.Thread._bootstrap_inner = delayed_bootstrap
-{_ENTRY}
+sent = None
+original_print = print
+def prompt_print(*args: object, **kwargs: object) -> None:
+    global sent
+    original_print(*args, **kwargs)
+    if args and args[0] == "Start the run? [y/N] ":
+        # Deliver at a known boundary, with the Runner handler installed and
+        # before reader startup. No parent/child scheduling race positions it.
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler) and handler is not signal.default_int_handler
+        sent = time.monotonic()
+        os.kill(os.getpid(), signal.SIGINT)
+run_cmds.print = prompt_print
+def exiting() -> None:
+    faulthandler.cancel_dump_traceback_later()
+    assert sent is not None
+    print(f"sigint-to-exit {time.monotonic() - sent}", flush=True)
+atexit.register(exiting)
+# Preserve a stack in TimeoutExpired.stderr before _child's cleanup can send
+# another SIGINT. This watchdog is diagnostic, not the signal-positioning gate.
+faulthandler.dump_traceback_later(10)
+raise SystemExit(main())
 """
     with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
         process,
         _,
     ):
-        output = _wait_prompt(process)
-        process.send_signal(signal.SIGINT)
-        stdout, stderr = process.communicate(timeout=5)
-        assert process.returncode == 130, (output + stdout, stderr)
+        with monkeypatch.context() as patch:
+            if parent_delayed:
+                # Model the collector being descheduled after select() wakes.
+                # Wait for actual child exit, then advance only Popen's clock:
+                # no CPU load, wall-clock sleep, or slower child is involved.
+                selector_type = vars(subprocess)["_PopenSelector"]
+                original_select = selector_type.select
+                original_time = time.monotonic
+                elapsed = 0.0
+
+                def delayed_select(
+                    selector: selectors.BaseSelector, timeout: float | None = None
+                ) -> list[tuple[selectors.SelectorKey, int]]:
+                    nonlocal elapsed
+                    ready = original_select(selector, timeout)
+                    assert process.wait(timeout=20) == 130
+                    elapsed = 6.0
+                    return ready
+
+                patch.setattr(selector_type, "select", delayed_select)
+                patch.setattr(subprocess, "_time", lambda: original_time() + elapsed)
+            # Allow the parent the same collection budget as other PTY tests.
+            # The child-side measurement below keeps the five-second exit bound.
+            stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 130, (stdout, stderr)
         assert stderr == b"interrupted\n"
+        latency = float(stdout.split(b"sigint-to-exit ")[1])
+        record_property("sigint_to_exit_s", latency)
+        assert latency < 5, (latency, stdout, stderr)
     assert not Path(run_config.run_root).exists()
     assert not Path(run_config.artifact_root).exists()
 

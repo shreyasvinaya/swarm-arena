@@ -11,7 +11,7 @@ from typing import Any, Literal, TypeVar
 import anyio
 import anyio.lowlevel
 
-from swarm_arena._agent.manager import LimitReached, Manager
+from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.curator import (
@@ -32,7 +32,12 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_signal
+from swarm_arena._errors import (
+    Fenced,
+    PlanError,
+    _core_error,
+    _exception_type_name,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -42,14 +47,17 @@ from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.board_types import Frontier
+from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.tooling import RunStatus
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._planning.planner import Planner
-from swarm_arena._planning.policy import Policy, guard
-from swarm_arena._planning.provenance import stamp
+from swarm_arena._planning.policy import _INACTIVE, Policy, guard
+from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.ranking import ranked
@@ -61,7 +69,6 @@ from swarm_arena._scoring.runner import (
     prepare_judge_batch,
 )
 
-_INACTIVE = {AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED}
 _T = TypeVar("_T")
 
 
@@ -125,22 +132,20 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "base_dir": str(base_dir),
             "planner_call_ids": [],
             "first_round": 1,
-            "preflight_complete": True,
         },
     )
 
 
 async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier) -> int:
     """Read the historical count without retaining a cancelled goal or owner."""
+    outcome = _Outcome()
     try:
         view = await run_sync_daemon(deps.board.snapshot, plan.goal.key(), frontier)
         return await run_sync_daemon(view.count_learnings, plan.goal.namespace)
-    except Exception as error:
-        safe = _rebuild_core_signal(error)
-        if safe is not None:
-            raise safe from None
+    except BaseException as error:
+        error = outcome.classify(error)
         raise _core_error(
-            RuntimeError, f"round page board read failed: {type(error).__name__}"
+            RuntimeError, f"round page board read failed: {_exception_type_name(error)}"
         ) from None
 
 
@@ -239,7 +244,7 @@ class GoalRunner:
         """Copy resume carriers and share the run's admission reservation."""
         self.deps, self.goal_id, self.plan, self.replanner = deps, goal_id, plan, replanner
         if deps.admission is None:
-            deps.admission = RunAdmission(deps.config.limits.max_agents_total)
+            deps.admission = RunAdmission(deps.config.limits.max_agents_total, [plan])
         self.admission = deps.admission
         self.history = list(history)
         self.state = state.model_copy(deep=True) if state is not None else GoalState()
@@ -350,11 +355,7 @@ class GoalRunner:
                 key = f"{team.name}/{spec.name}"
                 old = previous.get(address)
                 goal = team_goal(self.plan, team)
-                manager = (
-                    old.manager
-                    if old and old.spec.manager == spec.manager
-                    else await run_sync_daemon(spec.manager.build, Manager)
-                )
+                manager = old.manager if old and old.spec.manager == spec.manager else None
                 slots.append(
                     AgentSlot(
                         address=address,
@@ -607,7 +608,7 @@ class GoalRunner:
                 try:
                     while True:
                         if self.deps.journal.fenced.is_set():
-                            raise Fenced()
+                            raise _core_error(Fenced, "run ownership lost")
                         stopped = self._stop()
                         if stopped and not final:
                             break
@@ -637,15 +638,7 @@ class GoalRunner:
                 raise asyncio.CancelledError() from None
         # Reraise outside the task group so fencing keeps its original type.
         if errors:
-            error = errors[0]
-            if isinstance(error, Fenced):
-                raise error
-            rebuilt = _rebuild_core_signal(error)
-            if rebuilt is not None:
-                raise rebuilt from None
-            if isinstance(error, BaseExceptionGroup) or not isinstance(error, Exception):
-                raise _core_error(RuntimeError, "supervised hook failed") from None
-            raise error
+            raise _classify_outcome(errors[0]) from None
         return (True, results[0]) if results else (False, None)
 
     def _judge_context(
@@ -677,21 +670,37 @@ class GoalRunner:
             read_cache=not final,
         )
 
-    def _publish_scores(self, outcome: JudgeOutcome, scope: LLMScope, round: int) -> None:
+    def _publish_scores(
+        self,
+        outcome: JudgeOutcome,
+        scope: LLMScope,
+        round: int,
+        *,
+        barrier_batch: dict[str, Any] | None = None,
+        final_batch: dict[str, Any] | None = None,
+    ) -> None:
+        remaining = len(outcome.scores) + len(outcome.errors)
+
+        def append(kind: EventType, **payload: Any) -> Event:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0:
+                if barrier_batch is not None:
+                    payload["barrier_batch"] = barrier_batch
+                if final_batch is not None:
+                    payload["final_batch"] = final_batch
+            return self.deps.journal.append(self._draft(kind, round=round, **payload))
+
         for score in outcome.scores:
             if not score.llm_call_ids:
                 score = score.model_copy(update={"llm_call_ids": list(scope.call_ids)})
-            event = self.deps.journal.append(
-                self._draft(EventType.SCORE, round=round, score=score.model_dump(mode="json"))
-            )
+            event = append(EventType.SCORE, score=score.model_dump(mode="json"))
             self.deps.board.put_score(score, epoch=event.epoch, seq=event.seq)
         for error in outcome.errors:
-            self.deps.journal.append(
-                self._draft(EventType.JUDGE_ERROR, round=round, **error.model_dump())
-            )
+            append(EventType.JUDGE_ERROR, **error.model_dump())
 
     async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
-        """Fund exact batches and publish each group's judges in plan order."""
+        """Reuse committed batches, funding only missing barrier outcomes."""
         tranche = self._tranche("judges")
         reservations: dict[str, tuple[Reservation, Amount, bool]] = {}
         try:
@@ -726,11 +735,38 @@ class GoalRunner:
                 continue
             _, refs, _ = part_scoring(self.plan, part)
             for ref in refs:
+                identity: dict[str, Any] = {
+                    "goal_id": self.goal_id,
+                    "revision": self.plan.revision,
+                    "round": round,
+                    "part": part,
+                    "ref": ref.model_dump(mode="json"),
+                    "candidates": sorted(c.id for c in batch),
+                }
+                key = sha256_hex(canonical_json(identity))
+                if any(
+                    event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
+                    and event.goal_id == self.goal_id
+                    and event.round == round
+                    and isinstance(record := event.payload.get("barrier_batch"), dict)
+                    and record.get("key") == key
+                    for event in self._events
+                ):
+                    continue
+                completion: dict[str, Any] = {
+                    "key": key,
+                    "members": sorted(c.id for c in batch),
+                    "anchors": [],
+                }
                 leaders = [c for c, _ in self._round_state().ranked(part)]
                 scope = self._scope("judge", round, tranche)
+                preparation = _Outcome()
                 try:
                     judge = await run_sync_daemon(ref.build, Judge)
                     prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
+                    completion.update(
+                        members=sorted(c.id for c in prepared[0]), anchors=sorted(prepared[1])
+                    )
                     amount = await run_sync_daemon(
                         partial(
                             judge_amount,
@@ -741,21 +777,21 @@ class GoalRunner:
                             llm=False,
                         )
                     )
-                except Fenced:
-                    raise
-                except Exception as error:
+                except BaseException as error:
+                    error = preparation.classify(error)
                     outcome = JudgeOutcome(
                         scores=[],
                         errors=[
                             JudgeError(
                                 candidate_id=c.id,
                                 judge=ref.component_name(),
-                                reason=f"judge error: {type(error).__name__}",
+                                reason=f"judge error: {_exception_type_name(error)}",
                             )
                             for c in batch
                         ],
                     )
-                    self._publish_scores(outcome, scope, round)
+                    self._publish_scores(outcome, scope, round, barrier_batch=completion)
+                    await self._refresh()
                     continue
 
                 def on_admit(admitted: Reservation, amount: Amount = amount) -> None:
@@ -799,14 +835,66 @@ class GoalRunner:
                 if reservation is not None:
                     await self.deps.ledger.settle(reservation.id, amount, estimated=True)
                     reservations.pop(reservation.id)
-                self._publish_scores(outcome, scope, round)
+                self._publish_scores(outcome, scope, round, barrier_batch=completion)
                 await self._refresh()
         return True
 
+    def _final_identity(self, finalists: Sequence[Candidate]) -> dict[str, Any]:
+        """Bind final inputs to the lifecycle, plan, judge and candidate boundary."""
+        name = self._ranking_name(None)
+        ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
+        lifecycle = next(
+            (
+                [event.epoch, event.seq]
+                for event in reversed(self._events)
+                if event.goal_id == self.goal_id and event.type == EventType.GOAL_STARTED
+            ),
+            None,
+        )
+        return {
+            "goal_id": self.goal_id,
+            "lifecycle": lifecycle,
+            "revision": self.plan.revision,
+            "ref": ref.model_dump(mode="json"),
+            "members": sorted(c.id for c in finalists),
+            "candidates": sorted(
+                c.id for c in self.recorded.candidates.values() if c.goal_id == self.goal_id
+            ),
+        }
+
+    def _recover_final(
+        self, finalists: Sequence[Candidate] | None = None
+    ) -> list[Candidate] | None:
+        """Restore completion before selection can consume its own final scores."""
+        for event in reversed(self._events):
+            if not (
+                event.goal_id == self.goal_id
+                and event.round == 0
+                and event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
+                and isinstance(record := event.payload.get("final_batch"), dict)
+            ):
+                continue
+            by_id = self.recorded.candidates
+            if not all(id in by_id for id in record["members"]):
+                continue
+            inputs = finalists if finalists is not None else [by_id[id] for id in record["members"]]
+            identity = self._final_identity(inputs)
+            if record["key"] != sha256_hex(canonical_json(identity)):
+                continue
+            self.status, self.reason = record["status"], record["reason"]
+            self._stop()
+            return [by_id[id] for id in record["order"]]
+        return None
+
     async def _final(self, finalists: Sequence[Candidate]) -> list[Candidate]:
-        """Rescore within stop grace, falling back only to committed rankings."""
+        """Reuse this lifecycle's completed final batch, or rescore within stop grace."""
         if not finalists:
             return []
+        recovered = self._recover_final(finalists)
+        if recovered is not None:
+            return recovered
+        batch_identity = self._final_identity(finalists)
+        key = sha256_hex(canonical_json(batch_identity))
         name = self._ranking_name(None)
         ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
         tranche = self._tranche("final")
@@ -885,12 +973,27 @@ class GoalRunner:
                         JudgeError(
                             candidate_id=c.id,
                             judge=name,
-                            reason=f"judge error: {type(error).__name__}",
+                            reason=f"judge error: {_exception_type_name(error)}",
                         )
                         for c in finalists
                     ],
                 )
-            self._publish_scores(outcome, scope, 0)
+            if not order and outcome.errors:
+                self.status, self.reason = "no_result", "provider_failed"
+            # The last outcome proves completion of this exact batch. Queue it
+            # before settlement so a committed score/settle head includes order.
+            self._publish_scores(
+                outcome,
+                scope,
+                0,
+                final_batch={
+                    "key": key,
+                    **batch_identity,
+                    "order": [candidate.id for candidate in order],
+                    "status": self.status,
+                    "reason": self.reason,
+                },
+            )
             return order
         finally:
             if reservation is not None:
@@ -931,9 +1034,7 @@ class GoalRunner:
                 )
                 if isawaitable(proposed):
                     proposed = await proposed
-                if not isinstance(proposed, Plan):
-                    raise TypeError("invalid planner result")
-                return proposed
+                return await run_sync_daemon(_detach_plan, proposed)
 
         try:
             try:
@@ -946,7 +1047,7 @@ class GoalRunner:
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
-                    errors=[f"planner error: {type(error).__name__}"],
+                    errors=[f"planner error: {_exception_type_name(error)}"],
                     origin="autonomous",
                     first_round=self.rounds_closed + 1,
                 )
@@ -1003,7 +1104,6 @@ class GoalRunner:
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
                         planner_call_ids=list(scope.call_ids),
-                        preflight_complete=True,
                         first_round=self.rounds_closed + 1,
                     )
                 )
@@ -1013,7 +1113,7 @@ class GoalRunner:
                 self.plan = admitted
                 self.history.append(admitted)
 
-            await self.admission.update(self.goal_id, peak, publish=publish)
+            await self.admission.update(self.goal_id, peak, publish=publish, plan=admitted)
         except PlanError as error:
             self.deps.journal.append(
                 self._draft(
@@ -1030,12 +1130,12 @@ class GoalRunner:
 
     async def _preflight(self, plan: Plan) -> None:
         """Convert shared prerequisite failures to an admission refusal."""
+        outcome = _Outcome()
         try:
             await run_preflight([plan], self.deps.config, self.deps.executor)
-        except Fenced:
-            raise
-        except Exception as error:
-            raise PlanError([f"preflight failed: {type(error).__name__}"]) from None
+        except BaseException as error:
+            error = outcome.classify(error)
+            raise PlanError([f"preflight failed: {_exception_type_name(error)}"]) from None
 
     def _stop(self) -> bool:
         stops = self.deps.stops
@@ -1075,7 +1175,7 @@ class GoalRunner:
             proposed = await run_sync_daemon(policy.after_round, state)
             if isawaitable(proposed):
                 proposed = await proposed
-            return guard(proposed, state)
+            return await run_sync_daemon(lambda: guard(_detach_model(Decision, proposed), state))
 
         try:
             completed, result = await self._supervised_step(invoke, final=False)
@@ -1083,7 +1183,7 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
-            decision = guard(Decision(policy=f"policy error: {type(error).__name__}"), state)
+            decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(
                 EventType.DECISION,
@@ -1148,6 +1248,7 @@ class GoalRunner:
         scope = self._scope("curator", round, tranche)
 
         async def invoke() -> tuple[list[Learning], list[str]] | None:
+            outcome = _Outcome()
             try:
                 with llm_scope(scope):
                     frontier = await anyio.to_thread.run_sync(self.deps.board.frontier)
@@ -1175,8 +1276,8 @@ class GoalRunner:
                         new=visible_new,
                         view=view,
                     )
-            except Exception as error:
-                return [], [_curator_error(error)]
+            except BaseException as error:
+                return [], [_curator_error(outcome.classify(error))]
 
         completed = False
         result: tuple[list[Learning], list[str]] | None = None
@@ -1343,7 +1444,10 @@ class GoalRunner:
         abandoned on any stop. After an immediate stop or run deadline,
         barrier judging, converge slot preparation and final judging have
         ``settle_timeout_s`` to finish; on timeout, selection uses only previously
-        journaled ranking scores.
+        journaled ranking scores. A graceful stop that preempts the policy
+        journals the default ``Decision()`` without pruning. Candidates left
+        unjudged when a round's barrier is cut short stay unranked on resume;
+        later rounds do not rejudge those closed-round candidates.
         Policy checkpoints complete an unfinished round without repeating its
         managers or barrier. Round closure commits before replanning; revisions
         and rejections identify the first round to which they apply. Recovery
@@ -1351,9 +1455,8 @@ class GoalRunner:
         records its lifecycle reason independently of the live stop flags.
         A terminal policy checkpoint restores its effect and completes any
         owed round closure before constructing managers or judges. New revisions
-        pass bounded preflight before publication; failed proposals retain the
-        previous admitted revision. Recovery uses committed admitted revisions
-        without repeating preflight.
+        pass bounded preflight before publication. Recovery replays already
+        admitted revisions.
 
         Returns
         -------

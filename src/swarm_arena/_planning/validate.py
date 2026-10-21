@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import ConfigError, PlanError, _core_error
+from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
 from swarm_arena._model.data import json_equal
@@ -19,6 +19,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
+from swarm_arena._outcomes import _classify_outcome, _propagate_control
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
 from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
@@ -97,8 +98,11 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     """Hide arbitrary connector values at the admission boundary."""
     try:
         return action()
-    except Exception as error:
-        raise _core_error(PlanError, [f"{pointer}: {type(error).__name__}"]) from None
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        error = _classify_outcome(error)
+        raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
 
 
 def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
@@ -132,7 +136,10 @@ def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
             if not issubclass(cls, Configurable):
                 raise TypeError
             safe = _safe_location(cls.Config, tuple(location))
-        except Exception:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            _propagate_control(error)
             safe = ("<key>",) * len(location)
         tokens = [
             "<key>" if part == "<…>" else str(part).replace("~", "~0").replace("/", "~1")
@@ -403,8 +410,11 @@ def _rule_configs(
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
             continue
-        except Exception as error:
-            errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            error = _classify_outcome(error)
+            errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
             continue
         try:
             built[site.pointer] = _safe_call(f"{pointer}: {ref.path}", partial(ref.build, base))
@@ -866,8 +876,11 @@ def _validate_round_refs(plan: Plan) -> None:
             effective_tool_ref(ref, overrides)
         except ConfigError as error:
             errors.append(f"{pointer}: {error}")
-        except Exception as error:
-            errors.append(f"{pointer}: {ref.path}: {type(error).__name__}")
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            error = _classify_outcome(error)
+            errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
     if errors:
         raise _core_error(PlanError, errors) from None
 
@@ -997,8 +1010,11 @@ def admit_revision(
         frozen = _snapshot_round_refs(frozen, artifacts)
     except PlanError:
         raise
-    except Exception as error:
-        raise _core_error(PlanError, [f"/snapshot: {type(error).__name__}"]) from None
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        error = _classify_outcome(error)
+        raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )

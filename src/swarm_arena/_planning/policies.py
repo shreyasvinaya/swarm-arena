@@ -8,6 +8,7 @@ from pydantic import Field
 from swarm_arena._model.planning_types import Decision, RoundState
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel, _validate_config
 from swarm_arena._model.results import AgentStatus, Score
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._planning.policy import Policy, _live_agents, guard
 
 
@@ -419,9 +420,13 @@ class Chain(Policy):
                 cls, validated = ref._resolve_config(Policy)
                 try:
                     members.append(cls(validated))
-                except TypeError:
+                except TypeError as error:
+                    _propagate_control(error)
                     raise TypeError(f"cannot build policy {ref.path}") from None
-                except Exception:
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as error:
+                    _propagate_control(error)
                     raise ValueError(f"cannot build policy {ref.path}") from None
             self._members = members
         return self._members

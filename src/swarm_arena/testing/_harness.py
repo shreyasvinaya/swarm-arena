@@ -22,7 +22,8 @@ from swarm_arena._board.digest import build_digest
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.tranche import Tranche
-from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._errors import Fenced, _core_error, _exception_type_name
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
@@ -36,6 +37,7 @@ from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.runner import judge_round
@@ -103,7 +105,7 @@ class OfflineHarness:
         ``manager_errors`` with failed-run log notes and journaled by type only;
         their rounds still receive barrier judging and closure, return empty
         reports, and do not prevent later rounds. Cancellation and fencing
-        propagate. Returned reports pass strict validation and retain their identity.
+        propagate. Returned reports are detached, strictly validated base copies.
         Tranche outcomes may be ignored here: durable ``settle.usage_overflow``
         and ledger exhaustion remain authoritative for subsequent admission.
 
@@ -127,7 +129,7 @@ class OfflineHarness:
         Returns
         -------
         list[RoundReport]
-            Original valid reports in round order.
+            Detached, strictly validated base ``RoundReport`` copies in round order.
 
         Examples
         --------
@@ -368,17 +370,16 @@ class OfflineHarness:
                 ),
             )
             manager_error: Exception | None = None
+            outcome = _Outcome()
             try:
                 report = await manager.run_round(AgentContext(rt, gate=lambda: None))
-            except LimitReached:
-                report = RoundReport()
-            except Fenced:
-                raise
-            except Exception as error:
+            except BaseException as error:
+                error = outcome.classify(error)
                 if rt.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
-                self.manager_errors.append(error)
-                manager_error = error
+                if not isinstance(error, LimitReached):
+                    self.manager_errors.append(error)
+                    manager_error = error
                 report = RoundReport()
             finally:
                 self.candidates.extend(c for c in rt.own if isinstance(c, Candidate))
@@ -386,7 +387,7 @@ class OfflineHarness:
                 with anyio.CancelScope(shield=True):
                     await rt.tranche.close()
             if manager_error is not None:
-                reason = f"manager error: {type(manager_error).__name__}"
+                reason = f"manager error: {_exception_type_name(manager_error)}"
                 rt.journal.append(
                     EventDraft(
                         type=EventType.AGENT_STATUS,
@@ -416,9 +417,10 @@ class OfflineHarness:
                 )
             if not isinstance(report, RoundReport):
                 raise _fail("Manager.run_round() must return a RoundReport")
-            if _strict_copy(RoundReport, report) is None:
+            valid_report = await run_sync_daemon(_strict_copy, RoundReport, report)
+            if valid_report is None:
                 raise _fail("Manager.run_round() must return a valid RoundReport")
-            reports.append(report)
+            reports.append(valid_report)
             candidates = [c for c in rt.own if isinstance(c, Candidate)]
             leaders = [
                 view.get_candidate(row.candidate_id)

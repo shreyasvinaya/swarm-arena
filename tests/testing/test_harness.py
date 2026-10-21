@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -350,3 +351,33 @@ async def test_harness_uses_a_temp_arena_board(
     assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
     assert not (tmp_path / "real-arena").exists()
     assert not (tmp_path / "xdg").exists()
+
+
+@pytest.mark.parametrize("kind", ["group", "cancel"])
+async def test_nonstandard_manager_reason_uses_originating_type(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    secret = "harness-manager-secret"
+    failure = (
+        ExceptionGroup(secret, [ValueError(secret)])
+        if kind == "group"
+        else asyncio.CancelledError(secret)
+    )
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    harness = OfflineHarness()
+    await harness.run_rounds(
+        NoopManager(),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=1,
+        limits=Limits(),
+        config=RunConfig(),
+        judges=[],
+    )
+    [event] = _events(harness, "agent_status")
+    assert event.payload["reason"] == f"manager error: {type(failure).__name__}"
+    assert_secret_absent(RuntimeError(event.model_dump_json()), secret)

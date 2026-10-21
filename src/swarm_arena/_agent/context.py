@@ -15,17 +15,25 @@ from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
-from swarm_arena._errors import ConfigError, Fenced, SoftError, _core_signal, _rebuild_core_signal
+from swarm_arena._errors import (
+    ConfigError,
+    SoftError,
+    _core_signal,
+    _exception_type_name,
+    _is_core_signal,
+)
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.board_types import Row
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import Estimate
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.runner import for_manager
 from swarm_arena._tooling.staging import effective_files
@@ -75,10 +83,13 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
             raise TypeError("invalid feedback policy")
         return _ToolMetadata(description, input_model, editable, actions, feedback)
-    except Fenced:
+    except KeyboardInterrupt:
         raise
-    except Exception as error:
-        raise _core_signal(SoftError(f"invalid tool metadata: {type(error).__name__}")) from None
+    except BaseException as error:
+        error = _classify_outcome(error)
+        raise _core_signal(
+            SoftError(f"invalid tool metadata: {_exception_type_name(error)}")
+        ) from None
 
 
 class AgentContext:
@@ -92,6 +103,10 @@ class AgentContext:
     The runner prepares connector metadata in supervised daemon workers before
     constructing this loop-owned context. Feedback uses the producing policy;
     unknown policies hide reasons and details.
+
+    Identifier and name arguments, including collection elements, are copied to
+    exact strings at entry without invoking subclass hooks. Non-string values
+    raise a value-free ``TypeError`` before action admission or loop marshaling.
 
     Parameters
     ----------
@@ -386,6 +401,12 @@ class AgentContext:
         --------
         >>> candidate = await ctx.run_tool({"x": 1.0})  # doctest: +SKIP
         """
+        parents = tuple(_context_string(value, "parents") for value in parents)
+        edits = (
+            None
+            if edits is None
+            else {_context_string(path, "edits path"): text for path, text in edits.items()}
+        )
         self._charge()
         read_ids = tuple(self._read_ids)
         candidate = await execute_tool_run(
@@ -459,6 +480,7 @@ class AgentContext:
         >>> assert scores == [score] and scores[0] is not score
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        candidate_id = _context_string(candidate_id, "candidate_id")
 
         def read() -> list[Score]:
             self._charge(board_read=True)
@@ -524,17 +546,19 @@ class AgentContext:
         >>> assert hints == [hint] and hints[0] is not hint
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        tags = tuple(_context_string(value, "tags") for value in tags)
+        normalized_scope = _context_string(scope, "scope")
 
         def read() -> list[Learning]:
             self._charge(board_read=True)
-            if scope not in ("goal", "namespace"):
+            if normalized_scope not in ("goal", "namespace"):
                 raise _core_signal(SoftError("invalid learning scope"))
             rt = self._rt
             if query == "":
                 found = rt.view.learnings(
                     rt.goal.namespace,
                     tags=tags,
-                    goal=rt.goal_key if scope == "goal" else None,
+                    goal=rt.goal_key if normalized_scope == "goal" else None,
                     limit=limit,
                 )
             else:
@@ -542,7 +566,7 @@ class AgentContext:
                     rt.goal.namespace,
                     query,
                     tags=tags,
-                    goal=rt.goal_key if scope == "goal" else None,
+                    goal=rt.goal_key if normalized_scope == "goal" else None,
                     limit=limit,
                 )
             own = [
@@ -551,7 +575,7 @@ class AgentContext:
                 if isinstance(item, Learning)
                 and not item.hidden
                 and item.namespace == rt.goal.namespace
-                and (scope == "namespace" or item.goal_id == rt.goal_id)
+                and (normalized_scope == "namespace" or item.goal_id == rt.goal_id)
                 and set(tags).issubset(item.tags)
                 and (
                     query.casefold() in item.title.casefold()
@@ -603,6 +627,7 @@ class AgentContext:
         >>> assert found == hint and found is not hint
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        id = _context_string(id, "id")
 
         def read() -> Learning:
             self._charge(board_read=True)
@@ -651,6 +676,7 @@ class AgentContext:
         >>> assert found == candidate and found is not candidate
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        id = _context_string(id, "id")
 
         def read() -> Candidate:
             self._charge(board_read=True)
@@ -719,6 +745,7 @@ class AgentContext:
         >>> rt.view.leaderboard.assert_called_once_with(rt.goal_key, judge="rank")
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        part = None if part is None else _context_string(part, "part")
 
         def read() -> list[Row]:
             self._charge(board_read=True)
@@ -815,6 +842,9 @@ class AgentContext:
         >>> assert rt.own == [hint] and rt.counters.learnings == 1
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 0)
         """
+        evidence = tuple(_context_string(value, "evidence") for value in evidence)
+        refines = tuple(_context_string(value, "refines") for value in refines)
+        tags = tuple(_context_string(value, "tags") for value in tags)
         self._charge()
         rt = self._rt
         try:
@@ -940,6 +970,7 @@ class AgentContext:
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         >>> rt.artifacts.get_bytes.assert_not_called()
         """
+        name = _context_string(name, "name")
         action = next((a for a in self.actions if a.name == name), None)
         self._charge(board_read=action is not None and action.counts_as == "board_read")
         if action is None:
@@ -954,15 +985,14 @@ class AgentContext:
             raise _core_signal(SoftError(str(error))) from None
         lifetime = _ActionLifetime(self)
         token = _nested.set((*_nested.get(), lifetime))
+        outcome = _Outcome()
         try:
             return await action.handler(self, validated)
-        except Fenced:
-            raise
-        except Exception as error:
-            rebuilt = _rebuild_core_signal(error)
-            if isinstance(rebuilt, (SoftError, LimitReached)):
-                raise rebuilt from None
-            raise _core_signal(SoftError(f"action failed: {type(error).__name__}")) from None
+        except BaseException as error:
+            error = outcome.classify(error)
+            if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+                raise error from None
+            raise _core_signal(SoftError(f"action failed: {_exception_type_name(error)}")) from None
         finally:
             lifetime.live = False
             _nested.reset(token)

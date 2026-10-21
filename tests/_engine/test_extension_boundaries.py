@@ -294,7 +294,7 @@ async def _worker(mode: str, root: Path) -> None:
         # These are watchdogs, not the mechanism that makes a probe succeed.
         # Entry signals control termination; these watchdogs leave time for setup.
         limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
-        lease_ttl_s=1.5,
+        lease_ttl_s=3.0,
         settle_timeout_s=0.2,
     )
     deadline_clock: _RoundClock | None = None
@@ -607,7 +607,8 @@ def test_malformed_manager_is_contained_beside_healthy_peer(tmp_path: Path, kind
     assert any(e["type"] == "tool_end" and e["agent"] == "peer" for e in data["events"])
     assert any(e["type"] == "goal_finished" for e in data["events"])
     statuses = [e for e in data["events"] if e["type"] == "agent_status" and e["agent"] == "a"]
-    expected = "ValueError" if kind == "utf8" else "TypeError"
+    # Complete report validation now rejects malformed summaries before loop access.
+    expected = "ValidationError" if kind in {"json", "utf8"} else "TypeError"
     assert any(e["payload"]["reason"] == f"manager error: {expected}" for e in statuses)
 
 

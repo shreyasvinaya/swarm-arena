@@ -1,15 +1,12 @@
 """Take ownership of a committed run and retain its reconstructed services."""
 
 import asyncio
-import os
 import sys
 import threading
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
-from tempfile import gettempdir
 from uuid import uuid4
 
 import anyio
@@ -23,7 +20,7 @@ from swarm_arena._engine.goal import _repair_round_pages
 from swarm_arena._engine.preflight import check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, PlanError, _core_error
+from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
@@ -34,6 +31,7 @@ from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.validate import _rule_max_agents_total
 from swarm_arena._store.artifacts import ArtifactStore
@@ -139,12 +137,7 @@ class _ResumeServices:
         head = lease.doc.head
         assert head is not None
         try:
-            path = (
-                Path(gettempdir())
-                / f"swarm-arena-{os.getuid()}"
-                / "journals"
-                / f"{self.run_id}-e{lease.doc.epoch}.jsonl"
-            )
+            path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
             async with run_module._RunJournal(
                 self.store,
                 lease,
@@ -201,16 +194,16 @@ class _ResumeServices:
                             (state.started_commands, commands, EventType.COMMAND_END),
                         ):
                             for id, started in jobs.items():
+                                outcome = _Outcome()
                                 try:
                                     with anyio.move_on_after(config.settle_timeout_s):
                                         if await executor.kill_orphan(started):
                                             killed.append(id)
-                                except Fenced:
-                                    raise
-                                except Exception as error:
+                                except BaseException as error:
+                                    error = outcome.classify(error)
                                     raise _core_error(
                                         RuntimeError,
-                                        f"orphan recovery failed: {type(error).__name__}",
+                                        f"orphan recovery failed: {_exception_type_name(error)}",
                                     ) from None
                                 source = index[id]
                                 payload = (
@@ -285,7 +278,14 @@ class _ResumeServices:
                             views=ViewWriter(self.store, journal),
                             stops=StopState(),
                             clock=clock,
-                            admission=RunAdmission(config.limits.max_agents_total),
+                            admission=RunAdmission(
+                                config.limits.max_agents_total,
+                                [
+                                    plan
+                                    for revisions in state.plans.values()
+                                    for plan, _ in revisions
+                                ],
+                            ),
                         )
                         await _repair_round_pages(self.deps, state)
                         self.resumed = ResumeState(
@@ -310,7 +310,7 @@ class _ResumeServices:
                 except Exception as error:
                     if self.failure is None:
                         self.failure = _core_error(
-                            RuntimeError, f"resume cleanup failed: {type(error).__name__}"
+                            RuntimeError, f"resume cleanup failed: {_exception_type_name(error)}"
                         )
                 if executor is not None:
                     try:
@@ -446,14 +446,12 @@ async def resume_run(
 
     Raises
     ------
-    PlanError
-        A goal's agent peak exceeds the requested run-wide limit.
     ValueError
-        The journal is missing or a budget cap decreases.
-    LeaseHeld
-        A live owner requires explicit force.
-    Fenced
-        A competing resume advances the epoch.
+        A goal's agent peak exceeds the run-wide limit, the journal is missing
+        or has an invalid replay payload, or a budget cap decreases.
+    RuntimeError
+        A live owner requires force, a competing resume advances the epoch,
+        or a runtime service fails.
 
     Examples
     --------
