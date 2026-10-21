@@ -206,8 +206,7 @@ def test_lists_are_globally_ordered_and_empty_files_roundtrip(tmp_path: Path) ->
     assert list_human_objects(arena, ["z", "a"]) == (sorted(names[2:]), names[:2])
     assert read_human_object(arena, names[0]) == []
     arena.create("z/curation/unexpected.jsonl", b"")
-    with pytest.raises(ValueError, match="basename"):
-        list_human_objects(arena, ["z"])
+    assert list_human_objects(arena, ["z"]) == ([names[2]], [names[0]])
 
 
 def test_read_rejects_curation_score(tmp_path: Path) -> None:

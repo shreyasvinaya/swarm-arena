@@ -533,3 +533,7 @@ author. Each successful mutation refreshes the published frontier before its
 303 redirect, so its learning page and updated markers are immediately readable.
 A POST may wait for an in-progress storage refresh; GET requests continue reading
 the published generation during that wait.
+
+Foreign, corrupt, unreadable, or newer-version review and curation objects are
+skipped with a warning when capturing a new frontier. Recorded snapshots still
+require every object named by their frontier.

@@ -1,5 +1,6 @@
 """Validate, persist, and order write-once human review and curation objects."""
 
+import logging
 import re
 import secrets
 from collections.abc import Iterable, Sequence
@@ -14,6 +15,8 @@ from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import canonical_json, format_utc
 from swarm_arena._model.results import Learning, Score
 from swarm_arena._store.base import Store
+
+_LOG = logging.getLogger("swarm_arena.board")
 
 _Folder = Literal["reviews", "curation"]
 
@@ -260,7 +263,7 @@ def list_human_objects(arena: Store, namespaces: Sequence[str]) -> tuple[list[st
     -------
     tuple[list[str], list[str]]
         Review keys and curation keys, each ordered by timestamp then full name.
-        Malformed reserved locations are rejected.
+        Foreign locations are skipped with a value-free warning.
 
     Examples
     --------
@@ -272,10 +275,14 @@ def list_human_objects(arena: Store, namespaces: Sequence[str]) -> tuple[list[st
     for namespace in namespaces:
         for folder, target in (("reviews", reviews), ("curation", curation)):
             for key in arena.list(f"{namespace}/{folder}/"):
-                if _validate_human_key(key) != folder or not key.startswith(
-                    f"{namespace}/{folder}/"
-                ):
-                    raise _core_error(ValueError, "invalid human object location")
+                try:
+                    if _validate_human_key(key) != folder or not key.startswith(
+                        f"{namespace}/{folder}/"
+                    ):
+                        raise ValueError
+                except ValueError:
+                    _LOG.warning("skipping foreign arena human object")
+                    continue
                 target.add(key)
     return sorted(reviews, key=human_object_order), sorted(curation, key=human_object_order)
 

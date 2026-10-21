@@ -21,7 +21,7 @@ from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.results import Candidate, Learning, Score
-from swarm_arena._store.base import open_store
+from swarm_arena._store.base import Store, open_store
 
 
 @pytest.fixture
@@ -1112,3 +1112,48 @@ def test_cross_namespace_groups_keep_candidates_scores_and_siblings(tmp_path: Pa
         assert [c.id for c, _ in board._cache("toy").candidates(frontier)] == ["main"]
     finally:
         board.close()
+
+
+@pytest.mark.parametrize("kind", ["foreign", "corrupt", "future", "unreadable"])
+def test_frontier_omits_unreadable_human_objects(
+    tmp_path: Path,
+    board: ArenaBoard,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    import swarm_arena._board.arena as arena_module
+
+    run = _seed(tmp_path)
+    _learning(run)
+    good = _curate(tmp_path, "pin", "L-1")
+    arena = open_store(str(tmp_path / "arena"))
+    name = "toy/curation/20261018T130000.000Z-deadbeef.jsonl"
+    secret = "SENTINEL-private-human-object"
+    if kind == "foreign":
+        name = f"toy/curation/{secret}"
+        data = b""
+    elif kind == "future":
+        data = b'{"schema_version":2,"kind":"pin","learning_id":"L-1","author":"human:a"}'
+    else:
+        data = secret.encode()
+    arena.create(name, data)
+    original = arena_module.read_human_object
+
+    def read(store: Store, key: str) -> list[HumanObject]:
+        if kind == "unreadable" and key == name:
+            raise OSError(secret)
+        return original(store, key)
+
+    monkeypatch.setattr(arena_module, "read_human_object", read)
+    frontier = board.frontier()
+    assert frontier.curation == [good]
+    assert frontier.reviews == []
+    assert board.snapshot(run.goal.key(), frontier).get_learning("L-1").pinned
+    assert len(caplog.records) == 1
+    assert secret not in caplog.text
+    assert str(tmp_path) not in caplog.text
+    # A recorded frontier is exact: it must never silently drop a named object.
+    if kind != "foreign":
+        with pytest.raises((OSError, ValueError)):
+            board.snapshot(run.goal.key(), frontier.model_copy(update={"curation": [name]}))

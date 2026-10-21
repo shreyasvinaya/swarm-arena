@@ -516,17 +516,27 @@ class ArenaBoard(Board):
         with self._lock:
             self._decisions[(goal_id, round)] = decision.model_copy(deep=True)
 
-    def _load_objects(self, cache: ArenaCache, frontier: Frontier) -> None:
+    def _load_objects(
+        self, cache: ArenaCache, frontier: Frontier, *, tolerate_unreadable: bool = False
+    ) -> set[str]:
         """Read complete local-namespace objects and apply one atomic batch."""
         arena = open_store(self.config.arena_root)
         names: list[str] = []
         operations: list[HumanObject] = []
         empty: list[str] = []
+        omitted: set[str] = set()
         for name in sorted(set(frontier.reviews + frontier.curation), key=human_object_order):
             _validate_human_key(name)
             if not name.startswith(cache.namespace + "/") or cache.has_object(name):
                 continue
-            objects = read_human_object(arena, name)
+            try:
+                objects = read_human_object(arena, name)
+            except (StorageError, OSError, ValueError):
+                if not tolerate_unreadable:
+                    raise
+                _LOG.warning("skipping unreadable arena human object")
+                omitted.add(name)
+                continue
             if objects:
                 names.extend([name] * len(objects))
                 operations.extend(objects)
@@ -534,6 +544,7 @@ class ArenaBoard(Board):
                 empty.append(name)
         if names or empty:
             cache.apply_human_objects(names, operations, covered=empty)
+        return omitted
 
     def frontier(self) -> Frontier:
         """
@@ -603,6 +614,15 @@ class ArenaBoard(Board):
                     _LOG.warning("cannot read arena run %s", run_id)
             reviews, curation = list_human_objects(arena, self._namespaces)
             frontier = build_frontier(reads, reviews, curation)
+            omitted = set()
+            for cache in caches:
+                omitted.update(self._load_objects(cache, frontier, tolerate_unreadable=True))
+            frontier = frontier.model_copy(
+                update={
+                    "reviews": [name for name in reviews if name not in omitted],
+                    "curation": [name for name in curation if name not in omitted],
+                }
+            )
             published = self._prepare_published(frontier)
             latest = frontier.model_copy(deep=True)
             with self._lock:
