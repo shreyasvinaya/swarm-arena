@@ -300,7 +300,9 @@ async def _scoped_worker(mode: str, root: Path, patch: pytest.MonkeyPatch) -> No
         # Entry signals control termination; these watchdogs leave time for setup.
         limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
         lease_ttl_s=3.0,
-        settle_timeout_s=0.2,
+        # Stop settlement includes healthy journal I/O. Keep its allowance
+        # above CI scheduling noise and below the independently measured exit bound.
+        settle_timeout_s=2.0,
     )
     deadline_clock: _RoundClock | None = None
     if mode.endswith("serializer") and variant != "stop":
