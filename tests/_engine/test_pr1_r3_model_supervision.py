@@ -51,7 +51,9 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
             )
             with anyio.fail_after(10):
                 await Swarm(cfg).resume("r", force=True)
-        with anyio.move_on_after(1.0):
+        # Stop files are polled every 2 s and the hook stays blocked until `release`,
+        # so a 10 s bound still proves the run ends before the serializer returns.
+        with anyio.move_on_after(10):
             while not (  # noqa: ASYNC110 - observes a separate driver process
                 (tmp_path / "done.json").exists() if cause == "stop" else process.poll() is not None
             ):
