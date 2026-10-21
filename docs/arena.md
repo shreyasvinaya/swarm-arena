@@ -556,3 +556,7 @@ during resume repair; backend messages, notes, and causes are not exposed.
 When a revision introduces a namespace, the running board attaches it before
 agent dispatch. Live and resumed boards retain the union of all admitted revision
 namespaces. Attaching a namespace preserves reads from the published frontier.
+
+Resuming an unfinished round restores each agent's own committed learnings for
+reads, search, duplicate checks, and refinement. Peers still read the original
+round frontier, so another agent's same-round learnings stay private until closure.

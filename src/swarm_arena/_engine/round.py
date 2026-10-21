@@ -394,6 +394,7 @@ class RoundRunner:
         self.seed_parents = tuple(dict.fromkeys(seed_parents)) if converge else ()
         self.started_runs = dict(started_runs)
         self._counters: dict[str, dict[str, int]] = {}
+        self._own_learnings: dict[str, list[Learning]] = {}
 
     def _refresh_budget(self) -> None:
         if self.deps.ledger.run_exhausted():
@@ -495,7 +496,14 @@ class RoundRunner:
                 (ref.component_name(), await run_sync_daemon(ref.build, Check)) for ref in checks
             ],
             view=view,
-            own=[candidate for _, candidate in pairs],
+            own=[
+                *[candidate for _, candidate in pairs],
+                *[
+                    learning
+                    for learning in self._own_learnings.get(key, [])
+                    if learning.namespace == slot.goal_key.namespace
+                ],
+            ],
             digest=build_digest(
                 view,
                 goal=slot.goal_key,
@@ -677,7 +685,7 @@ class RoundRunner:
             await anyio.sleep_until(wake_at)
 
     async def _restore(self, round: int) -> None:
-        """Recover only the latest matching round's committed action allowance."""
+        """Recover the matching round's committed allowances and private learnings."""
         if (self.frontier is None and not self.converge) or self.deps.journal.head is None:
             return
         chain = await run_sync_daemon(read_chain, self.deps.store, self.deps.journal.head)
@@ -753,6 +761,14 @@ class RoundRunner:
                 )
             elif event.type == EventType.LEARNING:
                 counters["learnings"] = counters.get("learnings", 0) + 1
+                learning = Learning.model_validate(event.payload["learning"])
+                if (
+                    learning.run_id == self.deps.run_id
+                    and learning.goal_id == self.goal_id
+                    and learning.round == round
+                    and learning.author == key
+                ):
+                    self._own_learnings.setdefault(key, []).append(learning)
             elif event.type in {EventType.TOOL_START, EventType.RUN_LOST, EventType.TOOL_END}:
                 id = (
                     event.payload["candidate"]["id"]
