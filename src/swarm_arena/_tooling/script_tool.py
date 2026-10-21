@@ -15,7 +15,7 @@ from pydantic import (
     create_model,
 )
 
-from swarm_arena._errors import ConfigError, SoftError, _core_error, _core_signal
+from swarm_arena._errors import ConfigError, SoftError, StorageError, _core_error, _core_signal
 from swarm_arena._model.base import JsonValue
 from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
@@ -31,6 +31,8 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
+from swarm_arena._outcomes import _Outcome
+from swarm_arena._store.io import _validated_io
 from swarm_arena._tooling.paths import check_glob, check_relpath, fold_key
 from swarm_arena._tooling.result_file import tool_output_from_result
 from swarm_arena._tooling.shadowing import _can_create_python
@@ -154,7 +156,13 @@ def _read_file_sync(ctx: FileViewContext, args: ReadFileArgs) -> JsonValue:
     files = _files(ctx, args.candidate)
     if args.path not in files:
         raise _core_signal(SoftError(f"no such file: {args.path}"))
-    data = ctx._read_artifact(files[args.path])
+    try:
+        data = ctx._read_artifact(files[args.path])
+        if not isinstance(data, bytes):
+            raise TypeError("invalid artifact bytes")
+        data = memoryview(data).tobytes()
+    except BaseException as error:
+        _Outcome(capture_caller=False).contain(error, StorageError, "artifact read")
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -164,7 +172,7 @@ def _read_file_sync(ctx: FileViewContext, args: ReadFileArgs) -> JsonValue:
 
 async def _read_file(ctx: FileViewContext, args: ReadFileArgs) -> JsonValue:
     """Read artifact contents on a worker thread."""
-    return await anyio.to_thread.run_sync(_read_file_sync, ctx, args)
+    return await _validated_io(_read_file_sync, ctx, args)
 
 
 def _as_relpath(argument: str) -> str | None:

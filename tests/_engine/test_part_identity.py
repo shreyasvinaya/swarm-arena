@@ -24,7 +24,7 @@ from swarm_arena import (
     ScriptedManager,
     Swarm,
 )
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
@@ -84,6 +84,7 @@ def _anchor_probe(root: Path, patch: pytest.MonkeyPatch) -> None:
 
 
 async def part_driver(root: Path, kind: str, crash: bool) -> None:
+    """Run the part scenario with writer and judge probes scoped to this call."""
     p = _plan(teams=1, rounds=2, converge_team=True)
     if kind == "manifest":
         for file in ["a.txt", "b.txt"]:
@@ -142,6 +143,7 @@ async def part_driver(root: Path, kind: str, crash: bool) -> None:
     cfg = with_executor(
         RunConfig(
             run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
             artifact_root=str(root / "artifacts"),
             planner_catalog=PlannerCatalog(entries=entries),
         ),
@@ -158,10 +160,25 @@ async def part_driver(root: Path, kind: str, crash: bool) -> None:
         if crash and hit:
             os._exit(91)
 
-    JournalWriter._publish = commit
     with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", commit)
         _anchor_probe(root, patch)
         await Swarm(cfg, replanner=ReplacePart()).run(p, run_id="part")
+
+
+async def test_part_driver_restores_writer_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_publish = JournalWriter._publish
+
+    async def fail(self: Swarm, plan: Plan, *, run_id: str) -> None:
+        assert JournalWriter._publish is not original_publish
+        raise RuntimeError("driver failed")
+
+    monkeypatch.setattr(Swarm, "run", fail)
+    with pytest.raises(RuntimeError, match="driver failed"):
+        await part_driver(tmp_path, "inputs", False)
+    assert JournalWriter._publish is original_publish
 
 
 @pytest.mark.parametrize("kind", ["inputs", "manifest"])
@@ -204,9 +221,11 @@ async def test_current_part_identity_controls_join_and_board(
     store = LocalStore(Path(cfg.run_root) / "part")
     committed = read_committed(store)
     assert committed
-    board = RunBoard.from_state(state, run_root=cfg.run_root, head=lambda: committed[0].head)
+    board = ArenaBoard(arena_root=cfg.arena_root, cache_dir=str(tmp_path / "cache"))
+    board.open("part", cfg.run_root, ["n"])
     key = state.plans["g"][-1][0].parts[0].goal.key()
     view = board.snapshot(key, board.frontier())
     assert [c.id for c in view.best(key, 5, judge="y")] == [new.id]
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(KeyError):
         view.get_candidate(old.id)
+    board.close()

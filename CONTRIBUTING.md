@@ -69,3 +69,20 @@ directly.
 - The subject line is in the imperative mood (for example "add the store").
 - The body says what changed and why.
 - No AI co-author lines and no "generated with" text in commits or pull request descriptions.
+
+
+## Arena implementation notes
+
+Board preparation, curation reads, and page storage use abandonable daemon workers
+under the owning run's supervision. Normalize connector-returned data inside the
+worker before the loop consumes it. An abandoned wait must never start a later
+publication. Shared outcome containment retains caller cancellation and registered
+core controls; untrusted failures are reconstructed with type-only diagnostics.
+
+Round-page rendering produces the Markdown body. `ViewWriter` adds one source-head
+comment. Live closure probes only the newly closed round; resume checks every
+closed round for a missing page. Page creation is conditional and preserves any
+existing bytes.
+
+Score batch IDs include the barrier or final phase and their durable recovery key.
+This keeps ordinary and final judging of the same candidate distinct during replay.

@@ -1,0 +1,410 @@
+"""Read committed arena generations and perform offline human operations."""
+
+import argparse
+import getpass
+import sys
+from collections.abc import Callable
+from functools import partial
+from pathlib import Path
+from threading import Thread
+
+import anyio
+
+from swarm_arena._board.arena import ArenaBoard
+from swarm_arena._board.base import Board
+from swarm_arena._board.cache import LearningFilter
+from swarm_arena._board.human_objects import _validate_reviewer
+from swarm_arena._board.human_ops import _apply_human_operation
+from swarm_arena._board.ingest import run_store
+from swarm_arena._board.leaderboard import format_value
+from swarm_arena._board.pointers import RunPointer, _validate_namespace, _validate_run_id
+from swarm_arena._board.reindex import _reindex_with_diagnostics
+from swarm_arena._board.serve import make_server
+from swarm_arena._board.trace import trace
+from swarm_arena._errors import _core_error
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.reader import read_committed
+from swarm_arena._journal.replay import RunState
+from swarm_arena._model.plan import Plan
+from swarm_arena._model.run_config import RunConfig
+from swarm_arena._scoring.human_review import HumanReview
+from swarm_arena._store.base import open_store
+
+
+def _non_negative_integer(option: str) -> Callable[[str], int]:
+    """Convert numeric options without argparse's value-bearing int diagnostics."""
+
+    def convert(value: str) -> int:
+        try:
+            number = int(value)
+            if number >= 0:
+                return number
+        except ValueError:
+            pass
+        raise argparse.ArgumentTypeError(f"{option} must be a non-negative integer") from None
+
+    return convert
+
+
+def register(sub: argparse._SubParsersAction) -> None:
+    """
+    Register offline arena commands with a root parser.
+
+    Parameters
+    ----------
+    sub : argparse._SubParsersAction
+        Subparser collection to extend with synchronous command handlers.
+
+    Examples
+    --------
+    >>> parser = argparse.ArgumentParser()
+    >>> register(parser.add_subparsers())
+    >>> parser.parse_args(['leaderboard', 'toy']).target
+    'toy'
+    """
+    review = sub.add_parser("review", help="export or import human reviews")
+    actions = review.add_subparsers(dest="action", required=True)
+    export = actions.add_parser("export")
+    export.add_argument("run")
+    export.add_argument("--goal")
+    export.add_argument("--top", type=_non_negative_integer("--top"), default=20)
+    export.add_argument("--out", type=Path)
+    imported = actions.add_parser("import")
+    imported.add_argument("run")
+    imported.add_argument("csv", type=Path)
+    imported.add_argument("--reviewer", help="reviewer slug (default: valid login name)")
+    leaderboard = sub.add_parser("leaderboard", help="rank a run or namespace")
+    leaderboard.add_argument("target")
+    leaderboard.add_argument("--goal")
+    leaderboard.add_argument("--by")
+    board = sub.add_parser("board", help="search learnings or inspect evidence")
+    actions = board.add_subparsers(dest="action", required=True)
+    search = actions.add_parser("search")
+    search.add_argument("query")
+    search.add_argument("--goal")
+    search.add_argument("--tag", action="append", default=[])
+    for flag in ("verified", "human", "pinned", "hidden"):
+        search.add_argument(f"--{flag}", action="store_true")
+    search.add_argument("--limit", type=_non_negative_integer("--limit"), default=10)
+    serve = actions.add_parser("serve", help="serve the local board viewer")
+    serve.add_argument("target")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=_non_negative_integer("--port"), default=8765)
+    serve.add_argument("--author")
+    show = actions.add_parser("show")
+    show.add_argument("id")
+    learnings = sub.add_parser("learnings", help="add, pin or hide a learning")
+    actions = learnings.add_subparsers(dest="action", required=True)
+    pin = actions.add_parser("pin")
+    hide = actions.add_parser("hide")
+    for command in (pin, hide):
+        command.add_argument("id")
+    add = actions.add_parser("add")
+    add.add_argument("--title", required=True)
+    add.add_argument("--text", required=True)
+    add.add_argument("--goal")
+    add.add_argument("--tag", action="append", default=[])
+    add.add_argument("--evidence", nargs="+", action="extend", default=[])
+    for command in (pin, hide, add):
+        command.add_argument("--namespace", required=True)
+        command.add_argument("--author", default=None)
+    traced = sub.add_parser("trace", help="show a candidate's provenance")
+    traced.add_argument("id")
+    for command in (search, show, traced):
+        scope = command.add_mutually_exclusive_group(required=True)
+        scope.add_argument("--namespace")
+        scope.add_argument("--run")
+    reindex = sub.add_parser("reindex", help="rebuild disposable arena caches")
+    reindex.add_argument("--namespace", action="append", default=[])
+    for command in (
+        export,
+        imported,
+        leaderboard,
+        search,
+        show,
+        serve,
+        pin,
+        hide,
+        add,
+        traced,
+        reindex,
+    ):
+        command.add_argument("--config", type=Path, default=Path("run.toml"))
+        command.set_defaults(handler=_handle)
+
+
+def _handle(args: argparse.Namespace) -> int:
+    """Enter the asyncio boundary without changing root interrupt handling."""
+    try:
+        anyio.run(_execute, args, backend="asyncio")
+    except KeyboardInterrupt:
+        if args.command != "board" or args.action != "serve":
+            raise
+    return 0
+
+
+def _make_board(config: RunConfig) -> ArenaBoard:
+    """Build only the configured board, preserving optional import isolation."""
+    board = (
+        config.board.build(Board)
+        if config.board is not None
+        else ArenaBoard(arena_root=config.arena_root)
+    )
+    if not isinstance(board, ArenaBoard):
+        raise _core_error(ValueError, "arena commands need ArenaBoard")
+    return board
+
+
+def _run_plans(config: RunConfig, run_id: str) -> list[Plan]:
+    """Derive namespaces from a single authority-selected chain, never listings."""
+    _validate_run_id(run_id)
+    committed = read_committed(run_store(config.run_root, run_id))
+    if committed is None or not committed[1]:
+        raise _core_error(ValueError, f"run {run_id} has no committed events")
+    state = RunState.from_events(committed[1])
+    return [plan for revisions in state.plans.values() for plan, _ in revisions]
+
+
+def _plan_namespaces(plans: list[Plan]) -> list[str]:
+    """Include cross-namespace parts of every admitted revision."""
+    return sorted(
+        {
+            key.namespace
+            for plan in plans
+            for key in [plan.goal, *(part.goal for part in plan.parts)]
+        }
+    )
+
+
+def _import_reviewer(reviewer: str | None) -> str:
+    """Use an explicit identity or require a valid login-derived reviewer slug."""
+    if reviewer is not None:
+        return reviewer
+    try:
+        return _validate_reviewer(getpass.getuser())
+    except (ValueError, OSError, KeyError):
+        raise _core_error(
+            ValueError, "login name is not a valid reviewer slug; pass --reviewer"
+        ) from None
+
+
+def _resolve_target(
+    config: RunConfig, board: ArenaBoard, target: str
+) -> tuple[str | None, str | None, RunConfig]:
+    """Prefer an existing run directory or arena pointer to a namespace label."""
+    _validate_run_id(target)
+    if run_store(config.run_root, target).exists("control/owner.json"):
+        return target, None, config
+    arena = open_store(board.config.arena_root)
+    for key in arena.list(""):
+        parts = key.split("/")
+        if len(parts) == 3 and parts[1:] == ["runs", target + ".json"]:
+            try:
+                pointer = RunPointer.model_validate_json(arena.read(key).data)
+                if pointer.run_id == target:
+                    return target, None, config.model_copy(update={"run_root": pointer.run_root})
+            except (ValueError, OSError):
+                continue
+    return None, _validate_namespace(target), config
+
+
+async def _execute(args: argparse.Namespace) -> None:
+    """Keep every board lifetime bounded and publish before the first read."""
+    config = await run_sync_daemon(RunConfig.load, args.config)
+    board = await run_sync_daemon(_make_board, config)
+    try:
+        if args.command == "review":
+            if args.action == "export":
+                out = await HumanReview.export(
+                    args.run,
+                    config=config,
+                    out_dir=args.out or Path(f"review-{args.run}"),
+                    top=args.top,
+                    goal=args.goal,
+                )
+                print(out)
+            else:
+                review = HumanReview(_import_reviewer(args.reviewer))
+                scores = await review.import_csv(args.run, args.csv, config=config)
+                print(f"imported {len(scores)} scores as {review.judge_name}")
+            return
+        if args.command == "reindex":
+            arena_root, cache_dir = await run_sync_daemon(board._cache_settings)
+            effective = config.model_copy(update={"arena_root": arena_root})
+            rebuilt = await run_sync_daemon(
+                partial(
+                    _reindex_with_diagnostics,
+                    effective,
+                    args.namespace,
+                    cache_dir=cache_dir,
+                )
+            )
+            for ns, count in rebuilt.run_counts.items():
+                print(f"{ns}: {count} runs")
+            for warning in rebuilt.warnings:
+                print(warning, file=sys.stderr)
+            return
+        run_id = getattr(args, "run", None)
+        namespace = getattr(args, "namespace", None)
+        if args.command == "leaderboard" or (args.command == "board" and args.action == "serve"):
+            run_id, namespace, config = await run_sync_daemon(
+                _resolve_target, config, board, args.target
+            )
+        names = (
+            _plan_namespaces(await run_sync_daemon(_run_plans, config, run_id))
+            if run_id
+            else [_validate_namespace(namespace or "")]
+        )
+        await run_sync_daemon(board.open, "", "", names)
+        await run_sync_daemon(board.frontier)
+        # A main view also needs its declared parts' namespace readers.
+        with board._read_namespace() as reader:
+            expanded = sorted(set(names) | set(reader.plan_namespaces()))
+        if expanded != names:
+            await run_sync_daemon(board.open, "", "", expanded)
+            await run_sync_daemon(board.frontier)
+        if args.command == "board" and args.action == "serve":
+            await _serve(board, args, names, run_id, config.settle_timeout_s)
+        elif args.command == "leaderboard":
+            _leaderboard(board, args, run_id, namespace)
+        elif args.command == "learnings":
+            operation = await _apply_human_operation(
+                board,
+                args.namespace,
+                args.action,
+                author=args.author or getpass.getuser(),
+                learning_id=getattr(args, "id", None),
+                title=getattr(args, "title", ""),
+                text=getattr(args, "text", ""),
+                goal_id=getattr(args, "goal", None) or "",
+                tags=getattr(args, "tag", ()),
+                evidence=getattr(args, "evidence", ()),
+            )
+            if operation.learning is not None:
+                print(operation.learning.id)
+        elif args.command == "trace":
+            print("\n".join(trace(board, args.id)))
+        elif args.action == "search":
+            _search(board, args, names)
+        else:
+            _show(board, args.id)
+        for warning in (await run_sync_daemon(board._diagnostics))[1]:
+            print(warning, file=sys.stderr)
+    finally:
+        with anyio.move_on_after(config.settle_timeout_s, shield=True):
+            await run_sync_daemon(board.close)
+
+
+def _leaderboard(
+    board: ArenaBoard, args: argparse.Namespace, run_id: str | None, namespace: str | None
+) -> None:
+    """Rank current producing identities using each owning group's recorded judge."""
+    with board._read_namespace() as reader:
+        groups, judges = reader.leaderboards(
+            run_id=run_id, namespace=namespace, goal=args.goal, judge=args.by
+        )
+        for group_ns, goal_id, part, rows in groups:
+            row = rows[0]
+            suffix = f"/{part}" if part is not None else ""
+            print(
+                f"== {group_ns}/{goal_id}{suffix} ({row.judge}, "
+                f"rubric {row.rubric_hash[:8]}, panel {row.panel_hash[:8] or '-'}) =="
+            )
+            for row in rows:
+                print(
+                    f"{row.rank}\t{row.candidate_id}\t{row.run_id}\t{row.team}/{row.agent}"
+                    f"\t{format_value(row.value)}\t{','.join(row.built_on) or '-'}"
+                )
+        if not groups:
+            for judge in sorted(judges or {args.by or "ranking judge"}):
+                print(f"no scores for {judge}")
+
+
+def _search(board: ArenaBoard, args: argparse.Namespace, namespaces: list[str]) -> None:
+    """Apply search predicates and limit in the cache before hydrating rows."""
+    remaining = args.limit
+    if remaining < 0:
+        raise _core_error(ValueError, "limit must be nonnegative")
+    with board._read_namespace() as reader:
+        found = reader.search_markers(
+            namespaces,
+            query=args.query or None,
+            limit=remaining,
+            filters=LearningFilter(
+                goal_id=args.goal,
+                tags=args.tag,
+                verified=args.verified or None,
+                human=args.human or None,
+                pinned=args.pinned or None,
+                hidden=args.hidden,
+            ),
+        )
+        for item, superseded in found:
+            markers = [
+                name
+                for name, enabled in (
+                    ("verified", item.verified),
+                    ("human", item.from_human),
+                    ("pinned", item.pinned),
+                    ("hidden", item.hidden),
+                    ("superseded", superseded),
+                )
+                if enabled
+            ]
+            print(f"{item.id}\t{item.title}\t{item.author}\t{','.join(markers)}")
+
+
+def _show(board: ArenaBoard, identifier: str) -> None:
+    """Render candidate metadata or complete learning evidence with score errors."""
+    if identifier.startswith("c-"):
+        candidate = board.get_candidate(identifier)
+        print(f"request: {candidate.request.model_dump_json()}")
+        print(f"status: {candidate.output.status.value}")
+        print(f"checks: {[check.model_dump(mode='json') for check in candidate.checks]}")
+        print(f"scores: {[score.model_dump(mode='json') for score in board.scores(identifier)]}")
+        print(f"parents: {','.join(candidate.parent_ids) or '-'}")
+        paths = sorted(
+            set(candidate.request.edits) | {item.path for item in candidate.output.files}
+        )
+        print(f"files: {','.join(paths) or '-'}")
+    else:
+        item = board.get_learning(identifier)
+        print(f"{item.id}: {item.title}\n{item.text}\nevidence:")
+        for candidate_id in item.evidence:
+            try:
+                scores = board.scores(candidate_id)
+                values = ", ".join(f"{score.judge}={format_value(score.value)}" for score in scores)
+                print(f"{candidate_id}: {values or '-'}")
+            except (KeyError, ValueError):
+                print(f"{candidate_id}: error: unknown candidate")
+
+
+async def _serve(
+    board: ArenaBoard,
+    args: argparse.Namespace,
+    namespaces: list[str],
+    run_id: str | None,
+    settle_timeout_s: float,
+) -> None:
+    """Own the HTTP listener and stop its accept loop before closing the board."""
+    server = make_server(
+        board,
+        namespaces,
+        author=args.author or getpass.getuser(),
+        host=args.host,
+        port=args.port,
+        run_id=run_id,
+    )
+    thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    try:
+        thread.start()
+        print(f"Serving http://{args.host}:{server.server_port}/", flush=True)
+        await run_sync_daemon(thread.join)
+    finally:
+        try:
+            with anyio.move_on_after(settle_timeout_s, shield=True):
+                if thread.ident is not None:
+                    await run_sync_daemon(server.shutdown)
+                    await run_sync_daemon(thread.join, settle_timeout_s)
+        finally:
+            server.server_close()

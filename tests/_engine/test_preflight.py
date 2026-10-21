@@ -23,7 +23,9 @@ from swarm_arena import (
     RunConfig,
     TeamSpec,
 )
-from swarm_arena._engine.preflight import run_preflight
+from swarm_arena._engine import preflight
+from swarm_arena._engine.preflight import check_storage, run_preflight
+from swarm_arena._errors import ConditionalWritesUnsupported, _core_error
 from swarm_arena._exec.executor import Executor
 
 
@@ -158,45 +160,77 @@ async def test_hook_and_constructor_errors_are_type_only(monkeypatch: pytest.Mon
 
 async def test_hung_hook_is_abandonable_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    completed = anyio.Event()
+    scope = anyio.CancelScope()
 
     def block(self: object) -> None:
-        assert threading.current_thread().daemon
+        workers.append(threading.current_thread())
+        assert workers[-1].daemon
         entered.set()
-        release.wait(10)
+        assert release.wait(15), "preflight release deadline"
+
+    async def preflight() -> None:
+        with scope:
+            await run_preflight([_plan()], RunConfig(), _executor())
+        completed.set()
 
     monkeypatch.setattr(CountingTool, "preflight", block)
     try:
-        with anyio.move_on_after(0.2) as scope:
-            await run_preflight([_plan()], RunConfig(), _executor())
-        assert entered.is_set()
-        assert scope.cancel_called
+        async with anyio.create_task_group() as group:
+            group.start_soon(preflight)
+            with anyio.fail_after(10):
+                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            scope.cancel()
+            with anyio.fail_after(2):
+                await completed.wait()
+            assert workers[0].is_alive()
+            assert not release.is_set()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 async def test_cancelled_hook_does_not_continue_to_later_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release, finished = threading.Event(), threading.Event()
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    completed = anyio.Event()
+    scope = anyio.CancelScope()
     called: list[str] = []
 
     def block(self: object) -> None:
-        release.wait(10)
-        finished.set()
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(15), "preflight release deadline"
 
     def later(self: object) -> None:
         called.append("executor")
 
+    async def preflight() -> None:
+        with scope:
+            await run_preflight([_plan()], RunConfig(), _executor())
+        completed.set()
+
     monkeypatch.setattr(CountingTool, "preflight", block)
     monkeypatch.setattr(RecordingExecutor, "preflight", later)
     try:
-        with anyio.move_on_after(0.1) as scope:
-            await run_preflight([_plan()], RunConfig(), _executor())
-        assert scope.cancel_called
+        async with anyio.create_task_group() as group:
+            group.start_soon(preflight)
+            with anyio.fail_after(10):
+                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            scope.cancel()
+            with anyio.fail_after(2):
+                await completed.wait()
     finally:
         release.set()
-    assert await anyio.to_thread.run_sync(finished.wait, 1)
-    await anyio.sleep(0.02)
+        # Join the abandoned worker before checking that it cannot dispatch the next hook.
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
     assert called == []
 
 
@@ -222,14 +256,76 @@ async def test_part_overrides_and_executor_failures_are_collected(
 
 
 async def test_shared_preflight_has_its_own_hook_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
 
     def block(self: object) -> None:
-        release.wait()
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(10), "preflight release deadline"
 
     monkeypatch.setattr(CountingTool, "preflight", block)
     try:
-        with pytest.raises(RuntimeError, match="CountingTool: TimeoutError"):
-            await run_preflight([_plan()], RunConfig(settle_timeout_s=0.02), _executor())
+        with anyio.fail_after(3):
+            with pytest.raises(RuntimeError, match="CountingTool: TimeoutError"):
+                await run_preflight([_plan()], RunConfig(settle_timeout_s=1), _executor())
+        assert entered.is_set()
+        assert workers[0].is_alive()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+
+
+class RecordingStore:
+    def __init__(self, url: str, probed: list[str], *, fail: bool = False) -> None:
+        self.url, self.probed, self.fail = url, probed, fail
+
+    def probe_conditional_writes(self) -> None:
+        self.probed.append(self.url)
+        if self.fail:
+            raise ConditionalWritesUnsupported("create did not behave conditionally")
+
+
+def test_local_run_root_with_s3_arena_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_open(url: str) -> None:
+        pytest.fail("invalid root combination reached storage")
+
+    monkeypatch.setattr(preflight, "open_store", no_open)
+    with pytest.raises(ValueError, match="run_root"):
+        check_storage(RunConfig(run_root="./runs", arena_root="s3://b/arena"))
+
+
+def test_probe_runs_once_per_distinct_s3_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    probed: list[str] = []
+    monkeypatch.setattr(preflight, "open_store", lambda url: RecordingStore(url, probed))
+    check_storage(RunConfig(run_root="s3://b/x", arena_root="s3://b/x", artifact_root="s3://b/x"))
+    assert probed == ["s3://b/x"]
+    probed.clear()
+    check_storage(RunConfig())
+    assert probed == []
+    check_storage(RunConfig(run_root="s3://b/r", arena_root="s3://b/a", artifact_root="s3://b/f"))
+    assert probed == ["s3://b/r", "s3://b/a", "s3://b/f"]
+
+
+def test_probe_failure_stops_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    probed: list[str] = []
+    monkeypatch.setattr(preflight, "open_store", lambda url: RecordingStore(url, probed, fail=True))
+    with pytest.raises(ConditionalWritesUnsupported):
+        check_storage(RunConfig(run_root="s3://b/r", arena_root="s3://b/a"))
+    assert probed == ["s3://b/r"]
+
+
+async def test_storage_checked_first_in_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop_thread = threading.get_ident()
+    CountingTool.calls = 0
+
+    def fail(config: RunConfig) -> None:
+        assert threading.get_ident() != loop_thread
+        raise _core_error(ConditionalWritesUnsupported, "storage unavailable")
+
+    monkeypatch.setattr(preflight, "check_storage", fail)
+    with pytest.raises(ConditionalWritesUnsupported):
+        await run_preflight([_plan()], RunConfig(), _executor())
+    assert CountingTool.calls == 0

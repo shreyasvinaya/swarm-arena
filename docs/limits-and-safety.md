@@ -223,6 +223,14 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+Backend journal reads are contained and their bytes detached before chain or replay
+validation. Backend diagnostics and backend cancellation cannot impersonate core
+validation or caller cancellation.
+
+An invalid or missing committed journal segment raises `ChainError`, preserving
+the safe diagnostic that identifies the segment. Invalid replay payloads,
+missing committed state, incompatible agent limits, and decreased budget caps
+raise `ValueError` (or its `PlanError` subclass). These checks run before takeover.
 Normally the previous lease must be released or expired. `--force` explicitly
 permits a live takeover, records it, and fences the old owner by a conditional
 ownership write; it does not refund already committed work. Resume restores
@@ -266,7 +274,12 @@ Local logs retain their last 8 MiB each; declared outputs default to 256 MiB
 total and at most 4,096 files. Command preparation is abandonable: cancellation
 releases its slot and ignores late results, but cannot forcibly stop Python
 preparation code. Its workspace is retained with a warning for safe manual
-cleanup. Collection runs once and has a 30 s bound. See the
+cleanup. Collection runs once and has a 30 s bound. Output files and logs upload
+one object at a time through the supervised storage boundary. Cancelling an
+upload abandons its wait and prevents later uploads. Cancellation during the
+process or collection also skips artifact uploads: the partial result keeps
+collected data but drops file and log references. Process termination and
+bounded collection still finish before data-only partial delivery. See the
 [executor details](api/executor.md#localexecutor) before cleaning retained workspaces.
 
 Direct `LocalExecutor` preparation preserves the exception object raised by a
@@ -325,3 +338,55 @@ Non-string identifiers raise `TypeError` naming only the parameter and required
 type, without formatting the supplied value. Optional identifiers still accept
 `None` where documented. For example, `ctx.judge_error("c1", "invalid result")`
 records the same first-error diagnostic as before.
+
+
+## Lease-owned storage
+
+The driver awaits storage in abandonable daemon workers under its existing
+stop, remaining run time and ownership supervision. Shutdown uses the configured
+settlement allowance. Backend exceptions become value-free core errors;
+trusted chain and replay validation keeps its own diagnostics. Returned blob
+bytes and version identifiers are detached before the owner uses them.
+
+Journal publication waits end at the last confirmed lease expiry.
+Owner updates run against a private lease copy; only a timely result can update
+the writer's live document and committed head. An abandoned storage request may
+still finish remotely, but its return cannot trigger another driver operation.
+Live edits and log files use a separate awaited boundary per object.
+Synchronous published `BoardView` reads and owner-loop `Board.put_*` calls
+retain their in-memory contracts.
+
+A stop during the first journal publication settles that admitted batch within
+the cleanup allowance before deciding whether the run started. If `run_started`
+is committed, queued goals receive their stopped result and CLI summary; resume
+skips those finished goals.
+
+A run deadline closes queued goals as stopped, but it does not create a
+`stop_requested` event. The status stop field records explicit `stop` and
+`stop --now` commands only.
+
+Startup-stop and driver-stop cleanup share the same bounded failure contract:
+if their settlement allowance expires, they raise the value-free core error
+`stop cleanup timed out`. Normal export failures retain their original public
+exception shape while stop and deadline watchers remain active.
+The same cleanup error applies when a journal storage wait exhausts settlement
+while its confirmed lease remains valid. Confirmed lease expiry or takeover
+still raises `Fenced`. Either failure disables subsequent publication; late
+storage results cannot update the writer's state or start another operation.
+After settlement exhaustion, a writer whose confirmed lease remains valid
+attempts one bounded release so a new owner can resume immediately. A blocked
+or unsuccessful release does not extend cleanup indefinitely or reopen publication.
+This release attempt has its own `settle_timeout_s` allowance, capped by the
+remaining confirmed lease. Closing the writer can therefore take up to about
+2 × `settle_timeout_s`: one allowance for the original wait and another for release.
+
+A driver stop or deadline also bounds an in-progress journal storage primitive,
+including its retries, by the settlement allowance. Healthy graceful-stop work
+may continue: the bound applies to each storage wait, rather than expiring the
+writer after a fixed duration. Goal refresh and view storage use the same
+settlement bound for graceful stop as for immediate stop and deadline.
+
+A post-stop final-selection recovery read can exhaust its storage settlement
+allowance. That failure propagates as a core storage-settlement error; it does
+not publish judge errors or a terminal provider-failure result. Resume can
+continue the unfinished goal from the committed journal.

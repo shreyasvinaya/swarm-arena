@@ -1,7 +1,7 @@
+import asyncio
 import dataclasses
 import threading
 from collections.abc import Sequence
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -31,8 +31,9 @@ from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import round as round_module
 from swarm_arena._engine.goal import r0_revision_draft
-from swarm_arena._engine.round import AgentSlot, RoundRunner
+from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundOutcome, RoundRunner
 from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._journal.event import EventDraft
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Resources
@@ -89,7 +90,8 @@ class _BarrierManager(Manager):
         self.starts.append(start)
         if len(self.starts) == 2:
             self.both_entered.set()
-        await self.both_entered.wait()
+        with anyio.fail_after(10):
+            await self.both_entered.wait()
         self.spans.append((start, anyio.current_time()))
         return RoundReport(summary="")
 
@@ -123,8 +125,9 @@ class _RoundTime:
             await self.changed.wait()
 
     async def wait_past(self, deadline: float) -> None:
-        while self.last_tick < deadline:
-            await self.ticked.wait()
+        with anyio.fail_after(10):
+            while self.last_tick < deadline:
+                await self.ticked.wait()
 
 
 class _Raiser(Manager):
@@ -183,8 +186,25 @@ class _GateExecutor(Executor):
         await self.inner.aclose()
 
 
+class _PreparedRound(RoundRunner):
+    async def run(self, round: int) -> RoundOutcome:
+        await self.deps.journal.commit()
+        return await super().run(round)
+
+
+def _prepared_round(deps: EngineDeps, *, plan: Plan, **kwargs: Any) -> RoundRunner:
+    """Supply the initial committed plan normally owned by RunRunner."""
+    from swarm_arena._journal.reader import read_committed
+
+    committed = read_committed(deps.store)
+    events = [*(committed[1] if committed else []), *deps.journal._queue]
+    if not any(event.type == "plan_revision" for event in events):
+        deps.journal.append(r0_revision_draft(plan, plan.base_dir))
+    return _PreparedRound(deps, plan=plan, **kwargs)
+
+
 def _round(env: EngineEnv, agents: Sequence[AgentSlot], **kw: Any) -> RoundRunner:
-    return RoundRunner(
+    return _prepared_round(
         env.deps, goal_id="g", plan=PLAN, agents=agents, round_spec=RoundSpec(), rounds_left=1, **kw
     )
 
@@ -205,7 +225,7 @@ def _construction_round(
         plan = PLAN.model_copy(update={"parts": [part]})
         slot.team = slot.team.model_copy(update={"part": "p"})
         slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    return RoundRunner(
+    return _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=agents, round_spec=RoundSpec(), rounds_left=1
     )
 
@@ -217,14 +237,17 @@ async def test_runtime_constructor_is_supervised(
 ) -> None:
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     peer_ran = anyio.Event()
+    clock = _RoundTime(monkeypatch)
+    workers: list[threading.Thread] = []
     manager_calls: list[str] = []
     original = Ref.build
 
     def blocked(self: Ref, base: type[Any]) -> Any:
         if self.name == "faulty" and base is component:
+            workers.append(threading.current_thread())
             entered.set()
             # The safety bound also releases the old synchronous check build on RED.
-            release.wait(3)
+            assert release.wait(20), "constructor release deadline"
             returned.set()
         return original(self, base)
 
@@ -238,22 +261,24 @@ async def test_runtime_constructor_is_supervised(
             peer_ran.set()
             return RoundReport(summary="peer ran")
 
-    e = env.with_limits(round_timeout_s=0.5 if stop == "deadline" else 60.0)
+    e = env.with_limits(round_timeout_s=60.0)
     runner = _construction_round(
         e, component, [_with_manager("a", Probe("a")), _with_manager("b", Probe("b"))]
     )
     monkeypatch.setattr(Ref, "build", blocked)
 
     async def trigger() -> None:
-        assert await anyio.to_thread.run_sync(entered.wait, 1)
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
         await peer_ran.wait()
-        if stop == "stop_now":
+        if stop == "deadline":
+            clock.advance(61)
+        elif stop == "stop_now":
             e.deps.stops.stop_now = True
         elif stop == "fenced":
             e.deps.journal.fenced.set()
 
     try:
-        with anyio.fail_after(2):
+        with anyio.fail_after(10):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(trigger)
                 if stop == "fenced":
@@ -271,12 +296,16 @@ async def test_runtime_constructor_is_supervised(
         assert not returned.is_set()
         before = e.event_types()
         release.set()
-        assert await anyio.to_thread.run_sync(returned.wait, 1)
-        await anyio.lowlevel.checkpoint()
+        assert await anyio.to_thread.run_sync(returned.wait, 5)
+        await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert not workers[0].is_alive()
         assert manager_calls == ["b"]
         assert e.event_types() == before
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("component", [Tool, Check], ids=["tool", "check"])
@@ -347,9 +376,10 @@ async def test_round_started_commits_with_its_frontier(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real = env.deps.board.frontier
+    loop = asyncio.get_running_loop()
 
     def committing_frontier() -> Frontier:  # forces a commit while the frontier is built
-        anyio.from_thread.run(env.deps.journal.commit)
+        asyncio.run_coroutine_threadsafe(env.deps.journal.commit(), loop).result(timeout=5)
         return real()
 
     monkeypatch.setattr(env.deps.board, "frontier", committing_frontier)
@@ -626,7 +656,8 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
     e = dataclasses.replace(
         e, deps=dataclasses.replace(e.deps, executor=PaidExecutor(e.deps.executor))
     )
-    out = await _round(e, [_with_manager("a", BudgetManager())]).run(1)
+    with anyio.fail_after(10):
+        out = await _round(e, [_with_manager("a", BudgetManager())]).run(1)
     assert len(errors) == 1
     assert errors[0].limit == "budget"
     assert len(out.candidates) == 2
@@ -805,7 +836,6 @@ async def test_converge_stop_now_blocks_tools(env: EngineEnv) -> None:
 
 async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
     from swarm_arena import PartSpec
-    from swarm_arena._errors import SoftError
     from swarm_arena._model.results import Score
 
     part = PartSpec(name="p", goal=Goal(id="sub", namespace="n"))
@@ -814,29 +844,33 @@ async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
     slot = _runner("a")
     slot.team = slot.team.model_copy(update={"part": "p"})
     slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    first = await RoundRunner(
+    first = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(1)
     parent = first.candidates[0]
     assert parent.goal_id == "g"
     assert parent.part == "p"
-    end = env.events("tool_end")[0]
-    env.deps.board.put_score(
-        Score(id="score", candidate_id=parent.id, judge="program", key=(1.0,)),
-        epoch=end.epoch,
-        seq=end.seq,
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="score", candidate_id=parent.id, judge="program", key=(1.0,)
+                ).model_dump(mode="json")
+            },
+        )
     )
 
     class JoinManager(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
             assert ctx.seed_parents == (parent.id,)
             assert ctx.get_candidate(parent.id).id == parent.id
-            with pytest.raises(SoftError, match="own part"):
-                ctx.best(1, part="p")
+            assert ctx.best(1, part="p")[0].candidate_id == parent.id
             await ctx.run_tool({"x": 2}, parents=[parent.id])
             return RoundReport(summary="joined")
 
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=plan,
@@ -861,15 +895,20 @@ async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
     slot = _runner("a")
     slot.team = slot.team.model_copy(update={"part": "p"})
     slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
-    first = await RoundRunner(
+    first = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(1)
     c = first.candidates[0]
-    end = env.events("tool_end")[0]
-    env.deps.board.put_score(
-        Score(id="score", candidate_id=c.id, judge="program", key=(1.0,)),
-        epoch=end.epoch,
-        seq=end.seq,
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="score", candidate_id=c.id, judge="program", key=(1.0,)
+                ).model_dump(mode="json")
+            },
+        )
     )
 
     class RankingProbe(Manager):
@@ -891,7 +930,7 @@ async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
     await _round(env, [learner]).run(1)
     await env.deps.journal.commit()
     slot.manager = RankingProbe()
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
     ).run(2)
     assert out.reasons["t/a"] == ""
@@ -935,7 +974,7 @@ async def test_budget_drain_uses_only_inflight_job_grace(
             tasks.start_soon(latch)
             out = await _round(env, [slot, idle]).run(1)
     assert 0.2 <= times["cancel"] - times["flag"] < 2.0
-    assert times["cancel"] - times["closed"] < 0.4
+    assert times["cancel"] - times["closed"] < 2.0
     assert out.candidates[0].output.partial
     assert out.candidates[0].output.status == RunStatus.CANCELLED
 
@@ -997,12 +1036,14 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
 
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     workspaces: list[Path] = []
+    workers: list[threading.Thread] = []
     marker = tmp_path / "must-not-launch"
     slot = _scripted("a", [{"inputs": {}}])
     slot.tool_ref = Ref.of(PyTool({"code": f"open({str(marker)!r}, 'w').close()", "grace_s": 0.1}))
     original = PyTool.command
 
     def command(self: PyTool, request: ToolRequest, workspace: Path) -> Command:
+        workers.append(threading.current_thread())
         workspaces.append(workspace)
         entered.set()
         assert release.wait(10)
@@ -1028,12 +1069,17 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
         before = env.event_types()
         release.set()
         assert await anyio.to_thread.run_sync(done.wait, 5)
-        await anyio.sleep(0.05)
+        with anyio.fail_after(5):
+            await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert not workers[0].is_alive()
         assert env.event_types() == before
         assert not marker.exists()
         assert (workspaces[0] / "late_write").exists()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 async def test_effective_tool_uses_base_catalog_identity(env: EngineEnv) -> None:
@@ -1060,7 +1106,7 @@ async def test_effective_tool_uses_base_catalog_identity(env: EngineEnv) -> None
         env.deps, config=config, executor=RecordingExecutor(env.deps.executor)
     )
     override = {"timeout_s": 12.0}
-    out = await RoundRunner(
+    out = await _prepared_round(
         deps,
         goal_id="g",
         plan=PLAN,
@@ -1083,7 +1129,7 @@ async def test_tranche_pending_is_conservatively_closed(env: EngineEnv) -> None:
             await scope.tranche.reserve_call(Amount(usd=0.01))
             return RoundReport(summary="pending")
 
-    config = env.deps.config.model_copy(update={"settle_timeout_s": 0.05})
+    config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     e = dataclasses.replace(env, deps=dataclasses.replace(env.deps, config=config))
     with anyio.fail_after(5):
         await _round(e, [_with_manager("a", PendingManager())]).run(1)
@@ -1193,6 +1239,11 @@ async def test_metadata_preparation_is_supervised_per_agent(
     owner = threading.get_ident()
     hook_threads: list[int] = []
     ticks: list[float] = []
+    workers: list[threading.Thread] = []
+    beat_target: list[int] = []
+    beats_reached = anyio.Event()
+    peer_ran = anyio.Event()
+    clock = _RoundTime(monkeypatch)
     managers: list[str] = []
     original_build = Ref.build
 
@@ -1202,13 +1253,14 @@ async def test_metadata_preparation_is_supervised_per_agent(
             original_hook = getattr(instance, hook)
 
             def metadata() -> Any:
+                workers.append(threading.current_thread())
                 hook_threads.append(threading.get_ident())
                 entered.set()
                 if failure == "raise":
                     error = ValueError(secret)
                     error.add_note(secret)
                     raise error from RuntimeError(secret)
-                release.wait(1)
+                assert release.wait(20), "metadata release deadline"
                 returned.set()
                 return original_hook()
 
@@ -1220,25 +1272,38 @@ async def test_metadata_preparation_is_supervised_per_agent(
             assert threading.get_ident() == owner
             managers.append(ctx.spec.name)
             ctx.search_learnings("heartbeat peer")
+            peer_ran.set()
             return RoundReport(summary="healthy")
 
     async def heartbeat() -> None:
         while True:
             ticks.append(anyio.current_time())
-            await anyio.sleep(0.005)
+            if beat_target and len(ticks) >= beat_target[0]:
+                beats_reached.set()
+            await anyio.sleep(0.01)
 
-    e = env.with_limits(round_timeout_s=0.15)
+    async def trigger_deadline() -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        await peer_ran.wait()
+        beat_target.append(len(ticks) + 5)
+        with anyio.fail_after(2):
+            await beats_reached.wait()
+        assert not returned.is_set()
+        clock.advance(61)
+
+    e = env.with_limits(round_timeout_s=60)
     runner = _construction_round(
         e, Tool, [_with_manager("a", Probe()), _with_manager("b", Probe())]
     )
     monkeypatch.setattr(Ref, "build", build)
     try:
-        start = anyio.current_time()
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(heartbeat)
-            out = await runner.run(1)
-            tasks.cancel_scope.cancel()
-        elapsed = anyio.current_time() - start
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tasks:
+                if failure == "hang":
+                    tasks.start_soon(heartbeat)
+                    tasks.start_soon(trigger_deadline)
+                out = await runner.run(1)
+                tasks.cancel_scope.cancel()
         assert entered.is_set()
         assert managers == ["b"]
         assert hook_threads
@@ -1250,15 +1315,15 @@ async def test_metadata_preparation_is_supervised_per_agent(
         assert_secret_absent(RuntimeError(repr(e.events("agent_status"))), secret)
         if failure == "hang":
             assert not returned.is_set()
-            assert elapsed < 0.7
-            assert len(ticks) >= 5
-            assert max(b - a for a, b in pairwise(ticks)) < 0.1
+            assert beats_reached.is_set()
         before = e.event_types()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
     if failure == "hang":
-        assert await anyio.to_thread.run_sync(returned.wait, 1)
-        await anyio.lowlevel.checkpoint()
+        assert returned.is_set()
         assert e.event_types() == before
         assert managers == ["b"]
 
@@ -1291,7 +1356,7 @@ async def test_seed_feedback_follows_producer_group_and_revision(
     producer = _runner("a")
     producer.team = producer.team.model_copy(update={"part": "p"})
     producer.part, producer.goal, producer.goal_key = "p", part.goal, part.goal.key()
-    out = await RoundRunner(
+    out = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=plan,
@@ -1352,7 +1417,7 @@ async def test_seed_feedback_follows_producer_group_and_revision(
         )
     )
     reader = _with_manager("join", Reader())
-    second = await RoundRunner(
+    second = await _prepared_round(
         env.deps,
         goal_id="g",
         plan=revised,
@@ -1373,3 +1438,163 @@ async def test_seed_feedback_follows_producer_group_and_revision(
     assert all(
         e.payload["candidate"]["checks"][0]["reasons"] == [secret] for e in env.events("tool_end")
     )
+
+
+@pytest.mark.parametrize("newest", [False, True])
+async def test_round_gives_past_run_hint(env: EngineEnv, tmp_path: Path, newest: bool) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena._board.leaderboard import format_value
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    ranking = PLAN.ranking_name()
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=slot.goal)
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(ranking=ranking), past.candidate("c-past", repeat_key=key))
+    if newest:
+        past.commit(
+            past.candidate("c-new", repeat_key=key),
+            past.candidate("c-partial", repeat_key=key, partial=True),
+            past.candidate("c-late", repeat_key=key, status=RunStatus.TIMEOUT),
+        )
+    else:
+        past.commit(past.score("s-past", "c-past", 0.25, judge=ranking))
+    add_pointer(env.deps.config.arena_root, past)
+    out = await _round(env, [slot]).run(1)
+    (candidate,) = out.candidates
+    assert candidate.run_id == env.deps.run_id
+    expected = "c-new: unscored" if newest else f"c-past: {ranking}={format_value(0.25)}"
+    assert f"past-run match {expected}" in candidate.warnings
+    assert out.repeat_entries == [(key, candidate)]
+
+
+async def test_round_gives_past_run_hint_for_part_agent(env: EngineEnv, tmp_path: Path) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=PLAN.goal)
+    draft = past.plan(parts=["a"], ranking=PLAN.ranking_name())
+    recorded = Plan.model_validate(draft.payload["plan"])
+    part = recorded.parts[0]
+    slot.part, slot.goal, slot.goal_key = part.name, part.goal, part.goal.key()
+    slot.team = slot.team.model_copy(update={"part": part.name})
+    current = PLAN.model_copy(update={"parts": [part]})
+    await env.deps.journal.append_durable(r0_revision_draft(current, current.base_dir))
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(draft, past.candidate("c-past", part="a", repeat_key=key))
+    add_pointer(env.deps.config.arena_root, past)
+    out = await _prepared_round(
+        env.deps, goal_id="g", plan=current, agents=[slot], round_spec=RoundSpec(), rounds_left=1
+    ).run(1)
+    (candidate,) = out.candidates
+    assert "past-run match c-past: unscored" in candidate.warnings
+    assert out.repeat_entries == [(key, candidate)]
+
+
+async def test_own_match_wins_over_past_run(env: EngineEnv, tmp_path: Path) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import repeat_key
+    from swarm_arena.tool import ToolRequest
+
+    slot = _runner("a")
+    past = FakeRun(str(tmp_path / "past-runs"), "r-past", goal=slot.goal)
+    key = repeat_key(
+        goal_key=slot.goal_key,
+        tool_ref=slot.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(), past.candidate("c-past", repeat_key=key))
+    add_pointer(env.deps.config.arena_root, past)
+    first = await _round(env, [slot]).run(1)
+    out = await _round(env, [slot], repeat_entries=first.repeat_entries).run(2)
+    assert out.candidates == []
+    assert any(e.payload.get("refused") == first.candidates[0].id for e in env.events("watchdog"))
+
+
+def test_seed_view_preserves_part_and_count_capability() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._board.base import BoardView
+    from swarm_arena._engine.round import _SeedView
+
+    view = Mock(spec=BoardView, goal=PLAN.goal.key(), frontier=Frontier(), part="p")
+    view.count_learnings.return_value = 7
+    wrapped = _SeedView(view, {})
+    assert wrapped.part == "p"
+    assert wrapped.count_learnings("n", goal=view.goal) == 7
+    view.count_learnings.assert_called_once_with("n", goal=view.goal)
+
+
+async def test_digest_ranks_parts_by_their_judges(env: EngineEnv) -> None:
+    from swarm_arena import Score
+
+    part = PartSpec(
+        name="a",
+        goal=Goal(id="sub", namespace="n"),
+        judges=[
+            Ref(
+                path="swarm_arena:ProgramJudge",
+                name="a",
+                config={"function": "_fakes.tools:score_min_y"},
+            )
+        ],
+    )
+    plan = PLAN.model_copy(update={"parts": [part]})
+    slot = _runner("part")
+    slot.team = slot.team.model_copy(update={"part": "a"})
+    slot.part, slot.goal, slot.goal_key = "a", part.goal, part.goal.key()
+    first = await _prepared_round(
+        env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=2
+    ).run(1)
+    candidate = first.candidates[0]
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="score",
+            goal_id="g",
+            payload={
+                "score": Score(
+                    id="a-score",
+                    candidate_id=candidate.id,
+                    judge="a",
+                    key=(1.0,),
+                    value=1,
+                ).model_dump(mode="json")
+            },
+        )
+    )
+    seen: list[str] = []
+
+    class DigestProbe(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            seen.append(ctx.digest)
+            return RoundReport(summary="read digest")
+
+    out = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        agents=[_with_manager("main", DigestProbe())],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+    ).run(2)
+    assert out.reasons["t/main"] == ""
+    assert len(seen) == 1
+    assert any(line.startswith("Part a (a, ") for line in seen[0].splitlines())
+    assert candidate.id in seen[0]

@@ -6,10 +6,10 @@ import anyio
 import pytest
 
 from swarm_arena import Goal, Limits, Plan, RoundSpec, RunConfig
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
-from swarm_arena._engine.goal import GoalRunner
+from swarm_arena._engine.goal import GoalRunner, r0_revision_draft
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
 from swarm_arena._exec.local import LocalExecutor
@@ -37,7 +37,7 @@ async def test_concurrent_goal_returns_match_committed_order(
     config = run_config.model_copy(
         update={"limits": Limits(max_tokens=7, max_usd=0.000007), "reserve_fraction": 0.0}
     )
-    store = LocalStore(tmp_path / "order")
+    store = LocalStore(Path(config.run_root) / "order")
     lease = Lease.acquire_new(store, owner_id="engine", host="local", ttl_s=60)
     ids = IdGen("order", lease.doc.epoch)
     async with JournalWriter(
@@ -81,7 +81,8 @@ async def test_concurrent_goal_returns_match_committed_order(
         assert ledger.free() == Amount(tokens=1, usd=0.000001)
         assert ledger.goal_remaining("g1") == Estimate(tokens=2, usd=0.000002)
         assert ledger.goal_remaining("g2") == Estimate(tokens=1, usd=0.000001)
-        board = RunBoard(run_id="order", run_root=config.run_root, head=lambda: journal.head)
+        board = ArenaBoard(arena_root=config.arena_root, cache_dir=str(tmp_path / "cache"))
+        board.open("order", config.run_root, ["n"])
         views = ViewWriter(store, journal)
         deps = EngineDeps(
             run_id="order",
@@ -101,19 +102,21 @@ async def test_concurrent_goal_returns_match_committed_order(
             g: Plan(goal=Goal(id=g, namespace="n"), teams=[], judges=[], rounds=[RoundSpec()])
             for g in slices
         }
-        for g, plan in plans.items():
-            board.register_goal(plan.goal.key(), g, None)
-        first = GoalRunner(deps, goal_id="g1", plan=plans["g1"], replanner=None)
-        second = GoalRunner(deps, goal_id="g2", plan=plans["g2"], replanner=None)
+        for plan in plans.values():
+            await journal.append_durable(r0_revision_draft(plan, plan.base_dir))
+        first = GoalRunner(deps, goal_id="g1", plan=plans["g1"], replanner=None, journal_r0=False)
+        second = GoalRunner(deps, goal_id="g2", plan=plans["g2"], replanner=None, journal_r0=False)
         arrived, finished = anyio.Event(), anyio.Event()
         real_write = views.write
         real_refresh = first._refresh
 
-        async def slow_write(key: str, content: bytes, *, source: Head) -> None:
+        async def slow_write(
+            key: str, content: bytes, *, source: Head, create_only: bool = False
+        ) -> None:
             if key == "goals/g1/solution.json" and delayed_step == "view":
                 arrived.set()
                 await finished.wait()
-            await real_write(key, content, source=source)
+            await real_write(key, content, source=source, create_only=create_only)
 
         async def slow_refresh() -> None:
             await real_refresh()

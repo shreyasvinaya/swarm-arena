@@ -7,6 +7,8 @@ from unittest.mock import Mock
 import anyio
 import pytest
 from _fakes.engine import take_over_retrying, with_executor, with_limits
+from _fakes.finished import FinishedRun, run_again
+from _fakes.leases import force_take_over
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
@@ -246,8 +248,9 @@ async def test_base_dir_import_rule(run_config: RunConfig, tmp_path: Path) -> No
             sys.path.remove(str(tmp_path))
 
 
+@pytest.mark.parametrize("converge_team", [False, True])
 async def test_one_admission_shared_by_every_goal(
-    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, converge_team: bool
 ) -> None:
     from swarm_arena._engine.goal import GoalRunner
     from swarm_arena._engine.round import EngineDeps
@@ -260,7 +263,9 @@ async def test_one_admission_shared_by_every_goal(
         original(self, deps, **kwargs)
 
     monkeypatch.setattr(GoalRunner, "__init__", initialize)
-    await Swarm(run_config).run([plan(goal_id=g, rounds=1) for g in ("a", "b", "c")])
+    await Swarm(run_config).run(
+        [plan(goal_id=g, rounds=1, converge_team=converge_team) for g in ("a", "b", "c")]
+    )
     assert len(admissions) == 3
     assert admissions[0] is not None
     assert all(a is admissions[0] for a in admissions)
@@ -434,3 +439,424 @@ async def test_fenced_remains_bare_when_executor_shutdown_fails(
     with pytest.raises(Fenced) as caught:
         await Swarm(run_config).run(plan())
     assert type(caught.value) is Fenced
+
+
+async def test_default_board_is_arena(finished_run: FinishedRun) -> None:
+    from swarm_arena._model.board_types import Frontier
+
+    cfg, run = finished_run.config, finished_run.run_id
+    assert (Path(cfg.arena_root) / finished_run.namespace / "runs" / f"{run}.json").exists()
+    for event in events(cfg, "frontier"):
+        assert run in {
+            mark.run_id for mark in Frontier.model_validate(event.payload["frontier"]).marks
+        }
+
+
+async def test_second_run_sees_first_but_never_selects_it(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._model.board_types import Frontier
+    from swarm_arena._store.base import open_store
+
+    run2 = "second"
+    result = await Swarm(finished_run.config).run(finished_run.plan, run_id=run2)
+    assert result[finished_run.plan.goal.id]
+    assert all(c.run_id == run2 for c in result[finished_run.plan.goal.id])
+    store = open_store(finished_run.config.run_root).child(run2)
+    committed = read_committed(store)
+    assert committed is not None
+    front = next(e for e in committed[1] if e.type == "frontier")
+    frontier = Frontier.model_validate(front.payload["frontier"])
+    assert {m.run_id for m in frontier.marks} == {finished_run.run_id, run2}
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    board.open(run2, finished_run.config.run_root, [finished_run.namespace])
+    try:
+        view = board.snapshot(finished_run.plan.goal.key(), frontier)
+        assert view._visible_candidate_ids()
+        assert all(
+            view.get_candidate(id).run_id == finished_run.run_id
+            for id in view._visible_candidate_ids()
+        )
+    finally:
+        board.close()
+    solution = json.loads(store.read(f"goals/{finished_run.plan.goal.id}/solution.json").data)
+    assert solution["finalists"]
+    assert all(item["candidate"]["run_id"] == run2 for item in solution["finalists"])
+
+
+async def test_past_run_match_runs_again(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.leaderboard import format_value
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._store.base import open_store
+
+    states = []
+    for run_id in (finished_run.run_id, await run_again(finished_run)):
+        committed = read_committed(open_store(finished_run.config.run_root).child(run_id))
+        assert committed is not None
+        states.append(RunState.from_events(committed[1]))
+    first, second = [
+        next(c for c in state.candidates.values() if c.agent == "gd-1" and c.round == 1)
+        for state in states
+    ]
+    scores = [s for s in states[0].scores.values() if s.candidate_id == first.id and s.judge == "f"]
+    assert first.id != second.id
+    assert second.run_id != first.run_id
+    assert f"past-run match {first.id}: f={format_value(scores[-1].value)}" in second.warnings
+    assert all(
+        states[1].candidates[id].run_id == second.run_id
+        for id in states[1].goals[finished_run.plan.goal.id].repeat_keys
+    )
+
+
+async def test_past_run_candidate_as_parent(finished_run: "FinishedRun") -> None:
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._store.artifacts import ArtifactStore
+    from swarm_arena._store.base import open_store
+
+    board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    board.open("", "", [finished_run.namespace])
+    try:
+        view = board.snapshot(finished_run.plan.goal.key(), board.frontier())
+        first = view.best(finished_run.plan.goal.key(), 1, judge="f")[0]
+        plan2 = finished_run.plan.model_copy(deep=True)
+        spec = next(a for t in plan2.teams for a in t.agents if a.name == "gd-1")
+        spec.manager.config["requests"][0]["parents"] = "best"
+        run2 = await run_again(finished_run, plan=plan2)
+        committed = read_committed(open_store(finished_run.config.run_root).child(run2))
+        assert committed is not None
+        state = RunState.from_events(committed[1])
+        second = next(c for c in state.candidates.values() if c.agent == "gd-1" and c.round == 1)
+        assert second.parent_ids == [first.id]
+        assert second.request.parents[0].run_id == finished_run.run_id
+        assert second.request.parents[0].data == first.output.data
+        artifacts = ArtifactStore(open_store(finished_run.config.artifact_root))
+        for file in second.request.parents[0].files:
+            assert artifacts.get_bytes(file.sha256)
+        latest = board.snapshot(finished_run.plan.goal.key(), board.frontier())
+        assert (second.id, first.id) in latest.lineage(second.id).edges
+        assert first.id not in state.goals[finished_run.plan.goal.id].final_order
+    finally:
+        board.close()
+
+
+@pytest.mark.s3
+async def test_run_with_all_roots_on_s3(s3_url: str, run_config: RunConfig) -> None:
+    from swarm_arena._store.base import open_store
+
+    cfg = run_config.model_copy(
+        update={
+            "run_root": f"{s3_url}/runs",
+            "arena_root": f"{s3_url}/arena",
+            "artifact_root": f"{s3_url}/artifacts",
+        }
+    )
+    result = await Swarm(cfg).run(plan(rounds=1), run_id="remote")
+    assert result["g"]
+    assert open_store(cfg.run_root).child("remote").read("goals/g/solution.json").data
+
+
+async def test_custom_board_open_and_close_on_run_and_resume(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Sequence
+
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._journal.lease import read_owner
+    from swarm_arena._store.base import open_store
+
+    opened: list[str] = []
+    closed: list[str] = []
+    original_open, original_close = ArenaBoard.open, ArenaBoard.close
+
+    def open_board(self: ArenaBoard, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
+        owner = read_owner(open_store(run_root).child(run_id))
+        assert owner is not None
+        assert owner[0].head is not None
+        assert namespaces == ["n"]
+        opened.append(run_id)
+        original_open(self, run_id, run_root, namespaces)
+
+    def close_board(self: ArenaBoard) -> None:
+        closed.append(self.config.arena_root)
+        original_close(self)
+
+    monkeypatch.setattr(ArenaBoard, "open", open_board)
+    monkeypatch.setattr(ArenaBoard, "close", close_board)
+    root = str(tmp_path / "custom-arena")
+    cfg = run_config.model_copy(
+        update={
+            "board": Ref(
+                path="swarm_arena.board:ArenaBoard",
+                config={"arena_root": root, "cache_dir": str(tmp_path / "custom-cache")},
+            )
+        }
+    )
+    assert (await Swarm(cfg).run(plan(rounds=1), run_id="custom"))["g"]
+    await Swarm(cfg).resume("custom", force=True)
+    assert opened == ["custom", "custom"]
+    assert closed == [root, root]
+    assert (Path(root) / "n/runs/custom.json").exists()
+    assert not await anyio.to_thread.run_sync(Path(cfg.arena_root).exists)
+
+
+def test_finished_run_supports_sync_consumers(finished_run: FinishedRun) -> None:
+    assert finished_run.config_path.read_text() == finished_run.config.dumps()
+    assert len(finished_run.plan.rounds) == 2
+    assert all(
+        agent.manager.config["post_learnings"]
+        for team in finished_run.plan.teams
+        for agent in team.agents
+    )
+    assert (
+        Path(finished_run.config.run_root) / finished_run.run_id / "control/owner.json"
+    ).exists()
+
+
+async def test_board_open_failure_closes_board(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Sequence
+
+    from swarm_arena._board.arena import ArenaBoard
+
+    closed: list[bool] = []
+    original_open, original_close = ArenaBoard.open, ArenaBoard.close
+
+    def fail_open(self: ArenaBoard, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
+        original_open(self, run_id, run_root, namespaces)
+        raise RuntimeError("board open failed")
+
+    def close(self: ArenaBoard) -> None:
+        closed.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(ArenaBoard, "open", fail_open)
+    monkeypatch.setattr(ArenaBoard, "close", close)
+    with pytest.raises(RuntimeError, match="board open failed: RuntimeError"):
+        await Swarm(run_config).run(plan(rounds=1))
+    assert closed == [True]
+
+
+async def test_custom_board_construction_errors_hide_values(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._board.base import Board
+
+    original = Ref.build
+    secret = "BOARD_CONSTRUCTOR_SENTINEL"
+
+    def build(self: Ref, base: type[Any]) -> Any:
+        if base is Board:
+            raise RuntimeError(secret) from ValueError(secret)
+        return original(self, base)
+
+    monkeypatch.setattr(Ref, "build", build)
+    config = run_config.model_copy(
+        update={
+            "board": Ref(
+                path="swarm_arena.board:ArenaBoard", config={"arena_root": run_config.arena_root}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="construction failed") as caught:
+        await Swarm(config).run(plan(rounds=1))
+    assert_secret_absent(caught.value, secret)
+
+
+async def test_run_end_writes_review_export(finished_run: FinishedRun) -> None:
+    store = LocalStore(Path(finished_run.config.run_root) / finished_run.run_id)
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is not None
+    head = owner[0].head
+    prefix = f"review/e{head.epoch}-{head.seq}/"
+    assert store.read(prefix + "review.csv").data.startswith(
+        b"id,goal,team,agent,scores,verdict,score,notes"
+    )
+    assert b"<table>" in store.read(prefix + "index.html").data
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_review_export_failure_releases_run_services(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, resumed: bool
+) -> None:
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._errors import StorageError
+
+    run_id = "export-cleanup"
+    if resumed:
+        await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
+    board_closed: list[int] = []
+    executor_closed: list[int] = []
+    original_board = run_module._close_board
+    original_executor = run_module._close_executor
+
+    async def board_close(*args: Any, **kwargs: Any) -> None:
+        await original_board(*args, **kwargs)
+        board_closed.append(1)
+
+    async def executor_close(*args: Any, **kwargs: Any) -> None:
+        await original_executor(*args, **kwargs)
+        executor_closed.append(1)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise StorageError("review export unavailable")
+
+    monkeypatch.setattr(run_module, "_close_board", board_close)
+    monkeypatch.setattr(run_module, "_close_executor", executor_close)
+    monkeypatch.setattr(run_module, "write_review_export", fail)
+    operation = (
+        Swarm(run_config).resume(run_id)
+        if resumed
+        else Swarm(run_config).run(plan(rounds=1), run_id=run_id)
+    )
+    with pytest.raises(StorageError, match="review export unavailable"):
+        await operation
+    owner = read_owner(LocalStore(Path(run_config.run_root) / run_id))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+    assert board_closed == [1]
+    assert executor_closed == [1]
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("interrupt", ["cancel", "fence"])
+async def test_stalled_completion_export_ends_owner_before_worker_returns(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, resumed: bool, interrupt: str
+) -> None:
+    import asyncio
+    import threading
+
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._journal.lease import Lease
+
+    # The stalled phase keeps a short renewal interval (ttl / 3) so a successor's fence is seen
+    # within the bound; the setup run keeps the default lease so CI load cannot fence it early.
+    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 1.5})
+    run_id = "export-cancel"
+    if resumed:
+        await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
+    store = LocalStore(Path(config.run_root) / run_id)
+    prefix = f"review/e{2 if resumed else 1}-"
+    entered, release, returned, caller_done = (threading.Event() for _ in range(4))
+    creates: list[str] = []
+    workers: list[threading.Thread] = []
+    renewals_after_return: list[int] = []
+    failures: list[BaseException] = []
+    scopes: list[anyio.CancelScope] = []
+    real_create, real_renew = LocalStore.create, Lease.renew
+
+    def create(self: LocalStore, key: str, data: bytes) -> str:
+        if key.startswith(prefix):
+            creates.append(key)
+            if len(creates) == 1:
+                workers.append(threading.current_thread())
+                entered.set()
+                assert release.wait(10), "worker release deadline"
+            try:
+                return real_create(self, key, data)
+            finally:
+                returned.set()
+        return real_create(self, key, data)
+
+    def renew(self: Lease) -> None:
+        if caller_done.is_set():
+            renewals_after_return.append(self.doc.epoch)
+        real_renew(self)
+
+    async def caller() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                if resumed:
+                    await Swarm(config).resume(run_id)
+                else:
+                    await Swarm(config).run(plan(rounds=1), run_id=run_id)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            caller_done.set()
+
+    monkeypatch.setattr(LocalStore, "create", create)
+    monkeypatch.setattr(Lease, "renew", renew)
+    task = asyncio.create_task(caller())
+    services: list[asyncio.Task[Any]] = []
+    successor: Lease | None = None
+    try:
+        assert await run_sync_daemon(entered.wait, 15)
+        services = [t for t in asyncio.all_tasks() if t.get_name() == f"resume-{run_id}"]
+        started = anyio.current_time()
+        if interrupt == "cancel":
+            scopes[0].cancel()
+        else:
+            successor = force_take_over(store, owner_id="successor", host="local", ttl_s=60)
+        done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
+        assert done, "caller retained by stalled completion export"
+        assert anyio.current_time() - started < 3 * config.settle_timeout_s
+        owner = read_owner(store)
+        assert owner is not None
+        if interrupt == "cancel":
+            assert owner[0].expires_at <= utc_now()
+            assert not failures
+        else:
+            assert owner[0].owner_id == "successor"
+            assert len(failures) == 1
+            assert isinstance(failures[0], Fenced)
+        assert all(t.done() for t in services)
+        assert not returned.is_set()
+        release.set()
+        assert await run_sync_daemon(returned.wait, 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        await asyncio.gather(task, *services)
+        assert len(creates) == 1, "abandoned export started another file"
+        assert not renewals_after_return
+        assert read_owner(store) == owner
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 5)
+        for worker in workers:
+            await run_sync_daemon(worker.join, 5)
+            assert not worker.is_alive()
+        if successor is not None:
+            successor.release()
+
+
+async def test_driving_timeout_is_not_a_stop_command(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.control import read_status
+    from swarm_arena._engine.goal import GoalOutcome, GoalRunner
+    from swarm_arena._engine.round import EngineDeps
+
+    driving = anyio.Event()
+    original = GoalRunner.run
+
+    async def run_goal(runner: GoalRunner) -> GoalOutcome:
+        driving.set()
+        return await original(runner)
+
+    async def expire(runner: RunRunner, deps: EngineDeps) -> None:
+        await driving.wait()
+        deps.stops.run_timeout = True
+
+    monkeypatch.setattr(GoalRunner, "run", run_goal)
+    monkeypatch.setattr(RunRunner, "_watch_clock", expire)
+    config = with_limits(run_config, max_concurrent_goals=1)
+    with anyio.fail_after(20):
+        result = await Swarm(config).run(
+            [plan(goal_id="a", rounds=1), plan(goal_id="b", rounds=1)], run_id="r"
+        )
+    assert driving.is_set()
+    assert result["b"] == []
+    assert not events(config, "stop_requested")
+    assert (await read_status(config.run_root, "r")).stop == "none"
+    assert {e.goal_id: e.payload["reason"] for e in events(config, "goal_finished")}[
+        "b"
+    ] == "stopped"

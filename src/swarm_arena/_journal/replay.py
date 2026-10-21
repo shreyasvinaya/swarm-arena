@@ -56,10 +56,14 @@ class GoalState(FrozenModel):
         Latest ordinary round started.
     rounds_closed : int, default=0
         Latest ordinary round completed.
+    closed_seq : dict[int, int], default={}
+        Ordinary round number to its committed round_closed event sequence.
     agents : dict[str, AgentStatus], default={}
         Latest recorded team/agent statuses.
     decisions : list[tuple[int, Decision]], default=[]
         Policy decisions with their round numbers.
+    curated_decisions : list[int], default=[]
+        Committed policy event sequences with a completed curation batch.
     frontiers : dict[int, Frontier], default={}
         Snapshots for ordinary and converge rounds.
     end_reason : str or None, default=None
@@ -114,8 +118,10 @@ class GoalState(FrozenModel):
     status: Literal["queued", "running", "finished", "stopped", "no_result"] = "queued"
     round: int = 0
     rounds_closed: int = 0
+    closed_seq: dict[int, int] = {}
     agents: dict[str, AgentStatus] = {}
     decisions: list[tuple[int, Decision]] = []
+    curated_decisions: list[int] = []
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
     no_result_reason: str | None = None
@@ -173,6 +179,8 @@ class RunState:
     ``candidate_goal_keys`` retains each candidate's producing GoalKey, derived
     from its applicable committed revision when tool_end is folded. Historical
     evidence is never relabeled by a later same-name part revision.
+    Private event history retains the complete prefixes used by immutable round
+    pages, including historical limits and revision activation.
     ``llm_request_sha256`` is reserved for the later LLM event fold.
 
     Examples
@@ -204,6 +212,7 @@ class RunState:
     run_elapsed_s: float = 0.0
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
+    _events: list[Event] = field(default_factory=list, repr=False, compare=False)
     _finished_goals: set[str] = field(default_factory=set, repr=False, compare=False)
 
     def plan_for_round(self, goal_id: str, round: int) -> Plan:
@@ -284,6 +293,7 @@ class RunState:
 
     def _apply(self, event: Event) -> None:
         """Apply one owned event copy and retain the recorded budget history."""
+        self._events.append(event)
         payload = event.payload
         self.run_id = event.run_id
         self.epoch = event.epoch
@@ -296,6 +306,9 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.REVIEW_IMPORTED:
+                # Arena review objects own scores; the receipt only retains IDs for recovery.
+                pass
             case EventType.RUN_STARTED:
                 self.manifest = deepcopy(payload.get("manifest", {}))
             case EventType.RUN_CONFIG:
@@ -430,6 +443,8 @@ class RunState:
                     updates.update(_reset_converge())
                     updates["round"] = payload["round"]
             case EventType.ROUND_CLOSED:
+                round = payload.get("round", event.round or goal.round)
+                updates["closed_seq"] = {**goal.closed_seq, round: event.seq}
                 updates["rounds_closed"] = max(
                     goal.rounds_closed, payload.get("round", event.round or goal.round)
                 )
@@ -480,6 +495,13 @@ class RunState:
                     *goal.decisions,
                     (payload["round"], Decision.model_validate(payload["decision"])),
                 ]
+            case EventType.CURATED:
+                # Summary learning events own indexing; this receipt only closes a phase.
+                decision_seq = payload.get("decision_seq")
+                if decision_seq is not None:
+                    if type(decision_seq) is not int or decision_seq < 1:
+                        raise _core_error(ValueError, "invalid curation decision_seq")
+                    updates["curated_decisions"] = [*goal.curated_decisions, decision_seq]
             case EventType.PART_KEPT:
                 updates["kept_parts"] = {
                     **goal.kept_parts,
@@ -498,6 +520,7 @@ class RunState:
                 updates["pending_reason"] = payload.get("reason")
             case EventType.RESERVE_EXHAUSTED:
                 updates["select_only"] = True
+                updates["pending_reason"] = payload.get("reason", goal.pending_reason)
             case EventType.FINAL_ORDER:
                 updates["selection_recorded"] = True
                 updates["final_order"] = payload["candidate_ids"]

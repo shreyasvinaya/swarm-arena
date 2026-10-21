@@ -14,6 +14,7 @@ from swarm_arena import FunctionTool, Limits, Score
 from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._board.base import BoardView
+from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import SoftError, _core_error
@@ -124,6 +125,85 @@ async def test_learning_rules(ctx_env: CtxEnv) -> None:
     assert ctx_env.counters.learnings == 0
 
 
+@pytest.mark.parametrize("verified", [False, True])
+async def test_post_learning_sets_verified_from_evidence(ctx_env: CtxEnv, verified: bool) -> None:
+    c = _candidate().model_copy(update={"output": ToolOutput(status="ok", partial=not verified)})
+    ctx = ctx_env.ctx(own=[c])
+    posted = await ctx.post_learning("Measured result", "Converged in 8 iterations.", [c.id])
+    assert posted.verified is verified
+    assert ctx_env.events("learning")[-1].payload["learning"]["verified"] is verified
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 0)
+
+
+async def test_post_learning_duplicate_is_soft_error(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    view = await _snapshot(ctx_env, candidates=(_candidate(),), learnings=(_learning(),))
+    ctx = ctx_env.ctx(view=view)
+    allocate = Mock(wraps=ctx._rt.ids.next)
+    monkeypatch.setattr(ctx._rt.ids, "next", allocate)
+    before = len(ctx_env.events("learning"))
+    with pytest.raises(SoftError, match="near-duplicate of L-1"):
+        await ctx.post_learning("baseline", "Measured again.", ["c-old"])
+    assert ctx_env.counters.learnings == 0
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 0)
+    assert len(ctx_env.events("learning")) == before
+    allocate.assert_not_called()
+    assert ctx._rt.own == []
+    assert (
+        await ctx.post_learning("baseline", "8 iterations.", ["c-old"], refines=["L-1"])
+    ).verified
+
+
+@pytest.mark.parametrize("attack", ["none", "mutate", "impostor"])
+@pytest.mark.parametrize("failure", ["title", "text", "duplicate"])
+async def test_post_learning_guide_survives_action_boundary_safely(
+    ctx_env: CtxEnv, attack: str, failure: str
+) -> None:
+    import traceback
+
+    ctx = ctx_env.ctx(own=[_candidate(), _learning(title=SECRET)])
+    originals: list[SoftError] = []
+
+    async def handler(context: AgentContext, args: EmptyArgs) -> JsonValue:
+        try:
+            await context.post_learning(
+                SECRET + ("\n" if failure == "title" else ""),
+                SECRET * 100 if failure == "text" else "body",
+                ["c-old"],
+            )
+        except SoftError as error:
+            originals.append(error)
+            if attack == "none":
+                raise
+            unsafe = SoftError(SECRET) if attack == "impostor" else error
+            unsafe.args = (SECRET,)
+            unsafe.add_note(SECRET)
+            raise unsafe from RuntimeError(SECRET)
+        return None
+
+    ctx.actions = (Action(name="post", description="Post", input_model=EmptyArgs, handler=handler),)
+    with pytest.raises(SoftError) as caught:
+        await ctx.call_action("post", {})
+    assert_secret_absent(caught.value, SECRET, sanitized=True)
+    assert SECRET not in "".join(traceback.format_exception(caught.value))
+    assert caught.value is not originals[0]
+    if attack == "impostor":
+        assert str(caught.value) == "action failed: SoftError"
+    elif failure == "duplicate":
+        assert str(caught.value).startswith("near-duplicate of L-1")
+    else:
+        assert str(caught.value).endswith(LEARNING_GUIDE)
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads, ctx_env.counters.learnings) == (
+        1,
+        0,
+        0,
+    )
+    assert ctx_env.events("learning") == []
+
+
 async def test_notes_cap_and_carry(ctx_env: CtxEnv) -> None:
     ctx = ctx_env.ctx()
     with pytest.raises(SoftError):
@@ -163,7 +243,7 @@ async def test_read_ids_recorded(ctx_env: CtxEnv) -> None:
 
 
 async def test_extra_action_counts_as_board_read(ctx_env: CtxEnv) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     assert await ctx.call_action("list_files", {}) == {
         "files": ["problem/a.phyk", "problem/run.py"]
     }  # M1a Task 19 shape
@@ -173,7 +253,7 @@ async def test_extra_action_counts_as_board_read(ctx_env: CtxEnv) -> None:
 
 
 async def test_read_file_action_reads_only_the_agent_view(ctx_env: CtxEnv) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     assert await ctx.call_action("read_file", {"path": "problem/a.phyk"}) == {
         "path": "problem/a.phyk",
         "content": "a = 1\n",
@@ -265,17 +345,23 @@ async def _snapshot(
     rt = ctx_env.env.rt
     for candidate in candidates:
         event = rt.journal.append(
-            EventDraft(type="tool_end", payload={"candidate": candidate.model_dump(mode="json")})
+            EventDraft(
+                type="tool_end",
+                goal_id="g",
+                payload={"candidate": candidate.model_dump(mode="json")},
+            )
         )
         rt.board.put_candidate(candidate, epoch=event.epoch, seq=event.seq)
     for learning in learnings:
         event = rt.journal.append(
-            EventDraft(type="learning", payload={"learning": learning.model_dump(mode="json")})
+            EventDraft(
+                type="learning", goal_id="g", payload={"learning": learning.model_dump(mode="json")}
+            )
         )
         rt.board.put_learning(learning, epoch=event.epoch, seq=event.seq)
     for score in scores:
         event = rt.journal.append(
-            EventDraft(type="score", payload={"score": score.model_dump(mode="json")})
+            EventDraft(type="score", goal_id="g", payload={"score": score.model_dump(mode="json")})
         )
         rt.board.put_score(score, epoch=event.epoch, seq=event.seq)
     await rt.journal.commit()
@@ -316,8 +402,18 @@ async def test_parallel_run_tool_respects_last_budget_share(
 @pytest.mark.parametrize("part", [None, "p"])
 async def test_best_uses_own_group_and_records_rows(ctx_env: CtxEnv, part: str | None) -> None:
     rt = ctx_env.env.rt
-    ctx_env.env.board.register_goal(rt.goal_key, "g", part)
-    candidate = _candidate().model_copy(update={"part": part})
+    if part is not None:
+        from swarm_arena import Goal, PartSpec, Plan
+        from swarm_arena._engine.goal import r0_revision_draft
+
+        subgoal = Goal(id="sub", namespace="n")
+        plan = Plan(
+            goal=rt.goal, teams=[], judges=[], revision=1, parts=[PartSpec(name=part, goal=subgoal)]
+        )
+        await rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
+        ctx_env.env.rt = replace(rt, goal=subgoal, goal_key=subgoal.key(), part=part)
+        rt = ctx_env.env.rt
+    candidate = _candidate(round=1).model_copy(update={"part": part})
     score = Score(id="s-1", candidate_id=candidate.id, judge="rank", key=(2.0,))
     view = await _snapshot(ctx_env, candidates=(candidate,), scores=(score,))
     ctx = ctx_env.ctx(view=view, part=part, rankings={part or "": "rank"})
@@ -327,7 +423,7 @@ async def test_best_uses_own_group_and_records_rows(ctx_env: CtxEnv, part: str |
     assert rows[0].candidate_id == candidate.id
     assert ctx.best(0) == []
     assert ctx.best(-1) == []
-    with pytest.raises(SoftError, match="can read only this agent's own part"):
+    with pytest.raises(SoftError, match="part outside board snapshot"):
         ctx.best(1, part="other")
     c = await ctx.run_tool({"x": 2.0})
     assert c.read_ids == [candidate.id]
@@ -344,7 +440,7 @@ async def test_scores_and_read_provenance_are_snapshot_scoped(ctx_env: CtxEnv) -
     score = Score(id="s-1", candidate_id=c.id, judge="rank", key=(2.0,))
     view = await _snapshot(ctx_env, candidates=(c,), learnings=(_learning(),), scores=(score,))
     ctx = ctx_env.ctx(view=view, rankings={"": "rank"})
-    assert ctx.search_learnings("base")[0].id == "L-1"
+    assert ctx.search_learnings("baseline")[0].id == "L-1"
     ctx.read_learning("L-1")
     ctx.get_candidate(c.id)
     ctx.best(1)
@@ -378,7 +474,8 @@ async def test_read_snapshot_is_taken_before_tool_awaits(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         ctx.read_learning("L-2")
         release.set()
     assert result[0].read_ids == ["L-1"]
@@ -582,7 +679,8 @@ async def test_simultaneous_contexts_and_cancellation_keep_charges_independent(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         b.search_learnings("parallel")
         scope.cancel()
     assert (counters_a.turns, counters_a.board_reads) == (2, 2)
@@ -610,7 +708,7 @@ async def test_action_validation_and_failure_hide_values(ctx_env: CtxEnv) -> Non
 async def test_script_candidate_files_authorized_and_fetched_in_worker(
     ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     rt = ctx_env.rt
     digest = ctx_env.artifacts.put_bytes(b"a = 2\n")
     c = _candidate().model_copy(update={"overlay": {"problem/a.phyk": digest}})
@@ -636,7 +734,7 @@ async def test_script_candidate_files_authorized_and_fetched_in_worker(
 
 
 async def test_edit_byte_limit_uses_editable_script(ctx_env: CtxEnv) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     with pytest.raises(SoftError):
         await ctx.run_tool({}, edits={"problem/a.phyk": "x" * 262_145})
     assert ctx_env.counters.tool_runs == 0
@@ -688,14 +786,16 @@ async def test_properties_and_my_candidates_are_free(ctx_env: CtxEnv) -> None:
 async def test_snapshot_file_access_does_not_admit_new_other_agent_files(
     ctx_env: CtxEnv, prior_own: bool
 ) -> None:
-    ctx = ctx_env.script_ctx()
+    ctx = await ctx_env.script_ctx()
     rt = ctx_env.rt
     digest = ctx_env.artifacts.put_bytes(b"earlier\n")
-    earlier = _candidate(agent="a" if prior_own else "b").model_copy(
-        update={"overlay": {"problem/a.phyk": digest}}
+    earlier = _candidate(agent="a" if prior_own else "b", round=1).model_copy(
+        update={"part": rt.part, "overlay": {"problem/a.phyk": digest}}
     )
     event = rt.journal.append(
-        EventDraft(type="tool_end", payload={"candidate": earlier.model_dump(mode="json")})
+        EventDraft(
+            type="tool_end", goal_id="g", payload={"candidate": earlier.model_dump(mode="json")}
+        )
     )
     rt.board.put_candidate(earlier, epoch=event.epoch, seq=event.seq)
     await rt.journal.commit()
@@ -722,7 +822,9 @@ async def test_snapshot_file_access_does_not_admit_new_other_agent_files(
         }
     )
     event = rt.journal.append(
-        EventDraft(type="tool_end", payload={"candidate": later.model_dump(mode="json")})
+        EventDraft(
+            type="tool_end", goal_id="g", payload={"candidate": later.model_dump(mode="json")}
+        )
     )
     rt.board.put_candidate(later, epoch=event.epoch, seq=event.seq)
     await rt.journal.commit()
@@ -800,7 +902,6 @@ async def test_part_context_routes_learnings_events_and_read_ids(ctx_env: CtxEnv
             },
         )
     )
-    ctx_env.env.board.register_goal(goal.key(), "g", "part")
     ctx = ctx_env.ctx(
         goal=goal,
         goal_key=goal.key(),
@@ -894,7 +995,8 @@ async def test_escaped_action_lifetime_is_revoked(
     )
     parent = asyncio.create_task(ctx.call_action("spawn", {}))
     try:
-        await entered.wait()
+        with anyio.fail_after(10):
+            await entered.wait()
         if cancelled:
             parent.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1046,3 +1148,60 @@ async def test_core_signal_payload_cannot_be_transferred_or_mutated(
         assert isinstance(caught.value, LimitReached)
         assert caught.value.limit == "stop"
         assert str(caught.value) == "the run is stopping"
+
+
+@pytest.mark.parametrize("own_part", [None, "p"])
+async def test_best_reads_declared_fixed_siblings_and_preserves_permissions(
+    ctx_env: CtxEnv, own_part: str | None
+) -> None:
+    from swarm_arena import Goal, PartSpec, Plan
+    from swarm_arena._engine.goal import r0_revision_draft
+
+    rt = ctx_env.env.rt
+    part_goal = Goal(id="sub", namespace="n", inputs={"part": 1})
+    plan = Plan(
+        goal=rt.goal, teams=[], judges=[], revision=1, parts=[PartSpec(name="p", goal=part_goal)]
+    )
+    await rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
+    main = _candidate("main", round=1)
+    digest = rt.artifacts.put_bytes(b"sibling-file")
+    part = _candidate("part", round=1).model_copy(
+        update={"part": "p", "overlay": {"sibling.txt": digest}}
+    )
+    view = await _snapshot(
+        ctx_env,
+        candidates=(main, part),
+        scores=(
+            Score(id="main-score", candidate_id="main", judge="main-rank", key=(1.0,)),
+            Score(id="part-score", candidate_id="part", judge="part-rank", key=(3.0,)),
+            Score(id="part-same-judge", candidate_id="part", judge="main-rank", key=(100.0,)),
+        ),
+    )
+    from swarm_arena._board.arena import ArenaView
+
+    assert isinstance(view, ArenaView)
+    siblings = {"": view._sibling_view(None), "p": view._sibling_view("p")}
+    goal = part_goal if own_part else rt.goal
+    ctx = ctx_env.ctx(
+        goal=goal,
+        goal_key=goal.key(),
+        part=own_part,
+        view=siblings[own_part or ""],
+        sibling_views=siblings,
+        rankings={"": "main-rank", "p": "part-rank"},
+    )
+    assert [row.candidate_id for row in ctx.best(1)] == (["part"] if own_part else ["main"])
+    assert [row.candidate_id for row in ctx.best(1, part="p")] == ["part"]
+    assert [row.candidate_id for row in ctx.best(1, part="")] == ["main"]
+    with pytest.raises(SoftError, match="outside"):
+        ctx.best(1, part="not-declared")
+    assert ctx_env.counters.board_reads == 4
+    assert set(ctx._read_ids) == {"main", "part"}
+    if own_part:
+        with pytest.raises(SoftError, match="unknown candidate"):
+            ctx.get_candidate("main")
+    # A later committed score cannot change any selected sibling's fixed ranking.
+    await _snapshot(
+        ctx_env, scores=(Score(id="later", candidate_id="part", judge="part-rank", key=(9.0,)),)
+    )
+    assert ctx.best(1, part="p")[0].key == (3.0,)

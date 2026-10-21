@@ -205,6 +205,11 @@ class _RoundClock:
 
 
 async def _worker(mode: str, root: Path) -> None:
+    with pytest.MonkeyPatch.context() as patch:
+        await _scoped_worker(mode, root, patch)
+
+
+async def _scoped_worker(mode: str, root: Path, patch: pytest.MonkeyPatch) -> None:
     # Observe real extension/lease/journal signals before stopping or expiring work.
     from swarm_arena._journal.lease import Lease
     from swarm_arena._journal.reader import read_committed
@@ -224,7 +229,7 @@ async def _worker(mode: str, root: Path) -> None:
         if _JUDGE_ENTERED.is_set():
             _JUDGE_RENEWED.set()
 
-    Lease.renew = renew
+    patch.setattr(Lease, "renew", renew)
     module = "test_extension_boundaries"
     tool_name = {"hook": "BlockingHookTool", "collect": "FailingCollectTool"}.get(mode)
     command = [
@@ -295,14 +300,16 @@ async def _worker(mode: str, root: Path) -> None:
         # Entry signals control termination; these watchdogs leave time for setup.
         limits=Limits(round_timeout_s=120, run_timeout_s=180, tool_timeout_s=60),
         lease_ttl_s=3.0,
-        settle_timeout_s=0.2,
+        # Stop settlement includes healthy journal I/O. Keep its allowance
+        # above CI scheduling noise and below the independently measured exit bound.
+        settle_timeout_s=2.0,
     )
     deadline_clock: _RoundClock | None = None
     if mode.endswith("serializer") and variant != "stop":
         from swarm_arena._engine import round as round_module
 
         deadline_clock = _RoundClock(config.limits.effective_round_timeout_s())
-        round_module.anyio = deadline_clock  # ty: ignore[invalid-assignment]
+        patch.setattr(round_module, "anyio", deadline_clock)
     swarm = Swarm(config)
     live_store = LocalStore(root / "runs" / "boundary-run")
     stop_started: float | None = None

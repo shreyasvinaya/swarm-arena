@@ -17,6 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Each test job runs one of three disjoint groups of the suite (pytest-split).
+  # Tests still run one at a time inside each runner, so per-runner load does not change.
   core:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     # No extras: proves that the core imports and passes with no optional dependency.
@@ -25,16 +27,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # Branch pushes test the oldest and newest Python; main also covers 3.12.
+        python-version: ${{ github.ref == 'refs/heads/main' && fromJSON('["3.11", "3.12", "3.13"]') || fromJSON('["3.11", "3.13"]') }}
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-groups
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run pytest --durations=25
+      - if: matrix.shard == 1
+        run: uv run ruff check .
+      - if: matrix.shard == 1
+        run: uv run ruff format --check .
+      - run: uv run pytest --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
 
   extras:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -43,14 +49,18 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --all-groups
-      - run: uv run ty check
-      - run: uv run pytest --durations=25
+      - if: matrix.shard == 1
+        run: uv run ty check
+      - run: uv run pytest --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - if: matrix.shard == 1
+        run: uv run pytest -m s3 -v
 
   docs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -66,13 +76,17 @@ jobs:
   lowest-direct:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.11"
       - run: uv sync --all-groups --resolution lowest-direct --upgrade
-      - run: uv run --no-sync pytest -q --durations=25
+      - run: uv run --no-sync pytest -q --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
 
   macos:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -82,13 +96,14 @@ jobs:
       matrix:
         # Branch pushes test macOS on the newest Python; main also covers the oldest.
         python-version: ${{ github.ref == 'refs/heads/main' && fromJSON('["3.11", "3.13"]') || fromJSON('["3.13"]') }}
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-groups
-      - run: uv run pytest -q --durations=25
+      - run: uv run pytest -q --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
 
   pr-verify:
     # Same-repository PRs reuse the push run of their head commit instead of running

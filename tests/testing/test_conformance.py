@@ -1203,3 +1203,17 @@ async def test_check_manager_exception_keeps_original_cause_and_failed_run_tail(
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert "original stderr marker" in notes_of(caught.value.__cause__)
     assert "manager-secret-sentinel" in str(caught.value.__cause__)
+
+
+async def test_check_manager_after_run_board_removal() -> None:
+    manager = ScriptedManager(
+        [{"inputs": {"x": 1.0}, "round": 1}, {"inputs": {"x": 2.0}, "round": 2}]
+    )
+    assert (
+        len(
+            await check_manager(
+                manager, goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+            )
+        )
+        == 2
+    )

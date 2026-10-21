@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,9 @@ def test_open_store_refuses_scheme_without_conditional_writes(url: str) -> None:
         open_store(url)
 
 
-def test_open_store_s3_needs_extra() -> None:
-    with pytest.raises(ConditionalWritesUnsupported, match=r"swarm-arena\[s3\].*M2"):
+def test_open_store_s3_needs_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "s3fs", None)
+    with pytest.raises(ConditionalWritesUnsupported, match=r"swarm-arena\[s3\]"):
         open_store("s3://bucket/runs")
 
 
@@ -50,8 +52,6 @@ def test_open_store(tmp_path: Path) -> None:
     assert isinstance(s, LocalStore)
     assert s.url == str(tmp_path.resolve())
     s.probe_conditional_writes()
-    with pytest.raises(ConditionalWritesUnsupported, match="s3"):
-        open_store("s3://bucket/p")
     with pytest.raises(ConditionalWritesUnsupported, match="gs"):
         open_store("gs://bucket")
 
@@ -62,7 +62,8 @@ def test_open_store_expands_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.parametrize("scheme", ["s3", "gs", "file", "scheme" + SECRET + "+1.2"])
-def test_scheme_errors_are_sanitized(scheme: str) -> None:
+def test_scheme_errors_are_sanitized(scheme: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "s3fs", None)
     url = f"{scheme}://9537d6d3032b2555b86a3df9fb9abdda:password@bucket/private"
     with pytest.raises(ConditionalWritesUnsupported) as caught:
         open_store(url)
@@ -74,3 +75,9 @@ def test_base_child(tmp_path: Path) -> None:
     child = Store.child(s, "runs")
     child.create("a", b"x")
     assert s.read("runs/a").data == b"x"
+
+
+def test_probe_passes_on_local_store(tmp_path: Path) -> None:
+    root = tmp_path / "absent"
+    assert LocalStore(root).probe_conditional_writes() is None
+    assert not root.exists()

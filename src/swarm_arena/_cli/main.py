@@ -4,6 +4,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
+from swarm_arena._cli import arena_cmds
 from swarm_arena._cli.run_cmds import register
 from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
 from swarm_arena._version import __version__
@@ -16,7 +17,9 @@ def _parser() -> argparse.ArgumentParser:
         epilog="Exit codes: 0 success, 1 error, 2 usage, 130 interrupted (Ctrl-C).",
     )
     parser.add_argument("--version", action="store_true", help="print the version and exit")
-    register(parser.add_subparsers(dest="command"))
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    arena_cmds.register(sub)
     return parser
 
 

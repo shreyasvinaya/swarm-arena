@@ -8,6 +8,9 @@ import anyio
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._engine.control import stop_key
+from swarm_arena._errors import StorageError
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store
 
 
@@ -110,6 +113,10 @@ class RunClock:
         self._before = elapsed_before
         self._start = monotonic()
 
+    def _rebase(self, elapsed_before: float) -> None:
+        """Adopt the acquired checkpoint without restarting preparation time."""
+        self._before = elapsed_before
+
     def elapsed(self) -> float:
         """
         Return accumulated active seconds, excluding downtime before resume.
@@ -174,11 +181,22 @@ def round_deadline(start: float, round_timeout_s: float, run_left_s: float) -> f
     return start + min(round_timeout_s, run_left_s)
 
 
+def _stop_exists(store: Store, key: str) -> bool:
+    """Validate the storage result before any branch on the event loop."""
+    exists = store.exists(key)
+    if type(exists) is not bool:
+        raise TypeError("stop lookup must return bool")
+    return exists
+
+
 async def watch_stop_files(
     store: Store, epoch: int, state: StopState, *, interval_s: float = 2.0
 ) -> None:
     """
     Poll only this lease epoch's stop files until cancelled.
+
+    Storage waits are abandonable by the owning supervisor. Late results
+    cannot latch a stop or start another lookup.
 
     Parameters
     ----------
@@ -191,13 +209,26 @@ async def watch_stop_files(
     interval_s : float, default=2.0
         Seconds between polls.
 
+    Raises
+    ------
+    StorageError
+        If storage fails or returns a non-boolean result. Backend diagnostics
+        are contained before the owning task group receives the failure.
+
     Examples
     --------
     >>> await watch_stop_files(store, 2, StopState())  # doctest: +SKIP
     """
     while True:
-        if await anyio.to_thread.run_sync(store.exists, stop_key(epoch, now=True)):
-            state.stop_now = state.stop = True
-        if await anyio.to_thread.run_sync(store.exists, stop_key(epoch, now=False)):
-            state.stop = True
+        for now in (True, False):
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            outcome = _Outcome()
+            try:
+                exists = await run_sync_daemon(_stop_exists, store, stop_key(epoch, now=now))
+            except BaseException as error:
+                outcome.contain(error, StorageError, "stop lookup")
+            if exists:
+                if now:
+                    state.stop_now = True
+                state.stop = True
         await anyio.sleep(interval_s)

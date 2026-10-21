@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
+from _fakes.leases import force_take_over
 from _fakes.tools import RecordingExecutor
 
 from swarm_arena import ScriptTool
@@ -15,9 +16,8 @@ from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._budget.amount import Amount
-from swarm_arena._errors import Fenced
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_committed
@@ -41,23 +41,16 @@ def take_over_retrying(store: Store, *, owner_id: str = "intruder") -> Lease:
     owner = read_owner(store)
     assert owner is not None
     epoch = owner[0].epoch
-    for _ in range(100):
-        try:
-            return Lease.take_over(
-                store, owner_id=owner_id, host="local", ttl_s=60, force=True, expect_epoch=epoch
-            )
-        except Fenced:
-            current = read_owner(store)
-            if current is None or current[0].epoch != epoch:
-                raise
-    raise AssertionError("takeover did not make progress")
+    return force_take_over(
+        store, owner_id=owner_id, host="local", ttl_s=60, expect_epoch=epoch, attempts=100
+    )
 
 
 @dataclass
 class RtEnv:
     rt: AgentRuntime
     run_store: LocalStore
-    board: RunBoard
+    board: ArenaBoard
     marker: Path
     spy: RecordingExecutor
     inflight: Inflight
@@ -176,12 +169,14 @@ class RtEnv:
         cast(Any, self.rt.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
+                await anyio.sleep(0.01)
 
     async def wait_started(self) -> None:
-        while not await anyio.to_thread.run_sync(self.events, "tool_start"):  # noqa: ASYNC110
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(self.events, "tool_start"):  # noqa: ASYNC110
+                await anyio.sleep(0.01)
 
     def cancel_inflight(self) -> None:
         self.inflight.cancel_all()
@@ -233,18 +228,29 @@ class CtxEnv:
         self.counters, self.address = self.rt.counters, self.rt.address
         return AgentContext(self.rt, gate=gate)
 
-    def script_ctx(self) -> AgentContext:
+    async def script_ctx(self) -> AgentContext:
         files = {
             "problem/a.phyk": self.artifacts.put_bytes(b"a = 1\n"),
             "problem/run.py": self.artifacts.put_bytes(b"print(1)\n"),
         }
         goal = self.env.rt.goal.model_copy(update={"files": FileSet(manifest=files)})
-        self.env.board.register_goal(goal.key(), goal.id, None)
+        from swarm_arena import PartSpec, Plan
+        from swarm_arena._engine.goal import r0_revision_draft
+
+        plan = Plan(
+            goal=self.env.rt.goal,
+            teams=[],
+            judges=[],
+            revision=1,
+            parts=[PartSpec(name="script", goal=goal)],
+        )
+        await self.env.rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
         view = self.env.board.snapshot(goal.key(), self.env.board.frontier())
         return self.ctx(
             tool=ScriptTool(command=["python", "problem/run.py"], editable=["problem/a.phyk"]),
             goal=goal,
             goal_key=goal.key(),
+            part="script",
             view=view,
         )
 
@@ -317,8 +323,9 @@ class EngineEnv:
         cast(Any, self.deps.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
-            await anyio.sleep(0.01)
+        with anyio.fail_after(15):
+            while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
+                await anyio.sleep(0.01)
 
     def _configured(self, config: "RunConfig") -> "EngineEnv":
         from swarm_arena._budget.ledger import Ledger

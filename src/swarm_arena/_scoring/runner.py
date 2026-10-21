@@ -299,7 +299,8 @@ async def judge_round(
     leaders : Sequence[Candidate]
         Ordered leaders whose prefix supplies each judge's anchors.
     ctx_for : Callable[[Judge], JudgeContext]
-        Factory returning a new execution context for each judge.
+        Factory returning a new execution context for each judge. A supplied
+        batch id is retained so scores share the engine's durable phase identity.
     prepared : tuple or None, default=None
         Already funded batch and anchor ids for a single judge. The caller
         contains preparation-hook failures before providing this value.
@@ -327,7 +328,7 @@ async def judge_round(
         return JudgeOutcome(scores=scores, errors=errors)
     for ref, judge in judges:
         ctx = ctx_for(judge)
-        ctx.batch_id = f"{goal_id}-{ref.component_name()}-{eligible[0].id}"
+        ctx.batch_id = ctx.batch_id or f"{goal_id}-{ref.component_name()}-{eligible[0].id}"
         ctx.anchors = frozenset() if prepared is None else prepared[1]
         outcome = await _judge_batch(
             ref,
@@ -394,7 +395,7 @@ async def final_judge(
     if not finalists:
         return [], JudgeOutcome(scores=[], errors=[])
     ref, judge = ranking
-    ctx.batch_id = f"{goal_id}-{ref.component_name()}-{finalists[0].id}"
+    ctx.batch_id = ctx.batch_id or f"{goal_id}-{ref.component_name()}-{finalists[0].id}"
     outcome = await _judge_batch(ref, judge, finalists, ctx)
     scores = {score.candidate_id: score for score in outcome.scores}
     order = sorted(

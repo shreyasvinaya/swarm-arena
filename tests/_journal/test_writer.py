@@ -4,13 +4,20 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from threading import Lock, get_ident
+from typing import Any
 
 import anyio
 import pytest
 
-from swarm_arena._errors import ChainError, Fenced, StorageError, WriteOutcomeUnknown
-from swarm_arena._journal.event import EventDraft, EventType
-from swarm_arena._journal.lease import Lease, read_owner
+from swarm_arena._errors import (
+    ChainError,
+    Fenced,
+    StorageError,
+    WriteOutcomeUnknown,
+    _is_core_signal,
+)
+from swarm_arena._journal.event import Event, EventDraft, EventType
+from swarm_arena._journal.lease import Head, Lease, read_owner
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
@@ -50,6 +57,7 @@ class FlakyStore(Store):
         self.thread_ids: list[int] = []
         self.lock = Lock()
         self.create_started: anyio.Event | None = None
+        self.token = anyio.lowlevel.current_token()
         for key, data in (prewrite or {}).items():
             inner.create(key, data)
 
@@ -81,7 +89,7 @@ class FlakyStore(Store):
             self.max_concurrent_creates = max(self.max_concurrent_creates, self.active_creates)
         try:
             if self.create_started is not None:
-                anyio.from_thread.run_sync(self.create_started.set)
+                anyio.from_thread.run_sync(self.create_started.set, token=self.token)
             time.sleep(self.create_delay_s)
             if self.create_raises is not None:
                 raise self.create_raises
@@ -640,3 +648,233 @@ async def test_local_io_failure_fences_without_admitting_event(
     owner = read_owner(store)
     assert owner is not None
     assert owner[0].version == 1
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "chain", "cancel", "group"])
+async def test_inherited_read_failure_is_contained(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import asyncio
+
+    from _fakes.leases import force_take_over
+    from _fakes.secrecy import assert_secret_absent
+
+    async with _writer(store, tmp_path, group_window_s=0) as first:
+        await first.append_durable(EventDraft(type=EventType.RESERVE))
+    lease = force_take_over(store, owner_id="o2", host="h", ttl_s=60)
+    writer = JournalWriter(
+        store,
+        lease,
+        run_id="r",
+        next_seq=2,
+        local_path=tmp_path / "resumed.jsonl",
+        sync_interval_s=60,
+    )
+    marker = "private-chain-read-value"
+    errors: dict[str, BaseException] = {
+        "ordinary": RuntimeError(marker),
+        "chain": ChainError(marker),
+        "cancel": asyncio.CancelledError(marker),
+        "group": BaseExceptionGroup(marker, [RuntimeError(marker), asyncio.CancelledError(marker)]),
+    }
+    errors[kind].add_note(marker)
+
+    original = store.read
+
+    def fail(key: str) -> Blob:
+        if key.startswith("journal/"):
+            raise errors[kind]
+        return original(key)
+
+    monkeypatch.setattr(store, "read", fail)
+    try:
+        with pytest.raises(Fenced) as caught:
+            await writer.__aenter__()
+        assert_secret_absent(caught.value, marker)
+        assert writer.head == lease.doc.head
+        assert not (tmp_path / "resumed.jsonl").exists()
+    finally:
+        lease.release()
+
+
+async def test_inherited_read_retries_transient_failure(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._journal import writer as writer_module
+
+    async with _writer(store, tmp_path, group_window_s=0) as first:
+        await first.append_durable(EventDraft(type=EventType.RESERVE))
+    lease = force_take_over(store, owner_id="o2", host="h", ttl_s=60)
+    writer = JournalWriter(
+        store,
+        lease,
+        run_id="r",
+        next_seq=2,
+        local_path=tmp_path / "resumed.jsonl",
+        sync_interval_s=60,
+    )
+    attempts = 0
+    original = writer_module.read_chain
+
+    def read(current_store: Store, head: Head, **kwargs: Any) -> list[tuple[str, list[Event]]]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient read failure")
+        return original(current_store, head, **kwargs)
+
+    monkeypatch.setattr(writer_module, "read_chain", read)
+    async with writer:
+        assert attempts == 2
+        assert writer.committed == first.committed
+
+
+@pytest.mark.parametrize("site", ["create", "replace"])
+@pytest.mark.parametrize("deadline", ["lease", "settlement"])
+@pytest.mark.parametrize("clock_rate", [1.0, 0.5])
+async def test_blocked_publication_expires_without_late_state_change(
+    store: LocalStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    deadline: str,
+    clock_rate: float,
+) -> None:
+    import asyncio
+    import threading
+    from datetime import datetime, timedelta
+
+    from swarm_arena._journal import writer as writer_module
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
+    writer._settle_timeout_s = 0.2
+    wall_start, monotonic_start = utc_now(), time.monotonic()
+
+    def slow_utc_now() -> datetime:
+        return wall_start + timedelta(seconds=(time.monotonic() - monotonic_start) * clock_rate)
+
+    monkeypatch.setattr(writer_module, "utc_now", slow_utc_now)
+    original = getattr(store, site)
+
+    def block(*args: object, **kwargs: object) -> str:
+        if not entered.is_set():
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, site, block)
+
+    async def publish() -> None:
+        async with writer:
+            await writer.append_durable(EventDraft(type=EventType.RESERVE))
+
+    task = asyncio.create_task(publish())
+    before = writer._lease.doc
+    try:
+        with anyio.fail_after(10):
+            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        if deadline == "settlement":
+            writer._stop_storage()
+        done, _ = await asyncio.wait([task], timeout=4)
+        assert done, "publication wait outlived its deadline"
+        error = task.exception()
+        assert error is not None
+        assert _is_core_signal(error)
+        if deadline == "lease":
+            assert isinstance(error, Fenced)
+            assert not writer._stopping
+            assert not writer._settlement_expired
+        else:
+            assert not isinstance(error, Fenced)
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "stop cleanup timed out"
+            assert writer._remaining() > 0
+        with pytest.raises(type(error)):
+            writer.append(EventDraft(type=EventType.RESERVE))
+        assert writer.head is None
+        assert writer.committed == ()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 5)
+                    assert not worker.is_alive()
+    assert writer._lease.doc == before
+    assert writer.head is None
+    assert writer.committed == ()
+    owner = read_owner(store)
+    assert owner is not None
+    if site == "create":
+        assert owner[0].head is None
+    if deadline == "settlement":
+        assert owner[0].expires_at <= utc_now()
+        successor = Lease.take_over(store, owner_id="successor", host="test", ttl_s=60, force=False)
+        successor.release()
+
+
+async def test_settlement_timeout_bounds_the_release_attempt(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    writer = _writer(store, tmp_path, group_window_s=0)
+    writer._settle_timeout_s = 0.2
+    publishing, releasing, unblock = (threading.Event() for _ in range(3))
+    workers: list[threading.Thread] = []
+    create, replace = store.create, store.replace
+
+    def blocked_create(key: str, data: bytes) -> str:
+        workers.append(threading.current_thread())
+        publishing.set()
+        assert unblock.wait(30)
+        return create(key, data)
+
+    def blocked_release(key: str, data: bytes, *, if_match: str) -> str:
+        workers.append(threading.current_thread())
+        releasing.set()
+        assert unblock.wait(30)
+        return replace(key, data, if_match=if_match)
+
+    monkeypatch.setattr(store, "create", blocked_create)
+    monkeypatch.setattr(store, "replace", blocked_release)
+
+    async def publish() -> None:
+        async with writer:
+            await writer.append_durable(EventDraft(type=EventType.RESERVE))
+
+    task = asyncio.create_task(publish())
+    try:
+        assert await anyio.to_thread.run_sync(publishing.wait, 10)
+        writer._stop_storage()
+        assert await anyio.to_thread.run_sync(releasing.wait, 5)
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "failed writer retained its blocked release"
+        error = task.exception()
+        assert isinstance(error, RuntimeError)
+        assert _is_core_signal(error)
+        assert str(error) == "stop cleanup timed out"
+        assert writer.head is None
+    finally:
+        unblock.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert len(workers) == 2
+    assert writer.head is None
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].head is None

@@ -106,9 +106,15 @@ def test_current_kinds() -> None:
         "frontier": 1,
         "manifest": 1,
         "solution": 1,
+        "run_pointer": 1,
+        "human_object": 1,
     }
 
 
 def test_current_registry_is_immutable() -> None:
     with pytest.raises(TypeError):
         migrate.CURRENT["plan"] = 99  # ty: ignore[invalid-assignment]
+
+
+def test_m2_kinds_registered() -> None:
+    assert migrate.CURRENT["run_pointer"] == migrate.CURRENT["human_object"] == 1

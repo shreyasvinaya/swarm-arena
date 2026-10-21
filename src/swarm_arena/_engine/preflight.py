@@ -6,7 +6,8 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import _core_error, _exception_type_name
+from swarm_arena._board.arena import _effective_arena_root
+from swarm_arena._errors import ConfigError, StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import canonical_json
@@ -16,6 +17,7 @@ from swarm_arena._model.run_config import RunConfig
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
+from swarm_arena._store.base import open_store
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 _Component = Tool | Manager | Check | Judge
@@ -91,6 +93,7 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     >>> from swarm_arena.executor import LocalExecutor
     >>> anyio.run(run_preflight, [], RunConfig(), LocalExecutor())
     """
+    await _check_storage(config)
     seen: set[tuple[str, bytes]] = set()
     failures: list[str] = []
     for ref, base, overrides in _sites(plans):
@@ -110,3 +113,54 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
         failures.append(f"- {config.executor.path}: {_exception_type_name(exc)}")
     if failures:
         raise _core_error(RuntimeError, "preflight failed:\n" + "\n".join(failures)) from None
+
+
+def _board_arena_root(config: RunConfig) -> str:
+    """Resolve the shared root through the board construction error boundary."""
+    try:
+        root = _effective_arena_root(config)
+        if not isinstance(root, str):
+            raise TypeError("arena root must be a string")
+        return str.__str__(root)
+    except BaseException as error:
+        _Outcome(capture_caller=False).contain(error, RuntimeError, "board construction")
+
+
+async def _check_storage(config: RunConfig) -> None:
+    """Probe before ownership, with caller cancellation and type-only failures."""
+    outcome = _Outcome()
+    try:
+        await run_sync_daemon(check_storage, config)
+    except BaseException as error:
+        outcome.contain(error, StorageError, "storage preflight")
+
+
+def check_storage(config: RunConfig) -> None:
+    """Check root reachability and probe each distinct S3 root.
+
+    Parameters
+    ----------
+    config : RunConfig
+        Run, effective board arena and artifact roots to validate before mutation.
+
+    Raises
+    ------
+    ConfigError
+        If an S3 arena points at a local run root.
+    ConditionalWritesUnsupported
+        If a remote root cannot demonstrate conditional writes.
+
+    Examples
+    --------
+    >>> check_storage(RunConfig())
+    """
+    arena_root = _board_arena_root(config)
+    if arena_root.startswith("s3://") and not config.run_root.startswith("s3://"):
+        raise _core_error(
+            ConfigError,
+            "run_root must be reachable by other readers: a local run_root cannot "
+            "be used with an s3:// arena_root",
+        )
+    for root in dict.fromkeys((config.run_root, arena_root, config.artifact_root)):
+        if root.startswith("s3://"):
+            open_store(root).probe_conditional_writes()

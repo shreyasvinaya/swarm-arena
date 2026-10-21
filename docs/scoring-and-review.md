@@ -170,8 +170,75 @@ stopped goal can replace its solution while earlier final orders and stop
 reasons remain durable in the journal. See [Getting started](getting-started.md#read-the-solution)
 for reading an actual solution.
 
-## Human review (M2)
+## Human review
 
-Human review, curation, and the shared arena are M2 features. Built-in model
-judges and provider integrations are M3 features. Current scripts and custom
-judges can supply scores, but do not create those review workflows.
+`HumanReview` exports committed candidates to `review.csv`, a static escaped
+`index.html`, and one `candidates/<id>.json` file containing the candidate and
+its recorded scores. Each goal contributes up to 20 rows by default. Main and
+part groups use their own recorded ranking judges; replaced part identities
+are excluded. Export reads one committed head and does not import judge plugins.
+
+```python
+from pathlib import Path
+from swarm_arena import RunConfig
+from swarm_arena.scoring import HumanReview
+
+config = RunConfig.load(Path("runs/my-run/run.toml"))
+review = HumanReview("alice")
+out = await review.export("my-run", config=config, out_dir=Path("review"), top=20)
+# After editing review/review.csv:
+scores = await review.import_csv("my-run", out / "review.csv", config=config)
+```
+
+Reviewer names are 1–64 character lowercase slugs: `[a-z0-9][a-z0-9._-]*`.
+Derived review object locations must fit the storage key and local path limits;
+invalid locations are refused before takeover or receipt admission. Use `goal="goal-id"`
+on export to select one main goal; `top` applies separately to each main goal
+and includes its ranked parts.
+
+The CSV columns are `id`, `goal`, `team`, `agent`, `scores`, `verdict`, `score`,
+and `notes`. Keep the identifier and read-only context columns; edit the last
+three columns. `scores` shows recorded judge/value pairs for reference. Export
+prefixes text cells starting with `=`, `+`, `-`, `@`, a tab, or a carriage return
+with an apostrophe so spreadsheets treat them as text. Canonical candidate/score
+JSON remains unchanged. Context columns remain display-only during import. A
+verdict is `accept`, `reject`, or empty, with any letter case. A score is a
+finite number or empty. Both verdict and score empty means no review for that
+row; notes alone do not create a score. UTF-8 BOMs, CRLF line endings, and quoted
+multiline notes from spreadsheet programs are accepted. Missing columns,
+unknown or duplicate IDs, bad verdicts and invalid/non-finite scores are
+reported together with their row numbers before any storage probe or takeover.
+
+`judge_name` is read-only and derives from the reviewer. The complete receipt is
+validated before journal admission. Imports use judge `human:alice`, with key `(verdict_rank, score_or_zero)`:
+accept is `1`, empty is `0`, and reject is `-1`. The numeric `value` remains
+absent for a verdict-only review. Re-rank the arena using
+`leaderboard --by human:alice` in the arena CLI.
+
+Run imports **after the run ends**: a live owner prevents takeover. For `s3://`
+roots, valid imports probe conditional writes before taking the lease. The CSV
+is validated again against the final head fixed by takeover, and score IDs use
+that new epoch. Import does not execute goals or start a run clock. The run's
+active-time limit does not apply to later human review, including runs that ended
+by that limit. A stop requested during import raises `RuntimeError("review import
+stopped")`; lease and fencing supervision remain active.
+
+Review publication and repair honor cancellation and fencing. An interrupted
+publication resumes from the committed receipt; missing review objects are
+recreated with their original names and bytes. Imports create arena objects only
+for namespaces that receive scores. An empty import records no arena objects.
+
+
+Retrying a CSV after a receipt committed creates a new
+review batch; recovery itself does not duplicate the original batch.
+
+Successful fresh and resumed runs also write an immutable bundle under
+`<run_root>/<run-id>/review/e<epoch>-<seq>/` after the final commit. Rewriting
+identical bytes is safe; conflicting bytes fail. Earlier completion bundles
+remain available after resume.
+
+Review imports publish to the configured `ArenaBoard` arena root when supplied;
+otherwise they use `RunConfig.arena_root`.
+
+Human judge leaderboards compare all fidelities together and order verdict/score
+keys directly, without applying a program judge's `min_improvement` margin.

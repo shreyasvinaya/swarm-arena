@@ -1,5 +1,6 @@
 """Define synchronous board indexing and snapshot read contracts."""
 
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
@@ -50,7 +51,8 @@ class _Reads(ABC):
         Raises
         ------
         ValueError
-            If the goal is unknown or outside this view.
+            If the goal lies outside a fixed view. ArenaBoard returns an empty
+            list for an unknown board-level goal.
 
         Examples
         --------
@@ -80,7 +82,7 @@ class _Reads(ABC):
         namespace : str
             Problem family.
         tags : Sequence[str], default=()
-            Tags used to prefer matching learnings.
+            ArenaBoard filters by any supplied tag; in-memory boards may prefer matches.
         goal : GoalKey or None, default=None
             Goal whose learnings are preferred after pinned items.
         limit : int, default=50
@@ -119,16 +121,17 @@ class _Reads(ABC):
         limit: int = 10,
     ) -> list[Learning]:
         """
-        Search titles and bodies by case-insensitive substring, newest first.
+        Search visible learning text using the board implementation's ordering.
 
         Parameters
         ----------
         namespace : str
             Problem family.
         query : str
-            Substring to find in a title or body.
+            Literal search text. ArenaBoard tokenizes it and ranks with FTS5 bm25;
+            in-memory boards use a case-insensitive substring.
         tags : Sequence[str], default=()
-            Required tags; every supplied tag must be present.
+            ArenaBoard uses any-of tag filtering; in-memory boards require all tags.
         goal : GoalKey or None, default=None
             Optional goal scope, validated against a snapshot's goal.
         limit : int, default=10
@@ -137,7 +140,8 @@ class _Reads(ABC):
         Returns
         -------
         list[Learning]
-            Visible matches in descending journal order.
+            Visible matches in text relevance order for ArenaBoard, then learning
+            relevance; in-memory boards return newest matches first.
 
         Raises
         ------
@@ -307,7 +311,8 @@ class _Reads(ABC):
         Raises
         ------
         ValueError
-            If the goal is unknown or outside this view.
+            If the goal lies outside a fixed view. ArenaBoard returns an empty
+            list for an unknown board-level goal.
 
         Examples
         --------
@@ -406,6 +411,32 @@ class BoardView(_Reads):
     goal: GoalKey
     frontier: Frontier
 
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int:
+        """
+        Count visible learnings using the optional connector override.
+
+        Parameters
+        ----------
+        namespace : str
+            Namespace of the learnings to count.
+        goal : GoalKey or None, default=None
+            Optional goal scope, validated by the view's learning reader.
+
+        Returns
+        -------
+        int
+            Visible learning count; hidden items are never included.
+
+        Examples
+        --------
+        >>> from doctest import script_from_examples
+        >>> from swarm_arena.board import BoardView
+        >>> exec(script_from_examples(BoardView.__doc__))
+        >>> view.count_learnings("n")
+        1
+        """
+        return len(self.learnings(namespace, goal=goal, limit=sys.maxsize))
+
     def _visible_candidate_ids(self) -> frozenset[str]:
         """Return fixed, goal-scoped candidate membership without I/O or charges."""
         raise NotImplementedError
@@ -469,7 +500,12 @@ class Board(Configurable, _Reads):
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
         """
-        Open a run's board resources; the default does nothing.
+        Open or extend a run's board resources; the default does nothing.
+
+        The engine may call this again with the same run identifier and root
+        and a superset of namespaces after admitting a plan revision. Repeated
+        calls must reuse resources and preserve existing snapshot lifetimes.
+        Newly attached namespaces become available on the next frontier refresh.
 
         Parameters
         ----------
@@ -488,6 +524,7 @@ class Board(Configurable, _Reads):
         >>> from swarm_arena.board import Board
         >>> exec(script_from_examples(Board.__doc__))
         >>> board.open("r", "/runs", ["n"])
+        >>> board.open("r", "/runs", ["n", "shared"])
         """
 
     def close(self) -> None:

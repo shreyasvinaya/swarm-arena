@@ -6,9 +6,8 @@ from types import ModuleType
 import pytest
 
 from swarm_arena import board as board_facade
-from swarm_arena._board import base, run_board
+from swarm_arena._board import base
 from swarm_arena._board.base import Board, BoardView
-from swarm_arena._board.run_board import RunBoard
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.planning_types import Decision
@@ -16,7 +15,7 @@ from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate, Learning, Score
 
 
-@pytest.mark.parametrize("module", [base, run_board, board_facade])
+@pytest.mark.parametrize("module", [base, board_facade])
 def test_in_memory_examples_are_not_skipped(module: ModuleType) -> None:
     skipped = [
         test.name
@@ -54,6 +53,15 @@ def test_abstract_methods_are_required() -> None:
         "frontier",
         "snapshot",
     } <= Board.__abstractmethods__
+
+
+def test_count_learnings_default_counts_learnings() -> None:
+    namespace: dict[str, object] = {}
+    exec(doctest.script_from_examples(BoardView.__doc__ or ""), namespace)
+    view = namespace["view"]
+    assert isinstance(view, BoardView)
+    assert view.count_learnings("n") == 1
+    assert view.count_learnings("n", goal=view.goal) == len(view.learnings("n", goal=view.goal))
 
 
 def test_open_and_close_default_to_no_ops() -> None:
@@ -130,5 +138,5 @@ def test_open_and_close_default_to_no_ops() -> None:
     assert board.open("r", "/runs", ["n"]) is None
     assert board.close() is None
     assert board.config.model_dump() == {}
-    assert Board.open is RunBoard.open
-    assert Board.close is RunBoard.close
+    assert Board.open is Minimal.open
+    assert Board.close is Minimal.close

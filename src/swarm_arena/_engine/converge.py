@@ -200,6 +200,7 @@ async def converge(goal: "GoalRunner", *, select_only: bool) -> list[Candidate]:
                 goal_id=goal.goal_id,
                 plan=goal.plan,
                 agents=agents,
+                supervisor=goal,
                 round_spec=round_spec,
                 rounds_left=1,
                 converge=True,

@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from pathlib import Path
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -328,6 +329,29 @@ async def test_harness_carries_notes_and_snapshots_learnings(
     assert _events(harness, "learning")[0].seq < _events(harness, "frontier")[1].seq
 
 
+async def test_harness_uses_a_temp_arena_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    h = OfflineHarness()
+    await h.run_rounds(
+        ScriptedManager([{"inputs": {"x": 1.0}}]),
+        goal=GOAL,
+        tool=SQUARE,
+        rounds=1,
+        limits=Limits(),
+        config=RunConfig(
+            arena_root=str(tmp_path / "real-arena"), board=Ref(path="unavailable:Board")
+        ),
+    )
+    assert all("preflight_complete" not in e.payload for e in _events(h, "plan_revision"))
+    root = Path(h.store.url).parent.parent
+    assert (root / "arena" / GOAL.namespace / "runs" / "local.json").exists()
+    assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
+    assert not (tmp_path / "real-arena").exists()
+    assert not (tmp_path / "xdg").exists()
+
+
 @pytest.mark.parametrize("kind", ["group", "cancel"])
 async def test_nonstandard_manager_reason_uses_originating_type(
     monkeypatch: pytest.MonkeyPatch, kind: str
@@ -356,3 +380,84 @@ async def test_nonstandard_manager_reason_uses_originating_type(
     [event] = _events(harness, "agent_status")
     assert event.payload["reason"] == f"manager error: {type(failure).__name__}"
     assert_secret_absent(RuntimeError(event.model_dump_json()), secret)
+
+
+async def test_harness_cancellation_abandons_board_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._board.frontier import Frontier
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = ArenaBoard.frontier
+
+    def frontier(board: ArenaBoard) -> Frontier:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        return original(board)
+
+    monkeypatch.setattr(ArenaBoard, "frontier", frontier)
+    cancelled = anyio.Event()
+    scope = anyio.CancelScope()
+
+    async def run() -> None:
+        with scope:
+            await OfflineHarness().run_rounds(
+                ScriptedManager([]),
+                goal=GOAL,
+                tool=SQUARE,
+                rounds=1,
+                limits=Limits(),
+                config=RunConfig(),
+            )
+        cancelled.set()
+
+    task = asyncio.create_task(run())
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        scope.cancel()
+        with anyio.move_on_after(3):
+            await cancelled.wait()
+        assert cancelled.is_set(), "harness retained its board storage worker"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+
+
+async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import anyio
+
+    async def wait(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await anyio.Event().wait()
+        return RoundReport()
+
+    monkeypatch.setattr(NoopManager, "run_round", wait)
+    harness = OfflineHarness()
+    with anyio.fail_after(10), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+        await harness.run_rounds(
+            NoopManager(),
+            goal=GOAL,
+            tool=SQUARE,
+            rounds=1,
+            limits=Limits(run_timeout_s=1),
+            config=RunConfig(),
+        )
+
+
+def test_harness_documents_run_deadline() -> None:
+    doc = OfflineHarness.run_rounds.__doc__
+    assert doc is not None
+    assert "Raises" in doc
+    assert "Notes" in doc
+    assert "run_timeout_s" in doc
+    assert "offline harness stopped" in doc

@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -174,7 +175,8 @@ async def test_admission_closed_while_queued_refuses_start(rt_env: RtEnv) -> Non
     ] = []  # _run_capturing appends the LimitReached that execute_tool_run raises
     async with anyio.create_task_group() as tg:
         tg.start_soon(_run_capturing, rt, {"marker": str(rt_env.marker)}, errors)
-        await queued.entered.wait()
+        with anyio.fail_after(10):
+            await queued.entered.wait()
         rt_env.inflight.close()
         queued.release.set()
     err = errors[0]
@@ -479,8 +481,10 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     monkeypatch.setattr(rt.tool, "providers", lambda: frozenset({"openai"}))
     original_init, original_command = PyTool.__init__, PyTool.command
     workspaces: list[Path] = []
+    workers: list[threading.Thread] = []
 
     def block() -> None:
+        workers.append(threading.current_thread())
         entered.set()
         assert release.wait(10)
 
@@ -516,12 +520,17 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
             assert not rt_env.inflight._scopes
             release.set()
             assert await anyio.to_thread.run_sync(done.wait, 5)
-            await anyio.sleep(0.05)
+            with anyio.fail_after(5):
+                await anyio.to_thread.run_sync(workers[0].join, 5)
+            assert not workers[0].is_alive()
             assert rt_env.committed_types() == before
             assert not rt_env.marker.exists()
             assert workspaces[0].joinpath("late_write").exists()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> None:
@@ -719,7 +728,9 @@ async def test_hook_failures_do_not_expose_values(
         assert rt_env.events("reserve") == []
 
 
-async def test_past_run_parent_and_overlay_warning_are_retained(rt_env: RtEnv) -> None:
+async def test_past_run_parent_and_overlay_warning_are_retained(
+    rt_env: RtEnv, tmp_path: Path
+) -> None:
     from _fakes.tools import cand
 
     parent = cand(
@@ -728,7 +739,13 @@ async def test_past_run_parent_and_overlay_warning_are_retained(rt_env: RtEnv) -
         tool_identity="another-tool",
         overlay={"notes.txt": rt_env.rt.artifacts.put_bytes(b"notes")},
     )
-    rt_env.board.put_candidate(parent, epoch=1, seq=1)
+    from _fakes.board import records
+    from _fakes.journals import FakeRun, add_pointer
+
+    past = FakeRun(str(tmp_path / "past"), "older-run", goal=rt_env.rt.goal)
+    parent = parent.model_copy(update={"goal_id": rt_env.rt.goal_id})
+    past.commit(past.plan(), *records(parent))
+    add_pointer(rt_env.rt.config.arena_root, past)
     rt = dataclasses.replace(
         rt_env.rt, view=rt_env.board.snapshot(rt_env.rt.goal_key, rt_env.board.frontier())
     )
@@ -917,7 +934,8 @@ async def test_release_keeps_primary_control_outcome(
         rt = dataclasses.replace(rt, executor=queued)
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, [])
-            await queued.entered.wait()
+            with anyio.fail_after(10):
+                await queued.entered.wait()
             group.cancel_scope.cancel()
     assert not rt.repeats._pending
 
@@ -928,7 +946,17 @@ async def test_part_runtime_routes_main_goal_and_retains_part_context(rt_env: Rt
 
     sha = rt_env.rt.artifacts.put_bytes(b"part content")
     goal = Goal(id="sub", namespace="n", files=FileSet(manifest={"part.txt": sha}))
-    rt_env.board.register_goal(goal.key(), "g", "part")
+    from swarm_arena import PartSpec, Plan
+    from swarm_arena._engine.goal import r0_revision_draft
+
+    plan = Plan(
+        goal=rt_env.rt.goal,
+        teams=[],
+        judges=[],
+        revision=1,
+        parts=[PartSpec(name="part", goal=goal)],
+    )
+    await rt_env.rt.journal.append_durable(r0_revision_draft(plan, plan.base_dir))
     rt = dataclasses.replace(
         rt_env.rt,
         goal=goal,
@@ -1032,7 +1060,8 @@ async def test_unstarted_runs_do_not_increment_started_count(rt_env: RtEnv, fail
         errors: list[LimitReached] = []
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, errors)
-            await queued.entered.wait()
+            with anyio.fail_after(10):
+                await queued.entered.wait()
             assert rt.started_runs == 0
             rt_env.inflight.close()
             queued.release.set()
@@ -1063,7 +1092,8 @@ async def test_inflight_tracks_active_job_grace_until_collection(rt_env: RtEnv) 
     rt = dataclasses.replace(rt, executor=queued)
     async with anyio.create_task_group() as group:
         group.start_soon(_run_capturing, rt, {"x": 1}, [])
-        await queued.entered.wait()
+        with anyio.fail_after(10):
+            await queued.entered.wait()
         assert rt_env.inflight.max_grace_s() == tool_grace(rt.tool)
         rt_env.cancel_inflight()
     assert rt_env.inflight.max_grace_s() == 0.0
@@ -1894,3 +1924,83 @@ async def test_runtime_config_and_identity_evaluation_use_daemon(
     assert len(result.candidates) == 1
     assert observed
     assert all(thread is not threading.main_thread() and thread.daemon for thread in observed)
+
+
+@pytest.mark.parametrize("scored", [False, True])
+async def test_past_run_hint_in_warnings(rt_env: RtEnv, tmp_path: "Path", scored: bool) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena._agent.repeats import RepeatIndex, repeat_key
+    from swarm_arena._board.arena import past_run_repeat_entries
+    from swarm_arena.tool import ToolRequest
+
+    rt = rt_env.rt
+    past = FakeRun(str(tmp_path / "past"), "past", goal=rt.goal)
+    key = repeat_key(
+        goal_key=rt.goal_key,
+        tool_ref=rt.tool_ref,
+        request=ToolRequest(inputs={"x": 1.0}),
+        deterministic=True,
+    )
+    past.commit(past.plan(ranking="rank"), past.candidate("past-c", repeat_key=key))
+    if scored:
+        past.commit(
+            past.score("old", "past-c", 8, judge="rank"),
+            past.score("new", "past-c", 0.25, judge="rank"),
+        )
+    add_pointer(rt.config.arena_root, past)
+    view = rt.board.snapshot(rt.goal_key, rt.board.frontier())
+    rt = dataclasses.replace(
+        rt,
+        view=view,
+        rankings={"": "rank"},
+        repeats=RepeatIndex(rt.repeats.run_id, past_run_repeat_entries(view, rt.repeats.run_id)),
+    )
+    result = await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert result.run_id == rt.repeats.run_id
+    assert result.warnings == [f"past-run match past-c: {'rank=0.25' if scored else 'unscored'}"]
+    assert rt.repeats.added == [(key, result)]
+
+
+async def test_blocked_log_publication_is_abandoned_on_round_stop(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from swarm_arena._store.local import LocalStore
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    original = LocalStore.create
+    writes: list[str] = []
+
+    def create(store: LocalStore, key: str, data: bytes) -> str:
+        if "/logs/" in key:
+            writes.append(key)
+            if key.endswith(".out"):
+                workers.append(threading.current_thread())
+                entered.set()
+                assert release.wait(30)
+        return original(store, key, data)
+
+    monkeypatch.setattr(LocalStore, "create", create)
+    task = asyncio.create_task(
+        execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    )
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        rt_env.cancel_inflight()
+        done, _ = await asyncio.wait([task], timeout=3)
+        assert done, "log publication ignored the round's cancellation"
+        candidate = task.result()
+        assert candidate.output.logs_ref is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert len(writes) == 1, "abandoned log write published another file"

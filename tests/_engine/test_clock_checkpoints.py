@@ -36,7 +36,11 @@ class SlowManager(ScriptedManager):
 
 async def clock_driver(root: Path, phase: str) -> None:
     cfg = with_executor(
-        RunConfig(run_root=str(root / "runs"), artifact_root=str(root / "artifacts")),
+        RunConfig(
+            run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
+            artifact_root=str(root / "artifacts"),
+        ),
         workspace_root=str(root / "ws"),
     )
     p = _plan(
@@ -87,10 +91,11 @@ async def clock_driver(root: Path, phase: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = commit
-    ProviderJudge.__init__ = init
-    ProviderJudge.judge = score
-    await Swarm(cfg).run(p, run_id="clock")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", commit)
+        patch.setattr(ProviderJudge, "__init__", init)
+        patch.setattr(ProviderJudge, "judge", score)
+        await Swarm(cfg).run(p, run_id="clock")
 
 
 @pytest.mark.parametrize("phase", ["round", "converge", "final"])
@@ -107,9 +112,10 @@ async def test_clock_checkpoint_survives_process_death(
         f"import sys,anyio; from pathlib import Path; from {_MODULE} import clock_driver; "
         "anyio.run(clock_driver,Path(sys.argv[1]),sys.argv[2])"
     )
-    child = await anyio.run_process(
-        [sys.executable, "-c", code, str(tmp_path), phase], env=environment, check=False
-    )
+    with anyio.fail_after(30):
+        child = await anyio.run_process(
+            [sys.executable, "-c", code, str(tmp_path), phase], env=environment, check=False
+        )
     assert child.returncode == 91, child.stderr.decode()
     cfg = RunConfig.load(tmp_path / "runs" / "clock" / "run.toml")
     before = all_events(cfg)
@@ -117,7 +123,7 @@ async def test_clock_checkpoint_survives_process_death(
     start = next(e for e in before if e.type == "run_started")
     committed_work = (before[-1].ts - start.ts).total_seconds()
     assert checkpoint >= committed_work - 0.05, (checkpoint, committed_work)
-    await anyio.sleep(0.2)
+    # Exact seed equality below excludes downtime without a scheduling-dependent sleep.
     seeds: list[float] = []
 
     class CapturedClock(RunClock):

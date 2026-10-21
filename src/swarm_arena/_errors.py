@@ -157,6 +157,17 @@ class _CoreValueError(ValueError):
     """Allow core value errors to be weakly registered."""
 
 
+_CORE_STORAGE_ERRORS: tuple[type[StorageError], ...] = (
+    StorageError,
+    NotFound,
+    AlreadyExists,
+    PreconditionFailed,
+    WriteOutcomeUnknown,
+    ConditionalWritesUnsupported,
+    ChainError,
+)
+
+
 _CORE_SIGNALS: WeakKeyDictionary[
     Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None, str]
 ] = WeakKeyDictionary()
@@ -172,6 +183,11 @@ def _core_error(cls: type[_SignalT], *args: Any) -> _SignalT:
     return _core_signal(cls(*args))
 
 
+def _stop_cleanup_error() -> RuntimeError:
+    """Build the shared safe error for exhausted stop-storage settlement."""
+    return _core_error(RuntimeError, "stop cleanup timed out")
+
+
 def _core_signal_kinds() -> tuple[type[Exception], ...]:
     """Return exact core types with a lazy import to avoid model cycles."""
     from swarm_arena._agent.manager import LimitReached
@@ -183,6 +199,7 @@ def _core_signal_kinds() -> tuple[type[Exception], ...]:
         ConfigError,
         LeaseHeld,
         Fenced,
+        *_CORE_STORAGE_ERRORS,
         _CoreRuntimeError,
         _CoreValueError,
     )
@@ -246,6 +263,7 @@ def _is_core_signal(error: BaseException) -> bool:
 def _rebuild_core_signal(error: BaseException) -> Exception | None:
     """Reconstruct a registered signal from its snapshot, never user changes.
 
+    The storage family preserves its exact core type and vetted message.
     Only the exact supported core exception types may be registry keys: subclasses
     cannot supply custom equality or hashing to impersonate a registered key.
     The fresh result has no notes or exception chain and is registered so

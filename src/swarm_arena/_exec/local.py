@@ -77,7 +77,12 @@ class LocalExecutor(Executor):
     rejoins that one collect until its original deadline, keeping its result
     when available; it never starts an overlapping collect. A post-exit
     collect that exceeds the bound gives ERROR and an empty result.
-    The cancel-path output goes to ``job.on_partial``. Every diagnostic is
+    Artifact uploads are awaited one object at a time under caller supervision.
+    Cancellation abandons the current upload and starts no later upload. If
+    cancellation interrupts the process, collection, or an upload, collected
+    data is delivered without file or log references through ``job.on_partial``;
+    no partial-output uploads start after cancellation. The callback is bounded to
+    30 seconds. Every diagnostic is
     appended to the stderr log only while it is a regular file, so a tool that
     replaces a log with a FIFO or a symlink cannot stall the executor.
 
@@ -240,7 +245,7 @@ class LocalExecutor(Executor):
         result, the output is empty with ``partial=False``, and a note goes to
         the stderr log. On a
         cancel after the start handshake, ``job.on_partial`` gets the best
-        output there is (status CANCELLED), also when the tool had already
+        collected data (status CANCELLED, no file or log references), also when the tool had already
         exited and its collect was still running. A command
         ``cwd`` that is not a directory in the workspace gives status ERROR
         and the command never starts. A declared output file that is missing,
@@ -308,7 +313,7 @@ class LocalExecutor(Executor):
                 await anyio.lowlevel.checkpoint()
                 job_run = _JobRun(job, staged, workspace, artifacts, self.config)
                 if staged.fault is not None:
-                    return await anyio.to_thread.run_sync(job_run.fault_output, staged.fault)
+                    return await job_run.fault_output(staged.fault)
                 return await job_run.run(sup, self._rlimits(job))
             finally:
                 if not preparation.finished.is_set():

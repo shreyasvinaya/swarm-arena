@@ -91,14 +91,14 @@ Every milestone also updates: the `__all__` snapshot test (`tests/test_public_ap
 - **Scope:** §4.4 `HumanReview`, §4.9, §6.3, §6.3.1, §6.6, §7 (S3 storage), §7.1 "what readers read", §7.2, §7.3 item 4 (non-LLM steps).
 - **Deliverables:**
   1. **[verify] task 1:** s3fs or aiobotocore conditional writes. Check `If-None-Match: *` for create and `If-Match: <etag>` for replace, and the error codes on a mismatch (412 or 409), against the s3fs version that matches the locked `fsspec`. Also check whether moto supports them; if it does not, the `s3` tests use a MinIO service container. Record the result in `tasks/research/api-s3-conditional.md`.
-  2. `S3Store` (extra `s3 = ["s3fs>=<floor>", "aiobotocore>=<floor>"]` [plan]; floors from task 1: the oldest releases whose botocore `PutObject` model has `IfNoneMatch` and `IfMatch`). `S3Store` refuses to write when the installed botocore lacks either parameter. Storage that fails the conditional-write probe is refused: `check_storage` (R4.13.13) probes each distinct `s3://` root at preflight, and again in `resume`, `review import` (after its CSV pre-check), and `reconcile`, before they take over `owner.json` (they can run with another host or endpoint than the driver).
-  3. `ArenaBoard` (becomes the default when `RunConfig.board` is `None`, and `RunBoard` is deleted): run pointers written at run start, the per-run authority read of `owner.json`, incremental chain download into the SQLite cache keyed by `(run, epoch, seq)`, multi-run frontiers committed at each goal-round start, its own run indexed from committed chain segments like any other run (its `put_*` rows are hints that `snapshot` never returns, R4.6), `snapshot` filtered exactly by frontier, review and curation objects applied in the fixed order (name timestamp, then object name), arena human scores taken from `reviews/` only, and an item id that the cache already holds from another run is skipped with a warning (R4.0).
+  2. `S3Store` (extra `s3 = ["s3fs>=2023.12.1", "aiobotocore>=2.16.0"]` [plan]; floors from task 1: the oldest releases whose botocore `PutObject` model has `IfNoneMatch` and `IfMatch`). `S3Store` refuses to write when the installed botocore lacks either parameter. Storage that fails the conditional-write probe is refused: `check_storage` (R4.13.13) probes each distinct `s3://` root at preflight, and again in `resume`, `review import` (after its CSV pre-check), and `reconcile`, before they take over `owner.json` (they can run with another host or endpoint than the driver).
+  3. `ArenaBoard` (becomes the default when `RunConfig.board` is `None`, and `RunBoard` is deleted): run pointers written at run start, the per-run authority read of `owner.json`, incremental chain download into the SQLite cache keyed by `(run, epoch, seq)`, multi-run frontiers committed at each goal-round start, its own run indexed from committed chain segments like any other run (its `put_*` rows are hints that `snapshot` never returns, R4.6), `snapshot` filtered exactly by frontier, review and curation objects applied in the fixed order (name timestamp, then object name), arena human scores taken from `reviews/` only, and colliding item ids retain all producing runs with a warning; each frontier selects its holder deterministically (R4.0).
   4. Search: an FTS5 table over learning title, text, and tags. `search_learnings` orders by bm25, then by the relevance order of §6.3.
   5. Learnings rules: evidence must be in the agent's view, the duplicate check (an FTS5 near-match above a threshold [plan]: bm25 top hit plus title token Jaccard ≥ 0.6) that requires `refines` or `duplicate_reason`, `verified`, hidden learnings never shown to agents, and the "from other agents, unverified" markers in the digest.
   6. `Curator` ABC and the engine hook at round end (paid from the reserve). No LLM curator.
   7. Digest v2: the full relevance order over the whole namespace, the leaderboard with the judge identity, and the token cap (counted as UTF-8 bytes, an upper bound on tokens, R4.13.14 [plan]).
   8. Leaderboard (one judge identity per group: the group's own ranking judge, or the `--by` judge for every group; the newest identity when there is no current run, `min_improvement` for first place only, ties to the earliest) and round pages (`goals/<goal-id>/rounds/round-NN.md` views).
-  9. Human review: `HumanReview.export` (`review.csv`, one JSON file per candidate, a static `index.html`) and `HumanReview.import_csv` (takes the run lease, fails while a live owner holds it, writes the run copy and one `reviews/` object). The end-of-run engine hook (§5 step 8, §6.6) writes the export of every goal (top 20) to `<run_root>/<run-id>/review/` [plan], through the `Store` with conditional creates, after the final commit.
+  9. Human review: `HumanReview.export` (`review.csv`, one JSON file per candidate, a static `index.html`) and `HumanReview.import_csv` (takes the run lease, fails while a live owner holds it, writes the run copy and one `reviews/` object). The end-of-run engine hook (§5 step 8, §6.6) writes the export of every goal (top 20) to `<run_root>/<run-id>/review/e<epoch>-<seq>/`, through the `Store` with conditional creates, after the final commit.
   10. Preflight: refuse a local `run_root` with an `s3://` `arena_root`.
   11. CLI: `review export|import`, `leaderboard`, `board serve|search|show`, `learnings pin|hide|add` (human learning ids `L-h-<16 hex>`, R4.0), `trace` (plan revision, tool run, checks, scores, learnings), `reindex`.
   12. Board viewer (`board serve`): stdlib `http.server` on the SQLite cache, with search, filters, pages, a learning page, a candidate page with lineage, and the pin, hide, and add actions writing curation objects.
@@ -212,7 +212,7 @@ Rules [plan]:
 | `protocol.py` | Facade `swarm_arena.protocol` | M1a | `tests/test_public_api.py` |
 | `run_function.py` | Entry `python -m swarm_arena.run_function`: import the function, read `swarm/request.json`, call it, write `swarm/result.json`. Name fixed by §4.1; no `__all__` | M1a | `tests/test_run_function.py` |
 | `_launch.py` | Entry `python -I -m swarm_arena._launch`: block on the "go" pipe, then `os.execve` the tool command; exit 0 with no exec if the pipe closes first | M1a | `tests/test_launch.py` |
-| `_errors.py` | Private exception classes (R4.13.1) | M1a +M1b | `tests/test_errors.py` |
+| `_errors.py` | Private exception classes (R4.13.1) | M1a +M1b +M2 | `tests/test_errors.py` |
 | `_version.py` | `__version__` from `importlib.metadata` | M1a | `tests/test_public_api.py` |
 | `_facade.py` | `publish()`: sets `__module__` of exported names, their nested classes, and their methods to their facade (R0), so doctest collects method examples | M1a | `tests/test_public_api.py` |
 | `_model/__init__.py` | Empty | M1a | — |
@@ -220,7 +220,7 @@ Rules [plan]:
 | `_model/compat.py` | Isolated Pydantic implementation assumptions | M1a | `tests/_model/test_compat.py` |
 | `_model/data.py` | Finite JSON and depth bounds, `Sha256`, manifest validation; shared type-aware `json_equal` used by catalog matching and provenance | M1a | `tests/_model/test_data_validation.py` |
 | `_model/diagnostics.py` | Transportable sanitized validation errors and `validation_summary` | M1a | `tests/_model/test_validation_safety.py` |
-| `_model/safe.py` | Shared model validation and error sanitization boundaries | M1a | `tests/_model/test_validation_boundaries.py`, `tests/_model/test_validation_safety.py` |
+| `_model/safe.py` | Shared model validation and error sanitization boundaries | M1a +M2 | `tests/_model/test_validation_boundaries.py`, `tests/_model/test_validation_safety.py` |
 | `_model/locations.py` | Schema-aware identifier-only validation locations | M1a | `tests/_model/test_validation_locations.py` |
 | `_model/canonical.py` | Canonical JSON, sha256 helpers, UTC time format | M1a | `tests/_model/test_canonical.py` |
 | `_model/migrate.py` | `schema_version` migration registry; refuses newer versions | M1a +M2 | `tests/_model/test_migrate.py` |
@@ -277,12 +277,12 @@ Rules [plan]:
 | `_scoring/runner.py` | Checks after a tool run; barrier batches with anchors; final judge | M1b +M3 | `tests/_scoring/test_runner.py` |
 | `_scoring/human_review.py` | `HumanReview` export and import | M2 | `tests/_scoring/test_human_review.py` |
 | `_journal/__init__.py` | Empty | M1b | — |
-| `_journal/event.py` | `Event`, `EventDraft`, `EventType`, payload models | M1b +M2 | `tests/_journal/test_event.py` |
+| `_journal/event.py` | `Event`, `EventDraft`, `EventType`, `WRITE_THROUGH` | M1b | `tests/_journal/test_event.py` |
 | `_journal/segment.py` | Segment names, encode and decode with the link line | M1b | `tests/_journal/test_segment.py` |
 | `_journal/lease.py` | `Head`, `OwnerDoc`, `Lease` (acquire, renew, take over, release, fence) | M1b | `tests/_journal/test_lease.py` |
 | `_journal/writer.py` | `JournalWriter` (one writer task, group commit, unknown results) | M1b | `tests/_journal/test_writer.py` |
 | `_journal/reader.py` | `read_chain` with the chain check | M1b | `tests/_journal/test_reader.py` |
-| `_journal/views.py` | `ViewWriter`, source-head embedding | M1b | `tests/_journal/test_views.py` |
+| `_journal/views.py` | `ViewWriter`, source-head embedding | M1b +M2 | `tests/_journal/test_views.py` |
 | `_journal/replay.py` | `RunState`: pure fold of committed events | M1b +M2 | `tests/_journal/test_replay.py` |
 | `_journal/a2a.py` | A2A `Task` and `Artifact` records for tool runs and agent rounds | M1b | `tests/_journal/test_a2a.py` |
 | `_journal/llm_record.py` | `bind_run`, `record_call` (R4.13.19). Core module: no optional import | M3 +M4 | `tests/_journal/test_llm_record.py` |
@@ -290,12 +290,12 @@ Rules [plan]:
 | `_budget/amount.py` | `Amount` arithmetic and fit checks | M1b | `tests/_budget/test_amount.py` |
 | `_budget/split.py` | Goal weights, final slices, round and agent shares, returns | M1b | `tests/_budget/test_split.py` |
 | `_budget/ledger.py` | `Ledger`, `Reservation` | M1b +M4 | `tests/_budget/test_ledger.py` |
-| `_budget/tranche.py` | `Tranche` for LLM spend | M1b +M3 | `tests/_budget/test_tranche.py` |
+| `_budget/tranche.py` | `Tranche` for LLM spend | M1b +M2 +M3 | `tests/_budget/test_tranche.py` |
 | `_budget/estimate.py` | Worst-case estimate (§5 step 2), `judge_amount`, `final_slice_estimate` | M1b +M3 | `tests/_budget/test_estimate.py` |
 | `_budget/llm_scope.py` | `LLMScope` context variable seam with `call_ids`, and the call-id seam `requesting_call` (R4.13.7) | M1b | `tests/_budget/test_llm_scope.py` |
 | `_agent/__init__.py` | Empty | M1b | — |
 | `_agent/manager.py` | `Manager` ABC, `LimitReached` | M1b | `tests/_agent/test_manager.py` |
-| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items | M1b | `tests/_agent/test_runtime.py` |
+| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items | M1b +M2 | `tests/_agent/test_runtime.py` |
 | `_agent/context.py` | `AgentContext` (public actions) | M1b +M2 | `tests/_agent/test_context.py` |
 | `_agent/tool_run.py` | The `run_tool` pipeline | M1b +M2 +M4 | `tests/_agent/test_tool_run.py` |
 | `_agent/repeats.py` | Repeat key and rules (§6.2) | M1b | `tests/_agent/test_repeats.py` |
@@ -319,6 +319,7 @@ Rules [plan]:
 | `_board/ingest.py` | Incremental chain download into the cache | M2 | `tests/_board/test_ingest.py` |
 | `_board/pointers.py` | `runs/<run-id>.json` pointers | M2 | `tests/_board/test_pointers.py` |
 | `_board/human_objects.py` | Review and curation objects and their fixed order | M2 | `tests/_board/test_human_objects.py` |
+| `_board/human_ops.py` | Shared CLI and viewer add, pin and hide validation and publication | M2 | `tests/_cli/test_arena_cmds.py`, `tests/_board/test_serve.py` |
 | `_board/learnings.py` | Posting rules: evidence, duplicate check, `refines`, `verified` | M2 | `tests/_board/test_learnings.py` |
 | `_board/leaderboard.py` | `Row` building, `min_improvement` | M2 | `tests/_board/test_leaderboard.py` |
 | `_board/pages.py` | Round pages | M2 | `tests/_board/test_pages.py` |
@@ -330,7 +331,7 @@ Rules [plan]:
 | `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3) | M1b +M2 +M3 | `tests/_engine/test_run.py` |
 | `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
-| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b | `tests/_engine/test_round.py` |
+| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
 | `_engine/stops.py` | Mid-round stop rules (§6.4); `ProviderStops`, the run's one provider-failure registry (M3, R4.13.10) | M1b +M3 | `tests/_engine/test_stops.py` |
 | `_engine/parts.py` | Part assignment, kept best of a part, join, re-join attempts (groups come from `_scoring/ranking.py`) | M1b | `tests/_engine/test_parts.py` |
 | `_engine/converge.py` | Select and team converge, final judge call | M1b | `tests/_engine/test_converge.py` |
@@ -341,7 +342,7 @@ Rules [plan]:
 | `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed` | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
 | `_cli/__init__.py` | Empty | M1a | — |
 | `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 | `tests/_cli/test_main.py` |
-| `_cli/run_cmds.py` | `run`, `status`, `stop`, `resume` | M1b | `tests/_cli/test_run_cmds.py` |
+| `_cli/run_cmds.py` | `run`, `status`, `stop`, `resume` | M1b +M2 | `tests/_cli/test_run_cmds.py` |
 | `_cli/arena_cmds.py` | `review`, `leaderboard`, `board`, `learnings`, `trace`, `reindex` | M2 | `tests/_cli/test_arena_cmds.py` |
 | `_cli/plan_cmd.py` | `plan`; imports `swarm_arena.llm` only inside the `--llm` and `--together` handlers | M3 | `tests/_cli/test_plan_cmd.py` |
 | `_cli/cluster_cmds.py` | `submit`, `reconcile` | M4 | `tests/_cli/test_cluster_cmds.py` |
@@ -383,7 +384,7 @@ Rules [plan]:
 | `testing/_contracts.py` | Result validation and shared return-type predicates | M1a | `tests/testing/test_conformance.py` |
 | `testing/_candidates.py` | `make_candidate` | M1a | `tests/testing/test_candidates.py` |
 | `testing/_artifacts.py` | `read_output_file`, `read_logs` | M1a | `tests/testing/test_artifacts.py` |
-| `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b | `tests/testing/test_harness.py` |
+| `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b +M2 | `tests/testing/test_harness.py` |
 | `testing/_fake_model.py` | `FakeModel`, `FakeTurn` (imports `agents` lazily) | M3 | `tests/testing/test_fake_model.py` |
 
 ### R3.2 Other test files (not 1:1 with a module)
@@ -395,6 +396,10 @@ Rules [plan]:
 | `tests/_fakes/engine.py` | Test-side env types and helpers for agent and engine tests (`RtEnv`, `CtxEnv`, `EngineEnv`, the config helpers `with_limits` and `with_executor`, `take_over_retrying`); importable as `_fakes.engine`, never collected | M1b (+M2) |
 | `tests/_agent/conftest.py` | Agent fixtures `rt_env` and `ctx_env`; M2 changes their board to `ArenaBoard` | M1b (+M2) |
 | `tests/_engine/conftest.py` | Engine fixture `env` (an `EngineEnv` on a real lease, journal, ledger, board, and executor); M2 Task 9 changes its board to `ArenaBoard` | M1b (+M2) |
+| `tests/_fakes/curators.py` | Deterministic merging, posting, and crash-boundary curator fixtures | M2 |
+| `tests/_fakes/journals.py` | A committed run journal written without the engine; `FakeRun`, `add_pointer`, and cache observation helpers | M2 |
+| `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
+| `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
@@ -429,7 +434,7 @@ Signatures only; bodies are `...`. The comment above each block names the privat
 - Type aliases (in `_model/base.py`) [plan]: `Origin = Literal["human", "llm", "together", "autonomous"]`; `LLMRole = Literal["manager", "judge", "planner", "curator"]`; `CallRole = Literal["manager", "judge", "planner", "curator", "tool"]`; `CatalogKind = Literal["tool", "manager", "check", "judge", "policy"]`; `JsonValue = pydantic.JsonValue`.
 - Times are timezone-aware UTC `datetime`, serialized as ISO-8601 with milliseconds and `Z` [plan].
 - **Component contract (§4.1).** Every component class (tool, manager, check, judge, policy, executor, board, curator) has `Config: ClassVar[type[BaseModel]]` (default: an empty model) and is built as `cls(cls.Config.model_validate(config))`. The instance exposes the validated model as `obj.config`. Built-ins also accept the spec's shorthand arguments (for example `KeepTopTeams(2)`), but always accept a single `Config` instance positionally. `__init__` does no I/O (§9 rule 3). Typing pattern (M1a, checked with ty 0.0.89): component classes inherit `_model/ref.py:Configurable`, whose `Config = EmptyConfig` is a plain class attribute with no annotation (ty rejects a nested `class Config` that overrides an annotated base attribute). `obj.config` is a read-only property; built-ins override it with their own `Config` as the return type. The `Config: ClassVar[type[BaseModel]]` lines in R4 describe this contract. Fields typed `Ref` are `RefField` (`Annotated[Ref, BeforeValidator(coerce_ref)]`): instances are converted at runtime; statically typed callers pass `Ref.of(obj)`.
-- **Ids [plan]:** `<prefix>-<run tag>-e<epoch>-<n:04d>`, for example `c-3f9a1c2b5d6e7f80-e1-0193`. The run tag is `sha256(run_id)[:16]` (64 bits), so two runs share ids only on a 64-bit tag clash (about 3e-10 for 100,000 runs), and ids are unique across epochs. `ArenaCache.ingest` (M2) skips an item whose id it already holds from another run and records a warning that names both runs. So `Board.get_candidate`, `get_learning`, lineage, `parents`, `evidence`, `refines`, `supersedes`, `trace`, and `board show` resolve one item, and gateway key aliases `cand-<candidate id>` are unique on a shared gateway. The counter per prefix continues across epochs. Prefixes: `c` candidate, `L` learning, `s` score, `r` reservation, `llm` LLM call, `x` command job, `k` gateway key alias suffix. Scores from `review import` take ids from the run's `IdGen` under the import's own epoch. Human learnings (`learnings add`, the board viewer) have no run or epoch: `L-h-<16 random hex>`. Run id: `YYYY-MM-DDTHH-MM-SSZ_<6 hex>`. Outside a run (`swarm_arena.testing`), the run id is `"local"`.
+- **Ids [plan]:** `<prefix>-<run tag>-e<epoch>-<n:04d>`, for example `c-3f9a1c2b5d6e7f80-e1-0193`. The run tag is `sha256(run_id)[:16]` (64 bits), so two runs share ids only on a 64-bit tag clash (about 3e-10 for 100,000 runs), and ids are unique across epochs. `ArenaCache.ingest` (M2) retains each colliding producer and records an identifier-only warning. Each frontier selects the lexicographically smallest visible producer key (`run:<run_id>` for journal rows, `object:<object_name>` for human rows) before applying query filters; arrival order does not change a recorded frontier. So `Board.get_candidate`, `get_learning`, lineage, `parents`, `evidence`, `refines`, `supersedes`, `trace`, and `board show` resolve one item, and gateway key aliases `cand-<candidate id>` are unique on a shared gateway. The counter per prefix continues across epochs. Prefixes: `c` candidate, `L` learning, `s` score, `r` reservation, `llm` LLM call, `x` command job, `k` gateway key alias suffix. Scores from `review import` take ids from the run's `IdGen` under the import's own epoch. Human learnings (`learnings add`, the board viewer) have no run or epoch: `L-h-<16 random hex>`. Run id: `YYYY-MM-DDTHH-MM-SSZ_<6 hex>`. Outside a run (`swarm_arena.testing`), the run id is `"local"`.
 - **Addresses:** agent `"<goal>/<team>/<agent>"`; team `"<goal>/<team>"`. `Decision.prune` keys are relative to the goal: `"<team>"` or `"<team>/<agent>"` [plan]. Ledger holders (R4.13.6) [plan]: agent address, `"<goal>/:judges"`, `"<goal>/:planner"`, `"<goal>/:curator"`, `"<goal>/:final"`, `":run"`.
 - **Errors visible to users** are subclasses of built-in exceptions, so the public surface stays as in §9 [plan]: plan and config errors are `ValueError`; soft action errors are `ValueError`; storage errors are `RuntimeError`; `LimitReached` is public.
 
@@ -941,8 +946,10 @@ class ScriptJudge(Judge):
 # _scoring/human_review.py — M2
 class HumanReview:                              # [plan] not a Judge subclass: it never runs inside a round
     def __init__(self, reviewer: str) -> None: ...
-    judge_name: str                             # "human:<reviewer>"
-    async def export(self, run_id: str, *, config: RunConfig, out_dir: Path, top: int = 20,
+    @property
+    def judge_name(self) -> str: ...             # read-only "human:<reviewer>"
+    @staticmethod
+    async def export(run_id: str, *, config: RunConfig, out_dir: Path, top: int = 20,
                      goal: str | None = None) -> Path: ...
     async def import_csv(self, run_id: str, csv_path: Path, *, config: RunConfig) -> list[Score]: ...
 ```
@@ -1231,6 +1238,8 @@ class BoardView(ABC):                           # one goal's round-start snapsho
     goal: GoalKey
     frontier: Frontier
     def _visible_candidate_ids(self) -> frozenset[str]: ...  # private seam: fixed snapshot goal/part membership, no I/O or charges; M2 views implement it too
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int: ...
+        # optional: defaults to len(self.learnings(namespace, goal=goal, limit=sys.maxsize)); hidden items never count
     # abstract read methods with signatures identical to Board's below, limited to the snapshot:
     # best, learnings, search_learnings, get_learning, get_candidate, scores, lineage, leaderboard.
     # A namespace or goal argument that differs from the view's raises ValueError [plan].
@@ -1279,7 +1288,7 @@ class Board(ABC):
     def leaderboard(self, goal: GoalKey, *, judge: str) -> list[Row]: ...
 
 # _board/curator.py — M2
-class Curator(ABC):
+class Curator(Configurable, ABC):
     Config: ClassVar[type[BaseModel]]
     def models(self) -> tuple[str, ...]: ...    # [plan] default ()
     @abstractmethod
@@ -1289,7 +1298,7 @@ class Curator(ABC):
 class ArenaBoard(Board):
     class Config(BaseModel):
         arena_root: str
-        cache_dir: str | None = None            # None → ~/.cache/swarm-arena/<sha256(arena_root)[:12]> [plan]
+        cache_dir: str | None = None            # None → $XDG_CACHE_HOME (default ~/.cache)/swarm-arena/<sha256(resolved arena_root)[:12]> [plan]
     def __init__(self, config: "ArenaBoard.Config | None" = None, /, **fields: Any) -> None: ...
 ```
 
@@ -1702,9 +1711,10 @@ def read_chain(store: Store, head: Head, *, stop_after: str | None = None) -> li
 ```python
 class ViewWriter:
     def __init__(self, store: Store, writer: JournalWriter) -> None: ...
-    async def write(self, key: str, content: bytes, *, source: Head) -> None: ...
+    async def write(self, key: str, content: bytes, *, source: Head, create_only: bool = False) -> None: ...
         # create; on AlreadyExists: same sha256 → done; else replace only if the existing source head is an
-        # earlier segment on writer.committed
+        # earlier segment on writer.committed. With create_only=True, any existing object is preserved;
+        # immutable round pages use this mode even when a peer published different bytes.
 def embed_source_head(fmt: Literal["json", "toml", "md"], content: bytes, source: Head) -> bytes: ...
     # [plan] json: top-level "source_head"; toml: first line "# swarm-arena source_head: e<epoch>/<seq>/<segment>";
     # md: first line "<!-- swarm-arena source_head: ... -->"
@@ -1721,6 +1731,8 @@ class RunState:                                      # pure fold of committed ev
     config: RunConfig                                # [plan] the journaled run_config with limits from the last
                                                      # limits_changed.new
     plans: dict[str, list[tuple[Plan, Origin]]]      # goal → revisions; origin from the journal only
+    plan_first_rounds: dict[str, list[int]]          # activation round parallel to each committed plan
+    def plan_for_round(self, goal_id: str, round: int) -> Plan: ...
     goals: dict[str, GoalState]                      # status, round, agents, decisions, frontier per round; [plan]
                                                      # GoalState.status "stopped" when goal_finished.reason is a stop reason (R4.14);
                                                      # a goal_started after a goal_finished (a continuation) sets status
@@ -1728,6 +1740,7 @@ class RunState:                                      # pure fold of committed ev
                                                      # preserves ordinary round/rounds_closed and finalization state,
                                                      # recording its own converge_round and frontier (converge=true)
     candidates: dict[str, Candidate]
+    candidate_goal_keys: dict[str, GoalKey]         # immutable producing group per candidate
     fingerprints: dict[str, str | None]             # tool_end fingerprint from the producing effective tool; null is always distinct
     scores: dict[str, Score]
     learnings: dict[str, Learning]
@@ -1744,7 +1757,11 @@ class RunState:                                      # pure fold of committed ev
     llm_request_sha256: dict[str, str]               # [plan] M3: LLM call id → request sha256, from llm_call events (R4.13.19)
 ```
 
-`GoalState.no_result_reason` retains `no_result.reason` independently of
+`GoalState.closed_seq` maps each ordinary round to its committed `round_closed` event sequence,
+used to freeze and repair immutable pages. `GoalState.curated_decisions` records
+completed `curated.decision_seq` values; the committed policy sequence distinguishes
+curation attempts across continued lifecycles. `GoalState.no_result_reason` retains
+`no_result.reason` independently of
 `end_reason` (`goal_finished.reason`) and resets on continuation. The existing
 `final_order` and `final_parts` fields retain `final_order.candidate_ids` and
 `final_order.parts`; a null parts mapping denotes a main-goal or joined result.
@@ -1755,7 +1772,12 @@ not on an ordinary round. Candidates, repeat keys, and fingerprints survive
 continuation. `plan_rejected` never adds a plan revision.
 
 Optional payload keys added in M1b fix rounds (journal v1 is unreleased, so no
-schema_version bump): `plan_revision.join_retry` and
+schema_version bump): `plan_revision.first_round: int` records the first applicable
+ordinary round; `RunState.plan_for_round` selects its committed revision, and
+`plan_first_rounds` retains activation alongside each plan. `plan_rejected.first_round`
+records the refused proposal boundary without creating a revision.
+`round_closed` carries `round`, `replan: bool`, and `reason: str | None`; closure
+precedes the next proposal. `plan_revision.join_retry` and
 `plan_rejected.join_retry` count completed retry proposals (one-based, independent of
 `join_failed.attempt`; accepted and refused proposals both use the allowance).
 `GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
@@ -2084,8 +2106,9 @@ class AgentRuntime:
     seed_parents: tuple[str, ...] = ()                # ordered assigned ids; manager sees a read-only tuple
         # Runner supplies permitted visibility for assigned candidates; never insert foreign results into own.
     rankings: Mapping[str, str] = field(default_factory=dict)
-        # Group key (empty for main, part name otherwise) to ranking judge; the round runner
-        # fills the own group from Plan.ranking_name() or the part ranking.
+        # Group key (empty for main, part name otherwise) to each declared current group
+        # ranking judge. Sibling views retain the same recorded frontier and producing-key scope.
+    sibling_views: Mapping[str, BoardView] = field(default_factory=dict)
     private_paths: frozenset[str] = frozenset()      # [plan] every check and judge file path of the revision (R4.13.9)
     stops: ProviderStops                             # [plan] M3: the run's one ProviderStops, shared by every goal round
                                                      # (EngineDeps.provider_stops, R4.13.13)
@@ -2300,7 +2323,7 @@ class GoalStatus(FrozenModel):
     # Never import components to resolve names, combine parts, or substitute a tuple key coordinate for value.
 class StatusReport(FrozenModel):
     run_id: str; epoch: int; owner_live: bool; head_seq: int
-    stop: Literal["none", "stop", "stop-now"]; goals: dict[str, GoalStatus]; spent: Amount; lost: int
+    stop: Literal["none", "stop", "stop-now"]; goals: dict[str, GoalStatus]; spent: SpendTotal; lost: int
     # spent uses reservation amounts while open/estimated/keep_charged, actual for settled, preserving overflow actuals.
     # stop is committed RunState.stop; lost is len(RunState.lost). One owner read selects the committed chain.
 def format_status(report: StatusReport) -> str: ...  # _engine/control.py
@@ -2332,9 +2355,11 @@ def mark_planning_session(plan: Plan, scope: LLMScope) -> Plan: ...
 ```python
 def build_frontier(board_reads: Sequence[tuple[str, str, Head]], reviews: Sequence[str],
                    curation: Sequence[str]) -> Frontier: ...
-def build_digest(view: BoardView, *, goal: GoalKey, round: int, ranking: str, cap_tokens: int, k: int = 5) -> str: ...
-    # [M2] multi-run views (ArenaBoard) add a keyword-only run_id: the "new since the last round" count is per owning run;
-    # M1b reads the run from RunBoard's single frontier mark
+def build_digest(view: BoardView, *, goal: GoalKey, run_id: str, round: int,
+                 ranking: str | Mapping[str | None, str], cap_tokens: int, k: int = 5) -> str: ...
+    # A str ranks every group under one judge; a mapping selects each group's judge (None is the main group),
+    # omitting groups without a mapping entry. The "new since the last round" count is namespace-wide for the explicit
+    # owning run in round minus one, independent of frontier mark ordering; it is omitted in round one.
     # [plan] estimate_tokens(the whole returned string: markers, headers, rows, titles, and the counts line) <= cap_tokens.
     # When even the markers and the counts line do not fit, it returns the counts line only, cut to at most cap_tokens
     # UTF-8 bytes at a character boundary.
@@ -2344,16 +2369,21 @@ def estimate_tokens(text: str) -> int: ...
     # no tokenizer dependency (§6.3). English text uses about a quarter of the cap; to show more titles, raise
     # digest_tokens.
 class ArenaCache:                                    # M2; SQLite (WAL) file per namespace
-    def __init__(self, path: Path) -> None: ...      # [plan] one connection (check_same_thread=False) guarded by one
-        # threading.RLock held across each whole transaction and each query through fetch; downloads happen outside the
+    def __init__(self, path: Path) -> None: ...      # [plan] a WAL writer connection plus a separate reader per
+        # published generation, each guarded by one threading.RLock held across each whole transaction and each query through fetch; downloads happen outside the
         # lock; holds a shared flock on <path>.lock until close, and reindex refuses while any is held
     def ingest(self, run_id: str, run_root: str, segments: Sequence[tuple[str, list[Event]]]) -> None: ...
-        # idempotent by (run, epoch, seq); an id already held from another run -> item skipped, warning (R4.0)
+        # idempotent by (run, epoch, seq); retain colliding producers and warn. At each frontier,
+        # the smallest visible producer key holds the id; earlier frontiers retain their holder.
     def newest_segment(self, run_id: str) -> str | None: ...
-    def apply_human_objects(self, names: Sequence[str], objects: Sequence[HumanObject]) -> None: ...
-    def search(self, namespace: str, query: str, *, frontier: Frontier, goal: GoalKey | None,
-               tags: Sequence[str], limit: int) -> list[str]: ...
-        # FTS5 bm25 over a per-frontier index of the frontier's learnings only, then §6.3 relevance
+    def apply_human_objects(self, names: Sequence[str], objects: Sequence[HumanObject], *,
+                            covered: Sequence[str] = ()) -> None: ...
+        # covered records fully read names atomically even when their JSONL contains no operations.
+    def find(self, frontier: Frontier, *, query: str | None, filters: LearningFilter,
+             relevance_goal: tuple[str, str] | None, offset: int = 0, limit: int = 10) -> list[str]: ...
+        # FTS5 bm25 over the fixed frontier corpus, then learning relevance; predicates and pagination in SQL.
+    def count(self, frontier: Frontier, *, filters: LearningFilter) -> int: ...
+        # Non-text match count in SQL without model hydration.
 class RunPointer(StoredModel):  run_id: str; run_root: str
 class HumanObject(StoredModel):                      # reviews/ and curation/ objects (one JSONL line each)
     kind: Literal["pin", "hide", "add", "review"]
@@ -2480,7 +2510,21 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
 
-`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, `manifest`, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ...}`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started` (payload `select_only`, optional `reason`: the pending lifecycle termination reason, retained through takeover; absent/null means a natural end), `final_order` (payload `candidate_ids`, `parts`, optional `reason`: the termination reason at committed selection, used by finish-only recovery; absent/null means a natural end), `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, `manifest`, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, `first_round`, optional `join_retry`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ..., "first_round": ...}`, optional `join_retry`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started` (payload `select_only`, optional `reason`: the pending lifecycle termination reason, retained through takeover; absent/null means a natural end), `final_order` (payload `candidate_ids`, `parts`, optional `reason`: the termination reason at committed selection, used by finish-only recovery; absent/null means a natural end), `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+
+M2 payloads remain plain dictionaries at journal v1. Engine-run events may also
+carry `run_elapsed_s`; standalone human review does not start an engine clock.
+The current committed producer keys used by M2 readers are:
+
+| Event | Payload keys and interpretation |
+| --- | --- |
+| `round_started` | `round`, `shares`; converge rounds also set `converge`. |
+| `decision` | `round`, `decision` (a JSON-mode Decision dump). |
+| `round_closed` | `round`, `run_elapsed_s`, `replan`, `reason`; its event sequence populates `GoalState.closed_seq`. |
+| `curated` | `round`, `revision`, `decision_seq`, `summaries`, `supersedes`, `errors`; summary learning events and the completion receipt commit together. `decision_seq` identifies the applicable committed policy across lifecycles. |
+| `review_imported` | `reviewer`, `scores`, `objects`; score `batch_id` is the exact review object key. Repair reproduces those names and canonical bytes. Arena review objects alone supply human scores. |
+| `converge_started` | `select_only`, `reason`; retains lifecycle termination through takeover. |
+| `final_order` | `candidate_ids`, `parts`, `reason`. |
 
 ### R4.15 Stored formats and `schema_version`
 
@@ -2512,7 +2556,7 @@ These artifact models are distinct from
 - **Python:** 3.11 or newer, **POSIX** only (no Windows). `requires-python = ">=3.11"`.
 - **Async:** the anyio API on the **asyncio backend only** (§4.8). Tests pin `anyio_backend = "asyncio"`. `Swarm` raises on another backend. The CLI uses `anyio.run(..., backend="asyncio")`.
 - **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. [plan] lower bounds: `pydantic>=2.11,<3`, `typing-extensions>=4.12`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
-- **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.105.1,<1.106` (with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=<floor>`, `aiobotocore>=<floor>` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
+- **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.105.1,<1.106` (with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=2023.12.1`, `aiobotocore>=2.16.0` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
 - **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=4`.
 - **Tooling:** uv (`uv init --lib`, src layout, `py.typed`, build backend `uv_build>=0.13.1,<0.14`), ruff with numpy docstring rules, ty pinned exactly, pytest 9 with anyio's plugin and `anyio_mode = "auto"`, `-W error::DeprecationWarning`, an `__all__` snapshot test per public module.
 - **The core never imports** `agents`, `litellm`, `ray`, `s3fs`, `langfuse`, or `a2a`. A tool program is never imported by the core or the driver, except a `FunctionTool` function (R5.4 item 12). Managers, judges, planners, and the board run in the driver; only tool runs and `ctx.execute` go to the executor.
@@ -2616,7 +2660,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 8. `validate_plan(plan, config, *, history, other_active_agents) -> list[str]` (warnings). The core admits every revision through `admit_revision` (R4.13.12): a non-human revision passes the non-importing catalog check before any import or snapshot, and snapshots happen before `validate_plan`.
 9. `Swarm.run` returns `dict[goal_id, list[Candidate]]` in final-judge order (R4.1).
 10. CI splits `core` (no extras) and `extras` jobs; ruff `TID251` bans optional imports outside their modules (R2.0, R5.3).
-11. **Deviation from the §7.1 layout:** stop files are per epoch, `control/stop-e<epoch>` and `control/stop-now-e<epoch>`, not `control/stop` and `control/stop-now`, because `Store` has no delete and a resumed owner must not obey an old stop (R4.13.13). The run folder also gets `review/`, the end-of-run review export (§5 step 8, M2).
+11. **Deviation from the §7.1 layout:** stop files are per epoch, `control/stop-e<epoch>` and `control/stop-now-e<epoch>`, not `control/stop` and `control/stop-now`, because `Store` has no delete and a resumed owner must not obey an old stop (R4.13.13). The run folder also gets `<run_root>/<run-id>/review/e<epoch>-<seq>/`, the immutable end-of-run review export (§5 step 8, M2).
 12. **Exception to §4.3** ("the tool program is never imported by the core or the driver"): the driver imports a `FunctionTool` function to build its input model from the signature (R4.2). `FunctionTool` is for trusted, importable human code; `ScriptTool` scripts and connector tool programs are never imported.
 13. **Deviation from §7 and §11** ("the core reaches storage through `fsspec`"): the core reaches storage through the `Store` ABC. `LocalStore` uses `os` calls (`O_EXCL`, `flock`, `os.replace`), and `S3Store` uses `s3fs`, an fsspec implementation, so `fsspec` is not a direct core dependency (R5.1). Another backend (for example GCS) is a new `Store` subclass with conditional writes.
 14. **Stops on resume [plan]:** a goal stopped by `stop` or `stop --now` with rounds left continues on resume; a goal stopped by a limit (`run_timeout_s`, run or goal budget, `reserve_exhausted`) continues only when the resume changes the limits (`limits_changed`). Every goal end returns its unused pool (spec 4.10), live and in `Ledger.replay`. Resume re-opens each continued goal with a journaled `goal_started` `{pool}`: its `goal_weights` share of the free work pool, before that resume's `limits_changed`. It runs a new lifecycle, and its `solution.json` is replaced from the later head.

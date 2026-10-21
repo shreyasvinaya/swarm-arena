@@ -1,10 +1,10 @@
-"""Define conditional storage operations and select the local backend."""
+"""Define conditional storage operations and select the storage backend."""
 
 import re
 from abc import ABC, abstractmethod
 from typing import NamedTuple
 
-from swarm_arena._errors import ConditionalWritesUnsupported
+from swarm_arena._errors import ConditionalWritesUnsupported, _core_error
 
 
 class Blob(NamedTuple):
@@ -25,6 +25,15 @@ class Blob(NamedTuple):
 
     data: bytes
     etag: str
+
+
+def _read_blob(store: "Store", key: str) -> Blob:
+    """Detach a backend read in the worker before bytes or versions reach the loop."""
+    blob = store.read(key)
+    data, etag = blob.data, blob.etag
+    if not isinstance(data, bytes) or not isinstance(etag, str):
+        raise TypeError("invalid storage blob")
+    return Blob(memoryview(data).tobytes(), str.__str__(etag))
 
 
 def _check_key(key: str) -> str:
@@ -223,24 +232,24 @@ class Store(ABC):
 
 
 def open_store(url: str) -> Store:
-    """Open local storage or reject an unsupported URL scheme.
+    """Open local or S3 storage without performing I/O.
 
     Parameters
     ----------
     url : str
-        Local path, optionally starting with a tilde. URL schemes, including
-        ``file://``, are refused. S3 support requires the ``swarm-arena[s3]``
-        extra planned for M2.
+        Local path, optionally starting with a tilde, or an ``s3://`` root.
+        S3 requires the ``swarm-arena[s3]`` extra. Other URL schemes,
+        including ``file://``, are refused.
 
     Returns
     -------
     Store
-        Local store with an expanded, resolved root.
+        Local store with a resolved root, or a lazy S3 store.
 
     Raises
     ------
     ConditionalWritesUnsupported
-        If the location includes a URL scheme.
+        If the scheme is unsupported or the S3 extra is missing.
 
     Examples
     --------
@@ -255,9 +264,12 @@ def open_store(url: str) -> Store:
         # Only fixed, recognized scheme names may appear in diagnostics.
         scheme = match.group(1).lower()
         if scheme == "s3":
-            raise ConditionalWritesUnsupported("s3:// needs the swarm-arena[s3] extra (M2)")
-        label = f"{scheme}://" if scheme in {"s3", "gs", "file"} else "URL"
-        raise ConditionalWritesUnsupported(
-            f"{label} has no conditional writes; swarm-arena refuses to run on it"
+            from swarm_arena._store.s3 import S3Store
+
+            return S3Store(url)
+        label = f"{scheme}://" if scheme in {"gs", "file"} else "URL"
+        raise _core_error(
+            ConditionalWritesUnsupported,
+            f"{label} has no conditional writes; swarm-arena refuses to run on it",
         )
     return LocalStore(Path(url).expanduser().resolve())

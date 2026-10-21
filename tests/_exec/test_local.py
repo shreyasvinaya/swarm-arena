@@ -102,6 +102,17 @@ def log(tmp_path: Path, out: ToolOutput, which: int) -> bytes:  # 1 = stdout, 2 
     return store(tmp_path).get_bytes(out.logs_ref.split(":")[which])
 
 
+@pytest.fixture
+def kept_executor(tmp_path: Path) -> LocalExecutor:
+    return LocalExecutor(workspace_root=str(tmp_path / "ws"), keep_workspaces=True)
+
+
+def _workspace_log(tmp_path: Path, which: int) -> bytes:
+    """Inspect local diagnostics when cancellation has ended artifact publication."""
+    [workspace] = (tmp_path / "ws").iterdir()
+    return (workspace / "swarm" / ("stdout.log" if which == 1 else "stderr.log")).read_bytes()
+
+
 async def test_tool_never_runs_when_start_commit_fails(
     local_executor: LocalExecutor, tmp_path: Path
 ) -> None:  # exit criterion
@@ -236,8 +247,8 @@ async def test_cancel_delivers_partial_through_on_partial(
     assert [(o.status, o.partial, o.data) for o in got] == [
         (RunStatus.CANCELLED, True, {"step": 2})
     ]
-    assert got[0].logs_ref is not None
-    assert got[0].logs_ref.startswith("sha256:")
+    assert got[0].logs_ref is None
+    assert got[0].files == []
     assert list((tmp_path / "ws").iterdir()) == []
 
 
@@ -578,7 +589,7 @@ def ready_file(ws: Path) -> Callable[[], Awaitable[bool]]:
 
 @pytest.mark.parametrize(("budget", "kept"), [(30.0, True), (0.2, False)])
 async def test_cancel_after_normal_exit_keeps_the_result(
-    local_executor: LocalExecutor,
+    kept_executor: LocalExecutor,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     budget: float,
@@ -596,7 +607,7 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     COLLECTING.clear()
     code = WRITE.format("{'data': {'v': 7}}")  # exits 0 with a valid result
     job = tool_job(tmp_path, code, tool_cls=SlowCollectTool, on_partial=on_partial)
-    await cancel_when(lambda: local_executor.submit(job), collecting)
+    await cancel_when(lambda: kept_executor.submit(job), collecting)
     [out] = got
     assert out.status is RunStatus.CANCELLED
     assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
@@ -604,8 +615,8 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     assert out.ended_at is not None
     assert out.started_at <= out.ended_at
     if not kept:
-        assert b"no partial output" in log(tmp_path, out, 2)
-    assert list((tmp_path / "ws").iterdir()) == []
+        assert b"no partial output" in _workspace_log(tmp_path, 2)
+    assert out.logs_ref is None
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
@@ -671,7 +682,7 @@ async def test_cancel_during_staging_delivers_nothing(
     assert workspace.is_dir()
 
 
-async def test_failed_cancel_path_upload_sends_no_unstored_refs(
+async def test_cancel_skips_unavailable_uploads_and_sends_no_unstored_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     got: list[ToolOutput] = []
@@ -702,7 +713,7 @@ async def test_failed_cancel_path_upload_sends_no_unstored_refs(
     assert out.logs_ref is None
     assert out.started_at is not None
     [workspace] = list(ws.iterdir())
-    assert "uploads failed: StorageError" in (workspace / "swarm" / "stderr.log").read_text()
+    assert "uploads failed" not in (workspace / "swarm" / "stderr.log").read_text()
 
 
 async def test_missing_cwd_is_a_job_error(local_executor: LocalExecutor, tmp_path: Path) -> None:
@@ -1144,7 +1155,7 @@ def _not_a_tool_output(kind: str) -> Any:
 @pytest.mark.parametrize("kind", ["dict", "none", "construct", "copy"])
 @pytest.mark.parametrize("path", ["exit", "timeout", "cancel"])
 async def test_collect_must_return_a_valid_tool_output(
-    local_executor: LocalExecutor,
+    kept_executor: LocalExecutor,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     kind: str,
@@ -1161,20 +1172,23 @@ async def test_collect_must_return_a_valid_tool_output(
 
         code = "open('ready', 'w'); import time; time.sleep(60)"
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
-        await cancel_when(lambda: local_executor.submit(job), ready_file(tmp_path / "ws"))
+        await cancel_when(lambda: kept_executor.submit(job), ready_file(tmp_path / "ws"))
         [out] = got
         status = RunStatus.CANCELLED
     elif path == "timeout":
         code = "import time; time.sleep(60)"
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=0.5, grace_s=0.2)
-        out = await local_executor.submit(job)
+        out = await kept_executor.submit(job)
         status = RunStatus.TIMEOUT
     else:
-        out = await local_executor.submit(tool_job(tmp_path, "pass", tool_cls=OkCollectTool))
+        out = await kept_executor.submit(tool_job(tmp_path, "pass", tool_cls=OkCollectTool))
         status = RunStatus.ERROR
     # The collect gave no valid ToolOutput, so partial is False on every path.
     assert (out.status, out.partial, out.data, out.files) == (status, False, {}, [])
-    assert b"collect failed: Tool.collect() did not return a ToolOutput" in log(tmp_path, out, 2)
+    diagnostic = _workspace_log(tmp_path, 2) if path == "cancel" else log(tmp_path, out, 2)
+    assert b"collect failed: Tool.collect() did not return a ToolOutput" in diagnostic
+    if path == "cancel":
+        assert out.logs_ref is None
     assert out.started_at is not None
 
 
@@ -1207,12 +1221,12 @@ async def _cancel_when_ready(
     [
         (None, False, ({}, [])),  # no result.json: the data is empty and not partial (spec 5)
         ("{'data': {}}", True, ({}, [])),  # a valid result, even an empty one, is partial
-        ("{'data': {}, 'files': ['out/x.txt']}", True, ({}, ["out/x.txt"])),
+        ("{'data': {}, 'files': ['out/x.txt']}", True, ({}, [])),
         ("{'data': {'step': 3}}", True, ({"step": 3}, [])),
     ],
 )
 async def test_stopped_run_is_partial_only_with_a_valid_result(
-    local_executor: LocalExecutor,
+    kept_executor: LocalExecutor,
     tmp_path: Path,
     result: str | None,
     partial: bool,
@@ -1220,10 +1234,11 @@ async def test_stopped_run_is_partial_only_with_a_valid_result(
 ) -> None:
     write = "" if result is None else "; " + WRITE.format(result)
     code = "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x')" + write
-    out = await _cancel_when_ready(local_executor, tmp_path / "ws", {}, tmp_path, code)
+    out = await _cancel_when_ready(kept_executor, tmp_path / "ws", {}, tmp_path, code)
     assert (out.status, out.partial) == (RunStatus.CANCELLED, partial)
     assert (out.data, [ref.path for ref in out.files]) == kept
-    stderr = log(tmp_path, out, 2)
+    assert out.logs_ref is None
+    stderr = _workspace_log(tmp_path, 2)
     assert b"no partial output" not in stderr  # the collect itself did not fail
     assert (b"swarm/result.json is missing" in stderr) is (result is None)
 
@@ -1231,7 +1246,7 @@ async def test_stopped_run_is_partial_only_with_a_valid_result(
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
 @pytest.mark.parametrize("says_partial", [False, True])
 async def test_valid_empty_collect_output_is_partial_only_if_it_says_so(
-    local_executor: LocalExecutor,
+    kept_executor: LocalExecutor,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stop: str,
@@ -1247,17 +1262,20 @@ async def test_valid_empty_collect_output_is_partial_only_if_it_says_so(
             timeout_s=0.5,
             grace_s=0.2,
         )
-        out, status = await local_executor.submit(job), RunStatus.TIMEOUT
+        out, status = await kept_executor.submit(job), RunStatus.TIMEOUT
     else:
         kw = {"tool_cls": OkCollectTool}
-        out = await _cancel_when_ready(local_executor, tmp_path / "ws", kw, tmp_path, "pass")
+        out = await _cancel_when_ready(kept_executor, tmp_path / "ws", kw, tmp_path, "pass")
         status = RunStatus.CANCELLED
     assert (out.status, out.partial, out.data, out.files) == (status, says_partial, {}, [])
-    assert b"no partial output" not in log(tmp_path, out, 2)
+    diagnostic = _workspace_log(tmp_path, 2) if stop == "cancel" else log(tmp_path, out, 2)
+    assert b"no partial output" not in diagnostic
+    if stop == "cancel":
+        assert out.logs_ref is None
 
 
 @pytest.mark.parametrize("drop", ["cap", "upload"])
-async def test_partial_stays_true_when_kept_files_are_dropped_later(
+async def test_cancel_keeps_partial_when_files_cannot_be_uploaded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drop: str
 ) -> None:
     ws = tmp_path / "kept"
@@ -1284,11 +1302,10 @@ async def test_partial_stays_true_when_kept_files_are_dropped_later(
     )
     code = "import os; os.makedirs('out'); open('out/x.txt', 'w').write('x')"
     out = await _cancel_when_ready(ex, ws, {}, tmp_path, code)
-    status = RunStatus.ERROR if drop == "cap" else RunStatus.CANCELLED  # over a cap is an error
-    assert (out.status, out.partial, out.data, out.files) == (status, True, {}, [])
+    assert (out.status, out.partial, out.data, out.files) == (RunStatus.CANCELLED, True, {}, [])
+    assert out.logs_ref is None
     [workspace] = list(ws.iterdir())
-    note = "crosses max_output_bytes" if drop == "cap" else "uploads failed: StorageError"
-    assert note in (workspace / "swarm" / "stderr.log").read_text()
+    assert (workspace / "out/x.txt").read_bytes() == b"x"
 
 
 @pytest.mark.parametrize(
@@ -1486,8 +1503,12 @@ async def test_files_only_collect_counts_as_partial(
         )
         expected = RunStatus.TIMEOUT
     assert (out.status, out.partial, out.data) == (expected, True, {})
-    assert [ref.path for ref in out.files] == ["out/x.txt"]
-    assert store(tmp_path).get_bytes(out.files[0].sha256) == b"x"
+    if stop == "cancel":
+        assert out.files == []
+        assert out.logs_ref is None
+    else:
+        assert [ref.path for ref in out.files] == ["out/x.txt"]
+        assert store(tmp_path).get_bytes(out.files[0].sha256) == b"x"
 
 
 @pytest.mark.parametrize("extra", [0, 1])

@@ -654,6 +654,7 @@ def test_rejected_plan_does_not_replace_revisions() -> None:
 def test_reserve_exhaustion_enters_select_only() -> None:
     state = RunState.from_events([*_PRE, _ev(3, "reserve_exhausted", {}, goal_id="g")])
     assert state.goals["g"].select_only
+    assert state.goals["g"].pending_reason is None
 
 
 def test_plan_replay_refuses_null_in_nested_config() -> None:
@@ -888,3 +889,110 @@ def test_legacy_revision_before_closure_applies_to_successor_round() -> None:
     assert state.plan_for_round("g", 1).revision == 0
     assert state.plan_for_round("g", 2).revision == 1
     assert state.goals["g"].replanned_rounds == [1, 2]
+
+
+def test_replay_accepts_curated() -> None:
+    receipt = _ev(
+        3,
+        "curated",
+        {
+            "summaries": [],
+            "supersedes": {},
+            "errors": [],
+            "decision_seq": 2,
+            "revision": 0,
+            "round": 1,
+        },
+        goal_id="g",
+    )
+    state = RunState.from_events([*_PRE, receipt])
+    assert state.learnings == {}
+    assert state.scores == {}
+    assert state.goals["g"].curated_decisions == [2]
+    assert state.goals["g"].join_phase == "converge"
+
+
+def test_curated_preserves_retry_and_pending_replan() -> None:
+    events = [
+        *_PRE,
+        _ev(3, "join_failed", {"attempt": 1, "reasons": ["retry"]}, goal_id="g"),
+        _ev(4, "plan_rejected", {"first_round": 2, "join_retry": 1}, goal_id="g"),
+        _ev(5, "round_closed", {"round": 2, "replan": True}, goal_id="g"),
+    ]
+    before = RunState.from_events(events).goals["g"]
+    after = RunState.from_events(
+        [
+            *events,
+            _ev(
+                6,
+                "curated",
+                {
+                    "summaries": [],
+                    "supersedes": {},
+                    "errors": [],
+                    "decision_seq": 2,
+                    "revision": 0,
+                    "round": 2,
+                },
+                goal_id="g",
+            ),
+        ]
+    ).goals["g"]
+    assert after.model_copy(update={"curated_decisions": []}) == before
+
+
+@pytest.mark.parametrize("receipt", [False, True])
+def test_curator_refusal_replays_terminal_disposition(receipt: bool) -> None:
+    events = [
+        *_PRE,
+        _ev(3, "round_started", {"round": 1}, goal_id="g"),
+        _ev(4, "decision", {"round": 1, "decision": {}}, goal_id="g"),
+        _ev(5, "reserve_exhausted", {"round": 1, "reason": "reserve_exhausted"}, goal_id="g"),
+    ]
+    if receipt:
+        events.append(
+            _ev(6, "curated", {"decision_seq": 4, "summaries": [], "errors": []}, goal_id="g")
+        )
+    events.append(_ev(7, "takeover", {"force": True}, epoch=2))
+    state = RunState.from_events(events).goals["g"]
+    assert state.pending_reason == "reserve_exhausted"
+    assert state.select_only
+    assert state.pending_replan is None
+    assert state.curated_decisions == ([4] if receipt else [])
+
+
+def test_closed_seq_per_round() -> None:
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(7, "round_closed", {"round": 1, "replan": True}, goal_id="g"),
+            _ev(12, "round_closed", {"round": 2, "reason": "stop"}, goal_id="g"),
+        ]
+    )
+    goal = state.goals["g"]
+    assert goal.closed_seq == {1: 7, 2: 12}
+    assert goal.pending_replan == 2
+    assert goal.pending_reason == "stop"
+
+
+def test_replay_accepts_review_imported() -> None:
+    score = Score(
+        id="s-0123456789abcdef-e2-0042", candidate_id="c", judge="human:alice", key=(1, 7)
+    )
+    state = RunState.from_events(
+        [
+            *_PRE,
+            _ev(
+                3,
+                "review_imported",
+                {
+                    "reviewer": "alice",
+                    "scores": [score.model_dump(mode="json")],
+                    "objects": [],
+                },
+                epoch=2,
+            ),
+        ]
+    )
+    assert state.scores == {}
+    assert state.id_counters["s"] == 42

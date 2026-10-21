@@ -6,14 +6,21 @@ from dataclasses import dataclass
 from functools import partial
 from inspect import isawaitable, iscoroutinefunction
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
+import anyio.lowlevel
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.curator import (
+    Curator,
+    _curator_error,
+    _prepare_curator,
+    _stamp_summaries,
+)
+from swarm_arena._board.pages import _closed_prefix, page_key, round_page
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import judge_amount, make_price_of
 from swarm_arena._budget.ledger import Reservation
@@ -25,19 +32,30 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
+from swarm_arena._errors import (
+    Fenced,
+    PlanError,
+    StorageError,
+    _core_error,
+    _exception_type_name,
+    _is_core_signal,
+    _with_exception_type,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.lease import Head
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
+from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._model.base import CallRole
+from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
-from swarm_arena._model.results import AgentStatus, Candidate
+from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.tooling import RunStatus
 from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._planning.planner import Planner
@@ -119,6 +137,109 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "first_round": 1,
         },
     )
+
+
+async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier) -> int:
+    """Read the historical count without retaining a cancelled goal or owner."""
+    outcome = _Outcome()
+    try:
+
+        def read() -> int:
+            view = deps.board.snapshot(plan.goal.key(), frontier)
+            count = view.count_learnings(plan.goal.namespace)
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError("invalid learning count")
+            count = int.__int__(count)
+            if count < 0:
+                raise ValueError("invalid learning count")
+            return count
+
+        return await run_sync_daemon(read)
+    except BaseException as error:
+        outcome.contain(error, RuntimeError, "round page board read")
+
+
+async def _page_storage(operation: Callable[[], Awaitable[_T]]) -> _T:
+    """Contain backend failures while preserving registered control outcomes."""
+    outcome = _Outcome()
+    try:
+        return await operation()
+    except BaseException as error:
+        outcome.propagate_control(error)
+        if type(error) is StorageError and _is_core_signal(error):
+            # A nested view boundary retains the backend type; the page owns
+            # the public site label. Preserve distinct core errors such as ChainError.
+            name = _exception_type_name(error)
+            raise _with_exception_type(
+                _core_error(StorageError, f"round page storage failed: {name}"), name
+            ) from None
+        outcome.contain(error, StorageError, "round page storage")
+
+
+async def _publish_round_page(
+    deps: EngineDeps, prefix: RunState, goal_id: str, round: int, seq: int
+) -> None:
+    """Publish one recorded page within its owner's supervised lifetime."""
+    plan = prefix.plan_for_round(goal_id, round)
+    frontier = prefix.goals[goal_id].frontiers[round]
+    key = page_key(goal_id, round)
+
+    def exists() -> bool:
+        result = deps.store.exists(key)
+        if type(result) is not bool:
+            raise TypeError("invalid page existence result")
+        return result
+
+    if await _page_storage(partial(run_sync_daemon, exists)):
+        return
+    recorded_count = await _page_namespace_count(deps, plan, frontier)
+    count = recorded_count + sum(
+        item.goal_id == goal_id
+        and item.run_id == prefix.run_id
+        and item.round == round
+        and item.namespace == plan.goal.namespace
+        for item in prefix.learnings.values()
+    )
+    # Retain the close's original provenance when repairing a missing page.
+    segment = next(s for s in deps.journal.committed if parse_segment_name(s)[1] >= seq)
+    epoch, last_seq = parse_segment_name(segment)
+    source = Head(epoch=epoch, seq=last_seq, segment=segment)
+    content = round_page(prefix, goal_id, round, namespace_learnings=count)
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    if deps.journal.fenced.is_set():
+        raise _core_error(Fenced)
+    # ViewWriter adds provenance without transforming the rendered body.
+    await _page_storage(partial(deps.views.write, key, content, source=source, create_only=True))
+
+
+async def _repair_round_pages(
+    deps: EngineDeps,
+    state: RunState,
+    *,
+    goal_id: str | None = None,
+    closed_round: int | None = None,
+    supervisor: "GoalRunner | None" = None,
+) -> None:
+    """Publish absent pages from recorded frontiers without any paid work."""
+    for id, goal in state.goals.items():
+        if goal_id is not None and id != goal_id:
+            continue
+        for round, seq in sorted(goal.closed_seq.items()):
+            if closed_round is not None and round != closed_round:
+                continue
+            prefix = _closed_prefix(state, id, round)
+            plan = prefix.plan_for_round(id, round)
+            page_supervisor = supervisor or GoalRunner(
+                deps, goal_id=id, plan=plan, replanner=None, state=goal
+            )
+
+            completed, _ = await page_supervisor._supervised_step(
+                partial(_publish_round_page, deps, prefix, id, round, seq),
+                final=True,
+                settle_on_stop=True,
+            )
+            if not completed:
+                return
 
 
 class GoalRunner:
@@ -247,16 +368,31 @@ class GoalRunner:
 
     async def _refresh(self) -> None:
         """Fold only a committed head, including the durable fingerprint map."""
-        head = await self.deps.journal.commit()
-        if head is not None:
-            chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, head)
+
+        async def read() -> list[tuple[str, list[Event]]] | None:
+            head = await self.deps.journal.commit()
+            return await _read_chain(self.deps.store, head) if head is not None else None
+
+        chain = await self._storage_step(read)
+        if chain is not None:
             self._events = [event for _, events in chain for event in events]
             self.recorded = RunState.from_events(self._events)
+
+    async def _storage_step(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Keep retained storage reads and writes within final-work supervision."""
+        completed, result = await self._supervised_step(operation, final=True, settle_on_stop=True)
+        if not completed:
+            raise _core_error(RuntimeError, "goal storage settlement timed out")
+        return cast(_T, result)
+
+    async def _write_view(self, key: str, content: bytes, *, source: Head) -> None:
+        """Publish a retained view under the same deadline and ownership checks."""
+        await self._storage_step(partial(self.deps.views.write, key, content, source=source))
 
     async def _plan_view(self) -> None:
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/plan.r{self.plan.revision}.toml",
             self.plan.dumps().encode(),
             source=head,
@@ -298,11 +434,6 @@ class GoalRunner:
                 )
         if self._recovering_converge and self.plan.converge.team in teams:
             self._recovering_converge = False
-        board = self.deps.board
-        if isinstance(board, RunBoard):
-            board.register_goal(self.plan.goal.key(), self.goal_id, None)
-            for part in self.plan.parts:
-                board.register_goal(part.goal.key(), self.goal_id, part.name)
         return slots
 
     def _restore_watchdog(self, key: str) -> Watchdog:
@@ -337,7 +468,7 @@ class GoalRunner:
         await self._refresh()
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/solution.json",
             solution_view(self.recorded, self.goal_id, head),
             source=head,
@@ -356,7 +487,7 @@ class GoalRunner:
         )
 
     async def _restore_terminal_decision(self) -> None:
-        """Restore this lifecycle/revision's terminal policy and any owed closure."""
+        """Restore terminal policy/curation state and any owed round closure."""
         latest: tuple[int, Decision] | None = None
         for event in self._events:
             if event.goal_id != self.goal_id:
@@ -375,9 +506,11 @@ class GoalRunner:
             round, decision = latest
             if decision.no_result:
                 self.status, self.reason = "no_result", decision.no_result
-                if round > self.rounds_closed:
-                    self.rounds_closed = round
-                    await self._close_round(round, replan=False)
+            if (
+                decision.no_result or self.reason == "reserve_exhausted"
+            ) and round > self.rounds_closed:
+                self.rounds_closed = round
+                await self._close_round(round, replan=False)
 
     def _merge_repeats(self, entries: Sequence[tuple[str, Candidate]]) -> None:
         seen = {candidate.id for _, candidate in self.repeat_entries}
@@ -497,7 +630,7 @@ class GoalRunner:
         await tranche.close()
 
     async def _supervised_step(
-        self, operation: Callable[[], Awaitable[_T]], *, final: bool
+        self, operation: Callable[[], Awaitable[_T]], *, final: bool, settle_on_stop: bool = False
     ) -> tuple[bool, _T | None]:
         """Supervise hooks and contain nonstandard operation failures.
 
@@ -539,7 +672,11 @@ class GoalRunner:
                         if stopped and not final:
                             break
                         delay = 0.05
-                        if final and (self.deps.stops.stop_now or self.deps.stops.run_timeout):
+                        if final and (
+                            self.deps.stops.stop_now
+                            or self.deps.stops.run_timeout
+                            or (settle_on_stop and self.deps.stops.stop)
+                        ):
                             if grace_until is None:
                                 grace_until = (
                                     anyio.current_time() + self.deps.config.settle_timeout_s
@@ -568,7 +705,13 @@ class GoalRunner:
         return (True, results[0]) if results else (False, None)
 
     def _judge_context(
-        self, ref: Ref, batch: Sequence[Candidate], round: int, *, final: bool = False
+        self,
+        ref: Ref,
+        batch: Sequence[Candidate],
+        round: int,
+        *,
+        batch_id: str,
+        final: bool = False,
     ) -> JudgeContext:
         deps = self.deps
         first = batch[0]
@@ -584,6 +727,7 @@ class GoalRunner:
             goal=goal,
             executor=executor,
             artifact_root=deps.config.artifact_root,
+            batch_id=batch_id,
             run_id=deps.run_id,
             round=round,
             part=first.part,
@@ -753,8 +897,8 @@ class GoalRunner:
                         [(ref, judge)],
                         batch,
                         leaders,
-                        lambda _, ref=ref, prepared=prepared: self._judge_context(
-                            ref, prepared[0], round
+                        lambda _, ref=ref, prepared=prepared, key=key: self._judge_context(
+                            ref, prepared[0], round, batch_id=f"barrier-{key}"
                         ),
                         prepared=prepared,
                     )
@@ -855,7 +999,7 @@ class GoalRunner:
                         goal_id=self.goal_id,
                         on_admit=on_admit,
                     )
-                ctx = self._judge_context(ref, finalists, 0, final=True)
+                ctx = self._judge_context(ref, finalists, 0, batch_id=f"final-{key}", final=True)
                 dispatched = True
                 return await final_judge(
                     self.goal_id,
@@ -866,26 +1010,13 @@ class GoalRunner:
 
         try:
             order: list[Candidate] = []
+            completed = True
             try:
                 completed, result = await self._supervised_step(invoke, final=True)
                 if completed:
                     assert result is not None
                     order, outcome = result
                 else:
-                    await self._refresh()
-                    state = self._round_state()
-                    identity = state.ranking_identity.get(None)
-                    if identity is not None:
-                        order = [
-                            c
-                            for c, _ in ranked(
-                                finalists,
-                                state.scores,
-                                identity=identity,
-                                fidelity=None,
-                                allow_partial=self.plan.converge.allow_partial,
-                            )
-                        ]
                     raise TimeoutError
             except Fenced:
                 raise
@@ -893,6 +1024,8 @@ class GoalRunner:
                 self.status, self.reason = "no_result", "final slice used up"
                 return []
             except Exception as error:
+                if self.deps.journal.fenced.is_set():
+                    raise
                 outcome = JudgeOutcome(
                     scores=[],
                     errors=[
@@ -904,6 +1037,22 @@ class GoalRunner:
                         for c in finalists
                     ],
                 )
+            if not completed:
+                # Recovery storage belongs to the engine, outside judge classification.
+                await self._refresh()
+                state = self._round_state()
+                identity = state.ranking_identity.get(None)
+                if identity is not None:
+                    order = [
+                        c
+                        for c, _ in ranked(
+                            finalists,
+                            state.scores,
+                            identity=identity,
+                            fidelity=None,
+                            allow_partial=self.plan.converge.allow_partial,
+                        )
+                    ]
             if not order and outcome.errors:
                 self.status, self.reason = "no_result", "provider_failed"
             # The last outcome proves completion of this exact batch. Queue it
@@ -970,6 +1119,8 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
+            if self.deps.journal.fenced.is_set():
+                raise
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
@@ -1050,6 +1201,22 @@ class GoalRunner:
                 )
             )
             return False
+        from swarm_arena._engine.run import _attach_board_namespaces
+
+        completed, _ = await self._supervised_step(
+            partial(
+                _attach_board_namespaces,
+                self.deps,
+                {
+                    goal.namespace
+                    for plan in self.history
+                    for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                },
+            ),
+            final=False,
+        )
+        if not completed:
+            return False
         self.agents = await self._slots(self.plan.teams, reuse=True)
         await self._plan_view()
         return True
@@ -1109,6 +1276,8 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
+            if self.deps.journal.fenced.is_set():
+                raise
             decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(
@@ -1145,6 +1314,130 @@ class GoalRunner:
                         self._draft(EventType.PART_KEPT, part=part.name, candidate_id=best.id)
                     )
         return decision
+
+    async def _curate_round(self, round: int) -> None:
+        """Complete an eligible committed policy phase before ordinary closure."""
+        if self.deps.config.curator is None or self._stop():
+            return
+        await self._refresh()
+        decision = next(
+            event
+            for event in reversed(self._events)
+            if event.goal_id == self.goal_id
+            and event.type == EventType.DECISION
+            and event.payload["round"] == round
+        )
+        if decision.seq in self.recorded.goals[self.goal_id].curated_decisions:
+            return
+        new = [
+            item.model_copy(deep=True)
+            for item in self.recorded.learnings.values()
+            if item.run_id == self.deps.run_id
+            and item.goal_id == self.goal_id
+            and item.round == round
+            and item.author != "curator"
+        ]
+        if not new:
+            return
+        tranche = self._tranche("curator")
+        scope = self._scope("curator", round, tranche)
+
+        async def invoke() -> tuple[list[Learning], list[str]] | None:
+            outcome = _Outcome()
+            try:
+                with llm_scope(scope):
+                    frontier = await run_sync_daemon(
+                        lambda: _detach_model(Frontier, self.deps.board.frontier())
+                    )
+                    view = await run_sync_daemon(
+                        lambda: self.deps.board.snapshot(self.plan.goal.key(), frontier)
+                    )
+
+                    # Human hide operations belong to the snapshot, not the run
+                    # replay. Never reintroduce hidden items through the new list.
+                    def visible_learning(id: str) -> Learning:
+                        return _detach_model(Learning, view.get_learning(id))
+
+                    visible_new: list[Learning] = []
+                    for item in new:
+                        try:
+                            visible_new.append(await run_sync_daemon(visible_learning, item.id))
+                        except KeyError:
+                            continue
+                    if not visible_new:
+                        return None
+                    assert self.deps.config.curator is not None
+                    curator = await run_sync_daemon(self.deps.config.curator.build, Curator)
+                    return await _prepare_curator(
+                        curator,
+                        namespace=self.plan.goal.namespace,
+                        run_id=self.deps.run_id,
+                        goal_id=self.goal_id,
+                        round=round,
+                        new=visible_new,
+                        view=view,
+                    )
+            except BaseException as error:
+                return [], [_curator_error(outcome.classify(error))]
+
+        completed = False
+        result: tuple[list[Learning], list[str]] | None = None
+        try:
+            try:
+                completed, result = await self._supervised_step(invoke, final=False)
+            except LimitReached as error:
+                completed, result = True, ([], [f"curator limit: {error.limit}"])
+                # Only registered limits escape the plugin boundary above.
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                    )
+                )
+                self.select_only = True
+                self.status, self.reason = "stopped", "reserve_exhausted"
+            except Exception as error:
+                # The supervisor can raise sanitized cancellation-shaped failures.
+                completed, result = True, ([], [_curator_error(error)])
+        finally:
+            # Only pending usage waits are bounded; admitted durable settlement
+            # retains the ledger's existing finality and conservative charges.
+            with anyio.CancelScope(shield=True):
+                await self._close(tranche)
+            self._stop()
+        if not completed or result is None:
+            return
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        if self.deps.journal.fenced.is_set():
+            raise _core_error(Fenced)
+        summaries, errors = result
+        if self._stop():
+            summaries, errors = [], [*errors, "curation stopped"]
+        # No plugin objects or awaits occur between IDs and the entire batch's
+        # append. A background journal commit can therefore never split it.
+        with anyio.CancelScope(shield=True):
+            summaries = _stamp_summaries(summaries, self.deps.ids)
+            events = [
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.LEARNING, round=round, learning=item.model_dump(mode="json")
+                    )
+                )
+                for item in summaries
+            ]
+            self.deps.journal.append(
+                self._draft(
+                    EventType.CURATED,
+                    round=round,
+                    revision=self.plan.revision,
+                    decision_seq=decision.seq,
+                    summaries=[item.id for item in summaries],
+                    supersedes={item.id: item.supersedes for item in summaries},
+                    errors=errors,
+                )
+            )
+            await self.deps.journal.commit()
+            for item, event in zip(summaries, events, strict=True):
+                self.deps.board.put_learning(item, epoch=event.epoch, seq=event.seq)
 
     async def _complete_replan(self) -> None:
         """Run a closed round's unpublished replan before any successor managers."""
@@ -1184,6 +1477,11 @@ class GoalRunner:
             )
         )
 
+        await self._refresh()
+        await _repair_round_pages(
+            self.deps, self.recorded, goal_id=self.goal_id, closed_round=round, supervisor=self
+        )
+
     async def _run_rounds(self) -> None:
         # A crash after closure must not silently skip the pending replanner.
         await self._complete_replan()
@@ -1203,6 +1501,7 @@ class GoalRunner:
                     goal_id=self.goal_id,
                     plan=self.plan,
                     agents=self.agents,
+                    supervisor=self,
                     round_spec=spec,
                     rounds_left=self.plan.rounds_total(self.deps.config.limits)
                     - self.rounds_closed,
@@ -1212,6 +1511,8 @@ class GoalRunner:
                 ).run(round)
                 self._merge_repeats(out.repeat_entries)
                 await self._refresh()
+                if round not in self.recorded.goals[self.goal_id].frontiers:
+                    break
                 funded = await self._barrier([*recovered, *out.candidates], round)
                 self.rounds_closed = round
                 if funded:
@@ -1223,16 +1524,19 @@ class GoalRunner:
             self._resumed, self._frontier = {}, None
             if decision is not None and decision.no_result:
                 self.status, self.reason = "no_result", decision.no_result
+            if decision is not None and self.status != "no_result":
+                await self._curate_round(round)
             await self.admission.update(self.goal_id, self.active_agents())
             replan = (
                 funded
                 and self.status != "no_result"
+                and self.reason is None
                 and round < self.plan.rounds_total(self.deps.config.limits)
                 and not self._stop()
                 and self.replanner is not None
             )
             await self._close_round(round, replan=replan)
-            if not funded or self.status == "no_result":
+            if not funded or self.status == "no_result" or self.reason is not None:
                 break
             await self._complete_replan()
         await self._refresh()
@@ -1275,13 +1579,14 @@ class GoalRunner:
             await self.deps.journal.commit()
             await self._plan_view()
         await self._refresh()
+        await _repair_round_pages(self.deps, self.recorded, goal_id=self.goal_id, supervisor=self)
         if self.state.selection_recorded and not self.state.finished:
             return await self._finish_recovered()
         if not self.history:
             self.history = [p for p, _ in self.recorded.plans.get(self.goal_id, [])] or [self.plan]
         await self._restore_terminal_decision()
         self._restore_repeats()
-        if self.status != "no_result":
+        if self.status != "no_result" and self.reason != "reserve_exhausted":
             self.agents = await self._slots(self.plan.teams, reuse=False)
             if not self.state.converge_started and self.join_phase != "replan":
                 await self._run_rounds()
@@ -1320,7 +1625,7 @@ class GoalRunner:
         await self._refresh()
         head = self.deps.journal.head
         assert head is not None
-        await self.deps.views.write(
+        await self._write_view(
             f"goals/{self.goal_id}/solution.json",
             solution_view(self.recorded, self.goal_id, head),
             source=head,

@@ -7,7 +7,7 @@ import pytest
 from _fakes.run import all_events, events, plan
 
 from swarm_arena import Goal, PartSpec, Plan, Ref, RunConfig, Swarm
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._store.local import LocalStore
@@ -74,9 +74,22 @@ def _assert_membership(config: RunConfig, swarm: Swarm) -> RunState:
     assert swarm.run_id is not None
     committed = read_committed(LocalStore(Path(config.run_root) / swarm.run_id))
     assert committed is not None
-    owner, history = committed
+    _, history = committed
     state = RunState.from_events(history)
-    board = RunBoard.from_state(state, run_root=config.run_root, head=lambda: owner.head)
+    board = ArenaBoard(arena_root=config.arena_root)
+    board.open(
+        swarm.run_id,
+        config.run_root,
+        sorted(
+            {
+                goal.namespace
+                for revisions in state.plans.values()
+                for current, _ in revisions
+                for goal in [current.goal, *(part.goal for part in current.parts)]
+            }
+        ),
+    )
+    board.frontier()
     try:
         for goal_id, revisions in state.plans.items():
             current = revisions[-1][0]

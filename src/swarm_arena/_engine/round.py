@@ -1,20 +1,21 @@
 """Run parallel manager rounds against one durable, fixed frontier."""
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
 from swarm_arena._agent.context import AgentContext, _prepare_metadata, _ToolMetadata
 from swarm_arena._agent.manager import LimitReached, Manager, RoundReport
-from swarm_arena._agent.repeats import RepeatIndex
+from swarm_arena._agent.repeats import COUNTED, RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
+from swarm_arena._board.arena import ArenaView, past_run_repeat_entries
 from swarm_arena._board.base import Board, BoardView
-from swarm_arena._board.digest import build_digest
-from swarm_arena._board.run_board import RunBoard
+from swarm_arena._board.digest import _digest_group_views, build_digest
+from swarm_arena._board.leaderboard import group_judges
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
@@ -28,12 +29,13 @@ from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal, GoalKey
@@ -51,6 +53,9 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+if TYPE_CHECKING:
+    from swarm_arena._engine.goal import GoalRunner
 
 
 @dataclass(kw_only=True)
@@ -86,6 +91,10 @@ class EngineDeps:
         Accumulated active run time.
     admission : RunAdmission or None, default=None
         Shared scheduler capacity service; standalone goals initialize it.
+    board_namespaces : set[str]
+        Successfully attached namespaces across all admitted revisions.
+    board_attach_lock : anyio.Lock
+        Serialize namespace attachment across concurrent goals.
 
     Examples
     --------
@@ -107,6 +116,8 @@ class EngineDeps:
     stops: StopState
     clock: RunClock
     admission: RunAdmission | None = None
+    board_namespaces: set[str] = field(default_factory=set)
+    board_attach_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 @dataclass
@@ -193,12 +204,26 @@ class RoundOutcome:
     repeat_entries: list[tuple[str, Candidate]]
 
 
+def _past_run_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate]]:
+    """Keep the newest counted, complete other-run candidate for each repeat key."""
+    newest = {}
+    for key, candidate in past_run_repeat_entries(view, run_id):
+        key = _context_string(key, "repeat key")
+        candidate = _detach_model(Candidate, candidate)
+        if candidate.output.status in COUNTED and not candidate.output.partial:
+            newest[key] = candidate
+    return list(newest.items())
+
+
 class _SeedView(BoardView):
     """Add only assigned, frontier-covered parents to identifier reads."""
 
     def __init__(self, view: BoardView, parents: Mapping[str, BoardView]) -> None:
         self._view, self._parents = view, dict(parents)
-        self.goal, self.frontier = view.goal, view.frontier
+        part = getattr(view, "part", None)
+        self.part = None if part is None else _context_string(part, "part")
+        self.goal = _detach_model(GoalKey, view.goal)
+        self.frontier = _detach_model(Frontier, view.frontier)
 
     def best(
         self,
@@ -236,6 +261,10 @@ class _SeedView(BoardView):
         """Delegate scoped learning search."""
         return self._view.search_learnings(namespace, query, tags=tags, goal=goal, limit=limit)
 
+    def count_learnings(self, namespace: str, *, goal: GoalKey | None = None) -> int:
+        """Preserve the wrapped snapshot's optional count capability."""
+        return self._view.count_learnings(namespace, goal=goal)
+
     def get_learning(self, id: str) -> Learning:
         """Delegate learning lookup."""
         return self._view.get_learning(id)
@@ -255,6 +284,10 @@ class _SeedView(BoardView):
     def leaderboard(self, goal: GoalKey, *, judge: str) -> list[Row]:
         """Keep leaderboard reads restricted to the own group."""
         return self._view.leaderboard(goal, judge=judge)
+
+    def _digest_group_views(self) -> dict[str | None, BoardView] | None:
+        """Keep the underlying snapshot's fixed ranking-group capabilities."""
+        return _digest_group_views(self._view)
 
     def _visible_candidate_ids(self) -> frozenset[str]:
         return self._view._visible_candidate_ids() | self._parents.keys()
@@ -332,6 +365,9 @@ class RoundRunner:
     started_runs : Mapping[str, int], optional
         Restored durable starts by team/agent, including lost runs. Without an
         explicit count, a restarted round counts its committed tool_start events.
+    supervisor : GoalRunner or None, default=None
+        Existing goal owner for stop and fence supervision. Standalone rounds
+        create a local supervisor.
 
     Examples
     --------
@@ -358,6 +394,7 @@ class RoundRunner:
         converge: bool = False,
         seed_parents: Sequence[str] = (),
         started_runs: Mapping[str, int] = {},
+        supervisor: "GoalRunner | None" = None,
     ) -> None:
         """Copy incoming round and resume carriers before launching tasks."""
         self.deps, self.goal_id, self.plan = deps, goal_id, plan
@@ -368,7 +405,9 @@ class RoundRunner:
         self.frontier, self.converge = frontier, converge
         self.seed_parents = tuple(dict.fromkeys(seed_parents)) if converge else ()
         self.started_runs = dict(started_runs)
+        self._supervisor = supervisor
         self._counters: dict[str, dict[str, int]] = {}
+        self._own_learnings: dict[str, list[Learning]] = {}
 
     def _refresh_budget(self) -> None:
         if self.deps.ledger.run_exhausted():
@@ -388,7 +427,9 @@ class RoundRunner:
     async def _frontier(self, round: int, agents: Sequence[AgentSlot]) -> Frontier:
         if self.frontier is not None:
             return self.frontier
-        frontier = await anyio.to_thread.run_sync(self.deps.board.frontier)
+        frontier = await run_sync_daemon(
+            lambda: _detach_model(Frontier, self.deps.board.frontier())
+        )
         shares = (
             {}
             if self.converge
@@ -423,14 +464,25 @@ class RoundRunner:
         parents: Mapping[str, BoardView],
     ) -> AgentRuntime:
         deps = self.deps
-        view = await anyio.to_thread.run_sync(deps.board.snapshot, slot.goal_key, frontier)
+        view = await run_sync_daemon(lambda: deps.board.snapshot(slot.goal_key, frontier))
+        past = await run_sync_daemon(_past_run_entries, view, deps.run_id)
+
+        def sibling_views() -> dict[str, BoardView]:
+            if not isinstance(view, ArenaView):
+                return {}
+            return {
+                part or "": view._sibling_view(part)
+                for part in [None, *(p.name for p in self.plan.parts)]
+            }
+
+        siblings = await run_sync_daemon(sibling_views)
         if parents:
-            view = _SeedView(view, parents)
-        checks, judges, ranking = part_scoring(self.plan, slot.part)
-        if slot.part is None:
-            ranking = self.plan.ranking_name()
-        elif not ranking and len(judges) == 1:
-            ranking = judges[0].component_name()
+            view = await run_sync_daemon(_SeedView, view, parents)
+        checks, _, _ = part_scoring(self.plan, slot.part)
+        rankings = await run_sync_daemon(self._rankings)
+        digest_rankings = group_judges(self.plan)
+        # Live execution has already resolved sole unnamed judges under supervision.
+        digest_rankings.update({part or None: name for part, name in rankings.items()})
         execution_ref = await run_sync_daemon(
             effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
         )
@@ -459,16 +511,32 @@ class RoundRunner:
             tool_identity=await run_sync_daemon(tool_identity, slot.tool_ref, entry),
             catalog_entry=entry,
             checks=[
-                (ref.component_name(), await run_sync_daemon(ref.build, Check)) for ref in checks
+                await run_sync_daemon(
+                    lambda ref=ref: (
+                        _context_string(ref.component_name(), "check"),
+                        ref.build(Check),
+                    )
+                )
+                for ref in checks
             ],
             view=view,
-            own=[candidate for _, candidate in pairs],
-            digest=build_digest(
-                view,
-                goal=slot.goal_key,
-                round=round,
-                ranking=ranking,
-                cap_tokens=deps.config.limits.digest_tokens,
+            own=[
+                *[candidate for _, candidate in pairs],
+                *[
+                    learning
+                    for learning in self._own_learnings.get(key, [])
+                    if learning.namespace == slot.goal_key.namespace
+                ],
+            ],
+            digest=await run_sync_daemon(
+                lambda: build_digest(
+                    view,
+                    goal=slot.goal_key,
+                    run_id=deps.run_id,
+                    round=round,
+                    ranking=digest_rankings,
+                    cap_tokens=deps.config.limits.digest_tokens,
+                )
             ),
             notes=slot.notes,
             ledger=deps.ledger,
@@ -483,7 +551,7 @@ class RoundRunner:
             ),
             limits=deps.config.limits,
             counters=AgentCounters(**self._counters.get(key, {})),
-            repeats=RepeatIndex(deps.run_id, [*self.repeat_entries, *pairs]),
+            repeats=RepeatIndex(deps.run_id, [*self.repeat_entries, *pairs, *past]),
             watchdog=slot.watchdog,
             journal=deps.journal,
             board=deps.board,
@@ -493,10 +561,24 @@ class RoundRunner:
             config=deps.config,
             resumed=tuple(c for _, c in pairs),
             private_paths=private_paths,
-            rankings={slot.part or "": ranking},
+            rankings=rankings,
+            sibling_views=siblings,
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),
         )
+
+    def _rankings(self) -> dict[str, str]:
+        """Resolve every live group's ranking within supervised preparation."""
+        rankings = {"": self.plan.ranking_name()}
+        for part in self.plan.parts:
+            _, judges, ranking = part_scoring(self.plan, part.name)
+            rankings[part.name] = ranking or (
+                judges[0].component_name() if len(judges) == 1 else ""
+            )
+        return {
+            _context_string(part, "part"): _context_string(name, "judge")
+            for part, name in rankings.items()
+        }
 
     async def _feedback_policies(self) -> dict[str, dict[str, str]]:
         """Recover actual producing policies without re-running old check hooks.
@@ -507,7 +589,7 @@ class RoundRunner:
         """
         if self.deps.journal.head is None:
             return {}
-        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await _read_chain(self.deps.store, self.deps.journal.head)
         policies: dict[str, dict[str, str]] = {}
         for _, events in chain:
             for event in events:
@@ -528,8 +610,10 @@ class RoundRunner:
     async def _context(
         self, rt: AgentRuntime, policies: Mapping[str, Mapping[str, str]]
     ) -> _RoundContext:
-        """Prepare hooks under slot supervision, keeping all view reads on-loop."""
-        historical = set(rt.view._visible_candidate_ids())
+        """Prepare hooks and detach connector membership under slot supervision."""
+        historical = await run_sync_daemon(
+            lambda: {_context_string(id, "candidate_id") for id in rt.view._visible_candidate_ids()}
+        )
         historical.update(item.id for item in rt.own if isinstance(item, Candidate))
         historical.update(
             candidate.id for candidate in rt.repeats.candidates_of(f"{rt.team.name}/{rt.spec.name}")
@@ -563,10 +647,14 @@ class RoundRunner:
         if not self.seed_parents:
             return parents
         for goal in [self.plan.goal, *(part.goal for part in self.plan.parts)]:
-            view = await anyio.to_thread.run_sync(self.deps.board.snapshot, goal.key(), frontier)
+            view = await run_sync_daemon(
+                lambda goal=goal: self.deps.board.snapshot(goal.key(), frontier)
+            )
             for id in self.seed_parents:
                 try:
-                    view.get_candidate(id)
+                    await run_sync_daemon(
+                        lambda view=view, id=id: _detach_model(Candidate, view.get_candidate(id))
+                    )
                 except (KeyError, ValueError):
                     continue
                 parents[id] = view
@@ -632,10 +720,10 @@ class RoundRunner:
             await anyio.sleep_until(wake_at)
 
     async def _restore(self, round: int) -> None:
-        """Recover only the latest matching round's committed action allowance."""
+        """Recover the matching round's committed allowances and private learnings."""
         if (self.frontier is None and not self.converge) or self.deps.journal.head is None:
             return
-        chain = await anyio.to_thread.run_sync(read_chain, self.deps.store, self.deps.journal.head)
+        chain = await _read_chain(self.deps.store, self.deps.journal.head)
         events = [event for _, batch in chain for event in batch]
         if self.converge and self.frontier is None:
             state = RunState.from_events(events)
@@ -708,6 +796,14 @@ class RoundRunner:
                 )
             elif event.type == EventType.LEARNING:
                 counters["learnings"] = counters.get("learnings", 0) + 1
+                learning = Learning.model_validate(event.payload["learning"])
+                if (
+                    learning.run_id == self.deps.run_id
+                    and learning.goal_id == self.goal_id
+                    and learning.round == round
+                    and learning.author == key
+                ):
+                    self._own_learnings.setdefault(key, []).append(learning)
             elif event.type in {EventType.TOOL_START, EventType.RUN_LOST, EventType.TOOL_END}:
                 id = (
                     event.payload["candidate"]["id"]
@@ -744,22 +840,47 @@ class RoundRunner:
         --------
         >>> outcome = await runner.run(1)  # doctest: +SKIP
         """
-        await self._restore(round)
+        from swarm_arena._engine.goal import GoalRunner
+
         agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
-        board = self.deps.board
-        if isinstance(board, RunBoard):
-            board.register_goal(self.plan.goal.key(), self.goal_id, None)
-            for part in self.plan.parts:
-                board.register_goal(part.goal.key(), self.goal_id, part.name)
-        frontier = await self._frontier(round, agents)
+        private_paths = judge_private_paths(self.plan)
+
+        async def prepare() -> tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]]:
+            await self._restore(round)
+            frontier = await self._frontier(round, agents)
+            parents = await self._parent_views(frontier)
+            return frontier, parents, await self._feedback_policies()
+
+        supervisor = self._supervisor or GoalRunner(
+            self.deps, goal_id=self.goal_id, plan=self.plan, replanner=None, journal_r0=False
+        )
+        outcome = _Outcome()
+        completed, prepared = False, None
+        try:
+            completed, prepared = await supervisor._supervised_step(
+                prepare, final=self.converge, settle_on_stop=True
+            )
+        except BaseException as error:
+            outcome.contain(error, RuntimeError, "round preparation")
+        if not completed or prepared is None:
+            statuses = {}
+            for slot in agents:
+                slot.status = AgentStatus.FINISHED
+                statuses[f"{slot.team.name}/{slot.spec.name}"] = slot.status
+            return RoundOutcome(
+                round,
+                [],
+                [],
+                statuses,
+                {key: supervisor.reason or "round preparation stopped" for key in statuses},
+                [],
+            )
+        frontier, parents, feedback_policies = prepared
         deadline = round_deadline(
             anyio.current_time(),
             self.deps.config.limits.effective_round_timeout_s(),
             self.deps.clock.left(self.deps.config.limits.run_timeout_s),
         )
-        private_paths = judge_private_paths(self.plan)
-        parents = await self._parent_views(frontier)
-        feedback_policies = await self._feedback_policies()
         runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]

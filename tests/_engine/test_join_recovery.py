@@ -116,6 +116,7 @@ def retry_config(root: Path) -> RunConfig:
     return with_executor(
         RunConfig(
             run_root=str(root / "runs"),
+            arena_root=str(root / "arena"),
             artifact_root=str(root / "artifacts"),
             planner_catalog=PlannerCatalog(entries=entries),
         ),
@@ -144,19 +145,21 @@ async def crash_driver(root: Path, boundary: str) -> None:
         if hit:
             os._exit(91)
 
-    JournalWriter._publish = publish
     refuse = boundary in {"plan_rejected", "refused_control"}
     plan = retry_plan()
     if refuse:
         plan = plan.model_copy(
             update={"converge": plan.converge.model_copy(update={"max_join_attempts": 2})}
         )
-    await Swarm(cfg, replanner=RetryPlanner(refuse=refuse)).run(plan, run_id="join")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(JournalWriter, "_publish", publish)
+        await Swarm(cfg, replanner=RetryPlanner(refuse=refuse)).run(plan, run_id="join")
 
 
 async def launch(root: Path, boundary: str) -> RunConfig:
     await anyio.to_thread.run_sync(lambda: root.mkdir(parents=True))
     environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(root / "cache")
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
     )

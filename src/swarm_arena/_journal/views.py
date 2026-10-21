@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import anyio
+import anyio.lowlevel
 
 from swarm_arena._errors import AlreadyExists, PreconditionFailed, _core_error
 from swarm_arena._journal.lease import Head
@@ -16,7 +17,8 @@ from swarm_arena._journal.segment import parse_segment_name
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
-from swarm_arena._store.base import Store
+from swarm_arena._store.base import Store, _read_blob
+from swarm_arena._store.io import _create, _replace, _storage_io
 
 _Format = Literal["json", "toml", "md"]
 _FORMATS: dict[str, _Format] = {".json": "json", ".toml": "toml", ".md": "md"}
@@ -160,7 +162,9 @@ class ViewWriter:
 
     Existing views are replaced only when their head is an earlier member of
     the same chain. Equal, unknown, or malformed heads remain untouched.
-    Every Store operation runs in an AnyIO worker thread.
+    Create-only publication preserves any existing view without inspecting it.
+    Every Store operation runs in an abandonable daemon worker. The owning
+    run supervises the wait; an abandoned read cannot start a later write.
 
     Parameters
     ----------
@@ -179,7 +183,9 @@ class ViewWriter:
         self._store = store
         self._writer = writer
 
-    async def write(self, key: str, content: bytes, *, source: Head) -> None:
+    async def write(
+        self, key: str, content: bytes, *, source: Head, create_only: bool = False
+    ) -> None:
         """
         Create a view or conditionally replace one from an earlier committed head.
 
@@ -195,6 +201,9 @@ class ViewWriter:
             View body to encode with source metadata.
         source : Head
             Canonical head already present on this writer's committed chain.
+        create_only : bool, default=False
+            Preserve any existing view on AlreadyExists, without reading or
+            replacing it. Used for immutable round pages.
 
         Raises
         ------
@@ -204,8 +213,6 @@ class ViewWriter:
             If the key suffix or document is invalid.
         StorageError
             If a Store operation fails outside a conditional-write conflict.
-        OSError
-            If the backend's create operation fails.
 
         Examples
         --------
@@ -222,21 +229,26 @@ class ViewWriter:
             raise ValueError("view key requires .json, .toml, or .md suffix") from None
         data = embed_source_head(fmt, content, head)
         digest = sha256(data).digest()
+        await anyio.lowlevel.checkpoint_if_cancelled()
         try:
-            await anyio.to_thread.run_sync(self._store.create, key, data)
+            await _storage_io(_create, self._store, key, data, site="view storage")
             return
         except AlreadyExists:
-            pass
+            if create_only:
+                return
         for _ in range(2):
-            existing = await anyio.to_thread.run_sync(self._store.read, key)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            existing = await _storage_io(_read_blob, self._store, key, site="view storage")
             if sha256(existing.data).digest() == digest:
                 return
             previous = read_source_head(fmt, existing.data)
             if previous is None or previous.segment not in committed[:source_index]:
                 return
+            await anyio.lowlevel.checkpoint_if_cancelled()
             try:
-                await anyio.to_thread.run_sync(
-                    partial(self._store.replace, key, data, if_match=existing.etag)
+                await _storage_io(
+                    partial(_replace, self._store, key, data, if_match=existing.etag),
+                    site="view storage",
                 )
                 return
             except PreconditionFailed:

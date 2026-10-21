@@ -12,6 +12,8 @@ from pydantic import BaseModel, ValidationError
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
+from swarm_arena._board.arena import ArenaView
+from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
@@ -181,6 +183,10 @@ class AgentContext:
     ) -> None:
         """Bind runtime state and already prepared metadata on the owner loop."""
         self._rt, self._gate, self._thread = rt, gate, get_ident()
+        try:
+            self._loop_token = anyio.lowlevel.current_token()
+        except RuntimeError:
+            self._loop_token = None
         self._read_ids: dict[str, None] = {}
         self._feedback = dict(metadata.feedback)
         self._feedback_for = feedback_for
@@ -197,7 +203,11 @@ class AgentContext:
 
     def _on_loop(self, fn: Callable[[], _T]) -> _T:
         """Marshal an AnyIO worker's complete lookup and accounting operation."""
-        return fn() if get_ident() == self._thread else anyio.from_thread.run_sync(fn)
+        return (
+            fn()
+            if get_ident() == self._thread
+            else anyio.from_thread.run_sync(fn, token=self._loop_token)
+        )
 
     def _event(self, type: EventType, payload: dict[str, Any]) -> EventDraft:
         """Stamp the owning agent task on an ordinary event."""
@@ -506,7 +516,8 @@ class AgentContext:
         Parameters
         ----------
         query : str
-            Case-insensitive title or text substring.
+            Title or text search using the board's matching rules. An empty
+            query lists visible learnings without a text filter.
         tags : Sequence[str], default=()
             Required tags.
         scope : {'goal', 'namespace'}, default='goal'
@@ -543,6 +554,7 @@ class AgentContext:
         >>> assert hints == [hint] and hints[0] is not hint
         >>> assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
         """
+        query = _context_string(query, "query")
         tags = tuple(_context_string(value, "tags") for value in tags)
         normalized_scope = _context_string(scope, "scope")
 
@@ -551,13 +563,21 @@ class AgentContext:
             if normalized_scope not in ("goal", "namespace"):
                 raise _core_signal(SoftError("invalid learning scope"))
             rt = self._rt
-            found = rt.view.search_learnings(
-                rt.goal.namespace,
-                query,
-                tags=tags,
-                goal=rt.goal_key if normalized_scope == "goal" else None,
-                limit=limit,
-            )
+            if query == "":
+                found = rt.view.learnings(
+                    rt.goal.namespace,
+                    tags=tags,
+                    goal=rt.goal_key if normalized_scope == "goal" else None,
+                    limit=limit,
+                )
+            else:
+                found = rt.view.search_learnings(
+                    rt.goal.namespace,
+                    query,
+                    tags=tags,
+                    goal=rt.goal_key if normalized_scope == "goal" else None,
+                    limit=limit,
+                )
             own = [
                 item
                 for item in reversed(rt.own)
@@ -693,15 +713,15 @@ class AgentContext:
 
     def best(self, k: int, *, part: str | None = None) -> list[Row]:
         """
-        Return leaderboard rows from this agent's own group snapshot.
+        Return leaderboard rows from a declared group at the fixed frontier.
 
         Parameters
         ----------
         k : int
             Maximum number of rows.
         part : str or None, default=None
-            This agent's part, or None for its default group. Cross-part reads
-            require the future multi-goal board view.
+            None selects the own group; a declared name selects its sibling group.
+            The empty string selects the main group.
 
         Returns
         -------
@@ -739,12 +759,22 @@ class AgentContext:
         def read() -> list[Row]:
             self._charge(board_read=True)
             rt = self._rt
-            if part is not None and part != rt.part:
-                raise _core_signal(SoftError("best(part=...) can read only this agent's own part"))
-            judge = rt.rankings.get(rt.part or "")
+            group = (rt.part or "") if part is None else part
+            view = rt.view
+            siblings = rt.sibling_views
+            if isinstance(siblings, Mapping) and group in siblings:
+                view = siblings[group]
+            elif group != (rt.part or ""):
+                raise _core_signal(SoftError("part outside board snapshot"))
+            judge = rt.rankings.get(group)
             if judge is None:
                 raise _core_signal(SoftError("missing ranking for agent group"))
-            rows = rt.view.leaderboard(rt.goal_key, judge=judge)[: max(0, k)]
+            goal = rt.goal_key if view is rt.view else view.goal
+            rows = view.leaderboard(goal, judge=judge)
+            if isinstance(view, ArenaView):
+                ids = {candidate.id for candidate in view.best(goal, max(0, k), judge=judge)}
+                rows = [row for row in rows if row.candidate_id in ids]
+            rows = rows[: max(0, k)]
             self._read_ids.update((row.candidate_id, None) for row in rows)
             return rows
 
@@ -776,7 +806,7 @@ class AgentContext:
         refines : Sequence[str], default=()
             Visible learnings refined by this one.
         duplicate_reason : str or None, default=None
-            Accepted for compatibility; duplicate detection arrives in M2.
+            Nonblank explanation permitting a near-duplicate without refines.
 
         Returns
         -------
@@ -811,6 +841,7 @@ class AgentContext:
         ...     round=1, request=ToolRequest(), output=ToolOutput(status="ok"))
         >>> rt.view.get_candidate.return_value = candidate
         >>> import anyio
+        >>> rt.view.search_learnings.return_value = []
         >>> rt.repeats.run_id = "r"
         >>> rt.ids.next.return_value = "L-1"
         >>> rt.journal.append.return_value = Mock(epoch=1, seq=2)
@@ -842,16 +873,23 @@ class AgentContext:
             )
         except ValidationError as error:
             raise _core_signal(
-                SoftError(f"invalid learning: {validation_summary(error)}")
+                SoftError(f"invalid learning: {validation_summary(error)}. {LEARNING_GUIDE}")
             ) from None
-        for id in learning.evidence:
-            self._candidate(id)
-        for id in learning.refines:
-            self._learning(id)
+        verified = vet_learning(
+            rt.view,
+            rt.own,
+            namespace=learning.namespace,
+            author=learning.author,
+            title=learning.title,
+            text=learning.text,
+            evidence=learning.evidence,
+            refines=learning.refines,
+            duplicate_reason=duplicate_reason,
+        )
         if rt.counters.learnings >= rt.limits.max_learnings_per_agent_round:
             raise _core_signal(SoftError("max_learnings_per_agent_round reached"))
         rt.counters.learnings += 1
-        learning = learning.model_copy(update={"id": rt.ids.next("L")})
+        learning = learning.model_copy(update={"id": rt.ids.next("L"), "verified": verified})
         event = rt.journal.append(
             self._event(EventType.LEARNING, {"learning": learning.model_dump(mode="json")})
         )

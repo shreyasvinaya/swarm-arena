@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from swarm_arena._errors import AlreadyExists, StorageError
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.tooling import FileRef
-from swarm_arena._store.base import Store
+from swarm_arena._store.base import Store, _read_blob
 from swarm_arena._store.local import LocalStore
 
 _MAX_ARTIFACT_BYTES: Final = 2**30
@@ -148,7 +148,7 @@ class ArtifactStore:
         >>> artifacts.get_bytes(digest)  # doctest: +SKIP
         b'hello'
         """
-        data = self._store.read(sha256).data
+        data = _read_blob(self._store, sha256).data
         if sha256_hex(data) != sha256:
             raise StorageError("artifact failed its hash check")
         return data

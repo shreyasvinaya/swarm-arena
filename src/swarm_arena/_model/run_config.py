@@ -55,7 +55,9 @@ class RunConfig(StoredModel):
     lease_ttl_s : float, default=60.0
         Ownership lease lifetime in seconds.
     settle_timeout_s : float, default=60.0
-        Budget settlement timeout in seconds.
+        Post-stop settlement timeout in seconds, covering pending call reports
+        and durable publication of stop results, goal storage, solutions, and
+        review exports.
     tracing : TracingConfig, optional
         Payload storage and tracing policy.
     llm_gateway : GatewayConfig or None, default=None

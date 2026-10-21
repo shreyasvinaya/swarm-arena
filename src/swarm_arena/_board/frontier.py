@@ -2,6 +2,8 @@
 
 from collections.abc import Sequence
 
+from swarm_arena._board.human_objects import human_object_order
+from swarm_arena._board.ingest import _validate_marks
 from swarm_arena._journal.lease import Head
 from swarm_arena._model.board_types import Frontier
 
@@ -26,7 +28,12 @@ def build_frontier(
     Returns
     -------
     Frontier
-        Independent lists sorted deterministically without deduplication.
+        Independent canonical lists with identical marks and names deduplicated.
+
+    Raises
+    ------
+    ChainError
+        If two marks for one run disagree or a mark's metadata is invalid.
 
     Examples
     --------
@@ -34,15 +41,27 @@ def build_frontier(
     ['a', 'b']
     """
     return Frontier(
-        marks=[
-            Frontier.Mark(
-                run_id=run_id, run_root=root, epoch=head.epoch, seq=head.seq, segment=head.segment
-            )
-            for run_id, root, head in sorted(
-                board_reads,
-                key=lambda item: (item[0], item[1], item[2].epoch, item[2].seq, item[2].segment),
-            )
-        ],
-        reviews=sorted(reviews),
-        curation=sorted(curation),
+        marks=_validate_marks(
+            [
+                Frontier.Mark(
+                    run_id=run_id,
+                    run_root=root,
+                    epoch=head.epoch,
+                    seq=head.seq,
+                    segment=head.segment,
+                )
+                for run_id, root, head in sorted(
+                    board_reads,
+                    key=lambda item: (
+                        item[0],
+                        item[1],
+                        item[2].epoch,
+                        item[2].seq,
+                        item[2].segment,
+                    ),
+                )
+            ]
+        ),
+        reviews=sorted(set(reviews), key=human_object_order),
+        curation=sorted(set(curation), key=human_object_order),
     )

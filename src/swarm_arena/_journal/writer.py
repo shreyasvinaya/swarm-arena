@@ -1,6 +1,7 @@
 """Serialize journal publication and lease maintenance in one asynchronous task."""
 
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -18,13 +19,15 @@ from swarm_arena._errors import (
     WriteOutcomeUnknown,
     _core_error,
     _exception_type_name,
+    _stop_cleanup_error,
 )
 from swarm_arena._journal.event import WRITE_THROUGH, Event, EventDraft
 from swarm_arena._journal.lease import Head, Lease, read_owner
-from swarm_arena._journal.reader import read_chain
+from swarm_arena._journal.reader import _read_segment, read_chain
 from swarm_arena._journal.segment import encode_segment, segment_name
 from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._store.base import Store
+from swarm_arena._store.io import _create, _storage_io, _validated_io
 
 _T = TypeVar("_T")
 
@@ -33,10 +36,16 @@ class JournalWriter:
     """
     Publish queued events and maintain ownership through one writer task.
 
-    Store and lease operations run in AnyIO workers. Durable appends share a
+    The inherited-chain read is abandonable under the owner's supervision.
+    Publication and lease operations use abandonable daemon workers. Durable appends share a
     group window and wait for the authority head to cover their sequence. A
     transient storage failure suspends renewals and retries only until the
-    last confirmed expiry. Fatal failures wake all waiters with ``Fenced``.
+    last confirmed expiry. Fatal failures disable publication and wake all waiters.
+    Settlement exhaustion raises ``RuntimeError('stop cleanup timed out')``;
+    authority loss and other fatal publication failures raise ``Fenced``.
+    After settlement exhaustion, a release attempt has its own
+    ``settle_timeout_s`` allowance, capped by the remaining confirmed lease.
+    Closing can therefore take up to about twice ``settle_timeout_s``.
     Use this object from its owning event loop and within its async context.
 
     Parameters
@@ -55,6 +64,9 @@ class JournalWriter:
         Maximum interval before ordinary queued events trigger a commit.
     group_window_s : float, default=0.2
         Delay from the first durable wake-up to group publication.
+
+    settle_timeout_s : float, default=60
+        Maximum shutdown settlement wait for outstanding storage operations.
 
     Attributes
     ----------
@@ -81,6 +93,7 @@ class JournalWriter:
         local_path: Path,
         sync_interval_s: float,
         group_window_s: float = 0.2,
+        settle_timeout_s: float = 60,
     ) -> None:
         self._store = store
         self._lease = lease
@@ -89,6 +102,9 @@ class JournalWriter:
         self._local_path = local_path
         self._sync_interval_s = sync_interval_s
         self._group_window_s = group_window_s
+        self._settle_timeout_s = settle_timeout_s
+        self._closing_at = float("inf")
+        self._io_scope: anyio.CancelScope | None = None
         self._head = lease.doc.head
         if type(next_seq) is not int or next_seq != (self._head.seq if self._head else 0) + 1:
             raise ValueError("next_seq must immediately follow the inherited head")
@@ -103,8 +119,10 @@ class JournalWriter:
         self._sync_at: float | None = None
         self._immediate = False
         self._closing = False
+        self._stopping = False
         self._entered = False
         self._failure: Exception | None = None
+        self._settlement_expired = False
         self._tasks: TaskGroup | None = None
 
     async def __aenter__(self) -> "JournalWriter":
@@ -113,7 +131,15 @@ class JournalWriter:
             raise _core_error(RuntimeError, "journal writer context cannot be reused")
         if self._head is not None:
             try:
-                chain = await self._retry(partial(read_chain, self._store, self._head))
+                chain = await self._retry(
+                    partial(
+                        read_chain,
+                        self._store,
+                        self._head,
+                        _read=partial(_read_segment, self._store),
+                    ),
+                    validated=True,
+                )
                 self._committed = [name for name, _ in chain]
             except Exception as error:
                 self._fail(error)
@@ -128,6 +154,9 @@ class JournalWriter:
         """Shield the final publication and release, skipping writes after fencing."""
         was_fenced = self.fenced.is_set()
         self._closing = True
+        self._closing_at = anyio.current_time() + self._settle_timeout_s
+        if self._io_scope is not None:
+            self._io_scope.deadline = min(self._io_scope.deadline, self._closing_at)
         self._wake.set()
         try:
             with anyio.CancelScope(shield=True):
@@ -198,7 +227,7 @@ class JournalWriter:
         Fenced
             If the writer failed or lost ownership.
         RuntimeError
-            If the writer is outside its active context.
+            If the writer is outside its active context or settlement expired.
 
         Examples
         --------
@@ -250,6 +279,8 @@ class JournalWriter:
         ------
         Fenced
             If ownership expires, changes, or publication fails permanently.
+        RuntimeError
+            If the storage settlement allowance expires before the lease.
 
         Examples
         --------
@@ -274,6 +305,8 @@ class JournalWriter:
         ------
         Fenced
             If the writer failed or lost ownership.
+        RuntimeError
+            If the storage settlement allowance expires before the lease.
 
         Examples
         --------
@@ -336,7 +369,15 @@ class JournalWriter:
         """Expose only exception types and explicitly trusted core storage causes."""
         if self.fenced.is_set():
             error = self._failure
-            cause = error if isinstance(error, StorageError) else None
+            if self._settlement_expired:
+                raise _stop_cleanup_error() from None
+            cause = (
+                error
+                if isinstance(error, StorageError)
+                and _exception_type_name(error)
+                in {"StorageError", "ChainError", "NotFound", "PreconditionFailed"}
+                else None
+            )
             name = _exception_type_name(error) if error is not None else "NoneType"
             raise _core_error(Fenced, f"journal writer failed: {name}") from cause
 
@@ -344,56 +385,108 @@ class JournalWriter:
         """Compute lifetime using only the last confirmed owner document."""
         return (self._lease.doc.expires_at - utc_now()).total_seconds()
 
-    async def _retry(self, operation: Callable[[], _T]) -> _T:
-        """Retry transient core I/O without renewal, bounded by confirmed expiry."""
-        while True:
-            self._raise_if_fenced()
-            if self._remaining() <= 0:
-                raise _core_error(Fenced, "journal lease expired")
+    def _stop_storage(self) -> None:
+        """Bound storage settlement while allowing healthy graceful-stop work."""
+        self._stopping = True
+        if self._io_scope is not None:
+            self._io_scope.deadline = min(
+                self._io_scope.deadline, anyio.current_time() + self._settle_timeout_s
+            )
+
+    def _expired(self, lease_deadline: float) -> Exception:
+        """Classify expiry in the monotonic clock that enforced the wait."""
+        if (self._stopping or self._closing) and anyio.current_time() < lease_deadline:
+            self._settlement_expired = True
+            return _stop_cleanup_error()
+        return _core_error(Fenced, "journal lease expired")
+
+    async def _release_after_timeout(self) -> None:
+        """Try one bounded release without reopening publication or adopting late state."""
+        remaining = min(self._remaining(), self._settle_timeout_s)
+        if remaining <= 0:
+            return
+        candidate = Lease(self._store, self._lease.doc, self._lease.etag, ttl_s=self._lease.ttl_s)
+        with anyio.move_on_after(remaining):
+            # A lost CAS or unavailable backend must not replace the primary
+            # timeout or authorize any further publication by this writer.
+            with suppress(Exception):
+                await _storage_io(candidate.release)
+
+    async def _retry(self, operation: Callable[[], _T], *, validated: bool = False) -> _T:
+        """Bound the entire primitive, including retries, by the owner's lifetime."""
+        now = anyio.current_time()
+        lease_deadline = now + self._remaining()
+        deadline = min(
+            lease_deadline,
+            self._closing_at,
+            now + self._settle_timeout_s if self._stopping else float("inf"),
+        )
+        if deadline <= now:
+            raise self._expired(lease_deadline)
+        with anyio.CancelScope(deadline=deadline) as lifetime:
+            self._io_scope = lifetime
             try:
-                return await anyio.to_thread.run_sync(operation)
-            except ChainError:
-                raise
-            except (OSError, StorageError):
-                await anyio.sleep(max(0, min(1.0, self._remaining())))
+                while True:
+                    self._raise_if_fenced()
+                    try:
+                        boundary = _validated_io if validated else _storage_io
+                        result = await boundary(operation)
+                    except ChainError:
+                        raise
+                    except (OSError, StorageError) as error:
+                        if _exception_type_name(error) not in {"OSError", "StorageError"}:
+                            raise
+                        await anyio.sleep(
+                            max(0, min(1.0, lifetime.deadline - anyio.current_time()))
+                        )
+                    else:
+                        if self._remaining() <= 0:
+                            raise _core_error(Fenced, "journal lease expired")
+                        if lifetime.deadline <= anyio.current_time():
+                            raise self._expired(lease_deadline)
+                        return result
+            finally:
+                self._io_scope = None
+        raise self._expired(lease_deadline)
 
     async def _update_owner(
         self, kind: Literal["advance", "renew", "release"], head: Head | None = None
     ) -> None:
-        """Recover unknown updates by reading identity before adopting any ETag."""
+        """Adopt worker results only while the awaiting owner still has authority."""
         old = self._lease.doc
         expected = head if kind == "advance" else old.head
-        uncertain = False
+        while True:
+            candidate = Lease(
+                self._store, self._lease.doc, self._lease.etag, ttl_s=self._lease.ttl_s
+            )
 
-        def update() -> None:
-            nonlocal uncertain
-            if not uncertain:
+            def update(candidate: Lease = candidate) -> bool:
                 try:
                     if kind == "advance":
                         assert head is not None
-                        self._lease.advance(head)
+                        candidate.advance(head)
                     elif kind == "renew":
-                        self._lease.renew()
+                        candidate.renew()
                     else:
-                        self._lease.release()
-                    return
+                        candidate.release()
+                    return True
                 except WriteOutcomeUnknown:
-                    uncertain = True
-            owner = read_owner(self._store)
+                    return False
+
+            if await self._retry(update):
+                self._lease._adopt(candidate.doc, candidate.etag)
+                return
+            owner = await self._retry(partial(read_owner, self._store))
             if owner is None:
                 raise _core_error(Fenced, "journal owner disappeared")
             doc, etag = owner
             if (doc.epoch, doc.owner_id) != (old.epoch, old.owner_id):
                 raise _core_error(Fenced, "journal owner changed")
             if doc.head != old.head and doc.head != expected:
-                raise ChainError("unexpected journal head during recovery")
+                raise _core_error(ChainError, "unexpected journal head during recovery")
             self._lease._adopt(doc, etag)
-            uncertain = False
             if doc.head == expected and doc.version > old.version:
                 return
-            raise StorageError("journal owner update not confirmed")
-
-        await self._retry(update)
 
     async def _publish(self) -> None:
         """Freeze one batch and confirm its immutable bytes before advancing authority."""
@@ -405,18 +498,21 @@ class JournalWriter:
         self._sync_at = self._group_at = None
         self._immediate = False
 
-        def create() -> None:
+        def create() -> bool:
             try:
-                self._store.create(name, data)
+                _create(self._store, name, data)
+                return True
             except (AlreadyExists, WriteOutcomeUnknown):
-                try:
-                    stored = self._store.read(name)
-                except NotFound:
-                    raise StorageError("journal segment creation not confirmed") from None
-                if sha256(stored.data).digest() != digest:
-                    raise ChainError("journal segment bytes differ") from None
+                return False
 
-        await self._retry(create)
+        while not await self._retry(create):
+            try:
+                stored = await self._retry(partial(_read_segment, self._store, name))
+            except NotFound:
+                continue
+            if sha256(stored).digest() != digest:
+                raise _core_error(ChainError, "journal segment bytes differ")
+            break
         await self._update_owner("advance", new_head)
         self._head = new_head
         self._committed.append(name)
@@ -456,5 +552,7 @@ class JournalWriter:
                     self._wake = anyio.Event()
             except Exception as error:
                 self._fail(error)
+                if self._settlement_expired:
+                    await self._release_after_timeout()
             finally:
                 self._done.set()
