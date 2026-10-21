@@ -110,6 +110,10 @@ def reindex(
     their WAL/SHM sidecars. Persistent lockfiles are retained. Locks and board
     connections are closed on every exit. This function prints nothing; the
     CLI consumes the private diagnostic result from the same rebuild.
+    Rebuild equivalence compares complete logical rows, including producing
+    identities and provenance. Database-local surrogate rowids (such as
+    ``learnings.rowid`` used by FTS) are excluded: their allocation order may
+    differ when journals and human objects are ingested in a different order.
     Like Board.frontier, this synchronous I/O belongs on a worker. Callers
     holding a run lease must use their owner's supervised abandonable boundary.
 

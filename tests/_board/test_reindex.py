@@ -14,6 +14,7 @@ from _fakes.secrecy import assert_secret_absent
 from swarm_arena import Plan, RunConfig
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.cache import ArenaCache
+from swarm_arena._board.human_objects import HumanObject, write_human_objects
 from swarm_arena._board.reindex import (
     _reindex_with_diagnostics,
     recorded_frontiers,
@@ -25,6 +26,8 @@ from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.goal import GoalKey
+from swarm_arena._model.results import Learning
+from swarm_arena._store.base import open_store
 
 
 def _seed(config: RunConfig, namespace: str = "toy", run_id: str = "r1") -> FakeRun:
@@ -475,3 +478,65 @@ def test_reindex_collisions_preserve_rows_and_every_recorded_frontier(
         fresh.close()
         for run in runs:
             run._lease.release()
+
+
+def test_reindex_logical_rows_exclude_only_local_surrogate_rowids(tmp_path: Path) -> None:
+    config = RunConfig(run_root=str(tmp_path / "runs"), arena_root=str(tmp_path / "arena"))
+    incremental = tmp_path / "incremental"
+    rebuilt = tmp_path / "rebuilt"
+    run = FakeRun(config.run_root, "r1")
+    board = ArenaBoard(arena_root=config.arena_root, cache_dir=str(incremental))
+    fresh = ArenaBoard(arena_root=config.arena_root, cache_dir=str(rebuilt))
+
+    def rowids(directory: Path) -> dict[str, int]:
+        connection = sqlite3.connect(directory / "toy.sqlite")
+        try:
+            return dict(connection.execute("SELECT id, rowid FROM learnings"))
+        finally:
+            connection.close()
+
+    try:
+        run.commit(
+            run.plan(),
+            run.candidate("shared"),
+            run.score("s1", "shared", 1),
+            run.learning("L1", "First", evidence=["shared"]),
+        )
+        add_pointer(config.arena_root, run)
+        board.open("", "", ["toy"])
+        frontiers = [board.frontier()]
+        learning = Learning(
+            id="L-h-0123456789abcdef",
+            namespace="toy",
+            run_id="",
+            goal_id=run.goal.id,
+            round=0,
+            author="human:alice",
+            title="Human",
+            text="Human insight",
+            evidence=["shared"],
+            tags=["human"],
+            refines=["L1"],
+        )
+        write_human_objects(
+            open_store(config.arena_root),
+            "toy",
+            "curation",
+            [HumanObject(kind="add", learning=learning, author="human:alice")],
+            now=START,
+        )
+        frontiers.append(board.frontier())
+        run.commit(run.learning("L2", "Last", evidence=["shared"], supersedes=["L1"]))
+        frontiers.append(board.frontier())
+        before = [_snapshot_rows(board, run.goal.key(), f) for f in frontiers]
+        assert reindex(config, ["toy"], cache_dir=rebuilt) == frontiers[-1]
+        # Prove this exercises different allocation orders rather than merely
+        # omitting a column whose values happened to be identical.
+        assert rowids(incremental) == {"L1": 1, learning.id: 2, "L2": 3}
+        assert rowids(rebuilt) == {"L1": 1, "L2": 2, learning.id: 3}
+        assert _logical_rows(incremental) == _logical_rows(rebuilt)
+        assert [_snapshot_rows(fresh, run.goal.key(), f) for f in frontiers] == before
+    finally:
+        board.close()
+        fresh.close()
+        run._lease.release()
