@@ -35,7 +35,6 @@ from swarm_arena._errors import (
     LeaseHeld,
     StorageError,
     _core_error,
-    _rebuild_core_signal,
 )
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import EventDraft, EventType
@@ -47,6 +46,7 @@ from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.results import Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store, _check_key, open_store
 
 CSV_HEADER: Final = ("id", "goal", "team", "agent", "scores", "verdict", "score", "notes")
@@ -331,18 +331,11 @@ _T = TypeVar("_T")
 
 async def _review_io(operation: Callable[..., _T], *args: Any) -> _T:
     """Await abandonable review I/O with reconstructed storage diagnostics."""
-    await anyio.lowlevel.checkpoint_if_cancelled()
+    outcome = _Outcome()
     try:
         return await run_sync_daemon(operation, *args)
-    except Exception as error:
-        safe = _rebuild_core_signal(error)
-        if safe is not None:
-            raise safe from None
-        if isinstance(error, AlreadyExists):
-            raise _core_error(AlreadyExists, "review object already exists") from None
-        if isinstance(error, Fenced):
-            raise _core_error(Fenced) from None
-        raise _core_error(StorageError, f"review storage failed: {type(error).__name__}") from None
+    except BaseException as error:
+        outcome.contain(error, StorageError, "review storage")
 
 
 async def _publish_review_object(
