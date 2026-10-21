@@ -17,6 +17,7 @@ from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.split import weighted_shares
 from swarm_arena._engine import run as run_module
 from swarm_arena._engine.admission import RunAdmission
+from swarm_arena._engine.goal import _repair_round_pages
 from swarm_arena._engine.preflight import check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
@@ -271,6 +272,7 @@ class _ResumeServices:
                         clock=clock,
                         admission=RunAdmission(config.limits.max_agents_total),
                     )
+                    await _repair_round_pages(self.deps, state)
                     self.resumed = ResumeState(state, lease, lease.doc.epoch, ledger, killed, self)
                     self.ready.set()
                     await self.close.wait()

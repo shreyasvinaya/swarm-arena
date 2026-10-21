@@ -2112,3 +2112,79 @@ async def test_resume_checks_storage_before_takeover(
     owner = read_owner(crashed.store)
     assert owner is not None
     assert owner[0].epoch == 1
+
+
+async def test_resume_repairs_missing_pages_of_finished_goals(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events
+
+    from swarm_arena._journal.views import ViewWriter
+
+    config = with_executor(run_config, workspace_root=str(tmp_path / "workspace"))
+    original = ViewWriter.write
+
+    async def miss_first(self: ViewWriter, key: str, content: bytes, **kwargs: Any) -> None:
+        if key == "goals/g/rounds/round-01.md":
+            return
+        await original(self, key, content, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ViewWriter, "write", miss_first)
+        await Swarm(config).run(_plan(agents=("a",), rounds=2), run_id="pages")
+    store = LocalStore(Path(config.run_root) / "pages")
+    config = RunConfig.load(Path(config.run_root) / "pages" / "run.toml")
+    assert not store.exists("goals/g/rounds/round-01.md")
+    second = store.read("goals/g/rounds/round-02.md").data
+    before = all_events(config)
+    await Swarm(config).resume("pages", force=True)
+    first = store.read("goals/g/rounds/round-01.md").data
+    assert b"round 1 of 2" in first
+    assert store.read("goals/g/rounds/round-02.md").data == second
+    after = all_events(config)
+    paid = {"reserve", "tool_start", "score", "decision", "curated", "plan_revision"}
+    assert [e for e in after if e.type in paid] == [e for e in before if e.type in paid]
+    await Swarm(config).resume("pages", force=True)
+    assert store.read("goals/g/rounds/round-01.md").data == first
+    assert store.read("goals/g/rounds/round-02.md").data == second
+
+
+async def test_prepare_resume_repairs_page_after_real_close_crash(tmp_path: Path) -> None:
+    import os
+    import sys
+
+    from _fakes.run import all_events
+
+    environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
+    )
+    script = (
+        "import sys,anyio; from _fakes.curators import crash_driver; "
+        "anyio.run(crash_driver,sys.argv[1],'round_closed')"
+    )
+    with anyio.fail_after(60):
+        process = await anyio.run_process(
+            [sys.executable, "-c", script, str(tmp_path)], env=environment, check=False
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    config = RunConfig.load(tmp_path / "runs" / "curation" / "run.toml")
+    store = LocalStore(tmp_path / "runs" / "curation")
+    key = "goals/g/rounds/round-01.md"
+    assert not store.exists(key)
+    before = all_events(config)
+    summaries = [e.payload["summaries"][0] for e in before if e.type == "curated"]
+    assert len(summaries) == 1
+    with anyio.fail_after(60):
+        runner = await resume_run(config, "curation", force=True, replanner=None)
+        try:
+            page = store.read(key).data.decode()
+            assert summaries[0] in page
+            assert "New learnings (2)" in page
+            assert "· 2 learnings in namespace `n`." in page
+            assert "round 1 of 2" in page
+        finally:
+            await runner.aclose()
+    assert (tmp_path / "calls").read_text().splitlines() == ["called"]
+    assert [e.type for e in all_events(config) if e.seq > before[-1].seq] == ["takeover"]
