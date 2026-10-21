@@ -121,6 +121,14 @@ and plan projections, so an event-loop read does not wait for a worker fetching
 a journal or writing the cache. The frontier and its prepared reader state are
 published together under a short in-memory lock. A failed refresh leaves the
 previous generation readable; snapshot preparation also belongs on a worker.
+Each public Board or view read pins its captured reader lifetime for the entire
+operation, including queries performed after candidate validation. Publication
+swaps stop new Board reads from capturing the previous generation. Generations
+and fixed views share one reader per namespace; a swap does not close that pool.
+`close()` stops new reads and waits for active reads before releasing connections,
+without holding the refresh or publication lock during the wait. Subsequent reads
+raise `RuntimeError("arena board is closed")`. Calling `open()` again starts a new
+lifetime; views from the closed lifetime remain closed.
 Plan resolution is retained per run and committed mark in the open board.
 Repeated reads at unchanged marks do not replay journal history. Advancement
 reuses committed replay checkpoints and folds only missing events; a cold or
