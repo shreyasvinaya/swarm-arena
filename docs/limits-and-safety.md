@@ -223,6 +223,10 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+An invalid or missing committed journal segment raises `ChainError`, preserving
+the safe diagnostic that identifies the segment. Invalid replay payloads,
+missing committed state, incompatible agent limits, and decreased budget caps
+raise `ValueError` (or its `PlanError` subclass). These checks run before takeover.
 Normally the previous lease must be released or expired. `--force` explicitly
 permits a live takeover, records it, and fences the old owner by a conditional
 ownership write; it does not refund already committed work. Resume restores

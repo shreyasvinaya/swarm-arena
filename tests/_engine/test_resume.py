@@ -42,6 +42,7 @@ from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
 from swarm_arena._engine.round import RoundOutcome, RoundRunner
 from swarm_arena._errors import (
+    ChainError,
     ConditionalWritesUnsupported,
     Fenced,
     LeaseHeld,
@@ -2449,3 +2450,18 @@ with MonkeyPatch.context() as patch:
     await Swarm(config).resume(run_id, force=True)
     assert arena.read(key).data == repaired
     assert [k for k in arena.list("") if "/reviews/" in k] == [key]
+
+
+async def test_resume_missing_segment_keeps_chain_error(finished_run: FinishedRun) -> None:
+    root = Path(finished_run.config.run_root) / finished_run.run_id
+    store = LocalStore(root)
+    owner = store.read("control/owner.json").data
+    segment = sorted((root / "journal").glob("*.jsonl"))[0]
+    key = segment.relative_to(root).as_posix()
+    segment.unlink()
+
+    with pytest.raises(ChainError) as caught:
+        await Swarm(finished_run.config).resume(finished_run.run_id, force=True)
+
+    assert str(caught.value) == f"missing segment '{key}'"
+    assert store.read("control/owner.json").data == owner

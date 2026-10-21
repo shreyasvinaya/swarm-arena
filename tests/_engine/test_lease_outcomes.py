@@ -10,11 +10,11 @@ from _fakes.secrecy import assert_secret_absent
 from swarm_arena import RunConfig
 from swarm_arena._engine.resume import _acquire_lease, _take_over
 from swarm_arena._errors import Fenced, PreconditionFailed, StorageError, _is_core_signal
-from swarm_arena._journal.lease import Head, Lease, OwnerDoc
+from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._store.local import LocalStore
 
 
-@pytest.mark.parametrize("site", ["acquire", "takeover", "read", "validate"])
+@pytest.mark.parametrize("site", ["acquire", "takeover", "read"])
 @pytest.mark.parametrize("kind", ["ordinary", "cancel", "group", "fenced", "cas"])
 async def test_lease_outcomes_are_type_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, kind: str
@@ -42,21 +42,11 @@ async def test_lease_outcomes_are_type_only(
             raise AssertionError("untrusted failure was retried")
         raise errors[kind]
 
-    def validate(doc: OwnerDoc) -> None:
-        fail(doc)
-
     if site == "acquire":
         operation = _acquire_lease(fail, settle_timeout_s=1)
     else:
-        if site != "validate":
-            monkeypatch.setattr(store, "read" if site == "read" else "replace", fail)
-        operation = _take_over(
-            RunConfig(),
-            "r",
-            store,
-            force=True,
-            validate=validate if site == "validate" else None,
-        )
+        monkeypatch.setattr(store, "read" if site == "read" else "replace", fail)
+        operation = _take_over(RunConfig(), "r", store, force=True)
     with pytest.raises(StorageError) as caught:
         await operation
     assert calls == 1

@@ -416,7 +416,7 @@ _T = TypeVar("_T")
 
 
 async def _lease_io(operation: Callable[..., _T], *args: Any) -> _T:
-    """Read or validate takeover state under the shared outcome boundary."""
+    """Read takeover authority under the shared storage outcome boundary."""
     outcome = _Outcome()
     try:
         return await run_sync_daemon(operation, *args)
@@ -444,7 +444,7 @@ async def _take_over(
         if doc.head is None:
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
-            await _lease_io(validate, doc)
+            await run_sync_daemon(validate, doc)
         try:
             return await _acquire_lease(
                 partial(
@@ -496,8 +496,10 @@ async def resume_run(
     Raises
     ------
     ValueError
-        A goal's agent peak exceeds the run-wide limit, the journal is missing
-        or has an invalid replay payload, or a budget cap decreases.
+        A goal's agent peak exceeds the run-wide limit, no committed state
+        exists, a replay payload is invalid, or a budget cap decreases.
+    ChainError
+        The committed journal chain is broken or a segment is missing.
     RuntimeError
         A live owner requires force, a competing resume advances the epoch,
         a runtime service fails, or stop/run expiry interrupts preparation.

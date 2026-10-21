@@ -139,10 +139,13 @@ class Swarm:
         ------
         ValueError
             A goal's peak exceeds max_agents_total, a budget cap decreases,
-            or committed state is invalid.
+            no committed state exists, or a replay payload is invalid.
+        ChainError
+            The committed journal chain is broken or a segment is missing.
         RuntimeError
             The old owner is live without force, a competing resume wins
-            ownership, or a runtime service fails.
+            ownership, a runtime service fails, or stop/run expiry interrupts
+            service preparation.
 
         Notes
         -----
