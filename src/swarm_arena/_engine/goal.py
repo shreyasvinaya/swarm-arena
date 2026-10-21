@@ -1193,6 +1193,9 @@ class GoalRunner:
                 )
                 self.select_only = True
                 self.status, self.reason = "stopped", "reserve_exhausted"
+            except Exception as error:
+                # The supervisor can raise sanitized cancellation-shaped failures.
+                completed, result = True, ([], [_curator_error(error)])
         finally:
             # Only pending usage waits are bounded; admitted durable settlement
             # retains the ledger's existing finality and conservative charges.
