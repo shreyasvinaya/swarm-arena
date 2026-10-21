@@ -239,3 +239,6 @@ remain available after resume.
 
 Review imports publish to the configured `ArenaBoard` arena root when supplied;
 otherwise they use `RunConfig.arena_root`.
+
+Human judge leaderboards compare all fidelities together and order verdict/score
+keys directly, without applying a program judge's `min_improvement` margin.

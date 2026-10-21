@@ -361,3 +361,43 @@ def test_producing_key_selection_precedes_identity_and_fidelity(
             assert rows[0].rubric_hash == rows[0].fidelity
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_human_judges_rank_all_fidelities_without_plan_margin(mapping: bool) -> None:
+    cs = [
+        _candidate("c-cheap", 1, fidelity="cheap"),
+        _candidate("c-full", 2, fidelity="full", round=2),
+    ]
+    ss = [
+        _score("c-cheap", 9, 3, judge="human:alice", key=(1, 9)),
+        _score("c-full", 1, 4, judge="human:alice", key=(1, 1)),
+    ]
+    judge = {None: "human:alice"} if mapping else "human:alice"
+    rows = flatten(group_rows(cs, ss, judge=judge, min_improvement=0.5))
+    assert [r.candidate_id for r in rows] == ["c-cheap", "c-full"]
+    # With equal verdicts a later higher numeric human score must replace first place.
+    ss[1] = _score("c-full", 10, 4, judge="human:alice", key=(1, 10))
+    assert flatten(group_rows(cs, ss, judge=judge, min_improvement=0.5))[0].value == 10
+
+
+def test_mixed_mapping_preserves_program_fidelity_and_margin() -> None:
+    cs = [
+        _candidate("c-human-cheap", 1, fidelity="cheap"),
+        _candidate("c-human-full", 2, fidelity="full", round=2),
+        _candidate("c-part-cheap", 3, part="a", fidelity="cheap"),
+        _candidate("c-part-full", 4, part="a", fidelity="full", round=2),
+    ]
+    ss = [
+        _score(
+            c.id,
+            10 if c.fidelity == "cheap" else 1,
+            i + 5,
+            judge="human:alice" if c.part is None else "j",
+            key=(1,),
+        )
+        for i, (c, _) in enumerate(cs)
+    ]
+    ranked = group_rows(cs, ss, judge={None: "human:alice", "a": "j"})
+    assert len(ranked[None]) == 2
+    assert [r.candidate_id for r in ranked["a"]] == ["c-part-full"]

@@ -71,7 +71,7 @@ def group_rows(
         before identity choice. Latest matching Position wins per candidate.
     judge : str or Mapping[str or None, str]
         One judge for all groups, or recorded names per group. Missing names
-        omit a group. A single ``human:`` judge ranks all fidelities together.
+        omit a group. Each ``human:`` judge ranks all fidelities together.
     run_id : str or None, default=None
         Limit ranked candidates to this run, independently of identity choice.
     identity_run : str or None, default=None
@@ -113,17 +113,21 @@ def group_rows(
                 (score.candidate_id, score) for score, _ in recorded if score.identity == identity
             )
     selected = [c for c, _ in ordered if run_id is None or c.run_id == run_id]
-    ranked = ranked_groups(
-        selected,
-        latest.values(),
-        identity=identities,
-        fidelity=fidelity,
-        every_fidelity=isinstance(judge, str) and judge.startswith("human:"),
-    )
+    ranked = {}
+    for part, identity in identities.items():
+        ranked.update(
+            ranked_groups(
+                [c for c in selected if c.part == part],
+                latest.values(),
+                identity={part: identity},
+                fidelity=fidelity,
+                every_fidelity=identity[0].startswith("human:"),
+            )
+        )
     positions = {c.id: position for c, position in ordered}
     result: dict[str | None, list[Row]] = {}
     for part, eligible in ranked.items():
-        if min_improvement is not None:
+        if min_improvement is not None and not identities[part][0].startswith("human:"):
             leader: tuple[Candidate, Score] | None = None
             for pair in sorted(eligible, key=lambda pair: positions[pair[0].id]):
                 if leader is None or (
