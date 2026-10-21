@@ -373,7 +373,7 @@ def test_human_judges_rank_all_fidelities_without_plan_margin(mapping: bool) -> 
         _score("c-cheap", 9, 3, judge="human:alice", key=(1, 9)),
         _score("c-full", 1, 4, judge="human:alice", key=(1, 1)),
     ]
-    judge = {None: "human:alice"} if mapping else "human:alice"
+    judge: str | dict[str | None, str] = {None: "human:alice"} if mapping else "human:alice"
     rows = flatten(group_rows(cs, ss, judge=judge, min_improvement=0.5))
     assert [r.candidate_id for r in rows] == ["c-cheap", "c-full"]
     # With equal verdicts a later higher numeric human score must replace first place.

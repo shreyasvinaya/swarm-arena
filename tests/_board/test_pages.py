@@ -231,12 +231,12 @@ def test_unnamed_judge_does_not_import_plugins() -> None:
         assert "Leaderboard (rel-error, lower is better)" in _page(RunState.from_events(events))
 
 
-def test_source_head_embedded(state: RunState) -> None:
+def test_source_head_is_owned_by_publication(state: RunState) -> None:
     assert (
         read_source_head(
             "md", round_page(state, "ns-viscosity", 2, namespace_learnings=0, source=head)
         )
-        == head
+        is None
     )
 
 
@@ -265,10 +265,10 @@ def test_learning_status_and_unscored_evidence(author: str, verified: bool, labe
     assert "Pruned: agent `fd-solver/tuner-2` (done)." in page
 
 
-def test_source_changes_only_comment(state: RunState) -> None:
+def test_source_does_not_change_page_body(state: RunState) -> None:
     newer = Head(epoch=2, seq=200, segment="journal/e2-200.jsonl")
     page = round_page(state, "ns-viscosity", 2, namespace_learnings=412, source=newer)
-    assert page.splitlines()[1:] == _page(state).encode().splitlines()[1:]
+    assert page == _page(state).encode()
 
 
 def test_evidence_uses_formatter_for_a_score_without_value() -> None:

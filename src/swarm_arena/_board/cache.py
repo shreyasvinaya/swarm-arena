@@ -50,14 +50,9 @@ _SCHEMA = (
         "plan_json TEXT, first_round INTEGER NOT NULL, PRIMARY KEY(run_id, goal_id, revision))"
     ),
     (
-        "part_goals(run_id TEXT, goal_id TEXT, revision INTEGER, part TEXT, part_key TEXT, "
-        "PRIMARY KEY(run_id, goal_id, revision, part))"
-    ),
-    (
         "candidates(id TEXT, producer TEXT NOT NULL, run_id TEXT, epoch INTEGER, seq INTEGER, "
         "ts TEXT, "
-        "goal_id TEXT, goal_key TEXT, part_key TEXT, part TEXT, team TEXT, agent TEXT, round "
-        "INTEGER, fidelity TEXT, partial INTEGER, gated_out INTEGER, repeat_key TEXT, json "
+        "goal_id TEXT, goal_key TEXT, part_key TEXT, part TEXT, repeat_key TEXT, json "
         "TEXT, PRIMARY KEY(id, producer))"
     ),
     (
@@ -251,7 +246,7 @@ class ArenaCache:
     >>> cache.close()  # doctest: +SKIP
     """
 
-    SCHEMA_VERSION: ClassVar[int] = 3
+    SCHEMA_VERSION: ClassVar[int] = 4
 
     def __init__(self, path: Path) -> None:
         self.namespace = path.stem
@@ -354,60 +349,6 @@ class ArenaCache:
         with self._lock:
             row = self._conn.execute(
                 "SELECT name FROM segments WHERE run_id=? ORDER BY last_seq DESC LIMIT 1", (run_id,)
-            ).fetchone()
-            return row[0] if row else None
-
-    def has_segment(self, run_id: str, segment: str) -> bool:
-        """
-        Test membership in the cached committed chain.
-
-        Parameters
-        ----------
-        run_id : str
-            Run identifier.
-        segment : str
-            Exact segment key.
-
-        Returns
-        -------
-        bool
-            Whether the segment was committed to this cache.
-
-        Examples
-        --------
-        >>> cache.has_segment('r1', 'journal/e1-2.jsonl')  # doctest: +SKIP
-        True
-        """
-        with self._lock:
-            return (
-                self._conn.execute(
-                    "SELECT 1 FROM segments WHERE run_id=? AND name=?", (run_id, segment)
-                ).fetchone()
-                is not None
-            )
-
-    def run_root(self, run_id: str) -> str | None:
-        """
-        Return the last ingested storage root for a run.
-
-        Parameters
-        ----------
-        run_id : str
-            Run identifier.
-
-        Returns
-        -------
-        str or None
-            Recorded root, or None for an uncached run.
-
-        Examples
-        --------
-        >>> cache.run_root('r1')  # doctest: +SKIP
-        '/runs'
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT run_root FROM runs WHERE run_id=?", (run_id,)
             ).fetchone()
             return row[0] if row else None
 
@@ -946,44 +887,6 @@ class ArenaCache:
         with self._lock, self._frontier(frontier):
             return self._learnings(frontier, ids)
 
-    def plans(self, frontier: Frontier, run_id: str, goal_id: str) -> list[tuple[Plan, str, int]]:
-        """
-        Read committed plan revisions for one marked run and goal.
-
-        Parameters
-        ----------
-        frontier : Frontier
-            Covered committed marks, without any latest-head fallback.
-        run_id : str
-            Owning run identifier.
-        goal_id : str
-            Owning main goal identifier.
-
-        Returns
-        -------
-        list[tuple[Plan, str, int]]
-            Plan, recorded origin, and event sequence, ordered by revision.
-            Activation remains available through the private replay lookups;
-            publication of a revision does not imply immediate activation.
-
-        Raises
-        ------
-        ChainError
-            If marks conflict or are not exactly covered.
-
-        Examples
-        --------
-        >>> rows = cache.plans(frontier, 'r1', 'g1')  # doctest: +SKIP
-        """
-        with self._lock, self._frontier(frontier):
-            rows = self._conn.execute(
-                "SELECT plan_json, origin, p.seq FROM plans p "
-                "JOIN _read_sets m ON m.set_name='marks' AND m.id=p.run_id AND p.seq<=m.seq "
-                "WHERE p.run_id=? AND goal_id=? ORDER BY revision",
-                (run_id, goal_id),
-            ).fetchall()
-            return [(Plan.model_validate_json(data), origin, seq) for data, origin, seq in rows]
-
     def _plan_projection(
         self,
         frontier: Frontier,
@@ -1329,64 +1232,6 @@ class ArenaCache:
                 self._flags_sql() + "SELECT count(*) FROM " + source, params
             ).fetchone()[0]
 
-    def search(
-        self,
-        namespace: str,
-        query: str,
-        *,
-        frontier: Frontier,
-        goal: GoalKey | None,
-        tags: Sequence[str],
-        limit: int,
-    ) -> list[str]:
-        """
-        Search this namespace with an optional goal and any-of tags.
-
-        Parameters
-        ----------
-        namespace : str
-            Must equal this cache's namespace.
-        query : str
-            User text to tokenize and match literally.
-        frontier : Frontier
-            Fully covered fixed journal marks and human-object names.
-        goal : GoalKey or None
-            Goal filter and relevance preference, including human goal-ID fallback.
-        tags : Sequence[str]
-            Any-of tags, also used for relevance tie ordering.
-        limit : int
-            Maximum number of learning IDs.
-
-        Returns
-        -------
-        list[str]
-            Visible learning IDs in text rank and relevance order.
-
-        Raises
-        ------
-        ValueError
-            If namespace differs from the cache namespace.
-        ChainError
-            If the fixed frontier is not fully covered.
-
-        Examples
-        --------
-        >>> ids = cache.search('toy', 'log(nu)', frontier=frontier,
-        ...     goal=None, tags=(), limit=10)  # doctest: +SKIP
-        """
-        if namespace != self.namespace:
-            raise _core_error(ValueError, "search namespace does not match cache")
-        digest = goal_key_digest(goal) if goal is not None else None
-        return self.find(
-            frontier,
-            query=query,
-            filters=LearningFilter(
-                goal_key=digest, goal_id=goal.id if goal else None, tags=list(tags)
-            ),
-            relevance_goal=(digest, goal.id) if digest is not None and goal is not None else None,
-            limit=limit,
-        )
-
     def _covered(self, run_id: str, head: Head) -> bool:
         """Validate full metadata and ancestry, rejecting divergent older marks."""
         with self._lock:
@@ -1446,14 +1291,6 @@ class ArenaCache:
             except (ValueError, TypeError, KeyError):
                 raise _core_error(ChainError, "invalid journal replay payload") from None
         return state
-
-    def _plan_for_round(self, run_id: str, goal_id: str, round: int, *, through_seq: int) -> Plan:
-        """Select an executed revision using core replay within the supplied prefix."""
-        with self._lock:
-            try:
-                return self._replay(run_id, through_seq=through_seq).plan_for_round(goal_id, round)
-            except (KeyError, ValueError):
-                raise _core_error(ChainError, "no committed plan for goal") from None
 
     def ingest(
         self, run_id: str, run_root: str, segments: Sequence[tuple[str, list[Event]]]
@@ -1624,11 +1461,6 @@ class ArenaCache:
                     first_round,
                 ),
             )
-            for part in plan.parts:
-                self._conn.execute(
-                    "INSERT INTO part_goals VALUES (?, ?, ?, ?, ?)",
-                    (run_id, goal_id, plan.revision, part.name, goal_key_digest(part.goal.key())),
-                )
             return
         if event.type not in (EventType.TOOL_END, EventType.SCORE, EventType.LEARNING):
             return
@@ -1659,12 +1491,6 @@ class ArenaCache:
                     if candidate.part is None
                     else goal_key_digest(state.candidate_goal_keys[candidate.id]),
                     part=candidate.part,
-                    team=candidate.team,
-                    agent=candidate.agent,
-                    round=candidate.round,
-                    fidelity=candidate.fidelity,
-                    partial=candidate.output.partial,
-                    gated_out=candidate.gated_out,
                     repeat_key=repeat_key,
                     json=candidate.model_dump_json(),
                 ),

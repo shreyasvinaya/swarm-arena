@@ -1209,3 +1209,12 @@ def test_colliding_candidate_scores_keep_producer_at_each_frontier(
         finally:
             if reader is not board:
                 reader.close()
+
+
+def test_board_does_not_keep_unused_decision_or_frontier_copies(board: ArenaBoard) -> None:
+    from swarm_arena._model.planning_types import Decision
+
+    board.put_decision("g", 1, Decision(), epoch=1, seq=1)
+    board.frontier()
+    assert not hasattr(board, "_decisions")
+    assert not hasattr(board, "_latest")

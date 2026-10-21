@@ -6,7 +6,7 @@ import pytest
 from _fakes.curators import MergeAll
 
 from swarm_arena import Ref
-from swarm_arena._board.curator import Curator, run_curator
+from swarm_arena._board.curator import Curator, _prepare_curator, _stamp_summaries
 from swarm_arena._errors import Fenced, _core_error
 from swarm_arena._model.ids import IdGen
 from swarm_arena.board import BoardView, Learning
@@ -52,7 +52,7 @@ async def run(
 ) -> tuple[list[Learning], list[str]]:
     view = Mock(spec=BoardView)
     view.learnings.return_value = list(visible)
-    return await run_curator(
+    summaries, errors = await _prepare_curator(
         curator,
         namespace="toy",
         run_id="r1",
@@ -60,8 +60,8 @@ async def run(
         round=1,
         new=new,
         view=view,
-        ids=ids or IdGen("r1", 1),
     )
+    return _stamp_summaries(summaries, ids or IdGen("r1", 1)), errors
 
 
 async def test_summary_supersedes_and_unions_evidence() -> None:

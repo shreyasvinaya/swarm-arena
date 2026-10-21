@@ -231,13 +231,11 @@ class ArenaBoard(Board):
         self._namespaces: tuple[str, ...] = ()
         self._run_id = ""
         self._run_root = ""
-        self._latest: Frontier | None = None
         self._lifetime = _ReadLifetime()
         self._published = _Published(Frontier(), {}, {}, (), None, self._lifetime)
         self._candidates: dict[str, Candidate] = {}
         self._scores: dict[str, Score] = {}
         self._learnings: dict[str, Learning] = {}
-        self._decisions: dict[tuple[str, int], Decision] = {}
         self._run_plans: dict[tuple[str, str], tuple[Frontier.Mark, _RunPlans]] = {}
 
     @property
@@ -382,7 +380,6 @@ class ArenaBoard(Board):
                 if self._lifetime.closed:
                     self._lifetime = _ReadLifetime()
                 self._run_id, self._run_root, self._namespaces = run_id, resolved, names
-                self._latest = None
                 self._published = _Published(
                     Frontier(), {}, {}, names, run_id or None, self._lifetime
                 )
@@ -411,7 +408,6 @@ class ArenaBoard(Board):
             self._read_caches.clear()
             self._caches.clear()
             self._run_plans.clear()
-            self._latest = None
             self._published = _Published(Frontier(), {}, {}, (), None, lifetime)
         # Neither publication nor refresh locks may be held while readers drain.
         lifetime.wait()
@@ -491,7 +487,7 @@ class ArenaBoard(Board):
         self, goal_id: str, round: int, decision: Decision, *, epoch: int, seq: int
     ) -> None:
         """
-        Retain a decision hint without writing a journal or changing a frontier.
+        Accept a journaled decision notification without retaining a duplicate.
 
         Parameters
         ----------
@@ -500,7 +496,7 @@ class ArenaBoard(Board):
         round : int
             Decision's round number.
         decision : Decision
-            Core-journaled policy decision to copy.
+            Core-journaled policy decision; committed replay owns this state.
         epoch : int
             Journal ownership epoch.
         seq : int
@@ -512,8 +508,7 @@ class ArenaBoard(Board):
         >>> board = ArenaBoard(arena_root="/arena")
         >>> board.put_decision("g", 1, Decision(), epoch=1, seq=4)
         """
-        with self._lock:
-            self._decisions[(goal_id, round)] = decision.model_copy(deep=True)
+        return None
 
     def _load_objects(
         self, cache: ArenaCache, frontier: Frontier, *, tolerate_unreadable: bool = False
@@ -623,9 +618,7 @@ class ArenaBoard(Board):
                 }
             )
             published = self._prepare_published(frontier)
-            latest = frontier.model_copy(deep=True)
             with self._lock:
-                self._latest = latest
                 self._published = published
             return frontier
 

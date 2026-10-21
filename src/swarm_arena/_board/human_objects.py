@@ -311,32 +311,3 @@ def read_human_object(arena: Store, name: str) -> list[HumanObject]:
     objects = [HumanObject.model_validate_json(line) for line in arena.read(name).data.splitlines()]
     _check_folder_payload(folder, objects)
     return objects
-
-
-def fold_curation(ops: Iterable[tuple[str, int, HumanObject]]) -> dict[str, tuple[bool, bool]]:
-    """
-    Fold pins and hides by timestamp, full name, and JSONL line position.
-
-    Parameters
-    ----------
-    ops : Iterable[tuple[str, int, HumanObject]]
-        Object name, line index, and operation triples, in any input order.
-
-    Returns
-    -------
-    dict[str, tuple[bool, bool]]
-        Learning identifier to pinned/hidden flags; later pin or hide wins.
-        Add and review operations do not change these flags.
-
-    Examples
-    --------
-    >>> pin = HumanObject(kind="pin", learning_id="L-1", author="human:alice")
-    >>> fold_curation([("n1", 0, pin)])
-    {'L-1': (True, False)}
-    """
-    result: dict[str, tuple[bool, bool]] = {}
-    for _, _, obj in sorted(ops, key=lambda op: (human_object_order(op[0]), op[1])):
-        if obj.kind in {"pin", "hide"}:
-            assert obj.learning_id is not None
-            result[obj.learning_id] = (obj.kind == "pin", obj.kind == "hide")
-    return result

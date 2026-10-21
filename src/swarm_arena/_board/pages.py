@@ -7,7 +7,6 @@ from swarm_arena._board.cache import Position
 from swarm_arena._board.leaderboard import flatten, format_value, group_judges, group_rows
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.replay import RunState
-from swarm_arena._journal.views import embed_source_head
 from swarm_arena._model.results import Candidate, Score
 
 _T = TypeVar("_T", Candidate, Score)
@@ -102,12 +101,12 @@ def round_page(
     namespace_learnings : int
         Count from the recorded round frontier plus its new committed learnings.
     source : Head
-        Committed source head embedded as the first Markdown line.
+        Legacy caller source, retained until engine publication owns the header.
 
     Returns
     -------
     bytes
-        UTF-8 Markdown with exactly one leading source-head comment.
+        UTF-8 Markdown body with a leading blank line. Publication adds provenance.
 
     Examples
     --------
@@ -217,4 +216,4 @@ def round_page(
             f"learnings in namespace `{plan.goal.namespace}`.",
         ]
     )
-    return embed_source_head("md", ("\n".join(lines) + "\n").encode(), source)
+    return ("\n" + "\n".join(lines) + "\n").encode()

@@ -25,7 +25,8 @@ A part may use a different namespace from its main goal. Its candidates, scores,
 and learnings are indexed in that part's namespace; declared sibling views keep
 the same recorded frontier while selecting the sibling's namespace. A main view
 can still read its declared parts and join their results. The cache schema is
-version 2; a version 1 cache must be rebuilt so old namespace routing is not reused.
+version 4; incompatible older caches, including versions 1, 2 and 3, must be
+rebuilt with `swarm-arena reindex`.
 
 ## What the arena stores
 
@@ -47,10 +48,11 @@ run's mutable `owner.json` names its committed journal head. Only the chain
 reachable from that head counts; orphan segments never enter a view. Empty
 review and curation objects are valid and remain part of recorded frontiers.
 
-`put_candidate`, `put_score`, `put_learning`, and `put_decision` retain local
+`put_candidate`, `put_score`, and `put_learning` retain local
 hints after the core journals an item. They do not write the journal or publish
 items to snapshots. Only board-level candidate, learning, and score lookups
-can fall back to hints. Hidden learnings are excluded from normal reads,
+can fall back to hints. `put_decision` accepts a notification without retaining
+a second copy of the journaled decision. Hidden learnings are excluded from normal reads,
 including those fallbacks.
 
 ## Snapshots and frontiers

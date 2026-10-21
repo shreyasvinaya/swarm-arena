@@ -27,7 +27,7 @@ from swarm_arena import (
 )
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.learnings import DUPLICATE_JACCARD, jaccard, title_tokens
-from swarm_arena._board.reindex import recorded_frontiers
+from _fakes.arena import recorded_frontiers
 from swarm_arena._errors import AlreadyExists, PreconditionFailed
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import read_owner

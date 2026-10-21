@@ -8,11 +8,11 @@ from functools import partial
 from pathlib import Path
 
 import anyio
+from _fakes.arena import recorded_frontiers, reindex, snapshot_membership
 from _fakes.finished import FinishedRun, run_again
 
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.human_objects import HumanObject, write_human_objects
-from swarm_arena._board.reindex import recorded_frontiers, reindex, snapshot_membership
 from swarm_arena._journal.event import Event
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.reader import read_chain

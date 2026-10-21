@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from swarm_arena._board.human_objects import (
     HumanObject,
-    fold_curation,
     human_object_key,
     human_object_name,
     human_object_order,
@@ -58,17 +57,22 @@ def test_order_is_timestamp_then_name() -> None:
     assert sorted([a, b, c], key=human_object_order) == [c, b, a]
 
 
-def test_later_pin_or_hide_wins() -> None:
+def test_later_pin_or_hide_wins(tmp_path: Path) -> None:
+    from swarm_arena._board.cache import ArenaCache
+    from swarm_arena._model.board_types import Frontier
+
     hide = HumanObject(kind="hide", learning_id="L-1", author="human:a")
     pin = hide.model_copy(update={"kind": "pin"})
-    assert fold_curation([("n1", 0, hide), ("n2", 0, pin)]) == {"L-1": (True, False)}
-    assert fold_curation([("n1", 0, pin), ("n2", 0, hide)]) == {"L-1": (False, True)}
-    name = human_object_key("toy", "curation", NAME)
-    assert fold_curation([(name, 1, hide), (name, 0, pin)]) == {"L-1": (False, True)}
-    assert (
-        fold_curation([(name, 0, HumanObject(kind="add", learning=_learning(), author="human:a"))])
-        == {}
-    )
+    first = human_object_key("toy", "curation", NAME)
+    second = human_object_key("toy", "curation", "20261018T140000.000Z-0000ffff.jsonl")
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    try:
+        # Storage arrival order differs from timestamp order; last line also wins.
+        cache.apply_human_objects([second, first, second], [pin, pin, hide])
+        assert cache.flags(Frontier(curation=[first, second])) == {"L-1": (False, True)}
+        assert cache.flags(Frontier(curation=[first])) == {"L-1": (True, False)}
+    finally:
+        cache.close()
 
 
 def test_write_uses_given_name(tmp_path: Path) -> None:

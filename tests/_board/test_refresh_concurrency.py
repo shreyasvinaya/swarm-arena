@@ -314,7 +314,7 @@ def test_failed_reader_preparation_retains_published_generation(
             patch.setattr(board, "_read_cache", fail)
             with pytest.raises(RuntimeError, match="reader preparation failed"):
                 board.frontier()
-        assert board._latest == old_frontier
+        assert board._read_state().frontier == old_frontier
         assert [c.id for c in board.best(run.goal.key(), 5, judge="j")] == ["old"]
         with pytest.raises(KeyError):
             board.get_candidate("new")

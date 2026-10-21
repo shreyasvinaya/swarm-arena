@@ -10,6 +10,7 @@ from threading import Event as ThreadEvent
 from time import monotonic
 
 import pytest
+from _fakes.arena import _plan_for_round, plans, run_root, search
 from _fakes.journals import START, FakeRun, candidate_ids
 from _fakes.secrecy import assert_secret_absent
 
@@ -34,9 +35,9 @@ def test_ingest_is_idempotent(tmp_path: Path) -> None:
     cache.ingest("r1", run.run_root, segs)
     cache.ingest("r1", run.run_root, segs)
     assert candidate_ids(cache) == ["c-1"]
-    assert cache.run_root("r1") == run.run_root
+    assert run_root(cache, "r1") == run.run_root
     assert cache.newest_segment("missing") is None
-    assert cache.run_root("missing") is None
+    assert run_root(cache, "missing") is None
     cache.close()
     cache.close()
 
@@ -165,9 +166,9 @@ def test_producing_identity_matches_core_and_rebuild(tmp_path: Path, change: str
         rows == rebuilt._conn.execute("SELECT id, part_key FROM candidates ORDER BY id").fetchall()
     )
     assert dict(rows)["old"] == dict(rows)["late"] != dict(rows)["new"]
-    assert cache._plan_for_round("r1", "g1", 2, through_seq=head.seq).revision == 0
-    assert cache._plan_for_round("r1", "g1", 3, through_seq=head.seq).revision == 1
-    assert cache._plan_for_round("r1", "g1", 3, through_seq=initial.seq).revision == 0
+    assert _plan_for_round(cache, "r1", "g1", 2, through_seq=head.seq).revision == 0
+    assert _plan_for_round(cache, "r1", "g1", 3, through_seq=head.seq).revision == 1
+    assert _plan_for_round(cache, "r1", "g1", 3, through_seq=initial.seq).revision == 0
     assert cache._conn.execute("SELECT first_round FROM plans ORDER BY revision").fetchall() == [
         (1,),
         (3,),
@@ -208,7 +209,7 @@ def test_id_from_other_run_is_retained_with_frontier_holder(tmp_path: Path) -> N
     cache.close()
 
 
-@pytest.mark.parametrize("version", [2, 99])
+@pytest.mark.parametrize("version", [1, 2, 3, 99])
 def test_schema_version_mismatch_raises(tmp_path: Path, version: int) -> None:
     path = tmp_path / "toy.sqlite"
     ArenaCache(path).close()
@@ -311,8 +312,8 @@ def test_removed_part_is_historical_only(tmp_path: Path) -> None:
     cache = ArenaCache(tmp_path / "toy.sqlite")
     ingest_run(cache, run.store, "r1", run.run_root, head)
     assert candidate_ids(cache) == ["old"]
-    assert cache._plan_for_round("r1", "g1", 2, through_seq=head.seq).parts == []
-    assert [p.name for p in cache._plan_for_round("r1", "g1", 1, through_seq=head.seq).parts] == [
+    assert _plan_for_round(cache, "r1", "g1", 2, through_seq=head.seq).parts == []
+    assert [p.name for p in _plan_for_round(cache, "r1", "g1", 1, through_seq=head.seq).parts] == [
         "a"
     ]
     bad = run.commit(run.candidate("undeclared", part="a", round=2))
@@ -436,7 +437,9 @@ def test_fake_journal_preserves_producer_payloads_and_core_state(tmp_path: Path)
     assert state.goals["custom"].join_phase == "rounds"
     assert state.run_elapsed_s == 9.0
     assert state.plan_first_rounds["custom"] == [1, 2]
-    assert cache._conn.execute("SELECT partial, gated_out FROM candidates").fetchone() == (1, 1)
+    stored = cache.candidates(build_frontier([("r1", run.run_root, head)], [], []))[0][0]
+    assert stored.output.partial
+    assert stored.gated_out
     assert cache._conn.execute("SELECT ts FROM candidates").fetchone()[0].endswith(".000000+00:00")
     assert (
         "future_metadata"
@@ -752,10 +755,10 @@ def test_items_after_mark_are_hidden(tmp_path: Path) -> None:
     assert [s.id for s, _ in cache.scores(f2)] == ["s-1", "s-2"]
     assert [learning.id for learning in cache.learnings_by_id(f1, ["L-1", "L-2"])] == ["L-1"]
     assert [learning.id for learning in cache.learnings_by_id(f2, ["L-1", "L-2"])] == ["L-1", "L-2"]
-    assert [(p.revision, origin, seq) for p, origin, seq in cache.plans(f1, "r1", "g1")] == [
+    assert [(p.revision, origin, seq) for p, origin, seq in plans(cache, f1, "r1", "g1")] == [
         (0, "human", 1),
     ]
-    assert [p.revision for p, _, _ in cache.plans(f2, "r1", "g1")] == [0, 1]
+    assert [p.revision for p, _, _ in plans(cache, f2, "r1", "g1")] == [0, 1]
     cache.close()
 
 
@@ -780,7 +783,7 @@ def test_run_without_mark_is_hidden(tmp_path: Path) -> None:
             "learnings": [["L-r1", False, False]],
         }
     )
-    assert cache.plans(frontier, "r2", "g1") == []
+    assert plans(cache, frontier, "r2", "g1") == []
     assert cache.candidates(frontier, run_id="r2") == []
     assert cache.membership(Frontier()) == canonical_json(
         {
@@ -1071,7 +1074,7 @@ def test_invalid_human_batch_leaves_no_partial_rows(tmp_path: Path, kind: str) -
 
 
 @pytest.mark.parametrize(
-    "method", ["candidates", "scores", "flags", "learnings_by_id", "plans", "membership"]
+    "method", ["candidates", "scores", "flags", "learnings_by_id", "membership"]
 )
 @pytest.mark.parametrize("bad", ["seq", "epoch", "uncovered", "conflict"])
 def test_reads_require_exact_covered_marks(tmp_path: Path, method: str, bad: str) -> None:
@@ -1148,9 +1151,9 @@ def test_candidate_filters_preserve_fixed_producing_keys(tmp_path: Path, change:
     assert cache.candidates(current, run_id="missing") == []
     duplicate = frontier.model_copy(update={"marks": frontier.marks * 2})
     assert cache.membership(duplicate) == before
-    assert cache._plan_for_round("r1", "g1", 2, through_seq=head.seq).revision == 0
-    assert cache._plan_for_round("r1", "g1", 3, through_seq=head.seq).revision == 1
-    assert [p.revision for p, _, _ in cache.plans(frontier, "r1", "g1")] == [0]
+    assert _plan_for_round(cache, "r1", "g1", 2, through_seq=head.seq).revision == 0
+    assert _plan_for_round(cache, "r1", "g1", 3, through_seq=head.seq).revision == 1
+    assert [p.revision for p, _, _ in plans(cache, frontier, "r1", "g1")] == [0]
     cache.close()
 
 
@@ -1396,7 +1399,7 @@ def test_search_never_raises_on_fts_syntax(
 ) -> None:
     cache, _, frontier = cache_with_learnings
     assert isinstance(
-        cache.search("toy", query, frontier=frontier, goal=None, tags=(), limit=10), list
+        search(cache, "toy", query, frontier=frontier, goal=None, tags=(), limit=10), list
     )
     cache.close()
 
@@ -1405,11 +1408,11 @@ def test_search_finds_parenthesised_term(
     cache_with_learnings: tuple[ArenaCache, FakeRun, Frontier],
 ) -> None:
     cache, _, frontier = cache_with_learnings
-    assert cache.search("toy", "log(nu)", frontier=frontier, goal=None, tags=(), limit=1) == [
+    assert search(cache, "toy", "log(nu)", frontier=frontier, goal=None, tags=(), limit=1) == [
         "L-log"
     ]
     for query in ("()", "___", "*", '"'):
-        assert cache.search("toy", query, frontier=frontier, goal=None, tags=(), limit=10) == []
+        assert search(cache, "toy", query, frontier=frontier, goal=None, tags=(), limit=10) == []
     cache.close()
 
 
@@ -1450,8 +1453,8 @@ def test_search_order_ignores_rows_outside_frontier(tmp_path: Path) -> None:
     b.apply_human_objects([PIN_NAME], [HumanObject(kind="add", learning=human, author="human:x")])
     for limit in (10, 1):
         assert (
-            a.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
-            == b.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
+            search(a, "toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
+            == search(b, "toy", "alpha", frontier=frontier, goal=None, tags=(), limit=limit)
             == ["L-short", "L-long"][:limit]
         )
     table = "fts_" + frontier.digest()[:16]
@@ -1468,7 +1471,7 @@ def test_human_added_learning_is_searchable(tmp_path: Path) -> None:
     )
     for frontier, expected in ((Frontier(curation=[PIN_NAME]), [learning.id]), (Frontier(), [])):
         assert (
-            cache.search("toy", "zebra", frontier=frontier, goal=None, tags=(), limit=10)
+            search(cache, "toy", "zebra", frontier=frontier, goal=None, tags=(), limit=10)
             == expected
         )
     cache.close()
@@ -1538,7 +1541,7 @@ def test_goal_filter_keeps_human_learning_with_goal_id(tmp_path: Path) -> None:
             set(cache.find(frontier, query=None, filters=filters, relevance_goal=None)) == expected
         )
     assert set(
-        cache.search("toy", "hint", frontier=frontier, goal=run.goal.key(), tags=(), limit=10)
+        search(cache, "toy", "hint", frontier=frontier, goal=run.goal.key(), tags=(), limit=10)
     ) == {"L-run", one.id}
     cache.close()
 
@@ -1579,7 +1582,7 @@ def test_search_orders_by_bm25_then_relevance(tmp_path: Path) -> None:
         [PIN_NAME], [HumanObject(kind="pin", learning_id="L-long", author="human:x")]
     )
     frontier = frontier.model_copy(update={"curation": [PIN_NAME]})
-    assert cache.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == [
+    assert search(cache, "toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == [
         "L-verified",
         "L-newer",
         "L-long",
@@ -1721,7 +1724,7 @@ def test_search_rejects_other_namespace(
     cache, _, frontier = cache_with_learnings
     secret = "SECRET-NAMESPACE-INPUT"
     with pytest.raises(ValueError, match="namespace does not match cache") as caught:
-        cache.search(secret, "hint", frontier=frontier, goal=None, tags=(), limit=10)
+        search(cache, secret, "hint", frontier=frontier, goal=None, tags=(), limit=10)
     assert_secret_absent(caught.value, secret)
     cache.close()
 
@@ -1754,7 +1757,7 @@ def test_search_requires_complete_frontier_coverage(tmp_path: Path, missing: str
         )
     if missing == "review":
         cache.apply_human_objects([REVIEW_NAME], [_human_review()])
-    assert cache.search("toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == ["L-1"]
+    assert search(cache, "toy", "alpha", frontier=frontier, goal=None, tags=(), limit=10) == ["L-1"]
     cache.close()
 
 
@@ -1765,10 +1768,10 @@ def test_frontier_fts_lru_is_connection_local(
     frontiers = [frontier.model_copy(update={"reviews": [REVIEW_NAME] * i}) for i in range(10)]
     cache.apply_human_objects([REVIEW_NAME], [_human_review()])
     for f in frontiers[:8]:
-        cache.search("toy", "hint", frontier=f, goal=None, tags=(), limit=10)
-    cache.search("toy", "hint", frontier=frontiers[0], goal=None, tags=(), limit=10)
+        search(cache, "toy", "hint", frontier=f, goal=None, tags=(), limit=10)
+    search(cache, "toy", "hint", frontier=frontiers[0], goal=None, tags=(), limit=10)
     for f in frontiers[8:]:
-        cache.search("toy", "hint", frontier=f, goal=None, tags=(), limit=10)
+        search(cache, "toy", "hint", frontier=f, goal=None, tags=(), limit=10)
     tables = {
         row[0]
         for row in cache._conn.execute("SELECT name FROM sqlite_temp_master WHERE type='table'")
@@ -1953,7 +1956,7 @@ def test_all_reads_share_indexed_large_frontier(tmp_path: Path) -> None:
     frontier = build_frontier([("r1", run.run_root, head)], [], names)
     # Exercise the old variable ceiling even on SQLite builds with a higher default.
     cache._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
-    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+    assert search(cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
         "L-1"
     ]
     assert cache.count(frontier, filters=LearningFilter()) == 1
@@ -1961,7 +1964,7 @@ def test_all_reads_share_indexed_large_frontier(tmp_path: Path) -> None:
     assert cache.scores(frontier) == []
     assert cache.flags(frontier) == {"L-absent": (True, False)}
     assert [learning.id for learning in cache.learnings_by_id(frontier, ["L-1"])] == ["L-1"]
-    assert len(cache.plans(frontier, "r1", "g1")) == 1
+    assert len(plans(cache, frontier, "r1", "g1")) == 1
     assert cache.membership(frontier)
     assert not cache._conn.in_transaction
     assert not hasattr(cache, "_frontier_sql")
@@ -2040,7 +2043,7 @@ def test_warm_search_and_count_do_not_hydrate_corpus(
 ) -> None:
     cache = ArenaCache(tmp_path / "toy.sqlite")
     frontier = _seed_search_corpus(cache, 1000)
-    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+    assert search(cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
         "L-h-0000000000000000"
     ]
 
@@ -2049,10 +2052,10 @@ def test_warm_search_and_count_do_not_hydrate_corpus(
 
     monkeypatch.setattr(Learning, "model_validate_json", refuse)
     another = frontier.model_copy(update={"curation": frontier.curation * 2})
-    assert cache.search("toy", "rareword", frontier=another, goal=None, tags=(), limit=1) == [
+    assert search(cache, "toy", "rareword", frontier=another, goal=None, tags=(), limit=1) == [
         "L-h-0000000000000000"
     ]
-    assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+    assert search(cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
         "L-h-0000000000000000"
     ]
     assert cache.count(frontier, filters=LearningFilter(goal_id="absent")) == 0
@@ -2073,7 +2076,7 @@ def test_sql_search_work_and_peak_memory(tmp_path: Path) -> None:
     for size in (1_000, 10_000, 50_000):
         cache = ArenaCache(tmp_path / str(size) / "toy.sqlite")
         frontier = _seed_search_corpus(cache, size)
-        assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+        assert search(cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
             "L-h-0000000000000000"
         ]
         steps = 0
@@ -2084,7 +2087,7 @@ def test_sql_search_work_and_peak_memory(tmp_path: Path) -> None:
             return 0
 
         cache._conn.set_progress_handler(tick, 100)
-        assert cache.search("toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
+        assert search(cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1) == [
             "L-h-0000000000000000"
         ]
         search_work = steps
@@ -2098,8 +2101,8 @@ def test_sql_search_work_and_peak_memory(tmp_path: Path) -> None:
         gc.collect()
         tracemalloc.start()
         try:
-            assert cache.search(
-                "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1
+            assert search(
+                cache, "toy", "rareword", frontier=frontier, goal=None, tags=(), limit=1
             ) == ["L-h-0000000000000000"]
             _, peak = tracemalloc.get_traced_memory()
         finally:
@@ -2232,7 +2235,7 @@ def test_explicit_id_set_failure_rolls_back_and_keeps_frontier(
         ]
         assert len(cache.candidates(frontier, ids=["c-1"])) == 1
     assert cache._conn.execute("SELECT count(*) FROM temp._read_sets").fetchone() == (0,)
-    assert cache.search("toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == ["L-log"]
+    assert search(cache, "toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == ["L-log"]
     assert cache.count(frontier, filters=LearningFilter()) == 2
     assert cache.candidates(Frontier(), ids=["c-1"]) == []
     cache.close()
@@ -2353,7 +2356,7 @@ def test_nested_reads_keep_sets_until_outer_exit(
         assert len(marks) == 1
         assert [candidate.id for candidate, _ in cache.candidates(frontier, ids=["c-1"])] == ["c-1"]
         assert cache.count(frontier, filters=LearningFilter()) == 2
-        assert cache.search("toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == [
+        assert search(cache, "toy", "log", frontier=frontier, goal=None, tags=(), limit=1) == [
             "L-log"
         ]
         assert cache._frontier_depth == 1
@@ -2534,8 +2537,8 @@ def test_human_collisions_resolve_only_named_producers(tmp_path: Path) -> None:
             assert cache.learnings_by_id(frontier, ["L"])[0].title == f"Human{i}"
             assert cache.count(frontier, filters=LearningFilter(tags=[f"human{i}"])) == 1
             assert cache.count(frontier, filters=LearningFilter(tags=[f"human{1 - i}"])) == 0
-            assert cache.search(
-                "toy", f"Human{i}", frontier=frontier, goal=None, tags=(), limit=10
+            assert search(
+                cache, "toy", f"Human{i}", frontier=frontier, goal=None, tags=(), limit=10
             ) == ["L"]
         together = build_frontier(marks, reviews, curation)
         assert cache.scores(together)[0][0].value == 0
@@ -2549,3 +2552,26 @@ def test_human_collisions_resolve_only_named_producers(tmp_path: Path) -> None:
     finally:
         cache.close()
         run._lease.release()
+
+
+def test_cache_has_no_unused_projection_or_legacy_read_methods(tmp_path: Path) -> None:
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    try:
+        tables = {row[0] for row in cache._conn.execute("SELECT name FROM sqlite_master")}
+        assert "part_goals" not in tables
+        columns = {row[1] for row in cache._conn.execute("PRAGMA table_info(candidates)")}
+        assert not columns.intersection(
+            {"team", "agent", "round", "fidelity", "partial", "gated_out"}
+        )
+        assert not any(
+            hasattr(cache, name)
+            for name in (
+                "has_segment",
+                "search",
+                "plans",
+                "_plan_for_round",
+                "run_root",
+            )
+        )
+    finally:
+        cache.close()
