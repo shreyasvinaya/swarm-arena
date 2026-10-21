@@ -2,9 +2,12 @@
 
 import json
 import re
-from collections.abc import Iterator
+import socket
+from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -348,3 +351,56 @@ def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.Mon
 def test_unknown_server_namespace_is_rejected(server: Server) -> None:
     with pytest.raises(ValueError, match="namespace outside board"):
         make_server(server.board, ["foreign"], author="alice", port=0)
+
+
+@contextmanager
+def _default_server(server: Server) -> Generator[Server]:
+    http = make_server(server.board, ["toy"], author="alice", port=0)
+    thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        yield replace(server, http=http)
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize(
+    "method", ["HEAD", "PUT", "DELETE", "OPTIONS", "PATCH", "CONNECT", "CUSTOM"]
+)
+def test_every_method_checks_authority(server: Server, method: str) -> None:
+    with _default_server(server) as site:
+        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=5)
+        try:
+            connection.request(method, "/", headers={"Host": "evil.example"})
+            response = connection.getresponse()
+            assert response.status == 403
+            assert response.reason == "Forbidden"
+            assert b"Learning" not in response.read()
+        finally:
+            connection.close()
+
+
+@pytest.mark.parametrize("failure", ["syntax", "version", "method"])
+def test_protocol_errors_are_fixed(server: Server, failure: str) -> None:
+    sentinel = "private-request-sentinel-817592"
+    with _default_server(server) as site:
+        host = f"127.0.0.1:{site.http.server_port}"
+        request = {
+            "syntax": f"GET /?q={sentinel} EXTRA HTTP/1.1\r\nHost: {host}\r\n\r\n",
+            "version": f"GET / HTTP/{sentinel}\r\nHost: {host}\r\n\r\n",
+            "method": f"{sentinel} / HTTP/1.1\r\nHost: {host}\r\n\r\n",
+        }[failure]
+        with socket.create_connection(("127.0.0.1", site.http.server_port), timeout=5) as client:
+            client.sendall(request.encode())
+            response = bytearray()
+            while data := client.recv(65536):
+                response.extend(data)
+        assert sentinel.encode() not in response
+        assert b"Traceback" not in response
+        if failure == "method":
+            assert response.startswith(b"HTTP/1.0 501 Not Implemented\r\n")
+        elif failure == "syntax":
+            assert response.startswith(b"HTTP/1.0 400 Bad Request\r\n")

@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 from collections.abc import Sequence
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import RLock
 from typing import Literal
@@ -291,6 +292,26 @@ def make_server(
             super().setup()
             self.connection.settimeout(10)
 
+        def parse_request(self) -> bool:
+            """Check authority before the framework dispatches any parsed method."""
+            if not super().parse_request():
+                return False
+            if not self._allowed_host():
+                self.send_error(403)
+                return False
+            return True
+
+        def send_error(
+            self, code: int, message: str | None = None, explain: str | None = None
+        ) -> None:
+            """Replace parser and dispatch messages with fixed, value-free responses."""
+            try:
+                status = HTTPStatus(code)
+            except ValueError:
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+            self.close_connection = True
+            self._reply(status.value, status.phrase)
+
         def log_message(self, format: str, *args: object) -> None:
             """Keep request inputs and form data out of diagnostic output."""
 
@@ -311,7 +332,8 @@ def make_server(
             if location is not None:
                 self.send_header("Location", location)
             self.end_headers()
-            self.wfile.write(payload)
+            if self.command != "HEAD":
+                self.wfile.write(payload)
 
         def _allowed_host(self) -> bool:
             hosts = self.headers.get_all("Host", [])
@@ -331,9 +353,6 @@ def make_server(
 
         def _route(self, *, post: bool) -> None:
             nonlocal refreshed
-            if not self._allowed_host():
-                self._reply(403, "Forbidden")
-                return
             try:
                 parsed = urlsplit(self.path)
                 params = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=100)
