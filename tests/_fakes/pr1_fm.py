@@ -31,7 +31,9 @@ def failure(kind: str) -> BaseException:
     if kind == "cancel":
         return asyncio.CancelledError(MARK)
     if kind == "fenced_group":
-        return BaseExceptionGroup(MARK, [asyncio.CancelledError(MARK), Fenced(MARK), error])
+        return BaseExceptionGroup(
+            MARK, [asyncio.CancelledError(MARK), ExceptionGroup(MARK, [Fenced(MARK), error])]
+        )
     group = BaseExceptionGroup(MARK, [asyncio.CancelledError(MARK), error])
     group.add_note(MARK)
     group.__cause__ = RuntimeError(MARK)
@@ -89,6 +91,8 @@ class Broken(Manager):
                             await task
             try:
                 await ctx.call_action("broken", {})
+            except Fenced:
+                raise
             except Exception as error:
                 import traceback
 

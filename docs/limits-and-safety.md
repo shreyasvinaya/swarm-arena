@@ -165,7 +165,10 @@ check, and tool boundaries with type-only diagnostics. Healthy peers continue
 and the goal can finish. Cancellation before dispatch refunds the tool reservation
 exactly once, including command preparation and edit uploads. Cleanup has a bounded
 settlement wait; work that may have started retains its charge. Actual caller
-cancellation and ownership fencing still propagate; hook messages, notes, and causes are not rendered by the CLI.
+cancellation and ownership fencing still propagate. Fencing nested in an exception
+group propagates as a bare ownership-loss error, without group or leaf values;
+pending caller cancellation takes precedence. Hook messages, notes, and causes
+are not rendered by the CLI.
 Request-time estimate and provider hooks run in registered, cancellable
 preparation before reservation. Immediate stop and round deadlines abandon
 these waits without using the executor collection allowance.

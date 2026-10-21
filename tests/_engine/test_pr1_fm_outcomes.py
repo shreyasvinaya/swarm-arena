@@ -23,6 +23,7 @@ from swarm_arena import (
     Swarm,
     TeamSpec,
 )
+from swarm_arena._errors import Fenced
 from swarm_arena.executor import LocalExecutor
 
 
@@ -143,5 +144,12 @@ async def test_caller_cancellation_rejects_hook_replacement(tmp_path: Path) -> N
     await test_extension_failure_is_local(tmp_path, "action", "replace_cancel")
 
 
-async def test_user_group_cannot_claim_fencing(tmp_path: Path) -> None:
-    await test_extension_failure_is_local(tmp_path, "manager", "fenced_group")
+@pytest.mark.parametrize("where", ["manager", "action", "check", "command", "collect", "estimate"])
+async def test_nested_fencing_reaches_public_caller(tmp_path: Path, where: str) -> None:
+    hooks.PEER_READY = None
+    with pytest.raises(Fenced) as caught:
+        await Swarm(config(tmp_path)).run(plan(where, "fenced_group"), run_id="r")
+    assert hooks.MARK not in "".join(traceback.format_exception(caught.value))
+    assert hooks.MARK not in repr(caught.value.args)
+    assert caught.value.__cause__ is None
+    assert hooks.MARK not in json.dumps(events(tmp_path))
