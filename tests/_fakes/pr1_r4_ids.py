@@ -95,7 +95,7 @@ async def main() -> None:
         update={
             # Keep the old owner live through the one-second observation,
             # so the baseline also accepts the public stop request.
-            "lease_ttl_s": 2.0,
+            "lease_ttl_s": 3.0,
             "limits": cfg.limits.model_copy(
                 update={"default_run_reservation": Estimate(tokens=7, usd=0.000007)}
             ),

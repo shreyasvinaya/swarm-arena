@@ -57,7 +57,7 @@ async def main() -> None:
     cfg = cfg.model_copy(
         update={
             "settle_timeout_s": 0.1,
-            "lease_ttl_s": 0.3,
+            "lease_ttl_s": 3.0,
             "limits": cfg.limits.model_copy(
                 update={"default_run_reservation": Estimate(tokens=7, usd=0.000007)}
             ),
