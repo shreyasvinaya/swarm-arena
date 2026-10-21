@@ -16,11 +16,11 @@ from swarm_arena import Goal, Plan, ProgramJudge, Ref, RunConfig
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
-from swarm_arena._budget.llm_scope import current_llm_scope
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import goal as goal_module
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced, _core_error, _is_core_signal
+from swarm_arena._errors import Fenced, _core_error, _is_core_signal, _stop_cleanup_error
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -29,6 +29,7 @@ from swarm_arena._model.planning_types import History
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import ToolOutput
 from swarm_arena._scoring.judge import JudgeContext
+from swarm_arena._scoring.runner import JudgeError, JudgeOutcome
 
 _REASONS = {
     "stop": "stop",
@@ -694,3 +695,91 @@ async def test_final_refresh_timeout_is_core_and_recovery_can_finish(
     assert recovered.finalists
     assert len(env.events("goal_finished")) == 1
     assert not env.events("no_result")
+
+
+async def test_final_writer_timeout_propagates_without_judge_errors(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = env.deps.journal
+    journal._group_window_s = 0
+    journal._settle_timeout_s = 0.2
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    errors: list[Exception] = []
+    judge_errors: list[JudgeError] = []
+    completed = anyio.Event()
+    create = env.store.create
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=_plan(teams=1, rounds=1, judges=[Ref(path="_fakes.tools:ProviderJudge", name="y")]),
+        replanner=None,
+    )
+    publish_scores = runner._publish_scores
+
+    def blocked_create(key: str, data: bytes) -> str:
+        if key.startswith("journal/") and b'"kind":"final"' in data:
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(30)
+        return create(key, data)
+
+    def observe_scores(outcome: JudgeOutcome, scope: LLMScope, round: int, **kwargs: Any) -> None:
+        if round == 0:
+            judge_errors.extend(outcome.errors)
+        publish_scores(outcome, scope, round, **kwargs)
+
+    async def drive() -> None:
+        try:
+            await runner.run()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(env.store, "create", blocked_create)
+    monkeypatch.setattr(runner, "_publish_scores", observe_scores)
+    try:
+        with anyio.fail_after(20):
+            async with anyio.create_task_group() as group:
+                group.start_soon(drive)
+                assert await anyio.to_thread.run_sync(entered.wait, 10)
+                journal._stop_storage()
+                await completed.wait()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert _is_core_signal(errors[0])
+        assert str(errors[0]) == "stop cleanup timed out"
+        assert not judge_errors
+        assert (runner.status, runner.reason) != ("no_result", "provider_failed")
+        assert not [event for event in env.events("judge_error") if event.round == 0]
+        assert not env.events("no_result")
+        assert not env.events("goal_finished")
+        assert not env.store.exists("goals/g/solution.json")
+    finally:
+        release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("site", ["replan", "policy"])
+async def test_writer_timeout_bypasses_component_error_handlers(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    error = _stop_cleanup_error()
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        env.deps.journal._settlement_expired = True
+        env.deps.journal._fail(error)
+        raise error
+
+    monkeypatch.setattr(runner, "_supervised_step", fail)
+    operation = runner._replan() if site == "replan" else runner._round_decision(1)
+    with pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught:
+        await operation
+    assert caught.value is error
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")

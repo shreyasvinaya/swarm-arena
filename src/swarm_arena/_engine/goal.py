@@ -1024,6 +1024,8 @@ class GoalRunner:
                 self.status, self.reason = "no_result", "final slice used up"
                 return []
             except Exception as error:
+                if self.deps.journal.fenced.is_set():
+                    raise
                 outcome = JudgeOutcome(
                     scores=[],
                     errors=[
@@ -1117,6 +1119,8 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
+            if self.deps.journal.fenced.is_set():
+                raise
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
@@ -1272,6 +1276,8 @@ class GoalRunner:
         except Fenced:
             raise
         except Exception as error:
+            if self.deps.journal.fenced.is_set():
+                raise
             decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(
