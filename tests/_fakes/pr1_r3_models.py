@@ -30,7 +30,7 @@ class BlockingScore(Score):
 
             def release_on_file() -> None:
                 assert ROOT is not None
-                deadline = time.monotonic() + 12
+                deadline = time.monotonic() + 60  # backstop only; the test writes `release`
                 while not (ROOT / "release").exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 released.set()

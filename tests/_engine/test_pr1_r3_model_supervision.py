@@ -61,6 +61,8 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
         stopped = (
             (tmp_path / "done.json").exists() if cause == "stop" else process.poll() is not None
         )
+        # The fake serializer releases itself after 12 s; completion must come first.
+        serializer_returned = (tmp_path / "dump-exited").exists()
         after = (tmp_path / "heartbeat").read_text()
         evidence = {
             "cause": cause,
@@ -72,9 +74,11 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
             "heartbeat_after": after,
             "finished_before_release": stopped,
             "stop_file_exists": (tmp_path / "runs/r/control/stop-now-e1").exists(),
+            "serializer_returned_first": serializer_returned,
         }
         (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
         assert stopped, evidence
+        assert not serializer_returned, evidence
         assert thread_ids["hook_thread"] != thread_ids["loop_thread"], evidence
         if cause == "takeover":
             assert evidence["owner_epoch"] == 2
