@@ -550,3 +550,5 @@ and human learnings; blank optional filter fields impose no restriction.
 Board snapshots, curation reads, and round-page storage run in abandonable workers.
 Cancellation, immediate stop, and ownership loss can release the run while a
 backend call is still blocked. A cancelled page probe cannot start a later write.
+Page storage failures report only the originating exception type, including
+during resume repair; backend messages, notes, and causes are not exposed.

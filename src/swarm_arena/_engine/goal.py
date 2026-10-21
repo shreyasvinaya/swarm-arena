@@ -35,6 +35,7 @@ from swarm_arena._engine.solution import solution_view
 from swarm_arena._errors import (
     Fenced,
     PlanError,
+    StorageError,
     _core_error,
     _exception_type_name,
     _is_core_signal,
@@ -153,6 +154,21 @@ async def _page_namespace_count(deps: EngineDeps, plan: Plan, frontier: Frontier
         ) from None
 
 
+async def _page_storage(operation: Callable[[], Awaitable[_T]]) -> _T:
+    """Contain backend failures while preserving registered control outcomes."""
+    outcome = _Outcome()
+    try:
+        return await operation()
+    except BaseException as error:
+        registered = _is_core_signal(error)
+        error = outcome.classify(error)
+        if registered:
+            raise error from None
+        raise _core_error(
+            StorageError, f"round page storage failed: {_exception_type_name(error)}"
+        ) from None
+
+
 async def _publish_round_page(
     deps: EngineDeps, prefix: RunState, goal_id: str, round: int, seq: int
 ) -> None:
@@ -160,7 +176,7 @@ async def _publish_round_page(
     plan = prefix.plan_for_round(goal_id, round)
     frontier = prefix.goals[goal_id].frontiers[round]
     key = page_key(goal_id, round)
-    if await run_sync_daemon(deps.store.exists, key):
+    if await _page_storage(partial(run_sync_daemon, deps.store.exists, key)):
         return
     recorded_count = await _page_namespace_count(deps, plan, frontier)
     count = recorded_count + sum(
@@ -179,7 +195,9 @@ async def _publish_round_page(
     if deps.journal.fenced.is_set():
         raise _core_error(Fenced)
     # ViewWriter embeds the same header itself; pass just the body.
-    await deps.views.write(key, content.partition(b"\n")[2], source=source, create_only=True)
+    await _page_storage(
+        partial(deps.views.write, key, content.partition(b"\n")[2], source=source, create_only=True)
+    )
 
 
 async def _repair_round_pages(
