@@ -240,8 +240,7 @@ def _sanitize_validation_error(
             model.__name__, details, hide_input=True
         )
     except BaseException as failure:
-        _classify_outcome(failure)
-        pass
+        _propagate_control(failure)
     return _minimal_validation_error(model)
 
 

@@ -808,7 +808,6 @@ async def _run(
             # The tool has completed: abandon optional fingerprint work, then
             # finish its shielded publication/settlement. The caller's scope
             # still owns cancellation; the ownership check below still wins.
-            error = _classify_outcome(error)
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
         except BaseException as error:
             error = outcome.classify(error)
