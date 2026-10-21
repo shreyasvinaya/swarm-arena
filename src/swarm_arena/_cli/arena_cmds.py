@@ -4,6 +4,7 @@ import argparse
 import getpass
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,6 +30,21 @@ from swarm_arena._scoring.human_review import HumanReview
 _RUN_ID = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z_[0-9a-f]{6}$")
 
 
+def _non_negative_integer(option: str) -> Callable[[str], int]:
+    """Convert numeric options without argparse's value-bearing int diagnostics."""
+
+    def convert(value: str) -> int:
+        try:
+            number = int(value)
+            if number >= 0:
+                return number
+        except ValueError:
+            pass
+        raise argparse.ArgumentTypeError(f"{option} must be a non-negative integer") from None
+
+    return convert
+
+
 def register(sub: argparse._SubParsersAction) -> None:
     """
     Register offline arena commands with a root parser.
@@ -50,7 +66,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     export = actions.add_parser("export")
     export.add_argument("run")
     export.add_argument("--goal")
-    export.add_argument("--top", type=int, default=20)
+    export.add_argument("--top", type=_non_negative_integer("--top"), default=20)
     export.add_argument("--out", type=Path)
     imported = actions.add_parser("import")
     imported.add_argument("run")
@@ -68,7 +84,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     search.add_argument("--tag", action="append", default=[])
     for flag in ("verified", "human", "pinned", "hidden"):
         search.add_argument(f"--{flag}", action="store_true")
-    search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--limit", type=_non_negative_integer("--limit"), default=10)
     show = actions.add_parser("show")
     show.add_argument("id")
     learnings = sub.add_parser("learnings", help="add, pin or hide a learning")

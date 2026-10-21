@@ -374,3 +374,34 @@ def test_show_lists_changed_input_paths() -> None:
         _show(board, "c-edited")
     assert "files: tuning.py" in output.getvalue()
     assert "PRIVATE_FILE_CONTENT" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "option"),
+    [
+        (["review", "export", "run"], "--top"),
+        (["board", "search", "query", "--namespace", "toy"], "--limit"),
+    ],
+)
+@pytest.mark.parametrize("value", ["PRIVATE_NUMERIC_SENTINEL", "-7", "1.5"])
+def test_numeric_usage_errors_are_value_free(
+    arguments: list[str], option: str, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main([*arguments, option, value])
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert f"{option} must be a non-negative integer" in captured.err
+    assert value not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("value", ["0", "17"])
+def test_numeric_options_accept_non_negative_integers(value: str) -> None:
+    from swarm_arena._cli.main import _parser
+
+    arguments = _parser().parse_args(["review", "export", "run", "--top", value])
+    assert arguments.top == int(value)
+    arguments = _parser().parse_args(
+        ["board", "search", "query", "--namespace", "toy", "--limit", value]
+    )
+    assert arguments.limit == int(value)
