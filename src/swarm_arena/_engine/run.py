@@ -35,6 +35,7 @@ from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, utc_now
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ids import IdGen, new_run_id
 from swarm_arena._model.plan import Plan, Resources, RoundSpec
 from swarm_arena._model.results import Candidate
@@ -43,7 +44,7 @@ from swarm_arena._model.tooling import Estimate, ToolRequest
 from swarm_arena._outcomes import _has_core_fenced as _has_fenced
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
-from swarm_arena._planning.provenance import stamp
+from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
@@ -299,6 +300,12 @@ class RunRunner:
                 raise
             finally:
                 await services._aclose(failed=failed)
+        outcome = _Outcome()
+        try:
+            self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
+        except BaseException as error:
+            error = outcome.classify(error)
+            raise _core_error(PlanError, [f"invalid plan: {_exception_type_name(error)}"]) from None
         seen: set[str] = set()
         for plan in self.plans:
             if plan.goal.id in seen:
@@ -350,6 +357,8 @@ class RunRunner:
                     capacity = await executor.capacity()
                     invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
                     if not invalid_capacity:
+                        if capacity is not None:
+                            capacity = await run_sync_daemon(_detach_model, Resources, capacity)
                         warnings.extend(_capacity_warning(admitted, capacity))
                 except BaseException as exc:
                     exc = outcome.classify(exc)

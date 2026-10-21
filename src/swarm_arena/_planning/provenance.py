@@ -8,6 +8,7 @@ from pydantic import PrivateAttr
 from swarm_arena._model.base import CatalogKind, FrozenModel, Origin
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import json_equal
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.ref import Ref, is_ref_path
 
@@ -295,3 +296,13 @@ def stamp(plan: Plan, *, origin: Origin, parent: Plan | None) -> Plan:
             "parent_revision": None if parent is None else parent.revision,
         }
     )
+
+
+def _detach_plan(value: object) -> Plan:
+    """Detach a planner's model and preserve its nonserialized base directory."""
+    if not isinstance(value, Plan):
+        raise TypeError("invalid planner result")
+    base_dir = value.base_dir
+    plan = _detach_model(Plan, value)
+    plan._base_dir = type(plan.base_dir)(str(base_dir))
+    return plan

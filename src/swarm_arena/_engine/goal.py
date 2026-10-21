@@ -33,6 +33,7 @@ from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
@@ -41,7 +42,7 @@ from swarm_arena._model.tooling import RunStatus
 from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
-from swarm_arena._planning.provenance import stamp
+from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.ranking import ranked
@@ -959,9 +960,7 @@ class GoalRunner:
                 )
                 if isawaitable(proposed):
                     proposed = await proposed
-                if not isinstance(proposed, Plan):
-                    raise TypeError("invalid planner result")
-                return proposed
+                return await run_sync_daemon(_detach_plan, proposed)
 
         try:
             try:
@@ -1102,7 +1101,7 @@ class GoalRunner:
             proposed = await run_sync_daemon(policy.after_round, state)
             if isawaitable(proposed):
                 proposed = await proposed
-            return guard(proposed, state)
+            return await run_sync_daemon(lambda: guard(_detach_model(Decision, proposed), state))
 
         try:
             completed, result = await self._supervised_step(invoke, final=False)

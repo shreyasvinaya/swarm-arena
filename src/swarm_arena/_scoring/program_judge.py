@@ -7,10 +7,11 @@ from typing import ClassVar, cast
 
 from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, import_path, load_object
 from swarm_arena._model.results import Candidate, Score
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _propagate_control
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -23,9 +24,26 @@ def _is_async_callable(fn: object) -> bool:
     )
 
 
-def _score_copy(fn: Callable[[Goal, Candidate], Score], goal: Goal, candidate: Candidate) -> Score:
-    """Score a deep copy of the candidate; this runs in the daemon thread, off the loop."""
-    return fn(goal, candidate.model_copy(deep=True))
+def _score_copy(
+    fn: Callable[[Goal, Candidate], Score], goal: Goal, candidate: Candidate
+) -> tuple[Score | None, str | None]:
+    """Evaluate and detach all returned-model operations in the same worker."""
+    result = fn(goal, candidate.model_copy(deep=True))
+    if inspect.isawaitable(result):
+        _discard_awaitable(result)
+        return None, "ProgramJudge needs a sync function"
+    if not isinstance(result, Score):
+        return None, f"returned {type(result).__name__}, expected Score"
+    if not is_finite_score(result):
+        return None, "score key must be nonempty and finite"
+    try:
+        score = _detach_model(Score, result)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
+        return None, "invalid Score returned"
+    return score.model_copy(update={"candidate_id": candidate.id}), None
 
 
 def _discard_awaitable(result: object) -> None:
@@ -222,16 +240,12 @@ class ProgramJudge(Judge):
         [('c1', (0.9,))]
         >>> del sys.modules['judge_demo']
         """
-        fn = self._load_function()
+        fn = await run_sync_daemon(self._load_function)
         scores: list[Score] = []
         for candidate in candidates:
             outcome = _Outcome()
             try:
-                result = await run_sync_daemon(_score_copy, fn, goal, candidate)
-                if inspect.isawaitable(result):
-                    _discard_awaitable(result)
-                    ctx.judge_error(candidate.id, "ProgramJudge needs a sync function")
-                    continue
+                score, reason = await run_sync_daemon(_score_copy, fn, goal, candidate)
             except KeyboardInterrupt:
                 raise
             except BaseException as error:
@@ -239,18 +253,8 @@ class ProgramJudge(Judge):
                 error = outcome.classify(error)
                 ctx.judge_error(candidate.id, f"{name}: scoring function raised")
                 continue
-            if not isinstance(result, Score):
-                ctx.judge_error(candidate.id, f"returned {type(result).__name__}, expected Score")
-            elif not is_finite_score(result):
-                ctx.judge_error(candidate.id, "score key must be nonempty and finite")
-            else:
-                try:  # the function returned normally: a refusal here is about its Score
-                    score = Score.model_validate(
-                        {**result.model_dump(warnings=False), "candidate_id": candidate.id}
-                    )
-                except BaseException as error:
-                    outcome.propagate_control(error)
-                    ctx.judge_error(candidate.id, "invalid Score returned")
-                else:
-                    scores.append(score)
+            if reason is not None:
+                ctx.judge_error(candidate.id, reason)
+            elif score is not None:
+                scores.append(score)
         return scores

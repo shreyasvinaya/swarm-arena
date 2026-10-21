@@ -14,6 +14,7 @@ from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_stage import _Staged
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, format_logs_ref
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files
@@ -188,7 +189,7 @@ class _JobRun:
                 note_in_log(run.stderr_path, "too many declared files")
                 return None
             # model_copy and model_construct skip validation (the finite-JSON rule too).
-            return ToolOutput.model_validate(output.model_dump(warnings=False))
+            return _detach_model(ToolOutput, output)
         except (Fenced, BaseExceptionGroup):
             raise
         except (Exception, SystemExit):

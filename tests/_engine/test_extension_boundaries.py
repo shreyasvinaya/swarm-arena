@@ -607,7 +607,8 @@ def test_malformed_manager_is_contained_beside_healthy_peer(tmp_path: Path, kind
     assert any(e["type"] == "tool_end" and e["agent"] == "peer" for e in data["events"])
     assert any(e["type"] == "goal_finished" for e in data["events"])
     statuses = [e for e in data["events"] if e["type"] == "agent_status" and e["agent"] == "a"]
-    expected = "ValueError" if kind == "utf8" else "TypeError"
+    # Complete report validation now rejects malformed summaries before loop access.
+    expected = "ValidationError" if kind in {"json", "utf8"} else "TypeError"
     assert any(e["payload"]["reason"] == f"manager error: {expected}" for e in statuses)
 
 

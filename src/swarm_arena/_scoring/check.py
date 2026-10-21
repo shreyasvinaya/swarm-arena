@@ -6,14 +6,28 @@ from typing import ClassVar, Literal
 
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import Command, ToolOutput
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._tooling.staging import effective_files, plan_script_stage
 from swarm_arena._tooling.tool import cap_timeout
+
+
+def _prepare_command_output(value: object) -> ToolOutput:
+    """Fail closed on invalid executor models without exposing subclass operations."""
+    try:
+        return _detach_model(ToolOutput, value)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        _propagate_control(error)
+        return ToolOutput(status="error")
 
 
 class CheckContext:
@@ -140,7 +154,7 @@ class CheckContext:
             if candidate is not None
             else Job.Stage(root=dict(files or {}))
         )
-        return await self.executor.submit(
+        output = await self.executor.submit(
             Job(
                 id=self.ids.next("x"),
                 kind="command",
@@ -163,6 +177,7 @@ class CheckContext:
                 on_started=self.on_started,
             )
         )
+        return await run_sync_daemon(_prepare_command_output, output)
 
 
 class Check(Configurable, ABC):

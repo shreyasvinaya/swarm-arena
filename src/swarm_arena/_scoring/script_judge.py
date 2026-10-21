@@ -7,8 +7,10 @@ import anyio
 from pydantic import ConfigDict, Field, ValidationError
 
 from swarm_arena._errors import _core_error, _exception_type_name, _with_exception_type
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import StoredModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import FileSet, Goal
 from swarm_arena._model.migrate import CURRENT
 from swarm_arena._model.plan import Resources
@@ -223,7 +225,10 @@ class ScriptJudge(Judge):
         async def run(index: int, candidate: Candidate) -> None:
             outcome = _Outcome()
             try:
-                scores[index] = await self._score(candidate, ctx)
+                result = await self._score(candidate, ctx)
+                scores[index] = (
+                    None if result is None else await run_sync_daemon(_detach_model, Score, result)
+                )
             except BaseException as error:
                 raise outcome.classify(error) from None
 

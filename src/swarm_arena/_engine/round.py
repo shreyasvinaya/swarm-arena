@@ -35,6 +35,7 @@ from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.data import finite_json
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal, GoalKey
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
@@ -800,10 +801,7 @@ class RoundRunner:
                         )
                     ):
                         report = await slot.manager.run_round(ctx)
-                        if not isinstance(report, RoundReport) or not isinstance(
-                            report.summary, str
-                        ):
-                            raise TypeError("invalid manager report")
+                        report = await run_sync_daemon(_detach_model, RoundReport, report)
                         summaries[key] = finite_json(report.summary)
             except BaseException as error:
                 error = outcome.classify(error)

@@ -294,9 +294,19 @@ convergence ranks candidates or launches a team: final scores cannot reselect
 the input batch. The completion key also binds the committed candidate set at
 that boundary, so newly produced candidates invalidate reuse.
 
-
 Synchronous library validation and import helpers propagate `KeyboardInterrupt`
 unchanged. When the engine invokes these helpers in a daemon worker, the awaiting
 engine boundary still contains hook-raised interrupts as type-only failures.
 ScriptJudge reports the originating exception type for a single failed child;
 multiple failures retain the exception-group type. Messages remain value-free.
+
+Returned extension models are untrusted until preparation finishes. Score and
+check results, executor outputs, plans, policy decisions, and manager reports
+are detached and validated in abandonable daemon workers before the event loop
+reads or serializes them. The prepared values use core model classes and copied
+payloads, so subclass serializers and attribute hooks cannot block stop-now,
+lease renewal, or fencing detection. The same rule applies to local executor
+collection and conformance helpers. Learning records are constructed by core
+code from the posting API and reconstructed by journal replay; there is no
+extension-returned Learning hook. Detachment applies the core validation rules,
+including UTC-millisecond timestamp normalization.

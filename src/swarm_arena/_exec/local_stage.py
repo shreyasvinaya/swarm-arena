@@ -9,7 +9,8 @@ from pathlib import Path, PurePosixPath
 from swarm_arena._exec.env import build_env
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_workspace import _DIR_FLAGS
-from swarm_arena._model.tooling import ToolRequest
+from swarm_arena._model.detach import _detach_model
+from swarm_arena._model.tooling import Command, ToolRequest
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import materialize
 from swarm_arena._tooling.tool import Tool
@@ -84,6 +85,7 @@ def _stage(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged:
         command = job.command
     else:  # Job.__post_init__ already refuses this
         raise ValueError("job has no tool or command for its kind")
+    command = _detach_model(Command, command)
     limits = [value for value in (job.timeout_s, command.timeout_s) if value is not None]
     timeout_s = min(limits) if limits else None
     grace_s = min(job.grace_s, command.grace_s)

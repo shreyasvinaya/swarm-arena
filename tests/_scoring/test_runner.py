@@ -831,7 +831,8 @@ async def test_complete_score_validation_contains_invalid_metadata(field: str, v
     assert len(out.scores) == len(out.errors) == 1
     assert out.scores[0].judge == "recording"
     assert out.errors[0].judge == "bad"
-    assert out.errors[0].reason == "ValidationError: judge raised"
+    expected = "TypeError" if field == "llm_call_ids" else "ValidationError"
+    assert out.errors[0].reason == f"{expected}: judge raised"
     assert BOUNDARY_SECRET not in out.model_dump_json()
 
 

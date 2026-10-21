@@ -32,12 +32,13 @@ from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.data import check_utf8
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
 from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome
-from swarm_arena._scoring.check import CheckContext
+from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.result_file import request_json
@@ -218,6 +219,7 @@ class _CommandJournal(Executor):
 
     async def submit(self, job: Job) -> ToolOutput:
         output = await self._executor.submit(job)
+        output = await _prepare_sync(_prepare_command_output, output)
         self._journal.append(
             EventDraft(
                 type=EventType.COMMAND_END,
@@ -300,14 +302,14 @@ def _prepare_started(value: object) -> Job.Started:
     """Detach executor start-event serializers before touching the journal."""
     if not isinstance(value, Job.Started):
         raise TypeError("invalid started event")
-    return Job.Started.model_validate(value.model_dump(mode="python", warnings=False))
+    return _detach_model(Job.Started, value)
 
 
 def _prepare_output(value: object) -> ToolOutput:
     """Detach executor output serializers and validate before core completion."""
     if not isinstance(value, ToolOutput):
         raise TypeError("invalid tool output")
-    return ToolOutput.model_validate(value.model_dump(mode="python", warnings=False))
+    return _detach_model(ToolOutput, value)
 
 
 _T = TypeVar("_T")

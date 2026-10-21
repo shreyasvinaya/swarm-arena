@@ -182,12 +182,12 @@ async def check_tool(
     )
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         out = await runner.submit(job)
-        checked = await anyio.to_thread.run_sync(_check_tool_output, plan.tool, plan.request, out)
+        checked = await run_sync_daemon(_check_tool_output, plan.tool, plan.request, out)
         with anyio.move_on_after(BEFORE_KILL_TIMEOUT_S) as probe_scope:
             await run_sync_daemon(_probe_collect, plan.tool, plan.request)
         if probe_scope.cancel_called:
             raise _fail("Tool.collect() did not return before the failed-run probe deadline")
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return checked
 
@@ -261,8 +261,9 @@ async def check_check(
         raise _fail("Check.feedback must be 'pass_fail' or 'reasons'")
     async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
         ctx = CheckContext(goal=goal, executor=runner, artifact_root=_artifact_root(), ids=_ids())
-        result = _check_result(await built.check(candidate, ctx))
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+        returned = await built.check(candidate, ctx)
+        result = await run_sync_daemon(_check_result, returned)
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     return result.model_copy(update={"check": ref.component_name()})
 
@@ -357,11 +358,19 @@ async def check_judge(
             ids=_ids(),
             batch_id="b-" + secrets.token_hex(4),
         )
-        valid, scored = _check_scores(await built.judge(goal, candidates, ctx), candidates, ctx)
-        stamped = stamp_scores(
-            valid, judge=built, judge_name=ref.component_name(), ids=_ids(), batch_id=ctx.batch_id
+        returned = await built.judge(goal, candidates, ctx)
+        valid, scored = await run_sync_daemon(_check_scores, returned, candidates, ctx)
+        stamped = await run_sync_daemon(
+            partial(
+                stamp_scores,
+                valid,
+                judge=built,
+                judge_name=ref.component_name(),
+                ids=_ids(),
+                batch_id=ctx.batch_id,
+            )
         )
-    for note in await anyio.to_thread.run_sync(_failed_runs, runner.outputs):
+    for note in await run_sync_daemon(_failed_runs, runner.outputs):
         warnings.warn(note, UserWarning, stacklevel=2)
     for candidate_id, reason in ctx.errors.items():
         warnings.warn(f"judge error for {candidate_id}: {reason}", UserWarning, stacklevel=2)
@@ -389,7 +398,7 @@ async def check_manager(
     No judges are supplied: score reads are empty, including ``best``.
     ``LimitReached`` ends a round normally, supplying an empty ``RoundReport``;
     later rounds still run with fresh action counters. Every returned report
-    must already be valid in strict mode, and original report objects are
+    must already be valid in strict mode, and detached base report models are
     returned. Ordinary manager exceptions end only their round; judging and
     closure complete and later rounds run before the first failure becomes a
     type-only ``AssertionError`` with its original cause and failed-run stderr
@@ -414,7 +423,7 @@ async def check_manager(
     Returns
     -------
     list[RoundReport]
-        Original valid manager reports in round order.
+        Detached valid manager reports in round order.
 
     Raises
     ------

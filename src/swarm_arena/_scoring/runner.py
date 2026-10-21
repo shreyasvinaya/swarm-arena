@@ -6,6 +6,7 @@ from copy import copy
 from swarm_arena._errors import _exception_type_name
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
 from swarm_arena._outcomes import _Outcome
@@ -68,7 +69,7 @@ def _prepare_check_result(result: object) -> CheckResult:
     """Detach subclass serializers and validate the complete Python-mode result."""
     if not isinstance(result, CheckResult):
         raise TypeError("invalid check result")
-    return CheckResult.model_validate(result.model_dump(mode="python", warnings=False))
+    return _detach_model(CheckResult, result)
 
 
 async def run_checks(

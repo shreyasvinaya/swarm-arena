@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.ref import Configurable
@@ -394,9 +395,7 @@ def _prepare_score_stamps(
     scores: Sequence[Score], judge: Judge, judge_name: str, batch_id: str
 ) -> list[Score]:
     """Validate complete Python payloads and prepare provenance without allocating ids."""
-    validated = [
-        Score.model_validate(score.model_dump(mode="python", warnings=False)) for score in scores
-    ]
+    validated = [_detach_model(Score, score) for score in scores]
     rubric_hash = judge.rubric_hash()
     panel_hash: str | None = None
     prepared = []
