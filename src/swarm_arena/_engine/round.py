@@ -816,11 +816,6 @@ class RoundRunner:
         from swarm_arena._engine.goal import GoalRunner
 
         agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
-        deadline = round_deadline(
-            anyio.current_time(),
-            self.deps.config.limits.effective_round_timeout_s(),
-            self.deps.clock.left(self.deps.config.limits.run_timeout_s),
-        )
         private_paths = judge_private_paths(self.plan)
 
         async def prepare() -> tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]]:
@@ -835,10 +830,7 @@ class RoundRunner:
         outcome = _Outcome()
         completed, prepared = False, None
         try:
-            with anyio.move_on_after(max(0, deadline - anyio.current_time())):
-                completed, prepared = await supervisor._supervised_step(
-                    prepare, final=self.converge
-                )
+            completed, prepared = await supervisor._supervised_step(prepare, final=self.converge)
         except BaseException as error:
             registered = _is_core_signal(error)
             error = outcome.classify(error)
@@ -852,8 +844,20 @@ class RoundRunner:
             for slot in agents:
                 slot.status = AgentStatus.FINISHED
                 statuses[f"{slot.team.name}/{slot.spec.name}"] = slot.status
-            return RoundOutcome(round, [], [], statuses, {}, [])
+            return RoundOutcome(
+                round,
+                [],
+                [],
+                statuses,
+                {key: supervisor.reason or "round preparation stopped" for key in statuses},
+                [],
+            )
         frontier, parents, feedback_policies = prepared
+        deadline = round_deadline(
+            anyio.current_time(),
+            self.deps.config.limits.effective_round_timeout_s(),
+            self.deps.clock.left(self.deps.config.limits.run_timeout_s),
+        )
         runtimes: list[AgentRuntime | None] = [None for _ in agents]
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]
