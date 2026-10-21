@@ -3,7 +3,14 @@
 from datetime import datetime, timedelta
 from typing import ClassVar
 
-from swarm_arena._errors import Fenced, LeaseHeld, NotFound, PreconditionFailed, _core_error
+from swarm_arena._errors import (
+    Fenced,
+    LeaseHeld,
+    NotFound,
+    PreconditionFailed,
+    _core_error,
+    _is_core_signal,
+)
 from swarm_arena._model.base import FrozenModel, StoredModel
 from swarm_arena._model.canonical import UtcDatetime, canonical_json, utc_now
 from swarm_arena._store.base import Store
@@ -355,7 +362,9 @@ class Lease:
             etag = self._store.replace(
                 OWNER_KEY, canonical_json(doc.model_dump(mode="json")), if_match=self.etag
             )
-        except PreconditionFailed:
+        except PreconditionFailed as error:
+            if not _is_core_signal(error):
+                raise
             raise _core_error(Fenced, "another owner changed the lease") from None
         self._adopt(doc, etag)
 

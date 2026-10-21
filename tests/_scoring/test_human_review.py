@@ -226,7 +226,7 @@ async def test_import_retries_takeover_and_uses_final_head(
         if len(seen) == 1:
             review_run.commit(review_run.score(f"s-{run_tag(review_run.run_id)}-e1-9999", "c-1", 9))
             review_run._lease.release()
-            raise Fenced()
+            raise _core_error(Fenced, "another owner changed the lease")
         return real(cls, store, **kwargs)
 
     monkeypatch.setattr(Lease, "take_over", classmethod(race))

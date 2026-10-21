@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
+from typing import Any, TypeVar
 from uuid import uuid4
 
 import anyio
@@ -20,7 +21,14 @@ from swarm_arena._engine.goal import _repair_round_pages
 from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, PlanError, _core_error, _exception_type_name
+from swarm_arena._errors import (
+    Fenced,
+    PlanError,
+    StorageError,
+    _core_error,
+    _exception_type_name,
+    _is_core_signal,
+)
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
@@ -368,18 +376,32 @@ async def _acquire_lease(acquire: Callable[[], Lease], *, settle_timeout_s: floa
                 lease.release()
         return lease
 
+    outcome = _Outcome()
     await anyio.lowlevel.checkpoint_if_cancelled()
     try:
         return await run_sync_daemon(work)
-    except BaseException:
+    except BaseException as error:
         with lock:
             abandoned = True
             lease = acquired.pop() if acquired else None
         if lease is not None:
             with anyio.move_on_after(settle_timeout_s, shield=True):
-                with suppress(Fenced):
+                # Cleanup cannot replace the original outcome, including caller cancellation.
+                with suppress(BaseException):
                     await run_sync_daemon(lease.release)
-        raise
+        outcome.contain(error, StorageError, "lease acquisition")
+
+
+_T = TypeVar("_T")
+
+
+async def _lease_io(operation: Callable[..., _T], *args: Any) -> _T:
+    """Read or validate takeover state under the shared outcome boundary."""
+    outcome = _Outcome()
+    try:
+        return await run_sync_daemon(operation, *args)
+    except BaseException as error:
+        outcome.contain(error, StorageError, "lease preparation")
 
 
 async def _take_over(
@@ -393,7 +415,7 @@ async def _take_over(
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     while True:
-        owner = await run_sync_daemon(read_owner, store)
+        owner = await _lease_io(read_owner, store)
         if owner is None:
             if review:
                 raise FileNotFoundError(f"run {run_id} has no control/owner.json")
@@ -402,7 +424,7 @@ async def _take_over(
         if doc.head is None:
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
-            await run_sync_daemon(validate, doc)
+            await _lease_io(validate, doc)
         try:
             return await _acquire_lease(
                 partial(
@@ -416,8 +438,10 @@ async def _take_over(
                 ),
                 settle_timeout_s=config.settle_timeout_s,
             )
-        except Fenced:
-            current = await run_sync_daemon(read_owner, store)
+        except Fenced as error:
+            if not _is_core_signal(error):
+                _Outcome().contain(error, StorageError, "lease takeover")
+            current = await _lease_io(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:
                 epoch = current[0].epoch if current else "missing"
                 message = (

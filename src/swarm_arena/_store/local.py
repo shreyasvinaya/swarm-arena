@@ -8,7 +8,13 @@ from collections.abc import Iterable
 from pathlib import Path
 from secrets import token_hex
 
-from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed, StorageError
+from swarm_arena._errors import (
+    AlreadyExists,
+    NotFound,
+    PreconditionFailed,
+    StorageError,
+    _core_error,
+)
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._store.base import Blob, Store, _check_key
 
@@ -124,7 +130,7 @@ class LocalStore(Store):
                 try:
                     os.link(temp, path)
                 except FileExistsError:
-                    raise AlreadyExists("store key already exists") from None
+                    raise _core_error(AlreadyExists, "store key already exists") from None
             finally:
                 temp.unlink(missing_ok=True)
         except OSError:
@@ -205,7 +211,7 @@ class LocalStore(Store):
                     except FileNotFoundError:
                         raise NotFound("store key not found") from None
                     if sha256_hex(current) != if_match:
-                        raise PreconditionFailed("store version mismatch")
+                        raise _core_error(PreconditionFailed, "store version mismatch")
                     temp = path.with_name(f"{path.name}.tmp-{token_hex(6)}")
                     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     try:
