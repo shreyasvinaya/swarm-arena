@@ -702,3 +702,88 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
             assert not worker.is_alive()
         if successor is not None:
             successor.release()
+
+
+@pytest.mark.parametrize("operation", ["resume", "import"])
+@pytest.mark.parametrize("native", [True, False])
+async def test_cancelled_takeover_releases_undelivered_lease(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    native: bool,
+) -> None:
+    import asyncio
+    import threading
+
+    import anyio
+
+    from swarm_arena._engine.resume import resume_run
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._model.canonical import utc_now
+
+    acquired, release, returned, cleaned = (threading.Event() for _ in range(4))
+    original = Lease.take_over.__func__
+    original_release = Lease.release
+    before = _events(review_run.store)
+    scopes: list[anyio.CancelScope] = []
+    leases: list[Lease] = []
+    path = _file(tmp_path)
+
+    def take_over(cls: type[Lease], *args: Any, **kwargs: Any) -> Lease:
+        lease = original(cls, *args, **kwargs)
+        leases.append(lease)
+        acquired.set()
+        assert release.wait(5), "takeover worker release deadline"
+        returned.set()
+        return lease
+
+    def release_lease(self: Lease) -> None:
+        original_release(self)
+        if self in leases:
+            cleaned.set()
+
+    async def caller() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            if operation == "resume":
+                runner = await resume_run(
+                    run_config, review_run.run_id, force=False, replanner=None
+                )
+                await runner.aclose()
+            else:
+                await HumanReview("alice").import_csv(review_run.run_id, path, config=run_config)
+
+    monkeypatch.setattr(Lease, "take_over", classmethod(take_over))
+    monkeypatch.setattr(Lease, "release", release_lease)
+    task = asyncio.create_task(caller())
+    try:
+        assert await run_sync_daemon(acquired.wait, 5)
+        if native:
+            task.cancel()
+            done, _ = await asyncio.wait([task], timeout=0.5)
+            assert done, "native cancellation waits for takeover delivery"
+        else:
+            scopes[0].cancel()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        assert await run_sync_daemon(returned.wait, 5)
+        assert await run_sync_daemon(cleaned.wait, 0.5), "undelivered lease was not released"
+        owner = read_owner(review_run.store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+        assert _events(review_run.store) == before
+        monkeypatch.setattr(Lease, "take_over", classmethod(original))
+        # An ordinary later import succeeds without forcing or waiting for expiry.
+        await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        assert await run_sync_daemon(returned.wait, 5)
+        for lease in leases:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await run_sync_daemon(lease.release)
+                except Fenced:
+                    pass

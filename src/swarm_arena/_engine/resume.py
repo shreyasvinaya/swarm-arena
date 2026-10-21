@@ -3,7 +3,9 @@
 import asyncio
 import os
 import sys
+import threading
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -335,6 +337,38 @@ class _ResumeServices:
             raise self.failure
 
 
+async def _acquire_lease(acquire: Callable[[], Lease]) -> Lease:
+    """Release a successful CAS if cancellation wins its delivery handshake."""
+    lock = threading.Lock()
+    acquired: list[Lease] = []
+    abandoned = False
+
+    def work() -> Lease:
+        lease = acquire()
+        with lock:
+            release = abandoned
+            if not release:
+                acquired.append(lease)
+        if release:
+            # This daemon owns late cleanup, independent of caller cancellation.
+            with suppress(Fenced):
+                lease.release()
+        return lease
+
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    try:
+        return await run_sync_daemon(work)
+    except BaseException:
+        with lock:
+            abandoned = True
+            lease = acquired.pop() if acquired else None
+        if lease is not None:
+            with anyio.CancelScope(shield=True):
+                with suppress(Fenced):
+                    await run_sync_daemon(lease.release)
+        raise
+
+
 async def _take_over(
     config: RunConfig,
     run_id: str,
@@ -346,7 +380,7 @@ async def _take_over(
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     while True:
-        owner = await anyio.to_thread.run_sync(read_owner, store)
+        owner = await run_sync_daemon(read_owner, store)
         if owner is None:
             if review:
                 raise FileNotFoundError(f"run {run_id} has no control/owner.json")
@@ -355,9 +389,9 @@ async def _take_over(
         if doc.head is None:
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
-            await anyio.to_thread.run_sync(validate, doc)
+            await run_sync_daemon(validate, doc)
         try:
-            return await anyio.to_thread.run_sync(
+            return await _acquire_lease(
                 partial(
                     Lease.take_over,
                     store,
@@ -369,7 +403,7 @@ async def _take_over(
                 )
             )
         except Fenced:
-            current = await anyio.to_thread.run_sync(read_owner, store)
+            current = await run_sync_daemon(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:
                 epoch = current[0].epoch if current else "missing"
                 message = (
