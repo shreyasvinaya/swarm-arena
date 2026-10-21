@@ -8,6 +8,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import (
     Judge,
@@ -116,11 +117,13 @@ async def run_checks(
     """
     results: list[CheckResult] = []
     for name, check in checks:
+        outcome = _Outcome()
         try:
             result = await check.check(candidate, copy(ctx))
         except Fenced:
             raise
-        except Exception as error:
+        except BaseException as error:
+            error = outcome.classify(error)
             results.append(
                 CheckResult(
                     check=name, passed=False, reasons=[f"check error: {type(error).__name__}"]
@@ -131,7 +134,8 @@ async def run_checks(
             valid = await run_sync_daemon(_prepare_check_result, result)
         except Fenced:
             raise
-        except Exception:
+        except BaseException as error:
+            outcome.classify(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
         results.append(valid.model_copy(update={"check": name}))
     return results
@@ -221,6 +225,7 @@ async def _judge_batch(
     raised: str | None = None
     seen: set[str] = set()
     nonfinite: set[str] = set()
+    outcome = _Outcome()
     try:
         if leaders is not None:
             batch, ctx.anchors = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
@@ -237,7 +242,8 @@ async def _judge_batch(
         stamped = _stamp_score_ids(prepared, ctx.ids)
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = outcome.classify(error)
         stamped = []
         raised = f"{type(error).__name__}: judge raised"
 

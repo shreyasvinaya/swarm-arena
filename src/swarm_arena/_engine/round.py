@@ -41,6 +41,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.catalog_check import find_entry
 from swarm_arena._planning.policy import _INACTIVE
 from swarm_arena._planning.validate import judge_private_paths
@@ -771,6 +772,7 @@ class RoundRunner:
             nonlocal remaining
             key = f"{slot.team.name}/{slot.spec.name}"
             rt: AgentRuntime | None = None
+            outcome = _Outcome()
             try:
                 with scopes[index], track_inflight(inflight):
                     await anyio.lowlevel.checkpoint()
@@ -805,7 +807,8 @@ class RoundRunner:
                         summaries[key] = finite_json(report.summary)
             except Fenced:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = outcome.classify(error)
                 if self.deps.journal.fenced.is_set() or (
                     isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None
                 ):

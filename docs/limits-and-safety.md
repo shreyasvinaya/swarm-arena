@@ -160,6 +160,10 @@ round through `LimitReached`. Exceeding the learning publication cap is a soft
 action error and does not itself end the round. Other policy pruning happens
 between rounds. Tool exceptions
 become error candidates; a manager exception ends only that agent's round.
+User-raised cancellation and exception groups are contained at manager, action,
+check, and tool boundaries with type-only diagnostics. Healthy peers continue
+and the goal can finish. Actual caller cancellation and ownership fencing still
+propagate; hook messages, notes, and causes are not rendered by the CLI.
 Built-in provider probing and model-provider recovery are M3 work.
 
 ## Stop modes and resume

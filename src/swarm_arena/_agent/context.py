@@ -24,6 +24,7 @@ from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import Estimate
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.runner import for_manager
 from swarm_arena._tooling.staging import effective_files
@@ -75,7 +76,8 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         return _ToolMetadata(description, input_model, editable, actions, feedback)
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _core_signal(SoftError(f"invalid tool metadata: {type(error).__name__}")) from None
 
 
@@ -925,11 +927,13 @@ class AgentContext:
             raise _core_signal(SoftError(str(error))) from None
         lifetime = _ActionLifetime(self)
         token = _nested.set((*_nested.get(), lifetime))
+        outcome = _Outcome()
         try:
             return await action.handler(self, validated)
         except Fenced:
             raise
-        except Exception as error:
+        except BaseException as error:
+            error = outcome.classify(error)
             rebuilt = _rebuild_core_signal(error)
             if isinstance(rebuilt, (SoftError, LimitReached)):
                 raise rebuilt from None

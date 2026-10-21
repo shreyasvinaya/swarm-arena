@@ -14,6 +14,7 @@ from swarm_arena._exec.local_stage import _Staged
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
 from swarm_arena._model.tooling import CompletedRun, FileRef, RunStatus, ToolOutput, format_logs_ref
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.materialize import collect_output_files
 from swarm_arena._tooling.result_file import (
@@ -173,7 +174,10 @@ class _JobRun:
                 output = self._staged.tool.collect(self._staged.request, self._workspace, run)
             else:
                 output = command_output_from_result(self._workspace, run)
-        except (Exception, SystemExit) as error:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            _classify_outcome(error)
             note_in_log(run.stderr_path, f"collect failed: {type(error).__name__}")
             return None
         finally:
@@ -186,7 +190,10 @@ class _JobRun:
                 return None
             # model_copy and model_construct skip validation (the finite-JSON rule too).
             return ToolOutput.model_validate(output.model_dump(warnings=False))
-        except (Exception, SystemExit):
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            _classify_outcome(error)
             note_in_log(run.stderr_path, _NOT_AN_OUTPUT)  # the reason only: no values
             return None
 

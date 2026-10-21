@@ -33,6 +33,7 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
+from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._scoring.check import CheckContext
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
@@ -315,7 +316,8 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
         return hook(*args)
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
@@ -328,8 +330,11 @@ async def _prepare_sync(hook: Callable[..., _T], *args: Any, generation: int | N
                 inflight.add(scope, grace_s=0)
             elif not inflight._add_completion(scope, grace_s=0, generation=generation):
                 raise _core_signal(LimitReached("stop", "the round is stopping"))
+        outcome = _Outcome()
         try:
             result = await run_sync_daemon(hook, *args)
+        except BaseException as error:
+            raise outcome.classify(error) from None
         finally:
             if inflight is not None:
                 inflight.discard(scope)
@@ -377,7 +382,8 @@ def _request(
         raise
     except ConfigError as error:
         raise _core_signal(SoftError(str(error))) from None
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         raise _core_signal(SoftError(f"invalid tool request: {type(error).__name__}")) from None
 
 
@@ -407,7 +413,8 @@ def _stage_settings(
         return files, editable, protected
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         rebuilt = _rebuild_core_signal(error)
         if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
@@ -449,7 +456,8 @@ def _stage(
         )
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = _classify_outcome(error)
         rebuilt = _rebuild_core_signal(error)
         if isinstance(rebuilt, (SoftError, LimitReached)):
             raise rebuilt from None
@@ -593,6 +601,7 @@ async def _run(
     if inflight is None:
         raise _core_error(RuntimeError, "tool run requires track_inflight")
     generation = inflight._cancel_generation
+    outcome = _Outcome()
     started = False
     admission_refusal: LimitReached | None = None
     partial: list[ToolOutput] = []
@@ -612,7 +621,8 @@ async def _run(
         amount, providers = await run_sync_daemon(estimate)
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = outcome.classify(error)
         warnings.append(f"tool error: {type(error).__name__}")
         failed = True
     admitted: Reservation | None = None
@@ -702,7 +712,8 @@ async def _run(
                 output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
     except Fenced:
         raise
-    except Exception as error:
+    except BaseException as error:
+        error = outcome.classify(error)
         rebuilt = _rebuild_core_signal(error)
         if error is admission_refusal and isinstance(rebuilt, LimitReached) and not started:
             with anyio.CancelScope(shield=True):
@@ -724,7 +735,8 @@ async def _run(
             output = await run_sync_daemon(_prepare_output, output)
         except Fenced:
             raise
-        except Exception:
+        except BaseException as error:
+            outcome.classify(error)
             warnings.append("tool error: invalid output")
             output = ToolOutput(status=RunStatus.ERROR)
         finally:
@@ -754,7 +766,8 @@ async def _run(
                     estimated = providers and usage.usd is None and usage.total_tokens == 0
             except Fenced:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = outcome.classify(error)
                 warnings.append(f"tool error: {type(error).__name__}")
                 output = ToolOutput(status=RunStatus.ERROR)
                 actual, estimated = Amount(), started and providers
@@ -764,7 +777,8 @@ async def _run(
                 output = output.model_copy(update={"logs_ref": logs_ref})
             except Fenced:
                 raise
-            except Exception as error:
+            except BaseException as error:
+                error = outcome.classify(error)
                 warnings.append(f"tool error: {type(error).__name__}")
                 output = output.model_copy(update={"status": RunStatus.ERROR, "logs_ref": None})
     # Optional fingerprint work must remain cancellable before durable completion.
@@ -782,7 +796,8 @@ async def _run(
             raise
         except anyio.get_cancelled_exc_class() as error:
             warnings.append(f"fingerprint error: {type(error).__name__}")
-        except Exception as error:
+        except BaseException as error:
+            error = outcome.classify(error)
             warnings.append(f"fingerprint error: {type(error).__name__}")
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")

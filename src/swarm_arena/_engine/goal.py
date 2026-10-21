@@ -25,7 +25,7 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError, _core_error, _rebuild_core_signal
+from swarm_arena._errors import Fenced, PlanError
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -38,6 +38,7 @@ from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate
 from swarm_arena._model.tooling import RunStatus
+from swarm_arena._outcomes import _classify_outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import stamp
@@ -562,15 +563,7 @@ class GoalRunner:
                 raise asyncio.CancelledError() from None
         # Reraise outside the task group so fencing keeps its original type.
         if errors:
-            error = errors[0]
-            if isinstance(error, Fenced):
-                raise error
-            rebuilt = _rebuild_core_signal(error)
-            if rebuilt is not None:
-                raise rebuilt from None
-            if isinstance(error, BaseExceptionGroup) or not isinstance(error, Exception):
-                raise _core_error(RuntimeError, "supervised hook failed") from None
-            raise error
+            raise _classify_outcome(errors[0]) from None
         return (True, results[0]) if results else (False, None)
 
     def _judge_context(
