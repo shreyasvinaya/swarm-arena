@@ -650,13 +650,18 @@ async def _run(
         )
 
     try:
-        amount, providers = await run_sync_daemon(estimate)
+        amount, providers = await _prepare_sync(estimate)
     except Fenced:
         raise
     except BaseException as error:
         error = outcome.classify(error)
+        rebuilt = _rebuild_core_signal(error)
+        if isinstance(rebuilt, LimitReached):
+            raise rebuilt from None
         warnings.append(f"tool error: {type(error).__name__}")
         failed = True
+    if inflight.closed or generation != inflight._cancel_generation:
+        raise _core_signal(LimitReached("stop", "the round is stopping"))
 
     def on_admit(reservation: Reservation) -> None:
         owner.admitted = reservation
@@ -735,9 +740,10 @@ async def _run(
     except Fenced:
         raise
     except BaseException as error:
+        refused = error is admission_refusal
         error = outcome.classify(error)
         rebuilt = _rebuild_core_signal(error)
-        if error is admission_refusal and isinstance(rebuilt, LimitReached) and not started:
+        if refused and isinstance(rebuilt, LimitReached) and not started:
             raise rebuilt from None
         warnings.append(f"tool error: {type(error).__name__}")
         output = ToolOutput(status=RunStatus.ERROR)

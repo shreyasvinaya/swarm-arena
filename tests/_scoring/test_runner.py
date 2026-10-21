@@ -726,10 +726,20 @@ async def test_judge_hooks_preserve_fencing_and_cancellation(
             lambda current: _judge_ctx(),
         )
     )
-    with pytest.raises(failure_type) as caught:
-        await call
-    assert caught.value is failure
-    assert later.seen == []
+    if failure_type is Fenced:
+        with pytest.raises(Fenced) as caught:
+            await call
+        assert caught.value is failure
+        assert later.seen == []
+    else:
+        # These synchronous hooks raise user cancellation, without a pending
+        # caller cancellation. PR1-7 requires a contained, type-only failure.
+        result = await call
+        outcome = result[1] if isinstance(result, tuple) else result
+        assert len(outcome.errors) == 1
+        assert outcome.errors[0].reason == "_CoreRuntimeError: judge raised"
+        assert "ownership or cancellation" not in outcome.model_dump_json()
+        assert later.seen == ([] if final else [["c-1"]])
 
 
 async def test_prepared_batch_funded_size_equals_submitted_batch() -> None:

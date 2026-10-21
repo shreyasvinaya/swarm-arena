@@ -10,14 +10,11 @@ from swarm_arena._errors import Fenced, _core_error, _rebuild_core_signal
 def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Exception:
     """Preserve control signals and rebuild nonstandard hook failures by type."""
     if cancelled:
-        # Native caller messages belong to the caller, never to a hook group.
-        if isinstance(error, asyncio.CancelledError):
-            raise error
+        # A hook can catch genuine cancellation and replace its message. The
+        # pending caller state wins, independently of that untrusted outcome.
         raise asyncio.CancelledError() from None
     if isinstance(error, Fenced):
         raise error
-    if isinstance(error, BaseExceptionGroup) and error.subgroup(Fenced) is not None:
-        raise _core_error(Fenced, "run ownership lost") from None
     rebuilt = _rebuild_core_signal(error)
     if rebuilt is not None:
         return rebuilt

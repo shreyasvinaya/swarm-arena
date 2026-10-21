@@ -9,6 +9,7 @@ import anyio
 from pydantic import BaseModel
 
 from swarm_arena import Goal, Score, ScriptTool
+from swarm_arena._errors import Fenced
 from swarm_arena.board import Candidate
 from swarm_arena.manager import AgentContext, Manager, RoundReport
 from swarm_arena.scoring import Check, CheckContext, CheckResult
@@ -16,6 +17,7 @@ from swarm_arena.tool import Action, Command, CompletedRun, Estimate, ToolOutput
 
 MARK = "fm-secret-c7e51980"
 PEER_READY: anyio.Event | None = None
+NATIVE_READY: anyio.Event | None = None
 ENTERED = threading.Event()
 RELEASE = threading.Event()
 EXITED = threading.Event()
@@ -28,6 +30,8 @@ def failure(kind: str) -> BaseException:
     error.__cause__ = RuntimeError(MARK)
     if kind == "cancel":
         return asyncio.CancelledError(MARK)
+    if kind == "fenced_group":
+        return BaseExceptionGroup(MARK, [asyncio.CancelledError(MARK), Fenced(MARK), error])
     group = BaseExceptionGroup(MARK, [asyncio.CancelledError(MARK), error])
     group.add_note(MARK)
     group.__cause__ = RuntimeError(MARK)
@@ -58,6 +62,31 @@ class Broken(Manager):
         if ctx.goal.inputs["where"] == "manager":
             raise failure(kind)
         if ctx.goal.inputs["where"] == "action":
+            if kind == "replace_cancel":
+                global NATIVE_READY
+                NATIVE_READY = anyio.Event()
+                task = asyncio.create_task(ctx.call_action("broken", {}))
+                try:
+                    await NATIVE_READY.wait()
+                    task.cancel("caller cancellation")
+                    try:
+                        await task
+                    except asyncio.CancelledError as error:
+                        import traceback
+
+                        rendered = "".join(traceback.format_exception(error))
+                        assert MARK not in rendered
+                    else:
+                        raise AssertionError("caller cancellation was swallowed")
+                    await ctx.save_notes("action contained")
+                    return RoundReport()
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        from contextlib import suppress
+
+                        with suppress(asyncio.CancelledError):
+                            await task
             try:
                 await ctx.call_action("broken", {})
             except Exception as error:
@@ -98,6 +127,13 @@ class PaidTool(ScriptTool):
 
     def extra_actions(self) -> tuple[Action[Any], Action[Any]]:
         async def broken(ctx: AgentContext, args: BaseModel) -> Any:
+            if ctx.goal.inputs["kind"] == "replace_cancel":
+                assert NATIVE_READY is not None
+                NATIVE_READY.set()
+                try:
+                    await anyio.sleep_forever()
+                except asyncio.CancelledError:
+                    raise failure("cancel") from ValueError(MARK)
             raise failure(str(ctx.goal.inputs["kind"]))
 
         return (

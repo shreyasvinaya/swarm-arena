@@ -33,7 +33,7 @@ class CancelPreparation(Manager):
             try:
                 await task
             except asyncio.CancelledError as error:
-                assert str(error) == "caller cancellation"  # noqa: PT017
+                assert error.args in ((), ("caller cancellation",))  # noqa: PT017
             else:
                 raise AssertionError("native cancellation was swallowed")
         finally:

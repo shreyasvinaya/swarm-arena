@@ -166,6 +166,9 @@ and the goal can finish. Cancellation before dispatch refunds the tool reservati
 exactly once, including command preparation and edit uploads. Cleanup has a bounded
 settlement wait; work that may have started retains its charge. Actual caller
 cancellation and ownership fencing still propagate; hook messages, notes, and causes are not rendered by the CLI.
+Request-time estimate and provider hooks run in registered, cancellable
+preparation before reservation. Immediate stop and round deadlines abandon
+these waits without using the executor collection allowance.
 Built-in provider probing and model-provider recovery are M3 work.
 
 ## Stop modes and resume

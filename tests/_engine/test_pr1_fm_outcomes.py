@@ -137,3 +137,11 @@ def test_cli_manager_failure_is_local(tmp_path: Path, kind: str) -> None:
     assert '"goal_finished"' in text
     journal = [json.loads(line) for path in journals for line in path.read_text().splitlines()[1:]]
     assert any(e["type"] == "tool_end" and e["agent"] == "peer" for e in journal)
+
+
+async def test_caller_cancellation_rejects_hook_replacement(tmp_path: Path) -> None:
+    await test_extension_failure_is_local(tmp_path, "action", "replace_cancel")
+
+
+async def test_user_group_cannot_claim_fencing(tmp_path: Path) -> None:
+    await test_extension_failure_is_local(tmp_path, "manager", "fenced_group")

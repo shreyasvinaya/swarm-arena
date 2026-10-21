@@ -140,7 +140,7 @@ async def test_collection_context_is_daemon_local_and_always_reset(
     def invoke() -> None:
         token = result_file._OUTPUT_BYTE_LIMIT.set(91)
         try:
-            if failure in (KeyboardInterrupt, asyncio.CancelledError):
+            if failure is KeyboardInterrupt:
                 with pytest.raises(failure):
                     runner._collect(run)
             else:
