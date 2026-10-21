@@ -9,8 +9,8 @@ import anyio
 import pytest
 
 from swarm_arena._errors import ChainError, Fenced, StorageError, WriteOutcomeUnknown
-from swarm_arena._journal.event import EventDraft, EventType
-from swarm_arena._journal.lease import Lease, read_owner
+from swarm_arena._journal.event import Event, EventDraft, EventType
+from swarm_arena._journal.lease import Head, Lease, read_owner
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
@@ -640,3 +640,82 @@ async def test_local_io_failure_fences_without_admitting_event(
     owner = read_owner(store)
     assert owner is not None
     assert owner[0].version == 1
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "chain", "cancel", "group"])
+async def test_inherited_read_failure_is_contained(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import asyncio
+
+    from _fakes.leases import force_take_over
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._journal import writer as writer_module
+
+    async with _writer(store, tmp_path, group_window_s=0) as first:
+        await first.append_durable(EventDraft(type=EventType.RESERVE))
+    lease = force_take_over(store, owner_id="o2", host="h", ttl_s=60)
+    writer = JournalWriter(
+        store,
+        lease,
+        run_id="r",
+        next_seq=2,
+        local_path=tmp_path / "resumed.jsonl",
+        sync_interval_s=60,
+    )
+    marker = "private-chain-read-value"
+    errors: dict[str, BaseException] = {
+        "ordinary": RuntimeError(marker),
+        "chain": ChainError(marker),
+        "cancel": asyncio.CancelledError(marker),
+        "group": BaseExceptionGroup(marker, [RuntimeError(marker), asyncio.CancelledError(marker)]),
+    }
+    errors[kind].add_note(marker)
+
+    def fail(*args: object) -> None:
+        raise errors[kind]
+
+    monkeypatch.setattr(writer_module, "read_chain", fail)
+    try:
+        with pytest.raises(Fenced) as caught:
+            await writer.__aenter__()
+        assert_secret_absent(caught.value, marker)
+        assert writer.head == lease.doc.head
+        assert not (tmp_path / "resumed.jsonl").exists()
+    finally:
+        lease.release()
+
+
+async def test_inherited_read_retries_transient_failure(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._journal import writer as writer_module
+
+    async with _writer(store, tmp_path, group_window_s=0) as first:
+        await first.append_durable(EventDraft(type=EventType.RESERVE))
+    lease = force_take_over(store, owner_id="o2", host="h", ttl_s=60)
+    writer = JournalWriter(
+        store,
+        lease,
+        run_id="r",
+        next_seq=2,
+        local_path=tmp_path / "resumed.jsonl",
+        sync_interval_s=60,
+    )
+    attempts = 0
+    original = writer_module.read_chain
+
+    def read(current_store: Store, head: Head) -> list[tuple[str, list[Event]]]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient read failure")
+        return original(current_store, head)
+
+    monkeypatch.setattr(writer_module, "read_chain", read)
+    async with writer:
+        assert attempts == 2
+        assert writer.committed == first.committed

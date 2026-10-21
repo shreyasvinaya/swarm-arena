@@ -20,6 +20,7 @@ from swarm_arena._engine import run as run_module
 from swarm_arena._engine.control import request_stop
 from swarm_arena._errors import _is_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal import writer as writer_module
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._scoring import human_review as review_module
@@ -172,7 +173,9 @@ async def test_initialization_stop_cleanup_is_bounded(
     assert not store.exists("review")
 
 
-@pytest.mark.parametrize("site", ["review_repair", "board_build", "board_open", "page_repair"])
+@pytest.mark.parametrize(
+    "site", ["journal_entry", "review_repair", "board_build", "board_open", "page_repair"]
+)
 @pytest.mark.parametrize("signal", ["stop_now", "deadline", "cancel"])
 async def test_resume_initialization_stops_before_worker_release(
     run_config: RunConfig,
@@ -198,6 +201,17 @@ async def test_resume_initialization_stops_before_worker_release(
         workers.append(threading.current_thread())
         entered.set()
         assert release.wait(20)
+
+    store = LocalStore(Path(config.run_root) / "r")
+    initial_owner = read_owner(store)
+    assert initial_owner is not None
+    original_chain = writer_module.read_chain
+
+    def read_chain(*args: Any, **kwargs: Any) -> Any:
+        stages.append("journal_entry")
+        if site == "journal_entry":
+            hold()
+        return original_chain(*args, **kwargs)
 
     original_repair = review_module._repair_review_objects
     original_build = run_module._start_board
@@ -232,6 +246,7 @@ async def test_resume_initialization_stops_before_worker_release(
     monkeypatch.setattr(
         run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
     )
+    monkeypatch.setattr(writer_module, "read_chain", read_chain)
     monkeypatch.setattr(review_module, "_repair_review_objects", repair)
     monkeypatch.setattr(run_module, "_start_board", build)
     monkeypatch.setattr(ArenaBoard, "open", open_board)
@@ -269,3 +284,9 @@ async def test_resume_initialization_stops_before_worker_release(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
     assert stages[-1] == site
+
+    if site == "journal_entry":
+        owner = read_owner(store)
+        assert owner is not None
+        assert owner[0].head == initial_owner[0].head
+        assert not any(e.type == "takeover" for e in all_events(config))

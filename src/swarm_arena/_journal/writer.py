@@ -19,11 +19,13 @@ from swarm_arena._errors import (
     _core_error,
     _exception_type_name,
 )
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import WRITE_THROUGH, Event, EventDraft
 from swarm_arena._journal.lease import Head, Lease, read_owner
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.segment import encode_segment, segment_name
 from swarm_arena._model.canonical import canonical_json, utc_now
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store
 
 _T = TypeVar("_T")
@@ -33,7 +35,8 @@ class JournalWriter:
     """
     Publish queued events and maintain ownership through one writer task.
 
-    Store and lease operations run in AnyIO workers. Durable appends share a
+    The inherited-chain read is abandonable under the owner's supervision.
+    Publication and lease operations run in AnyIO workers. Durable appends share a
     group window and wait for the authority head to cover their sequence. A
     transient storage failure suspends renewals and retries only until the
     last confirmed expiry. Fatal failures wake all waiters with ``Fenced``.
@@ -113,7 +116,13 @@ class JournalWriter:
             raise _core_error(RuntimeError, "journal writer context cannot be reused")
         if self._head is not None:
             try:
-                chain = await self._retry(partial(read_chain, self._store, self._head))
+                outcome = _Outcome()
+                try:
+                    chain = await self._retry(
+                        partial(read_chain, self._store, self._head), abandonable=True
+                    )
+                except BaseException as error:
+                    outcome.contain(error, StorageError, "journal initialization")
                 self._committed = [name for name, _ in chain]
             except Exception as error:
                 self._fail(error)
@@ -344,13 +353,16 @@ class JournalWriter:
         """Compute lifetime using only the last confirmed owner document."""
         return (self._lease.doc.expires_at - utc_now()).total_seconds()
 
-    async def _retry(self, operation: Callable[[], _T]) -> _T:
+    async def _retry(self, operation: Callable[[], _T], *, abandonable: bool = False) -> _T:
         """Retry transient core I/O without renewal, bounded by confirmed expiry."""
         while True:
             self._raise_if_fenced()
             if self._remaining() <= 0:
                 raise _core_error(Fenced, "journal lease expired")
             try:
+                if abandonable:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    return await run_sync_daemon(operation)
                 return await anyio.to_thread.run_sync(operation)
             except ChainError:
                 raise
