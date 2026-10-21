@@ -1567,7 +1567,8 @@ async def test_resume_shutdown_bound_and_primary_failure(
     monkeypatch.setattr(RunRunner, "_drive", drive)
     task = asyncio.create_task(runner.run())
     try:
-        await closing.wait()
+        with anyio.fail_after(10):
+            await closing.wait()
         done, _ = await asyncio.wait({task}, timeout=1)
         assert task in done, "executor shutdown exceeded its configured bound"
         if fenced:
@@ -1819,16 +1820,18 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
 
     entered, release = threading.Event(), threading.Event()
     deadlines: list[anyio.CancelScope] = []
+    workers: list[threading.Thread] = []
     real = run_module._build_executor
-    config = crashed.config.model_copy(update={"settle_timeout_s": 0.05, "lease_ttl_s": 0.3})
+    config = crashed.config.model_copy(update={"settle_timeout_s": 1.0})
 
     def blocked(config: RunConfig) -> Executor:
+        workers.append(threading.current_thread())
         entered.set()
-        release.wait()
+        assert release.wait(15), "constructor release deadline"
         return real(config)
 
     async def prepare() -> None:
-        with anyio.fail_after(10) as deadline:
+        with anyio.fail_after(15) as deadline:
             deadlines.append(deadline)
             await Swarm(config).resume(crashed.run_id)
 
@@ -1836,22 +1839,28 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
         patch.setattr(run_module, "_build_executor", blocked)
         task = asyncio.create_task(prepare())
         try:
-            with anyio.fail_after(5):
-                while not entered.is_set():  # noqa: ASYNC110 - daemon entry signal
-                    await anyio.sleep(0.01)
-            deadlines[0].deadline = anyio.current_time() + 0.01
-            done, _ = await asyncio.wait([task], timeout=0.5)
-            completed_without_release = bool(done)
+            with anyio.fail_after(10):
+                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            services = [
+                t for t in asyncio.all_tasks() if t.get_name() == f"resume-{crashed.run_id}"
+            ]
+            assert services
+            deadlines[0].deadline = anyio.current_time()
+            done, _ = await asyncio.wait([task], timeout=3)
+            assert done, "caller cancellation waited for the constructor"
+            assert all(service.done() for service in services)
+            assert workers[0].is_alive()
         finally:
             release.set()
-            result = await asyncio.gather(task, return_exceptions=True)
-    assert completed_without_release, "caller cancellation waited for the constructor"
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
     assert isinstance(result[0], TimeoutError)
     owner = read_owner(crashed.store)
     assert owner is not None
     assert owner[0].expires_at <= utc_now()
-    await anyio.sleep(0.35)
-    assert read_owner(crashed.store) == owner
+    # The service and abandoned worker have both ended: neither can renew this owner later.
     await Swarm(crashed.config).resume(crashed.run_id)
     next_owner = read_owner(crashed.store)
     assert next_owner is not None
@@ -2213,8 +2222,9 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
     from swarm_arena._board.arena import ArenaBoard, ArenaView
 
     config, store = await _finished_without_round_page(tmp_path, run_config)
-    config = config.model_copy(update={"settle_timeout_s": 0.05, "lease_ttl_s": 0.3})
+    config = config.model_copy(update={"settle_timeout_s": 1.0})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     loop_thread = threading.get_ident()
     scopes: list[anyio.CancelScope] = []
     owner_type = ArenaBoard if site == "snapshot" else ArenaView
@@ -2223,9 +2233,10 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
 
     def blocked(*args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
+        workers.append(threading.current_thread())
         entered.set()
         assert threading.get_ident() != loop_thread
-        release.wait()
+        assert release.wait(15), "page hook release deadline"
         returned.set()
         return result
 
@@ -2238,25 +2249,28 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
     monkeypatch.setattr(owner_type, method, blocked)
     task = asyncio.create_task(prepare())
     try:
-        with anyio.fail_after(5):
-            while not entered.is_set():  # noqa: ASYNC110 - hook entry signal
-                await anyio.sleep(0.01)
+        with anyio.fail_after(10):
+            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        services = [t for t in asyncio.all_tasks() if t.get_name() == "resume-repair"]
+        assert services
         scopes[0].cancel()
-        with anyio.fail_after(2):
+        with anyio.fail_after(3):
             await task
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
-        # Keep the hook blocked through a complete renewal period.
-        await anyio.sleep(config.lease_ttl_s + 0.1)
-        assert read_owner(store) == owner
+        # Check the renewal service has ended while the worker is still held.
+        assert all(service.done() for service in services)
+        assert not returned.is_set()
         assert not store.exists("goals/g/rounds/round-01.md")
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
-    with anyio.fail_after(5):
-        while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
-            await anyio.sleep(0.01)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+    assert returned.is_set()
+    assert read_owner(store) == owner
     assert not store.exists("goals/g/rounds/round-01.md")
 
 

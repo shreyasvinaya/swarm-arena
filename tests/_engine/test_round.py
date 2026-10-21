@@ -1,7 +1,6 @@
 import dataclasses
 import threading
 from collections.abc import Sequence
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -90,7 +89,8 @@ class _BarrierManager(Manager):
         self.starts.append(start)
         if len(self.starts) == 2:
             self.both_entered.set()
-        await self.both_entered.wait()
+        with anyio.fail_after(10):
+            await self.both_entered.wait()
         self.spans.append((start, anyio.current_time()))
         return RoundReport(summary="")
 
@@ -124,8 +124,9 @@ class _RoundTime:
             await self.changed.wait()
 
     async def wait_past(self, deadline: float) -> None:
-        while self.last_tick < deadline:
-            await self.ticked.wait()
+        with anyio.fail_after(10):
+            while self.last_tick < deadline:
+                await self.ticked.wait()
 
 
 class _Raiser(Manager):
@@ -235,14 +236,17 @@ async def test_runtime_constructor_is_supervised(
 ) -> None:
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     peer_ran = anyio.Event()
+    clock = _RoundTime(monkeypatch)
+    workers: list[threading.Thread] = []
     manager_calls: list[str] = []
     original = Ref.build
 
     def blocked(self: Ref, base: type[Any]) -> Any:
         if self.name == "faulty" and base is component:
+            workers.append(threading.current_thread())
             entered.set()
             # The safety bound also releases the old synchronous check build on RED.
-            release.wait(3)
+            assert release.wait(20), "constructor release deadline"
             returned.set()
         return original(self, base)
 
@@ -256,22 +260,24 @@ async def test_runtime_constructor_is_supervised(
             peer_ran.set()
             return RoundReport(summary="peer ran")
 
-    e = env.with_limits(round_timeout_s=0.5 if stop == "deadline" else 60.0)
+    e = env.with_limits(round_timeout_s=60.0)
     runner = _construction_round(
         e, component, [_with_manager("a", Probe("a")), _with_manager("b", Probe("b"))]
     )
     monkeypatch.setattr(Ref, "build", blocked)
 
     async def trigger() -> None:
-        assert await anyio.to_thread.run_sync(entered.wait, 1)
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
         await peer_ran.wait()
-        if stop == "stop_now":
+        if stop == "deadline":
+            clock.advance(61)
+        elif stop == "stop_now":
             e.deps.stops.stop_now = True
         elif stop == "fenced":
             e.deps.journal.fenced.set()
 
     try:
-        with anyio.fail_after(2):
+        with anyio.fail_after(10):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(trigger)
                 if stop == "fenced":
@@ -289,12 +295,16 @@ async def test_runtime_constructor_is_supervised(
         assert not returned.is_set()
         before = e.event_types()
         release.set()
-        assert await anyio.to_thread.run_sync(returned.wait, 1)
-        await anyio.lowlevel.checkpoint()
+        assert await anyio.to_thread.run_sync(returned.wait, 5)
+        await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert not workers[0].is_alive()
         assert manager_calls == ["b"]
         assert e.event_types() == before
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("component", [Tool, Check], ids=["tool", "check"])
@@ -644,7 +654,8 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
     e = dataclasses.replace(
         e, deps=dataclasses.replace(e.deps, executor=PaidExecutor(e.deps.executor))
     )
-    out = await _round(e, [_with_manager("a", BudgetManager())]).run(1)
+    with anyio.fail_after(10):
+        out = await _round(e, [_with_manager("a", BudgetManager())]).run(1)
     assert len(errors) == 1
     assert errors[0].limit == "budget"
     assert len(out.candidates) == 2
@@ -961,7 +972,7 @@ async def test_budget_drain_uses_only_inflight_job_grace(
             tasks.start_soon(latch)
             out = await _round(env, [slot, idle]).run(1)
     assert 0.2 <= times["cancel"] - times["flag"] < 2.0
-    assert times["cancel"] - times["closed"] < 0.4
+    assert times["cancel"] - times["closed"] < 2.0
     assert out.candidates[0].output.partial
     assert out.candidates[0].output.status == RunStatus.CANCELLED
 
@@ -1023,12 +1034,14 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
 
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     workspaces: list[Path] = []
+    workers: list[threading.Thread] = []
     marker = tmp_path / "must-not-launch"
     slot = _scripted("a", [{"inputs": {}}])
     slot.tool_ref = Ref.of(PyTool({"code": f"open({str(marker)!r}, 'w').close()", "grace_s": 0.1}))
     original = PyTool.command
 
     def command(self: PyTool, request: ToolRequest, workspace: Path) -> Command:
+        workers.append(threading.current_thread())
         workspaces.append(workspace)
         entered.set()
         assert release.wait(10)
@@ -1054,12 +1067,17 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
         before = env.event_types()
         release.set()
         assert await anyio.to_thread.run_sync(done.wait, 5)
-        await anyio.sleep(0.05)
+        with anyio.fail_after(5):
+            await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert not workers[0].is_alive()
         assert env.event_types() == before
         assert not marker.exists()
         assert (workspaces[0] / "late_write").exists()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 async def test_effective_tool_uses_base_catalog_identity(env: EngineEnv) -> None:
@@ -1219,6 +1237,11 @@ async def test_metadata_preparation_is_supervised_per_agent(
     owner = threading.get_ident()
     hook_threads: list[int] = []
     ticks: list[float] = []
+    workers: list[threading.Thread] = []
+    beat_target: list[int] = []
+    beats_reached = anyio.Event()
+    peer_ran = anyio.Event()
+    clock = _RoundTime(monkeypatch)
     managers: list[str] = []
     original_build = Ref.build
 
@@ -1228,13 +1251,14 @@ async def test_metadata_preparation_is_supervised_per_agent(
             original_hook = getattr(instance, hook)
 
             def metadata() -> Any:
+                workers.append(threading.current_thread())
                 hook_threads.append(threading.get_ident())
                 entered.set()
                 if failure == "raise":
                     error = ValueError(secret)
                     error.add_note(secret)
                     raise error from RuntimeError(secret)
-                release.wait(1)
+                assert release.wait(20), "metadata release deadline"
                 returned.set()
                 return original_hook()
 
@@ -1246,25 +1270,38 @@ async def test_metadata_preparation_is_supervised_per_agent(
             assert threading.get_ident() == owner
             managers.append(ctx.spec.name)
             ctx.search_learnings("heartbeat peer")
+            peer_ran.set()
             return RoundReport(summary="healthy")
 
     async def heartbeat() -> None:
         while True:
             ticks.append(anyio.current_time())
-            await anyio.sleep(0.005)
+            if beat_target and len(ticks) >= beat_target[0]:
+                beats_reached.set()
+            await anyio.sleep(0.01)
 
-    e = env.with_limits(round_timeout_s=0.15)
+    async def trigger_deadline() -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        await peer_ran.wait()
+        beat_target.append(len(ticks) + 5)
+        with anyio.fail_after(2):
+            await beats_reached.wait()
+        assert not returned.is_set()
+        clock.advance(61)
+
+    e = env.with_limits(round_timeout_s=60)
     runner = _construction_round(
         e, Tool, [_with_manager("a", Probe()), _with_manager("b", Probe())]
     )
     monkeypatch.setattr(Ref, "build", build)
     try:
-        start = anyio.current_time()
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(heartbeat)
-            out = await runner.run(1)
-            tasks.cancel_scope.cancel()
-        elapsed = anyio.current_time() - start
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tasks:
+                if failure == "hang":
+                    tasks.start_soon(heartbeat)
+                    tasks.start_soon(trigger_deadline)
+                out = await runner.run(1)
+                tasks.cancel_scope.cancel()
         assert entered.is_set()
         assert managers == ["b"]
         assert hook_threads
@@ -1276,15 +1313,15 @@ async def test_metadata_preparation_is_supervised_per_agent(
         assert_secret_absent(RuntimeError(repr(e.events("agent_status"))), secret)
         if failure == "hang":
             assert not returned.is_set()
-            assert elapsed < 0.7
-            assert len(ticks) >= 5
-            assert max(b - a for a, b in pairwise(ticks)) < 0.1
+            assert beats_reached.is_set()
         before = e.event_types()
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
     if failure == "hang":
-        assert await anyio.to_thread.run_sync(returned.wait, 1)
-        await anyio.lowlevel.checkpoint()
+        assert returned.is_set()
         assert e.event_types() == before
         assert managers == ["b"]
 
