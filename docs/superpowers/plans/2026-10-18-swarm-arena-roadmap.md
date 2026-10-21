@@ -395,6 +395,7 @@ Rules [plan]:
 | `tests/_fakes/engine.py` | Test-side env types and helpers for agent and engine tests (`RtEnv`, `CtxEnv`, `EngineEnv`, the config helpers `with_limits` and `with_executor`, `take_over_retrying`); importable as `_fakes.engine`, never collected | M1b (+M2) |
 | `tests/_agent/conftest.py` | Agent fixtures `rt_env` and `ctx_env`; M2 changes their board to `ArenaBoard` | M1b (+M2) |
 | `tests/_engine/conftest.py` | Engine fixture `env` (an `EngineEnv` on a real lease, journal, ledger, board, and executor); M2 Task 9 changes its board to `ArenaBoard` | M1b (+M2) |
+| `tests/_fakes/curators.py` | Deterministic merging, posting, and crash-boundary curator fixtures | M2 |
 | `tests/_fakes/journals.py` | A committed run journal written without the engine; `FakeRun`, `add_pointer`, and cache observation helpers | M2 |
 | `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
 | `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |

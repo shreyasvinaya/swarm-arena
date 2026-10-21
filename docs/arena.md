@@ -219,3 +219,81 @@ Child-store prefixes follow the raw Store key rules: characters such as `?`,
 Listings match the local Store contract: basenames containing `.tmp-` or ending
 in `.lock` are hidden, including nested objects. Filtering applies to every page
 before returning sorted keys relative to the store root.
+
+## Curation
+
+Set `RunConfig.curator` to a reference to a `swarm_arena.board.Curator` subclass
+when a run should merge related learnings at ordinary round end:
+
+```python
+from collections.abc import Sequence
+from swarm_arena import Ref, RunConfig
+from swarm_arena.board import BoardView, Curator, Learning
+
+
+class MergeRelated(Curator):
+    async def curate(
+        self, namespace: str, new: Sequence[Learning], view: BoardView
+    ) -> list[Learning]:
+        if len(new) < 2:
+            return []
+        return [
+            Learning(
+                id="proposal",
+                namespace=namespace,
+                run_id="",
+                goal_id="",
+                round=0,
+                author="human:proposal",
+                title="Related observations",
+                text="These observations share the cited evidence.",
+                supersedes=[item.id for item in new],
+            )
+        ]
+
+
+# Put the class in an importable module, for example my_project.curators.
+config = RunConfig(curator=Ref(path="my_project.curators:MergeRelated"))
+```
+
+Curators follow the normal component configuration contract: an empty safe
+configuration by default, or a nested `Config` model. `models()` declares model
+aliases and defaults to `()`. The hook runs inside the curator LLM scope, with
+holder `<goal>/:curator` paid from the reserve. This hook adds no built-in LLM
+curator; `LLMCurator` is planned for the LLM milestone.
+
+Proposals must supersede at least one learning from `new` or the visible
+namespace snapshot. Hidden and unknown learnings are refused. The core validates
+content with the production `Learning` rules, assigns IDs and run/goal/round
+metadata, sets `author="curator"`, clears pin/hide and requesting-call metadata,
+and combines evidence in supersedes order without duplicates. A summary is
+verified when any superseded learning is verified. Evidence-free summaries are
+dropped, including summaries of human learnings that have no evidence.
+
+Superseded learnings remain searchable but rank below their visible summaries
+in the normal learning list. Search still prioritizes text-match relevance.
+Hiding a mistaken summary with the planned `learnings hide <summary-id>` command
+undoes the merge's ranking effect; the original learnings remain intact.
+
+Curation follows the committed nonterminal policy decision and precedes round
+closure and replanning. No curator is called when configuration or new learnings
+are absent, or after a terminal policy or stop. Constructors, model hooks,
+invocation and result normalization participate in goal stop, deadline and
+fencing supervision. Abandoned daemon work cannot allocate summary IDs or publish
+results. Ordinary failures produce type-only diagnostics; genuine core budget
+and fencing signals retain their control behavior. Pending unknown calls are
+charged conservatively when the tranche closes.
+
+A successful preparation publishes all summary `learning` events and one
+`curated` receipt together, without an await between their appends. Its plain
+v1 payload contains `summaries` (IDs), `supersedes` (summary ID to source IDs),
+`errors` (value-free diagnostics), `round`, `revision` (the executed revision),
+and `decision_seq` (the committed policy event sequence). The event's goal ID
+and the policy sequence distinguish phases across revisions and lifecycle
+continuations. Engine events also retain the shared run-clock checkpoint.
+Empty results and ordinary errors complete an attempted phase; disabled and
+no-new-learning skips do not emit receipts. Stop-abandoned attempts cannot
+publish summaries. Replay indexes summaries through their learning events and
+uses the receipt only to prevent repeated curation. Recovery without a receipt
+may retry an eligible nonterminal attempt; terminal recovery performs no new
+paid curation. Curation does not change join-retry or pending-replan state.

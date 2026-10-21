@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Learning posts vet visible evidence and refinements before ID allocation,
   require justification for near-duplicates, derive verification from complete
   passing evidence, and include value-free writing guidance on invalid content.
+- Optional configurable curators merge round learnings with supervised normalization,
+  reserve accounting, and atomic completion receipts for crash-safe recovery.
+
 - Arena snapshots resolve owning groups before foreign key matches, keeping
   part candidates, declared siblings, and goal learning scope consistent.
 - Arena lineage batches ancestor IDs inside one frontier read scope per namespace,

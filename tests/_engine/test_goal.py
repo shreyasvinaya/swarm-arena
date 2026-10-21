@@ -14,6 +14,7 @@ from swarm_arena import (
     ProgramJudge,
     Ref,
     RoundSpec,
+    RunConfig,
     ScriptedManager,
     TeamSpec,
 )
@@ -1046,3 +1047,638 @@ async def test_unfunded_converge_barrier_selects_only_prior_survivors(env: Engin
     assert (out.status, out.reason) == ("stopped", "reserve_exhausted")
     assert out.finalists
     assert all(c.team == "t0" for c in out.finalists)
+
+
+def _curator_plan(*, rounds: int = 2) -> Plan:
+    plan = _plan(teams=1, rounds=rounds)
+    for team in plan.teams:
+        team.agents[0] = team.agents[0].model_copy(
+            update={
+                "manager": team.agents[0].manager.model_copy(
+                    update={
+                        "config": {**team.agents[0].manager.config, "post_learnings": True},
+                        "path": "_fakes.curators:PostingManager",
+                    }
+                )
+            }
+        )
+    return plan
+
+
+async def test_engine_runs_curator_at_round_end(env: EngineEnv) -> None:
+    from swarm_arena._journal.replay import RunState
+
+    env.deps.config = env.deps.config.model_copy(
+        update={"curator": Ref(path="_fakes.curators:MergeAll")}
+    )
+    plan = _curator_plan()
+    await GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None).run()
+    receipts = env.events("curated")
+    assert [e.round for e in receipts] == [1, 2]
+    state = RunState.from_events(env._events())
+    for event in receipts:
+        decision = next(e for e in env.events("decision") if e.round == event.round)
+        assert event.payload["decision_seq"] == decision.seq
+        assert event.payload["revision"] == 0
+        assert event.payload["errors"] == []
+        for id in event.payload["summaries"]:
+            record = next(e for e in env.events("learning") if e.payload["learning"]["id"] == id)
+            assert env.segment_index(record.seq) == env.segment_index(event.seq)
+        assert (
+            decision.seq
+            < event.seq
+            < next(e.seq for e in env.events("round_closed") if e.round == event.round)
+        )
+    frontier = state.goals["g"].frontiers[2]
+    view = env.deps.board.snapshot(plan.goal.key(), frontier)
+    ids = [item.id for item in view.learnings("n")]
+    first = state.learnings[receipts[0].payload["summaries"][0]]
+    assert all(ids.index(first.id) < ids.index(id) for id in first.supersedes)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_curator_skips_without_configuration_or_new_learnings(
+    env: EngineEnv, configured: bool
+) -> None:
+    if configured:
+        env.deps.config = env.deps.config.model_copy(
+            update={"curator": Ref(path="_fakes.curators:MergeAll")}
+        )
+    await GoalRunner(env.deps, goal_id="g", plan=_plan(teams=1, rounds=1), replanner=None).run()
+    assert env.events("curated") == []
+
+
+async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
+    """Commit a real policy boundary without spending on a tool subprocess."""
+    from swarm_arena._engine.goal import r0_revision_draft
+    from swarm_arena._journal.event import EventDraft, EventType
+    from swarm_arena._model.planning_types import Decision
+    from swarm_arena.board import Learning
+
+    plan = _plan(teams=1, rounds=1)
+    env.deps.config = env.deps.config.model_copy(
+        update={
+            "curator": Ref(path="_fakes.curators:MergeAll"),
+            "settle_timeout_s": 0.02,
+        }
+    )
+    env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
+    item = Learning(
+        id="L-source",
+        namespace="n",
+        run_id=env.deps.run_id,
+        goal_id="g",
+        round=1,
+        author="agent",
+        title="Original",
+        text="Evidence",
+        evidence=["c-1"],
+    )
+    env.deps.journal.append(
+        EventDraft(
+            type=EventType.LEARNING,
+            goal_id="g",
+            round=1,
+            payload={"learning": item.model_dump(mode="json")},
+        )
+    )
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type=EventType.DECISION,
+            goal_id="g",
+            round=1,
+            payload={"round": 1, "decision": Decision().model_dump(mode="json")},
+        )
+    )
+    return GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None, journal_r0=False)
+
+
+@pytest.mark.parametrize("stage", ["constructor", "models", "invoke", "serialize", "traverse"])
+@pytest.mark.parametrize("stop", ["stop", "deadline"])
+async def test_curator_blocking_hooks_are_abandoned_before_ids(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    stop: str,
+) -> None:
+    import threading
+    from collections.abc import Sequence
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena.board import Learning
+
+    runner = await _curation_checkpoint(env)
+    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+    finished = anyio.Event()
+    before = env.deps.ids.counters()
+    original_init = MergeAll.__init__
+    original_curate = MergeAll.curate
+
+    def block() -> None:
+        entered.set()
+        try:
+            assert release.wait(5)
+        finally:
+            exited.set()
+
+    def init(self: MergeAll, *args: Any, **kwargs: Any) -> None:
+        block()
+        original_init(self, *args, **kwargs)
+
+    def models(self: MergeAll) -> tuple[str, ...]:
+        block()
+        return ()
+
+    class BlockingLearning(Learning):
+        def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            block()
+            return super().model_dump(*args, **kwargs)
+
+    class BlockingSequence(Sequence[Learning]):
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, key: Any) -> Any:
+            block()
+            raise IndexError
+
+    async def curate(self: MergeAll, *args: Any, **kwargs: Any) -> Any:
+        if stage == "invoke":
+            entered.set()
+            try:
+                await anyio.sleep_forever()
+            finally:
+                exited.set()
+        result = await original_curate(self, *args, **kwargs)
+        if stage == "traverse":
+            return BlockingSequence()
+        if stage == "serialize":
+            return [*result, BlockingLearning.model_validate(result[0].model_dump())]
+        return result
+
+    if stage == "constructor":
+        monkeypatch.setattr(MergeAll, "__init__", init)
+    elif stage == "models":
+        monkeypatch.setattr(MergeAll, "models", models)
+    else:
+        monkeypatch.setattr(MergeAll, "curate", curate)
+
+    async def work() -> None:
+        try:
+            await runner._curate_round(1)
+        finally:
+            finished.set()
+
+    try:
+        with anyio.fail_after(4):
+            async with anyio.create_task_group() as group:
+                group.start_soon(work)
+                assert await anyio.to_thread.run_sync(entered.wait, 2)
+                if stop == "stop":
+                    env.deps.stops.stop = True
+                else:
+                    env.deps.config = env.deps.config.model_copy(
+                        update={
+                            "limits": env.deps.config.limits.model_copy(
+                                update={"run_timeout_s": 0.001}
+                            )
+                        }
+                    )
+                await finished.wait()
+                assert env.deps.ids.counters() == before
+                assert env.events("curated") == []
+                release.set()
+                assert await anyio.to_thread.run_sync(exited.wait, 1)
+                # A subsequent healthy core operation proves the abandoned daemon
+                # cannot publish into its former goal after returning.
+                await runner._refresh()
+                assert len(env.events("learning")) == 1
+                assert env.deps.ids.counters() == before
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("stage", ["constructor", "models", "curate", "empty", "malformed"])
+async def test_curator_failed_attempt_commits_safe_completion(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    from _fakes.curators import MergeAll
+
+    runner = await _curation_checkpoint(env)
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("CURATOR_SENTINEL_SECRET")
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        if stage == "empty":
+            return []
+        if stage == "malformed":
+            return [object()]
+        return fail()
+
+    monkeypatch.setattr(
+        MergeAll,
+        {"constructor": "__init__", "models": "models"}.get(stage, "curate"),
+        fail if stage in {"constructor", "models"} else curate,
+    )
+    before = env.deps.ids.counters()
+    await runner._curate_round(1)
+    await runner._curate_round(1)
+    receipts = env.events("curated")
+    assert len(receipts) == 1
+    assert receipts[0].payload["summaries"] == []
+    assert bool(receipts[0].payload["errors"]) == (stage != "empty")
+    assert "CURATOR_SENTINEL_SECRET" not in repr(receipts)
+    assert env.deps.ids.counters() == before
+
+
+@pytest.mark.parametrize("mode", ["reported", "unknown", "overflow", "spoof"])
+async def test_curator_uses_reserve_and_settles_authoritatively(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import USD_LIMIT, Amount
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.ids import IdGen
+    from swarm_arena.manager import LimitReached
+
+    runner = await _curation_checkpoint(env)
+    original = MergeAll.curate
+
+    async def curate(self: MergeAll, *args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        assert (scope.role, scope.goal_id, scope.round) == ("curator", "g", 1)
+        if mode == "spoof":
+            raise LimitReached("budget", "CURATOR_SENTINEL_SECRET")
+        estimate = Amount(usd=0.01)
+        id = await scope.tranche.reserve_call(estimate)
+        if mode == "reported":
+            await scope.tranche.settle_call(id, Amount(usd=0.000003))
+        elif mode == "overflow":
+            await scope.tranche.settle_call(id, Amount.model_construct(tokens=2, usd=USD_LIMIT * 2))
+        elif mode == "unknown":
+            raise RuntimeError("CURATOR_SENTINEL_SECRET")
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    await runner._curate_round(1)
+    await env.deps.journal.commit()
+    reserves = env.events("reserve")
+    settlements = env.events("settle")
+    assert all(e.payload["reservation"]["holder"] == "g/:curator" for e in reserves)
+    assert len(reserves) == len(settlements) == (0 if mode == "spoof" else 1)
+    live = env.deps.ledger
+    replay = Ledger.replay(
+        RunState.from_events(env._events()), journal=env.deps.journal, ids=IdGen(env.deps.run_id, 1)
+    )
+    assert live.free() == replay.free()
+    assert live._charges == replay._charges
+    assert all(entry.settled for entry in live._entries.values())
+    if mode in {"reported", "unknown"}:
+        assert settlements[0].payload["actual"]["usd"] == (0.000003 if mode == "reported" else 0.01)
+    if mode == "overflow":
+        assert live.run_exhausted()
+        assert replay.run_exhausted()
+        assert all(not event.payload["summaries"] for event in env.events("curated"))
+    if mode == "spoof":
+        assert runner.reason is None
+    assert "CURATOR_SENTINEL_SECRET" not in repr(env.events("curated"))
+    if mode != "overflow":
+        assert len(env.events("curated")) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary", ["decision", "prepared", "curated", "round_closed", "terminal_decision"]
+)
+async def test_curator_recovers_committed_phase_after_process_death(
+    tmp_path: Path, boundary: str
+) -> None:
+    import os
+    import sys
+
+    import anyio
+    from _fakes.run import all_events, events
+
+    from swarm_arena import RunConfig, Swarm
+    from swarm_arena._journal.replay import RunState
+
+    environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
+    )
+    script = (
+        "import sys,anyio; from _fakes.curators import crash_driver; "
+        "anyio.run(crash_driver,sys.argv[1],sys.argv[2])"
+    )
+    with anyio.fail_after(60):
+        process = await anyio.run_process(
+            [sys.executable, "-c", script, str(tmp_path), boundary], env=environment, check=False
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    cfg = RunConfig.load(tmp_path / "runs" / "curation" / "run.toml")
+    before = all_events(cfg)
+    assert sum(e.type == "curated" for e in before) == int(boundary in {"curated", "round_closed"})
+    if boundary == "prepared":
+        assert all(
+            e.payload["learning"]["author"] != "curator" for e in before if e.type == "learning"
+        )
+    with anyio.fail_after(60):
+        result = await Swarm(cfg).resume("curation", force=True)
+    if boundary == "terminal_decision":
+        assert not result["g"]
+        assert events(cfg, "curated") == []
+        assert not (tmp_path / "calls").exists()
+        assert len(events(cfg, "tool_start")) == 1
+        assert len(events(cfg, "decision")) == 1
+        assert len(events(cfg, "round_closed")) == 1
+        assert len(events(cfg, "score")) == sum(e.type == "score" for e in before)
+        return
+    assert result["g"]
+    receipts = events(cfg, "curated")
+    assert [e.round for e in receipts] == [1, 2]
+    assert [e.round for e in events(cfg, "decision")] == [1, 2]
+    assert [e.round for e in events(cfg, "round_closed")] == [1, 2]
+    assert len(events(cfg, "tool_start")) == 2
+    expected_calls = 3 if boundary == "prepared" else 2
+    assert len((tmp_path / "calls").read_text().splitlines()) == expected_calls
+    state = RunState.from_events(all_events(cfg))
+    summaries = [item for item in state.learnings.values() if item.author == "curator"]
+    assert len(summaries) == 2
+    assert len({item.id for item in summaries}) == 2
+    assert all(item.evidence for item in summaries)
+    assert state.goals["g"].curated_decisions == [e.payload["decision_seq"] for e in receipts]
+
+
+async def test_curator_reserve_exhaustion_completes_without_more_paid_work(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from _fakes.curators import MergeAll
+    from _fakes.engine import with_executor
+    from _fakes.run import events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        await scope.tranche.reserve_call(Amount(usd=100))
+        pytest.fail("unfunded work dispatched")
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    config = with_executor(
+        run_config.model_copy(
+            update={"limits": Limits(max_usd=10), "curator": Ref(path="_fakes.curators:MergeAll")}
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    await Swarm(config).run(_curator_plan())
+    receipts = events(config, "curated")
+    assert len(receipts) == 1
+    assert receipts[0].payload["summaries"] == []
+    assert receipts[0].payload["errors"] == ["curator limit: budget"]
+    assert len(events(config, "tool_start")) == 1
+    assert events(config, "goal_finished")[-1].payload["reason"] == "reserve_exhausted"
+
+
+@pytest.mark.parametrize(
+    "phase", ["reserve_admission", "pending_call", "settle_admission", "settle_parent"]
+)
+async def test_curator_cancellation_retains_settlement_finality(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._journal.writer import JournalWriter
+    from swarm_arena._model.ids import IdGen
+
+    runner = await _curation_checkpoint(env)
+    original_wait = JournalWriter._wait_for
+    admitted: list[int] = []
+    dispatched: list[str] = []
+    pending = anyio.Event()
+    parent_scope = anyio.CancelScope()
+
+    async def wait(writer: JournalWriter, seq: int) -> None:
+        target = "reserve" if phase == "reserve_admission" else "settle"
+        if (
+            phase != "pending_call"
+            and not admitted
+            and any(event.seq == seq and event.type == target for event in writer._queue)
+        ):
+            admitted.append(seq)
+            if phase in {"reserve_admission", "settle_parent"}:
+                parent_scope.cancel()
+            else:
+                # Native task cancellation can interrupt a durable settlement even
+                # inside an AnyIO shield. Its already-admitted charge stays final.
+                task = asyncio.current_task()
+                assert task is not None
+                asyncio.get_running_loop().call_soon(task.cancel)
+        await original_wait(writer, seq)
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        call = await scope.tranche.reserve_call(Amount(usd=0.01))
+        dispatched.append(call)
+        if phase == "pending_call":
+            pending.set()
+            await anyio.sleep_forever()
+        await scope.tranche.settle_call(call, Amount(usd=0.000003))
+        return []
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    monkeypatch.setattr(JournalWriter, "_wait_for", wait)
+    if phase in {"reserve_admission", "settle_parent"}:
+        with parent_scope:
+            await runner._curate_round(1)
+        if phase == "reserve_admission":
+            assert not dispatched
+    elif phase == "settle_admission":
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(runner._curate_round(1))
+    else:
+        with anyio.fail_after(3):
+            async with anyio.create_task_group() as group:
+                group.start_soon(runner._curate_round, 1)
+                await pending.wait()
+                env.deps.stops.stop = True
+    await env.deps.journal.commit()
+    assert env.events("curated") == []
+    assert len(env.events("reserve")) == len(env.events("settle")) == 1
+    settlement = env.events("settle")[0]
+    assert (
+        settlement.payload["actual"]["usd"]
+        == {
+            "reserve_admission": 0.0,
+            "pending_call": 0.01,
+            "settle_admission": 0.000003,
+            "settle_parent": 0.000003,
+        }[phase]
+    )
+    live = env.deps.ledger
+    replay = Ledger.replay(
+        RunState.from_events(env._events()), journal=env.deps.journal, ids=IdGen(env.deps.run_id, 1)
+    )
+    assert live._charges == replay._charges
+    assert live.free() == replay.free()
+    assert all(entry.settled for entry in live._entries.values())
+    seq = env.deps.journal._next_seq
+    await live.settle(settlement.payload["id"], Amount())
+    assert env.deps.journal._next_seq == seq
+
+
+async def test_curator_fencing_is_not_swallowed(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.curators import MergeAll
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import Fenced, _core_error
+
+    runner = await _curation_checkpoint(env)
+    error = _core_error(Fenced, "ownership lost")
+    error.args = ("CURATOR_SENTINEL_SECRET",)
+    error.add_note("CURATOR_SENTINEL_SECRET")
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    with pytest.raises(Fenced) as caught:
+        await runner._curate_round(1)
+    assert_secret_absent(caught.value, "CURATOR_SENTINEL_SECRET")
+    assert env.events("curated") == []
+    assert env.deps.ids.counters().get("L", 0) == 0
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        Ref(path="_fakes.curators:Missing"),
+        Ref(path="_fakes.curators:MergeAll", config={"unknown": "CURATOR_SENTINEL_SECRET"}),
+        Ref(path="swarm_arena:ScriptedManager", config={"requests": []}),
+    ],
+)
+async def test_curator_real_build_failure_is_a_safe_completed_attempt(
+    env: EngineEnv, ref: Ref
+) -> None:
+    runner = await _curation_checkpoint(env)
+    env.deps.config = env.deps.config.model_copy(update={"curator": ref})
+    await runner._curate_round(1)
+    receipt = env.events("curated")[0]
+    assert receipt.payload["summaries"] == []
+    assert receipt.payload["errors"]
+    assert "CURATOR_SENTINEL_SECRET" not in repr(receipt)
+
+
+@pytest.mark.parametrize("hook", ["models", "curate"])
+async def test_curator_hook_descriptors_run_off_loop(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    hook: str,
+) -> None:
+    import threading
+
+    from _fakes.curators import MergeAll
+
+    runner = await _curation_checkpoint(env)
+    original = getattr(MergeAll, hook)
+
+    def getter(self: MergeAll) -> Any:
+        assert threading.current_thread() is not threading.main_thread()
+        return original.__get__(self, type(self))
+
+    monkeypatch.setattr(MergeAll, hook, property(getter))
+    await runner._curate_round(1)
+    receipt = env.events("curated")[0]
+    assert receipt.payload["errors"] == []
+    assert len(receipt.payload["summaries"]) == 1
+
+
+async def test_curator_does_not_resurrect_a_human_hidden_new_learning(env: EngineEnv) -> None:
+    from swarm_arena._board.human_objects import HumanObject, write_human_objects
+    from swarm_arena._model.canonical import utc_now
+    from swarm_arena._store.base import open_store
+
+    runner = await _curation_checkpoint(env)
+    write_human_objects(
+        open_store(env.deps.config.arena_root),
+        "n",
+        "curation",
+        [HumanObject(kind="hide", learning_id="L-source", author="human:reviewer")],
+        now=utc_now(),
+    )
+    before = env.deps.ids.counters()
+    await runner._curate_round(1)
+    assert env.events("curated") == []
+    assert len(env.events("learning")) == 1
+    assert env.deps.ids.counters() == before
+
+
+@pytest.mark.parametrize("boundary", ["decision", "curated", "round_closed"])
+async def test_curator_recovery_preserves_join_retry_phase(tmp_path: Path, boundary: str) -> None:
+    import os
+    import sys
+
+    import anyio
+    from _engine.test_join_recovery import RetryPlanner
+    from _fakes.run import all_events, events
+
+    from swarm_arena import Swarm
+    from swarm_arena._journal.replay import RunState
+
+    environment = dict(os.environ)
+    environment["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).parents[1]), str(Path(__file__).parents[2] / "src")]
+    )
+    script = (
+        "import sys,anyio; from _fakes.curators import join_crash_driver; "
+        "anyio.run(join_crash_driver,sys.argv[1],sys.argv[2])"
+    )
+    with anyio.fail_after(90):
+        process = await anyio.run_process(
+            [sys.executable, "-c", script, str(tmp_path), boundary], env=environment, check=False
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    config = RunConfig.load(tmp_path / "runs" / "curation" / "run.toml")
+    before = RunState.from_events(all_events(config)).goals["g"]
+    assert before.join_retries == 1
+    assert before.join_phase == "rounds"
+    with anyio.fail_after(90):
+        result = await Swarm(config, replanner=RetryPlanner()).resume("curation", force=True)
+    assert result["g"]
+    state = RunState.from_events(all_events(config)).goals["g"]
+    assert state.join_retries == 1
+    assert state.pending_replan is None
+    assert [event.round for event in events(config, "curated")] == [1, 2]
+    assert len((tmp_path / "calls").read_text().splitlines()) == 2
+    assert len(events(config, "join_failed")) == 1
+    assert len(events(config, "plan_revision")) == 2
+    assert [event.round for event in events(config, "round_closed")] == [1, 2]
+    assert events(config, "goal_finished")[-1].payload["reason"] is None

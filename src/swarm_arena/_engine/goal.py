@@ -8,10 +8,17 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import anyio
+import anyio.lowlevel
 
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
+from swarm_arena._board.curator import (
+    Curator,
+    _curator_error,
+    _prepare_curator,
+    _stamp_summaries,
+)
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import judge_amount, make_price_of
 from swarm_arena._budget.ledger import Reservation
@@ -23,7 +30,7 @@ from swarm_arena._engine.parts import kept_best, part_scoring, team_goal
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundRunner
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._errors import Fenced, PlanError
+from swarm_arena._errors import Fenced, PlanError, _core_error
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -33,7 +40,7 @@ from swarm_arena._model.base import CallRole
 from swarm_arena._model.plan import Plan, RoundSpec, TeamSpec
 from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
-from swarm_arena._model.results import AgentStatus, Candidate
+from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.tooling import RunStatus
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import Policy, guard
@@ -1013,6 +1020,116 @@ class GoalRunner:
                     )
         return decision
 
+    async def _curate_round(self, round: int) -> None:
+        """Complete an eligible committed policy phase before ordinary closure."""
+        if self.deps.config.curator is None or self._stop():
+            return
+        await self._refresh()
+        decision = next(
+            event
+            for event in reversed(self._events)
+            if event.goal_id == self.goal_id
+            and event.type == EventType.DECISION
+            and event.payload["round"] == round
+        )
+        if decision.seq in self.recorded.goals[self.goal_id].curated_decisions:
+            return
+        new = [
+            item.model_copy(deep=True)
+            for item in self.recorded.learnings.values()
+            if item.run_id == self.deps.run_id
+            and item.goal_id == self.goal_id
+            and item.round == round
+            and item.author != "curator"
+        ]
+        if not new:
+            return
+        tranche = self._tranche("curator")
+        scope = self._scope("curator", round, tranche)
+
+        async def invoke() -> tuple[list[Learning], list[str]] | None:
+            try:
+                with llm_scope(scope):
+                    frontier = await anyio.to_thread.run_sync(self.deps.board.frontier)
+                    view = await anyio.to_thread.run_sync(
+                        self.deps.board.snapshot, self.plan.goal.key(), frontier
+                    )
+                    # Human hide operations belong to the snapshot, not the run
+                    # replay. Never reintroduce hidden items through the new list.
+                    visible_new: list[Learning] = []
+                    for item in new:
+                        try:
+                            visible_new.append(view.get_learning(item.id).model_copy(deep=True))
+                        except KeyError:
+                            continue
+                    if not visible_new:
+                        return None
+                    assert self.deps.config.curator is not None
+                    curator = await run_sync_daemon(self.deps.config.curator.build, Curator)
+                    return await _prepare_curator(
+                        curator,
+                        namespace=self.plan.goal.namespace,
+                        run_id=self.deps.run_id,
+                        goal_id=self.goal_id,
+                        round=round,
+                        new=visible_new,
+                        view=view,
+                    )
+            except Exception as error:
+                return [], [_curator_error(error)]
+
+        completed = False
+        result: tuple[list[Learning], list[str]] | None = None
+        try:
+            try:
+                completed, result = await self._supervised_step(invoke, final=False)
+            except LimitReached as error:
+                completed, result = True, ([], [f"curator limit: {error.limit}"])
+                # Only registered limits escape the plugin boundary above.
+                self.deps.journal.append(self._draft(EventType.RESERVE_EXHAUSTED, round=round))
+                self.select_only = True
+                self.status, self.reason = "stopped", "reserve_exhausted"
+        finally:
+            # Only pending usage waits are bounded; admitted durable settlement
+            # retains the ledger's existing finality and conservative charges.
+            with anyio.CancelScope(shield=True):
+                await self._close(tranche)
+            self._stop()
+        if not completed or result is None:
+            return
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        if self.deps.journal.fenced.is_set():
+            raise _core_error(Fenced)
+        summaries, errors = result
+        if self._stop():
+            summaries, errors = [], [*errors, "curation stopped"]
+        # No plugin objects or awaits occur between IDs and the entire batch's
+        # append. A background journal commit can therefore never split it.
+        with anyio.CancelScope(shield=True):
+            summaries = _stamp_summaries(summaries, self.deps.ids)
+            events = [
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.LEARNING, round=round, learning=item.model_dump(mode="json")
+                    )
+                )
+                for item in summaries
+            ]
+            self.deps.journal.append(
+                self._draft(
+                    EventType.CURATED,
+                    round=round,
+                    revision=self.plan.revision,
+                    decision_seq=decision.seq,
+                    summaries=[item.id for item in summaries],
+                    supersedes={item.id: item.supersedes for item in summaries},
+                    errors=errors,
+                )
+            )
+            await self.deps.journal.commit()
+            for item, event in zip(summaries, events, strict=True):
+                self.deps.board.put_learning(item, epoch=event.epoch, seq=event.seq)
+
     async def _complete_replan(self) -> None:
         """Run a closed round's unpublished replan before any successor managers."""
         await self._refresh()
@@ -1090,6 +1207,8 @@ class GoalRunner:
             self._resumed, self._frontier = {}, None
             if decision is not None and decision.no_result:
                 self.status, self.reason = "no_result", decision.no_result
+            if decision is not None and self.status != "no_result":
+                await self._curate_round(round)
             await self.admission.update(self.goal_id, self.active_agents())
             replan = (
                 funded

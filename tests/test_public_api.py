@@ -54,6 +54,7 @@ PUBLIC["swarm_arena.planning"] += [
 ]
 PUBLIC["swarm_arena.board"] += ["Board", "BoardView"]
 PUBLIC["swarm_arena.board"] += ["ArenaBoard"]
+PUBLIC["swarm_arena.board"] += ["Curator"]
 PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
 PUBLIC["swarm_arena.tool"] += [
     "Command",

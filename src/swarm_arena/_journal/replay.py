@@ -60,6 +60,8 @@ class GoalState(FrozenModel):
         Latest recorded team/agent statuses.
     decisions : list[tuple[int, Decision]], default=[]
         Policy decisions with their round numbers.
+    curated_decisions : list[int], default=[]
+        Committed policy event sequences with a completed curation batch.
     frontiers : dict[int, Frontier], default={}
         Snapshots for ordinary and converge rounds.
     end_reason : str or None, default=None
@@ -118,6 +120,7 @@ class GoalState(FrozenModel):
     rounds_closed: int = 0
     agents: dict[str, AgentStatus] = {}
     decisions: list[tuple[int, Decision]] = []
+    curated_decisions: list[int] = []
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
     no_result_reason: str | None = None
@@ -488,6 +491,13 @@ class RunState:
                     *goal.decisions,
                     (payload["round"], Decision.model_validate(payload["decision"])),
                 ]
+            case EventType.CURATED:
+                # Summary learning events own indexing; this receipt only closes a phase.
+                decision_seq = payload.get("decision_seq")
+                if decision_seq is not None:
+                    if type(decision_seq) is not int or decision_seq < 1:
+                        raise _core_error(ValueError, "invalid curation decision_seq")
+                    updates["curated_decisions"] = [*goal.curated_decisions, decision_seq]
             case EventType.PART_KEPT:
                 updates["kept_parts"] = {
                     **goal.kept_parts,

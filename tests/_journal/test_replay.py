@@ -888,3 +888,53 @@ def test_legacy_revision_before_closure_applies_to_successor_round() -> None:
     assert state.plan_for_round("g", 1).revision == 0
     assert state.plan_for_round("g", 2).revision == 1
     assert state.goals["g"].replanned_rounds == [1, 2]
+
+
+def test_replay_accepts_curated() -> None:
+    receipt = _ev(
+        3,
+        "curated",
+        {
+            "summaries": [],
+            "supersedes": {},
+            "errors": [],
+            "decision_seq": 2,
+            "revision": 0,
+            "round": 1,
+        },
+        goal_id="g",
+    )
+    state = RunState.from_events([*_PRE, receipt])
+    assert state.learnings == {}
+    assert state.scores == {}
+    assert state.goals["g"].curated_decisions == [2]
+    assert state.goals["g"].join_phase == "converge"
+
+
+def test_curated_preserves_retry_and_pending_replan() -> None:
+    events = [
+        *_PRE,
+        _ev(3, "join_failed", {"attempt": 1, "reasons": ["retry"]}, goal_id="g"),
+        _ev(4, "plan_rejected", {"first_round": 2, "join_retry": 1}, goal_id="g"),
+        _ev(5, "round_closed", {"round": 2, "replan": True}, goal_id="g"),
+    ]
+    before = RunState.from_events(events).goals["g"]
+    after = RunState.from_events(
+        [
+            *events,
+            _ev(
+                6,
+                "curated",
+                {
+                    "summaries": [],
+                    "supersedes": {},
+                    "errors": [],
+                    "decision_seq": 2,
+                    "revision": 0,
+                    "round": 2,
+                },
+                goal_id="g",
+            ),
+        ]
+    ).goals["g"]
+    assert after.model_copy(update={"curated_decisions": []}) == before
