@@ -1,0 +1,104 @@
+"""Stop polling shares its owner's bounded lifetime in startup and driving."""
+
+import asyncio
+import threading
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+import anyio
+import pytest
+from _fakes.run import plan
+
+from swarm_arena import RunConfig, Swarm
+from swarm_arena._board.arena import ArenaBoard
+from swarm_arena._engine import run as run_module
+from swarm_arena._engine.round import EngineDeps
+from swarm_arena._engine.run import RunRunner
+from swarm_arena._journal.lease import read_owner
+from swarm_arena._model.canonical import utc_now
+from swarm_arena._model.results import Candidate
+from swarm_arena._store.local import LocalStore
+
+
+@pytest.mark.parametrize("phase", ["startup", "driver"])
+@pytest.mark.parametrize("signal", ["cancel", "deadline"])
+async def test_blocked_stop_poll_releases_owner(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, phase: str, signal: str
+) -> None:
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    poll_entered, work_entered, release, driving = (threading.Event() for _ in range(4))
+    workers: list[threading.Thread] = []
+    deadline = anyio.Event()
+    original_drive = RunRunner._drive
+    original_create, original_exists = LocalStore.create, LocalStore.exists
+    original_frontier = ArenaBoard.frontier
+
+    class ClockBackend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        async def sleep(self, seconds: float) -> None:
+            await deadline.wait()
+
+    async def drive(runner: RunRunner, deps: EngineDeps, epoch: int) -> dict[str, list[Candidate]]:
+        driving.set()
+        return await original_drive(runner, deps, epoch)
+
+    def hold(entered: threading.Event) -> None:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(20), "controlled worker release deadline"
+
+    def exists(store: LocalStore, key: str) -> bool:
+        if key == "control/stop-now-e1" and (phase == "startup" or driving.is_set()):
+            hold(poll_entered)
+        return original_exists(store, key)
+
+    def create(store: LocalStore, key: str, data: bytes) -> str:
+        if phase == "startup" and key == "manifest.json":
+            hold(work_entered)
+        return original_create(store, key, data)
+
+    def frontier(*args: Any, **kwargs: Any) -> Any:
+        if phase == "driver" and driving.is_set():
+            hold(work_entered)
+        return original_frontier(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "anyio", ClockBackend())
+    monkeypatch.setattr(
+        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
+    )
+    monkeypatch.setattr(RunRunner, "_drive", drive)
+    monkeypatch.setattr(LocalStore, "exists", exists)
+    monkeypatch.setattr(LocalStore, "create", create)
+    monkeypatch.setattr(ArenaBoard, "frontier", frontier)
+    task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
+    try:
+        with anyio.fail_after(10):
+            assert await anyio.to_thread.run_sync(work_entered.wait, 8)
+            assert await anyio.to_thread.run_sync(poll_entered.wait, 8)
+        if signal == "cancel":
+            task.cancel()
+        else:
+            deadline.set()
+        done, _ = await asyncio.wait([task], timeout=2)
+        assert done, "owner waited for its blocked stop lookup"
+        assert not release.is_set()
+        if signal == "cancel":
+            assert task.cancelled()
+        else:
+            assert task.result() == ({} if phase == "startup" else {"g": []})
+        owner = read_owner(LocalStore(Path(config.run_root) / "r"))
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 5)
+                    assert not worker.is_alive()

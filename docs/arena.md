@@ -547,7 +547,8 @@ or arena pointers before treating the target as a namespace. Custom IDs such as
 and human learnings; blank optional filter fields impose no restriction.
 
 Cancellation, immediate stop, run timeout, and ownership loss can end a run
-while storage is unavailable, including during startup. Once startup stops,
+while storage is unavailable, including during startup and stop-file polling.
+Cancelled stop lookups discard late results. Once startup stops,
 no later initialization stage begins. Round preparation does not consume the
 agent round timeout. Storage failures report exception types without exposing
 backend messages or private values.

@@ -8,6 +8,7 @@ import anyio
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._engine.control import stop_key
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._store.base import Store
 
 
@@ -180,6 +181,9 @@ async def watch_stop_files(
     """
     Poll only this lease epoch's stop files until cancelled.
 
+    Storage waits are abandonable by the owning supervisor. Late results
+    cannot latch a stop or start another lookup.
+
     Parameters
     ----------
     store : Store
@@ -196,8 +200,10 @@ async def watch_stop_files(
     >>> await watch_stop_files(store, 2, StopState())  # doctest: +SKIP
     """
     while True:
-        if await anyio.to_thread.run_sync(store.exists, stop_key(epoch, now=True)):
-            state.stop_now = state.stop = True
-        if await anyio.to_thread.run_sync(store.exists, stop_key(epoch, now=False)):
-            state.stop = True
+        for now in (True, False):
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            if await run_sync_daemon(store.exists, stop_key(epoch, now=now)):
+                if now:
+                    state.stop_now = True
+                state.stop = True
         await anyio.sleep(interval_s)
