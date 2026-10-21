@@ -162,8 +162,10 @@ between rounds. Tool exceptions
 become error candidates; a manager exception ends only that agent's round.
 User-raised cancellation and exception groups are contained at manager, action,
 check, and tool boundaries with type-only diagnostics. Healthy peers continue
-and the goal can finish. Actual caller cancellation and ownership fencing still
-propagate; hook messages, notes, and causes are not rendered by the CLI.
+and the goal can finish. Cancellation before dispatch refunds the tool reservation
+exactly once, including command preparation and edit uploads. Cleanup has a bounded
+settlement wait; work that may have started retains its charge. Actual caller
+cancellation and ownership fencing still propagate; hook messages, notes, and causes are not rendered by the CLI.
 Built-in provider probing and model-provider recovery are M3 work.
 
 ## Stop modes and resume

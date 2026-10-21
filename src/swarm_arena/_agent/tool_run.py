@@ -1,8 +1,10 @@
 """Validate, reserve, execute, and durably publish one agent tool request."""
 
+import asyncio
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import anyio
@@ -475,6 +477,28 @@ def _logs(rt: AgentRuntime, id: str, ref: str) -> str:
     return stem
 
 
+@dataclass
+class _ToolReservation:
+    """Retain admission ownership until dispatch or normal completion."""
+
+    admitted: Reservation | None = None
+    started: bool = False
+
+
+async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> None:
+    """Book zero once before dispatch, bounding even the ledger's inner shield."""
+    if owner.admitted is None or owner.started or rt.journal.fenced.is_set():
+        return
+    with anyio.CancelScope(shield=True):
+        try:
+            # Native timeout cancellation crosses the ledger durability shield.
+            # The writer retains any admitted settlement after this waiter exits.
+            async with asyncio.timeout(rt.config.settle_timeout_s):
+                await rt.ledger.settle(owner.admitted.id, Amount())
+        except TimeoutError:
+            pass
+
+
 async def execute_tool_run(
     rt: AgentRuntime,
     inputs: Mapping[str, Any],
@@ -580,7 +604,14 @@ async def execute_tool_run(
                 tool_runs=rt.counters.tool_runs,
             ).model_copy(update={"task_id": agent_task_id(rt.address, rt.round)})
         )
-        return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids))
+        owner = _ToolReservation()
+        try:
+            return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids), owner)
+        except Fenced:
+            raise
+        except BaseException:
+            await _refund_undispatched(rt, owner)
+            raise
     finally:
         if index is not None:
             rt.repeats.release(rt, allocation_request, index)
@@ -594,6 +625,7 @@ async def _run(
     overlay: dict[str, str],
     warnings: list[str],
     read_ids: Sequence[str],
+    owner: _ToolReservation,
 ) -> Candidate:
     """Own reservation, executor lifecycle, and the shielded completion sequence."""
     id = rt.ids.next("c")
@@ -625,23 +657,13 @@ async def _run(
         error = outcome.classify(error)
         warnings.append(f"tool error: {type(error).__name__}")
         failed = True
-    admitted: Reservation | None = None
 
     def on_admit(reservation: Reservation) -> None:
-        nonlocal admitted
-        admitted = reservation
+        owner.admitted = reservation
 
-    try:
-        res = await rt.ledger.reserve(
-            rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
-        )
-    except anyio.get_cancelled_exc_class():
-        # No executor dispatch is possible before reserve returns. Retain
-        # ownership at admission so cancellation of durability can refund it.
-        if admitted is not None and not rt.journal.fenced.is_set():
-            with anyio.move_on_after(rt.config.settle_timeout_s, shield=True):
-                await rt.ledger.settle(admitted.id, Amount())
-        raise
+    res = await rt.ledger.reserve(
+        rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
+    )
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
@@ -662,7 +684,7 @@ async def _run(
                 started=event.model_dump(mode="json"),
             ).model_copy(update={"task_id": id})
         )
-        started = True
+        started = owner.started = True
         rt.started_runs += 1
 
     async def on_partial(value: ToolOutput) -> None:
@@ -716,8 +738,6 @@ async def _run(
         error = outcome.classify(error)
         rebuilt = _rebuild_core_signal(error)
         if error is admission_refusal and isinstance(rebuilt, LimitReached) and not started:
-            with anyio.CancelScope(shield=True):
-                await rt.ledger.settle(res.id, Amount())
             raise rebuilt from None
         warnings.append(f"tool error: {type(error).__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
