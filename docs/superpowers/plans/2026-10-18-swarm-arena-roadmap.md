@@ -1755,14 +1755,11 @@ not on an ordinary round. Candidates, repeat keys, and fingerprints survive
 continuation. `plan_rejected` never adds a plan revision.
 
 Optional payload keys added in M1b fix rounds (journal v1 is unreleased, so no
-schema_version bump): `plan_revision.preflight_complete: bool` is true only after
-the shared component preflight succeeded for that revision (startup revisions carry
-true); a revision is published only after its preflight succeeds, and a failing
-preflight refuses the revision like an admission failure. `plan_revision.join_retry` and
+schema_version bump): `plan_revision.join_retry` and
 `plan_rejected.join_retry` count completed retry proposals (one-based, independent of
 `join_failed.attempt`; accepted and refused proposals both use the allowance).
 `GoalState.join_phase` (`converge`, `replan`, `rounds`) and `join_retries` replay the
-owed join-retry transition; `preflight_revisions` replays preflight completion.
+owed join-retry transition. Revisions are published only after successful preflight.
 Every engine-run event may carry `run_elapsed_s: float`, the accumulated active-driver
 checkpoint; replay folds the maximum over all events and excludes downtime.
 `RunState.candidate_goal_keys` maps each candidate to the GoalKey of the part that

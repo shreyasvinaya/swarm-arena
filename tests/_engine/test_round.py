@@ -1348,7 +1348,6 @@ async def test_seed_feedback_follows_producer_group_and_revision(
                 "plan": revised.model_dump(mode="json"),
                 "origin": "human",
                 "first_round": 2,
-                "preflight_complete": True,
             },
         )
     )

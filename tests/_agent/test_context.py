@@ -796,7 +796,6 @@ async def test_part_context_routes_learnings_events_and_read_ids(ctx_env: CtxEnv
                     revision=1,
                 ).model_dump(mode="json"),
                 "origin": "human",
-                "preflight_complete": True,
                 "first_round": 1,
             },
         )

@@ -115,7 +115,6 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "base_dir": str(base_dir),
             "planner_call_ids": [],
             "first_round": 1,
-            "preflight_complete": True,
         },
     )
 
@@ -929,7 +928,6 @@ class GoalRunner:
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
                         planner_call_ids=list(scope.call_ids),
-                        preflight_complete=True,
                         first_round=self.rounds_closed + 1,
                     )
                 )
@@ -1154,9 +1152,8 @@ class GoalRunner:
         records its lifecycle reason independently of the live stop flags.
         A terminal policy checkpoint restores its effect and completes any
         owed round closure before constructing managers or judges. New revisions
-        pass bounded preflight before publication. Recovery checks revisions
-        lacking a completion marker and durably refuses failures, restoring
-        the previous admitted revision before dispatch.
+        pass bounded preflight before publication. Recovery replays already
+        admitted revisions.
 
         Returns
         -------

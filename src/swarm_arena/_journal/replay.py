@@ -70,8 +70,6 @@ class GoalState(FrozenModel):
         Lifecycle termination reason retained through takeover before completion.
     pending_replan : int or None, default=None
         First round awaiting the replan recorded by its preceding round closure.
-    preflight_revisions : list[int], default=[]
-        Revisions with durably completed prerequisite checks.
     replanned_rounds : list[int], default=[]
         Round boundaries with an already committed revision or rejection.
     notes : dict[str, str], default={}
@@ -123,7 +121,6 @@ class GoalState(FrozenModel):
     no_result_reason: str | None = None
     pending_reason: str | None = None
     pending_replan: int | None = None
-    preflight_revisions: list[int] = []
     replanned_rounds: list[int] = []
     notes: dict[str, str] = {}
     repeat_keys: dict[str, str] = {}
@@ -441,11 +438,6 @@ class RunState:
                     updates["pending_replan"] = first_round
                 updates["pending_reason"] = payload.get("reason", goal.pending_reason)
             case EventType.PLAN_REVISION | EventType.PLAN_REJECTED:
-                if payload.get("preflight_complete", False):
-                    updates["preflight_revisions"] = [
-                        *goal.preflight_revisions,
-                        payload["plan"]["revision"],
-                    ]
                 retry = payload.get("join_retry")
                 if retry is not None:
                     updates["join_retries"] = retry

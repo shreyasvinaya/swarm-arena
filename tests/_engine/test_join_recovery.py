@@ -181,7 +181,7 @@ async def test_join_retry_survives_committed_process_crash(tmp_path: Path, bound
         tmp_path / "control", "refused_control" if boundary == "plan_rejected" else "control"
     )
     cfg = await launch(tmp_path / "crashed", boundary)
-    assert all(e.payload["preflight_complete"] for e in events(cfg, "plan_revision"))
+    assert all("preflight_complete" not in e.payload for e in events(cfg, "plan_revision"))
     result = await Swarm(cfg, replanner=RetryPlanner(refuse=boundary == "plan_rejected")).resume(
         "join", force=True
     )
