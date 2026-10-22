@@ -2,7 +2,6 @@
 
 import atexit
 import shutil
-import sys
 import tempfile
 import warnings
 from collections.abc import AsyncGenerator, Sequence
@@ -118,7 +117,7 @@ async def _assert_drained(scope: LLMScope) -> None:
 async def _finish_draining(
     scope: LLMScope, error: BaseException | None, outcome: _DrainOutcome
 ) -> None:
-    """Raise a normal-return violation or annotate the existing failure."""
+    """Raise a normal-return violation or annotate the locally captured failure."""
     try:
         await _assert_drained(scope)
     except _LLMContractError:
@@ -241,12 +240,16 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                 await _setup_run((), config)
                 tranche = OfflineHarness._tranche(ledger, ":run", goal.id, config.limits)
                 scope = _scope("judge", goal, tranche, journal, config, artifacts, run_id=run_id)
+                escaping: BaseException | None = None
                 try:
                     with llm_scope(scope):
                         yield scope, ids
                     completed = True
+                except BaseException as error:
+                    escaping = error
+                    raise
                 finally:
-                    await _finish_draining(scope, sys.exc_info()[1], drain_outcome)
+                    await _finish_draining(scope, escaping, drain_outcome)
     finally:
         if not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
@@ -468,6 +471,7 @@ class OfflineHarness:
                 )
             )
             board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
+            board_failed = False
             try:
                 await _open_board(board, config, run_id, [goal.namespace])
                 view = await _storage_io(
@@ -522,8 +526,11 @@ class OfflineHarness:
                 with track_inflight(Inflight()):
                     reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
                 completed = True
+            except BaseException:
+                board_failed = True
+                raise
             finally:
-                await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+                await _close_board(board, config, failed=board_failed)
         if not completed:
             error = _core_error(RuntimeError, "offline harness stopped")
             self._drain_outcome.note(error)
@@ -624,27 +631,35 @@ class OfflineHarness:
                 team=rt.team.name,
                 agent=rt.spec.name,
             )
+            escaping: BaseException | None = None
             try:
-                with llm_scope(scope):
-                    report = await manager.run_round(AgentContext(rt, gate=lambda: None))
+                try:
+                    with llm_scope(scope):
+                        report = await manager.run_round(AgentContext(rt, gate=lambda: None))
+                except BaseException as error:
+                    error = outcome.classify(error)
+                    if _is_core_signal(error) and _core_category(error) is _SignalCategory.TERMINAL:
+                        raise error from None
+                    if rt.journal.fenced.is_set():
+                        raise _core_error(Fenced, "run ownership lost") from None
+                    if not isinstance(error, LimitReached):
+                        self.manager_errors.append(error)
+                        manager_error = error
+                    report = RoundReport()
             except BaseException as error:
-                error = outcome.classify(error)
-                if _is_core_signal(error) and _core_category(error) is _SignalCategory.TERMINAL:
-                    raise error from None
-                if rt.journal.fenced.is_set():
-                    raise _core_error(Fenced, "run ownership lost") from None
-                if not isinstance(error, LimitReached):
-                    self.manager_errors.append(error)
-                    manager_error = error
-                report = RoundReport()
+                escaping = error
+                raise
             finally:
                 self.candidates.extend(c for c in rt.own if isinstance(c, Candidate))
                 self.learnings.extend(item for item in rt.own if isinstance(item, Learning))
                 # The bound run owns interrupted cleanup; healthy closure stays
                 # supervised by the existing run deadline and writer lifetime.
-                propagating = sys.exc_info()[1]
-                await _finish_draining(scope, propagating or manager_error, self._drain_outcome)
-                if propagating is None:
+                await _finish_draining(
+                    scope,
+                    escaping if escaping is not None else manager_error,
+                    self._drain_outcome,
+                )
+                if escaping is None:
                     closed = await rt.tranche.close()
                     if closed.overflow or rt.ledger.run_exhausted():
                         rt.ledger._check_usage_overflow()

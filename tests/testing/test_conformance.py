@@ -2162,6 +2162,94 @@ async def test_conformance_rejects_reservations_without_calls(
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("opened", [False, True])
+async def test_conformance_rejects_leaks_inside_a_caller_exception_handler(
+    kind: str,
+    opened: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._journal import llm_record
+
+    scopes: list[LLMScope] = []
+    baseline = dict(llm_record._bindings)
+    caller_error = KeyError("handled caller failure")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scopes.append(await _reserve_conformance_call(opened=opened))
+        return RoundReport(summary="leaked")
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scopes.append(await _reserve_conformance_call(opened=opened))
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with anyio.fail_after(15):
+        try:
+            raise caller_error
+        except KeyError:
+            with pytest.raises(AssertionError, match="drain rule"):
+                await (
+                    check_manager(
+                        NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square")
+                    )
+                    if kind == "manager"
+                    else check_judge(
+                        FixedJudge({"value": 1}), GOAL, [make_candidate(ok(), goal_id=GOAL.id)]
+                    )
+                )
+        finally:
+            assert not getattr(caller_error, "__notes__", ())
+            assert len(scopes) == 1
+            assert scopes[0].tranche._closed
+            assert scopes[0].tranche.pending() == 0
+            assert llm_record._bindings == baseline
+
+
+async def test_check_manager_closes_each_round_inside_a_caller_exception_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._journal import llm_record
+
+    scopes: list[LLMScope] = []
+    baseline = dict(llm_record._bindings)
+    caller_error = KeyError("handled caller failure")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if scopes:
+            assert scopes[-1].tranche._closed
+        scope = current_llm_scope()
+        assert scope is not None
+        scopes.append(scope)
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    with anyio.fail_after(15):
+        try:
+            raise caller_error
+        except KeyError:
+            reports = await check_manager(
+                NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+            )
+    assert reports == [RoundReport(summary="done"), RoundReport(summary="done")]
+    assert len(scopes) == 2
+    assert all(scope.tranche._closed for scope in scopes)
+    assert not getattr(caller_error, "__notes__", ())
+    assert llm_record._bindings == baseline
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
 async def test_conformance_reports_setup_failure_at_its_own_boundary(
     kind: str,
     monkeypatch: pytest.MonkeyPatch,
