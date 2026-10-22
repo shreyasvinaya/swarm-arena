@@ -1313,3 +1313,28 @@ time.sleep(60)
         "stopped",
         "provider unavailable",
     )
+
+
+async def test_probe_preserves_upstream_type_without_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import litellm
+
+    from swarm_arena._errors import _exception_type_name
+    from swarm_arena.llm import _hooks
+
+    fake = FakeModel([])
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise litellm.BadRequestError(
+            message="max_tokens unsupported private-probe-sentinel", model="m", llm_provider="fake"
+        )
+
+    monkeypatch.setattr(fake, "get_response", fail)
+    monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with pytest.raises(RuntimeError) as caught:
+            await _hooks.probe_provider("fake", run.scope("manager"))
+        assert _exception_type_name(caught.value) == "BadRequestError"
+        assert_secret_absent(caught.value, "private-probe-sentinel")
+        assert "private-probe-sentinel" not in repr(run.events("llm_call"))

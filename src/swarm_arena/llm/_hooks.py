@@ -37,10 +37,13 @@ from swarm_arena._errors import (
     ProviderFailed,
     _core_category,
     _core_error,
+    _exception_type_name,
     _is_core_control,
+    _is_core_signal,
     _register_carrier,
     _register_carrier_type,
     _SignalCategory,
+    _with_exception_type,
 )
 from swarm_arena._errors import _unwrap_control as _unwrap_control
 from swarm_arena._exec.threads import run_sync_daemon
@@ -818,21 +821,30 @@ async def probe_provider(provider: str, scope: LLMScope) -> bool:
                     build_model(spec), alias=alias, spec=spec, namespace="probe", max_tokens=1
                 )
 
-            model = await _prepare(prepare)
-            if model is not None:
-                with bypass_response_cache():
-                    await model.get_response(
-                        None,
-                        "ping",
-                        ModelSettings(),
-                        [],
-                        None,
-                        [],
-                        ModelTracing.DISABLED,
-                        previous_response_id=None,
-                        conversation_id=None,
-                        prompt=None,
-                    )
+            try:
+                model = await _prepare(prepare)
+                if model is not None:
+                    with bypass_response_cache():
+                        await model.get_response(
+                            None,
+                            "ping",
+                            ModelSettings(),
+                            [],
+                            None,
+                            [],
+                            ModelTracing.DISABLED,
+                            previous_response_id=None,
+                            conversation_id=None,
+                            prompt=None,
+                        )
+            except BaseException as error:
+                classified = boundary.classify(error)
+                if _is_core_control(classified) or _is_core_signal(classified):
+                    raise classified from None
+                name = _exception_type_name(classified)
+                raise _with_exception_type(
+                    _core_error(RuntimeError, f"LLM provider probe failed: {name}"), name
+                ) from None
         return True
     except BaseException as error:
         classified = boundary.classify(error)
