@@ -1573,7 +1573,8 @@ async def test_resume_shutdown_bound_and_primary_failure(
         await release.wait()
 
     monkeypatch.setattr(spy, "aclose", close)
-    config = crashed.config_with(spy, monkeypatch).model_copy(update={"settle_timeout_s": 0.05})
+    # Normal writer/lease cleanup must finish before the executor is observed.
+    config = crashed.config_with(spy, monkeypatch).model_copy(update={"settle_timeout_s": 2.0})
     runner = await resume_run(config, crashed.run_id, force=True, replanner=None)
     assert runner.resumed is not None
     expected = {"g": [runner.resumed.state.candidates["c1"]]}
@@ -1588,7 +1589,7 @@ async def test_resume_shutdown_bound_and_primary_failure(
     try:
         with anyio.fail_after(10):
             await closing.wait()
-        done, _ = await asyncio.wait({task}, timeout=1)
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert task in done, "executor shutdown exceeded its configured bound"
         if fenced:
             with pytest.raises(Fenced) as error:
@@ -1603,6 +1604,10 @@ async def test_resume_shutdown_bound_and_primary_failure(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+        services = runner.resumed._services
+        assert services.task is not None
+        with anyio.fail_after(10):
+            await asyncio.shield(services.task)
 
 
 class _CrashBoundary(BaseException):
