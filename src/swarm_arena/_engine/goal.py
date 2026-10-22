@@ -1420,6 +1420,10 @@ class GoalRunner:
             failure = error
             try:
                 error = boundary.classify(error)
+                interrupted = _core_category(error) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
                 if _core_category(error) is _SignalCategory.LIMIT:
                     limit = cast(LimitReached, error)
                     completed, result = True, ([], [f"curator limit: {limit.limit}"])
@@ -1434,10 +1438,31 @@ class GoalRunner:
             except anyio.get_cancelled_exc_class() as cancelled:
                 interrupted, failure = True, cancelled
             except BaseException as control:
+                interrupted = _core_category(control) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
                 failure = control
         finally:
             # Close on every exit, including a custom curator interrupted before
             # _prepare_curator could drain. No late result may publish a receipt.
+            if not interrupted:
+                try:
+                    # Report arrival and durable settlement have separate budgets.
+                    with anyio.move_on_after(scope.settle_timeout_s) as report_timer:
+                        with _local_timer_scope(report_timer) as report_wait:
+                            while tranche.pending():  # noqa: ASYNC110 - external call settlement
+                                await anyio.sleep(0.05)
+                    if report_wait.failure is not None:
+                        raise report_wait.failure from None
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as report_error:
+                    failure = (
+                        BaseExceptionGroup("curator reports", [failure, report_error])
+                        if failure is not None
+                        else report_error
+                    )
             timer = anyio.CancelScope(
                 deadline=anyio.current_time() + self.deps.config.settle_timeout_s,
                 shield=True,
@@ -1445,7 +1470,7 @@ class GoalRunner:
             try:
                 with _local_timer_scope(timer) as local_timer:
                     with timer:
-                        await drain(scope, wait=not interrupted)
+                        await drain(scope, wait=False)
                     if local_timer.failure is not None:
                         raise local_timer.failure from None
                     if timer.cancel_called:
