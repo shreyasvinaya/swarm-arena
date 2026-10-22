@@ -102,7 +102,9 @@ every worker; inventories built from weak subclass registries must discard
 unreachable classes and use stable ordering. Process-local monkeypatches do not
 require serial execution. Tests that assert authoritative LiteLLM accounting
 after `acompletion` must flush its background logging worker before draining
-the scope; completion itself does not await the callback. The moto development
+the scope; completion itself does not await the callback. Tests of timeout
+accounting must establish call admission with an event before expiring the real
+round timer; short startup deadlines can expire before any call exists. The moto development
 floor includes conditional S3 `IfMatch` support, required by store CAS tests.
 
 The committed `.test_durations` balances shards with `least_duration`.

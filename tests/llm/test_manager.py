@@ -209,21 +209,47 @@ async def test_cancel_mid_call_charges_reservation_in_full(tmp_path: Path, nativ
         assert scope.call_ids == [call.id]
 
 
-async def test_round_timeout_charges_the_cut_call_without_waiting(tmp_path: Path) -> None:
+async def test_round_timeout_charges_the_cut_call_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena.llm import _manager
+
+    timers: list[anyio.CancelScope] = []
+    original_timer_scope = _manager._local_timer_scope
+
+    def observed_timer(timer: anyio.CancelScope) -> Any:
+        timers.append(timer)
+        return original_timer_scope(timer)
+
+    monkeypatch.setattr(_manager, "_local_timer_scope", observed_timer)
     fake = HeldModel()
     fake.register("opus")
     async with open_llm_run(
         tmp_path,
-        config=config(limits=Limits(round_timeout_s=0.05), settle_timeout_s=10),
+        config=config(limits=Limits(round_timeout_s=60), settle_timeout_s=10),
     ) as run:
         scope = run.scope("manager")
-        with llm_scope(scope), anyio.fail_after(2), pytest.raises(LimitReached) as e:
-            await AgentsSDKManager(model="opus").run_round(context())
-        (call,) = run.calls()
-        assert e.value.limit == "round_timeout_s"
-        assert call.error is not None
-        assert call.error.startswith("estimated:")
-        assert run.charged(scope).usd == pytest.approx(call.cost_usd)
+        with llm_scope(scope):
+            task = asyncio.create_task(AgentsSDKManager(model="opus").run_round(context()))
+        try:
+            with anyio.fail_after(10):
+                await fake.entered.wait()
+            # Expire the real round deadline only after the call is admitted.
+            # A 50 ms startup deadline could legitimately cut off admission itself.
+            (timer,) = timers
+            timer.deadline = anyio.current_time()
+            with anyio.fail_after(2), pytest.raises(LimitReached) as e:
+                await task
+            (call,) = run.calls()
+            assert e.value.limit == "round_timeout_s"
+            assert timer.cancel_called
+            assert call.error is not None
+            assert call.error.startswith("estimated:")
+            assert run.charged(scope).usd == pytest.approx(call.cost_usd)
+            assert scope.call_ids == [call.id]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_alias_without_manager_role_fails_before_any_call(tmp_path: Path) -> None:
