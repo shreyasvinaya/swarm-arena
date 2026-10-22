@@ -2485,3 +2485,39 @@ async def test_accounting_terminal_never_commits_provider_receipt(
     assert not env.events("provider_failed")
     assert not env.events("plan_rejected")
     assert not env.events("no_result")
+
+
+@pytest.mark.parametrize("stage", ["drain", "close"])
+async def test_curator_accounting_failure_prevents_provider_completion(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._engine import goal as goal_module
+    from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
+
+    runner = await _curation_checkpoint(env)
+    calls: list[str] = []
+
+    async def fail_provider(*args: Any, **kwargs: Any) -> Any:
+        calls.append("curator")
+        raise _core_error(ProviderFailed, "anthropic")
+
+    async def fail_accounting(*args: Any, **kwargs: Any) -> None:
+        raise _core_error(StorageError, "LLM settlement failed: OSError")
+
+    monkeypatch.setattr(MergeAll, "curate", fail_provider)
+    monkeypatch.setattr(
+        goal_module if stage == "drain" else runner,
+        "drain" if stage == "drain" else "_close",
+        fail_accounting,
+    )
+    for _ in range(2):
+        with pytest.raises(StorageError, match="LLM settlement failed: OSError") as caught:
+            await runner._curate_round(1)
+        assert _is_core_signal(caught.value)
+        await env.deps.journal.commit()
+        assert not env.events("provider_failed")
+        assert not env.events("curated")
+        assert env.deps.provider_stops.generations() == {}
+    assert calls == ["curator", "curator"]

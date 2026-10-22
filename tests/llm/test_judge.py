@@ -1114,3 +1114,38 @@ async def test_llm_ranking_final_runs_with_zero_tool_reservation(tmp_path: Path)
         (tmp_path / "runs" / "zero" / "goals" / "g" / "solution.json").read_text()
     )
     assert solution["status"] == "ok"
+
+
+@pytest.mark.parametrize("aliases", [("b",), ("a", "b")])
+async def test_panel_accounting_failure_prevents_provider_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...]
+) -> None:
+    from swarm_arena._engine.stops import provider_stops
+    from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
+    from swarm_arena.llm import _judge
+
+    async def fail_provider(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise _core_error(ProviderFailed, "fake")
+
+    async def fail_accounting(*args: Any, **kwargs: Any) -> None:
+        raise _core_error(StorageError, "LLM settlement failed: OSError")
+
+    for alias in aliases:
+        fake = FakeModel([turn(1)])
+        if alias == "b":
+            monkeypatch.setattr(fake, "get_response", fail_provider)
+        fake.register(alias)
+    monkeypatch.setattr(_judge, "_finish_accounting", fail_accounting)
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=configuration(aliases)) as run:
+        scope = run.scope("judge")
+        ctx = JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path))
+        with (
+            llm_scope(scope),
+            pytest.raises(StorageError, match="LLM settlement failed: OSError") as caught,
+        ):
+            await LLMJudge("r", aliases).judge(goal, candidates(1), ctx)
+        assert _is_core_signal(caught.value)
+        await scope.journal.commit()
+        assert provider_stops(scope.journal).generations() == {}
+        assert not run.events("provider_failed")

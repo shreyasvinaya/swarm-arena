@@ -11,7 +11,13 @@ from pydantic import Field, JsonValue, model_validator
 from swarm_arena._board.digest import untrusted
 from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
 from swarm_arena._engine.stops import report_provider_failure
-from swarm_arena._errors import ProviderFailed, _core_category, _is_core_control, _SignalCategory
+from swarm_arena._errors import (
+    ProviderFailed,
+    StorageError,
+    _core_category,
+    _is_core_control,
+    _SignalCategory,
+)
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
@@ -238,6 +244,7 @@ class LLMJudge(Judge):
         scope = scope.child()
         interrupted = False
         failure: BaseException | None = None
+        accounting_failure: BaseException | None = None
         scores: list[Score] = []
         provider_errors: dict[int, Exception] = {}
         survivors: list[str] = []
@@ -260,6 +267,7 @@ class LLMJudge(Judge):
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as cleanup_error:
+                accounting_failure = cleanup_error
                 failure = (
                     BaseExceptionGroup("judge cleanup", [failure, cleanup_error])
                     if failure is not None
@@ -267,6 +275,11 @@ class LLMJudge(Judge):
                 )
         if failure is not None:
             classified = boundary.classify(failure)
+            if _core_category(classified) is _SignalCategory.TERMINAL:
+                raise classified from None
+            if accounting_failure is not None:
+                # Provider classification cannot establish successful settlement.
+                boundary.contain(accounting_failure, StorageError, "LLM judge accounting")
             if _core_category(classified) is _SignalCategory.PROVIDER:
                 failure = classified
             elif _is_core_control(classified):

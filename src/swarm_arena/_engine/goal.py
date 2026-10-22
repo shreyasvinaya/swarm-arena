@@ -1591,6 +1591,7 @@ class GoalRunner:
         result: tuple[list[Learning], list[str]] | None = None
         boundary = _Outcome()
         failure: BaseException | None = None
+        accounting_failure: BaseException | None = None
         try:
             completed, result = await self._supervised_step(invoke, final=False)
             interrupted = not completed
@@ -1636,6 +1637,7 @@ class GoalRunner:
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException as report_error:
+                    accounting_failure = report_error
                     failure = (
                         BaseExceptionGroup("curator reports", [failure, report_error])
                         if failure is not None
@@ -1661,6 +1663,11 @@ class GoalRunner:
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as cleanup_error:
+                accounting_failure = (
+                    BaseExceptionGroup("curator accounting", [accounting_failure, cleanup_error])
+                    if accounting_failure is not None
+                    else cleanup_error
+                )
                 failure = (
                     BaseExceptionGroup("curator cleanup", [failure, cleanup_error])
                     if failure is not None
@@ -1677,6 +1684,9 @@ class GoalRunner:
                 self.deps.journal._raise_if_fenced()
                 if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
                     raise error from None
+                if accounting_failure is not None:
+                    # An incomplete drain/close must not complete the curator phase.
+                    boundary.contain(accounting_failure, StorageError, "curator accounting")
                 if _core_category(error) is _SignalCategory.PROVIDER:
                     assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
                     await self.deps.provider_stops.fail(error.provider, source="curator")
