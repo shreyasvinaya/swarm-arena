@@ -131,7 +131,13 @@ async def _prepare(operation: Callable[[], _T]) -> _T:
     try:
         return await run_sync_daemon(operation)
     except BaseException as error:
-        outcome.contain(error, ValueError, "LLM preparation")
+        classified = outcome.classify(error)
+        if _is_core_control(classified) or _is_core_signal(error):
+            raise classified from None
+        name = _exception_type_name(classified)
+        raise _with_exception_type(
+            _core_error(ValueError, f"LLM preparation failed: {name}"), name
+        ) from None
 
 
 @lru_cache(maxsize=1)
