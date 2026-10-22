@@ -11,11 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
-from swarm_arena._errors import _core_error, _exception_type_name
+from swarm_arena._errors import ConfigError, _core_error, _exception_type_name
 from swarm_arena._model.settings import TracingConfig
 from swarm_arena._outcomes import _Outcome
 
 _EXIT_TIMEOUT_S = 5.0
+_PROJECT_TIMEOUT_S = 5
 _lock = threading.Lock()
 _log = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ class _Resources:
     instrumentor: Any
     requested: threading.Event = field(default_factory=threading.Event, init=False)
     worker: threading.Thread = field(init=False)
+    project_worker: threading.Thread | None = field(default=None, init=False)
+    project_url: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         # Python 3.12+ cannot start threads in atexit. Start the idle daemon now.
@@ -41,11 +44,32 @@ class _Resources:
 
 
 _resources: _Resources | None = None
+_closing: _Resources | None = None
+
+
+def _resolve_project(resources: _Resources) -> None:
+    """Resolve optional link metadata once, off the model-call path."""
+    try:
+        response = resources.client.api.projects.get(
+            request_options={"max_retries": 0, "timeout_in_seconds": _PROJECT_TIMEOUT_S}
+        )
+        project_id = response.data[0].id if response.data else None
+        if type(project_id) is not str or not project_id:
+            raise ValueError("project identifier unavailable")
+        resources.project_url = f"{resources.client._base_url}/project/{project_id}/traces/"
+    except BaseException as error:
+        # A missing prefix caches failure: neither setup nor calls retry it.
+        _log.warning("%s", _exception_type_name(error))
 
 
 def _shutdown_resources(resources: _Resources) -> None:
     """Close only owned resources, without recorder or journal callbacks."""
-    from agents import set_trace_processors
+    from agents.tracing import setup
+
+    def clear_processors() -> None:
+        provider = setup.GLOBAL_TRACE_PROVIDER
+        if provider is not None:
+            provider.set_processors([])
 
     def forget() -> None:
         owned = resources.client._resources
@@ -66,7 +90,7 @@ def _shutdown_resources(resources: _Resources) -> None:
 
     operations = (
         forget,
-        lambda: set_trace_processors([]),
+        clear_processors,
         uninstrument,
         close_prompt_cache,
         lambda: resources.client.flush(),
@@ -90,16 +114,20 @@ def _close(resources: _Resources, timeout_s: float) -> None:
 
 def _reset_langfuse(timeout_s: float) -> None:
     """Release the process owner with a bounded wait; used only at exit/tests."""
-    global _resources
+    global _resources, _closing
     deadline = time.monotonic() + timeout_s
     if not _lock.acquire(timeout=max(0, timeout_s)):
         _log.warning("TimeoutError")
         return
     try:
-        resources, _resources = _resources, None
+        resources = _resources or _closing
+        _resources = None
+        _closing = resources
         atexit.unregister(_close_at_exit)
         if resources is not None:
             _close(resources, max(0, deadline - time.monotonic()))
+            if not resources.worker.is_alive():
+                _closing = None
     finally:
         _lock.release()
 
@@ -118,8 +146,8 @@ def setup_langfuse(tracing: TracingConfig) -> None:
 
     Raises
     ------
-    ImportError
-        If the optional Langfuse dependencies are absent.
+    ConfigError
+        If the optional Langfuse dependencies are absent; includes the install hint.
     RuntimeError
         If tracing initialization fails; only the exception type is reported.
 
@@ -131,7 +159,7 @@ def setup_langfuse(tracing: TracingConfig) -> None:
     >>> current_trace_url() is None
     True
     """
-    global _resources
+    global _resources, _closing
     with _lock:
         # Avoid the SDK's lazy default OpenAI exporter even on the first off run.
         from agents.tracing import setup
@@ -139,7 +167,13 @@ def setup_langfuse(tracing: TracingConfig) -> None:
 
         if setup.GLOBAL_TRACE_PROVIDER is None:
             setup.set_trace_provider(DefaultTraceProvider())
-        if not tracing.langfuse or _resources is not None:
+        if not tracing.langfuse:
+            return
+        if _closing is not None:
+            if _closing.worker.is_alive():
+                raise _core_error(RuntimeError, "Langfuse cleanup pending")
+            _closing = None
+        if _resources is not None:
             return
         try:
             from langfuse import Langfuse
@@ -147,7 +181,9 @@ def setup_langfuse(tracing: TracingConfig) -> None:
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
         except ImportError:
-            raise ImportError("Langfuse tracing requires swarm-arena[langfuse]") from None
+            raise _core_error(
+                ConfigError, "Langfuse tracing requires swarm-arena[langfuse]"
+            ) from None
 
         class ConsentSampler(Sampler):
             def should_sample(
@@ -176,6 +212,7 @@ def setup_langfuse(tracing: TracingConfig) -> None:
             raise _core_error(RuntimeError, "Langfuse instrumentor already owned")
         provider = TracerProvider(sampler=ConsentSampler(), shutdown_on_exit=False)
         client: Any = None
+        resources: _Resources | None = None
         try:
             client = Langfuse(tracer_provider=provider)
             owned = client._resources
@@ -187,15 +224,26 @@ def setup_langfuse(tracing: TracingConfig) -> None:
                 atexit.unregister(owned.shutdown)
                 atexit.unregister(owned.prompt_cache._task_manager.shutdown)
             instrumentor.instrument(tracer_provider=provider, exclusive_processor=True)
+            resources = _Resources(client, provider, instrumentor)
+            resources.project_worker = threading.Thread(
+                target=_resolve_project,
+                args=(resources,),
+                name="swarm-arena-tracing-project",
+                daemon=True,
+            )
+            resources.project_worker.start()
         except BaseException as error:
             if client is not None:
-                _close(_Resources(client, provider, instrumentor), _EXIT_TIMEOUT_S)
+                _closing = resources or _Resources(client, provider, instrumentor)
+                _close(_closing, _EXIT_TIMEOUT_S)
+                if not _closing.worker.is_alive():
+                    _closing = None
             else:
                 provider.shutdown()
             raise _core_error(
                 RuntimeError, f"Langfuse setup failed: {_exception_type_name(error)}"
             ) from None
-        _resources = _Resources(client, provider, instrumentor)
+        _resources = resources
         atexit.register(_close_at_exit)
 
 
@@ -228,7 +276,7 @@ def _guarded_context(factory: Callable[[], AbstractContextManager[Any]]) -> Gene
             )
         except BaseException as error:
             if failure is None:
-                outcome.contain(error, RuntimeError, "Langfuse context")
+                outcome.propagate_control(error)
             _log.warning("%s", _exception_type_name(error))
 
 
@@ -296,12 +344,13 @@ def _call_trace(scope: LLMScope) -> Generator[None]:
 
 
 def current_trace_url() -> str | None:
-    """Return the current consenting scope's Langfuse URL, without raising.
+    """Return the current consenting scope's Langfuse URL without network I/O.
 
     Returns
     -------
     str or None
-        Trace URL, or None when consent, a current trace, or the URL is absent.
+        Trace URL, or None when consent, a current trace, or resolved project
+        metadata is absent. Failed project resolution is not retried.
 
     Examples
     --------
@@ -316,7 +365,7 @@ def current_trace_url() -> str | None:
         trace_id = resources.client.get_current_trace_id()
         if not trace_id:
             return None
-        url = resources.client.get_trace_url(trace_id=trace_id)
-        return url if type(url) is str else None
+        prefix = resources.project_url
+        return prefix + trace_id if prefix is not None and type(trace_id) is str else None
     except BaseException:
         return None

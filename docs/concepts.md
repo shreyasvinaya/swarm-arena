@@ -429,6 +429,12 @@ Each enabled run becomes a Langfuse session. Manager, judge, planner and curator
 calls carry the goal, team, agent, round and role; a call's `trace_url` links to
 the current trace when available. Both stages of a structured fallback call
 are traced and journaled. A missing trace URL does not remove the local record.
+The first enabled setup resolves the project identifier on a daemon using one
+request with a five-second timeout and no retries. Until resolution succeeds,
+and for the rest of the process after failure, trace URLs are absent. Looking up
+a call's trace URL performs no network I/O; pending or failed resolution never
+holds up a model call. Ordinary trace-context exit failures log only their type
+and preserve the completed result. Control signals still propagate.
 
 The client and instrumentation are shared for the process. Components finish
 all owned actions and accounting before leaving their tracing context, without

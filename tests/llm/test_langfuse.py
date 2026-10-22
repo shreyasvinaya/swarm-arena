@@ -63,10 +63,23 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     original = langfuse.Langfuse
     clients: list[Any] = []
 
-    def no_http(request: httpx.Request) -> httpx.Response:
-        pytest.fail("tracing attempted an HTTP request")
+    def project_http(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/public/projects"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "test",
+                        "name": "test",
+                        "metadata": {},
+                        "organization": {"id": "org", "name": "test"},
+                    }
+                ]
+            },
+        )
 
-    http = httpx.Client(transport=httpx.MockTransport(no_http))
+    http = httpx.Client(transport=httpx.MockTransport(project_http))
 
     def client(**kwargs: Any) -> Any:
         result = original(
@@ -77,7 +90,6 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
             span_exporter=exporter,
             httpx_client=http,
         )
-        result._project_id = "test"
         clients.append(result)
         return result
 
@@ -86,8 +98,37 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     try:
         yield exporter, clients
     finally:
+        resources = _langfuse._resources or _langfuse._closing
+        if resources is not None and resources.project_worker is not None:
+            resources.project_worker.join(5)
+            assert not resources.project_worker.is_alive()
         _langfuse._reset_langfuse(2)
         http.close()
+
+
+def wait_project_resolution() -> None:
+    resources = _langfuse._resources
+    assert resources is not None
+    assert resources.project_worker is not None
+    resources.project_worker.join(5)
+    assert not resources.project_worker.is_alive()
+
+
+@contextmanager
+def spy_processor() -> Generator[Spy]:
+    from agents.tracing import setup
+    from agents.tracing.provider import DefaultTraceProvider
+
+    _langfuse.setup_langfuse(TracingConfig())
+    provider = setup.GLOBAL_TRACE_PROVIDER
+    assert isinstance(provider, DefaultTraceProvider)
+    previous = provider._multi_processor._processors
+    spy = Spy()
+    agents.add_trace_processor(spy)
+    try:
+        yield spy
+    finally:
+        provider.set_processors(list(previous))
 
 
 def test_setup_does_nothing_when_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,6 +145,8 @@ def test_setup_does_nothing_when_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_missing_extra_is_actionable_and_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm_arena._errors import ConfigError
+
     original = builtins.__import__
 
     def missing(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -112,7 +155,7 @@ def test_missing_extra_is_actionable_and_value_free(monkeypatch: pytest.MonkeyPa
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", missing)
-    with pytest.raises(ImportError, match=r"swarm-arena\[langfuse\]") as caught:
+    with pytest.raises(ConfigError, match=r"swarm-arena\[langfuse\]") as caught:
         _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     assert_secret_absent(caught.value, "SENTINEL_SECRET")
 
@@ -142,6 +185,8 @@ async def judge_call(tmp_path: Path, enabled: bool) -> tuple[Any, list[Any]]:
     cfg = configuration().model_copy(update={"tracing": TracingConfig(langfuse=enabled)})
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=cfg) as run:
+        if enabled:
+            wait_project_resolution()
         with llm_scope(run.scope("judge")):
             await LLMJudge("rubric", ["a"]).judge(
                 goal,
@@ -157,20 +202,21 @@ async def manager_call(tmp_path: Path, enabled: bool) -> tuple[Any, list[Any]]:
     async with open_llm_run(
         tmp_path, config=manager_config(tracing=TracingConfig(langfuse=enabled))
     ) as run:
+        if enabled:
+            wait_project_resolution()
         with llm_scope(run.scope("manager")):
             await AgentsSDKManager(model="opus").run_round(context())
         return fake, run.calls()
 
 
 async def test_no_spans_leave_the_process_when_langfuse_is_off(tmp_path: Path) -> None:
-    spy = Spy()
-    agents.set_trace_processors([spy])
-    for call in (manager_call, judge_call):
-        fake, recorded = await call(tmp_path, False)
-        assert fake.calls[0]["tracing"] is ModelTracing.DISABLED
-        assert recorded[0].trace_url is None
-    assert spy.traces == []
-    assert spy.spans == []
+    with spy_processor() as spy:
+        for call in (manager_call, judge_call):
+            fake, recorded = await call(tmp_path, False)
+            assert fake.calls[0]["tracing"] is ModelTracing.DISABLED
+            assert recorded[0].trace_url is None
+        assert spy.traces == []
+        assert spy.spans == []
 
 
 async def test_component_span_attributes(
@@ -226,31 +272,29 @@ async def test_judge_call_opens_an_sdk_trace_and_sets_trace_url(
     tmp_path: Path, exported: Any
 ) -> None:
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
-    spy = Spy()
-    agents.add_trace_processor(spy)
-    fake, calls = await judge_call(tmp_path, True)
-    exported[1][0].flush()
-    spans = exported[0].get_finished_spans()
-    assert [t.name for t in spy.traces] == ["swarm-arena judge"]
-    assert fake.calls[0]["tracing"] is ModelTracing.ENABLED
-    assert (
-        calls[0].trace_url
-        == f"https://langfuse.example/project/test/traces/{spans[0].context.trace_id:032x}"
-    )
+    with spy_processor() as spy:
+        fake, calls = await judge_call(tmp_path, True)
+        exported[1][0].flush()
+        spans = exported[0].get_finished_spans()
+        assert [t.name for t in spy.traces] == ["swarm-arena judge"]
+        assert fake.calls[0]["tracing"] is ModelTracing.ENABLED
+        assert (
+            calls[0].trace_url
+            == f"https://langfuse.example/project/test/traces/{spans[0].context.trace_id:032x}"
+        )
 
 
 async def test_disabled_after_enabled_exports_nothing(tmp_path: Path, exported: Any) -> None:
     await manager_call(tmp_path, True)
     exported[1][0].flush()
     exported[0].clear()
-    spy = Spy()
-    agents.add_trace_processor(spy)
-    await manager_call(tmp_path, False)
-    await judge_call(tmp_path, False)
-    exported[1][0].flush()
-    assert exported[0].get_finished_spans() == ()
-    assert spy.traces == []
-    assert spy.spans == []
+    with spy_processor() as spy:
+        await manager_call(tmp_path, False)
+        await judge_call(tmp_path, False)
+        exported[1][0].flush()
+        assert exported[0].get_finished_spans() == ()
+        assert spy.traces == []
+        assert spy.spans == []
 
 
 async def test_concurrent_mixed_scopes_export_only_consenting_run(
@@ -261,6 +305,7 @@ async def test_concurrent_mixed_scopes_export_only_consenting_run(
     FakeModel([turn(1), turn(1)]).register("a")
     cfg = configuration().model_copy(update={"tracing": TracingConfig(langfuse=True)})
     async with open_llm_run(tmp_path, config=cfg) as run:
+        wait_project_resolution()
         enabled = run.scope("judge", agent="enabled")
         disabled = replace(run.scope("judge", agent="disabled"), tracing=TracingConfig())
         entered = anyio.Event()
@@ -315,12 +360,12 @@ async def test_trace_url_is_none_without_a_current_trace(
         current.assert_called_once_with()
 
 
-async def test_trace_url_failure_is_ignored(
+async def test_trace_id_failure_is_ignored(
     tmp_path: Path, exported: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     monkeypatch.setattr(
-        exported[1][0], "get_trace_url", Mock(side_effect=RuntimeError("SENTINEL_SECRET"))
+        exported[1][0], "get_current_trace_id", Mock(side_effect=RuntimeError("SENTINEL_SECRET"))
     )
     _, calls = await manager_call(tmp_path, True)
     assert calls[0].trace_url is None
@@ -406,9 +451,11 @@ async def test_component_cleanup_cannot_replace_body_control(
 
 
 async def test_success_inside_unrelated_except_still_checks_trace_cleanup(
-    tmp_path: Path, exported: Any, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, exported: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     import langfuse
+
+    from swarm_arena.manager import RoundReport
 
     @contextmanager
     def broken(**kwargs: Any) -> Generator[None]:
@@ -416,19 +463,19 @@ async def test_success_inside_unrelated_except_still_checks_trace_cleanup(
         raise ValueError("SENTINEL_SECRET")
 
     monkeypatch.setattr(langfuse, "propagate_attributes", broken)
+    FakeModel([finish()]).register("opus")
     async with open_llm_run(
         tmp_path, config=manager_config(tracing=TracingConfig(langfuse=True))
     ) as run:
         try:
             raise RuntimeError("unrelated")
         except RuntimeError:
-            with (
-                llm_scope(run.scope("manager")),
-                pytest.raises(RuntimeError) as caught,
-                _langfuse.component_span(run.scopes[-1]),
-            ):
-                pass
-        assert_secret_absent(caught.value, "SENTINEL_SECRET")
+            with llm_scope(run.scope("manager")):
+                report = await AgentsSDKManager(model="opus").run_round(context())
+        assert isinstance(report, RoundReport)
+        assert len(run.calls()) == 1
+        assert "ValueError" in caplog.text
+        assert "SENTINEL_SECRET" not in caplog.text
 
 
 async def test_context_construction_failure_is_value_free(
@@ -488,6 +535,7 @@ async def test_planner_and_curator_trace_their_child_calls(tmp_path: Path, expor
     fake.register("planner")
     cfg = planner_config(tmp_path).model_copy(update={"tracing": TracingConfig(langfuse=True)})
     async with open_llm_run(tmp_path, config=cfg) as run:
+        wait_project_resolution()
         scope = run.scope("planner")
         with llm_scope(scope):
             await LLMPlanner("planner")._draft_at(
@@ -613,6 +661,7 @@ async def test_two_stage_calls_export_sdk_generation_spans(
     monkeypatch.setattr(_structured, "supports", lambda spec, feature: False)
     cfg = configuration().model_copy(update={"tracing": TracingConfig(langfuse=True)})
     async with open_llm_run(tmp_path, config=cfg) as run:
+        wait_project_resolution()
         with llm_scope(run.scope("judge")):
             await _structured.structured_call(
                 alias="a",
@@ -681,7 +730,17 @@ def test_actual_process_exit_uses_bounded_daemon(tmp_path: Path, blocked: bool) 
     code = textwrap.dedent("""
         import atexit
         import threading
+        from agents.tracing import processors
+        from swarm_arena._model.settings import TracingConfig
         from swarm_arena.llm import _langfuse
+
+        def reject_default_processor() -> None:
+            raise AssertionError("default vendor processor created")
+
+        processors.default_processor = reject_default_processor
+
+        _langfuse.setup_langfuse(TracingConfig())
+        provider_entered = threading.Event()
 
         class Client:
             _resources = None
@@ -696,11 +755,17 @@ def test_actual_process_exit_uses_bounded_daemon(tmp_path: Path, blocked: bool) 
         class Provider:
             def shutdown(self):
                 print("provider entered", flush=True)
+                provider_entered.set()
                 if BLOCKED:
-                    threading.Event().wait(60)
+                    threading.Event().wait(300)
                 print("provider closed", flush=True)
 
-        _langfuse._resources = _langfuse._Resources(Client(), Provider(), Instrumentor())
+        resources = _langfuse._Resources(Client(), Provider(), Instrumentor())
+        _langfuse._resources = resources
+        if BLOCKED:
+            # Finish ordinary cleanup before applying the short exit deadline.
+            resources.requested.set()
+            assert provider_entered.wait(10), "provider shutdown never became ready"
         _langfuse._EXIT_TIMEOUT_S = 0.05 if BLOCKED else 2
         atexit.register(_langfuse._close_at_exit)
     """).replace("BLOCKED", repr(blocked))
@@ -709,7 +774,8 @@ def test_actual_process_exit_uses_bounded_daemon(tmp_path: Path, blocked: bool) 
         cwd=tmp_path,
         text=True,
         capture_output=True,
-        timeout=10,
+        # Allow cold imports, but fail before the held shutdown's safety release.
+        timeout=60,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -767,3 +833,192 @@ def test_existing_instrumentor_is_not_silently_reused(exported: Any) -> None:
         instrumentor.uninstrument()
         provider.shutdown()
         agents.set_trace_processors([])
+
+
+@pytest.mark.parametrize("response", ["success", "timeout", "rate_limit", "empty"])
+async def test_project_resolution_never_blocks_llm_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    response: str,
+) -> None:
+    import httpx
+    import langfuse
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    entered, release = threading.Event(), threading.Event()
+    requests: list[httpx.Request] = []
+    clients: list[Any] = []
+    original = langfuse.Langfuse
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/public/projects"
+        requests.append(request)
+        entered.set()
+        assert release.wait(30), "project lookup was not released"
+        if response == "timeout":
+            raise httpx.ConnectTimeout("SENTINEL_SECRET")
+        if response == "rate_limit":
+            return httpx.Response(429, headers={"Retry-After": "60"}, json={})
+        data = (
+            []
+            if response == "empty"
+            else [
+                {
+                    "id": "resolved",
+                    "name": "test",
+                    "metadata": {},
+                    "organization": {"id": "org", "name": "test"},
+                }
+            ]
+        )
+        return httpx.Response(200, json={"data": data})
+
+    http = httpx.Client(transport=httpx.MockTransport(transport))
+
+    def client(**kwargs: Any) -> Any:
+        result = original(
+            **kwargs,
+            public_key="pk-test-" + uuid4().hex,
+            secret_key="sk-test",
+            base_url="https://langfuse.example",
+            span_exporter=InMemorySpanExporter(),
+            httpx_client=http,
+        )
+        clients.append(result)
+        return result
+
+    monkeypatch.setenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", "false")
+    monkeypatch.setattr(langfuse, "Langfuse", client)
+    cfg = manager_config(tracing=TracingConfig(langfuse=True))
+    resources: Any = None
+    try:
+        _langfuse.setup_langfuse(TracingConfig(langfuse=True))
+        resources = _langfuse._resources
+        assert resources is not None
+        assert resources.project_worker is not None
+        assert await anyio.to_thread.run_sync(entered.wait, 5)
+        assert clients[0]._project_id is None
+        get_url = Mock(side_effect=AssertionError("network-capable URL helper called"))
+        monkeypatch.setattr(clients[0], "get_trace_url", get_url)
+        FakeModel([finish()]).register("opus")
+        # The transport remains held until this complete, journaled round returns.
+        with anyio.fail_after(5):
+            async with open_llm_run(tmp_path, config=cfg) as run:
+                with llm_scope(run.scope("manager")):
+                    await AgentsSDKManager(model="opus").run_round(context())
+                assert len(run.calls()) == 1
+                assert run.calls()[0].trace_url is None
+        assert not release.is_set()
+        release.set()
+        await anyio.to_thread.run_sync(resources.project_worker.join, 5)
+        assert not resources.project_worker.is_alive(), "project lookup retried or did not finish"
+        _, calls = await manager_call(tmp_path, True)
+        assert (calls[0].trace_url is not None) is (response == "success")
+        get_url.assert_not_called()
+        assert len(requests) == 1
+        assert all(0 < value <= 5 for value in requests[0].extensions["timeout"].values())
+        assert "SENTINEL_SECRET" not in caplog.text
+        if response != "success":
+            assert any(record.name == _langfuse.__name__ for record in caplog.records)
+    finally:
+        release.set()
+        if resources is not None and resources.project_worker is not None:
+            await anyio.to_thread.run_sync(resources.project_worker.join, 5)
+            assert not resources.project_worker.is_alive()
+        _langfuse._reset_langfuse(2)
+        await anyio.to_thread.run_sync(http.close)
+
+
+def test_close_does_not_create_a_missing_sdk_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.tracing import processors, setup
+
+    monkeypatch.setattr(setup, "GLOBAL_TRACE_PROVIDER", None)
+    default = Mock(side_effect=AssertionError("default vendor processor created"))
+    monkeypatch.setattr(processors, "default_processor", default)
+    client = Mock(_resources=None)
+    resources = _langfuse._Resources(client, Mock(), Mock(is_instrumented_by_opentelemetry=False))
+    _langfuse._close(resources, 2)
+    assert not resources.worker.is_alive()
+    default.assert_not_called()
+    assert setup.GLOBAL_TRACE_PROVIDER is None
+    client.flush.assert_called_once_with()
+
+
+def test_reset_refuses_new_owner_until_cleanup_finishes(
+    exported: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _langfuse.setup_langfuse(TracingConfig(langfuse=True))
+    resources = _langfuse._resources
+    assert resources is not None
+    entered, release = threading.Event(), threading.Event()
+    original = resources.instrumentor.uninstrument
+
+    def held() -> None:
+        entered.set()
+        assert release.wait(30)
+        original()
+
+    monkeypatch.setattr(resources.instrumentor, "uninstrument", held)
+    resources.requested.set()
+    try:
+        assert entered.wait(5)
+        _langfuse._reset_langfuse(0.05)
+        with pytest.raises(RuntimeError, match="Langfuse cleanup pending"):
+            _langfuse.setup_langfuse(TracingConfig(langfuse=True))
+    finally:
+        release.set()
+        resources.worker.join(5)
+        assert not resources.worker.is_alive()
+    _langfuse.setup_langfuse(TracingConfig(langfuse=True))
+    assert _langfuse._resources is not resources
+    assert resources.instrumentor.is_instrumented_by_opentelemetry
+
+
+async def test_missing_extra_hint_survives_swarm_run(
+    run_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._errors import ConfigError
+
+    original = builtins.__import__
+
+    def missing(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "langfuse":
+            raise ImportError("SENTINEL_SECRET")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing)
+    cfg = run_config.model_copy(update={"tracing": TracingConfig(langfuse=True)})
+    with pytest.raises(ConfigError, match=r"swarm-arena\[langfuse\]") as caught:
+        await Swarm(cfg).run(plan(rounds=1), run_id="missing-tracing-extra")
+    assert_secret_absent(caught.value, "SENTINEL_SECRET")
+
+
+@pytest.mark.parametrize("kind", ["fenced", "terminal"])
+async def test_trace_exit_control_still_wins_after_success(
+    tmp_path: Path, exported: Any, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import langfuse
+
+    from swarm_arena._errors import Fenced, _core_error, _stop_cleanup_error
+
+    error = _core_error(Fenced, "ownership lost") if kind == "fenced" else _stop_cleanup_error()
+
+    @contextmanager
+    def broken(**kwargs: Any) -> Generator[None]:
+        yield
+        raise error
+
+    monkeypatch.setattr(langfuse, "propagate_attributes", broken)
+    async with open_llm_run(
+        tmp_path, config=manager_config(tracing=TracingConfig(langfuse=True))
+    ) as run:
+        with (
+            llm_scope(run.scope("manager")),
+            pytest.raises(type(error), match=str(error)),
+            _langfuse.component_span(run.scopes[-1]),
+        ):
+            pass
