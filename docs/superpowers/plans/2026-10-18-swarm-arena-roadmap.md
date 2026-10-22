@@ -1997,6 +1997,9 @@ class LLMScope:
     cache: CachePolicy | None
     force_no_cache_read: bool = False                # anchors and the final judge
     call_ids: list[str] = field(default_factory=list)   # [plan] record_call appends the id of every LLMCall made in this scope
+    parent: LLMScope | None = field(default=None, repr=False, compare=False)
+    def child(self) -> LLMScope: ...
+    def lineage(self) -> Generator[LLMScope]: ...
 def current_llm_scope() -> LLMScope | None: ...
 @contextmanager
 def llm_scope(scope: LLMScope) -> Iterator[None]: ...
@@ -2019,6 +2022,12 @@ fields immediately after `cache`, with no defaults. Every engine and standalone
 session constructor passes its `RunConfig` values. Report waiting and owned
 post-stop settlement/publication cleanup both use `settle_timeout_s`; it is not
 solely a grace period for receiving usage.
+
+`child()` shares funding and services with its parent while allocating an
+independent call-id list and drain lifetime. `lineage()` yields the current
+scope followed by its ancestors. Recording propagates call links through that
+lineage; draining a child leaves its owner open, while an owner's drain includes
+its descendants.
 
 #### R4.13.8 Process supervision — M1a
 

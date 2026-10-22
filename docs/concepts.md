@@ -221,11 +221,12 @@ See the [exact pruning rules](scoring-and-review.md#pruning-policies) and
 ## Board
 
 `Board` is the indexing interface for candidates, scores, learnings, decisions,
-and lineage; `BoardView` is a fixed-frontier read view. The engine's in-memory
-run board indexes this run's committed journal and is reconstructed on resume.
-The journal is the durable authority. There is no cross-run arena in this
-release; that is M2. Managers access permitted views through `AgentContext`,
-with read caps and a UTF-8-byte-bounded digest. See the [board API](api/board.md).
+and lineage; `BoardView` is a fixed-frontier read view. The engine defaults to
+`ArenaBoard`, which combines this run's committed journal with permitted
+cross-run arena data. The journal remains the durable authority, and run state
+is reconstructed on resume. Managers access permitted views through
+`AgentContext`, with read caps and a UTF-8-byte-bounded digest. See the
+[arena guide](arena.md) and [board API](api/board.md).
 
 ## Swarm
 
@@ -388,3 +389,12 @@ effective cache key and the generating response, including replacements at the
 same key. When that evidence is unavailable or ambiguous, the origin stays unset.
 The recorder persists the opaque identity for replay even when payload storage
 is disabled.
+
+## Provider recovery preparation
+
+When a provider latch is outstanding, fresh-round preparation resolves slots
+concurrently before probing and selecting active agents. Healthy peers wait for
+the slowest slot to resolve or reach the effective round deadline. After this
+bounded preparation, the round has its own execution deadline, so a stuck slot
+can make preparation plus execution take about twice the effective round timeout.
+See [provider failures](limits-and-safety.md#provider-failures).
