@@ -737,6 +737,8 @@ class Ledger:
         Notes
         -----
         The settlement carries ``usage_overflow=True`` for history-only replay.
+        Admission stops before waiting for the settlement lock; cancellation
+        of that wait retains the same terminal state for a later retry.
         All later reservations raise ``LimitReached("usage_overflow")``, even
         with unlimited caps. Later settlements are no-ops, retaining earlier
         charges. A failed durable append retains exhaustion conservatively;
@@ -755,6 +757,14 @@ class Ledger:
         >>> anyio.run(example)
         True
         """
+        entry = self._entries[reservation_id]
+        actual = _nonnegative(actual)
+        if actual.usd != USD_LIMIT:
+            raise _core_error(ValueError, "overflow settlement requires the supported USD limit")
+        # Publish the one admission latch before waiting for the settlement lock.
+        # A cancelled wait or failed append must not make known overflow spendable.
+        if not entry.settled and self._overflow_reservation is None:
+            self._overflow_reservation = reservation_id
         await self._settle(reservation_id, actual, usage_overflow=True)
 
     def _check_usage_overflow(self) -> None:

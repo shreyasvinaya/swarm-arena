@@ -192,7 +192,7 @@ class Tranche:
         >>> tranche.can_cover(Amount(usd=0.2))
         False
         """
-        if self._closed or self._outcome.overflow:
+        if self._closed:
             return False
         try:
             self._ledger._check_usage_overflow()

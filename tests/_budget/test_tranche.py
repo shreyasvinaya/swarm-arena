@@ -646,3 +646,35 @@ async def test_can_cover_rejects_overflow_even_with_free_credit(env: LedgerEnv) 
     assert not tranche.can_cover(Amount())
     with pytest.raises(LimitReached, match="overflow"):
         await tranche.reserve_call(Amount())
+
+
+async def test_cancelled_overflow_lock_wait_keeps_one_admission_latch(env: LedgerEnv) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory
+
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    rid = await tranche.reserve_call(Amount(usd=0.1))
+    batch = tranche._calls[rid].batch
+    assert batch is not None
+    entry = env.ledger._entries[batch.id]
+    await entry.lock.acquire()
+    task = asyncio.create_task(tranche._settle_call(rid, Amount(usd=USD_LIMIT), overflow=True))
+    try:
+        await anyio.wait_all_tasks_blocked()
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        before = list(env.journal.events)
+        assert not tranche.can_cover(Amount())
+        with pytest.raises(LimitReached) as caught:
+            await tranche.reserve_call(Amount())
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        assert env.journal.events == before
+    finally:
+        entry.lock.release()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert (await tranche.close()).overflow
+    assert env.count("settle") == 1
+    assert _replay(env).run_exhausted()

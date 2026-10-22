@@ -732,3 +732,44 @@ async def test_all_provider_attempt_controls_are_stripped(tmp_path: Path, channe
     assert payload == {**controls, "seed": 42}
     assert sent.retry == caller.retry
     assert sent.metadata["retry_policy"] == "ordinary metadata"
+
+
+@pytest.mark.parametrize("direct", [False, True])
+async def test_overflow_advice_and_hook_match_reservation_while_settlement_waits(
+    tmp_path: Path, direct: bool
+) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._errors import _core_category
+
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        tranche = scope.tranche
+        rid = await tranche.reserve_call(Amount(usd=1 if direct else 0.01))
+        call = tranche._calls[rid]
+        entry = run.ledger._entries[rid if call.batch is None else call.batch.id]
+        other = Tranche(run.ledger, ":run", "g", size=Amount(usd=0.25))
+        await other.reserve_call(Amount(usd=0.01))
+        await entry.lock.acquire()
+        task = asyncio.create_task(tranche._settle_call(rid, Amount(usd=USD_LIMIT), overflow=True))
+        try:
+            await anyio.wait_all_tasks_blocked()
+            assert not task.done()
+            assert tranche._outcome.overflow
+            assert not tranche.can_cover(Amount())
+            assert not other.can_cover(Amount())
+            with pytest.raises(LimitReached) as refused:
+                await other.reserve_call(Amount())
+            assert _core_category(refused.value) is _SignalCategory.TERMINAL
+            deps = ManagerDeps(ctx=cast(AgentContext, object()), links=CallLinks())
+            with llm_scope(scope), pytest.raises(AgentsException) as hooked:
+                await BudgetHooks().on_llm_start(
+                    RunContextWrapper(deps),
+                    Agent(name="test", model=metered(FakeModel([]))),
+                    "sys",
+                    [],
+                )
+            assert _core_category(_unwrap_control(hooked.value)) is _SignalCategory.TERMINAL
+        finally:
+            entry.lock.release()
+            await task
+            await other.close()
