@@ -476,8 +476,11 @@ assert model.calls[0]["model_settings"].parallel_tool_calls is True
 
 The kit rebuilds a manager with `parallel_tool_calls=True` when its Config
 supports that field. It binds the temporary run before invoking registered run
-setups, and opens a fresh manager scope for each round. A component that leaves
-LLM calls undrained raises an `AssertionError` naming the drain rule; a manager
+setups, and opens a fresh manager scope for each round. A normally returning
+component that leaves LLM calls or reservations pending raises an `AssertionError`
+naming the drain rule. If an exception or owner interruption is already in
+flight, that outcome is preserved with a value-free drain-rule note. Registered
+terminal controls and genuine caller cancellation propagate. A manager
 candidate linked to a call outside that round's scope fails the
 `requested_by_call` rule. Cleanup settles outstanding reservations before
 closing the owned services. Concurrent helper invocations use separate run

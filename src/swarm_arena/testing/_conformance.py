@@ -299,7 +299,9 @@ async def check_judge(
     log. If the call raises an error instead (a failed contract assert, or an
     error from ``judge()`` itself), each command with any status but ``ok``
     adds that text as a note to the error, which is otherwise passed on
-    unchanged.
+    unchanged. An undrained normal return is an assertion failure; an existing
+    failure or caller interruption keeps its outcome and receives a value-free
+    drain-rule note.
 
     Parameters
     ----------
@@ -437,6 +439,8 @@ async def check_manager(
     bound temporary run. Each round has a manager LLM scope. The kit forces
     ``parallel_tool_calls=True`` when the manager's Config has that field and
     asserts self-drain and requesting-call membership before returning reports.
+    A drain violation annotates an existing failure or owner interruption with
+    a value-free note; a normal return raises the drain-rule AssertionError.
 
     Parameters
     ----------

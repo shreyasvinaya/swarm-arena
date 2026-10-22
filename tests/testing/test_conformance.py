@@ -2179,3 +2179,160 @@ async def test_conformance_reports_setup_failure_at_its_own_boundary(
         await _run_conformance_kind(kind)
     assert_secret_absent(caught.value, SECRET)
     assert llm_record._bindings == baseline
+
+
+def _has_drain_note(error: BaseException | None) -> bool:
+    while error is not None:
+        if any("drain rule" in note for note in getattr(error, "__notes__", ())):
+            return True
+        error = error.__cause__
+    return False
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("opened", [False, True])
+async def test_conformance_keeps_component_failure_with_a_drain_note(
+    kind: str,
+    opened: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    failure = KeyError("component failed")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await _reserve_conformance_call(opened=opened)
+        raise failure
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await _reserve_conformance_call(opened=opened)
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(AssertionError if kind == "manager" else KeyError) as caught:
+        await _run_conformance_kind(kind)
+    assert (caught.value.__cause__ if kind == "manager" else caught.value) is failure
+    assert _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("stop", ["native", "anyio", "run"])
+async def test_conformance_keeps_owner_interruption_with_a_drain_note(
+    kind: str,
+    stop: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal import llm_record
+
+    entered = anyio.Event()
+    scopes: list[Any] = []
+    timers: list[Any] = []
+    cancellations: list[BaseException] = []
+    owner = anyio.CancelScope()
+    baseline = dict(llm_record._bindings)
+
+    async def hold() -> None:
+        scope = await _reserve_conformance_call()
+        scopes.append(scope)
+        entered.set()
+        if stop == "run":
+            llm_record._bindings[scope.run_id].stops.run_timeout = True
+        await anyio.sleep_forever()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await hold()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await hold()
+        return []
+
+    async def invoke() -> None:
+        with owner:
+            try:
+                async with asyncio.timeout(None) as timer:
+                    timers.append(timer)
+                    await _run_conformance_kind(kind, config=RunConfig(settle_timeout_s=2))
+            except asyncio.CancelledError as error:
+                cancellations.append(error)
+                raise
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    task = asyncio.create_task(invoke())
+    try:
+        with anyio.fail_after(12):
+            await entered.wait()
+            if stop == "native":
+                timers[0].reschedule(asyncio.get_running_loop().time())
+                with pytest.raises(TimeoutError) as caught:
+                    await task
+                assert _has_drain_note(caught.value)
+            elif stop == "anyio":
+                owner.cancel()
+                await task
+                assert len(cancellations) == 1
+                assert _has_drain_note(cancellations[0])
+            else:
+                with pytest.raises(RuntimeError, match="offline harness stopped") as caught:
+                    await task
+                assert _has_drain_note(caught.value)
+        assert scopes[0].tranche._closed
+        assert llm_record._bindings == baseline
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("control", ["terminal", "fenced"])
+async def test_conformance_keeps_core_control_with_a_drain_note(
+    kind: str,
+    control: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import Fenced, _core_category, _SignalCategory, _stop_cleanup_error
+
+    failure = (
+        _stop_cleanup_error()
+        if control == "terminal"
+        else _core_error(Fenced, "run ownership lost")
+    )
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await _reserve_conformance_call()
+        raise failure
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await _reserve_conformance_call()
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(RuntimeError if control == "terminal" else Fenced) as caught:
+        await _run_conformance_kind(kind)
+    expected = _SignalCategory.TERMINAL if control == "terminal" else _SignalCategory.FENCED
+    assert _core_category(caught.value) is expected
+    assert _has_drain_note(caught.value)

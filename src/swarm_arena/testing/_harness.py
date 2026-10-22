@@ -7,7 +7,7 @@ import tempfile
 import warnings
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
@@ -81,11 +81,52 @@ class _LLMContractError(AssertionError):
     """Identify a core-owned LLM conformance rule without connector text."""
 
 
+_DRAIN_RULE = "LLM drain rule: component must drain its calls before returning"
+
+
+@dataclass
+class _DrainOutcome:
+    """Retain a value-free contract note across owner cancellation rebuilding."""
+
+    violated: bool = False
+    noted: BaseException | None = None
+
+    def note(self, error: BaseException) -> None:
+        """Attach the rule once to each propagated outcome object."""
+        if self.violated and self.noted is not error:
+            BaseException.add_note(error, _DRAIN_RULE)
+            self.noted = error
+
+
+@asynccontextmanager
+async def _retain_drain_outcome(outcome: _DrainOutcome) -> AsyncGenerator[None]:
+    """Keep the note when an enclosing owner rebuilds a cancellation outcome."""
+    try:
+        yield
+    except BaseException as error:
+        outcome.note(error)
+        raise
+
+
 async def _assert_drained(scope: LLMScope) -> None:
     """Check self-drain while the owner can still settle a broken component."""
     missing = await drain(scope, wait=False)
     if missing or scope.tranche.pending() != 0:
-        raise _LLMContractError("LLM drain rule: component must drain its calls before returning")
+        raise _LLMContractError(_DRAIN_RULE)
+
+
+async def _finish_draining(
+    scope: LLMScope, error: BaseException | None, outcome: _DrainOutcome
+) -> None:
+    """Raise a normal-return violation or annotate the existing failure."""
+    try:
+        await _assert_drained(scope)
+    except _LLMContractError:
+        if error is None:
+            raise
+        if not isinstance(error, _LLMContractError):
+            outcome.violated = True
+            outcome.note(error)
 
 
 def _scope(
@@ -142,18 +183,22 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
     ids = IdGen(run_id, lease.doc.epoch)
     stops, clock = StopState(), RunClock(0)
     artifacts = _artifacts()
+    drain_outcome = _DrainOutcome()
     completed = False
     entered = False
     try:
-        async with JournalWriter(
-            store,
-            lease,
-            run_id=run_id,
-            next_seq=1,
-            local_path=root / "journal.jsonl",
-            sync_interval_s=config.sync_interval_s,
-            settle_timeout_s=config.settle_timeout_s,
-        ) as journal:
+        async with (
+            _retain_drain_outcome(drain_outcome),
+            JournalWriter(
+                store,
+                lease,
+                run_id=run_id,
+                next_seq=1,
+                local_path=root / "journal.jsonl",
+                sync_interval_s=config.sync_interval_s,
+                settle_timeout_s=config.settle_timeout_s,
+            ) as journal,
+        ):
             entered = True
             async with (
                 _supervise_writer(journal),
@@ -201,14 +246,16 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                         yield scope, ids
                     completed = True
                 finally:
-                    await drain(scope, wait=False)
+                    await _finish_draining(scope, sys.exc_info()[1], drain_outcome)
     finally:
         if not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):
                     await _storage_io(lease.release)
     if not completed:
-        raise _core_error(RuntimeError, "offline harness stopped")
+        error = _core_error(RuntimeError, "offline harness stopped")
+        drain_outcome.note(error)
+        raise error
 
 
 class OfflineHarness:
@@ -243,6 +290,7 @@ class OfflineHarness:
         self.candidates: list[Candidate] = []
         self.learnings: list[Learning] = []
         self.manager_errors: list[Exception] = []
+        self._drain_outcome = _DrainOutcome()
         self.store: LocalStore
 
     async def run_rounds(
@@ -317,6 +365,7 @@ class OfflineHarness:
             raise ValueError("rounds must be positive")
         self.candidates, self.learnings = [], []
         self.manager_errors = []
+        self._drain_outcome = _DrainOutcome()
         root = await anyio.to_thread.run_sync(self._run_folder)
         run_id = "offline-" + uuid4().hex
         self.store = LocalStore(root / "runs" / run_id)
@@ -349,6 +398,7 @@ class OfflineHarness:
         stops, clock = StopState(), RunClock(0)
         artifacts = _artifacts()
         async with (
+            _retain_drain_outcome(self._drain_outcome),
             _executor(None) as executor,
             _failed_runs_on(executor),
             JournalWriter(
@@ -475,7 +525,9 @@ class OfflineHarness:
             finally:
                 await _close_board(board, config, failed=sys.exc_info()[0] is not None)
         if not completed:
-            raise _core_error(RuntimeError, "offline harness stopped")
+            error = _core_error(RuntimeError, "offline harness stopped")
+            self._drain_outcome.note(error)
+            raise error
         notes = await anyio.to_thread.run_sync(_failed_runs, executor.outputs)
         if self.manager_errors:
             for error in self.manager_errors:
@@ -590,10 +642,12 @@ class OfflineHarness:
                 self.learnings.extend(item for item in rt.own if isinstance(item, Learning))
                 # The bound run owns interrupted cleanup; healthy closure stays
                 # supervised by the existing run deadline and writer lifetime.
-                await _assert_drained(scope)
-                closed = await rt.tranche.close()
-                if closed.overflow or rt.ledger.run_exhausted():
-                    rt.ledger._check_usage_overflow()
+                propagating = sys.exc_info()[1]
+                await _finish_draining(scope, propagating or manager_error, self._drain_outcome)
+                if propagating is None:
+                    closed = await rt.tranche.close()
+                    if closed.overflow or rt.ledger.run_exhausted():
+                        rt.ledger._check_usage_overflow()
             if any(
                 c.requested_by_call is not None and c.requested_by_call not in scope.call_ids
                 for c in rt.own
