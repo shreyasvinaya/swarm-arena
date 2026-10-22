@@ -64,7 +64,8 @@ class Inflight:
     Attributes
     ----------
     closed : bool
-        Whether new submissions and queued starts must be refused.
+        Whether new reservations must be refused. Budget closure still permits
+        previously reserved submissions to start until drain grace expires.
 
     Examples
     --------
@@ -77,10 +78,17 @@ class Inflight:
     def __init__(self) -> None:
         """Start with open admission and no submissions."""
         self.closed = False
+        self._starts_closed = False
         self._cancel_generation = 0
         self._scopes: dict[anyio.CancelScope, float] = {}
 
-    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
+    def add(
+        self,
+        scope: anyio.CancelScope,
+        *,
+        grace_s: float = 0.0,
+        admitted_generation: int | None = None,
+    ) -> None:
         """
         Admit a submission unless the round has closed.
 
@@ -90,6 +98,9 @@ class Inflight:
             Scope controlling one executor submission.
         grace_s : float, default=0.0
             Effective job grace in seconds; retained through executor collection.
+        admitted_generation : int or None, default=None
+            Cancellation generation of a reserved action allowed to drain after
+            budget closure. Other closure kinds still refuse its start.
 
         Raises
         ------
@@ -108,7 +119,9 @@ class Inflight:
         >>> anyio.run(demo)
         False
         """
-        if self.closed:
+        if admitted_generation is not None:
+            self._check_admitted(admitted_generation)
+        elif self.closed:
             raise _core_signal(LimitReached("stop", "the round is stopping"))
         self._scopes[scope] = grace_s
 
@@ -145,9 +158,15 @@ class Inflight:
         """
         return max(self._scopes.values(), default=0.0)
 
-    def close(self) -> None:
+    def close(self, *, budget: bool = False) -> None:
         """
         Refuse future admission without cancelling existing work.
+
+        Parameters
+        ----------
+        budget : bool, default=False
+            Let already reserved actions start during budget drain. A later
+            non-budget close permanently revokes this allowance.
 
         Examples
         --------
@@ -157,6 +176,12 @@ class Inflight:
         True
         """
         self.closed = True
+        self._starts_closed |= not budget
+
+    def _check_admitted(self, generation: int) -> None:
+        """Refuse reserved starts after hard closure or cancellation."""
+        if self._starts_closed or generation != self._cancel_generation:
+            raise _core_signal(LimitReached("stop", "the round is stopping"))
 
     def cancel_all(self) -> None:
         """
@@ -331,14 +356,18 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
 
 
 async def _prepare_sync(
-    hook: Callable[..., _T], *args: Any, generation: int | None = None, storage: bool = False
+    hook: Callable[..., _T],
+    *args: Any,
+    generation: int | None = None,
+    storage: bool = False,
+    admitted_generation: int | None = None,
 ) -> _T:
     """Supervise preparation; admitted commands may finish during graceful stop."""
     inflight = _inflight.get()
     with anyio.CancelScope() as scope:
         if inflight is not None:
             if generation is None:
-                inflight.add(scope, grace_s=0)
+                inflight.add(scope, grace_s=0, admitted_generation=admitted_generation)
             elif not inflight._add_completion(scope, grace_s=0, generation=generation):
                 raise _core_signal(LimitReached("stop", "the round is stopping"))
         outcome = _Outcome()
@@ -689,13 +718,11 @@ async def _run(
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
         try:
-            event = await _prepare_sync(_prepare_started, event)
+            event = await _prepare_sync(_prepare_started, event, admitted_generation=generation)
+            inflight._check_admitted(generation)
         except LimitReached as error:
             admission_refusal = error
             raise
-        if inflight.closed:
-            admission_refusal = _core_signal(LimitReached("stop", "the round is stopping"))
-            raise admission_refusal
         await rt.journal.append_durable(
             _draft(
                 rt,
@@ -715,7 +742,9 @@ async def _run(
         if not failed:
             for edit in [{path: content} for path, content in request.edits.items()] or [{}]:
                 try:
-                    await _prepare_sync(put_edits, edit, rt.artifacts, storage=True)
+                    await _prepare_sync(
+                        put_edits, edit, rt.artifacts, storage=True, admitted_generation=generation
+                    )
                 except LimitReached as error:
                     if inflight.closed or generation != inflight._cancel_generation:
                         admission_refusal = error
@@ -749,7 +778,7 @@ async def _run(
             )
             with anyio.CancelScope() as run_scope:
                 try:
-                    inflight.add(run_scope, grace_s=job.grace_s)
+                    inflight.add(run_scope, grace_s=job.grace_s, admitted_generation=generation)
                 except LimitReached as error:
                     admission_refusal = error
                     raise

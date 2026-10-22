@@ -216,6 +216,14 @@ class _ActionInflight(Inflight):
         self._local.closed = value
 
     @property
+    def _starts_closed(self) -> bool:
+        return self._parent._starts_closed or self._local._starts_closed
+
+    @_starts_closed.setter
+    def _starts_closed(self, value: bool) -> None:
+        self._local._starts_closed = value
+
+    @property
     def _cancel_generation(self) -> int:
         return self._parent._cancel_generation + self._local._cancel_generation
 
@@ -223,10 +231,30 @@ class _ActionInflight(Inflight):
     def _cancel_generation(self, value: int) -> None:
         self._local._cancel_generation = value - self._parent._cancel_generation
 
-    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
-        self._local.add(scope, grace_s=grace_s)
+    def add(
+        self,
+        scope: anyio.CancelScope,
+        *,
+        grace_s: float = 0.0,
+        admitted_generation: int | None = None,
+    ) -> None:
+        if admitted_generation is not None:
+            self._check_admitted(admitted_generation)
+        self._local.add(
+            scope,
+            grace_s=grace_s,
+            admitted_generation=(
+                self._local._cancel_generation if admitted_generation is not None else None
+            ),
+        )
         try:
-            self._parent.add(scope, grace_s=grace_s)
+            self._parent.add(
+                scope,
+                grace_s=grace_s,
+                admitted_generation=(
+                    self._parent._cancel_generation if admitted_generation is not None else None
+                ),
+            )
         except BaseException:
             self._local.discard(scope)
             raise
