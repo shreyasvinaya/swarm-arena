@@ -78,7 +78,9 @@ at the output path is refused before the planning session starts, even with
 `--force`. New files use the process umask; replacement preserves the existing
 file's permission mode. The complete file and its directory are synced before
 publication. Cancellation during preparation of the output prevents publication;
-the abandoned worker removes its temporary file when the pending I/O returns.
+the abandoned worker removes its temporary file when the pending I/O returns,
+but the file may remain if the process exits first. This `.swarm-plan-*` file
+is hidden, uniquely named and never read.
 
 The goal and catalog files resolve against the goal file's directory, using the
 same parent-directory convention as `Plan.load` even for a symlinked goal file. Source
