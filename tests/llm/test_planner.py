@@ -405,3 +405,114 @@ async def test_stamps_llm_origin_revision_0(tmp_path: Path) -> None:
 
 async def test_output_origin_human_is_overwritten(tmp_path: Path) -> None:
     await _assert_stamped(tmp_path, True)
+
+
+@pytest.mark.parametrize("failure", ["malformed", "limit", "overflow"])
+async def test_standalone_failure_records_finished_outcome(tmp_path: Path, failure: str) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena.manager import LimitReached
+    from swarm_arena.tool import Usage
+
+    config = planner_config(tmp_path)
+    if failure == "limit":
+        config = config.model_copy(update={"limits": Limits(max_tokens=10)})
+    fake = FakeModel(
+        [
+            FakeTurn(
+                text="not-json" if failure == "malformed" else json.dumps(planner_output()),
+                usage=Usage(input_tokens=10**18 if failure == "overflow" else 1),
+            )
+        ]
+    )
+    fake.register("planner")
+    with pytest.raises((ValueError, LimitReached)) as caught:
+        await LLMPlanner("planner").plan(GOAL, config, None)
+    if failure == "overflow":
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    events = all_events(config)
+    finished = [e for e in events if e.type == "goal_finished"]
+    assert len(finished) == 1
+    assert finished[0].payload["reason"] == (
+        "planner failed" if failure == "malformed" else "run budget"
+    )
+    assert RunState.from_events(events).goals["g"].finished
+
+
+@pytest.mark.parametrize("kind", ["stop", "stop_now", "deadline", "takeover"])
+async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._errors import Fenced
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.lease import read_owner
+    from swarm_arena._model.canonical import utc_now
+    from swarm_arena._store.local import LocalStore
+
+    class HeldModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__([FakeTurn(text=json.dumps(planner_output()))])
+            self.entered, self.release = anyio.Event(), anyio.Event()
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            self.entered.set()
+            await self.release.wait()
+            return await super().get_response(*args, **kwargs)
+
+    config = planner_config(tmp_path)
+    if kind == "deadline":
+        config = config.model_copy(update={"limits": Limits(max_tokens=1_000_000, run_timeout_s=2)})
+    fake = HeldModel()
+    fake.register("planner")
+    task = asyncio.create_task(LLMPlanner("planner").plan(GOAL, config, None))
+    replacement = None
+    try:
+        with anyio.fail_after(15):
+            await fake.entered.wait()
+            (session,) = await anyio.to_thread.run_sync(
+                lambda: list(Path(config.run_root).iterdir())
+            )
+            store = LocalStore(session)
+            if kind in {"stop", "stop_now"}:
+                (
+                    session / "control" / ("stop-now-e1" if kind == "stop_now" else "stop-e1")
+                ).write_text("")
+            if kind == "takeover":
+                replacement = force_take_over(store, owner_id="replacement", host="test", ttl_s=60)
+                fenced_events = all_events(config)
+                fake.release.set()
+                with pytest.raises(Fenced):
+                    await task
+            else:
+                with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
+                    await task
+        assert session.name not in llm_record._bindings
+        owner = read_owner(store)
+        assert owner is not None
+        events = all_events(config)
+        if kind == "takeover":
+            assert owner[0].owner_id == "replacement"
+            assert owner[0].epoch == 2
+            assert replacement is not None
+            assert owner[0] == replacement.doc
+            assert events == fenced_events
+        else:
+            assert owner[0].expires_at <= utc_now()
+            calls = [e.payload["call"] for e in events if e.type == "llm_call"]
+            assert len(calls) == 1
+            assert calls[0]["error"].startswith("estimated:")
+            finished = [e for e in events if e.type == "goal_finished"]
+            assert len(finished) == 1
+            assert (
+                finished[0].payload["reason"]
+                == {"stop": "stop", "stop_now": "stop --now", "deadline": "run_timeout_s"}[kind]
+            )
+        fake.release.set()
+        assert all_events(config) == events
+    finally:
+        fake.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if replacement is not None:
+            replacement.release()

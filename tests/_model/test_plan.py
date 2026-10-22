@@ -467,7 +467,8 @@ def test_plain_plan_has_no_planning_session() -> None:
     assert not plan.dumps().startswith("# swarm-arena planning session:")
 
 
-def test_planning_session_line_round_trips(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", ["", " ", "\t "])
+def test_planning_session_line_round_trips(tmp_path: Path, suffix: str) -> None:
     from unittest.mock import Mock
 
     from swarm_arena._engine.run import mark_planning_session
@@ -479,6 +480,7 @@ def test_planning_session_line_round_trips(tmp_path: Path) -> None:
     assert marked.planner_call_ids == ("llm-1",)
     text = marked.dumps()
     assert text.startswith("# swarm-arena planning session: r-abc\n")
+    text = text.replace("r-abc\n", f"r-abc{suffix}\n", 1)
     path = tmp_path / "linked.toml"
     path.write_text(text)
     for loaded in (Plan.loads(text, base_dir=tmp_path), Plan.load(path)):

@@ -1458,8 +1458,13 @@ async def test_planning_session_stopped_setup_never_yields(
             (session / "control" / "stop-e1").write_text("")
         else:
             task.cancel()
-        with anyio.fail_after(10), pytest.raises((RuntimeError, asyncio.CancelledError)):
-            await task
+        with anyio.fail_after(10):
+            if stop == "stop":
+                with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
+                    await task
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
         assert yielded == []
         assert session.name not in llm_record._bindings
         owner = read_owner(LocalStore(session))

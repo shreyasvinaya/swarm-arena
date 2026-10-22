@@ -478,7 +478,11 @@ class Plan(StoredModel):
         'human'
         """
         first = text.partition("\n")[0].removesuffix("\r")
-        session = first[len(_SESSION_PREFIX) :] if first.startswith(_SESSION_PREFIX) else None
+        session = (
+            first[len(_SESSION_PREFIX) :].rstrip(" \t")
+            if first.startswith(_SESSION_PREFIX)
+            else None
+        )
         plan = cls._from_data(loads_toml(text, where="plan"), base_dir=base_dir)
         try:
             plan._set_planner_provenance(session, ())

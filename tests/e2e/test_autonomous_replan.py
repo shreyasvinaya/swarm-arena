@@ -136,3 +136,19 @@ async def test_replan_keeping_the_human_scriptjudge_is_accepted(tmp_path: Path) 
 
 async def test_replan_keeping_the_human_team_and_a_checked_part_is_accepted(tmp_path: Path) -> None:
     await _assert_kept(tmp_path, True)
+
+
+async def test_autonomous_revision_clears_external_planning_session(tmp_path: Path) -> None:
+    plan, config = setup(tmp_path)
+    plan._set_planner_provenance("r-external", ("llm-external",))
+
+    class CopyPlanner(Planner):
+        async def plan(self, goal: Any, config: RunConfig, history: Any) -> Plan:
+            return history.revisions[-1].model_copy()
+
+    await Swarm(config, replanner=CopyPlanner()).run(plan)
+    revisions = events(config, "plan_revision")
+    assert [e.payload["plan"]["revision"] for e in revisions] == [0, 1]
+    assert revisions[0].payload["planning_session"] == "r-external"
+    assert revisions[1].payload["planning_session"] is None
+    assert revisions[1].payload["planner_call_ids"] == []

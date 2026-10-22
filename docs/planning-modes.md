@@ -229,8 +229,17 @@ An explicit new round schedule includes completed rounds, including completed
 implicit rounds. Empty output rounds retain the current schedule. Every draft
 passes shared authorization, file admission and component preflight before the
 engine publishes an autonomous revision under the run's admission lock.
-Rejected proposals keep the current revision. Fencing, terminal accounting
-failures and caller cancellation propagate as controls.
+Rejected proposals keep the current revision. Fencing and caller cancellation
+propagate as controls. In-run usage overflow stops the run through the budget
+path; standalone planning raises the terminal accounting error.
+
+An autonomous revision has no external `planning_session` link: its planner
+call IDs belong to the current run journal. The r0 link remains unchanged.
+Standalone cleanup records `goal_finished` before raising a terminal overflow.
+Its reason distinguishes `planning complete`, `planner failed` (including an
+invalid draft), `run budget`, `run_timeout_s`, `stop`, and `stop --now`; caller
+cancellation records `stopped`. A fenced owner cannot append a finish event.
+Trailing spaces and tabs after a saved planning-session comment are ignored.
 
 Interactive **together** planning remains a later M3 feature.
 

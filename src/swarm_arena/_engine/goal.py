@@ -1176,7 +1176,7 @@ class GoalRunner:
                     origin="autonomous",
                     admit=admit_revision,
                 )
-                admitted._set_planner_provenance(admitted.planning_session, tuple(scope.call_ids))
+                admitted._set_planner_provenance(None, tuple(scope.call_ids))
                 if (
                     self._join_retry_number is not None
                     and admitted.rounds_total(self.deps.config.limits) <= self.rounds_closed

@@ -36,8 +36,10 @@ from swarm_arena._errors import (
     Fenced,
     PlanError,
     StorageError,
+    _core_category,
     _core_error,
     _exception_type_name,
+    _SignalCategory,
     _stop_cleanup_error,
 )
 from swarm_arena._exec.executor import Executor
@@ -1255,22 +1257,37 @@ async def planning_session(
                                 with _stop_cleanup(config):
                                     await drain(scope, wait=False)
                                     outcome = await tranche.close()
-                                    if outcome.overflow:
-                                        ledger._check_usage_overflow()
+                                    reason = "planner failed" if failed else "planning complete"
+                                    error = sys.exc_info()[1]
+                                    if error is not None:
+                                        try:
+                                            classified = boundary.classify(error)
+                                        except anyio.get_cancelled_exc_class():
+                                            reason = "stopped"
+                                        else:
+                                            if _core_category(classified) in {
+                                                _SignalCategory.LIMIT,
+                                                _SignalCategory.TERMINAL,
+                                            }:
+                                                reason = "run budget"
+                                    if outcome.overflow or stops.run_budget:
+                                        reason = "run budget"
+                                    if stops.run_timeout:
+                                        reason = "run_timeout_s"
+                                    if stops.stop or stops.stop_now:
+                                        reason = "stop --now" if stops.stop_now else "stop"
                                     await _record_stop(journal, stops)
                                     journal.append(
                                         EventDraft(
                                             type=EventType.GOAL_FINISHED,
                                             goal_id=goal.id,
-                                            payload={
-                                                "reason": "stopped"
-                                                if failed
-                                                else "planning complete"
-                                            },
+                                            payload={"reason": reason},
                                         )
                                     )
                                     await ledger.end_goal(goal.id)
                                     await journal.commit()
+                                    if outcome.overflow:
+                                        ledger._check_usage_overflow()
                         completed = True
         if not completed or stops.stop or stops.stop_now or stops.run_timeout:
             raise _core_error(RuntimeError, "planning session stopped") from None
