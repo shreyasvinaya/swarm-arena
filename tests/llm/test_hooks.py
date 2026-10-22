@@ -1,0 +1,680 @@
+"""Metering, authoritative settings and SDK control transport."""
+
+import asyncio
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, cast
+
+import anyio
+import pytest
+from _engine.conftest import env as env
+from _fakes.engine import EngineEnv
+from _fakes.llm_run import open_llm_run
+from _fakes.secrecy import assert_secret_absent
+from agents import (
+    Agent,
+    AgentOutputSchema,
+    Model,
+    ModelResponse,
+    ModelSettings,
+    RunContextWrapper,
+    Runner,
+    function_tool,
+)
+from agents import RunConfig as SDKRunConfig
+from agents.exceptions import AgentsException
+from agents.models.interface import ModelTracing
+from pydantic import BaseModel
+
+from swarm_arena import Limits, RunConfig
+from swarm_arena._budget.amount import Amount
+from swarm_arena._budget.llm_scope import llm_scope
+from swarm_arena._budget.tranche import Tranche
+from swarm_arena._errors import (
+    Fenced,
+    _core_error,
+    _is_core_control,
+    _rebuild_core_signal,
+    _stop_cleanup_error,
+)
+from swarm_arena._journal.llm_record import drain
+from swarm_arena._outcomes import _Outcome
+from swarm_arena.config import CachePolicy, ModelCatalog, ModelSpec
+from swarm_arena.llm._cache import bypass_response_cache
+from swarm_arena.llm._hooks import (
+    BudgetExceeded,
+    BudgetHooks,
+    MeteredModel,
+    _sdk_control,
+    _unwrap_control,
+)
+from swarm_arena.llm._linking import CallLinks, ManagerDeps, tool_calls_of
+from swarm_arena.manager import AgentContext, LimitReached
+from swarm_arena.testing import FakeModel, FakeTurn
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:pydantic._internal._generate_schema"
+)
+
+SPEC = ModelSpec(
+    model="fake/m",
+    roles=["manager", "judge"],
+    max_tokens=8000,
+    prices=ModelSpec.Prices(input=1, output=3),
+)
+
+
+def config(**kwargs: Any) -> RunConfig:
+    return RunConfig(
+        models=ModelCatalog({"m": SPEC}), limits=Limits(), settle_timeout_s=2, **kwargs
+    )
+
+
+def metered(capture: Model, **kwargs: Any) -> MeteredModel:
+    return MeteredModel(capture, alias="m", spec=SPEC, namespace="test", **kwargs)
+
+
+async def invoke(
+    model: Model, settings: ModelSettings | None = None, **kwargs: Any
+) -> ModelResponse:
+    return await model.get_response(
+        "sys",
+        [],
+        settings or ModelSettings(),
+        kwargs.pop("tools", []),
+        kwargs.pop("output_schema", None),
+        [],
+        ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+        **kwargs,
+    )
+
+
+async def test_reserves_and_sends_metadata(tmp_path: Path) -> None:
+    capture = FakeModel([FakeTurn(text="ok", tool_calls=(("best", {}),))])
+    links = CallLinks()
+    model = metered(capture, links=links)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope):
+            response = await invoke(model)
+        await drain(scope, wait=True)
+        md = capture.calls[0]["model_settings"].metadata
+        assert (  # noqa: PT018 - required acceptance assertion
+            md["reservation_id"].startswith("r-")
+            and md["call_id"].startswith("llm-")
+            and md["model_alias"] == "m"
+        )
+        assert all(type(value) is str for value in md.values())
+        assert model.call_ids == scope.call_ids == [md["call_id"]]
+        assert links.get(tool_calls_of(response)[0][0]) == md["call_id"]
+        assert run.charged(scope)._micro_usd == sum(
+            Amount(usd=call.cost_usd)._micro_usd for call in run.calls()
+        )
+
+
+async def test_agent_settings_are_kept(tmp_path: Path) -> None:
+    capture = FakeModel([FakeTurn(text="ok")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            await invoke(
+                metered(capture), ModelSettings(parallel_tool_calls=True, tool_choice="auto")
+            )
+    settings = capture.calls[0]["model_settings"]
+    assert settings.parallel_tool_calls is True
+    assert settings.tool_choice == "auto"
+
+
+@pytest.mark.parametrize(
+    ("ours", "callers", "sent"),
+    [(1, None, 1), (None, 100, 100), (None, None, 8000), (None, 10_000, 8000)],
+)
+async def test_max_tokens_cap(
+    ours: int | None, callers: int | None, sent: int, tmp_path: Path
+) -> None:
+    capture = FakeModel([FakeTurn(text="ok")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope):
+            await invoke(metered(capture, max_tokens=ours), ModelSettings(max_tokens=callers))
+        assert capture.calls[0]["model_settings"].max_tokens == sent
+        estimate = next(iter(scope.tranche._calls.values())).estimate
+        assert estimate.tokens >= sent
+        assert estimate._micro_usd == (estimate.tokens - sent) * 2 + sent * 3
+
+
+def test_stream_response_is_not_supported() -> None:
+    with pytest.raises(NotImplementedError, match="MeteredModel does not stream"):
+        metered(FakeModel([])).stream_response(
+            None,
+            [],
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+
+
+async def test_budget_exceeded_when_tranche_cannot_reserve(tmp_path: Path) -> None:
+    capture = FakeModel([FakeTurn(text="never")])
+    cfg = config().model_copy(update={"limits": Limits(max_usd=1e-6)})
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(BudgetExceeded) as e:
+            await invoke(metered(capture))
+        assert (  # noqa: PT018 - required acceptance assertion
+            isinstance(e.value, LimitReached)
+            and isinstance(e.value, AgentsException)
+            and e.value.limit == "budget"
+        )
+        assert capture.calls == []
+        assert run.calls() == [] and run.charged(scope) == Amount()  # noqa: PT018
+        assert _is_core_control(_unwrap_control(e.value))
+
+
+async def test_outside_scope_raises_runtime_error() -> None:
+    with pytest.raises(RuntimeError, match="outside an LLM scope"):
+        await invoke(metered(FakeModel([])))
+
+
+async def test_parallel_calls_settle_their_own_reservation(tmp_path: Path) -> None:
+    capture = FakeModel([FakeTurn(text="a"), FakeTurn(text="b")])
+    model = metered(capture)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(invoke, model)
+                tasks.start_soon(invoke, model)
+        await drain(scope, wait=True)
+        a, b = run.calls()
+        assert a.reservation_id != b.reservation_id
+        assert run.charged(scope).usd == pytest.approx(a.cost_usd + b.cost_usd)
+        assert (
+            run.charged(scope)._micro_usd
+            == Amount(usd=a.cost_usd)._micro_usd + Amount(usd=b.cost_usd)._micro_usd
+        )
+
+
+async def test_estimate_counts_tool_schemas_and_output_schema(tmp_path: Path) -> None:
+    @function_tool
+    def example(value: str) -> str:
+        """Return a value described by a tool schema."""
+        return value
+
+    class Output(BaseModel):
+        value: str
+
+    estimates = []
+    async with open_llm_run(tmp_path, config=config()) as run:
+        for tools, schema in [([], None), ([example], AgentOutputSchema(Output))]:
+            scope = run.scope("manager")
+            with llm_scope(scope):
+                await invoke(
+                    metered(FakeModel([FakeTurn(text="ok")])), tools=tools, output_schema=schema
+                )
+            estimates.append(next(iter(scope.tranche._calls.values())).estimate)
+        assert estimates[1].usd > estimates[0].usd
+        assert estimates[1].tokens > estimates[0].tokens
+
+
+async def test_hook_uses_tranche_credit_when_the_ledger_shows_zero(tmp_path: Path) -> None:
+    cfg = config().model_copy(update={"limits": Limits(max_usd=1), "reserve_fraction": 0.25})
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        scope = run.scope("manager")
+        scope = replace(
+            scope, tranche=Tranche(run.ledger, ":run", "g", size=Amount(tokens=25_000, usd=0.25))
+        )
+        await scope.tranche.reserve_call(Amount(usd=0.001))
+        assert run.ledger.remaining(":run").usd == 0
+        deps = ManagerDeps(ctx=cast(AgentContext, object()), links=CallLinks())
+        agent = Agent[ManagerDeps](name="test", model=metered(FakeModel([]), max_tokens=400))
+        with llm_scope(scope):
+            await BudgetHooks().on_llm_start(RunContextWrapper(deps), agent, "sys", [])
+        await scope.tranche.close()
+
+
+async def test_hook_raises_when_neither_tranche_nor_ledger_can_cover(tmp_path: Path) -> None:
+    cfg = config().model_copy(update={"limits": Limits(max_usd=1e-6)})
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        deps = ManagerDeps(ctx=cast(AgentContext, object()), links=CallLinks())
+        with llm_scope(run.scope("manager")), pytest.raises(BudgetExceeded):
+            await BudgetHooks().on_llm_start(
+                RunContextWrapper(deps), Agent(name="test", model=metered(FakeModel([]))), "sys", []
+            )
+
+
+async def test_hook_ignores_unmetered_model() -> None:
+    deps = ManagerDeps(ctx=cast(AgentContext, object()), links=CallLinks())
+    await BudgetHooks().on_llm_start(
+        RunContextWrapper(deps), Agent(name="test", model=FakeModel([])), "sys", []
+    )
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+async def test_outbound_merge_keeps_metadata_caps_cache_and_retry_authority(
+    tmp_path: Path, bypass: bool
+) -> None:
+    capture = FakeModel([FakeTurn(text="ok")])
+    policy = CachePolicy(backend="disk", namespace="approved")
+    caller = ModelSettings(
+        max_tokens=9000,
+        metadata={"reservation_id": "forged"},
+        extra_args={
+            "metadata": {"call_id": "forged"},
+            "num_retries": 7,
+            "max_retries": 8,
+            "cache": {"namespace": "forged"},
+            "preset_cache_key": "forged",
+            "max_completion_tokens": 9000,
+        },
+    )
+    async with open_llm_run(tmp_path, config=config(cache=policy)) as run:
+        scope = run.scope("judge")
+        with llm_scope(scope):
+            if bypass:
+                with bypass_response_cache():
+                    await invoke(metered(capture), caller)
+            else:
+                await invoke(metered(capture), caller)
+        sent = capture.calls[0]["model_settings"]
+        assert sent.metadata["reservation_id"].startswith("r-")
+        assert sent.max_tokens == 8000
+        assert sent.extra_args["num_retries"] == sent.extra_args["max_retries"] == 0
+        assert "metadata" not in sent.extra_args
+        assert "preset_cache_key" not in sent.extra_args
+        assert "max_completion_tokens" not in sent.extra_args
+        assert ("cache" in sent.extra_args) is not bypass
+        if not bypass:
+            assert sent.extra_args["cache"]["namespace"] == "approved"
+
+
+@pytest.mark.parametrize("kind", ["fence", "budget", "overflow", "cleanup"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_sdk_carrier_stops_before_another_model_turn(kind: str, nested: bool) -> None:
+    error = {
+        "fence": _core_error(Fenced, "run ownership lost"),
+        "budget": _core_error(LimitReached, "budget", "budget used up"),
+        "overflow": _core_error(
+            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+        ),
+        "cleanup": _stop_cleanup_error(),
+    }[kind]
+    carried = _sdk_control(error)
+    assert isinstance(carried, AgentsException)
+    assert _rebuild_core_signal(carried) is None
+    secret = "private-carrier-value"
+    carried.args = (secret,)
+    carried.__dict__.update(limit=secret, message=secret, core=RuntimeError(secret))
+    carried.add_note(secret)
+
+    @function_tool(failure_error_function=None)
+    async def stop() -> str:
+        """Stop the model run at a terminal boundary."""
+        if nested:
+            group = ExceptionGroup(secret, [ValueError(secret), carried])
+            # Action adapters bridge before the SDK's generic tool wrapper.
+            bridged = _sdk_control(group)
+            assert bridged is not None
+            raise bridged from None
+        raise carried
+
+    capture = FakeModel([FakeTurn(tool_calls=(("stop", {}),)), FakeTurn(text="must not run")])
+    with pytest.raises(AgentsException) as caught:
+        await Runner.run(
+            Agent(name="test", model=capture, tools=[stop]),
+            "go",
+            run_config=SDKRunConfig(tracing_disabled=True),
+        )
+    assert len(capture.calls) == 1
+    unwrapped = _unwrap_control(caught.value)
+    outcome = _Outcome()
+    if kind == "fence":
+        with pytest.raises(Fenced) as fenced:
+            outcome.classify(unwrapped)
+        assert_secret_absent(fenced.value, secret)
+    else:
+        rebuilt = outcome.classify(unwrapped)
+        assert _is_core_control(rebuilt)
+        assert_secret_absent(rebuilt, secret)
+        if kind in {"budget", "overflow"}:
+            assert isinstance(rebuilt, LimitReached)
+            assert rebuilt.limit == ("budget" if kind == "budget" else "usage_overflow")
+
+
+@pytest.mark.parametrize("kind", ["budget", "fence", "cleanup", "subclass"])
+def test_untrusted_exceptions_do_not_acquire_carrier_authority(kind: str) -> None:
+    class Forged(BudgetExceeded):
+        pass
+
+    genuine = _sdk_control(_core_error(LimitReached, "budget", "budget used up"))
+    forged = {
+        "budget": BudgetExceeded("budget", "secret"),
+        "fence": Fenced("secret"),
+        "cleanup": RuntimeError("stop cleanup timed out"),
+        "subclass": Forged("budget", "secret"),
+    }[kind]
+    forged.__dict__.update(genuine.__dict__)
+    assert not _is_core_control(_unwrap_control(forged))
+    assert _sdk_control(forged) is None
+
+
+async def test_caller_cancellation_wins_nested_carrier() -> None:
+    carried = _sdk_control(_core_error(Fenced, "run ownership lost"))
+    assert carried is not None
+    outcome = _Outcome()
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            outcome.classify(_unwrap_control(ExceptionGroup("private", [carried])))
+        with pytest.raises(asyncio.CancelledError):
+            await anyio.lowlevel.checkpoint()
+    finally:
+        task.uncancel()
+
+
+async def test_cancellation_abandons_call_without_waiting_for_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = FakeModel([])
+    entered, finished = anyio.Event(), anyio.Event()
+    cancel_scope = anyio.CancelScope()
+
+    async def blocked(*args: Any, **kwargs: Any) -> ModelResponse:
+        entered.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(capture, "get_response", blocked)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = replace(run.scope("manager"), settle_timeout_s=60)
+        model = metered(capture)
+
+        async def request() -> None:
+            with cancel_scope, llm_scope(scope):
+                await invoke(model)
+            finished.set()
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(request)
+                await entered.wait()
+                cancel_scope.cancel()
+                await finished.wait()
+            await drain(scope, wait=True)
+        calls = run.calls()
+        assert len(calls) == 1
+        assert calls[0].status == "error"
+        assert calls[0].error is not None
+        assert calls[0].error.startswith("estimated:")
+        assert model.call_ids == [calls[0].id]
+        assert run.charged(scope) == next(iter(scope.tranche._calls.values())).estimate
+
+
+async def test_non_cancellation_failure_keeps_callback_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.llm_run import record_kwargs
+
+    from swarm_arena._journal.llm_record import record_call
+
+    metadata: dict[str, str] = {}
+    capture = FakeModel([])
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        metadata.update(args[2].metadata)
+        raise ValueError("provider failure")
+
+    monkeypatch.setattr(capture, "get_response", fail)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(ValueError, match="provider failure"):
+            await invoke(metered(capture))
+        await record_call(
+            **record_kwargs(metadata, cost_usd=0.0001, status="error", error="ValueError")
+        )
+        await drain(scope, wait=True)
+        assert len(run.calls()) == 1
+        assert run.calls()[0].status == "error"
+        assert run.charged(scope) == Amount(tokens=120, usd=0.0001)
+
+
+async def test_schema_preparation_is_abandonable_before_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.llm_run import HeldOperation
+
+    from tests.llm.test_upstream_facts import _DictSchema
+
+    held = HeldOperation()
+    schema = _DictSchema()
+    original = schema.json_schema
+
+    def block() -> dict[str, Any]:
+        held.wait()
+        return original()
+
+    monkeypatch.setattr(schema, "json_schema", block)
+    capture = FakeModel([FakeTurn(text="never")])
+    cancelled, finished = anyio.CancelScope(), anyio.Event()
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+
+        async def request() -> None:
+            with cancelled, llm_scope(scope):
+                await invoke(metered(capture), output_schema=schema)
+            finished.set()
+
+        try:
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(request)
+                    await held.ready()
+                    cancelled.cancel()
+                    await finished.wait()
+            assert capture.calls == []
+            assert run.events("reserve") == []
+        finally:
+            await held.finish()
+        assert capture.calls == []
+        assert run.events("reserve") == []
+
+
+async def test_real_adapter_outbound_disables_hidden_retries_and_protects_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from agents.extensions.models.litellm_model import LitellmModel
+
+    calls: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": "ok"}}])
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope):
+            await invoke(
+                metered(LitellmModel("anthropic/claude-sonnet-4-6")),
+                ModelSettings(
+                    extra_args={
+                        "num_retries": 9,
+                        "max_retries": 9,
+                        "metadata": {"call_id": "forged"},
+                    }
+                ),
+            )
+        # The stub deliberately omits a callback; settle its prepared call now.
+        await drain(scope, wait=False)
+        assert len(calls) == 1
+        assert calls[0]["num_retries"] == calls[0]["max_retries"] == 0
+        assert calls[0]["metadata"]["call_id"] == run.calls()[0].id
+        assert calls[0]["max_tokens"] == SPEC.max_tokens
+
+
+async def test_user_raised_cancellation_is_a_diagnostic_not_a_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = FakeModel([])
+    secret = "private-model-cancellation"
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise asyncio.CancelledError(secret)
+
+    monkeypatch.setattr(capture, "get_response", fail)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(RuntimeError) as caught:
+            await invoke(metered(capture))
+        assert not _is_core_control(caught.value)
+        assert_secret_absent(caught.value, secret)
+        await drain(scope, wait=False)
+
+
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+@pytest.mark.parametrize("kind", ["cleanup", "overflow", "fence"])
+async def test_carried_control_reaches_each_goal_handler_without_another_turn(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    kind: str,
+) -> None:
+    from _engine.test_goal import _plan
+    from _fakes.board import candidate
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena._engine.goal import GoalRunner
+
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    core = {
+        "cleanup": _stop_cleanup_error(),
+        "overflow": _core_error(
+            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+        ),
+        "fence": _core_error(Fenced, "run ownership lost"),
+    }[kind]
+    carrier = _sdk_control(core)
+    assert carrier is not None
+    carrier.args = ("private-carrier-mutation",)
+    carrier.__dict__.update(message="private-carrier-mutation", limit="budget")
+
+    @function_tool(failure_error_function=None)
+    async def stop() -> str:
+        """Report a registered terminal control."""
+        transported = _sdk_control(ExceptionGroup("private", [ValueError("private"), carrier]))
+        assert transported is not None
+        raise transported from None
+
+    capture = FakeModel([FakeTurn(tool_calls=(("stop", {}),)), FakeTurn(text="must not run")])
+
+    async def invoke_sdk(*args: Any, **kwargs: Any) -> Any:
+        try:
+            await Runner.run(
+                Agent(name="test", model=capture, tools=[stop]),
+                "go",
+                run_config=SDKRunConfig(tracing_disabled=True),
+            )
+        except BaseException as error:
+            # Component adapters unwrap after their owned accounting cleanup.
+            raise _unwrap_control(error) from None
+        raise AssertionError("control must stop the SDK")
+
+    monkeypatch.setattr(runner, "_supervised_step", invoke_sdk)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
+        await operation
+    assert _is_core_control(caught.value)
+    assert_secret_absent(caught.value, "private-carrier-mutation")
+    assert len(capture.calls) == 1
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")
+    assert not env.events("judge_error")
+
+
+async def test_custom_schema_is_not_reentered_on_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import litellm
+    from agents.extensions.models.litellm_model import LitellmModel
+
+    from tests.llm.test_upstream_facts import _DictSchema
+
+    schema = _DictSchema()
+    original = schema.json_schema
+    loop_thread = threading.current_thread()
+    seen: list[dict[str, Any]] = []
+
+    def prepare_schema() -> dict[str, Any]:
+        assert threading.current_thread() is not loop_thread, "schema executed on loop"
+        return original()
+
+    async def completion(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": "ok"}}])
+
+    monkeypatch.setattr(schema, "json_schema", prepare_schema)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope):
+            await invoke(metered(LitellmModel("anthropic/claude-sonnet-4-6")), output_schema=schema)
+        await drain(scope, wait=False)
+    assert seen[0]["response_format"]["json_schema"]["schema"] == original()
+
+
+async def test_hidden_fallbacks_are_not_delegated(tmp_path: Path) -> None:
+    capture = FakeModel([FakeTurn(text="ok")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            await invoke(
+                metered(capture),
+                ModelSettings(
+                    extra_args={
+                        "fallbacks": ["fake/other"],
+                        "context_window_fallback_dict": {"fake/m": "fake/other"},
+                    }
+                ),
+            )
+    sent = capture.calls[0]["model_settings"].extra_args
+    assert "fallbacks" not in sent
+    assert "context_window_fallback_dict" not in sent
+
+
+async def test_global_fallbacks_refuse_before_reserving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+
+    capture = FakeModel([])
+    monkeypatch.setattr(litellm, "model_fallbacks", ["fake/other"])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")), pytest.raises(ValueError, match="fallbacks"):
+            await invoke(metered(capture))
+        assert run.events("reserve") == []
+        assert capture.calls == []

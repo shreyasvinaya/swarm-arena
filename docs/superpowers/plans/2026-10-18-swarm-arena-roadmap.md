@@ -2529,6 +2529,29 @@ def cache_identity(kwargs: Mapping[str, Any], response: Any, *,
     # Missing/conflicting evidence returns None; the core restores its index on resume.
 ```
 
+M3 metering and control bridge extension:
+
+- `llm/_hooks.py::MeteredModel` reserves against the current scope before each
+  request, applies `merge_model_settings` as the final settings merge, disables
+  hidden provider retries and links detached responses through `CallLinks`.
+  `BudgetHooks` uses `Tranche.can_cover`; it never substitutes ledger remaining
+  for credit in a committed tranche. Closed or overflowed tranches cannot cover
+  calls; smaller next batches and independent reservations use the same funding
+  rules as actual admission.
+- `llm/_hooks.py::_sdk_control(error) -> AgentsException | None` issues private
+  SDK carriers only for registered core controls. `_unwrap_control(error)`
+  restores saved core snapshots, including nested groups, before the consumer's
+  captured `_Outcome` classifies the result after owned cleanup. SDK function
+  tools use `failure_error_function=None`; plain caller-created
+  `BudgetExceeded` instances and copied carrier attributes confer no authority.
+- `_errors.py` stores an immutable category alongside each vetted snapshot:
+  diagnostic, ordinary limit, terminal failure or fencing. Registration alone
+  proves safe provenance, not control meaning. `_is_core_control` consults only
+  that snapshot; `_outcomes.py` retains caller cancellation before nested
+  fencing, then terminal cleanup/overflow, limits and contained diagnostics.
+  Final judging, replanning and policy consume this one mechanism and preserve
+  the actual writer cause. The core never imports the optional SDK.
+
 #### R4.13.18 CLI — M1a (root) and later
 
 ```python

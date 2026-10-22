@@ -133,6 +133,87 @@ class Tranche:
             micros = _USD_LIMIT_MICROS
         return _nonnegative(Amount(tokens=tokens, usd=_usd_from_micro_units(micros)))
 
+    def _available_batch(self, estimate: Amount) -> _Batch | None:
+        """Find the same durable local credit for advisory and real admission."""
+        return next(
+            (
+                batch
+                for batch in reversed(self._batches)
+                if batch.durable
+                and batch.tokens >= estimate.tokens
+                and batch.micros >= estimate._micro_usd
+            ),
+            None,
+        )
+
+    def _next_size(self) -> Amount:
+        """Shrink only capped units to the holder's currently available funds."""
+        remaining = self._ledger.remaining(self._holder)
+        limits = self._ledger.limits
+        return Amount(
+            tokens=min(self._size.tokens, remaining.tokens)
+            if limits.max_tokens is not None
+            else self._size.tokens,
+            usd=_usd_from_micro_units(min(self._size._micro_usd, remaining._micro_usd))
+            if limits.max_usd is not None
+            else self._size.usd,
+        )
+
+    def can_cover(self, estimate: Amount) -> bool:
+        """
+        Check whether current funding can admit a call without changing it.
+
+        Parameters
+        ----------
+        estimate : Amount
+            Nonnegative call estimate.
+
+        Returns
+        -------
+        bool
+            Whether a durable batch, a smaller new batch or an independent
+            reservation can cover the call. Closed or overflowed tranches
+            return False. The check is advisory under concurrent reservations.
+
+        Raises
+        ------
+        ValueError
+            If the estimate or holder is invalid.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena._model.limits import Limits
+        >>> ledger = Mock(spec=Ledger, limits=Limits(max_usd=1))
+        >>> ledger.remaining.return_value = Amount(usd=0.1)
+        >>> tranche = Tranche(ledger, "g/t/a", "g", size=Amount(usd=0.25))
+        >>> tranche.can_cover(Amount(usd=0.05))
+        True
+        >>> tranche.can_cover(Amount(usd=0.2))
+        False
+        """
+        if self._closed or self._outcome.overflow:
+            return False
+        try:
+            self._ledger._check_usage_overflow()
+        except LimitReached:
+            return False
+        estimate = _nonnegative(estimate)
+        if not estimate.fits_in(self._size, cap_tokens=True, cap_usd=True):
+            if self._holder != ":run" and self._holder.split("/", 1)[0] != self._goal_id:
+                return False
+            return estimate.fits_in(
+                self._ledger.remaining(self._holder),
+                cap_tokens=self._ledger.limits.max_tokens is not None,
+                cap_usd=self._ledger.limits.max_usd is not None,
+            )
+        if self._available_batch(estimate) is not None:
+            return True
+        size = self._next_size()
+        if self._holder != ":run" and self._holder.split("/", 1)[0] != self._goal_id:
+            return False
+        return estimate.fits_in(size, cap_tokens=True, cap_usd=True)
+
     async def reserve_call(self, estimate: Amount) -> str:
         """
         Admit a call locally or commit a sufficient new reservation first.
@@ -193,25 +274,9 @@ class Tranche:
                 await anyio.lowlevel.checkpoint_if_cancelled()
                 call.actual = None
                 return res.id
-            batch = next(
-                (
-                    b
-                    for b in reversed(self._batches)
-                    if b.durable and b.tokens >= estimate.tokens and b.micros >= estimate._micro_usd
-                ),
-                None,
-            )
+            batch = self._available_batch(estimate)
             if batch is None:
-                remaining = self._ledger.remaining(self._holder)
-                limits = self._ledger.limits
-                size = Amount(
-                    tokens=min(self._size.tokens, remaining.tokens)
-                    if limits.max_tokens is not None
-                    else self._size.tokens,
-                    usd=_usd_from_micro_units(min(self._size._micro_usd, remaining._micro_usd))
-                    if limits.max_usd is not None
-                    else self._size.usd,
-                )
+                size = self._next_size()
                 if not estimate.fits_in(size, cap_tokens=True, cap_usd=True):
                     raise _core_signal(LimitReached("budget", f"budget used up for {self._holder}"))
 

@@ -7,10 +7,13 @@ import anyio
 
 from swarm_arena._errors import (
     Fenced,
+    _core_category,
     _core_error,
     _exception_type_name,
+    _is_core_control,
     _is_core_signal,
     _rebuild_core_signal,
+    _SignalCategory,
     _with_exception_type,
 )
 
@@ -20,7 +23,7 @@ def _has_core_fenced(error: BaseException) -> bool:
     pending = [error]
     while pending:
         current = pending.pop()
-        if isinstance(current, Fenced) and _is_core_signal(current):
+        if _core_category(current) is _SignalCategory.FENCED:
             return True
         if isinstance(current, BaseExceptionGroup):
             pending.extend(current.exceptions)
@@ -35,10 +38,31 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
         raise asyncio.CancelledError() from None
     if _has_core_fenced(error):
         raise _core_error(Fenced, "run ownership lost") from None
+    # Nested groups cannot demote terminal cleanup or overflow to a hook
+    # diagnostic. Fencing above still wins over every other registered control.
+    pending = [error]
+    limit: Exception | None = None
+    while pending:
+        current = pending.pop()
+        category = _core_category(current)
+        if category is _SignalCategory.TERMINAL:
+            rebuilt = _rebuild_core_signal(current)
+            assert rebuilt is not None
+            return rebuilt
+        if category is _SignalCategory.LIMIT:
+            limit = _rebuild_core_signal(current)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    if limit is not None:
+        return limit
     rebuilt = _rebuild_core_signal(error)
     if rebuilt is not None:
         return rebuilt
-    if isinstance(error, (Fenced, BaseExceptionGroup)) or not isinstance(error, Exception):
+    from swarm_arena._agent.manager import LimitReached
+
+    if isinstance(error, (Fenced, LimitReached, BaseExceptionGroup)) or not isinstance(
+        error, Exception
+    ):
         name = _exception_type_name(error)
         return _with_exception_type(
             _core_error(RuntimeError, f"supervised hook failed: {name}"), name
@@ -48,7 +72,9 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
 
 def _propagate_control(error: BaseException) -> None:
     """Raise control outcomes when a boundary intentionally discards failure details."""
-    _classify_outcome(error)
+    classified = _classify_outcome(error)
+    if _is_core_control(classified):
+        raise classified from None
 
 
 class _Outcome:
@@ -73,13 +99,14 @@ class _Outcome:
 
     def propagate_control(self, error: BaseException) -> None:
         """Propagate controls using this caller's cancellation snapshot."""
-        self.classify(error)
+        classified = self.classify(error)
+        if _is_core_control(classified):
+            raise classified from None
 
     def contain(self, error: BaseException, error_type: type[Exception], site: str) -> NoReturn:
         """Raise rebuilt core signals or a fresh type-only boundary failure."""
-        registered = _is_core_signal(error)
         classified = self.classify(error)
-        if registered:
+        if _is_core_control(classified) or _is_core_signal(error):
             raise classified from None
         raise _core_error(
             error_type, f"{site} failed: {_exception_type_name(classified)}"

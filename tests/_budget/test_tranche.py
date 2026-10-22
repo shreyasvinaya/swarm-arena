@@ -600,3 +600,49 @@ async def test_overflow_marker_requires_normalized_limit(env: LedgerEnv) -> None
     assert env.count("settle") == 0
     assert not (await tranche.settle_call(rid, Amount(usd=0.01))).overflow
     assert env.charged("g1/t/a") == Amount(usd=0.01)
+
+
+@pytest.mark.parametrize(
+    "case", ["free credit fits", "tranche used up, ledger fits one tranche", "neither"]
+)
+async def test_can_cover_matches_reserve_call(case: str, tmp_path: Path) -> None:
+    env = await _env(Limits(max_usd=1 if case != "neither" else 0.3))
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(tokens=25_000, usd=0.25))
+    await tranche.reserve_call(Amount(usd=0.1 if case == "free credit fits" else 0.25))
+    est = Amount(usd=0.1)
+    before = list(env.journal.events)
+    assert tranche.can_cover(est) is (case != "neither")
+    assert env.journal.events == before
+    if case == "neither":
+        with pytest.raises(LimitReached):
+            await tranche.reserve_call(est)
+    else:
+        await tranche.reserve_call(est)
+    await tranche.close()
+
+
+@pytest.mark.parametrize(("tokens", "usd"), [(None, None), (100, None), (None, 0.1), (100, 0.1)])
+@pytest.mark.parametrize("size", [Amount(), Amount(tokens=25_000, usd=0.25)])
+async def test_can_cover_shrinks_batches_and_respects_uncapped_units(
+    tokens: int | None,
+    usd: float | None,
+    size: Amount,
+) -> None:
+    env = await _env(Limits(max_tokens=tokens, max_usd=usd))
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=size)
+    estimate = Amount(tokens=10, usd=0.01)
+    assert tranche.can_cover(estimate)
+    await tranche.reserve_call(estimate)
+    await tranche.close()
+    assert not tranche.can_cover(Amount())
+
+
+async def test_can_cover_rejects_overflow_even_with_free_credit(env: LedgerEnv) -> None:
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    await tranche.reserve_call(Amount(usd=0.01))
+    other = Tranche(env.ledger, "g1/t/a", "g1", size=Amount())
+    rid = await other.reserve_call(Amount(usd=0.01))
+    await other._settle_call(rid, Amount(usd=USD_LIMIT), overflow=True)
+    assert not tranche.can_cover(Amount())
+    with pytest.raises(LimitReached, match="overflow"):
+        await tranche.reserve_call(Amount())

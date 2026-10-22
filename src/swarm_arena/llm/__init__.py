@@ -23,7 +23,8 @@ except ModuleNotFoundError as _exc:
     raise
 
 from swarm_arena._facade import publish as _publish
+from swarm_arena.llm._hooks import BudgetExceeded
 
-__all__: list[str] = []
+__all__: list[str] = ["BudgetExceeded"]
 
 _publish(__name__, __all__)

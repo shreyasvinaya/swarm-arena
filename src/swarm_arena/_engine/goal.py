@@ -38,7 +38,9 @@ from swarm_arena._errors import (
     StorageError,
     _core_error,
     _exception_type_name,
+    _is_core_control,
     _is_core_signal,
+    _SignalCategory,
     _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
@@ -382,7 +384,11 @@ class GoalRunner:
         """Keep retained storage reads and writes within final-work supervision."""
         completed, result = await self._supervised_step(operation, final=True, settle_on_stop=True)
         if not completed:
-            raise _core_error(RuntimeError, "goal storage settlement timed out")
+            raise _core_error(
+                RuntimeError,
+                "goal storage settlement timed out",
+                _category=_SignalCategory.TERMINAL,
+            )
         return cast(_T, result)
 
     async def _write_view(self, key: str, content: bytes, *, source: Head) -> None:
@@ -668,8 +674,7 @@ class GoalRunner:
                 grace_until: float | None = None
                 try:
                     while True:
-                        if self.deps.journal.fenced.is_set():
-                            raise _core_error(Fenced, "run ownership lost")
+                        self.deps.journal._raise_if_fenced()
                         stopped = self._stop()
                         if stopped and not final:
                             break
@@ -1010,6 +1015,7 @@ class GoalRunner:
                     ctx,
                 )
 
+        boundary = _Outcome()
         try:
             order: list[Candidate] = []
             completed = True
@@ -1020,14 +1026,14 @@ class GoalRunner:
                     order, outcome = result
                 else:
                     raise TimeoutError
-            except Fenced:
-                raise
-            except LimitReached:
-                self.status, self.reason = "no_result", "final slice used up"
-                return []
-            except Exception as error:
-                if self.deps.journal.fenced.is_set():
-                    raise
+            except BaseException as error:
+                error = boundary.classify(error)
+                self.deps.journal._raise_if_fenced()
+                if _is_core_control(error):
+                    if type(error) is LimitReached and error.limit != "usage_overflow":
+                        self.status, self.reason = "no_result", "final slice used up"
+                        return []
+                    raise error from None
                 outcome = JudgeOutcome(
                     scores=[],
                     errors=[
@@ -1073,12 +1079,15 @@ class GoalRunner:
             )
             return order
         finally:
-            if reservation is not None:
-                await self.deps.ledger.settle(
-                    reservation.id, amount if dispatched else Amount(), estimated=dispatched
-                )
-            await self._close(tranche)
-            self._stop()
+            try:
+                if reservation is not None:
+                    await self.deps.ledger.settle(
+                        reservation.id, amount if dispatched else Amount(), estimated=dispatched
+                    )
+                await self._close(tranche)
+                self._stop()
+            except BaseException as error:
+                raise boundary.classify(error) from None
 
     async def _replan(self) -> bool:
         """Supervise the proposal, then atomically recheck capacity and publish."""
@@ -1113,16 +1122,17 @@ class GoalRunner:
                     proposed = await proposed
                 return await run_sync_daemon(_detach_plan, proposed)
 
+        boundary = _Outcome()
         try:
             try:
                 completed, proposed = await self._supervised_step(propose, final=False)
             finally:
                 await self._close(tranche)
-        except Fenced:
-            raise
-        except Exception as error:
-            if self.deps.journal.fenced.is_set():
-                raise
+        except BaseException as error:
+            error = boundary.classify(error)
+            self.deps.journal._raise_if_fenced()
+            if _is_core_control(error):
+                raise error from None
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
@@ -1272,14 +1282,15 @@ class GoalRunner:
                 proposed = await proposed
             return await run_sync_daemon(lambda: guard(_detach_model(Decision, proposed), state))
 
+        boundary = _Outcome()
         try:
             completed, result = await self._supervised_step(invoke, final=False)
             decision = result if completed and result is not None else Decision()
-        except Fenced:
-            raise
-        except Exception as error:
-            if self.deps.journal.fenced.is_set():
-                raise
+        except BaseException as error:
+            error = boundary.classify(error)
+            self.deps.journal._raise_if_fenced()
+            if _is_core_control(error):
+                raise error from None
             decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(

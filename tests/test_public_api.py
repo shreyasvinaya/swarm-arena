@@ -116,6 +116,15 @@ PUBLIC["swarm_arena"] += ["ProgramJudge"]
 PUBLIC["swarm_arena.scoring"] += ["Lexicographic"]
 
 
+try:
+    importlib.metadata.version("openai-agents")
+    importlib.metadata.version("litellm")
+except importlib.metadata.PackageNotFoundError:
+    pass
+else:
+    PUBLIC["swarm_arena.llm"] = ["BudgetExceeded"]
+
+
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_all_snapshot(module: str) -> None:
     names = importlib.import_module(module).__all__
@@ -202,7 +211,7 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
     } <= found
 
 
-CORE = sorted(set(PUBLIC) - {"swarm_arena", "swarm_arena.testing"})
+CORE = sorted(set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm"})
 
 
 @pytest.mark.parametrize("pydantic_model", [False, True])

@@ -1,6 +1,8 @@
 """Define user-visible plan, configuration, action, and storage errors."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from enum import Enum, auto
 from typing import Any, TypeVar, cast
 from weakref import WeakKeyDictionary
 
@@ -168,24 +170,43 @@ _CORE_STORAGE_ERRORS: tuple[type[StorageError], ...] = (
 )
 
 
-_CORE_SIGNALS: WeakKeyDictionary[
-    Exception, tuple[type[Exception], tuple[str, ...], str | None, tuple[str, ...] | None, str]
-] = WeakKeyDictionary()
+class _SignalCategory(Enum):
+    """Core-owned authority, independent of an exception's public shape."""
+
+    DIAGNOSTIC = auto()
+    LIMIT = auto()
+    TERMINAL = auto()
+    FENCED = auto()
+
+
+@dataclass(frozen=True)
+class _SignalSnapshot:
+    kind: type[Exception]
+    args: tuple[str, ...]
+    limit: str | None
+    errors: tuple[str, ...] | None
+    name: str
+    category: _SignalCategory
+
+
+_CORE_SIGNALS: WeakKeyDictionary[Exception, _SignalSnapshot] = WeakKeyDictionary()
 _SignalT = TypeVar("_SignalT", bound=Exception)
 
 
-def _core_error(cls: type[_SignalT], *args: Any) -> _SignalT:
+def _core_error(
+    cls: type[_SignalT], *args: Any, _category: _SignalCategory | None = None
+) -> _SignalT:
     """Construct and register one vetted error, including weak runtime errors."""
     if cls is RuntimeError:
-        return cast(_SignalT, _core_signal(_CoreRuntimeError(*args)))
+        return cast(_SignalT, _core_signal(_CoreRuntimeError(*args), _category=_category))
     if cls is ValueError:
-        return cast(_SignalT, _core_signal(_CoreValueError(*args)))
-    return _core_signal(cls(*args))
+        return cast(_SignalT, _core_signal(_CoreValueError(*args), _category=_category))
+    return _core_signal(cls(*args), _category=_category)
 
 
 def _stop_cleanup_error() -> RuntimeError:
     """Build the shared safe error for exhausted stop-storage settlement."""
-    return _core_error(RuntimeError, "stop cleanup timed out")
+    return _core_error(RuntimeError, "stop cleanup timed out", _category=_SignalCategory.TERMINAL)
 
 
 def _core_signal_kinds() -> tuple[type[Exception], ...]:
@@ -205,7 +226,7 @@ def _core_signal_kinds() -> tuple[type[Exception], ...]:
     )
 
 
-def _core_signal(error: _SignalT) -> _SignalT:
+def _core_signal(error: _SignalT, *, _category: _SignalCategory | None = None) -> _SignalT:
     """Register a freshly core-created signal and snapshot its vetted payload.
 
     Call only at core construction sites, never on exceptions caught from
@@ -218,7 +239,18 @@ def _core_signal(error: _SignalT) -> _SignalT:
     if not any(type(error) is kind for kind in _core_signal_kinds()):
         raise TypeError("expected a core error")
     if error not in _CORE_SIGNALS:
-        _CORE_SIGNALS[error] = (
+        category = _category
+        if category is None:
+            category = (
+                _SignalCategory.FENCED
+                if type(error) is Fenced
+                else _SignalCategory.TERMINAL
+                if type(error) is LimitReached and error.limit == "usage_overflow"
+                else _SignalCategory.LIMIT
+                if type(error) is LimitReached
+                else _SignalCategory.DIAGNOSTIC
+            )
+        _CORE_SIGNALS[error] = _SignalSnapshot(
             type(error),
             error.args,
             error.limit if isinstance(error, LimitReached) else None,
@@ -228,6 +260,7 @@ def _core_signal(error: _SignalT) -> _SignalT:
             else "ValueError"
             if type(error) is _CoreValueError
             else type(error).__name__,
+            category,
         )
     return error
 
@@ -237,7 +270,7 @@ def _exception_type_name(error: BaseException) -> str:
     if any(type(error) is kind for kind in _core_signal_kinds()):
         payload = _CORE_SIGNALS.get(cast(Exception, error))
         if payload is not None:
-            return payload[4]
+            return payload.name
     if type(error) is _CoreRuntimeError:
         return "RuntimeError"
     if type(error) is _CoreValueError:
@@ -247,8 +280,7 @@ def _exception_type_name(error: BaseException) -> str:
 
 def _with_exception_type(error: _SignalT, name: str) -> _SignalT:
     """Attach an originating type to a freshly registered, sanitized failure."""
-    kind, args, limit, errors, _ = _CORE_SIGNALS[error]
-    _CORE_SIGNALS[error] = kind, args, limit, errors, name
+    _CORE_SIGNALS[error] = replace(_CORE_SIGNALS[error], name=name)
     return error
 
 
@@ -258,6 +290,19 @@ def _is_core_signal(error: BaseException) -> bool:
         any(type(error) is kind for kind in _core_signal_kinds())
         and cast(Exception, error) in _CORE_SIGNALS
     )
+
+
+def _core_category(error: BaseException) -> _SignalCategory | None:
+    """Read authority only from the exact-type, nontransferable snapshot."""
+    if not _is_core_signal(error):
+        return None
+    return _CORE_SIGNALS[cast(Exception, error)].category
+
+
+def _is_core_control(error: BaseException) -> bool:
+    """Distinguish real controls from safely reconstructible diagnostics."""
+    category = _core_category(error)
+    return category is not None and category is not _SignalCategory.DIAGNOSTIC
 
 
 def _rebuild_core_signal(error: BaseException) -> Exception | None:
@@ -276,13 +321,13 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
     payload = _CORE_SIGNALS.get(cast(Exception, error))
     if payload is None:
         return None
-    kind, args, limit, errors, name = payload
+    kind, args, limit, errors = payload.kind, payload.args, payload.limit, payload.errors
     if kind is LimitReached:
         assert limit is not None
-        rebuilt = _core_error(LimitReached, limit, args[0])
+        rebuilt = _core_error(LimitReached, limit, args[0], _category=payload.category)
     elif kind is PlanError:
         assert errors is not None
-        rebuilt = _core_error(PlanError, errors)
+        rebuilt = _core_error(PlanError, errors, _category=payload.category)
     else:
-        rebuilt = _core_error(kind, *args)
-    return _with_exception_type(rebuilt, name)
+        rebuilt = _core_error(kind, *args, _category=payload.category)
+    return _with_exception_type(rebuilt, payload.name)

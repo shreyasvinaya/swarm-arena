@@ -3,6 +3,7 @@
 import json
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import Any
 
 import anyio
@@ -780,6 +781,122 @@ async def test_writer_timeout_bypasses_component_error_handlers(
     operation = runner._replan() if site == "replan" else runner._round_decision(1)
     with pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught:
         await operation
-    assert caught.value is error
+    assert caught.value is not error
+    assert _is_core_signal(caught.value)
     assert not env.events("plan_rejected")
     assert not env.events("decision")
+
+
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+@pytest.mark.parametrize("kind", ["cleanup", "overflow", "fence", "validation", "cancel", "group"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_goal_handlers_use_registered_categories(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    kind: str,
+    nested: bool,
+) -> None:
+    import asyncio
+
+    from _fakes.board import candidate
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._outcomes import _classify_outcome
+
+    secret = "private-goal-outcome"
+    errors: dict[str, BaseException] = {
+        "cleanup": _stop_cleanup_error(),
+        "overflow": _core_error(
+            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+        ),
+        "fence": _core_error(Fenced, "run ownership lost"),
+        "validation": _core_error(ValueError, "invalid field"),
+        "cancel": _classify_outcome(asyncio.CancelledError(secret)),
+        "group": _classify_outcome(BaseExceptionGroup(secret, [asyncio.CancelledError(secret)])),
+    }
+    error = errors[kind]
+    error.args = (secret,)
+    error.add_note(secret)
+    error.__dict__.update(category="control", limit=secret)
+    if nested:
+        error = BaseExceptionGroup(secret, [asyncio.CancelledError(secret), error])
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    invocations: list[str] = []
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        invocations.append(site)
+        raise error
+
+    monkeypatch.setattr(runner, "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    if kind in {"cleanup", "overflow", "fence"}:
+        with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
+            await operation
+        assert_secret_absent(caught.value, secret)
+        if kind == "overflow":
+            assert isinstance(caught.value, LimitReached)
+            assert caught.value.limit == "usage_overflow"
+        elif kind == "fence":
+            assert isinstance(caught.value, Fenced)
+        else:
+            assert str(caught.value) == "stop cleanup timed out"
+        assert not env.events("plan_rejected")
+        assert not env.events("decision")
+        assert not env.events("judge_error")
+    else:
+        await operation
+        await env.deps.journal.commit()
+        event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
+        assert env.events(event_kind)
+        assert secret not in str([event.payload for event in env.events(event_kind)])
+    assert invocations == [site]
+
+
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+async def test_goal_handler_caller_cancellation_wins_terminal_outcome(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+) -> None:
+    import asyncio
+
+    from _fakes.board import candidate
+
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    task = asyncio.current_task()
+    assert task is not None
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        task.cancel()
+        raise ExceptionGroup(
+            "private", [_stop_cleanup_error(), _core_error(Fenced, "run ownership lost")]
+        )
+
+    monkeypatch.setattr(runner, "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    finally:
+        task.uncancel()
+        # Cleanup may or may not have consumed the native cancellation delivery.
+        with suppress(asyncio.CancelledError):
+            await anyio.lowlevel.checkpoint()
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")
+    assert not env.events("judge_error")

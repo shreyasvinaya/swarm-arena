@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metered LLM calls reserve against committed tranche credit, protect per-call
+  tracking and output caps, link requested tools to their call, and preserve
+  registered budget, fencing and cleanup controls across SDK boundaries.
+
 - LiteLLM call logging with per-run catalog prices, exact cache-lifetime usage,
   conservative failed-call charging, proven response-cache origins, and idempotent
   logger/cache installation under the owning run lifetime.

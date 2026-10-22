@@ -110,9 +110,10 @@ Settlement is idempotent by reservation ID. Ordinary reported usage releases
 unused funding back to its original pools. After a committed start,
 provider-using tools retain the full reservation when usage cannot be recovered,
 including invalid output; available usage otherwise settles the reported amount.
-`settle_timeout_s` bounds the wait for pending call reports, not the subsequent
-durable settlement writes. Without a committed settle, the reservation stays
-charged in full. Cancelling construction or command preparation
+`settle_timeout_s` bounds the wait for pending call reports and post-stop or
+post-deadline settlement, including durable stop-result publication. Healthy
+live settlement remains under its owner's supervision without this fixed timer.
+Without a committed settle, the reservation stays charged in full. Cancelling construction or command preparation
 before a committed start releases the reservation at zero while ownership is
 held; a late preparation result never launches or journals work.
 
@@ -129,9 +130,36 @@ that enforces tool-internal provider spending. Reported overspend is recorded
 and can exhaust the budget. Usage beyond the supported accounting range
 terminally exhausts the whole run, even with unset caps.
 
-The tranche machinery reserves before spending and settles unused portions;
-its default sizes are listed above. Built-in LLM calls and gateway enforcement
-are M3 work, not an available provider safety guarantee.
+## Tokens, USD, and tranches
+
+Metered LLM calls reserve before dispatch against their scope's committed
+tranche. Default tranche sizes are **0.25 USD and 25,000 tokens**. Small calls
+use available tranche credit; a new tranche shrinks to the remaining capped
+budget when necessary, and larger calls reserve independently. The advisory
+hook checks tranche credit as well as the remaining ledger balance; the actual
+reservation remains authoritative when calls overlap.
+
+Each admitted call gets its own reservation ID and preallocated LLM call ID.
+Callbacks settle by reservation ID, including concurrent identical requests.
+The output cap never exceeds the catalog's `max_tokens`; estimates include
+serialized prompts, input items, tools and output schemas. Provider-managed
+retries are disabled so hidden attempts cannot share one reservation. Runner
+retries, when enabled, enter the metered path again with a fresh reservation.
+
+Scope owners drain before closing their tranche. A missing report after
+`settle_timeout_s` produces an `estimated:` call error charged at the reservation;
+a cancelled call is abandoned so drain does not wait for its callback. A
+response-cache hit costs **0 USD and 0 charged tokens**, while retaining reported
+usage for display. Local budget refusal before reservation sends no request,
+creates no LLM call record and costs zero.
+
+`BudgetExceeded` is both an SDK exception and a `LimitReached`. Registered
+fencing, terminal cleanup failure and usage overflow stop the SDK operation
+without another model turn; sanitized hook failures do not gain that authority.
+Usage overflow retains conservative charges. Exact journal/ledger equality
+applies to finalized, non-overflow accounting; fencing or interrupted publication
+can leave a reservation conservatively charged. Gateway enforcement of external
+tool spending remains later work.
 
 ## Three execution clocks and the watchdog
 
