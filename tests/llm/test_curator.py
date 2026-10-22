@@ -485,3 +485,82 @@ async def test_identifier_subclasses_do_not_run_comparison_hooks(tmp_path: Path)
             )
     assert summary.supersedes == ["L1", "L2"]
     assert type(summary.namespace) is str
+
+
+@pytest.mark.parametrize("second_call", [False, True])
+async def test_custom_curator_failure_waits_for_authoritative_usage(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, second_call: bool
+) -> None:
+    from _engine.test_goal import _curation_checkpoint
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena.llm._curator import CURATOR_SCHEMA
+    from swarm_arena.llm._structured import structured_call
+
+    env = env.with_limits(max_usd=10, max_tokens=100000)
+    runner = await _curation_checkpoint(env)
+    config = configuration()
+    config.models.root["costly"] = config.models.root["cur"].model_copy(
+        update={"prices": ModelSpec.Prices(input=1e6, output=1e6)}
+    )
+    env.deps.config = env.deps.config.model_copy(update={"models": config.models})
+    fake = LateFakeModel([turn([])], delay_s=0.3)
+    fake.register("cur")
+    FakeModel([]).register("costly")
+
+    async def curate(
+        self: MergeAll, namespace: str, new: Sequence[Learning], view: BoardView
+    ) -> list[Learning]:
+        scope = current_llm_scope()
+        assert scope is not None
+        for alias in ["cur", "costly"] if second_call else ["cur"]:
+            await structured_call(
+                alias=alias,
+                role="curator",
+                models=scope.models,
+                namespace=namespace,
+                system="merge",
+                user="data",
+                schema=CURATOR_SCHEMA,
+                name="curator",
+                no_cache_read=False,
+                temperature=None,
+            )
+        raise KeyError("SECRET")
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    try:
+        async with _bound_run(
+            env.deps.run_id,
+            journal=env.deps.journal,
+            ids=env.deps.ids,
+            artifacts=env.deps.artifacts,
+            config=env.deps.config,
+            stops=env.deps.stops,
+            clock=env.deps.clock,
+            state=RunState.from_events(env._events()),
+        ):
+            await runner._curate_round(1)
+        (event,) = env.events("llm_call")
+        call = event.payload["call"]
+        assert call["error"] is None
+        assert call["cost_usd"] == pytest.approx(0.00014)
+        assert fake.recorded.is_set()
+        (receipt,) = env.events("curated")
+        assert receipt.payload["errors"] == [
+            "curator limit: budget" if second_call else "curator error: KeyError"
+        ]
+        reserves = {
+            e.payload["reservation"]["id"]
+            for e in env.events("reserve")
+            if e.payload["reservation"]["holder"] == "g/:curator"
+        }
+        charged = sum(
+            e.payload["actual"]["usd"] for e in env.events("settle") if e.payload["id"] in reserves
+        )
+        assert charged == pytest.approx(call["cost_usd"])
+    finally:
+        await fake.aclose()

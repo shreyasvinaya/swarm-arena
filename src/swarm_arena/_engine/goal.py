@@ -1409,11 +1409,13 @@ class GoalRunner:
                 return [], [_curator_error(outcome.classify(error))]
 
         completed = False
+        interrupted = False
         result: tuple[list[Learning], list[str]] | None = None
         boundary = _Outcome()
         failure: BaseException | None = None
         try:
             completed, result = await self._supervised_step(invoke, final=False)
+            interrupted = not completed
         except BaseException as error:
             failure = error
             try:
@@ -1429,6 +1431,8 @@ class GoalRunner:
                     self.select_only = True
                     self.status, self.reason = "stopped", "reserve_exhausted"
                     failure = None
+            except anyio.get_cancelled_exc_class() as cancelled:
+                interrupted, failure = True, cancelled
             except BaseException as control:
                 failure = control
         finally:
@@ -1441,7 +1445,7 @@ class GoalRunner:
             try:
                 with _local_timer_scope(timer) as local_timer:
                     with timer:
-                        await drain(scope, wait=False)
+                        await drain(scope, wait=not interrupted)
                     if local_timer.failure is not None:
                         raise local_timer.failure from None
                     if timer.cancel_called:
