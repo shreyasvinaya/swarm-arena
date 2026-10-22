@@ -9,7 +9,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import LimitReached, Manager
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import _exception_type_name, _is_core_signal
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
@@ -330,6 +330,8 @@ async def check_judge(
         the wrong type, or ``judge()`` does not return a list of valid
         ``Score`` objects, returns a score for an unknown candidate, or two
         scores for one candidate, or leaves LLM calls undrained.
+    RuntimeError
+        If a registered run setup fails or owned core cleanup fails.
     ValueError
         If any candidate goal_id does not match the goal id, a file glob
         matches no file, or the judge cannot be built.
@@ -464,6 +466,8 @@ async def check_manager(
         Component failures name only the exception type; the original cause
         may contain connector text, as permitted by the kit diagnostic policy.
         LLM contract failures name the violated rule.
+    RuntimeError
+        If a registered run setup fails or owned core cleanup fails.
     ValueError
         If components cannot be built or snapshotted, or rounds is not positive.
 
@@ -502,12 +506,17 @@ async def check_manager(
             limits=limits,
             config=config,
         )
-        if harness.manager_errors:
-            raise harness.manager_errors[0]
-        return reports
     except (LimitReached, _LLMContractError, anyio.get_cancelled_exc_class()):
         raise
     except BaseException as error:
+        # Component outcomes were classified inside the harness and are reported
+        # below. Registered failures here belong to its owned run services.
+        if _is_core_signal(error):
+            raise
         outcome.propagate_control(error)
         error = outcome.classify(error)
         raise AssertionError(f"manager raised {_exception_type_name(error)}") from error
+    if harness.manager_errors:
+        error = harness.manager_errors[0]
+        raise AssertionError(f"manager raised {_exception_type_name(error)}") from error
+    return reports

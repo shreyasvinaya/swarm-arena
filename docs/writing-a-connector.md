@@ -487,8 +487,9 @@ identities and services.
 judge scope with a funded tranche. Omitting `config` uses `RunConfig()` defaults.
 Judge scripts can return their expected JSON as `FakeTurn.text` with a catalog
 alias authorized for `judge`. Both helpers run registered setups once per run,
-so real LiteLLM components receive the call logger too. Every metered
-fake call uses the real recorder, payload storage and reservation settlement;
+so real LiteLLM components receive the call logger too. A failing setup raises
+`RuntimeError("run setup failed: <Type>")` from either helper, with value-free
+diagnostics. Every metered fake call uses the real recorder, payload storage and reservation settlement;
 the default turn consumes 100 input and 20 output tokens, costing $0.00014
 at the example prices. Direct SDK calls without run metadata only replay turns.
 

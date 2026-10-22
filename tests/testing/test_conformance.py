@@ -2159,3 +2159,23 @@ async def test_conformance_rejects_reservations_without_calls(
     with pytest.raises(AssertionError, match="drain rule"):
         await _run_conformance_kind(kind)
     assert scopes[0].tranche._closed
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_reports_setup_failure_at_its_own_boundary(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._engine import run
+    from swarm_arena._journal import llm_record
+
+    baseline = dict(llm_record._bindings)
+
+    def fail(config: RunConfig) -> None:
+        raise KeyError(SECRET)
+
+    monkeypatch.setattr(run, "_run_setups", [fail])
+    with pytest.raises(RuntimeError, match=r"^run setup failed: KeyError$") as caught:
+        await _run_conformance_kind(kind)
+    assert_secret_absent(caught.value, SECRET)
+    assert llm_record._bindings == baseline
