@@ -948,3 +948,35 @@ def test_board_close_ignores_sync_callers_handled_exception(
                 else swarm.resume("original", force=True)
             )
         assert flags == [False]
+
+
+async def test_falsey_body_failure_is_retained_with_accounting_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena.llm import _invocation, _planner
+
+    class FalseyError(Exception):
+        def __bool__(self) -> bool:
+            return False
+
+    async def prepare(*args: Any, **kwargs: Any) -> Any:
+        raise FalseyError(SECRET)
+
+    async def finish(*args: Any, **kwargs: Any) -> None:
+        raise ValueError(SECRET)
+
+    monkeypatch.setattr(_planner, "_prepare", prepare)
+    monkeypatch.setattr(_planner, "_finish_accounting", finish, raising=False)
+    monkeypatch.setattr(_invocation, "_finish_accounting", finish)
+    config = planner_config(tmp_path)
+    async with open_llm_run(tmp_path, config=config) as run:
+        parent = run.scope("planner")
+        with pytest.raises(RuntimeError) as shared:
+            async with _invocation._invocation(parent, name="planner", error_type=ValueError):
+                raise FalseyError(SECRET)
+        with llm_scope(parent), pytest.raises(RuntimeError) as planner:
+            await LLMPlanner("planner")._draft_at(GOAL, config, None, base_dir=tmp_path)
+        assert type(planner.value) is type(shared.value)
+        assert str(planner.value) == str(shared.value)
+        assert "ExceptionGroup" in str(planner.value)
+        assert_secret_absent(planner.value, SECRET)
