@@ -3,6 +3,7 @@
 import importlib
 import importlib.metadata
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,19 @@ def s3_url(monkeypatch: pytest.MonkeyPatch, _s3_endpoint: str) -> Iterator[str]:
 def isolated_board_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every default board cache inside its test's temporary root."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_llm_process_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no process-wide LiteLLM response cache or call logger."""
+    # Only modules a test already imported are reset, so core-only tests import nothing.
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        monkeypatch.setattr(litellm, "cache", None)
+        monkeypatch.setattr(litellm, "callbacks", [])
+    logger = sys.modules.get("swarm_arena.llm._logger")
+    if logger is not None:
+        monkeypatch.setattr(logger, "_installed_policy", None)
 
 
 @pytest.fixture
