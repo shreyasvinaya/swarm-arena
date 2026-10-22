@@ -104,7 +104,9 @@ require serial execution. Tests that assert authoritative LiteLLM accounting
 after `acompletion` must flush its background logging worker before draining
 the scope; completion itself does not await the callback. Tests of timeout
 accounting must establish call admission with an event before expiring the real
-round timer; short startup deadlines can expire before any call exists. The moto development
+round timer; short startup deadlines can expire before any call exists. Unknown-write
+renewal tests must observe takeover explicitly and leave enough lease lifetime
+for CI scheduling noise. The moto development
 floor includes conditional S3 `IfMatch` support, required by store CAS tests.
 
 The committed `.test_durations` balances shards with `least_duration`.

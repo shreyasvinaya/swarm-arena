@@ -358,18 +358,28 @@ async def test_store_operations_run_off_loop(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("after", [True, False])
 async def test_unknown_renewal_checks_identity(tmp_path: Path, after: bool) -> None:
+    taken = anyio.Event()
+    token = anyio.lowlevel.current_token()
+
+    def take_and_signal(store: Store) -> None:
+        _take(store)
+        anyio.from_thread.run_sync(taken.set, token=token)
+
     flaky = FlakyStore(
         LocalStore(tmp_path / "run"),
         unknown_after_replace=int(after),
         unknown_before_replace=int(not after),
-        after_unknown=_take,
+        after_unknown=take_and_signal,
     )
-    async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
-        with anyio.fail_after(0.8):
+    # This checks unknown-write identity, not expiry under a subsecond lease.
+    async with _writer(flaky, tmp_path, ttl_s=3) as w:
+        with anyio.fail_after(10):
+            await taken.wait()
             await w.fenced.wait()
         owner = read_owner(flaky)
         assert owner is not None
         version = owner[0].version
+        assert owner[0].epoch == 2
     assert read_owner(flaky) == owner
     assert version == 2 + int(after)
 
