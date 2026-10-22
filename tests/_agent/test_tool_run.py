@@ -1623,7 +1623,9 @@ async def test_core_tool_limits_survive_extra_actions_and_round_classification(
     runner.agents[0].manager = RaisesControl()
     runner.converge = True
     result = await runner.run(2)
-    assert result.reasons["t/a"] == "limit reached"
+    assert result.reasons["t/a"] == ("run budget" if case == "usage_overflow" else "limit reached")
+    if case == "usage_overflow":
+        assert runner.deps.stops.run_budget
 
 
 async def test_stage_soft_error_keeps_safe_diagnostic_through_extra_action(rt_env: RtEnv) -> None:
