@@ -11,6 +11,7 @@ from typing import Any, Literal, TypeVar, cast
 import anyio
 import anyio.lowlevel
 
+from swarm_arena._agent.context import _local_timer_scope
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
@@ -42,12 +43,14 @@ from swarm_arena._errors import (
     _is_core_control,
     _is_core_signal,
     _SignalCategory,
+    _stop_cleanup_error,
     _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head
+from swarm_arena._journal.llm_record import drain
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
@@ -1407,33 +1410,71 @@ class GoalRunner:
 
         completed = False
         result: tuple[list[Learning], list[str]] | None = None
+        boundary = _Outcome()
+        failure: BaseException | None = None
         try:
+            completed, result = await self._supervised_step(invoke, final=False)
+        except BaseException as error:
+            failure = error
             try:
-                completed, result = await self._supervised_step(invoke, final=False)
-            except LimitReached as error:
-                completed, result = True, ([], [f"curator limit: {error.limit}"])
-                # Only registered limits escape the plugin boundary above.
-                self.deps.journal.append(
-                    self._draft(
-                        EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                error = boundary.classify(error)
+                if _core_category(error) is _SignalCategory.LIMIT:
+                    limit = cast(LimitReached, error)
+                    completed, result = True, ([], [f"curator limit: {limit.limit}"])
+                    self.deps.journal.append(
+                        self._draft(
+                            EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                        )
                     )
-                )
-                self.select_only = True
-                self.status, self.reason = "stopped", "reserve_exhausted"
-            except Exception as error:
-                # The supervisor can raise sanitized cancellation-shaped failures.
-                completed, result = True, ([], [_curator_error(error)])
+                    self.select_only = True
+                    self.status, self.reason = "stopped", "reserve_exhausted"
+                    failure = None
+            except BaseException as control:
+                failure = control
         finally:
-            # Only pending usage waits are bounded; admitted durable settlement
-            # retains the ledger's existing finality and conservative charges.
-            with anyio.CancelScope(shield=True):
-                await self._close(tranche)
+            # Close on every exit, including a custom curator interrupted before
+            # _prepare_curator could drain. No late result may publish a receipt.
+            timer = anyio.CancelScope(
+                deadline=anyio.current_time() + self.deps.config.settle_timeout_s,
+                shield=True,
+            )
+            try:
+                with _local_timer_scope(timer) as local_timer:
+                    with timer:
+                        await drain(scope, wait=False)
+                    if local_timer.failure is not None:
+                        raise local_timer.failure from None
+                    if timer.cancel_called:
+                        raise _stop_cleanup_error()
+                # Legacy custom calls can reserve without a recorder entry.
+                # Preserve their report allowance; durable close remains under
+                # the writer's owned storage/settlement bounds.
+                with anyio.CancelScope(shield=True):
+                    await self._close(tranche)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as cleanup_error:
+                failure = (
+                    BaseExceptionGroup("curator cleanup", [failure, cleanup_error])
+                    if failure is not None
+                    else cleanup_error
+                )
             self._stop()
+        if failure is not None:
+            # Classify while the captured exception is active so AnyIO can
+            # still recognize its own cancellation through the context chain.
+            try:
+                raise failure
+            except BaseException as error:
+                error = boundary.classify(error)
+                self.deps.journal._raise_if_fenced()
+                if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                    raise error from None
+                completed, result = True, ([], [_curator_error(error)])
         if not completed or result is None:
             return
         await anyio.lowlevel.checkpoint_if_cancelled()
-        if self.deps.journal.fenced.is_set():
-            raise _core_error(Fenced)
+        self.deps.journal._raise_if_fenced()
         summaries, errors = result
         if self._stop():
             summaries, errors = [], [*errors, "curation stopped"]

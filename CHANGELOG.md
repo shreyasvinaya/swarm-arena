@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CollaborativePlanner supports bounded human approval, accumulated feedback and
   catalog-admitted edits in one planning session, with a cancellable terminal
   reviewer and supervised editor cleanup.
+- `LLMCurator` merges evidence-backed round learnings through metered structured
+  calls, with bounded invocation cleanup and invocation-validated summary call links.
 
 - LLMPlanner generates catalog-authorized drafts, freezes human goal identity,
   and preserves human components during autonomous replanning; standalone planning

@@ -125,6 +125,7 @@ else:
     PUBLIC["swarm_arena.llm"] = [
         "AgentsSDKManager",
         "BudgetExceeded",
+        "LLMCurator",
         "LLMJudge",
         "LLMPlanner",
         "CollaborativePlanner",

@@ -311,14 +311,16 @@ config = RunConfig(curator=Ref(path="my_project.curators:MergeRelated"))
 Curators follow the normal component configuration contract: an empty safe
 configuration by default, or a nested `Config` model. `models()` declares model
 aliases and defaults to `()`. The hook runs inside the curator LLM scope, with
-holder `<goal>/:curator` paid from the reserve. This hook adds no built-in LLM
-curator; `LLMCurator` is planned for the LLM milestone.
+holder `<goal>/:curator` paid from the reserve. The optional `llm` extra provides
+`LLMCurator`, described below.
 
 Proposals must supersede at least one learning from `new` or the visible
 namespace snapshot. Hidden and unknown learnings are refused. The core validates
 content with the production `Learning` rules, assigns IDs and run/goal/round
-metadata, sets `author="curator"`, clears pin/hide and requesting-call metadata,
-and combines evidence in supersedes order without duplicates. A summary is
+metadata, sets `author="curator"`, clears pin/hide flags, and combines evidence
+in supersedes order without duplicates. After draining the invocation, it keeps
+`posted_by_call` only if that call belongs to this invocation; otherwise it uses
+the invocation's final call, or `None` when no call was made. A summary is
 verified when any superseded learning is verified. Evidence-free summaries are
 dropped, including summaries of human learnings that have no evidence.
 
@@ -338,7 +340,9 @@ charged conservatively when the tranche closes.
 
 Cancellation-shaped failures raised by a curator hook also produce a type-only
 error receipt and allow the goal to continue. Real caller cancellation retains
-its cancellation behavior.
+its cancellation behavior. Terminal recording or storage cleanup failures and
+usage overflow propagate without publishing summaries or a successful curation
+receipt; they are never ordinary curator failures.
 
 Synchronous curator hooks run in abandonable daemon threads: the engine abandons
 their waits at stop-now and on timeouts. Async curator hooks run on the engine
@@ -368,6 +372,55 @@ uses the receipt only to prevent repeated curation. Recovery without a receipt
 may retry an eligible nonterminal attempt; terminal recovery performs no new
 paid curation. Curation does not change join-retry or pending-replan state.
 
+
+### LLM curator
+
+Install the optional integration with `uv add 'swarm-arena[llm]'`, then configure
+an approved model with the `curator` role:
+
+```python
+from swarm_arena import Limits, Ref, RunConfig
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import LLMCurator
+
+config = RunConfig(
+    limits=Limits(max_tokens=25_000),
+    models=ModelCatalog(
+        {
+            "cur": ModelSpec(
+                model="openai/gpt-4.1-mini",
+                roles=["curator"],
+                max_tokens=1000,
+            ),
+        }
+    ),
+    curator=Ref.of(LLMCurator(model="cur", max_group=8)),
+)
+```
+
+At round end, `LLMCurator` groups the new learnings from the completed round;
+it makes no model call for fewer than two learnings. Calls are paid from the
+reserve and use the shared metered structured-output path. Input learning text
+is wrapped in the shared untrusted-data markers. The supplied board snapshot
+remains fixed.
+
+Each accepted group has two to `max_group` distinct valid indices, with no index
+reused by an earlier accepted group. Titles must be nonempty, single-line and
+at most 120 characters; bodies have a 1,500-character limit. Invalid and
+evidence-free groups are dropped. Malformed structured output fails the
+invocation with a value-free diagnostic. Summaries carry `supersedes`, ordered
+unions of evidence and tags, and are verified if any member is verified.
+
+Each invocation drains its own child scope before returning. Late or absent
+usage reports are bounded by `settle_timeout_s`; absent reports are charged
+conservatively. A two-stage response links the summary to the formatting call
+that supplied its groups. For finalized, non-overflow accounting, the settled
+charge equals the sum of recorded call costs. Terminal overflow or interrupted
+publication retains the core's conservative accounting rules.
+
+The engine assigns the final learning IDs and publishes the summaries and
+curation receipt atomically. Undo a mistaken merge with
+`swarm-arena learnings hide <summary-id>`; the source learnings remain intact.
 
 ## Round pages
 
