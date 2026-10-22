@@ -1061,9 +1061,9 @@ async def test_action_connector_control_errors_are_sanitized(
     assert not getattr(caught.value, "__notes__", ())
 
 
-@pytest.mark.parametrize("control", ["soft", "limit", "gate", "watchdog", "fenced"])
+@pytest.mark.parametrize("control", ["soft", "limit", "gate", "watchdog", "fenced", "cleanup"])
 async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: str) -> None:
-    from swarm_arena._errors import Fenced
+    from swarm_arena._errors import Fenced, _is_core_control, _stop_cleanup_error
 
     blocked = False
     ctx = ctx_env.ctx(gate=lambda: LimitReached("stop", "stopping") if blocked else None)
@@ -1074,6 +1074,8 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
             return context.get_candidate("c-absent").id
         if control == "fenced":
             raise _core_error(Fenced, "run ownership lost")
+        if control == "cleanup":
+            raise _stop_cleanup_error()
         if control == "gate":
             blocked = True
         else:
@@ -1083,11 +1085,18 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
         return None
 
     ctx.actions = (Action(name="core", description="Core", input_model=EmptyArgs, handler=handler),)
-    expected = Fenced if control == "fenced" else SoftError if control == "soft" else LimitReached
+    expected = {
+        "fenced": Fenced,
+        "soft": SoftError,
+        "cleanup": RuntimeError,
+    }.get(control, LimitReached)
     with pytest.raises(expected) as caught:
         await ctx.call_action("core", {})
     if control == "soft":
         assert str(caught.value) == "unknown candidate: c-absent"
+    elif control == "cleanup":
+        assert _is_core_control(caught.value)
+        assert str(caught.value) == "stop cleanup timed out"
     elif isinstance(caught.value, LimitReached):
         assert caught.value.limit == ("stop" if control == "gate" else "max_consecutive_failures")
 

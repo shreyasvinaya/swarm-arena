@@ -20,6 +20,7 @@ from swarm_arena._errors import (
     SoftError,
     _core_signal,
     _exception_type_name,
+    _is_core_control,
     _is_core_signal,
 )
 from swarm_arena._journal.a2a import agent_task_id
@@ -954,6 +955,11 @@ class AgentContext:
         JsonValue
             Handler result.
 
+        Notes
+        -----
+        Registered core controls, including terminal cleanup failures, propagate
+        to the caller. Other handler failures become safe ``SoftError`` results.
+
         Examples
         --------
         Use in-memory service doubles to exercise the action without storage.
@@ -999,7 +1005,9 @@ class AgentContext:
             return await action.handler(self, validated)
         except BaseException as error:
             error = outcome.classify(error)
-            if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            if _is_core_control(error) or (
+                _is_core_signal(error) and isinstance(error, (SoftError, LimitReached))
+            ):
                 raise error from None
             raise _core_signal(SoftError(f"action failed: {_exception_type_name(error)}")) from None
         finally:
