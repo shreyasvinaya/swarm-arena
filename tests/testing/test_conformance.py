@@ -2478,3 +2478,117 @@ async def test_check_judge_preserves_error_identity_and_chain(
     assert caught.value is error
     assert error.__cause__ is cause
     assert error.__context__ is cause
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_rejects_reservation_admitted_during_close(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+
+    from swarm_arena._budget.ledger import Ledger
+
+    entered, closing = anyio.Event(), anyio.Event()
+    tasks: list[asyncio.Task[None]] = []
+    original_close = Tranche.close
+    original_reserve = Ledger.reserve
+
+    async def reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await closing.wait()
+        return await original_reserve(self, *args, **kwargs)
+
+    async def close(self: Tranche) -> Any:
+        closing.set()
+        return await original_close(self)
+
+    async def leak() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        await scope.tranche.reserve_call(Amount(usd=0.001))
+
+    async def start() -> None:
+        tasks.append(asyncio.create_task(leak()))
+        await entered.wait()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await start()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await start()
+        return []
+
+    monkeypatch.setattr(Ledger, "reserve", reserve)
+    monkeypatch.setattr(Tranche, "close", close)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    try:
+        with anyio.fail_after(10), pytest.raises(AssertionError, match="drain rule"):
+            await _run_conformance_kind(kind)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("estimated", [False, True])
+async def test_conformance_accepts_exact_closed_scope_accounting(
+    kind: str, estimated: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal.llm_record import drain, record_call
+    from swarm_arena._model.tooling import Usage
+
+    async def finish() -> None:
+        scope = await _reserve_conformance_call()
+        if not estimated:
+            reservation = next(iter(scope.tranche._calls))
+            await record_call(
+                metadata={
+                    "run_id": scope.run_id,
+                    "reservation_id": reservation,
+                    "goal_id": scope.goal_id,
+                    "team": scope.team,
+                    "agent": scope.agent,
+                    "round": str(scope.round),
+                },
+                model="fake/m",
+                provider="fake",
+                usage=Usage(),
+                cost_usd=0.000321,
+                cache_hit=False,
+                latency_ms=None,
+                status="ok",
+                error=None,
+                request=None,
+                response=None,
+                litellm_call_id=None,
+                tool_call_ids=[],
+                settle=True,
+            )
+        await drain(scope, wait=False)
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await finish()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await finish()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    assert await _run_conformance_kind(kind)

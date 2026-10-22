@@ -47,6 +47,7 @@ from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_js
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.llm_record import _bound_run, drain
+from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.base import CallRole
@@ -66,6 +67,7 @@ from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.runner import judge_round
 from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.base import Store
 from swarm_arena._store.io import _storage_io
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.staging import tool_identity
@@ -111,6 +113,26 @@ async def _assert_drained(scope: LLMScope) -> None:
     """Check self-drain while the owner can still settle a broken component."""
     missing = await drain(scope, wait=False)
     if missing or scope.tranche.pending() != 0:
+        raise _LLMContractError(_DRAIN_RULE)
+
+
+async def _assert_accounted(scope: LLMScope, store: Store) -> None:
+    """Compare closed funding with journaled scope costs in exact monetary units."""
+    tranche = scope.tranche
+    reservations = {batch.id for batch in tranche._batches}
+    reservations.update(cid for cid, call in tranche._calls.items() if call.batch is None)
+    charged = Amount()
+    for reservation in reservations:
+        charged += Amount(usd=tranche._ledger._charges[reservation].usd)
+    head = await scope.journal.commit()
+    recorded = Amount()
+    if head is not None:
+        call_ids = set(scope.call_ids)
+        for _, events in await _read_chain(store, head):
+            for event in events:
+                if event.type == EventType.LLM_CALL and event.payload["call"]["id"] in call_ids:
+                    recorded += Amount(usd=event.payload["call"]["cost_usd"])
+    if charged != recorded:
         raise _LLMContractError(_DRAIN_RULE)
 
 
@@ -250,6 +272,10 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                     raise
                 finally:
                     await _finish_draining(scope, escaping, drain_outcome)
+                    if escaping is None:
+                        await tranche.close()
+                        ledger._check_usage_overflow()
+                        await _assert_accounted(scope, store)
     finally:
         if not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
@@ -666,6 +692,8 @@ class OfflineHarness:
                     closed = await rt.tranche.close()
                     if closed.overflow or rt.ledger.run_exhausted():
                         rt.ledger._check_usage_overflow()
+                    if manager_error is None:
+                        await _assert_accounted(scope, self.store)
             if any(
                 c.requested_by_call is not None and c.requested_by_call not in scope.call_ids
                 for c in rt.own
