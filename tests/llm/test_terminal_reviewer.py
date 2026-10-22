@@ -216,6 +216,81 @@ async def test_bad_edit_asks_again(tmp_path: Path) -> None:
     assert "secret-sentinel-editor-invalid" not in out.getvalue()
 
 
+@pytest.mark.parametrize("failure", ["toml", "encoding", "exit"])
+async def test_edit_retries_keep_the_last_file(tmp_path: Path, failure: str) -> None:
+    once = tmp_path / "once"
+    broken = b"rationale = 'human work'\n[goal\n" if failure != "encoding" else b"human work\xff"
+    repaired = PLAN.model_copy(update={"rationale": "human work"}).dumps().encode()
+    editor = _editor(
+        tmp_path,
+        "import pathlib, sys\np = pathlib.Path(sys.argv[1])\n"
+        f"once = pathlib.Path({str(once)!r})\n"
+        "if not once.exists():\n    once.write_text('1')\n"
+        f"    p.write_bytes({broken!r})\n"
+        + ("    sys.exit(1)\n" if failure == "exit" else "")
+        + "else:\n"
+        f"    assert p.read_bytes() == {broken!r}\n    p.write_bytes({repaired!r})\n",
+    )
+    result = await TerminalReviewer(
+        stdin=io.StringIO("e\ne\n"), stdout=io.StringIO(), editor=editor
+    ).review(PLAN)
+    assert isinstance(result, Edited)
+    assert result.plan.rationale == "human work"
+
+
+async def test_edited_file_error_names_the_human_layer(tmp_path: Path) -> None:
+    secret = "secret-sentinel-encoding"
+    invalid = secret.encode() + bytes([255])
+    editor = _editor(
+        tmp_path, "import pathlib, sys\n" + f"pathlib.Path(sys.argv[1]).write_bytes({invalid!r})\n"
+    )
+    out = io.StringIO()
+    assert (
+        await TerminalReviewer(stdin=io.StringIO("e\na\n"), stdout=out, editor=editor).review(PLAN)
+        == Approve()
+    )
+    assert "edited plan could not be read: UnicodeDecodeError" in out.getvalue()
+    assert "LLM preparation" not in out.getvalue()
+    assert secret not in out.getvalue()
+
+
+async def test_missing_editor_diagnostic_contains_no_path(tmp_path: Path) -> None:
+    secret = "secret-sentinel-editor-path"
+    out = io.StringIO()
+    result = await TerminalReviewer(
+        stdin=io.StringIO("e\na\n"), stdout=out, editor=str(tmp_path / secret)
+    ).review(PLAN)
+    assert result == Approve()
+    assert "editor could not be started: FileNotFoundError" in out.getvalue()
+    assert secret not in out.getvalue()
+
+
+async def test_admission_refusal_keeps_edits_for_repair(tmp_path: Path) -> None:
+    once = tmp_path / "once"
+    editor = _editor(
+        tmp_path,
+        "import pathlib, sys\np = pathlib.Path(sys.argv[1])\nt = p.read_text()\n"
+        f"once = pathlib.Path({str(once)!r})\n"
+        "if not once.exists():\n    once.write_text('1')\n"
+        "    t = t.replace('title = \"\"', 'title = \"changed\"')\n"
+        "    t = t.replace('Explore the catalog', 'human work')\n"
+        "else:\n    assert 'human work' in t\n    assert 'title = \"changed\"' in t\n"
+        "    t = t.replace('title = \"changed\"', 'title = \"\"')\n"
+        "p.write_text(t)\n",
+    )
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output()))])
+    fake.register("planner")
+    out = io.StringIO()
+    reviewer = TerminalReviewer(stdin=io.StringIO("e\ne\n"), stdout=out, editor=editor)
+    result = await CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(
+        PLAN.goal, planner_config(tmp_path), None
+    )
+    assert result.rationale == "human work"
+    assert result.goal.title == ""
+    assert len(fake.calls) == 1
+    assert "edited plan admission refused" in out.getvalue()
+
+
 async def test_editor_failure_asks_again(tmp_path: Path) -> None:
     editor = _editor(
         tmp_path, 'import sys\nsys.stderr.write("secret-sentinel-editor-failure")\nsys.exit(7)\n'

@@ -1,10 +1,13 @@
 """Human decisions at the collaborative planning boundary."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
 
+from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.plan import Plan
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.provenance import _detach_plan
 
 
@@ -108,3 +111,24 @@ class Reviewer(Protocol):
         >>> reviewer: Reviewer = Human()
         """
         ...
+
+
+_T = TypeVar("_T")
+
+
+async def _review_work(operation: Callable[[], _T], site: str) -> _T:
+    """Detach human-layer values with caller-owned, site-specific containment."""
+    outcome = _Outcome()
+    try:
+        return await run_sync_daemon(operation)
+    except BaseException as error:
+        outcome.contain(error, RuntimeError, site)
+
+
+def _report_rejection(reviewer: Reviewer, diagnostic: str) -> None:
+    """Deliver a safe refusal to the terminal adapter or the default console."""
+    report = getattr(reviewer, "_plan_rejected", None)
+    if report is None:
+        print(diagnostic)
+    else:
+        report(diagnostic)

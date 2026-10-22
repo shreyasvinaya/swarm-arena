@@ -107,11 +107,17 @@ async def test_plan_at_preserves_non_cwd_source_directory(tmp_path: Path, edited
         assert result.rationale == "edited away from cwd"
 
 
-@pytest.mark.parametrize("field", ["inputs", "files", "ref"])
-async def test_edited_plan_still_meets_the_catalog_boundary(tmp_path: Path, field: str) -> None:
+@pytest.mark.parametrize(
+    "field",
+    ["id", "namespace", "title", "description", "metadata", "inputs", "files", "file_globs", "ref"],
+)
+async def test_edited_plan_still_meets_the_catalog_boundary(
+    tmp_path: Path, field: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     from swarm_arena.tool import FileSet
 
-    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output()))])
+    fake.register("planner")
 
     def edit(plan: Plan) -> Edited:
         if field == "ref":
@@ -119,25 +125,129 @@ async def test_edited_plan_still_meets_the_catalog_boundary(tmp_path: Path, fiel
                 plan.teams[0].agents[0].model_copy(update={"tool": Ref(path="untrusted:Tool")})
             )
             return Edited(plan)
-        value = {"changed": SECRET} if field == "inputs" else FileSet(manifest={"other": "a" * 64})
-        return Edited(plan.model_copy(update={"goal": plan.goal.model_copy(update={field: value})}))
+        if field in {"files", "file_globs"}:
+            value: Any = (
+                FileSet(manifest={"other": "a" * 64})
+                if field == "files"
+                else FileSet(globs=["changed"])
+            )
+            field_name = "files"
+        else:
+            value = {"changed": SECRET} if field in {"inputs", "metadata"} else "changed"
+            field_name = field
+        return Edited(
+            plan.model_copy(update={"goal": plan.goal.model_copy(update={field_name: value})})
+        )
 
     config = planner_config(tmp_path)
-    with pytest.raises(ValueError, match=r"catalog|frozen main goal") as caught:
-        await CollaborativePlanner(LLMPlanner("planner"), _Reviews([edit])).plan(GOAL, config, None)
-    assert_secret_absent(caught.value, SECRET)
+    result = await CollaborativePlanner(LLMPlanner("planner"), _Reviews([edit, Approve()])).plan(
+        GOAL, config, None
+    )
+    assert result.goal == GOAL
+    assert len(fake.calls) == 1
+    printed = capsys.readouterr().out
+    assert "edited plan admission refused" in printed
+    assert SECRET not in printed
     assert len([e for e in all_events(config) if e.type == "goal_finished"]) == 1
 
 
-@pytest.mark.parametrize("limit", [2, 5])
+@pytest.mark.parametrize("limit", [1, 2, 5])
 async def test_no_approval_after_max_iterations(tmp_path: Path, limit: int) -> None:
     fake = FakeModel([FakeTurn(text=json.dumps(planner_output())) for _ in range(limit)])
     fake.register("planner")
-    with pytest.raises(RuntimeError, match=f"plan not approved after {limit} reviews"):
+    with pytest.raises(
+        RuntimeError, match=f"plan not approved after {limit} review" + ("s" if limit != 1 else "$")
+    ):
         await CollaborativePlanner(
             LLMPlanner("planner"), _Reviews([Feedback("again")] * limit), max_iterations=limit
         ).plan(GOAL, planner_config(tmp_path), None)
     assert len(fake.calls) == limit
+
+
+async def test_rejected_edits_still_exhaust_the_review_limit(tmp_path: Path) -> None:
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output()))])
+    fake.register("planner")
+
+    def edit(plan: Plan) -> Edited:
+        return Edited(
+            plan.model_copy(update={"goal": plan.goal.model_copy(update={"title": SECRET})})
+        )
+
+    with pytest.raises(RuntimeError, match="plan not approved after 2 reviews"):
+        await CollaborativePlanner(
+            LLMPlanner("planner"), _Reviews([edit, edit]), max_iterations=2
+        ).plan(GOAL, planner_config(tmp_path), None)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("site", ["detach", "admission"])
+async def test_human_failure_labels_are_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    from swarm_arena.llm import _planner
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    if site == "detach":
+
+        def detach(decision: object) -> Any:
+            raise ValueError(SECRET)
+
+        monkeypatch.setattr(_planner, "_detach_decision", detach)
+        label = "review decision detach failed: ValueError"
+    else:
+        original_admit = _planner._admit_draft
+
+        async def admit(*args: Any, **kwargs: Any) -> Plan:
+            if kwargs.get("origin") == "together":
+                raise RuntimeError(SECRET)
+            return await original_admit(*args, **kwargs)
+
+        monkeypatch.setattr(_planner, "_admit_draft", admit)
+        label = "plan admission failed: RuntimeError"
+    with pytest.raises(RuntimeError, match=label) as caught:
+        await CollaborativePlanner(LLMPlanner("planner"), _Reviews([Approve()])).plan(
+            GOAL, planner_config(tmp_path), None
+        )
+    assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("site", ["admission", "diagnostic"])
+@pytest.mark.parametrize("kind", ["fenced", "terminal"])
+async def test_admission_and_diagnostic_controls_never_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, kind: str
+) -> None:
+    from swarm_arena._errors import Fenced, _core_error, _stop_cleanup_error
+    from swarm_arena.llm import _planner
+
+    error = _core_error(Fenced, "run ownership lost") if kind == "fenced" else _stop_cleanup_error()
+    original_admit = _planner._admit_draft
+
+    async def admit(*args: Any, **kwargs: Any) -> Plan:
+        if kwargs.get("origin") == "together":
+            raise error
+        return await original_admit(*args, **kwargs)
+
+    def report(*args: Any) -> None:
+        raise error
+
+    def edit(plan: Plan) -> Edited:
+        return Edited(
+            plan.model_copy(update={"goal": plan.goal.model_copy(update={"title": "changed"})})
+        )
+
+    monkeypatch.setattr(
+        _planner,
+        "_admit_draft" if site == "admission" else "_report_rejection",
+        admit if site == "admission" else report,
+    )
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output()))])
+    fake.register("planner")
+    decisions = [Approve(), Approve()] if site == "admission" else [edit, Approve()]
+    with pytest.raises(Fenced if kind == "fenced" else RuntimeError):
+        await CollaborativePlanner(LLMPlanner("planner"), _Reviews(decisions)).plan(
+            GOAL, planner_config(tmp_path), None
+        )
+    assert len(fake.calls) == 1
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5, "2"])
@@ -200,19 +310,34 @@ async def test_reviewer_failure_closes_session(tmp_path: Path, kind: str) -> Non
 
 
 @pytest.mark.parametrize("mode", ["cancel", "deadline", "eof"])
-async def test_terminal_session_exits_without_resurrection(tmp_path: Path, mode: str) -> None:
+async def test_terminal_session_exits_without_resurrection(
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import io
     import os
 
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.stops import RunClock
     from swarm_arena._journal import llm_record
     from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 
     FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
     config = planner_config(tmp_path)
+    expired = anyio.Event()
+
+    class ControlledClock:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        async def sleep(self, seconds: float) -> None:
+            if seconds == 123456.0:
+                await expired.wait()
+            else:
+                await anyio.sleep(seconds)
+
     if mode == "deadline":
-        config = config.model_copy(
-            update={"limits": config.limits.model_copy(update={"run_timeout_s": 2})}
-        )
+        monkeypatch.setattr(RunClock, "left", lambda self, limit: 123456.0)
+        monkeypatch.setattr(run_module, "anyio", ControlledClock())
     read_fd, write_fd = os.pipe()
     with os.fdopen(read_fd) as stdin:
         reviewer = TerminalReviewer(stdin=stdin, stdout=io.StringIO())
@@ -229,6 +354,8 @@ async def test_terminal_session_exits_without_resurrection(tmp_path: Path, mode:
                     with pytest.raises(asyncio.CancelledError):
                         await task
                 else:
+                    if mode == "deadline":
+                        expired.set()
                     if mode == "eof":
                         os.close(write_fd)
                         write_fd = -1
@@ -239,6 +366,10 @@ async def test_terminal_session_exits_without_resurrection(tmp_path: Path, mode:
             assert os.get_blocking(read_fd)
             events = all_events(config)
             assert len([e for e in events if e.type == "goal_finished"]) == 1
+            if mode == "deadline":
+                assert [e.payload["reason"] for e in events if e.type == "goal_finished"] == [
+                    "run_timeout_s"
+                ]
             sessions = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
             assert not any(p.name in llm_record._bindings for p in sessions)
             if write_fd >= 0:
