@@ -349,3 +349,13 @@ batch. A failed final batch retains its original input membership, lifecycle,
 revision and judge reference; resume completes `NO_RESULT(provider_failed)`
 without selecting again from final scores or repeating the call. A completed
 ranking-policy skip also prevents repeated manager or policy work.
+
+Before initial converge selection, the engine retries each paused ranking batch
+once through normal judge admission and the shared provider service. The judging
+reserve funds this retry under a graceful stop or a run-budget stop; an immediate
+stop or deadline skips it. Durable retry receipts and scores prevent repeat calls
+on resume. Only a validated provider failure in this retry can make an empty
+selection report `provider_failed`; otherwise it reports `no passing candidate`.
+Explicit no-result outcomes from final judging retain their own reasons.
+Batches paused in join-retry rounds are not retried and never determine the
+`provider_failed` selection reason.

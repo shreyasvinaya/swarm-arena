@@ -2889,3 +2889,54 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
                 == "settled"
             )
     assert "PRIVATE_COMPONENT_FAILURE" not in repr(events)
+
+
+@pytest.mark.parametrize("flag", ["stop", "run_budget", "stop_now", "run_timeout", "join_retry"])
+async def test_paused_ranking_retry_obeys_stop_and_join_boundaries(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    from collections.abc import Sequence
+
+    from _fakes.non_agent import FailingJudge
+
+    from swarm_arena._errors import ProviderFailed
+    from swarm_arena._model.results import Candidate, Score
+    from swarm_arena.scoring import JudgeContext
+
+    judge_call = FailingJudge.judge
+
+    async def recover_at_converge(
+        self: FailingJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        try:
+            return await judge_call(self, goal, candidates, ctx)
+        except ProviderFailed:
+            if ctx.round != 0:
+                raise
+            return [Score(candidate_id=c.id, key=(1.0,)) for c in candidates]
+
+    monkeypatch.setattr(FailingJudge, "judge", recover_at_converge)
+
+    counter = tmp_path / "judge-calls"
+    judge = Ref.of(FailingJudge({"phase": "barrier", "counter": str(counter)})).model_copy(
+        update={"name": "y"}
+    )
+    if flag != "join_retry":
+        env.on_commit("round_closed", lambda ev: _raise_flag(env.deps.stops, flag, goal_id="g"))
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=_plan(rounds=1, judges=[judge]),
+        replanner=None,
+        state=GoalState(join_retries=int(flag == "join_retry")),
+    )
+    outcome = await runner.run()
+    permitted = flag in {"stop", "run_budget"}
+    assert counter.read_text().splitlines() == (
+        ["1:None:False", "0:None:False", "0:None:True"] if permitted else ["1:None:False"]
+    )
+    assert bool(outcome.finalists) is permitted
+    retries = [e for e in env.events("score") if e.payload.get("barrier_batch", {}).get("retry_of")]
+    assert bool(retries) is permitted
+    if not permitted:
+        assert env.events("no_result")[-1].payload == {"reason": "no passing candidate"}

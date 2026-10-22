@@ -1104,7 +1104,9 @@ class GoalRunner:
         return True
 
     async def _retry_ranking(self) -> bool:
-        """Retry each paused ranking batch once, reusing durable retry completions."""
+        """Retry pre-join paused batches once, including under funded graceful stops."""
+        if self.join_retries:
+            return False
         records = list(self.recorded.goals[self.goal_id].provider_batches.values())
         paused = [
             record
@@ -1128,7 +1130,8 @@ class GoalRunner:
             )
         ]
         for record in paused:
-            if self._stop():
+            self._stop()
+            if self.deps.stops.stop_now or self.deps.stops.run_timeout:
                 break
             candidates = [
                 self.recorded.candidates[id]
@@ -2034,7 +2037,9 @@ class GoalRunner:
             if self.status != "no_result":
                 self.status, self.reason = (
                     "no_result",
-                    "provider_failed" if ranking_still_failed else "no passing candidate",
+                    "provider_failed"
+                    if ranking_still_failed and not self.join_retries
+                    else "no passing candidate",
                 )
             self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
         else:
