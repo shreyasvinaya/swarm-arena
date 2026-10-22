@@ -259,3 +259,58 @@ Character-to-token conversion is a heuristic; actual supported costs above the
 estimate are charged in full. A two-stage final judge also needs funding for
 its formatter's full input and output. An output-only judge allowance does not
 establish that both complete calls fit.
+
+## Caching
+
+Provider prompt caching is enabled by default. Stable instructions, tools, the
+frozen goal and its reference files precede changing round facts.
+
+| Provider | Prompt-cache behavior |
+| --- | --- |
+| Claude on `anthropic/`, `bedrock/`, or `vertex_ai/` | `[{"location": "message", "role": "system"}, {"location": "message", "index": -1}]` injection points. TTL defaults to `5m`; `prompt_cache = { ttl = "1h" }` adds an explicit ephemeral one-hour control to each point. |
+| OpenAI, DeepSeek, Fireworks/Kimi | Automatic caching of the stable prefix; no injected markers. |
+| Gemini | Implicit caching; no injected markers. Explicit context caching is a later option. |
+
+Set `prompt_cache = { enabled = false }` for a model to disable its injected
+prompt-cache points. Provider minimum prompt lengths still apply. Prompt-cache
+reads and writes retain their separate usage and pricing, including the 5m/1h
+write split described above.
+
+Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
+extra (`uv add "swarm-arena[llm,cache]"`). Configure `RunConfig.cache` in TOML:
+
+```toml
+[cache]
+backend = "s3"                       # "disk" | "s3" | "redis"
+s3_path = "s3://bucket/swarm-arena/llm-cache"
+# disk_dir = ".cache/llm"             # for backend = "disk"
+# redis_url_env = "REDIS_URL"          # for backend = "redis"; full redis:// or rediss:// URL
+# namespace = "physika"               # optional override; defaults to each goal's namespace
+ttl_s = 2592000                       # 30 days
+
+[cache.roles]
+judge   = { read = true,  write = true  }
+planner = { read = false, write = true  }
+manager = { read = false, write = false }
+curator = { read = true,  write = true  }
+```
+
+The response cache uses `default_off`: each allowed call opts in with independent
+read and write switches and its effective namespace. Anchors and the final judge
+never read cached responses; their results may still be written when judge writes
+are enabled. Streamed and thinking calls never read or write the response cache.
+Provider recovery probes bypass both directions. These restrictions take precedence
+over caller settings, including preset cache keys and provider extra arguments.
+
+Cache keys include request parameters such as tools, schemas, temperature, seed and
+reasoning settings. Tracking metadata is excluded, so reservation and call IDs do
+not invalidate cache hits. Each per-call settings object carries string-valued
+run, goal, team, agent, round, role, reservation, call and model-alias metadata.
+The output limit is capped by the model catalog. An explicit temperature is sent
+with `drop_params=True`, allowing providers that reject that parameter to omit it.
+
+A response-cache hit costs zero. Proven origin links distinguish namespace,
+effective cache key and the generating response, including replacements at the
+same key. When that evidence is unavailable or ambiguous, the origin stays unset.
+The recorder persists the opaque identity for replay even when payload storage
+is disabled.

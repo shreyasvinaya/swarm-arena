@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lazy `FakeModel` and `FakeTurn` helpers replay isolated offline LLM
   conversations, capture SDK inputs, and record exact catalog-priced usage
   through the real journal and reservation settlement path.
+- Per-call LLM settings with tracking metadata, Claude prompt-cache points,
+  per-role response-cache controls, complete probe bypass and replayable cache origins.
+
 - Manager prompts keep system instructions and frozen reference files ahead of round facts;
   shared untrusted-content wrapping removes embedded markers before digest byte capping.
 - Model alias, role, capability and price validation for plans, replanners and

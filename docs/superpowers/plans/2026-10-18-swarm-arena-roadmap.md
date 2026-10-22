@@ -2494,6 +2494,41 @@ class CallLogger("litellm.integrations.custom_logger.CustomLogger"):        # on
 def install(config: RunConfig) -> None: ...          # idempotent: logger, cost map env, response cache
 ```
 
+The expanded per-call settings contract supersedes the abbreviated signature above.
+`ModelSpec` has no alias; call provenance and the cache namespace are supplied by
+the metered adapter. `install` belongs to `llm/_logger.py`.
+
+```python
+# llm/_settings.py
+def model_settings(spec: ModelSpec, *, alias: str, scope: LLMScope, reservation_id: str,
+                   call_id: str, namespace: str, read: bool, write: bool,
+                   max_tokens: int | None = None,
+                   temperature: float | None = None) -> "agents.ModelSettings": ...
+    # metadata adds call_id and model_alias; every value is str (including round).
+    # include_usage=True; output override capped by spec.max_tokens.
+    # An explicit temperature carries drop_params=True.
+def injection_points(spec: ModelSpec) -> list[dict[str, Any]] | None: ...
+def merge_model_settings(caller: "agents.ModelSettings", per_call: "agents.ModelSettings", *,
+                         streamed: bool = False, thinking: bool = False) -> "agents.ModelSettings": ...
+    # Final merge before delegation: protect metadata and remove caller cache/preset controls.
+    # Detect SDK reasoning and thinking/reasoning through extra_args and extra_body.
+
+# llm/_cache.py
+def cache_switches(policy: CachePolicy | None, role: LLMRole, *, force_no_read: bool,
+                   streamed: bool, thinking: bool) -> tuple[bool, bool]: ...
+def cache_namespace(policy: CachePolicy | None, goal_namespace: str) -> str: ...
+def require_cache_extra(policy: CachePolicy) -> None: ...
+def response_cache(policy: CachePolicy) -> "litellm.caching.caching.Cache": ...
+def bypass_response_cache() -> "ContextManager[None]": ...
+    # Internal task-local complete bypass for provider probes; anchors/final only suppress reads.
+def cache_identity(kwargs: Mapping[str, Any], response: Any, *,
+                   effective_key: str | None = None) -> str | None: ...
+    # Hash verified namespace-bearing effective key + generating response id.
+    # The callback adapter passes this to record_call(cache_identity=...) under supervised preparation.
+    # Miss callbacks can omit the key: use an exact outbound/write key capture, never a reconstructed key.
+    # Missing/conflicting evidence returns None; the core restores its index on resume.
+```
+
 #### R4.13.18 CLI — M1a (root) and later
 
 ```python
