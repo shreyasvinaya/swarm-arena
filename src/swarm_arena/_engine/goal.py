@@ -276,7 +276,9 @@ class GoalRunner:
     --------
     >>> from unittest.mock import Mock
     >>> from swarm_arena import Goal, RunConfig
-    >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+    >>> from swarm_arena._engine.stops import ProviderStops
+    >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None,
+    ...             provider_stops=ProviderStops(Mock()))
     >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
     >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
     0
@@ -346,7 +348,9 @@ class GoalRunner:
         --------
         >>> from unittest.mock import Mock
         >>> from swarm_arena import Goal, RunConfig
-        >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+        >>> from swarm_arena._engine.stops import ProviderStops
+        >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None,
+        ...             provider_stops=ProviderStops(Mock()))
         >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
         >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
         0
