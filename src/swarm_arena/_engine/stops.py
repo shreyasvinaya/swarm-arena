@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import TYPE_CHECKING, Any
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 import anyio
 
@@ -293,7 +293,7 @@ if TYPE_CHECKING:
 
 
 _probe: Callable[[str, LLMScope], Awaitable[bool]] | None = None
-_services: WeakKeyDictionary[JournalWriter, ProviderStops] = WeakKeyDictionary()
+_services: dict[int, tuple[ref[JournalWriter], ProviderStops]] = {}
 
 
 def register_probe(fn: Callable[[str, LLMScope], Awaitable[bool]] | None) -> None:
@@ -398,7 +398,14 @@ class ProviderStops:
     def __init__(
         self, journal: JournalWriter, *, state: RunState | None = None, standalone: bool = False
     ) -> None:
-        self._journal = ref(journal)
+        identity = id(journal)
+
+        def discard(writer: ref[JournalWriter]) -> None:
+            entry = _services.get(identity)
+            if entry is not None and entry[0] is writer:
+                del _services[identity]
+
+        self._journal = ref(journal, discard)
         self._standalone = standalone
         self._generations = dict(state.provider_generations) if state is not None else {}
         self._failed = dict(state.provider_failed) if state is not None else {}
@@ -407,7 +414,7 @@ class ProviderStops:
         )
         self._providers: dict[str, frozenset[str]] = {}
         self._cancel: dict[str, Callable[[], None]] = {}
-        _services[journal] = self
+        _services[identity] = (self._journal, self)
 
     def _writer(self) -> JournalWriter:
         journal = self._journal()
@@ -629,7 +636,7 @@ def provider_stops(journal: JournalWriter) -> ProviderStops:
     Parameters
     ----------
     journal : JournalWriter
-        Current owner's writer.
+        Current owner's writer, matched by identity regardless of value equality.
 
     Returns
     -------
@@ -643,7 +650,10 @@ def provider_stops(journal: JournalWriter) -> ProviderStops:
     >>> provider_stops(writer) is provider_stops(writer)
     True
     """
-    return _services.get(journal) or ProviderStops(journal)
+    entry = _services.get(id(journal))
+    if entry is not None and entry[0]() is journal:
+        return entry[1]
+    return ProviderStops(journal)
 
 
 async def report_provider_failure(
