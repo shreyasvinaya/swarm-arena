@@ -40,6 +40,57 @@ def test_request_hook_preserves_terminal(nested: bool) -> None:
     assert _core_category(caught.value) is _SignalCategory.TERMINAL
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "site", ["request", "stage_settings", "stage", "estimate", "dispatch", "usage", "fingerprint"]
+)
+async def test_tool_conversion_preserves_terminal(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._agent import tool_run as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[str] = []
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("tool", [BaseExceptionGroup("boundary", [error])])
+        raise error
+
+    executor = Mock(spec=Executor, submit=AsyncMock(return_value=ToolOutput(status=RunStatus.OK)))
+    rt = dataclasses.replace(rt_env.rt, executor=executor)
+    if site == "request":
+        monkeypatch.setattr(module, "_validate_config", fail)
+    elif site == "stage_settings":
+        monkeypatch.setattr(rt.tool, "_own_files", fail)
+    elif site == "stage":
+        monkeypatch.setattr(module, "plan_tool_stage", fail)
+    elif site == "estimate":
+        monkeypatch.setattr(rt.tool, "estimate", fail)
+    elif site == "dispatch":
+        executor.submit.side_effect = fail
+    elif site == "usage":
+
+        def amount(*args: Any, **kwargs: Any) -> Amount:
+            if "tokens" in kwargs:
+                fail()
+            return Amount(*args, **kwargs)
+
+        monkeypatch.setattr(module, "Amount", Mock(wraps=Amount, side_effect=amount))
+    else:
+        monkeypatch.setattr(rt.tool, "fingerprint", fail)
+
+    with pytest.raises(RuntimeError) as caught:
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert reached == [site]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert not rt_env.events("tool_end")
+
+
 class _QueuedExecutor(Executor):
     def __init__(self, delegate: Executor) -> None:
         super().__init__()

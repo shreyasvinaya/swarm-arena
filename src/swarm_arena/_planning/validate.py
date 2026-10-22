@@ -15,7 +15,14 @@ from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
 from swarm_arena._budget.estimate import make_price_of
-from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
+from swarm_arena._errors import (
+    ConfigError,
+    PlanError,
+    _core_category,
+    _core_error,
+    _exception_type_name,
+    _SignalCategory,
+)
 from swarm_arena._exec.threads import _DaemonCall
 from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -426,6 +433,8 @@ def _rule_configs(
             raise
         except BaseException as error:
             error = _classify_outcome(error)
+            if _core_category(error) is _SignalCategory.TERMINAL:
+                raise error from None
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
             continue
         try:
@@ -1028,6 +1037,8 @@ def _validate_round_refs(plan: Plan) -> None:
             raise
         except BaseException as error:
             error = _classify_outcome(error)
+            if _core_category(error) is _SignalCategory.TERMINAL:
+                raise error from None
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
     if errors:
         raise _core_error(PlanError, errors) from None
@@ -1162,6 +1173,8 @@ def admit_revision(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents

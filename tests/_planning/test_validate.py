@@ -62,6 +62,63 @@ def test_safe_call_preserves_terminal(nested: bool) -> None:
     assert _core_category(caught.value) is _SignalCategory.TERMINAL
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["configs", "round_refs", "snapshot"])
+def test_planning_conversion_preserves_terminal(
+    artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[str] = []
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("planning", [BaseExceptionGroup("boundary", [error])])
+        raise error
+
+    current = _plan(rounds=1)
+    if site == "configs":
+        monkeypatch.setattr(Ref, "load", fail)
+    elif site == "round_refs":
+        monkeypatch.setattr(
+            validation,
+            "_round_refs",
+            lambda _: iter([("/rounds/0", current.teams[0].agents[0].tool, {})]),
+        )
+        monkeypatch.setattr(validation, "effective_tool_ref", fail)
+    else:
+        monkeypatch.setattr(validation, "snapshot_plan", fail)
+
+    def invoke() -> None:
+        if site == "configs":
+            validation._rule_configs(current, RunConfig(), (), built={})
+        elif site == "round_refs":
+            validation._validate_round_refs(current)
+        else:
+            admit_revision(current, RunConfig(), artifacts)
+
+    with pytest.raises(RuntimeError) as caught:
+        invoke()
+    assert reached == [site]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+def test_admit_revision_preserves_plan_error(
+    artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._errors import _core_error
+
+    error = _core_error(PlanError, ["/snapshot: rejected"])
+    monkeypatch.setattr(validation, "snapshot_plan", Mock(side_effect=error))
+    with pytest.raises(PlanError) as caught:
+        admit_revision(_plan(rounds=1), RunConfig(), artifacts)
+    assert caught.value.errors == error.errors
+
+
 J_A = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="a")
 J_B = Ref(path="_fakes.tools:FixedJudge", config={"value": 2}, name="b")
 MANAGER = Ref(path="_fakes.tools:NoopManager")

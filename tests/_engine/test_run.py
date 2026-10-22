@@ -59,6 +59,64 @@ async def test_startup_and_shutdown_preserve_terminal(site: str, nested: bool) -
     assert _core_category(caught.value) is _SignalCategory.TERMINAL
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "site", ["construction", "detach", "admission", "estimates", "capacity", "approval"]
+)
+async def test_run_conversion_preserves_terminal(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena.executor import Executor
+
+    reached: list[str] = []
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("startup", [BaseExceptionGroup("boundary", [error])])
+        raise error
+
+    executor = Mock(spec=Executor, capacity=AsyncMock(return_value=None), aclose=AsyncMock())
+    monkeypatch.setattr(module, "_build_executor", Mock(return_value=executor))
+    approve = None
+    if site == "construction":
+        monkeypatch.setattr(module, "_build_executor", fail)
+    elif site == "detach":
+        monkeypatch.setattr(module, "_detach_plan", fail)
+    elif site == "admission":
+        monkeypatch.setattr(module, "admit_revision", fail)
+    elif site == "estimates":
+        monkeypatch.setattr(module, "_estimates", fail)
+    elif site == "capacity":
+        executor.capacity.side_effect = fail
+    else:
+        approve = AsyncMock(side_effect=fail)
+    runner = RunRunner(run_config, [plan(rounds=1)], run_id=None, approve=approve, replanner=None)
+    operation = module._start_executor(run_config) if site == "construction" else runner.run()
+    with pytest.raises(RuntimeError) as caught:
+        await operation
+    assert reached == [site]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+async def test_run_admission_preserves_plan_error(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as module
+
+    error = _core_error(PlanError, ["/teams: rejected"])
+    monkeypatch.setattr(module, "admit_revision", Mock(side_effect=error))
+    runner = RunRunner(run_config, [plan(rounds=1)], run_id=None, approve=None, replanner=None)
+    with pytest.raises(PlanError) as caught:
+        await runner.run()
+    assert caught.value.errors == error.errors
+
+
 class RecordingManager(ScriptedManager):
     results: ClassVar[list[LLMCall | None]] = []
     pause_second: ClassVar[anyio.Event | None] = None

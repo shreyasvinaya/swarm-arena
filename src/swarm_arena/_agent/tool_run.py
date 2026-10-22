@@ -20,10 +20,12 @@ from swarm_arena._errors import (
     ConfigError,
     Fenced,
     SoftError,
+    _core_category,
     _core_error,
     _core_signal,
     _exception_type_name,
     _is_core_signal,
+    _SignalCategory,
 )
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
@@ -426,6 +428,8 @@ def _request(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         raise _core_signal(
             SoftError(f"invalid tool request: {_exception_type_name(error)}")
         ) from None
@@ -459,6 +463,8 @@ def _stage_settings(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
             raise error from None
         raise _core_signal(
@@ -503,6 +509,8 @@ def _stage(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
             raise error from None
         raise _core_signal(
@@ -562,7 +570,8 @@ async def execute_tool_run(
     before completion propagates. Optional fingerprinting receives a deep copy
     and waits at most ten seconds outside the completion shield. Interrupted
     fingerprinting records null and completes settlement while still owner.
-    Fencing prevents completion and settlement. Connector failures become
+    Fencing prevents completion and settlement. Registered terminal failures
+    propagate before ordinary component outcomes. Connector failures become
     error candidates with type-only warnings.
     Executor outputs are detached under round supervision before completion.
     Partial output delivered after cancellation gets at most the configured
@@ -721,6 +730,8 @@ async def _run(
         amount, providers = await _prepare_sync(estimate)
     except BaseException as error:
         error = outcome.classify(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         if _is_core_signal(error) and isinstance(error, LimitReached):
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -819,6 +830,8 @@ async def _run(
         inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
+        if _core_category(error) is _SignalCategory.TERMINAL:
+            raise error from None
         if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -865,6 +878,8 @@ async def _run(
                 estimated = providers and usage.usd is None and usage.total_tokens == 0
         except BaseException as error:
             error = outcome.classify(error)
+            if _core_category(error) is _SignalCategory.TERMINAL:
+                raise error from None
             warnings.append(f"tool error: {_exception_type_name(error)}")
             output = ToolOutput(status=RunStatus.ERROR)
             actual, estimated = Amount(), started and providers
@@ -906,6 +921,8 @@ async def _run(
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
         except BaseException as error:
             error = outcome.classify(error)
+            if _core_category(error) is _SignalCategory.TERMINAL:
+                raise error from None
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")

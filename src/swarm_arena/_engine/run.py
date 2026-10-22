@@ -401,6 +401,8 @@ async def _start_executor(config: RunConfig) -> Executor:
         return await run_sync_daemon(_build_executor, config)
     except BaseException as exc:
         exc = outcome.classify(exc)
+        if _core_category(exc) is _SignalCategory.TERMINAL:
+            raise exc from None
         raise _core_error(
             RuntimeError, f"executor construction failed: {_exception_type_name(exc)}"
         ) from None
@@ -561,6 +563,8 @@ class RunRunner:
             self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
         except BaseException as error:
             error = outcome.classify(error)
+            if _core_category(error) is _SignalCategory.TERMINAL:
+                raise error from None
             raise _core_error(PlanError, [f"invalid plan: {_exception_type_name(error)}"]) from None
         seen: set[str] = set()
         for plan in self.plans:
@@ -591,6 +595,8 @@ class RunRunner:
                         )
                     except BaseException as error:
                         classified = outcome.classify(error)
+                        if _core_category(classified) is _SignalCategory.TERMINAL:
+                            raise classified from None
                         if isinstance(classified, PlanError):
                             raise classified from None
                         raise _core_error(
@@ -607,6 +613,8 @@ class RunRunner:
                     estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
                 except BaseException as exc:
                     exc = outcome.classify(exc)
+                    if _core_category(exc) is _SignalCategory.TERMINAL:
+                        raise exc from None
                     raise _core_error(
                         RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
                     ) from None
@@ -628,6 +636,8 @@ class RunRunner:
                         warnings.extend(_capacity_warning(admitted, capacity))
                 except BaseException as exc:
                     exc = outcome.classify(exc)
+                    if _core_category(exc) is _SignalCategory.TERMINAL:
+                        raise exc from None
                     raise _core_error(
                         RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
                     ) from None
@@ -641,6 +651,8 @@ class RunRunner:
                         approved = await self.approve(estimate.to_estimate(), warnings)
                     except BaseException as exc:
                         exc = outcome.classify(exc)
+                        if _core_category(exc) is _SignalCategory.TERMINAL:
+                            raise exc from None
                         raise _core_error(
                             RuntimeError, f"approval failed: {_exception_type_name(exc)}"
                         ) from None
