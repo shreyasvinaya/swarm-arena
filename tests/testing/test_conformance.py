@@ -1217,3 +1217,32 @@ async def test_check_manager_after_run_board_removal() -> None:
         )
         == 2
     )
+
+
+@pytest.mark.parametrize("registered", [False, True])
+async def test_check_manager_distinguishes_user_limit_from_nested_core_limit(
+    registered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import _core_error
+    from swarm_arena.manager import LimitReached
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if registered:
+            raise ExceptionGroup(
+                "outer", [ExceptionGroup("inner", [_core_error(LimitReached, "budget", "private")])]
+            )
+        raise LimitReached("budget", "private")
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    if registered:
+        reports = await check_manager(
+            NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+        )
+        assert reports == [RoundReport(), RoundReport()]
+    else:
+        with pytest.raises(AssertionError, match=r"^manager raised LimitReached$") as caught:
+            await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert "private" not in str(caught.value.__cause__)

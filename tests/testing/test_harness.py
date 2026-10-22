@@ -461,3 +461,34 @@ def test_harness_documents_run_deadline() -> None:
     assert "Notes" in doc
     assert "run_timeout_s" in doc
     assert "offline harness stopped" in doc
+
+
+@pytest.mark.parametrize("registered", [False, True])
+async def test_harness_distinguishes_user_limit_from_nested_core_limit(
+    registered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena.manager import LimitReached
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if registered:
+            raise ExceptionGroup(
+                "outer", [ExceptionGroup("inner", [_core_error(LimitReached, "budget", "private")])]
+            )
+        raise LimitReached("budget", "private")
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    harness = OfflineHarness()
+    reports = await harness.run_rounds(
+        NoopManager(), goal=GOAL, tool=SQUARE, rounds=2, limits=Limits(), config=RunConfig()
+    )
+    assert reports == [RoundReport(), RoundReport()]
+    if registered:
+        assert harness.manager_errors == []
+        assert not _events(harness, "agent_status")
+    else:
+        assert len(harness.manager_errors) == 2
+        assert all(isinstance(error, RuntimeError) for error in harness.manager_errors)
+        statuses = _events(harness, "agent_status")
+        assert len(statuses) == 2
+        assert all(event.payload["reason"] == "manager error: LimitReached" for event in statuses)
+        assert all("private" not in str(error) for error in harness.manager_errors)
