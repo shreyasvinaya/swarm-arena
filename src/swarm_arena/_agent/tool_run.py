@@ -731,7 +731,8 @@ async def _run(
 
     def on_admit(reservation: Reservation) -> None:
         # The ledger calls this synchronously after booking, before durability.
-        inflight.add(admission_scope, grace_s=grace_s, admitted_generation=generation)
+        if not failed:  # failed estimation already rules out dispatch
+            inflight.add(admission_scope, grace_s=grace_s, admitted_generation=generation)
         owner.admitted = reservation
 
     res = await rt.ledger.reserve(
@@ -814,6 +815,7 @@ async def _run(
             if run_scope.cancelled_caught:
                 output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
     except BaseException as error:
+        inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
         if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:

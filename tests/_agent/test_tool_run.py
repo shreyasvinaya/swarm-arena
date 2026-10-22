@@ -2035,3 +2035,40 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
     assert len(writes) == 1, "abandoned log write published another file"
+
+
+@pytest.mark.parametrize("failure", ["estimate", "providers", "put_edits"])
+async def test_predispatch_error_retains_candidate_after_completion_cancel(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from swarm_arena._agent import tool_run
+    from swarm_arena._errors import ConfigError
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise ConfigError("pre-dispatch failure")
+
+    monkeypatch.setattr(tool_run if failure == "put_edits" else rt_env.rt.tool, failure, fail)
+    real = tool_run.run_sync_daemon
+    observed: list[int] = []
+
+    async def wrapped(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if fn is tool_run._prepare_output:
+            observed.append(len(rt_env.inflight._scopes))
+            rt_env.inflight.cancel_all()
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tool_run, "run_sync_daemon", wrapped)
+    candidate = await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert observed == [1]  # only the bounded output scope remains registered
+    assert not rt_env.events("tool_start")
+    assert len(rt_env.events("tool_end")) == 1
+    reserves = rt_env.events("reserve")
+    assert len(reserves) == 1
+    reservation = reserves[0].payload["reservation"]["id"]
+    settles = rt_env.events("settle")
+    assert len(settles) == 1
+    assert settles[0].payload["id"] == reservation
+    assert rt_env.reservation_state(reservation) == "settled"
+    assert rt_env.charged(reservation) == Amount()
+    assert not rt_env.inflight._scopes

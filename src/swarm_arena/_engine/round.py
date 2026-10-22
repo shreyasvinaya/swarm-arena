@@ -736,8 +736,8 @@ class RoundRunner:
                     grace = inflight.max_grace_s()
                     # Borrow a minimum admission drain from the existing collection
                     # allowance; zero-grace jobs must survive this watcher tick.
-                    drain_until = now + max(grace, 1.0)
                     budget_collection_until = now + 2 * grace + 5.0
+                    drain_until = min(now + max(grace, 5.0), budget_collection_until)
             if cancel_until is None and (
                 immediate or (drain_until is not None and now >= drain_until)
             ):
