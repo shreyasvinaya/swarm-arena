@@ -723,15 +723,21 @@ def _owns_callback(binding: _Binding, meta: dict[str, str]) -> bool:
         if meta["owner_epoch"] != epoch:
             return False
         identified = True
-    tag = run_tag(meta.get("run_id", ""))
-    for key, prefix in (("call_id", "llm"), ("reservation_id", "r")):
-        value = meta.get(key)
-        if value:
-            match = re.fullmatch(rf"{prefix}-{tag}-e([0-9]+)-[0-9]+", value)
-            if match is not None:
-                if match[1] != epoch:
-                    return False
-                identified = True
+    call_id = meta.get("call_id")
+    reservation_id = meta.get("reservation_id")
+    if reservation_id:
+        # Admission, not an ID grammar, establishes reservation ownership.
+        if reservation_id in binding.pending:
+            identified = True
+        elif not call_id:
+            return False
+    if call_id:
+        tag = run_tag(meta.get("run_id", ""))
+        match = re.fullmatch(rf"llm-{tag}-e([0-9]+)-[0-9]+", call_id)
+        if match is not None:
+            if match[1] != epoch:
+                return False
+            identified = True
     # Initial owners retain legacy unkeyed reporting. After takeover, a detached
     # unkeyed row must carry owner_epoch; run_id alone cannot identify its owner.
     return (
@@ -767,7 +773,8 @@ async def record_call(
     metadata : Mapping[str, Any]
         String tracking fields, including run_id, reservation_id and call_id.
         Detached unkeyed reports after takeover must include owner_epoch (a
-        decimal string); epoch-bearing call/reservation IDs already identify it.
+        decimal string); epoch-bearing call IDs or an exact matching pending
+        reservation in the live binding already identify it, including batched IDs.
     model, provider : str
         Actual model and provider identifiers.
     usage : Usage

@@ -2601,6 +2601,11 @@ M3 implemented recording contract (supersedes the earlier sketch where different
   newer epoch replaces its stale predecessor and abandons the predecessor's
   pending callback work; equal/older epochs cannot replace it. Owner cleanup uses
   `unbind_run(run_id, journal=journal)` so stale cleanup cannot remove a successor.
+  Reservation-only reports establish ownership by exact identity in the live
+  binding's pending reservations, independent of ID grammar (including batched
+  `/call-N` suffixes). Unknown or predecessor reservation-only IDs are ignored;
+  they cannot be adopted as unkeyed reports. Callbacks carrying a preallocated
+  call ID must still supply its matching reservation (T2-I1).
   Callback call/reservation IDs carry their dispatch epoch. Detached unkeyed
   callbacks after takeover must supply `metadata["owner_epoch"]` as a decimal
   string (for example, `str(scope.journal.epoch)` captured at dispatch), or run in

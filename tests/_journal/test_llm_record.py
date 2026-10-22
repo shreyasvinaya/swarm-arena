@@ -1349,3 +1349,107 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
         await old.resumed._services._aclose(failed=True)
         if new is not None:
             await new.aclose()
+
+
+@pytest.mark.parametrize("batched", [False, True])
+async def test_resumed_detached_reservation_only_report(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, batched: bool
+) -> None:
+    from _fakes.run import plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.resume import resume_run
+    from swarm_arena._engine.round import EngineDeps
+    from swarm_arena._store.local import LocalStore
+
+    def as_run(deps: EngineDeps) -> LLMRun:
+        assert isinstance(deps.store, LocalStore)
+        return LLMRun(
+            deps.run_id,
+            deps.config,
+            deps.store,
+            deps.journal,
+            deps.artifacts,
+            deps.ledger,
+            deps.ids,
+            deps.stops,
+            deps.clock,
+        )
+
+    async def opened(run: LLMRun) -> tuple[LLMScope, dict[str, str]]:
+        scope = run.scope("manager")
+        if batched:
+            scope = replace(
+                scope,
+                tranche=Tranche(run.ledger, ":run", "g", size=Amount(tokens=25_000, usd=0.25)),
+            )
+        return await _open(run, scope)
+
+    config = run_config.model_copy(update={"settle_timeout_s": 2})
+    await Swarm(config).run(plan(rounds=1), run_id="reservation-only")
+    old = await resume_run(config, "reservation-only", force=True, replanner=None)
+    new = None
+    try:
+        assert old.resumed is not None
+        old_deps = old.resumed._services.deps
+        assert old_deps is not None
+        old_run = as_run(old_deps)
+        _, predecessor = await opened(old_run)
+        predecessor.pop("call_id")
+        new = await resume_run(config, "reservation-only", force=True, replanner=None)
+        assert new.resumed is not None
+        deps = new.resumed._services.deps
+        assert deps is not None
+        run = as_run(deps)
+        assert run.journal.epoch > old_run.journal.epoch > 1
+        scope, meta = await opened(run)
+        cid = meta.pop("call_id")
+        assert "owner_epoch" not in meta
+        assert current_llm_scope() is None
+        assert pending_scope(meta) is scope
+        assert pending_scope(predecessor) is None
+        inventory = run.store.list("")
+
+        def forbidden(_: bytes) -> str:
+            pytest.fail("unowned reservation uploaded a payload")
+
+        with monkeypatch.context() as no_upload:
+            no_upload.setattr(run.artifacts, "put_bytes", forbidden)
+            assert await record_call(**record_kwargs(predecessor)) is None
+        assert run.store.list("") == inventory
+        assert run.calls() == []
+        assert scope.tranche.pending() == 1
+        call = await record_call(**record_kwargs(meta))
+        assert call is not None
+        assert call.id == cid
+        assert call.reservation_id == meta["reservation_id"]
+        assert call.status == "ok"
+        assert call.error is None
+        assert scope.call_ids == [cid]
+        assert scope.tranche.pending() == 0
+        assert await record_call(**record_kwargs(meta)) is None
+        assert await drain(scope, wait=False) == []
+        await scope.tranche.close()
+        await run.journal.commit()
+        assert [(item.id, item.cost_usd) for item in run.calls()] == [(cid, 0.002)]
+        assert run.charged(scope)._micro_usd == 2_000
+        assert scope.tranche.pending() == 0
+        assert list(run.state().llm_calls) == [cid]
+        # A plausible current-epoch ID has no authority without exact admission.
+        unknown = {**meta, "reservation_id": run.ids.next("r")}
+        assert pending_scope(unknown) is None
+        with monkeypatch.context() as no_upload:
+            no_upload.setattr(run.artifacts, "put_bytes", forbidden)
+            assert await record_call(**record_kwargs(unknown)) is None
+            unknown["owner_epoch"] = str(run.journal.epoch)
+            assert await record_call(**record_kwargs(unknown)) is None
+        await run.journal.commit()
+        assert [item.id for item in run.calls()] == [cid]
+        assert run.charged(scope)._micro_usd == 2_000
+    finally:
+        assert old.resumed is not None
+        await old.resumed._services._aclose(failed=True)
+        if new is not None:
+            await new.aclose()
