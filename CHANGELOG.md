@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rosenbrock examples with LLM managers and an advisory judge panel, plus offline
+  exit tests for exact call accounting, replay and a model-managed final slice.
+
 - `swarm-arena plan` validates and estimates manual plans or saves catalog-admitted
   LLM and terminal-reviewed proposals with planning-session provenance, safe output
   handling, and shared interrupt cleanup.

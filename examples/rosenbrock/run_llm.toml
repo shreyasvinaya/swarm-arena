@@ -1,0 +1,24 @@
+run_root = ".swarm-arena/runs"
+arena_root = ".swarm-arena/arena"
+artifact_root = ".swarm-arena/artifacts"
+
+[models.opus]
+model = "anthropic/claude-opus-5-5"
+roles = ["manager"]
+
+[models.sonnet]
+model = "anthropic/claude-sonnet-5-5"
+roles = ["manager"]
+
+[models.gpt]
+model = "openai/gpt-6"
+roles = ["judge"]
+
+[models.haiku]
+model = "anthropic/claude-haiku-5-5"
+roles = ["judge"]
+
+[limits]
+max_rounds = 2
+max_tokens = 1_000_000
+default_run_reservation = {tokens = 0, usd = 0.0}

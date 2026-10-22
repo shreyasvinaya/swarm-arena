@@ -1,0 +1,207 @@
+"""Exercise final ranking and a model-managed converge team on a capped run."""
+
+import json
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("agents")
+
+from _fakes.fake_models import registered_model
+from _fakes.run import all_events, events, run_dir
+from e2e.test_rosenbrock_llm import _example, _manager_turns, _micros, _registered_judge
+
+from swarm_arena import ConvergeSpec, Goal, Limits, Plan, Ref, RunConfig, Score, Swarm
+from swarm_arena._budget.amount import Amount
+from swarm_arena._journal.replay import RunState
+from swarm_arena.board import Candidate
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import LLMJudge
+from swarm_arena.scoring import JudgeContext
+
+
+class _FinalJudge(LLMJudge):
+    """Use an exact free objective at barriers and the real LLM for final ranking."""
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        """
+        Defer paid scoring until the final public engine operation.
+
+        Parameters
+        ----------
+        goal : Goal
+            Goal being judged.
+        candidates : sequence of Candidate
+            Published data-only outputs.
+        ctx : JudgeContext
+            Engine-owned phase and execution context.
+
+        Returns
+        -------
+        list of Score
+            Free barrier scores or the real LLM judge's final scores.
+
+        Examples
+        --------
+        >>> _FinalJudge("r", ["j"]).models()
+        ('j',)
+        """
+        if ctx.final:
+            return await super().judge(goal, candidates, ctx)
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+
+async def test_llm_ranking_judge_and_llm_converge_manager_fit_the_final_slice(
+    tmp_path: Path,
+) -> None:
+    plan, config = _example(tmp_path)
+    judge = Ref.of(LLMJudge("r", ["j"])).model_copy(update={"name": "llm"})
+    # Keep the scripted optimizer plan and give only convergence an LLM manager.
+
+    plan = Plan.load(plan.base_dir / "plan.toml")
+    team = plan.teams[0].model_copy(
+        update={
+            "name": "join",
+            "agents": [
+                plan.teams[0]
+                .agents[0]
+                .model_copy(
+                    update={
+                        "manager": Ref(
+                            path="swarm_arena.llm:AgentsSDKManager", config={"model": "m"}
+                        )
+                    }
+                )
+            ],
+        }
+    )
+    plan = plan.model_copy(
+        update={
+            "judges": [judge],
+            "ranking": "llm",
+            "converge": ConvergeSpec(mode="team", team=team),
+        }
+    )
+    config = config.model_copy(
+        update={
+            "models": ModelCatalog(
+                {
+                    alias: ModelSpec(
+                        model=f"fake/{alias}",
+                        roles=[role],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                    for alias, role in (("j", "judge"), ("m", "manager"))
+                }
+            ),
+            "limits": config.limits.model_copy(update={"max_usd": 5.0}),
+        }
+    )
+    with (
+        _registered_judge("j") as judge_fake,
+        registered_model(_manager_turns(), name="m") as manager_fake,
+    ):
+        result = await Swarm(config).run(plan)
+        assert result[plan.goal.id]
+        solution = json.loads(
+            (run_dir(config) / "goals" / plan.goal.id / "solution.json").read_text()
+        )
+        assert solution["status"] == "ok"
+        assert not events(config, "reserve_exhausted")
+        assert not events(config, "judge_error")
+        assert judge_fake.calls
+        assert len(manager_fake.calls) == 2
+        final_scores = [e.payload["score"] for e in events(config, "score") if e.round == 0]
+        expected = [
+            s["candidate_id"] for s in sorted(final_scores, key=lambda s: s["value"], reverse=True)
+        ]
+        assert (
+            events(config, "final_order")[-1].payload["candidate_ids"]
+            == expected[: plan.converge.top_n]
+        )
+        state = RunState.from_events(all_events(config))
+        assert all(c.status == "ok" for c in state.llm_calls.values())
+        assert any(c.team == "join" for c in state.candidates.values())
+        start = events(config, "converge_started")[0].seq
+        ids = {
+            e.payload["reservation"]["id"]
+            for e in events(config, "reserve")
+            if e.seq > start and e.payload["reservation"]["goal_id"] == plan.goal.id
+        }
+        spent = sum((Amount.model_validate(state.reservations[id].actual) for id in ids), Amount())
+        final_slice = Amount.model_validate(
+            events(config, "run_started")[0].payload["final_slices"][plan.goal.id]
+        )
+        assert spent.fits_in(final_slice, cap_tokens=True, cap_usd=True)
+        assert sum(_micros(c.cost_usd) for c in state.llm_calls.values()) > 0
+
+
+async def test_oversize_final_inputs_are_refused_before_any_provider_call(tmp_path: Path) -> None:
+    from _fakes.engine import with_executor
+    from _fakes.run import plan as simple_plan
+
+    plan = simple_plan(
+        rounds=1,
+        tool_ref=Ref(
+            path="swarm_arena:FunctionTool",
+            config={"function": "_fakes.rosenbrock_llm:large_output"},
+        ),
+    )
+    plan.teams[0].agents[0] = (
+        plan.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(
+                    path="swarm_arena:ScriptedManager",
+                    config={"requests": [{"inputs": {"size": 100_000}}]},
+                ),
+            }
+        )
+    )
+    plan = plan.model_copy(
+        update={
+            "judges": [Ref.of(_FinalJudge("r", ["j"])).model_copy(update={"name": "llm"})],
+            "ranking": "llm",
+        }
+    )
+    config = with_executor(
+        RunConfig(
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(
+                max_tokens=10_000,
+                llm_tranche_tokens=1000,
+                max_usd=5,
+                max_rounds=1,
+                default_run_reservation={"tokens": 0, "usd": 0.0},
+            ),
+            models=ModelCatalog(
+                {
+                    "j": ModelSpec(
+                        model="fake/j",
+                        roles=["judge"],
+                        max_tokens=100,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    with registered_model([], name="j") as fake:
+        result = await Swarm(config).run(plan)
+        assert result == {"g": []}
+        assert not fake.calls
+    assert events(config, "no_result")[-1].payload["reason"] == "reserve_exhausted"
+    assert not events(config, "llm_call")
+    state = RunState.from_events(all_events(config))
+    assert all(r.state == "settled" for r in state.reservations.values())
+    spent = sum((Amount.model_validate(r.actual) for r in state.reservations.values()), Amount())
+    assert spent.fits_in(Amount(tokens=10_000, usd=5), cap_tokens=True, cap_usd=True)

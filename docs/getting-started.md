@@ -159,15 +159,30 @@ use `resume RUN_DIR --config RUN_TOML`; `--force` permits an explicit ownership
 takeover. See [Limits and safety](limits-and-safety.md) before changing limits or
 forcing takeover.
 
-## Later: use a model-driven manager
+## With an API key
 
-The one-line manager replacement below **needs the `llm` extra (M3)**. It is a
-future integration example, not part of the current offline quickstart. It also
-requires a configured model alias and provider credentials in the run settings.
+Install the `llm` extra and configure a model alias and its provider credentials.
+An agent's manager changes in one line:
 
 ```toml
 manager = {path = "swarm_arena.llm:AgentsSDKManager", config = {model = "opus"}}
 ```
+
+The supplied `examples/rosenbrock/plan_llm.toml` uses Opus and Sonnet managers
+and adds a GPT/Haiku advisory panel beside the programmatic ranking judge.
+`run_llm.toml` supplies the aliases, a one-million-token cap, two rounds and zero
+tool reservations because these tools make no model calls. It has no USD cap.
+Set `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` in your environment, then run:
+
+```sh
+uv sync --extra llm
+uv run swarm-arena run --yes examples/rosenbrock/run_llm.toml examples/rosenbrock/plan_llm.toml
+```
+
+The [example walkthrough](https://github.com/shreyasvinaya/swarm-arena/blob/main/examples/rosenbrock/README.md#with-api-keys) includes
+offline `FakeModel` tests and the opt-in live test. All ordinary tests are offline.
+Final judging reserves serialized input at call time; output-only final slices
+cannot guarantee that arbitrary candidate text will fit the remaining budget.
 
 For your own programs, see [Try your own scripts offline](own-files.md#try-it-offline)
 and [Writing a connector](writing-a-connector.md).

@@ -20,8 +20,8 @@
 
 Full offline swarm runs, scripted managers, pruning, convergence, and resumable
 run journals work today, alongside tools, checks, judges, `LocalExecutor`, and the
-`swarm_arena.testing` conformance kit. Model-driven managers arrive with the
-`llm` extra (M3).
+`swarm_arena.testing` conformance kit. Model-driven managers and judge panels are
+available with the `llm` extra.
 
 ## Quickstart
 
@@ -60,6 +60,10 @@ Read `<run-dir>/goals/rosenbrock/solution.json` for the ordered results; run dat
 stays under `.swarm-arena/`. See [Getting started](docs/getting-started.md) for the
 included source, plan, limits, Python API, and `status`/`stop`/`resume` commands,
 or the [example README](examples/rosenbrock/README.md) for a short walkthrough.
+
+With Anthropic and OpenAI API keys, the [LLM Rosenbrock example](examples/rosenbrock/README.md#with-api-keys)
+uses model-driven managers and an advisory judge panel. Its offline exit tests use
+isolated `FakeModel` conversations and check exact accounting, replay and final funding.
 
 ## Optional integrations
 
