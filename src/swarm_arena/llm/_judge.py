@@ -25,7 +25,7 @@ from swarm_arena._model.results import Candidate, Score
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext, _panel_drops, _PanelDrop
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
-from swarm_arena.llm._invocation import _invocation
+from swarm_arena.llm._invocation import _invocation, _InvocationAccounting
 from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._structured import _captured_call_ids, structured_call
 
@@ -258,16 +258,20 @@ class LLMJudge(Judge):
         survivors: list[str] = []
         failure: Exception | None = None
         boundary = _Outcome()
+        accounting = _InvocationAccounting()
         try:
             async with _invocation(
                 parent,
                 name="judge",
                 error_type=RuntimeError,
                 accounting_name="LLM judge accounting",
+                accounting=accounting,
             ) as scope:
                 tracing.enter_context(component_span(scope))
                 scores = await self._judge(goal, candidates, ctx, provider_errors, survivors)
         except Exception as error:
+            if accounting.failed:
+                raise
             if _core_category(boundary.classify(error)) not in {
                 _SignalCategory.PROVIDER,
                 _SignalCategory.LIMIT,

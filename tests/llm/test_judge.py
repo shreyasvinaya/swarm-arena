@@ -1138,10 +1138,12 @@ async def test_llm_ranking_final_runs_with_zero_tool_reservation(tmp_path: Path)
     assert solution["status"] == "ok"
 
 
+@pytest.mark.parametrize("accounting_kind", ["storage", "limit"])
 @pytest.mark.parametrize("aliases", [("b",), ("a", "b")])
 async def test_panel_accounting_failure_prevents_provider_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...], accounting_kind: str
 ) -> None:
+    from swarm_arena._agent.manager import LimitReached
     from swarm_arena._engine.stops import provider_stops
     from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
     from swarm_arena.llm import _invocation
@@ -1149,8 +1151,14 @@ async def test_panel_accounting_failure_prevents_provider_completion(
     async def fail_provider(*args: Any, **kwargs: Any) -> ModelResponse:
         raise _core_error(ProviderFailed, "fake")
 
+    accounting_error = (
+        _core_error(LimitReached, "max_tokens", "accounting limit")
+        if accounting_kind == "limit"
+        else _core_error(StorageError, "LLM settlement failed: OSError")
+    )
+
     async def fail_accounting(*args: Any, **kwargs: Any) -> None:
-        raise _core_error(StorageError, "LLM settlement failed: OSError")
+        raise accounting_error
 
     for alias in aliases:
         fake = FakeModel([turn(1)])
@@ -1164,7 +1172,7 @@ async def test_panel_accounting_failure_prevents_provider_completion(
         ctx = JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path))
         with (
             llm_scope(scope),
-            pytest.raises(StorageError, match="LLM settlement failed: OSError") as caught,
+            pytest.raises(type(accounting_error)) as caught,
         ):
             await LLMJudge("r", aliases).judge(goal, candidates(1), ctx)
         assert _is_core_signal(caught.value)
