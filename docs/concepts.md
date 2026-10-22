@@ -229,7 +229,9 @@ them. It then validates aliases from the built managers and judges, including
 nested judges, part scoring, and convergence. Replanners and curators receive
 the same checks before run publication and before resume takes ownership.
 A refused resume leaves the epoch, lease and journal unchanged. Startup hooks
-run in cancellable daemon workers on both entry paths. Managers require function calling.
+run in cancellable daemon workers on both entry paths. Hook-raised interrupts,
+cancellations and exception groups become value-free startup failures; genuine
+caller cancellation still cancels preparation. Managers require function calling.
 Judges, planners, and curators without response-schema support produce a
 **two-stage** warning: a free-text answer needs a subsequent formatting call.
 On resume, these warnings are retained in the journal's takeover event.

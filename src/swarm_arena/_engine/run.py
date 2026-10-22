@@ -236,8 +236,6 @@ async def _check_startup_models(config: RunConfig, replanner: Planner | None) ->
     outcome = _Outcome()
     try:
         errors, warnings = await run_sync_daemon(_startup_models, config, replanner)
-    except KeyboardInterrupt:
-        raise
     except BaseException as error:
         error = outcome.classify(error)
         raise _core_error(
@@ -539,8 +537,6 @@ class RunRunner:
                                 staged,
                             )
                         )
-                    except KeyboardInterrupt:
-                        raise
                     except BaseException as error:
                         classified = outcome.classify(error)
                         if isinstance(classified, PlanError):
