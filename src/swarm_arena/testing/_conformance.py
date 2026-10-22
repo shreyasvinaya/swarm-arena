@@ -364,13 +364,14 @@ async def check_judge(
     async with (
         _executor(executor) as runner,
         _failed_runs_on(runner),
-        _judge_scope(goal, RunConfig() if config is None else config) as scope,
+        _judge_scope(goal, RunConfig() if config is None else config) as (scope, ids),
     ):
         ctx = JudgeContext(
             goal=goal,
             executor=runner,
             artifact_root=_artifact_root(),
-            ids=_ids(),
+            run_id=scope.run_id,
+            ids=ids,
             batch_id="b-" + secrets.token_hex(4),
         )
         returned = await built.judge(goal, candidates, ctx)
@@ -382,7 +383,7 @@ async def check_judge(
                 valid,
                 judge=built,
                 judge_name=ref.component_name(),
-                ids=_ids(),
+                ids=ids,
                 batch_id=ctx.batch_id,
             )
         )

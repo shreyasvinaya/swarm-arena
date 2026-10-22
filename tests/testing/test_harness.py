@@ -346,7 +346,8 @@ async def test_harness_uses_a_temp_arena_board(
     )
     assert all("preflight_complete" not in e.payload for e in _events(h, "plan_revision"))
     root = Path(h.store.url).parent.parent
-    assert (root / "arena" / GOAL.namespace / "runs" / "local.json").exists()
+    run_id = h.candidates[0].run_id
+    assert (root / "arena" / GOAL.namespace / "runs" / f"{run_id}.json").exists()
     assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
     assert not (tmp_path / "real-arena").exists()
     assert not (tmp_path / "xdg").exists()

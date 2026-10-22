@@ -781,7 +781,7 @@ async def test_check_judge_stamps_and_warns(local_executor: LocalExecutor) -> No
     scores = await check_judge(ProgramJudge(rosen_score), GOAL, [c1, c2], executor=local_executor)
     assert [s.candidate_id for s in scores] == [c1.id, c2.id]
     assert {s.judge for s in scores} == {"program"}
-    assert all(s.id.startswith(f"s-{run_tag('local')}-e0-") and s.rubric_hash for s in scores)
+    assert all(s.id.startswith("s-") and "-e1-" in s.id and s.rubric_hash for s in scores)
     assert len({s.batch_id for s in scores}) == 1
     assert scores[0].batch_id.startswith("b-")
     with pytest.warns(UserWarning, match=f"judge error for {c1.id}"):
@@ -1291,9 +1291,15 @@ async def test_check_manager_runs_the_run_setups(
     from swarm_arena._journal import llm_record
 
     calls: list[RunConfig] = []
+    run_ids: list[str] = []
 
     def spy(config: RunConfig) -> None:
-        assert "local" in llm_record._bindings
+        [run_id] = [
+            run_id
+            for run_id, binding in llm_record._bindings.items()
+            if Path(binding.journal._store.url).parent == Path(config.run_root).resolve()
+        ]
+        run_ids.append(run_id)
         calls.append(config)
 
     monkeypatch.setattr(run, "_run_setups", [])
@@ -1314,7 +1320,8 @@ async def test_check_manager_runs_the_run_setups(
         }
     )
     assert calls == [harness_config]
-    assert "local" not in llm_record._bindings
+    assert len(run_ids) == 1
+    assert run_ids[0] not in llm_record._bindings
 
 
 async def test_check_judge_opens_a_judge_scope(
@@ -1356,7 +1363,7 @@ async def test_check_judge_opens_a_judge_scope(
     assert (scope.role, scope.models) == ("judge", config.models)
     assert scope.cache == config.cache
     assert len(setups) == 1
-    assert "local" not in llm_record._bindings
+    assert scope.run_id not in llm_record._bindings
 
 
 async def test_check_manager_forces_parallel_tool_calls(tmp_path: Path) -> None:
@@ -1541,7 +1548,7 @@ async def test_manager_that_leaves_calls_open_fails_the_kit(
                 assert committed is not None
                 assert len([e for e in committed[1] if e.type == "llm_call"]) == 1
                 assert scopes[0].tranche._closed
-                assert "local" not in llm_record._bindings
+                assert scopes[0].run_id not in llm_record._bindings
             finally:
                 group.cancel_scope.cancel()
 
@@ -1612,7 +1619,7 @@ async def test_check_judge_cleans_up_a_component_with_open_calls(
     [scope] = seen
     assert scope.tranche._closed
     assert scope.tranche.pending() == 0
-    assert "local" not in llm_record._bindings
+    assert scope.run_id not in llm_record._bindings
     committed = read_committed(scope.journal._store)
     assert committed is not None
     calls = [event.payload["call"] for event in committed[1] if event.type == "llm_call"]
@@ -1632,6 +1639,7 @@ async def test_check_judge_setup_is_abandoned_on_caller_cancellation(
 
     held = HeldOperation()
     entered = False
+    bindings_before = dict(llm_record._bindings)
 
     def setup(config: RunConfig) -> None:
         held.wait()
@@ -1669,7 +1677,7 @@ async def test_check_judge_setup_is_abandoned_on_caller_cancellation(
             with anyio.fail_after(5):
                 await finished.wait()
             assert not entered
-            assert "local" not in llm_record._bindings
+            assert llm_record._bindings == bindings_before
             assert not held.release.is_set()
         finally:
             owner.cancel()
@@ -1764,3 +1772,109 @@ async def test_check_judge_releases_a_lease_before_writer_ownership(
             await held.finish()
             if not released.is_set():
                 await anyio.to_thread.run_sync(release, leases[0])
+
+
+@pytest.mark.parametrize("kind", ["judge", "manager"])
+async def test_overlapping_conformance_runs_are_isolated(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+
+    baseline = dict(llm_record._bindings)
+    first_entered, release = anyio.Event(), anyio.Event()
+    second_finished = anyio.Event()
+    scopes: list[LLMScope] = []
+    results: dict[str, list[Any]] = {}
+    failures: dict[str, Exception] = {}
+
+    async def hold(scope: LLMScope) -> None:
+        scopes.append(scope)
+        scope.journal._check_open()
+        assert scope.run_id in llm_record._bindings
+        assert Path(scope.journal._store.url).name == scope.run_id
+        if len(scopes) == 1:
+            first_entered.set()
+            await release.wait()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        assert ctx.run_id == scope.run_id
+        assert ctx.ids.next("x").startswith(f"x-{run_tag(scope.run_id)}-")
+        await hold(scope)
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    async def manage(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scope = current_llm_scope()
+        assert scope is not None
+        candidate = await ctx.run_tool({"x": 1})
+        assert candidate.run_id == scope.run_id
+        assert candidate.id.startswith(f"c-{run_tag(scope.run_id)}-")
+        await hold(scope)
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    monkeypatch.setattr(NoopManager, "run_round", manage)
+    candidate = make_candidate(ok(), goal_id=GOAL.id)
+
+    async def invoke(label: str) -> None:
+        try:
+            if kind == "judge":
+                results[label] = await check_judge(FixedJudge({"value": 1}), GOAL, [candidate])
+            else:
+                results[label] = await check_manager(
+                    NoopManager(),
+                    goal=GOAL,
+                    tool=FunctionTool("_fakes.tools:square"),
+                )
+        except Exception as error:
+            failures[label] = error
+        finally:
+            if label == "second":
+                second_finished.set()
+            elif label in failures:
+                first_entered.set()
+
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as group:
+            group.start_soon(invoke, "first")
+            await first_entered.wait()
+            try:
+                assert not failures
+                group.start_soon(invoke, "second")
+                await second_finished.wait()
+                assert not failures
+                assert len(scopes) == 2
+                first, second = scopes
+                assert first.run_id != second.run_id
+                assert first.run_id in llm_record._bindings
+                assert second.run_id not in llm_record._bindings
+            finally:
+                release.set()
+    assert not failures
+    assert llm_record._bindings == baseline
+    assert set(results) == {"first", "second"}
+    if kind == "judge":
+        for label, scope in zip(("first", "second"), scopes, strict=True):
+            [score] = results[label]
+            assert score.candidate_id == candidate.id
+            assert score.key == (1.0,)
+            assert score.id.startswith(f"s-{run_tag(scope.run_id)}-")
+    else:
+        assert all(returned == [RoundReport(summary="done")] for returned in results.values())
+    for scope in scopes:
+        assert scope.tranche._closed
+        committed = read_committed(scope.journal._store)
+        assert committed is not None
+        assert all(event.run_id == scope.run_id for event in committed[1])
+        assert all(event.context_id == scope.run_id for event in committed[1])

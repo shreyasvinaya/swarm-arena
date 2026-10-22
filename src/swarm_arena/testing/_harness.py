@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from uuid import uuid4
 
 import anyio
 
@@ -87,6 +88,7 @@ def _scope(
     config: RunConfig,
     artifacts: ArtifactStore,
     *,
+    run_id: str,
     round: int = 0,
     team: str = "",
     agent: str = "",
@@ -94,7 +96,7 @@ def _scope(
     """Use the harness's entered services and effective run settings."""
     return LLMScope(
         role=role,
-        run_id="local",
+        run_id=run_id,
         goal_id=goal.id,
         team=team,
         agent=agent,
@@ -112,10 +114,11 @@ def _scope(
 
 
 @asynccontextmanager
-async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope]:
+async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LLMScope, IdGen]]:
     """Own an isolated judge run, including initialization and callback cleanup."""
     root = await _storage_io(OfflineHarness._run_folder)
-    store = LocalStore(root / "runs" / "local")
+    run_id = "offline-" + uuid4().hex
+    store = LocalStore(root / "runs" / run_id)
     config = config.model_copy(
         update={
             "run_root": str(root / "runs"),
@@ -128,7 +131,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope
         ),
         settle_timeout_s=config.settle_timeout_s,
     )
-    ids = IdGen("local", lease.doc.epoch)
+    ids = IdGen(run_id, lease.doc.epoch)
     stops, clock = StopState(), RunClock(0)
     artifacts = _artifacts()
     completed = False
@@ -137,7 +140,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope
         async with JournalWriter(
             store,
             lease,
-            run_id="local",
+            run_id=run_id,
             next_seq=1,
             local_path=root / "journal.jsonl",
             sync_interval_s=config.sync_interval_s,
@@ -148,7 +151,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope
                 _supervise_writer(journal),
                 _supervise_initialization(store, lease.doc.epoch, stops, clock, config),
                 _bound_run(
-                    "local",
+                    run_id,
                     journal=journal,
                     ids=ids,
                     artifacts=artifacts,
@@ -184,10 +187,10 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope
                 )
                 await _setup_run((), config)
                 tranche = OfflineHarness._tranche(ledger, ":run", goal.id, config.limits)
-                scope = _scope("judge", goal, tranche, journal, config, artifacts)
+                scope = _scope("judge", goal, tranche, journal, config, artifacts, run_id=run_id)
                 try:
                     with llm_scope(scope):
-                        yield scope
+                        yield scope, ids
                     completed = True
                 finally:
                     await drain(scope, wait=False)
@@ -307,7 +310,8 @@ class OfflineHarness:
         self.candidates, self.learnings = [], []
         self.manager_errors = []
         root = await anyio.to_thread.run_sync(self._run_folder)
-        self.store = LocalStore(root / "runs" / "local")
+        run_id = "offline-" + uuid4().hex
+        self.store = LocalStore(root / "runs" / run_id)
         config = config.model_copy(
             update={
                 "limits": limits,
@@ -323,7 +327,6 @@ class OfflineHarness:
             snapshot, judge, _ = await anyio.to_thread.run_sync(_build, ref, Judge, goal)
             built_judges.append((snapshot, judge))
         ranking = built_judges[0][0].component_name() if built_judges else ":unscored"
-        ids = IdGen("local", 1)
         lease = await anyio.to_thread.run_sync(
             partial(
                 Lease.acquire_new,
@@ -333,6 +336,7 @@ class OfflineHarness:
                 ttl_s=config.lease_ttl_s,
             )
         )
+        ids = IdGen(run_id, lease.doc.epoch)
         completed = False
         stops, clock = StopState(), RunClock(0)
         artifacts = _artifacts()
@@ -342,7 +346,7 @@ class OfflineHarness:
             JournalWriter(
                 self.store,
                 lease,
-                run_id="local",
+                run_id=run_id,
                 next_seq=1,
                 local_path=root / "journal.jsonl",
                 sync_interval_s=config.sync_interval_s,
@@ -351,7 +355,7 @@ class OfflineHarness:
             _supervise_writer(journal),
             _supervise_initialization(self.store, lease.doc.epoch, stops, clock, config),
             _bound_run(
-                "local",
+                run_id,
                 journal=journal,
                 ids=ids,
                 artifacts=artifacts,
@@ -407,7 +411,7 @@ class OfflineHarness:
             )
             board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
             try:
-                await _open_board(board, config, "local", [goal.namespace])
+                await _open_board(board, config, run_id, [goal.namespace])
                 view = await _storage_io(
                     board.snapshot,
                     goal.key(),
@@ -439,7 +443,7 @@ class OfflineHarness:
                     tranche=self._tranche(ledger, address, goal.id, limits),
                     limits=limits,
                     counters=AgentCounters(),
-                    repeats=RepeatIndex("local"),
+                    repeats=RepeatIndex(run_id),
                     watchdog=Watchdog(limits),
                     journal=journal,
                     board=board,
@@ -540,7 +544,7 @@ class OfflineHarness:
                 digest=build_digest(
                     view,
                     goal=rt.goal_key,
-                    run_id="local",
+                    run_id=rt.repeats.run_id,
                     round=number,
                     ranking=ranking,
                     cap_tokens=rt.limits.digest_tokens,
@@ -555,6 +559,7 @@ class OfflineHarness:
                 rt.journal,
                 rt.config,
                 rt.artifacts,
+                run_id=rt.repeats.run_id,
                 round=number,
                 team=rt.team.name,
                 agent=rt.spec.name,
@@ -600,7 +605,7 @@ class OfflineHarness:
                             "reason": reason,
                             "a2a": task_to_json(
                                 agent_round_task(
-                                    context_id="local",
+                                    context_id=rt.repeats.run_id,
                                     address=rt.address,
                                     round=number,
                                     learnings=[
@@ -657,7 +662,7 @@ class OfflineHarness:
                 goal=rt.goal,
                 executor=executor,
                 artifact_root=rt.config.artifact_root,
-                run_id="local",
+                run_id=rt.repeats.run_id,
                 round=rt.round,
                 fidelity=rt.fidelity,
                 ids=rt.ids,

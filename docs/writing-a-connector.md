@@ -480,7 +480,8 @@ setups, and opens a fresh manager scope for each round. A component that leaves
 LLM calls undrained raises an `AssertionError` naming the drain rule; a manager
 candidate linked to a call outside that round's scope fails the
 `requested_by_call` rule. Cleanup settles outstanding reservations before
-closing the owned services.
+closing the owned services. Concurrent helper invocations use separate run
+identities and services.
 
 `check_judge(judge, goal, candidates, config=config)` similarly opens a bound
 judge scope with a funded tranche. Omitting `config` uses `RunConfig()` defaults.
