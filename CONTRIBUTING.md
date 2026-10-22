@@ -89,7 +89,13 @@ This keeps ordinary and final judging of the same candidate distinct during repl
 
 ## CI timing and isolation
 
-CI uses separate pytest-xdist worker processes inside pytest-split shards. Keep
+CI uses separate pytest-xdist worker processes inside pytest-split shards.
+Branch pushes use 20 jobs: core (two Python versions × two shards), extras
+(two versions × three shards), lowest-direct core (three shards), lowest-direct
+with all extras (two shards), macOS (four shards), and docs. Both lowest-direct
+configurations use Python 3.11 and preserve their resolved environment with
+`uv run --no-sync`. Main also tests core Python 3.12 and macOS Python 3.11;
+two shards per macOS version keep its total at four jobs. Keep
 filesystem writes under `tmp_path`, bind test servers to port 0, and reap children
 in fixture teardown or `finally`. Collection must produce identical node IDs in
 every worker; inventories built from weak subclass registries must discard

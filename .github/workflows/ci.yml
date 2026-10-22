@@ -29,7 +29,7 @@ jobs:
       matrix:
         # Branch pushes test the oldest and newest Python; main also covers 3.12.
         python-version: ${{ github.ref == 'refs/heads/main' && fromJSON('["3.11", "3.12", "3.13"]') || fromJSON('["3.11", "3.13"]') }}
-        shard: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
@@ -43,7 +43,7 @@ jobs:
       - if: matrix.shard == 1
         run: uv run ruff format --check .
       - run: cp .test_durations test-durations.json
-      - run: uv run pytest -n 4 --dist worksteal --durations=25 --store-durations --clean-durations --durations-path test-durations.json --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - run: uv run pytest -n 4 --dist worksteal --durations=25 --store-durations --clean-durations --durations-path test-durations.json --splits 2 --group ${{ matrix.shard }} --splitting-algorithm least_duration
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -113,6 +113,32 @@ jobs:
         with:
           name: durations-lowest-direct-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
           path: test-durations.json
+
+  lowest-direct-extras:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.11"
+      - run: uv sync --all-extras --all-groups --resolution lowest-direct --upgrade
+      - run: cp .test_durations test-durations.json
+      - run: uv run --no-sync pytest -q -n 4 --dist worksteal --durations=25 --store-durations --clean-durations --durations-path test-durations.json --splits 2 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durations-lowest-direct-extras-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
+          path: test-durations.json
+
+      - if: matrix.shard == 1
+        run: uv run --no-sync pytest -m s3 -v
 
   macos:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
