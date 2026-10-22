@@ -637,6 +637,9 @@ class OfflineHarness:
                     with llm_scope(scope):
                         report = await manager.run_round(AgentContext(rt, gate=lambda: None))
                 except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        outcome.propagate_control(error)
+                        raise
                     error = outcome.classify(error)
                     if _is_core_signal(error) and _core_category(error) is _SignalCategory.TERMINAL:
                         raise error from None

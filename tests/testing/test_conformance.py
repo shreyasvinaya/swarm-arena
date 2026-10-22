@@ -2424,3 +2424,57 @@ async def test_conformance_keeps_core_control_with_a_drain_note(
     expected = _SignalCategory.TERMINAL if control == "terminal" else _SignalCategory.FENCED
     assert _core_category(caught.value) is expected
     assert _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+async def test_conformance_preserves_process_interrupts(
+    kind: str, error_type: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    error = error_type()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise error
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise error
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(error_type) as caught:
+        await _run_conformance_kind(kind)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("shape", ["chained", "group", "limit"])
+async def test_check_judge_preserves_error_identity_and_chain(
+    shape: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent.manager import LimitReached
+
+    cause = KeyError("cause")
+    error = (
+        ExceptionGroup("group", [ValueError("child")])
+        if shape == "group"
+        else LimitReached("user", "user limit")
+        if shape == "limit"
+        else ValueError("failure")
+    )
+    error.__cause__ = cause
+    error.__context__ = cause
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise error
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(type(error)) as caught:
+        await _run_conformance_kind("judge")
+    assert caught.value is error
+    assert error.__cause__ is cause
+    assert error.__context__ is cause

@@ -382,7 +382,8 @@ async def check_judge(
         try:
             returned = await built.judge(goal, candidates, ctx)
         except BaseException as error:
-            raise outcome.classify(error) from None
+            outcome.propagate_control(error)
+            raise
         await _assert_drained(scope)
         try:
             scope.tranche._ledger._check_usage_overflow()
@@ -517,7 +518,13 @@ async def check_manager(
             limits=limits,
             config=config,
         )
-    except (LimitReached, _LLMContractError, anyio.get_cancelled_exc_class()):
+    except (
+        LimitReached,
+        _LLMContractError,
+        KeyboardInterrupt,
+        SystemExit,
+        anyio.get_cancelled_exc_class(),
+    ):
         raise
     except BaseException as error:
         # Component outcomes were classified inside the harness and are reported
