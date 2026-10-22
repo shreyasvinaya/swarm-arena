@@ -1184,7 +1184,13 @@ class RoundRunner:
             except BaseException as error:
                 error = outcome.classify(error)
                 self.deps.journal._raise_if_fenced()
-                if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                if _core_category(error) is _SignalCategory.TERMINAL:
+                    if isinstance(error, LimitReached) and error.limit == "usage_overflow":
+                        self.deps.stops.run_budget = True
+                        reasons[key] = "run budget"
+                        return
+                    raise error from None
+                if _core_category(error) is _SignalCategory.FENCED:
                     raise error from None
                 if _core_category(error) is _SignalCategory.PROVIDER:
                     assert isinstance(error, ProviderFailed)  # noqa: PT017 - core type narrowing

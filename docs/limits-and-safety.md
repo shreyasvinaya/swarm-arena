@@ -499,3 +499,8 @@ A registered judge budget refusal at the barrier records `reserve_exhausted`
 and ends ordinary rounds in select-only mode. At final judging it produces
 `no_result` with reason `reserve_exhausted`. Registered limits in replanning and
 policy retain their existing contained rejection/error-decision behavior.
+
+A registered usage overflow from a manager takes the run-budget stop path:
+ordinary rounds end, and the free final selection can still run. A registered
+cleanup or storage terminal failure escapes the run even when no ledger or
+binding state accompanies it. Neither kind is recorded as a manager error.

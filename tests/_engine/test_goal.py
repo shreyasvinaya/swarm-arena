@@ -2375,7 +2375,7 @@ async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) ->
     with anyio.fail_after(60):
         result = await Swarm(config, replanner=FailingPlanner()).resume("failure", force=True)
     after = all_events(config)
-    if boundary in {"batch", "policy", "final", "final_scores", "curator", "join", "parts"}:
+    if boundary in {"batch", "policy", "final", "final_scores", "curator", "join"}:
         for name, contents in calls_before.items():
             assert (tmp_path / name).read_text() == contents
     if boundary == "planner":
@@ -2394,7 +2394,7 @@ async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) ->
         assert result["g"] == []
         assert events(config, "no_result")[-1].payload["reason"] == "provider_failed"
     if boundary == "parts":
-        assert len((tmp_path / "judge-calls").read_text().splitlines()) == 2
+        assert (tmp_path / "judge-calls").read_text().splitlines() == ["1:a:False", "1:b:False"]
         failed_parts = {
             e.payload["barrier_batch"]["part"]
             for e in after
