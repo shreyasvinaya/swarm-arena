@@ -13,7 +13,7 @@ import asyncio
 import io
 import signal
 import sys
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from os import get_blocking, read, set_blocking
@@ -74,7 +74,7 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 
 @contextmanager
-def _sigint_wakeup() -> Generator[None]:
+def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[None]:
     """Wake the selector even when SIGINT is delivered to another OS thread."""
     handler = signal.getsignal(signal.SIGINT)
     if current_thread() is not main_thread() or not callable(handler):
@@ -86,6 +86,9 @@ def _sigint_wakeup() -> Generator[None]:
     # Python runs it. add_signal_handler installs a wakeup fd written by the
     # low-level signal handler, including when a worker receives the signal.
     def interrupt() -> None:
+        if on_interrupt is not None:
+            on_interrupt()
+            return
         try:
             handler(signal.SIGINT, None)
         except (KeyboardInterrupt, SystemExit):

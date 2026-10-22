@@ -287,6 +287,8 @@ EOF ends review with
 Cancellation restores stdin's descriptor state, first asks the editor to terminate,
 and reaps it, using a kill fallback after a one-second grace period. The terminal's
 saved mode, including echo and canonical input, is restored after every editor exit.
+Another Ctrl-C during the grace ends it immediately, kills and reaps the editor,
+and lets the planning session finish its journal cleanup.
 
 One metered planning session spans every draft and human review. Its run-time
 allowance and stop/lease supervision remain active while awaiting input or the

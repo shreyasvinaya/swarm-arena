@@ -3,8 +3,11 @@ import io
 import json
 import os
 import pty
+import select
 import signal
+import sys
 import termios
+import time
 from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,6 +25,118 @@ from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
 
 PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+
+
+@pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "stubborn"])
+def test_repeated_interrupt_reaps_editor_and_finishes_session(
+    tmp_path: Path, editor_kind: str
+) -> None:
+    marker = tmp_path / "editor-pid"
+    result = tmp_path / "result.json"
+    editor = _editor(
+        tmp_path,
+        "import os, pathlib, signal, time\n"
+        "def slow_exit(*args):\n    time.sleep(0.8); os._exit(0)\n"
+        + (
+            "signal.signal(signal.SIGINT, slow_exit)\n"
+            if editor_kind == "slow_interrupt"
+            else "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        )
+        + (
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            if editor_kind == "stubborn"
+            else "signal.signal(signal.SIGTERM, slow_exit)\n"
+        )
+        + f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        "while True: time.sleep(1)\n",
+    )
+    code = f"""
+import asyncio, io, json, os, signal, termios
+from pathlib import Path
+from _fakes.planning_llm import planner_config, planner_output
+from _fakes.run import all_events
+from swarm_arena import Goal
+from swarm_arena.llm import CollaborativePlanner, LLMPlanner
+from swarm_arena.llm._terminal_reviewer import TerminalReviewer
+from swarm_arena.testing import FakeModel, FakeTurn
+config = planner_config(Path.cwd())
+FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
+before = termios.tcgetattr(0)[3]
+handler = signal.getsignal(signal.SIGINT)
+async def main():
+    reviewer = TerminalReviewer(stdin=io.StringIO('e\\n'), editor={editor!r})
+    await CollaborativePlanner(LLMPlanner('planner'), reviewer).plan(
+        Goal(id='g', namespace='n'), config, None)
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    pass
+else:
+    raise AssertionError('interruption expected')
+after = termios.tcgetattr(0)[3]
+Path({str(result)!r}).write_text(json.dumps({{
+    'tty_restored': (before & (termios.ECHO | termios.ICANON)) ==
+                    (after & (termios.ECHO | termios.ICANON)),
+    'handler_restored': signal.getsignal(signal.SIGINT) is handler,
+    'blocking_restored': os.get_blocking(0),
+    'finished': [e.payload.get('reason') for e in all_events(config)
+                 if e.type == 'goal_finished'],
+}}))
+"""
+    pid, master = pty.fork()
+    if pid == 0:
+        os.chdir(tmp_path)
+        os.execve(
+            sys.executable,
+            [sys.executable, "-B", "-c", code],
+            {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        )
+    editor_pid = None
+    reaped = False
+    output = bytearray()
+
+    def pump() -> None:
+        if select.select([master], [], [], 0.02)[0]:
+            with suppress(OSError):
+                output.extend(os.read(master, 65536))
+
+    try:
+        deadline = time.monotonic() + 20
+        while not marker.exists() or not marker.read_text():
+            assert time.monotonic() < deadline, bytes(output)
+            pump()
+        editor_pid = int(marker.read_text())
+        os.write(master, b"\x03")
+        # Position the second terminal interrupt inside the one-second grace.
+        time.sleep(0.3)
+        os.write(master, b"\x03")
+        deadline = time.monotonic() + 10
+        while True:
+            exited, status = os.waitpid(pid, os.WNOHANG)
+            if exited:
+                reaped = True
+                break
+            assert time.monotonic() < deadline, bytes(output)
+            pump()
+        assert os.waitstatus_to_exitcode(status) == 0, bytes(output)
+        data = json.loads(result.read_text())
+        assert data == {
+            "tty_restored": True,
+            "handler_restored": True,
+            "blocking_restored": True,
+            "finished": ["stopped"],
+        }
+        with pytest.raises(ProcessLookupError):
+            os.kill(editor_pid, 0)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+        if not reaped:
+            os.waitpid(pid, 0)
+        if editor_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(editor_pid, signal.SIGKILL)
+        os.close(master)
 
 
 @pytest.mark.parametrize(

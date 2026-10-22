@@ -12,7 +12,7 @@ from typing import TextIO
 import anyio
 
 from swarm_arena._agent.context import _local_timer_scope
-from swarm_arena._cli.run_cmds import _readline
+from swarm_arena._cli.run_cmds import _readline, _sigint_wakeup
 from swarm_arena._errors import _core_error, _exception_type_name, _is_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.context_strings import _context_string
@@ -146,14 +146,18 @@ class TerminalReviewer:
                     finally:
                         with anyio.CancelScope(shield=True):
                             if process.returncode is None:
-                                with suppress(ProcessLookupError):
-                                    process.terminate()
                                 grace = anyio.CancelScope(deadline=anyio.current_time() + 1.0)
-                                with _local_timer_scope(grace), grace:
+                                # A further Ctrl-C shortens only this grace; Runner must
+                                # keep the journal writer alive for session cleanup.
+                                with _sigint_wakeup(grace.cancel):
+                                    with suppress(ProcessLookupError):
+                                        process.terminate()
+                                    with _local_timer_scope(grace), grace:
+                                        await process.wait()
+                                    if process.returncode is None:
+                                        with suppress(ProcessLookupError):
+                                            process.kill()
                                     await process.wait()
-                                if process.returncode is None:
-                                    process.kill()
-                                await process.wait()
             finally:
                 if tty_fd is not None and saved is not None:
                     termios.tcsetattr(tty_fd, termios.TCSANOW, saved)
