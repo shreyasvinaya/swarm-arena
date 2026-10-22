@@ -132,3 +132,10 @@ def _report_rejection(reviewer: Reviewer, diagnostic: str) -> None:
         print(diagnostic)
     else:
         report(diagnostic)
+
+
+def _clear_review(reviewer: Reviewer) -> None:
+    """Discard any session-local edits retained by the reviewer adapter."""
+    clear = getattr(reviewer, "_clear_edit", None)
+    if clear is not None:
+        clear()

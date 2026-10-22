@@ -980,3 +980,18 @@ async def test_falsey_body_failure_is_retained_with_accounting_failure(
         assert str(planner.value) == str(shared.value)
         assert "ExceptionGroup" in str(planner.value)
         assert_secret_absent(planner.value, SECRET)
+
+
+async def test_custom_reviewer_cleanup_hook(tmp_path: Path) -> None:
+    class Reviews(_Reviews):
+        cleared = False
+
+        def _clear_edit(self) -> None:
+            self.cleared = True
+
+    reviewer = Reviews([Approve()])
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    await CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(
+        GOAL, planner_config(tmp_path), None
+    )
+    assert reviewer.cleared
