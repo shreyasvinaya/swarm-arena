@@ -352,8 +352,13 @@ class GoalRunner:
         """
         statuses = {f"{s.team.name}/{s.spec.name}": s.status for s in self.agents}
         statuses = {**self.state.agents, **statuses}
+        paused = self.deps.provider_stops.stopped()
         main = sum(
             statuses.get(f"{team.name}/{agent.name}") not in _INACTIVE
+            or (
+                statuses.get(f"{team.name}/{agent.name}") == AgentStatus.STOPPED
+                and f"{self.goal_id}/{team.name}/{agent.name}" in paused
+            )
             for team in self.plan.teams
             for agent in team.agents
         )
@@ -473,6 +478,7 @@ class GoalRunner:
         goal = self.recorded.goals[self.goal_id]
         reason = goal.pending_reason
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=reason))
             await self.deps.journal.commit()
             await self.deps.ledger.end_goal(self.goal_id)
@@ -1322,6 +1328,7 @@ class GoalRunner:
             reason = decision.prune.get(key, decision.prune.get(slot.team.name))
             if reason is not None:
                 slot.status = AgentStatus.PRUNED
+                self.deps.provider_stops.release(slot.address)
                 self.deps.journal.append(
                     EventDraft(
                         type=EventType.AGENT_STATUS,
@@ -1420,6 +1427,10 @@ class GoalRunner:
             failure = error
             try:
                 error = boundary.classify(error)
+                interrupted = _core_category(error) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
                 if _core_category(error) is _SignalCategory.LIMIT:
                     limit = cast(LimitReached, error)
                     completed, result = True, ([], [f"curator limit: {limit.limit}"])
@@ -1434,10 +1445,31 @@ class GoalRunner:
             except anyio.get_cancelled_exc_class() as cancelled:
                 interrupted, failure = True, cancelled
             except BaseException as control:
+                interrupted = _core_category(control) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
                 failure = control
         finally:
             # Close on every exit, including a custom curator interrupted before
             # _prepare_curator could drain. No late result may publish a receipt.
+            if not interrupted:
+                try:
+                    # Report arrival and durable settlement have separate budgets.
+                    with anyio.move_on_after(scope.settle_timeout_s) as report_timer:
+                        with _local_timer_scope(report_timer) as report_wait:
+                            while tranche.pending():  # noqa: ASYNC110 - external call settlement
+                                await anyio.sleep(0.05)
+                    if report_wait.failure is not None:
+                        raise report_wait.failure from None
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as report_error:
+                    failure = (
+                        BaseExceptionGroup("curator reports", [failure, report_error])
+                        if failure is not None
+                        else report_error
+                    )
             timer = anyio.CancelScope(
                 deadline=anyio.current_time() + self.deps.config.settle_timeout_s,
                 shield=True,
@@ -1445,7 +1477,7 @@ class GoalRunner:
             try:
                 with _local_timer_scope(timer) as local_timer:
                     with timer:
-                        await drain(scope, wait=not interrupted)
+                        await drain(scope, wait=False)
                     if local_timer.failure is not None:
                         raise local_timer.failure from None
                     if timer.cancel_called:
@@ -1688,6 +1720,7 @@ class GoalRunner:
             )
         # Replay returns the pool at goal_finished; do not suspend before applying it live.
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             await self.deps.journal.append_durable(
                 self._draft(EventType.GOAL_FINISHED, reason=self.reason)
             )

@@ -2834,3 +2834,121 @@ async def test_public_resume_refuses_planning_session_without_mutation(
     assert message in capsys.readouterr().err
     assert read_committed(store) == before
     assert read_owner(store) == owner
+
+
+@pytest.mark.parametrize("healthy", [True, False, "ordinary", "budget"])
+async def test_provider_causes_survive_takeover_and_only_fresh_round_probes(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    healthy: bool | str,
+) -> None:
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    c = await _crash(tmp_path, run_config, recorders, lost=(), completed=())
+    await _append(
+        c,
+        EventDraft(
+            type="provider_failed",
+            payload={
+                "variant": "transition",
+                "transition": "failed",
+                "provider": "retired-provider",
+                "generation": 1,
+                "source": "manager",
+                "stopped": ["g/t/a"],
+            },
+        ),
+    )
+    seen: list[tuple[str, int]] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        seen.append((provider, scope.round))
+        if healthy == "ordinary":
+            raise KeyError("private-probe-message")
+        if healthy == "budget":
+            from swarm_arena._budget.amount import Amount
+
+            await scope.tranche.reserve_call(Amount(usd=1_000_000))
+        return healthy is True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(c.config).resume(c.run_id, force=True)
+    assert seen == [("retired-provider", 2)]
+    paused = next(e for e in _events(c, "agent_status") if e.agent == "a" and e.round == 1)
+    assert (paused.payload["status"], paused.payload["reason"]) == (
+        "stopped",
+        "provider unavailable",
+    )
+    starts = [e for e in _events(c, "tool_start") if e.agent == "a"]
+    assert [e.round for e in starts] == ([2] if healthy is True else [])
+    transitions = [e.payload for e in _events(c, "provider_failed")]
+    assert any(p.get("transition") == "recovered" for p in transitions) is (healthy is True)
+    assert not RunState.from_events(_events(c)).provider_causes
+    if healthy == "budget":
+        assert (
+            next(e for e in _events(c, "goal_finished") if e.goal_id == "g").payload["reason"]
+            == "goal budget"
+        )
+    assert "private-probe-message" not in str([e.payload for e in _events(c)])
+
+
+async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    config = with_limits(run_config, max_agents_total=1, max_concurrent_goals=2)
+    c = await _crash(
+        tmp_path,
+        config,
+        recorders,
+        plans=[_plan("g", agents=("a",)), _plan("h", agents=("b",))],
+        queued=("h",),
+        lost=(),
+        completed=(),
+    )
+    await _append(
+        c,
+        EventDraft(
+            type="provider_failed",
+            payload={
+                "variant": "transition",
+                "transition": "failed",
+                "provider": "retired-provider",
+                "generation": 1,
+                "source": "manager",
+                "stopped": ["g/t/a"],
+            },
+        ),
+    )
+    entered, release = anyio.Event(), anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+
+    async def resume() -> None:
+        await Swarm(c.config).resume(c.run_id, force=True)
+
+    with anyio.fail_after(25):
+        async with anyio.create_task_group() as group:
+            group.start_soon(resume)
+            try:
+                await entered.wait()
+                assert not any(e.goal_id == "h" for e in _events(c, "goal_started"))
+            finally:
+                release.set()
+    events = _events(c)
+    g_done = next(e.seq for e in events if e.type == "goal_finished" and e.goal_id == "g")
+    h_start = next(e.seq for e in events if e.type == "goal_started" and e.goal_id == "h")
+    assert g_done < h_start

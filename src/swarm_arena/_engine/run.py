@@ -30,7 +30,13 @@ from swarm_arena._engine.manifest import RunManifest, build_manifest_async
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._engine.stops import RunClock, StopState, watch_stop_files
+from swarm_arena._engine.stops import (
+    ProviderStops,
+    RunClock,
+    StopState,
+    _StopWatcher,
+    watch_stop_files,
+)
 from swarm_arena._errors import (
     AlreadyExists,
     Fenced,
@@ -152,41 +158,78 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
         raise error
 
 
+def _stop_watcher(store: Store, epoch: int, stops: StopState) -> _StopWatcher:
+    """Reuse the owner's poller across acquisition, setup and driving."""
+    if stops._watcher is None:
+        stops._watcher = _StopWatcher(partial(watch_stop_files, store, epoch, stops))
+    return stops._watcher
+
+
+async def _close_stop_watcher(stops: StopState) -> None:
+    """Join retained polling before releasing the owner's remaining services."""
+    if stops._watcher is not None:
+        watcher, stops._watcher = stops._watcher, None
+        await watcher.close()
+
+
 @asynccontextmanager
 async def _supervise_initialization(
-    store: Store, epoch: int, stops: StopState, clock: RunClock | None, config: RunConfig
+    store: Store,
+    epoch: int,
+    stops: StopState,
+    clock: RunClock | None,
+    config: RunConfig,
+    *,
+    retain: bool = False,
 ) -> AsyncGenerator[Callable[[], None]]:
-    """Watch stop files and, when a clock is supplied, the remaining run allowance."""
+    """Bind phase cancellation to retained polling and the remaining run allowance.
+
+    Acquisition retains polling in StopState for the owner's full lifetime.
+    Later phases reuse it; their exit cancels only their deadline task. Owner
+    teardown joins the poller, including a backend wait abandoned on shutdown.
+    """
     outcome = _Outcome()
     error: BaseException | None = None
+    owned = stops._watcher is None
+    poller = _stop_watcher(store, epoch, stops)
     watcher_scope = anyio.CancelScope()
     with anyio.CancelScope() as preparation:
-        stops.on_change = preparation.cancel
 
         async def watch() -> None:
             with watcher_scope:
-                async with anyio.create_task_group() as watchers:
-                    watchers.start_soon(watch_stop_files, store, epoch, stops)
-                    if clock is not None:
-                        await anyio.sleep(clock.left(config.limits.run_timeout_s))
-                        stops.run_timeout = True
+                if clock is not None:
+                    await anyio.sleep(clock.left(config.limits.run_timeout_s))
+                    stops.run_timeout = True
+                else:
+                    await anyio.sleep_forever()
 
         def prepared() -> None:
             stops.on_change = None
+            poller.on_error = None
             watcher_scope.cancel()
 
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(watch)
             try:
                 await anyio.lowlevel.checkpoint()
+                stops.on_change = preparation.cancel
+                poller.on_error = preparation.cancel
+                if poller.error is not None:
+                    raise poller.error
+                if stops.stop or stops.stop_now or stops.run_timeout:
+                    preparation.cancel()
                 yield prepared
             except BaseException as caught:
                 error = caught
             finally:
                 prepared()
                 tasks.cancel_scope.cancel()
+    if owned and not retain:
+        await _close_stop_watcher(stops)
     # The task group's own cancellation must not hide a concurrent caller cancel.
     outcome.propagate_control(asyncio.CancelledError())
+    if poller.error is not None:
+        raise poller.error
     if error is not None:
         if preparation.cancel_called and isinstance(error, anyio.get_cancelled_exc_class()):
             return
@@ -746,6 +789,7 @@ class RunRunner:
                                         }
                                     ),
                                 )
+                                ProviderStops(journal)
                                 deps = EngineDeps(
                                     run_id=run_id,
                                     config=config,
@@ -777,6 +821,7 @@ class RunRunner:
                                 await _close_board(board, config, failed=board_failed)
                     return await _finish_initialization_stop(store, journal, stops, config)
         finally:
+            await _close_stop_watcher(stops)
             if lease is not None and not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(BaseException):
@@ -814,7 +859,7 @@ class RunRunner:
         async with _supervise_writer(deps.journal):
             async with anyio.create_task_group() as watchers:
                 try:
-                    watchers.start_soon(watch_stop_files, deps.store, epoch, deps.stops)
+                    watchers.start_soon(_stop_watcher(deps.store, epoch, deps.stops).wait_error)
                     watchers.start_soon(self._watch_clock, deps)
                     result = await self._queue(deps)
                     await self._record_stops(deps)
@@ -837,6 +882,7 @@ class RunRunner:
                     error = caught
                 finally:
                     watchers.cancel_scope.cancel()
+                    await _close_stop_watcher(deps.stops)
             if error is not None:
                 raise error
         return result
@@ -1235,6 +1281,7 @@ async def planning_session(
                             usd=config.limits.llm_tranche_usd,
                         ),
                     )
+                    ProviderStops(journal, standalone=True)
                     scope = LLMScope(
                         role="planner",
                         run_id=run_id,
@@ -1313,6 +1360,7 @@ async def planning_session(
         if not completed or stops.stop or stops.stop_now or stops.run_timeout:
             raise _core_error(RuntimeError, "planning session stopped") from None
     finally:
+        await _close_stop_watcher(stops)
         if lease is not None and not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):

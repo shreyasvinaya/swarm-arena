@@ -31,12 +31,19 @@ from pydantic import TypeAdapter
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+from swarm_arena._engine.stops import register_probe
 from swarm_arena._errors import (
     Fenced,
+    ProviderFailed,
+    _core_category,
     _core_error,
+    _exception_type_name,
     _is_core_control,
+    _is_core_signal,
     _register_carrier,
     _register_carrier_type,
+    _SignalCategory,
+    _with_exception_type,
 )
 from swarm_arena._errors import _unwrap_control as _unwrap_control
 from swarm_arena._exec.threads import run_sync_daemon
@@ -46,8 +53,8 @@ from swarm_arena._model.catalog import ModelSpec
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import finite_json
 from swarm_arena._outcomes import _classify_outcome, _Outcome
-from swarm_arena.llm._cache import cache_namespace, cache_switches
-from swarm_arena.llm._catalog import call_estimate
+from swarm_arena.llm._cache import bypass_response_cache, cache_namespace, cache_switches
+from swarm_arena.llm._catalog import build_model, call_estimate
 from swarm_arena.llm._linking import CallLinks, ManagerDeps
 from swarm_arena.llm._settings import merge_model_settings
 from swarm_arena.llm._settings import model_settings as per_call_settings
@@ -557,6 +564,19 @@ class MeteredModel(Model):
             except anyio.get_cancelled_exc_class():
                 abandon_call(scope, rid)
                 raise
+            if not _is_core_control(classified) and await _prepare(
+                lambda: is_provider_failure(classified)
+            ):
+
+                def identity() -> str:
+                    # Never trust the provider name carried by the upstream error.
+                    approved = scope.models.root.get(self.alias)
+                    if approved is None or approved.model != spec.model:
+                        raise _core_error(ValueError, "unapproved provider model")
+                    return _context_string(approved.provider, "provider")
+
+                provider = await _prepare(identity)
+                raise _core_error(ProviderFailed, provider) from None
             raise classified from None
         if self.links is not None:
             self.links.add(call_id, response)
@@ -694,3 +714,143 @@ class BudgetHooks(RunHooks[ManagerDeps]):
             carrier = _sdk_control(_core_error(LimitReached, "budget", "LLM budget used up"))
             assert carrier is not None
             raise carrier from None
+
+
+def is_provider_failure(exc: BaseException) -> bool:
+    """Recognize adapter failures using structured evidence before message fallback.
+
+    Parameters
+    ----------
+    exc : BaseException
+        Upstream exception inspected only at the supervised adapter boundary.
+
+    Returns
+    -------
+    bool
+        Whether the exception identifies unavailable provider service or credit.
+        No inspected message is retained or published.
+
+    Examples
+    --------
+    >>> is_provider_failure(ValueError("invalid request"))
+    False
+    """
+    if isinstance(
+        exc,
+        (
+            litellm.AuthenticationError,
+            litellm.PermissionDeniedError,
+            litellm.RateLimitError,
+            litellm.ServiceUnavailableError,
+            litellm.InternalServerError,
+            litellm.APIConnectionError,
+            litellm.Timeout,
+        ),
+    ):
+        return True
+    if not isinstance(exc, litellm.BadRequestError):
+        return False
+    status = getattr(exc, "status_code", None)
+    if type(status) is int and (status in {401, 402, 403, 429} or status >= 500):
+        return True
+    codes: list[str] = []
+    body = getattr(exc, "body", None)
+    for obj in (exc, body, body.get("error") if isinstance(body, dict) else None):
+        for key in ("code", "type"):
+            value = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+            if type(value) is str and value:
+                codes.append(value.lower())
+    known = {
+        "insufficient_quota",
+        "insufficient_credits",
+        "credit_balance_too_low",
+        "billing_hard_limit_reached",
+        "authentication_error",
+        "permission_denied",
+        "rate_limit_error",
+        "overloaded_error",
+        "service_unavailable",
+    }
+    if any(code in known for code in codes):
+        return True
+    generic = {"invalid_request_error", "bad_request", "bad_request_error", "invalid_request"}
+    if any(code not in generic for code in codes):
+        return False
+    return "credit balance" in str(exc).lower()
+
+
+async def probe_provider(provider: str, scope: LLMScope) -> bool:
+    """Make one uncached, one-token probe and drain its invocation before return.
+
+    Parameters
+    ----------
+    provider : str
+        Previously failed provider identifier.
+    scope : LLMScope
+        Supervised manager scope funded by the goal's judges tranche.
+
+    Returns
+    -------
+    bool
+        False only for a validated provider failure. Missing aliases succeed.
+        Fencing, terminal cleanup and actual caller cancellation propagate.
+
+    Examples
+    --------
+    >>> healthy = await probe_provider("openai", scope)  # doctest: +SKIP
+    """
+    from swarm_arena.llm._invocation import _invocation
+
+    provider = _context_string(provider, "provider")
+    boundary = _Outcome()
+    try:
+        async with _invocation(scope, name="provider probe", error_type=RuntimeError) as child:
+
+            def prepare() -> MeteredModel | None:
+                choices = [
+                    (_context_string(a, "alias"), s)
+                    for a, s in child.models.root.items()
+                    if _context_string(s.provider, "provider") == provider
+                ]
+                if not choices:
+                    return None
+                alias, spec = next(
+                    ((a, s) for a, s in choices if child.role in s.roles), choices[0]
+                )
+                return MeteredModel(
+                    build_model(spec), alias=alias, spec=spec, namespace="probe", max_tokens=1
+                )
+
+            try:
+                model = await _prepare(prepare)
+                if model is not None:
+                    with bypass_response_cache():
+                        await model.get_response(
+                            None,
+                            "ping",
+                            ModelSettings(),
+                            [],
+                            None,
+                            [],
+                            ModelTracing.DISABLED,
+                            previous_response_id=None,
+                            conversation_id=None,
+                            prompt=None,
+                        )
+            except BaseException as error:
+                classified = boundary.classify(error)
+                if _is_core_control(classified) or _is_core_signal(classified):
+                    raise classified from None
+                name = _exception_type_name(classified)
+                raise _with_exception_type(
+                    _core_error(RuntimeError, f"LLM provider probe failed: {name}"), name
+                ) from None
+        return True
+    except BaseException as error:
+        classified = boundary.classify(error)
+        if _core_category(classified) is _SignalCategory.PROVIDER:
+            return False
+        raise classified from None
+
+
+register_probe(probe_provider)

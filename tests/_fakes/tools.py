@@ -1465,3 +1465,10 @@ def score_one(goal: Goal, candidate: Candidate) -> Score:
     (1.0,)
     """
     return Score.maximize(1.0)
+
+
+class ProviderPyTool(PyTool):
+    """Declare the provider used by scripted failure/recovery integration tests."""
+
+    def providers(self) -> frozenset[str]:
+        return frozenset({"fake"})

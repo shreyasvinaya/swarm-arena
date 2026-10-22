@@ -28,6 +28,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.resume import _supervised_acquire
 from swarm_arena._engine.run import (
     _close_board,
+    _close_stop_watcher,
     _open_board,
     _setup_run,
     _supervise_initialization,
@@ -286,6 +287,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                         await _assert_accounted(scope, store)
                         completed = True
     finally:
+        await _close_stop_watcher(stops)
         if lease is not None and not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):
@@ -582,6 +584,7 @@ class OfflineHarness:
                     finally:
                         await _close_board(board, config, failed=board_failed)
         finally:
+            await _close_stop_watcher(stops)
             if lease is not None and not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(BaseException):

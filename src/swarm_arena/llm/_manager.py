@@ -225,7 +225,7 @@ class AgentsSDKManager(Manager):
             timer = anyio.CancelScope(
                 deadline=anyio.current_time() + scope.limits.effective_round_timeout_s()
             )
-            with _local_timer_scope(timer) as local_timer:
+            with _local_timer_scope(timer, relay_provider_stop=True) as local_timer:
                 async with anyio.create_task_group() as group:
                     with _own_actions(group, local_timer) as actions:
                         try:

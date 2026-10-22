@@ -1264,3 +1264,54 @@ async def test_best_reads_declared_fixed_siblings_and_preserves_permissions(
         ctx_env, scores=(Score(id="later", candidate_id="part", judge="part-rank", key=(9.0,)),)
     )
     assert ctx.best(1, part="p")[0].key == (3.0,)
+
+
+@pytest.mark.parametrize("provider_first", [True, False])
+async def test_provider_stop_cannot_become_action_timeout(
+    ctx_env: CtxEnv, provider_first: bool
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight, _local_timer_scope
+    from swarm_arena._agent.tool_run import Inflight
+    from swarm_arena._errors import ProviderFailed
+
+    ctx = ctx_env.ctx()
+    owned = _ActionInflight(Inflight())
+    outer_scope, manager_scope, action_scope = (anyio.CancelScope() for _ in range(3))
+    with (
+        _local_timer_scope(outer_scope) as outer,
+        _local_timer_scope(manager_scope, relay_provider_stop=True) as manager,
+        _local_timer_scope(action_scope) as action,
+    ):
+        if provider_first:
+            outer.stop_provider(_core_error(ProviderFailed, "openai"))
+        owned.stop(action_scope, cancel=True)
+        if not provider_first:
+            outer.stop_provider(_core_error(ProviderFailed, "openai"))
+        assert manager_scope.cancel_called
+        assert not outer_scope.cancel_called
+        assert manager.failure is not None
+        assert _core_category(manager.failure) is _SignalCategory.PROVIDER
+        assert not owned.is_timeout_refusal(
+            _core_error(LimitReached, "stop", "action stopped"), action, ctx
+        )
+    assert outer.provider_child is None
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal"])
+async def test_provider_timer_preserves_stronger_control(control: str) -> None:
+    from swarm_arena._agent.context import _local_timer_scope
+    from swarm_arena._errors import Fenced, ProviderFailed
+
+    error = (
+        _core_error(Fenced, "run ownership lost")
+        if control == "fenced"
+        else _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL)
+    )
+    with _local_timer_scope(anyio.CancelScope()) as timer:
+        timer.stop_provider(_core_error(ProviderFailed, "openai"))
+        timer.record(error)
+        timer.stop_provider(_core_error(ProviderFailed, "openai"))
+        assert timer.failure is not None
+        assert _core_category(timer.failure) is (
+            _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+        )

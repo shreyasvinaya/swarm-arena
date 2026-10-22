@@ -578,7 +578,11 @@ class HumanReview:
         ...     "r", Path("review.csv"), config=config)
         """
         from swarm_arena._engine.resume import _take_over
-        from swarm_arena._engine.run import _supervise_initialization, _supervise_writer
+        from swarm_arena._engine.run import (
+            _close_stop_watcher,
+            _supervise_initialization,
+            _supervise_writer,
+        )
         from swarm_arena._engine.stops import StopState
 
         config = config.model_copy(
@@ -677,6 +681,7 @@ class HumanReview:
                 raise _core_error(RuntimeError, "review import stopped")
             return scores
         finally:
+            await _close_stop_watcher(stops)
             if not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(Fenced):

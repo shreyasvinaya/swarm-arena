@@ -1,9 +1,10 @@
 import asyncio
 import dataclasses
 import threading
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import anyio
@@ -20,6 +21,7 @@ from swarm_arena import (
     Plan,
     Ref,
     RoundSpec,
+    RunConfig,
     ScriptedManager,
     TeamSpec,
 )
@@ -33,6 +35,7 @@ from swarm_arena._engine import round as round_module
 from swarm_arena._engine.goal import r0_revision_draft
 from swarm_arena._engine.round import AgentSlot, EngineDeps, RoundOutcome, RoundRunner
 from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.limits import Limits
@@ -41,6 +44,7 @@ from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.results import AgentStatus
 from swarm_arena._model.tooling import Estimate, RunStatus, ToolOutput
 from swarm_arena._scoring.check import Check
+from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.tool import Tool
 from swarm_arena.executor import Executor, Job
 
@@ -1598,3 +1602,298 @@ async def test_digest_ranks_parts_by_their_judges(env: EngineEnv) -> None:
     assert len(seen) == 1
     assert any(line.startswith("Part a (a, ") for line in seen[0].splitlines())
     assert candidate.id in seen[0]
+
+
+@pytest.fixture
+async def provider_env(
+    tmp_path: Path, run_config: RunConfig, artifacts: ArtifactStore, local_executor: LocalExecutor
+) -> AsyncIterator[EngineEnv]:
+    from _engine.conftest import env as engine_env
+    from _fakes.engine import with_limits
+
+    config = with_limits(run_config, max_usd=10.0, default_run_reservation=Estimate(usd=0.1))
+    async with asynccontextmanager(cast(Any, engine_env).__wrapped__)(
+        tmp_path, config, artifacts, local_executor
+    ) as result:
+        yield result
+
+
+class _ProviderManager(Manager):
+    def __init__(self, *, fail_first: bool = True) -> None:
+        super().__init__()
+        self.calls = 0
+        self.fail_first = fail_first
+
+    def models(self) -> tuple[str, ...]:
+        return ("provider-model",)
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        from swarm_arena._errors import ProviderFailed
+
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise _core_error(ProviderFailed, "anthropic")
+        await ctx.run_tool({"x": self.calls})
+        return RoundReport(summary="ok")
+
+
+@pytest.mark.parametrize("healthy", [True, False, None])
+async def test_provider_probe_recovery_before_frontier_and_shares(
+    provider_env: EngineEnv, monkeypatch: pytest.MonkeyPatch, healthy: bool | None
+) -> None:
+    env = provider_env
+    from swarm_arena._engine import stops as stops_module
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    manager = _ProviderManager()
+    slot = _with_manager("a", manager)
+    peer = _runner("b")
+    env.deps.config = env.deps.config.model_copy(
+        update={
+            "models": ModelCatalog(
+                {"provider-model": ModelSpec(model="anthropic/test", roles=["manager"])}
+            )
+        }
+    )
+    order: list[str] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        assert provider == "anthropic"
+        assert (scope.role, scope.goal_id, scope.team, scope.agent, scope.round) == (
+            "manager",
+            "g",
+            "",
+            "",
+            2,
+        )
+        assert scope.tranche._holder == "g/:judges"
+        order.append("probe")
+        return bool(healthy)
+
+    first = await _prepared_round(
+        env.deps, goal_id="g", plan=PLAN, agents=[slot, peer], round_spec=RoundSpec(), rounds_left=2
+    ).run(1)
+    assert first.statuses["t/a"] == AgentStatus.STOPPED, first.reasons
+    assert env.deps.provider_stops.stopped()[slot.address] == {"anthropic"}
+    monkeypatch.setattr(stops_module, "_probe", probe if healthy is not None else None)
+    frontier = env.deps.board.frontier
+
+    def read_frontier() -> Frontier:
+        order.append("frontier")
+        return frontier()
+
+    monkeypatch.setattr(env.deps.board, "frontier", read_frontier)
+    second = await _prepared_round(
+        env.deps, goal_id="g", plan=PLAN, agents=[slot, peer], round_spec=RoundSpec(), rounds_left=1
+    ).run(2)
+    assert order == (["frontier"] if healthy is None else ["probe", "frontier"])
+    assert manager.calls == (1 if healthy is False else 2)
+    if healthy is False:
+        assert slot.status == AgentStatus.STOPPED
+    else:
+        assert second.statuses["t/a"] == AgentStatus.FINISHED
+        assert any(c.agent == "a" and c.output.status == RunStatus.OK for c in second.candidates)
+        rs = next(e for e in env.events("round_started") if e.round == 2)
+        fr = next(e for e in env.events("frontier") if e.round == 2)
+        assert fr.seq == rs.seq + 1
+        assert rs.payload["shares"]["g/t/a"] == rs.payload["shares"]["g/t/b"]
+        assert Amount.model_validate(rs.payload["shares"]["g/t/a"]).usd > 0
+        assert any(
+            e.payload["reservation"]["holder"] == "g/t/a" and e.seq > rs.seq
+            for e in env.events("reserve")
+        )
+
+
+async def test_restarted_round_does_not_probe_or_clear_provider_causes(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+
+    slot = _runner("a")
+    stops = env.deps.provider_stops
+    stops.register(slot.address, frozenset({"anthropic"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    slot.status = AgentStatus.STOPPED
+
+    async def forbidden(provider: str, scope: LLMScope) -> bool:
+        pytest.fail("restarted round probed")
+
+    monkeypatch.setattr(stops_module, "_probe", forbidden)
+    await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=PLAN,
+        agents=[slot],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+        frontier=env.deps.board.frontier(),
+    ).run(1)
+    assert slot.status == AgentStatus.STOPPED
+    assert stops.stopped()[slot.address] == {"anthropic"}
+
+
+@pytest.mark.parametrize("converge", [False, True])
+@pytest.mark.parametrize("disposition", ["newer_failure", "pruned", "watchdog"])
+async def test_provider_probe_preserves_newer_failure_and_permanent_stops(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, converge: bool, disposition: str
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+
+    slot = _runner("a")
+    service = env.deps.provider_stops
+    service.register(slot.address, frozenset({"anthropic"}), lambda: None)
+    await service.fail("anthropic", source="manager")
+    slot.status = AgentStatus.STOPPED
+    order: list[str] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        order.append("probe")
+        if disposition == "newer_failure":
+            await service.fail(provider, source="judge")
+        else:
+            slot.status = (
+                AgentStatus.PRUNED if disposition == "pruned" else AgentStatus.WATCHDOG_STOPPED
+            )
+            service.release(slot.address)
+        return True
+
+    frontier = env.deps.board.frontier
+
+    def read_frontier() -> Frontier:
+        order.append("frontier")
+        return frontier()
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    monkeypatch.setattr(env.deps.board, "frontier", read_frontier)
+    outcome = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=PLAN,
+        agents=[slot],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+        converge=converge,
+    ).run(1)
+    assert order == ["probe", "frontier"]
+    assert outcome.candidates == []
+    assert (
+        slot.status
+        == {
+            "newer_failure": AgentStatus.STOPPED,
+            "pruned": AgentStatus.PRUNED,
+            "watchdog": AgentStatus.WATCHDOG_STOPPED,
+        }[disposition]
+    )
+    if disposition == "newer_failure":
+        assert service.generations() == {"anthropic": 2}
+        assert service.stopped()[slot.address] == {"anthropic"}
+    else:
+        assert slot.address not in service.stopped()
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal", "caller"])
+async def test_provider_probe_preserves_owner_controls(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+    from swarm_arena._errors import _SignalCategory
+
+    slot = _runner("a")
+    stops = env.deps.provider_stops
+    stops.register(slot.address, frozenset({"anthropic"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    slot.status = AgentStatus.STOPPED
+    entered = anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        entered.set()
+        if control == "caller":
+            await anyio.sleep_forever()
+        if control == "fenced":
+            raise _core_error(Fenced, "run ownership lost")
+        raise _core_error(RuntimeError, "terminal probe", _category=_SignalCategory.TERMINAL)
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    runner = _round(env, [slot])
+    if control == "caller":
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel() -> None:
+                    await entered.wait()
+                    scope.cancel()
+
+                tasks.start_soon(cancel)
+                await runner._probe_stopped(2)
+                pytest.fail("probe swallowed caller cancellation")
+        assert scope.cancelled_caught
+    else:
+        with pytest.raises(Fenced if control == "fenced" else RuntimeError):
+            await runner._probe_stopped(2)
+    assert stops.stopped()[slot.address] == {"anthropic"}
+
+
+@pytest.mark.parametrize("component", [Tool, Manager], ids=["tool", "manager"])
+async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, component: type[Tool] | type[Manager]
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+
+    release = threading.Event()
+    entered: set[str] = set()
+    workers: list[threading.Thread] = []
+    original = Ref.build
+    peer_calls: list[str] = []
+    probes: list[str] = []
+
+    def blocked(self: Ref, base: type[Any]) -> Any:
+        if self.name in {"stuck-a", "stuck-b"} and base is component:
+            workers.append(threading.current_thread())
+            entered.add(self.name)
+            assert release.wait(5), "constructor release deadline"
+        return original(self, base)
+
+    class Peer(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            peer_calls.append("ran")
+            return RoundReport(summary="peer ran")
+
+    slots = [_runner("a"), _runner("b"), _with_manager("peer", Peer())]
+    for slot in slots[:2]:
+        if component is Tool:
+            slot.tool_ref = slot.tool_ref.model_copy(update={"name": "stuck-" + slot.spec.name})
+        else:
+            slot.manager = None
+            slot.spec = slot.spec.model_copy(
+                update={
+                    "manager": slot.spec.manager.model_copy(
+                        update={"name": "stuck-" + slot.spec.name}
+                    )
+                }
+            )
+    e = env.with_limits(round_timeout_s=0.2, run_timeout_s=30.0)
+    service = e.deps.provider_stops
+    service.register(slots[2].address, frozenset({"fake"}), lambda: None)
+    await service.fail("fake", source="manager")
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        probes.append(provider)
+        return True
+
+    monkeypatch.setattr(Ref, "build", blocked)
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    start = anyio.current_time()
+    try:
+        with anyio.fail_after(2):
+            out = await _round(e, slots).run(1)
+        assert anyio.current_time() - start < 1.5
+        assert entered == {"stuck-a", "stuck-b"}
+        assert probes == ["fake"]
+        assert peer_calls == ["ran"]
+        assert out.reasons["t/a"] == out.reasons["t/b"] == "runtime preparation cancelled"
+        assert out.statuses["t/peer"] == AgentStatus.FINISHED
+    finally:
+        release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()

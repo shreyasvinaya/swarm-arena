@@ -1577,3 +1577,269 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
     assert owner[0].expires_at <= utc_now()
     assert setups == []
     assert yielded == []
+
+
+async def test_provider_paused_goal_keeps_queued_goal_out_until_completion(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config,
+        max_agents_total=1,
+        max_concurrent_goals=2,
+        max_usd=10.0,
+        max_tool_runs_per_round=1,
+        default_run_reservation=Estimate(usd=0.1),
+    )
+    code = """
+import json, os
+n = json.load(open('swarm/request.json'))['params']['n']
+json.dump({'data': {}, 'failed_provider': 'fake'} if n == 1 else {'data': {'y': float(n)}},
+          open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=2, tool=ProviderPyTool({"code": code}))
+    g.teams[0].agents[0] = (
+        g.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref.of(
+                    ScriptedManager([{"inputs": {"n": n}, "round": n} for n in (1, 2)])
+                )
+            }
+        )
+    )
+    h = plan(goal_id="h", rounds=1)
+    entered, release = anyio.Event(), anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        assert (provider, scope.goal_id, scope.round) == ("fake", "g", 2)
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+
+    async def run() -> None:
+        try:
+            await Swarm(cfg).run([g, h], run_id="provider-capacity")
+        finally:
+            entered.set()
+
+    with anyio.fail_after(25):
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            try:
+                await entered.wait()
+                assert not any(e.goal_id == "h" for e in events(cfg, "goal_started")), [
+                    (e.type, e.payload)
+                    for e in all_events(cfg)
+                    if e.type in {"agent_status", "provider_failed", "tool_end", "decision"}
+                ]
+                assert events(cfg, "provider_failed")[0].payload["source"] == "tool"
+            finally:
+                release.set()
+    ev = all_events(cfg)
+    assert next(e.seq for e in ev if e.type == "goal_finished" and e.goal_id == "g") < next(
+        e.seq for e in ev if e.type == "goal_started" and e.goal_id == "h"
+    )
+    ends = [e for e in ev if e.type == "tool_end" and e.goal_id == "g"]
+    assert [(e.round, e.payload["candidate"]["output"]["status"]) for e in ends] == [
+        (1, "provider_failed"),
+        (2, "ok"),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "budget", "nonbool"])
+async def test_provider_probe_failure_is_goal_local(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=2, default_run_reservation=Estimate(usd=0.1)
+    )
+    code = """
+import json, os
+json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=3, tool=ProviderPyTool({"code": code}))
+    peer = plan(goal_id="g", rounds=3).teams[0].agents[0].model_copy(update={"name": "peer"})
+    g.teams[0].agents.append(peer)
+    h = plan(goal_id="h", rounds=3)
+    calls: list[int] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        calls.append(scope.round)
+        if failure == "nonbool":
+            return "not a bool"  # ty: ignore[invalid-return-type]
+        if failure == "budget":
+            await scope.tranche.reserve_call(Amount(usd=1_000_000))
+        raise KeyError("private-probe-message")
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(cfg).run([g, h], run_id="probe-failure")
+    ev = all_events(cfg)
+    assert calls == ([2] if failure == "budget" else [2, 3])
+    assert {e.goal_id for e in ev if e.type == "goal_finished"} == {"g", "h"}
+    assert max(e.round for e in ev if e.type == "round_started" and e.goal_id == "h") == 3
+    assert not any(e.payload.get("transition") == "recovered" for e in ev)
+    if failure == "budget":
+        assert max(e.round for e in ev if e.type == "round_started" and e.goal_id == "g") == 1
+        assert (
+            next(e for e in ev if e.type == "goal_finished" and e.goal_id == "g").payload["reason"]
+            == "goal budget"
+        )
+    else:
+        assert any(
+            e.type == "agent_status" and e.goal_id == "g" and e.agent == "peer" and e.round == 3
+            for e in ev
+        )
+        assert ("ValueError" if failure == "nonbool" else "KeyError") in caplog.text
+    assert "private-probe-message" not in caplog.text + str([e.payload for e in ev])
+
+
+@pytest.mark.parametrize("destination", ["queued", "converge"])
+async def test_fresh_slots_probe_outstanding_provider_latch(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, destination: str
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena import ConvergeSpec
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=1, default_run_reservation=Estimate(usd=0.1)
+    )
+    code = """
+import json, os
+json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=1, tool=ProviderPyTool({"code": code}))
+    healthy = plan(
+        goal_id="h",
+        rounds=1,
+        tool=ProviderPyTool(
+            {
+                "code": code.replace(
+                    "{'data': {}, 'failed_provider': 'fake'}", "{'data': {'y': 10.0}}"
+                )
+            }
+        ),
+    )
+    if destination == "queued":
+        plans = [g, healthy]
+        expected = ("fake", "h", 1)
+    else:
+        # A passing main-round peer permits a converge team to run.
+        peer = plan(goal_id="g", rounds=1).teams[0].agents[0].model_copy(update={"name": "peer"})
+        g.teams[0].agents.append(peer)
+        healthy.teams[0].agents[0] = (
+            healthy.teams[0]
+            .agents[0]
+            .model_copy(update={"manager": Ref.of(ScriptedManager([{"inputs": {"n": 50}}]))})
+        )
+        g = g.model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=healthy.teams[0].model_copy(update={"name": "conv"})
+                )
+            }
+        )
+        plans = [g]
+        expected = ("fake", "g", 2)
+    seen: list[tuple[str, str, int]] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        seen.append((provider, scope.goal_id, scope.round))
+        assert not any(
+            e.type == "tool_start" and e.goal_id == expected[1] and e.round == expected[2]
+            for e in all_events(cfg)
+        )
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(cfg).run(plans, run_id="outstanding-provider")
+    assert seen == [expected]
+    assert any(
+        e.type == "tool_end"
+        and e.goal_id == expected[1]
+        and e.round == expected[2]
+        and e.payload["candidate"]["output"]["status"] == "ok"
+        for e in all_events(cfg)
+    )
+
+
+async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._agent.context import AgentContext
+    from swarm_arena._agent.manager import RoundReport
+    from swarm_arena._engine.stops import ProviderStops
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=2, default_run_reservation=Estimate(usd=0.1)
+    )
+    g = plan(goal_id="g", rounds=1, tool=ProviderPyTool({"code": WRITE}))
+    h = plan(goal_id="h", rounds=1, tool=ProviderPyTool({"code": WRITE}))
+    h.teams[0].agents.append(
+        plan(goal_id="h", rounds=1).teams[0].agents[0].model_copy(update={"name": "healthy"})
+    )
+    registered, stopped = anyio.Event(), anyio.Event()
+    addresses: set[str] = set()
+    services: list[ProviderStops] = []
+    original_register, original_run = ProviderStops.register, ScriptedManager.run_round
+
+    def register(
+        self: ProviderStops, address: str, providers: frozenset[str], cancel: Callable[[], None]
+    ) -> None:
+        original_register(self, address, providers, cancel)
+        addresses.add(address)
+        services.append(self)
+        if len(addresses) == 3:
+            registered.set()
+
+    async def run_round(self: ScriptedManager, ctx: AgentContext) -> RoundReport:
+        await stopped.wait()
+        return await original_run(self, ctx)
+
+    async def fail() -> None:
+        await registered.wait()
+        await services[0].fail("fake", source="manager")
+        stopped.set()
+
+    monkeypatch.setattr(ProviderStops, "register", register)
+    monkeypatch.setattr(ScriptedManager, "run_round", run_round)
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(fail)
+            await Swarm(cfg).run([g, h], run_id="provider-cross-goal")
+    ev = all_events(cfg)
+    failure = next(
+        e for e in ev if e.type == "provider_failed" and e.payload.get("transition") == "failed"
+    )
+    assert failure.payload["stopped"] == ["g/t0/a0", "h/t0/a0"]
+    statuses = {(e.goal_id, e.agent): e.payload["status"] for e in ev if e.type == "agent_status"}
+    assert statuses == {
+        ("g", "a0"): "stopped",
+        ("h", "a0"): "stopped",
+        ("h", "healthy"): "finished",
+    }
+    assert any(e.type == "tool_end" and e.agent == "healthy" for e in ev)
+    assert not any(e.type == "tool_start" and e.agent == "a0" for e in ev)

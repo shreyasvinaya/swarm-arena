@@ -11,8 +11,16 @@ import anyio
 from swarm_arena._board.digest import untrusted
 from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
 from swarm_arena._engine.run import mark_planning_session, planning_session
-from swarm_arena._errors import _core_category, _core_error, _is_core_control, _SignalCategory
+from swarm_arena._errors import (
+    ConfigError,
+    PlanError,
+    _core_category,
+    _core_error,
+    _is_core_control,
+    _SignalCategory,
+)
 from swarm_arena._model.base import CatalogKind
+from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.catalog import PlannerCatalog
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
@@ -28,8 +36,16 @@ from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal, check_models
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
 from swarm_arena.llm._manager import _finish_accounting
-from swarm_arena.llm._reviewer import Approve, Edited, Reviewer, _detach_decision
+from swarm_arena.llm._reviewer import (
+    Approve,
+    Edited,
+    Reviewer,
+    _detach_decision,
+    _report_rejection,
+    _review_work,
+)
 from swarm_arena.llm._structured import DictOutputSchema, structured_call
+from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 
 _ENTRY: Final[dict[str, Any]] = {
     "type": "object",
@@ -510,6 +526,16 @@ class LLMPlanner(Planner):
         return result
 
 
+def _check_review_goal(proposed: Goal, frozen: Goal) -> None:
+    """Refuse descriptive and declaration changes before shared identity admission."""
+    if (
+        canonical_json(proposed.model_dump(mode="json", exclude={"files"}))
+        != canonical_json(frozen.model_dump(mode="json", exclude={"files"}))
+        or proposed.files.globs != frozen.files.globs
+    ):
+        raise _core_error(PlanError, ["/goal: main goal differs from the frozen main goal"])
+
+
 class CollaborativePlanner(Planner):
     """Draft and review plans inside one bounded planning session.
 
@@ -598,13 +624,17 @@ class CollaborativePlanner(Planner):
         base_dir: Path,
     ) -> Plan:
         """Review with the explicit source root supplied by file-based callers."""
-        if current_llm_scope() is None:
-            async with planning_session(config, goal, self) as scope:
-                result = mark_planning_session(
-                    await self._review(goal, config, history, base_dir=base_dir), scope
-                )
-            return result
-        return await self._review(goal, config, history, base_dir=base_dir)
+        try:
+            if current_llm_scope() is None:
+                async with planning_session(config, goal, self) as scope:
+                    result = mark_planning_session(
+                        await self._review(goal, config, history, base_dir=base_dir), scope
+                    )
+                return result
+            return await self._review(goal, config, history, base_dir=base_dir)
+        finally:
+            if isinstance(self._reviewer, TerminalReviewer):
+                self._reviewer._clear_edit()
 
     async def _review(
         self,
@@ -622,16 +652,27 @@ class CollaborativePlanner(Planner):
         frozen = await _freeze_draft_goal(goal, base_dir=base_dir, artifacts=scope.artifacts)
         feedback: list[str] = []
         previous = None
+        draft: Plan | None = None
         for _ in range(self._max_iterations):
-            draft = await self._planner._draft_at(
-                frozen, config, history, base_dir=base_dir, feedback=feedback, previous=previous
-            )
+            if draft is None:
+                draft = await self._planner._draft_at(
+                    frozen, config, history, base_dir=base_dir, feedback=feedback, previous=previous
+                )
+            offered = await _review_work(partial(_detach_plan, draft), "review draft detach")
             try:
-                offered = await _prepare(partial(_detach_plan, draft))
                 decision = await self._reviewer.review(offered)
-                decision = await _prepare(partial(_detach_decision, decision))
-                if isinstance(decision, Approve | Edited):
-                    proposed = draft if isinstance(decision, Approve) else decision.plan
+            except BaseException as error:
+                boundary.contain(error, RuntimeError, "reviewer")
+            decision = await _review_work(
+                partial(_detach_decision, decision), "review decision detach"
+            )
+            if isinstance(decision, Approve | Edited):
+                proposed = draft if isinstance(decision, Approve) else decision.plan
+                admission = _Outcome()
+                try:
+                    await _review_work(
+                        partial(_check_review_goal, proposed.goal, frozen), "plan admission"
+                    )
                     return await _admit_draft(
                         proposed,
                         config,
@@ -641,8 +682,20 @@ class CollaborativePlanner(Planner):
                         history=revisions,
                         origin="together",
                     )
-                feedback.append(decision.text)
-            except BaseException as error:
-                boundary.contain(error, RuntimeError, "reviewer")
+                except BaseException as error:
+                    try:
+                        admission.contain(error, RuntimeError, "plan admission")
+                    except (PlanError, ConfigError) as refusal:
+                        if not isinstance(decision, Edited):
+                            raise
+                        diagnostic = f"edited plan admission refused: {refusal}"
+                        await _review_work(
+                            partial(_report_rejection, self._reviewer, diagnostic),
+                            "review diagnostic",
+                        )
+                continue
+            feedback.append(decision.text)
             previous = draft
-        raise _core_error(RuntimeError, f"plan not approved after {self._max_iterations} reviews")
+            draft = None
+        noun = "review" if self._max_iterations == 1 else "reviews"
+        raise _core_error(RuntimeError, f"plan not approved after {self._max_iterations} {noun}")

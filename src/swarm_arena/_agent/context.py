@@ -79,6 +79,21 @@ class _LocalTimer:
     scope: anyio.CancelScope
     live: bool = True
     failure: Exception | None = None
+    provider_stopped: bool = False
+    provider_child: "_LocalTimer | None" = None
+    provider_cancel: Callable[[], None] | None = None
+
+    def stop_provider(self, error: Exception) -> None:
+        """Route a provider stop through the live manager timer, when present."""
+        self.provider_stopped = True
+        self.record(error)
+        child = self.provider_child
+        if child is not None and child.live:
+            child.stop_provider(error)
+        elif self.provider_cancel is not None:
+            self.provider_cancel()
+        else:
+            self.scope.cancel()
 
     def record(self, error: BaseException) -> None:
         """Retain only registered controls using the shared authority precedence."""
@@ -101,15 +116,24 @@ _local_timers: ContextVar[tuple[_LocalTimer, ...]] = ContextVar("agent_local_tim
 
 
 @contextmanager
-def _local_timer_scope(scope: anyio.CancelScope) -> Generator[_LocalTimer, None, None]:
+def _local_timer_scope(
+    scope: anyio.CancelScope, *, relay_provider_stop: bool = False
+) -> Generator[_LocalTimer, None, None]:
     """Keep timer provenance live until its owner finishes bounded cleanup."""
     parents = tuple(timer for timer in _local_timers.get() if timer.live)
     timer = _LocalTimer(scope)
+    parent = parents[-1] if relay_provider_stop and parents else None
+    if parent is not None:
+        parent.provider_child = timer
+        if parent.provider_stopped and parent.failure is not None:
+            timer.stop_provider(parent.failure)
     token = _local_timers.set((*parents, timer))
     try:
         yield timer
     finally:
         timer.live = False
+        if parent is not None:
+            parent.provider_child = None
         _local_timers.reset(token)
 
 

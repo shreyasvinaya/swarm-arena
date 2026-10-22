@@ -252,6 +252,7 @@ returns `Approve()`, `Feedback(text)`, or `Edited(plan)`. Feedback accumulates,
 and the next model request includes the previous draft. The default limit is
 five reviews; `max_iterations` must be a positive integer. Exhaustion raises
 `RuntimeError("plan not approved after N reviews")` with the configured count.
+The singular case says `plan not approved after 1 review`.
 Direct Python together planning resolves relative goal files against cwd;
 file-based callers retain the loaded goal file's directory through drafting
 and review.
@@ -277,18 +278,32 @@ The private terminal adapter is provided for the plan CLI. It displays TOML
 and asks `Approve [a], feedback [f], edit [e]: `.
 Feedback is one line. Editing invokes the executable selected by `editor`,
 `VISUAL`, `EDITOR`, then `vi`, with one temporary-file argument and no shell.
-Specify an executable path rather than a command with flags. Invalid TOML and
-editor failures print safe diagnostics and retry; EOF ends review with
+Specify an executable path rather than a command with flags. An editor wrapper
+must **exec** the editor (for example, `exec vi -n "$@"`) so cancellation reaches
+the editor itself. Invalid TOML and editor failures print safe diagnostics and
+retry, keeping the last edited file, including undecodable bytes, for repair.
+EOF ends review with
 `RuntimeError("terminal input ended")`. Edits load with the draft's `base_dir`.
-Cancellation restores stdin's descriptor state and stops and reaps the editor.
+Cancellation restores stdin's descriptor state, first asks the editor to terminate,
+and reaps it, using a kill fallback after a one-second grace period. The terminal's
+saved mode, including echo and canonical input, is restored after every editor exit.
+Another Ctrl-C during the grace ends it immediately, kills and reaps the editor,
+and lets the planning session finish its journal cleanup.
 
 One metered planning session spans every draft and human review. Its run-time
 allowance and stop/lease supervision remain active while awaiting input or the
 editor; review does not restart the allowance. Each draft drains its accounting.
 The result retains session provenance and is stamped `origin="together"`.
 Edited plans pass the same catalog admission as generated drafts, preserve
-their source directory, and cannot change the frozen human main goal's inputs
-or files. Approval cannot authorize a mutation of the offered draft: return
+their source directory, and cannot change the frozen human main goal. Its title,
+description, metadata, namespace, id, inputs and file declarations are all fixed;
+edited snapshots must still identify the original frozen files. A refused edit
+prints a safe admission diagnostic to stdout and returns the same draft to the
+reviewer for another review (including custom reviewers),
+retaining the edited text for repair without another paid model call. Each refused
+edit counts toward `max_iterations`; giving feedback requests a new draft instead.
+The terminal adapter clears retained edits when the collaborative session ends.
+Approval cannot authorize a mutation of the offered draft: return
 `Edited(plan)` to propose changes explicitly. Custom async reviewers must
 cooperate with cancellation.
 

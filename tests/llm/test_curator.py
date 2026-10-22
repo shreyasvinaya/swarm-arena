@@ -487,9 +487,10 @@ async def test_identifier_subclasses_do_not_run_comparison_hooks(tmp_path: Path)
     assert type(summary.namespace) is str
 
 
+@pytest.mark.parametrize("delay_s", [0.3, None])
 @pytest.mark.parametrize("second_call", [False, True])
 async def test_custom_curator_failure_waits_for_authoritative_usage(
-    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, second_call: bool
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, second_call: bool, delay_s: float | None
 ) -> None:
     from _engine.test_goal import _curation_checkpoint
     from _fakes.curators import MergeAll
@@ -507,7 +508,7 @@ async def test_custom_curator_failure_waits_for_authoritative_usage(
         update={"prices": ModelSpec.Prices(input=1e6, output=1e6)}
     )
     env.deps.config = env.deps.config.model_copy(update={"models": config.models})
-    fake = LateFakeModel([turn([])], delay_s=0.3)
+    fake = LateFakeModel([turn([])], delay_s=delay_s)
     fake.register("cur")
     FakeModel([]).register("costly")
 
@@ -546,9 +547,14 @@ async def test_custom_curator_failure_waits_for_authoritative_usage(
             await runner._curate_round(1)
         (event,) = env.events("llm_call")
         call = event.payload["call"]
-        assert call["error"] is None
-        assert call["cost_usd"] == pytest.approx(0.00014)
-        assert fake.recorded.is_set()
+        if delay_s is not None:
+            assert call["error"] is None
+            assert call["cost_usd"] == pytest.approx(0.00014)
+            assert fake.recorded.is_set()
+        else:
+            assert call["error"].startswith("estimated:")
+            assert call["cost_usd"] > 0.00014
+            assert not fake.recorded.is_set()
         (receipt,) = env.events("curated")
         assert receipt.payload["errors"] == [
             "curator limit: budget" if second_call else "curator error: KeyError"
@@ -692,3 +698,112 @@ async def test_run_curator_interruption_and_resume_links(
     assert sum(settles[rid] for rid in reserves) == pytest.approx(
         sum(call.cost_usd for call in state.llm_calls.values())
     )
+
+
+async def test_run_custom_curator_provider_error_keeps_receipt_and_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.curators import MergeAll
+    from _fakes.run import all_events
+
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena.llm._curator import CURATOR_SCHEMA
+    from swarm_arena.llm._structured import structured_call
+
+    fake = FakeModel([])
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("SECRET provider failure")
+
+    async def curate(
+        self: MergeAll, namespace: str, new: Sequence[Learning], view: BoardView
+    ) -> list[Learning]:
+        scope = current_llm_scope()
+        assert scope is not None
+        await structured_call(
+            alias="cur",
+            role="curator",
+            models=scope.models,
+            namespace=namespace,
+            system="merge",
+            user="data",
+            schema=CURATOR_SCHEMA,
+            name="curator",
+            no_cache_read=False,
+            temperature=None,
+        )
+        raise AssertionError("provider failure was lost")
+
+    monkeypatch.setattr(fake, "get_response", boom)
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    fake.register("cur")
+    config = run_configuration(tmp_path).model_copy(
+        update={"curator": Ref(path="_fakes.curators:MergeAll")}
+    )
+    with anyio.fail_after(60):
+        await Swarm(config).run(posting_plan(), run_id="provider-error")
+    events = all_events(config)
+    (receipt,) = [e for e in events if e.type == "curated"]
+    assert receipt.payload["errors"] == ["curator error: RuntimeError"]
+    assert receipt.payload["summaries"] == []
+    assert any(e.type == "final_order" for e in events)
+    (call,) = [e.payload["call"] for e in events if e.type == "llm_call"]
+    assert call["error"].startswith("estimated:")
+    assert call["cost_usd"] > 0
+    reserves = {
+        e.payload["reservation"]["id"]
+        for e in events
+        if e.type == "reserve" and e.payload["reservation"]["holder"] == "g/:curator"
+    }
+    assert sum(
+        e.payload["actual"]["usd"]
+        for e in events
+        if e.type == "settle" and e.payload["id"] in reserves
+    ) == pytest.approx(call["cost_usd"])
+    assert not any("SECRET" in json.dumps(e.payload) for e in events if e.type != "llm_call")
+
+
+@pytest.mark.parametrize("kind", ["fenced", "terminal"])
+async def test_custom_curator_control_skips_report_wait(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    from _engine.test_goal import _curation_checkpoint
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine import goal as module
+    from swarm_arena._errors import Fenced, _core_error, _stop_cleanup_error
+
+    runner = await _curation_checkpoint(env)
+    control = (
+        _core_error(Fenced, "run ownership lost") if kind == "fenced" else _stop_cleanup_error()
+    )
+    drained = False
+    report_polled = False
+    original_pending = Tranche.pending
+
+    async def curate(
+        self: MergeAll, namespace: str, new: Sequence[Learning], view: BoardView
+    ) -> list[Learning]:
+        raise control
+
+    def pending(self: Tranche) -> int:
+        # Any report polling before settlement would add a fresh wait budget.
+        nonlocal report_polled
+        report_polled |= not drained
+        return original_pending(self)
+
+    async def drain(scope: Any, *, wait: bool) -> list[str]:
+        nonlocal drained
+        assert not wait, "control must bypass report waiting"
+        drained = True
+        return []
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    monkeypatch.setattr(module, "drain", drain)
+    monkeypatch.setattr(Tranche, "pending", pending)
+    with pytest.raises(type(control)), anyio.fail_after(10):
+        await runner._curate_round(1)
+    assert drained
+    assert not report_polled
+    assert not env.events("curated")
