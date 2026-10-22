@@ -1027,6 +1027,8 @@ class GoalRunner:
                     order, outcome = result
                 else:
                     raise TimeoutError
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException as error:
                 error = boundary.classify(error)
                 self.deps.journal._raise_if_fenced()
@@ -1087,6 +1089,8 @@ class GoalRunner:
                     )
                 await self._close(tranche)
                 self._stop()
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException as error:
                 raise boundary.classify(error) from None
 
@@ -1129,6 +1133,8 @@ class GoalRunner:
                 completed, proposed = await self._supervised_step(propose, final=False)
             finally:
                 await self._close(tranche)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException as error:
             error = boundary.classify(error)
             self.deps.journal._raise_if_fenced()
@@ -1287,6 +1293,8 @@ class GoalRunner:
         try:
             completed, result = await self._supervised_step(invoke, final=False)
             decision = result if completed and result is not None else Decision()
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException as error:
             error = boundary.classify(error)
             self.deps.journal._raise_if_fenced()

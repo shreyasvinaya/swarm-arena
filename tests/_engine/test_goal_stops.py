@@ -953,3 +953,81 @@ class TestPlannerBudgetRefusal:
         assert outcome.status == "no_result"
         assert len(env.events("goal_finished")) == 1
         assert env.events("plan_rejected")[-1].payload["errors"] == ["planner error: LimitReached"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    ("site", "origin"),
+    [
+        ("final", "close"),
+        ("replan", "close"),
+        ("final", "supervisor"),
+        ("replan", "supervisor"),
+        ("policy", "supervisor"),
+    ],
+)
+async def test_core_interrupt_bypasses_goal_handler_classification(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: type[BaseException],
+    site: str,
+    origin: str,
+) -> None:
+    from _fakes.board import candidate
+
+    error = interrupt()
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(runner, "_close" if origin == "close" else "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    with pytest.raises(interrupt) as caught:
+        await operation
+    assert caught.value is error
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+async def test_user_hook_interrupt_stays_contained_at_goal_handlers(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: type[BaseException],
+    site: str,
+) -> None:
+    from _fakes.board import candidate
+
+    secret = "private-hook-interrupt"
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    supervised = runner._supervised_step
+
+    async def hook() -> Any:
+        raise interrupt(secret)
+
+    async def invoke(*args: Any, **kwargs: Any) -> Any:
+        return await supervised(hook, **kwargs)
+
+    monkeypatch.setattr(runner, "_supervised_step", invoke)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    await operation
+    await env.deps.journal.commit()
+    event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
+    assert env.events(event_kind)
+    assert secret not in str([event.payload for event in env.events(event_kind)])
