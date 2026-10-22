@@ -424,6 +424,56 @@ async def test_append_failure_can_be_recovered_without_losing_call(
         assert run.charged(scope) == ESTIMATE
 
 
+@pytest.mark.parametrize("reservation", [None, "UNMATCHED_RESERVATION_SECRET", "other"])
+async def test_preallocated_call_requires_matching_reservation(
+    tmp_path: Path, reservation: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with open_llm_run(tmp_path) as run:
+        scope, original = await _open(run)
+        other_scope, other = await _open(run)
+        meta = dict(original)
+        if reservation is None:
+            del meta["reservation_id"]
+        else:
+            meta["reservation_id"] = (
+                other["reservation_id"] if reservation == "other" else reservation
+            )
+
+        def forbidden(_: bytes) -> str:
+            pytest.fail("malformed identity uploaded a payload")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(run.artifacts, "put_bytes", forbidden)
+            with pytest.raises(ValueError, match="matching reservation") as caught:
+                await record_call(**record_kwargs(meta))
+        assert_secret_absent(caught.value, "UNMATCHED_RESERVATION_SECRET")
+        assert run.calls() == []
+        assert await drain(scope, wait=False) == [original["call_id"]]
+        assert scope.tranche.pending() == 0
+        assert other_scope.tranche.pending() == 1
+        assert run.charged(scope) == ESTIMATE
+        assert await drain(other_scope, wait=False) == [other["call_id"]]
+        assert list(run.state().llm_calls) == [original["call_id"], other["call_id"]]
+
+
+async def test_drain_does_not_duplicate_an_already_journaled_id(tmp_path: Path) -> None:
+    from swarm_arena._journal.llm_record import _bindings
+
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        await record_call(**record_kwargs(meta, settle=False))
+        # Defend the journal identity even if pending bookkeeping is inconsistent.
+        pending = _bindings[run.run_id].pending[meta["reservation_id"]]
+        pending.journaled = False
+        try:
+            with pytest.raises(ValueError, match="already journaled"):
+                await drain(scope, wait=False)
+            await run.journal.commit()
+            assert list(run.state().llm_calls) == [meta["call_id"]]
+        finally:
+            pending.journaled = True
+
+
 async def test_money_is_normalized_once_in_record_and_settlement(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
         scope = run.scope("manager")

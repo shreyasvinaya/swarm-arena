@@ -2593,6 +2593,11 @@ the returned call ID and reservation ID in string metadata, then call
 Before closing a component tranche, use `await drain(scope, wait=True)`; cancelled
 calls first use `abandon_call(scope, rid)` and drain without report waiting.
 
+A report carrying a preallocated call ID must also carry its matching reservation
+ID. Missing or mismatched pairs fail value-free before payload upload or adoption,
+including against replayed identities. Drain refuses a duplicate placeholder for
+an already journaled ID even if pending bookkeeping is inconsistent.
+
 ### R4.14 Journal event types — M1b (additions noted)
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.

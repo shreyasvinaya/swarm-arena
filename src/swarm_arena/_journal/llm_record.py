@@ -80,6 +80,7 @@ class _Binding:
     recorded: set[str] = field(default_factory=set)
     originals: dict[str, str | None] = field(default_factory=dict)
     pending: dict[str, _Pending] = field(default_factory=dict)
+    call_reservations: dict[str, str] = field(default_factory=dict)
     scopes: dict[int, LLMScope] = field(default_factory=dict)
     drained: set[int] = field(default_factory=set)
     workers: set[anyio.CancelScope] = field(default_factory=set)
@@ -188,6 +189,8 @@ def bind_run(
         if call.run_id != run_id or call.id in binding.recorded:
             raise _core_error(ValueError, "invalid committed LLM call identity")
         binding.recorded.add(call.id)
+        if call.reservation_id is not None:
+            binding.call_reservations[call.id] = call.reservation_id
         if call.litellm_call_id is not None:
             binding.seen_litellm[call.litellm_call_id] = call.id
         _digest(request_sha256.get(call.id))
@@ -278,6 +281,7 @@ def open_call(
         raise _core_error(ValueError, "invalid call estimate")
     cid = binding.ids.next("llm")
     binding.pending[rid] = _Pending(scope, cid, rid, estimate, alias, model, provider)
+    binding.call_reservations[cid] = rid
     binding.scopes[id(scope)] = scope
     return cid
 
@@ -743,6 +747,9 @@ async def _record(
 ) -> LLMCall | None:
     entry = binding.pending.get(meta.get("reservation_id", ""))
     cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
+    reservation = binding.call_reservations.get(cid)
+    if reservation is not None and meta.get("reservation_id") != reservation:
+        raise _core_error(ValueError, "LLM call requires its matching reservation")
     lid = kwargs["litellm_call_id"]
     if lid is not None:
         lid = _context_string(lid, "litellm_call_id")
@@ -839,6 +846,8 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None:
 
 
 def _placeholder(binding: _Binding, entry: _Pending) -> None:
+    if entry.call_id in binding.recorded:
+        raise _core_error(ValueError, "LLM call is already journaled")
     scope = entry.scope
     call = LLMCall(
         id=entry.call_id,
