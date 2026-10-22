@@ -18,10 +18,12 @@ from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
     SoftError,
+    _core_error,
     _core_signal,
     _exception_type_name,
     _is_core_control,
     _is_core_signal,
+    _SignalCategory,
 )
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
@@ -30,6 +32,7 @@ from swarm_arena._model.board_types import Row
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
@@ -41,6 +44,17 @@ from swarm_arena._tooling.staging import effective_files
 from swarm_arena._tooling.tool import Action, Tool
 
 _T = TypeVar("_T")
+_CONTEXT_LIMITS = frozenset(Limits.model_fields) | {"budget", "stop"}
+
+
+def _context_limit(value: object) -> str:
+    """Validate ordinary stopping limits without invoking user string hooks."""
+    if not issubclass(type(value), str):
+        raise _core_error(ValueError, "invalid agent limit") from None
+    limit = _context_string(value, "limit")
+    if limit not in _CONTEXT_LIMITS:
+        raise _core_error(ValueError, "invalid agent limit") from None
+    return limit
 
 
 @dataclass(eq=False)
@@ -114,7 +128,11 @@ class AgentContext:
     rt : AgentRuntime
         Agent services, snapshot and mutable round state.
     gate : Callable[[], LimitReached or None], optional
-        Return a stopping exception when new actions are blocked.
+        Return a stopping exception when new actions are blocked. Its limit,
+        like the watchdog's, must name a ``Limits`` field, ``budget``, or
+        ``stop``. Unknown limits (including ledger-only ``usage_overflow``)
+        raise a value-free core ``ValueError`` before admission. Accepted
+        limits carry ordinary limit authority, never terminal authority.
 
     Attributes
     ----------
@@ -228,10 +246,13 @@ class AgentContext:
         rt = self._rt
         blocked = self._gate()
         if blocked is not None:
-            raise _core_signal(LimitReached(blocked.limit, str(blocked)))
+            limit = _context_limit(blocked.limit)
+            raise _core_signal(LimitReached(limit, str(blocked)), _category=_SignalCategory.LIMIT)
         if rt.watchdog.limit is not None:
+            limit = _context_limit(rt.watchdog.limit)
             raise _core_signal(
-                LimitReached(rt.watchdog.limit, rt.watchdog.reason or "agent stopped")
+                LimitReached(limit, rt.watchdog.reason or "agent stopped"),
+                _category=_SignalCategory.LIMIT,
             )
         lifetime = next((item for item in reversed(_nested.get()) if item.owner is self), None)
         if lifetime is not None and lifetime.live:

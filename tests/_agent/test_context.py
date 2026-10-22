@@ -17,7 +17,14 @@ from swarm_arena._board.base import BoardView
 from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
-from swarm_arena._errors import SoftError, _core_error
+from swarm_arena._errors import (
+    SoftError,
+    _core_category,
+    _core_error,
+    _is_core_control,
+    _is_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -283,6 +290,49 @@ async def test_gate_blocks_new_actions(ctx_env: CtxEnv) -> None:
     with pytest.raises(LimitReached) as err:
         await ctx.run_tool({"x": 1.0})
     assert err.value.limit == "stop"
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+@pytest.mark.parametrize("limit", [*Limits.model_fields, "budget", "stop"])
+async def test_context_accepts_only_ordinary_limit_authority(
+    ctx_env: CtxEnv, source: str, limit: str
+) -> None:
+    ctx_env.ctx()
+    blocked = LimitReached(limit, "stopping")
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+        ctx_env.rt.watchdog.reason = "stopping"
+    ctx = AgentContext(ctx_env.rt, gate=lambda: blocked if source == "gate" else None)
+    with pytest.raises(LimitReached, match=r"^stopping$") as error:
+        ctx.search_learnings("x")
+    assert error.value is not blocked
+    assert error.value.limit == limit
+    assert _core_category(error.value) is _SignalCategory.LIMIT
+    assert _is_core_control(error.value)
+    assert ctx_env.counters.turns == 0
+    assert ctx_env.events("agent_counters") == []
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+@pytest.mark.parametrize("limit", ["usage_overflow", SECRET, ""])
+async def test_context_rejects_unknown_limits_without_terminal_authority(
+    ctx_env: CtxEnv, source: str, limit: str
+) -> None:
+    ctx_env.ctx()
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+        ctx_env.rt.watchdog.reason = SECRET
+    ctx = AgentContext(
+        ctx_env.rt, gate=lambda: LimitReached(limit, SECRET) if source == "gate" else None
+    )
+    with pytest.raises(ValueError, match=r"^invalid agent limit$") as error:
+        await ctx.save_notes("x")
+    assert _is_core_signal(error.value)
+    assert _core_category(error.value) is _SignalCategory.DIAGNOSTIC
+    assert not _is_core_control(error.value)
+    assert_secret_absent(error.value, SECRET, sanitized=True)
+    assert ctx_env.counters.turns == 0
+    assert ctx_env.events("agent_counters") == []
 
 
 async def test_actions_journal_counters(ctx_env: CtxEnv) -> None:

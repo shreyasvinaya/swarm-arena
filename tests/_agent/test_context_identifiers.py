@@ -5,7 +5,47 @@ from _fakes.engine import CtxEnv
 from _fakes.pr1_r5_ids import HostileString, NotString, hostile
 
 from swarm_arena import Limits
-from swarm_arena._errors import SoftError
+from swarm_arena._errors import SoftError, _core_category, _is_core_signal, _SignalCategory
+from swarm_arena.manager import LimitReached
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+@pytest.mark.parametrize("valid", [True, False])
+async def test_context_limit_strings_are_normalized_before_validation(
+    ctx_env: CtxEnv, source: str, valid: bool
+) -> None:
+    limit = hostile("stop" if valid else "secret-unknown-limit")
+    ctx = ctx_env.ctx(gate=lambda: LimitReached(limit, "stopping") if source == "gate" else None)
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+        ctx_env.rt.watchdog.reason = "stopping"
+    with pytest.raises(LimitReached if valid else ValueError) as error:
+        ctx.search_learnings("x")
+    assert _is_core_signal(error.value)
+    if valid:
+        assert isinstance(error.value, LimitReached)
+        assert type(error.value.limit) is str
+        assert error.value.limit == "stop"
+        assert _core_category(error.value) is _SignalCategory.LIMIT
+    else:
+        assert str(error.value) == "invalid agent limit"
+        assert _core_category(error.value) is _SignalCategory.DIAGNOSTIC
+    assert ctx_env.counters.turns == 0
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+async def test_context_rejects_non_string_limits_without_value_hooks(
+    ctx_env: CtxEnv, source: str
+) -> None:
+    limit: Any = NotString()
+    ctx = ctx_env.ctx(gate=lambda: LimitReached(limit, "stopping") if source == "gate" else None)
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+    with pytest.raises(ValueError, match=r"^invalid agent limit$") as error:
+        ctx.search_learnings("x")
+    assert _is_core_signal(error.value)
+    assert _core_category(error.value) is _SignalCategory.DIAGNOSTIC
+    assert ctx_env.counters.turns == 0
 
 
 async def test_agent_read_identifiers_are_plain_strings(ctx_env: CtxEnv) -> None:
