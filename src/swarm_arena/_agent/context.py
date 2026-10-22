@@ -152,7 +152,11 @@ def _defer_timer_error(error: BaseException) -> bool:
 class _ActionInflight(Inflight):
     """Keep one owned action visible to round stop and independently cancellable."""
 
-    def __init__(self, parent: Inflight) -> None:
+    def __init__(self, parent: Inflight, *, round_deadline: float = float("inf")) -> None:
+        self._round_deadline = min(
+            round_deadline,
+            parent._round_deadline if isinstance(parent, _ActionInflight) else float("inf"),
+        )
         self._parent = parent
         self._local = Inflight()
         self._scopes = self._local._scopes
@@ -216,6 +220,14 @@ class _ActionInflight(Inflight):
         self._local.closed = value
 
     @property
+    def _starts_closed(self) -> bool:
+        return self._parent._starts_closed or self._local._starts_closed
+
+    @_starts_closed.setter
+    def _starts_closed(self, value: bool) -> None:
+        self._local._starts_closed = value
+
+    @property
     def _cancel_generation(self) -> int:
         return self._parent._cancel_generation + self._local._cancel_generation
 
@@ -223,10 +235,30 @@ class _ActionInflight(Inflight):
     def _cancel_generation(self, value: int) -> None:
         self._local._cancel_generation = value - self._parent._cancel_generation
 
-    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
-        self._local.add(scope, grace_s=grace_s)
+    def add(
+        self,
+        scope: anyio.CancelScope,
+        *,
+        grace_s: float = 0.0,
+        admitted_generation: int | None = None,
+    ) -> None:
+        if admitted_generation is not None:
+            self._check_admitted(admitted_generation)
+        self._local.add(
+            scope,
+            grace_s=grace_s,
+            admitted_generation=(
+                self._local._cancel_generation if admitted_generation is not None else None
+            ),
+        )
         try:
-            self._parent.add(scope, grace_s=grace_s)
+            self._parent.add(
+                scope,
+                grace_s=grace_s,
+                admitted_generation=(
+                    self._parent._cancel_generation if admitted_generation is not None else None
+                ),
+            )
         except BaseException:
             self._local.discard(scope)
             raise
@@ -247,6 +279,21 @@ class _ActionInflight(Inflight):
         return self._parent._add_completion(
             scope, grace_s=grace_s, generation=self._parent._cancel_generation
         )
+
+
+def _provider_round_deadline() -> float:
+    """Read the engine deadline inherited by this slot and its owned actions."""
+    registry = _inflight.get()
+    return registry._round_deadline if isinstance(registry, _ActionInflight) else float("inf")
+
+
+def _check_provider_admission() -> None:
+    """Refuse new calls without turning a round stop into an action timeout."""
+    if anyio.current_time() >= _provider_round_deadline():
+        raise _core_error(LimitReached, "round_timeout_s", "the manager round timed out")
+    registry = _inflight.get()
+    if registry is not None and registry.closed:
+        raise _core_error(LimitReached, "stop", "the round is stopping")
 
 
 @dataclass(frozen=True)

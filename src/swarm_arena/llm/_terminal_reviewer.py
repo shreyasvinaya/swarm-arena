@@ -148,7 +148,8 @@ class TerminalReviewer:
                     return None
                 async with process:
                     try:
-                        code = await process.wait()
+                        with _sigint_wakeup():
+                            code = await process.wait()
                     finally:
                         with anyio.CancelScope(shield=True):
                             if process.returncode is None:

@@ -508,7 +508,7 @@ async def test_run_budget_flag_is_never_cleared(env: EngineEnv) -> None:
 
 
 @pytest.mark.parametrize("flag", ["stop", "run_budget", "goal_budget"])
-async def test_queued_job_never_starts_after_admission_closes(
+async def test_queued_job_obeys_admission_closure_kind(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, flag: str
 ) -> None:
     gate = _GateExecutor(
@@ -517,8 +517,8 @@ async def test_queued_job_never_starts_after_admission_closes(
     e = dataclasses.replace(env, deps=dataclasses.replace(env.deps, executor=gate))
     closed, real_close = anyio.Event(), Inflight.close
 
-    def signalling_close(self: Inflight) -> None:
-        real_close(self)
+    def signalling_close(self: Inflight, *, budget: bool = False) -> None:
+        real_close(self, budget=budget)
         closed.set()
 
     monkeypatch.setattr(Inflight, "close", signalling_close)
@@ -535,8 +535,13 @@ async def test_queued_job_never_starts_after_admission_closes(
         async with anyio.create_task_group() as tg:
             tg.start_soon(close_while_queued)
             out = await _round(e, [_runner("b")]).run(1)
-    assert "tool_start" not in e.event_types()
-    assert out.candidates == []
+    if flag == "stop":
+        assert "tool_start" not in e.event_types()
+        assert out.candidates == []
+    else:
+        assert e.event_types().count("tool_start") == 1
+        assert len(out.candidates) == 1
+        assert out.candidates[0].output.status == RunStatus.OK
     (res_b,) = [
         ev.payload["reservation"]["id"]
         for ev in e.events("reserve")
@@ -959,9 +964,9 @@ async def test_budget_drain_uses_only_inflight_job_grace(
     monkeypatch.setattr(Inflight, "cancel_all", record)
     real_close = Inflight.close
 
-    def close(self: Inflight) -> None:
+    def close(self: Inflight, *, budget: bool = False) -> None:
         times.setdefault("closed", anyio.current_time())
-        real_close(self)
+        real_close(self, budget=budget)
 
     monkeypatch.setattr(Inflight, "close", close)
 
@@ -977,8 +982,8 @@ async def test_budget_drain_uses_only_inflight_job_grace(
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(latch)
             out = await _round(env, [slot, idle]).run(1)
-    assert 0.2 <= times["cancel"] - times["flag"] < 2.0
-    assert times["cancel"] - times["closed"] < 2.0
+    assert 5.0 <= times["cancel"] - times["flag"] < 7.0
+    assert 5.0 <= times["cancel"] - times["closed"] < 7.0
     assert out.candidates[0].output.partial
     assert out.candidates[0].output.status == RunStatus.CANCELLED
 
@@ -1897,3 +1902,51 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
         for worker in workers:
             await anyio.to_thread.run_sync(worker.join, 5)
             assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("flag", ["run_budget", "goal_budget"])
+@pytest.mark.parametrize("grace", [0.0, 5.0])
+async def test_budget_close_during_reserve_durability(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, flag: str, grace: float
+) -> None:
+    closed = anyio.Event()
+    real_close = Inflight.close
+    observed_grace: list[float] = []
+
+    def close(self: Inflight, *, budget: bool = False) -> None:
+        if budget:
+            observed_grace.append(self.max_grace_s())
+        real_close(self, budget=budget)
+        closed.set()
+
+    monkeypatch.setattr(Inflight, "close", close)
+    journal = env.deps.journal
+    append = journal.append_durable
+
+    async def gated(draft: EventDraft, **kwargs: Any) -> Any:
+        result = await append(draft, **kwargs)
+        if draft.type == "reserve" and draft.payload["reservation"]["kind"] == "tool":
+            if flag == "goal_budget":
+                env.deps.stops.goal_budget.add("g")
+            else:
+                env.deps.stops.run_budget = True
+            await closed.wait()
+        return result
+
+    monkeypatch.setattr(journal, "append_durable", gated)
+    slot = _runner("b")
+    slot.tool_ref = Ref.of(FunctionTool("_fakes.tools:square", grace_s=grace))
+    with anyio.fail_after(30):
+        out = await _round(env, [slot]).run(1)
+    assert len(env.events("tool_start")) == 1
+    assert len(out.candidates) == 1
+    assert observed_grace == [grace]
+    reserves = [
+        e.payload["reservation"]
+        for e in env.events("reserve")
+        if e.payload["reservation"]["kind"] == "tool"
+    ]
+    assert len(reserves) == 1
+    settles = [e for e in env.events("settle") if e.payload["id"] == reserves[0]["id"]]
+    assert len(settles) == 1
+    assert Amount.model_validate(settles[0].payload["actual"]) == Amount()
