@@ -719,3 +719,51 @@ def test_llm_pages_escape_recorded_metadata_and_check_host(server: Server) -> No
         urlopen(request, timeout=5)
     assert error.value.code == 403
     error.value.close()
+
+
+@pytest.mark.parametrize("records", ["candidate", "plan", "calls-only"])
+def test_llm_route_enforces_served_namespace_selection(tmp_path: Path, records: str) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    for namespace in ("public", "private"):
+        run = FakeRun(str(tmp_path / "runs"), f"{namespace}-run", namespace=namespace)
+        drafts = [
+            _record(
+                _call(
+                    run, f"{namespace}-call", team=f"{namespace}-team", agent=f"{namespace}-agent"
+                )
+            ),
+        ]
+        if records != "calls-only":
+            drafts.insert(0, run.plan())
+        if records == "candidate":
+            drafts.append(run.candidate(f"{namespace}-c"))
+        run.commit(*drafts)
+        add_pointer(board.config.arena_root, run)
+    board.open("", "", ["public", "private"])
+    http = make_server(board, ["public"], author="alice", port=0)
+    thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", http.server_port, timeout=5)
+    try:
+        for namespace, status in (("private", 404), ("public", 200)):
+            connection.request("GET", f"/run/{namespace}-run/llm")
+            response = connection.getresponse()
+            body = response.read().decode()
+            assert response.status == status
+            assert "private-team/private-agent" not in body
+            if status == 200:
+                assert "public-team/public-agent" in body
+        if records == "candidate":
+            connection.request("GET", "/candidate/private-c")
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 404
+    finally:
+        connection.close()
+        http.shutdown()
+        http.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        board.close()

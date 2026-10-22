@@ -543,7 +543,8 @@ in `requested_by_call`, the tool run and its internal calls, checks, recorded
 judge calls and scores, then citing learnings and their posting calls. Each call
 appears once and shows its recorded role, model, total tokens and six-decimal USD
 cost. A response-cache hit shows `cache-hit-of=ID` only when an origin was recorded;
-an optional trace URL is printed as text. For example:
+an optional trace URL is printed as text. A recorded call link without a matching
+call record prints `llm ID: not found`. For example:
 
 ```text
 llm planner-call planner local/model tokens=120 cost=$0.000140
@@ -554,9 +555,11 @@ An initial or queued goal's `planning_session` is read from the producing run's
 recorded root, even when the viewer uses another `run_root`. Completed and
 interrupted planning journals are readable provenance; trace never resumes them
 or acquires their lease. The session's committed head is captured at publication,
-with its recorded completion reason when present. An absent session prints
-`planning session ID: not found`. Later autonomous revisions use their own
-`planner_call_ids` and have no standalone-session link. Recorded plan `base_dir`
+with its recorded completion reason when present. An absent or unreadable session
+prints `planning session ID: not found`; an unreadable session leaves other runs
+available. A session capture is reused while its producing run's committed mark
+is unchanged, and is checked again when that mark advances. Later autonomous
+revisions use their own `planner_call_ids` and have no standalone-session link. Recorded plan `base_dir`
 is preserved; viewing a plan does not resolve files or import producer plugins.
 
 ## Board viewer
@@ -595,9 +598,15 @@ and response-cache hit count. The rate is
 `cache_read_tokens / (input_tokens + cache_read_tokens + cache_write_tokens)`,
 or `0.0%` when the denominator is zero. Ordinary input tokens exclude cache
 tokens; output tokens do not enter this rate. Failed calls, probes and planning
-calls count even when no candidate links to them. Calls repeated in several
-namespace caches count once per source root, run and call ID. Candidate pages
-link to this statistics page.
+calls within the displayed run count even when no candidate links to them.
+Response-cache hits count in calls and response hits, but add no input, cache-read
+or cache-write tokens: the rate measures provider prompt caching, excluding
+replayed cached-response usage. Standalone-session planner calls appear in
+`trace` only; they are not added to the producing run's statistics, and a session
+without an arena pointer has no statistics page. The viewer's selected namespaces
+also restrict which source runs may have a statistics page.
+Calls repeated in several namespace caches count once per source root, run and
+call ID. Candidate pages link to this statistics page.
 
 Trace and statistics use the request's retained published generation, including
 while another thread refreshes the board or closes it. Committed call and plan

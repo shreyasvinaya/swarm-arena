@@ -74,7 +74,8 @@ def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]:
     Parameters
     ----------
     calls : Iterable[LLMCall]
-        Source-deduplicated calls from a captured generation.
+        Source-deduplicated calls from a captured generation. Response-cache
+        hits contribute to call and hit counts but not provider token sums.
 
     Returns
     -------
@@ -93,9 +94,9 @@ def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]:
         for i, value in enumerate(
             (
                 1,
-                call.usage.input_tokens,
-                call.usage.cache_read_tokens,
-                call.usage.cache_write_tokens,
+                0 if call.cache_hit else call.usage.input_tokens,
+                0 if call.cache_hit else call.usage.cache_read_tokens,
+                0 if call.cache_hit else call.usage.cache_write_tokens,
                 int(call.cache_hit),
             )
         ):
@@ -291,9 +292,12 @@ def _lines(
 
     def emit(run_id: str, identifiers: Iterable[str], source: Mapping[str, LLMCall]) -> None:
         for identifier in identifiers:
-            if identifier in source and (run_id, identifier) not in seen:
+            if (run_id, identifier) not in seen:
                 seen.add((run_id, identifier))
-                lines.append(format_llm_step(source[identifier]))
+                call = source.get(identifier)
+                lines.append(
+                    format_llm_step(call) if call is not None else f"llm {identifier}: not found"
+                )
 
     run_calls = calls[candidate.run_id]
     lines.extend(
@@ -302,9 +306,17 @@ def _lines(
             f"team={candidate.team} agent={candidate.agent} rationale={rationale}",
         ]
     )
-    emit(candidate.run_id, plan.planner_call_ids, run_calls)
+    session = sessions.get(plan.planning_session) if plan.planning_session else None
+    for identifier in plan.planner_call_ids:
+        if identifier in run_calls:
+            emit(candidate.run_id, [identifier], run_calls)
+        else:
+            emit(
+                plan.planning_session or candidate.run_id,
+                [identifier],
+                session.calls if session is not None else {},
+            )
     if plan.planning_session:
-        session = sessions.get(plan.planning_session)
         label = f"planning session {plan.planning_session}"
         if session is None:
             lines.append(f"{label}: not found")
@@ -329,8 +341,8 @@ def _lines(
         outcome = "passed" if check.passed else "failed"
         reasons = "; ".join(check.reasons)
         lines.append(f"check    {check.check} {outcome}" + (f" {reasons}" if reasons else ""))
-    for score, _ in cache.scores(frontier, candidate_ids=[candidate.id]):
-        emit(candidate.run_id, score.llm_call_ids, run_calls)
+    for score, position in cache.scores(frontier, candidate_ids=[candidate.id]):
+        emit(position[1], score.llm_call_ids, calls.get(position[1], {}))
         lines.append(
             f"score    {score.judge} {format_value(score.value)} key={score.key} "
             f"rubric={score.rubric_hash[:8]} panel={score.panel_hash[:8] or '-'}"

@@ -40,6 +40,7 @@ from swarm_arena._model.planning_types import Decision
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Learning, LLMCall, Score
 from swarm_arena._model.run_config import RunConfig
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import open_store
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class _Published:
     run_id: str | None
     lifetime: _ReadLifetime
     sessions: dict[tuple[str, str], "_SessionCalls | None"] = field(default_factory=dict)
+    source_namespaces: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
 
 
 def _resolved_root(root: str) -> str:
@@ -343,29 +345,48 @@ class ArenaBoard(Board):
         """Capture each standalone session once, from its producing run's root."""
         from swarm_arena._board.trace import _calls_at, _SessionCalls
 
-        sessions: dict[tuple[str, str], _SessionCalls | None] = {}
+        previous_state = self._read_state()
+        previous_marks = {
+            (_resolved_root(mark.run_root), mark.run_id): mark
+            for mark in previous_state.frontier.marks
+        }
+        requested: dict[tuple[str, str], bool] = {}
         for mark in frontier.marks:
             root = _resolved_root(mark.run_root)
+            changed = previous_marks.get((root, mark.run_id)) != mark
             for revisions in plans[mark.run_id].revisions.values():
                 for plan in revisions:
-                    if not plan.planning_session:
-                        continue
-                    key = (root, plan.planning_session)
-                    if key in sessions:
-                        continue
-                    owner = read_owner(run_store(root, plan.planning_session))
-                    if owner is None or owner[0].head is None:
-                        sessions[key] = None
-                        continue
-                    head = owner[0].head
-                    previous = self._session_calls.get(key)
-                    if previous is not None and previous[0] == head:
-                        session = previous[1]
-                    else:
-                        calls, reason = _calls_at(run_store(root, plan.planning_session), head)
-                        session = _SessionCalls(calls, reason)
-                        self._session_calls[key] = (head.model_copy(deep=True), session)
-                    sessions[key] = session
+                    if plan.planning_session:
+                        key = (root, plan.planning_session)
+                        requested[key] = requested.get(key, False) or changed
+        sessions: dict[tuple[str, str], _SessionCalls | None] = {}
+        for key, changed in requested.items():
+            if not changed and key in previous_state.sessions:
+                sessions[key] = previous_state.sessions[key]
+                continue
+            root, session_id = key
+            # Publication is synchronous worker preparation. Lease-owning
+            # callers retain cancellation on their existing outer boundary.
+            outcome = _Outcome(capture_caller=False)
+            try:
+                store = run_store(root, session_id)
+                owner = read_owner(store)
+                if owner is None or owner[0].head is None:
+                    sessions[key] = None
+                    continue
+                head = owner[0].head
+                previous = self._session_calls.get(key)
+                if previous is not None and previous[0] == head:
+                    session = previous[1]
+                else:
+                    calls, reason = _calls_at(store, head)
+                    session = _SessionCalls(calls, reason)
+                    self._session_calls[key] = (head.model_copy(deep=True), session)
+                sessions[key] = session
+            except (StorageError, OSError, ValueError) as error:
+                outcome.propagate_control(error)
+                _LOG.warning("cannot read planning session %s", session_id)
+                sessions[key] = None
         return sessions
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:
@@ -638,6 +659,7 @@ class ArenaBoard(Board):
             self._require_open()
             arena = open_store(self.config.arena_root)
             roots: dict[str, str] = {}
+            source_namespaces: dict[tuple[str, str], set[str]] = {}
             for namespace in self._namespaces:
                 pointers, warnings = list_pointers(arena, namespace)
                 for warning in warnings:
@@ -648,8 +670,14 @@ class ArenaBoard(Board):
                     _LOG.warning("%s", warning)
                 for pointer in pointers:
                     roots.setdefault(pointer.run_id, pointer.run_root)
+                    source_namespaces.setdefault(
+                        (_resolved_root(pointer.run_root), pointer.run_id), set()
+                    ).add(namespace)
             if self._run_id:
                 roots[self._run_id] = self._run_root
+                source_namespaces.setdefault((self._run_root, self._run_id), set()).update(
+                    self._namespaces
+                )
             for namespace in self._namespaces:
                 self._cache(namespace)
             caches = list(self._caches.values())
@@ -683,7 +711,15 @@ class ArenaBoard(Board):
                     "curation": [name for name in curation if name not in omitted],
                 }
             )
-            published = self._prepare_published(frontier)
+            published = replace(
+                self._prepare_published(frontier),
+                source_namespaces={
+                    (_resolved_root(mark.run_root), mark.run_id): frozenset(
+                        source_namespaces.get((_resolved_root(mark.run_root), mark.run_id), ())
+                    )
+                    for mark in frontier.marks
+                },
+            )
             with self._lock:
                 self._published = published
             return frontier
@@ -1686,9 +1722,14 @@ class _ArenaReader:
                     )
         raise KeyError(identifier)
 
-    def llm_calls(self, run_id: str) -> list[LLMCall]:
-        """Return detached calls once per published source, run and call ID."""
-        if run_id not in self._state.plans:
+    def llm_calls(self, run_id: str, *, namespaces: Sequence[str] | None = None) -> list[LLMCall]:
+        """Return detached calls only for a source exposed by this fixed selection."""
+        selected = set(self._state.namespaces if namespaces is None else namespaces)
+        visible = any(
+            identifier == run_id and selected.intersection(names)
+            for (_, identifier), names in self._state.source_namespaces.items()
+        )
+        if not visible or run_id not in self._state.plans:
             raise KeyError(run_id)
         return [call.model_copy(deep=True) for call in self._state.plans[run_id].calls.values()]
 

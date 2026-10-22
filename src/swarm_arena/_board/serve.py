@@ -166,9 +166,9 @@ def _candidate_page(state: _ArenaReader, namespaces: Sequence[str], identifier: 
     return body + f"<h2>Trace</h2><pre>{_e(chr(10).join(lines))}</pre>"
 
 
-def _llm_page(state: _ArenaReader, identifier: str) -> str:
+def _llm_page(state: _ArenaReader, namespaces: Sequence[str], identifier: str) -> str:
     """Render token-cache rates and response hits from the request's reader."""
-    stats = cache_stats(state.llm_calls(identifier))
+    stats = cache_stats(state.llm_calls(identifier, namespaces=namespaces))
     body = (
         f"<h1>LLM calls: {_e(identifier)}</h1><table><thead><tr>"
         "<th>Agent / role</th><th>Calls</th><th>Input tokens</th>"
@@ -396,7 +396,9 @@ def make_server(
                             state, names, unquote(parsed.path[len("/candidate/") :])
                         )
                     elif parsed.path.startswith("/run/") and parsed.path.endswith("/llm"):
-                        body = _llm_page(state, unquote(parsed.path[len("/run/") : -len("/llm")]))
+                        body = _llm_page(
+                            state, names, unquote(parsed.path[len("/run/") : -len("/llm")])
+                        )
                     else:
                         raise KeyError("route")
                 self._reply(200, body)
