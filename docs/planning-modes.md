@@ -233,3 +233,8 @@ Rejected proposals keep the current revision. Fencing, terminal accounting
 failures and caller cancellation propagate as controls.
 
 Interactive **together** planning remains a later M3 feature.
+
+Standalone planning journals remain readable for accounting and provenance.
+They cannot be resumed: both `Swarm.resume` and `swarm-arena resume` refuse
+with `run is a planning session; it cannot be resumed` before taking ownership
+or appending any event, including for an interrupted planning session.

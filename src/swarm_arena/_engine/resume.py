@@ -87,6 +87,10 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
         for _, batch in read_chain(store, doc.head, _read=partial(_read_segment, store))
         for event in batch
     ]
+    if any(
+        event.type == EventType.RUN_STARTED and event.payload.get("planning") for event in events
+    ):
+        raise _core_error(ValueError, "run is a planning session; it cannot be resumed")
     return events, RunState.from_events(events)
 
 
@@ -553,7 +557,8 @@ async def resume_run(
     ValueError
         A goal's agent peak exceeds the run-wide limit, no committed state
         exists, a replay payload is invalid, a budget cap decreases, or startup
-        model validation refuses the replanner or curator before takeover.
+        model validation refuses the replanner or curator before takeover, or
+        the journal belongs to a standalone planning session.
     ChainError
         The committed journal chain is broken or a segment is missing.
     RuntimeError

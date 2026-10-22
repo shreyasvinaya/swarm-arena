@@ -2776,3 +2776,61 @@ async def test_resume_startup_models_restore_recorded_import_base(
         assert set(result) == {"g"}
     finally:
         sys.modules.pop("local_resume_curator", None)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_public_resume_refuses_planning_session_without_mutation(
+    run_config: RunConfig, tmp_path: Path, capsys: pytest.CaptureFixture[str], completed: bool
+) -> None:
+    from swarm_arena._cli.main import main
+
+    config = run_config
+    run_id = "planning-session"
+    store = LocalStore(Path(config.run_root) / run_id)
+    lease = Lease.acquire_new(store, owner_id="previous", host="local", ttl_s=60)
+    async with JournalWriter(
+        store,
+        lease,
+        run_id=run_id,
+        next_seq=1,
+        local_path=tmp_path / "planning.jsonl",
+        sync_interval_s=60,
+        settle_timeout_s=2,
+    ) as journal:
+        journal.append(
+            EventDraft(type="run_config", payload={"config": config.model_dump(mode="json")})
+        )
+        journal.append(
+            EventDraft(
+                type="run_started",
+                payload={"planning": True, "final_slices": {"g": Amount().model_dump()}},
+            )
+        )
+        journal.append(EventDraft(type="goal_started", goal_id="g"))
+        if completed:
+            journal.append(
+                EventDraft(
+                    type="goal_finished", goal_id="g", payload={"reason": "planning complete"}
+                )
+            )
+        await journal.commit()
+    # The unfinished variant is the durable prefix left by a crashed session.
+    before = read_committed(store)
+    assert before is not None
+    owner = read_owner(store)
+    assert RunState.from_events(before[1]).goals["g"].finished is completed
+    message = "run is a planning session; it cannot be resumed"
+    with pytest.raises(ValueError, match=message):
+        await Swarm(config).resume(run_id, force=True)
+    assert read_committed(store) == before
+    assert read_owner(store) == owner
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(config.dumps())
+    code = await anyio.to_thread.run_sync(
+        main,
+        ["resume", str(Path(config.run_root) / run_id), "--config", str(config_path), "--force"],
+    )
+    assert code == 1
+    assert message in capsys.readouterr().err
+    assert read_committed(store) == before
+    assert read_owner(store) == owner
