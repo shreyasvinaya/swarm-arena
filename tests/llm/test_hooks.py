@@ -7,6 +7,9 @@ from typing import Any, cast
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _engine.conftest import env as env
 from _fakes.engine import EngineEnv
 from _fakes.llm_run import open_llm_run
@@ -92,6 +95,55 @@ async def invoke(
         prompt=None,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("stage", ["entry", "funded", "settings"])
+@pytest.mark.parametrize("reason", ["closed", "deadline"])
+async def test_slot_round_control_refuses_provider_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, reason: str
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+    from swarm_arena.llm import _hooks
+
+    registry = _ActionInflight(Inflight())
+    capture = FakeModel([FakeTurn(text="unused")])
+    prepare = _hooks._prepare
+    reserve = Tranche.reserve_call
+
+    def expire() -> None:
+        if reason == "closed":
+            registry.close()
+        else:
+            registry._round_deadline = anyio.current_time() - 1
+
+    async def prepared(operation: Any) -> Any:
+        result = await prepare(operation)
+        if stage == "settings" and operation.__name__ == "settings":
+            expire()
+        return result
+
+    async def funded(self: Tranche, *args: Any, **kwargs: Any) -> str:
+        result = await reserve(self, *args, **kwargs)
+        if stage == "funded":
+            expire()
+        return result
+
+    monkeypatch.setattr(_hooks, "_prepare", prepared)
+    monkeypatch.setattr(Tranche, "reserve_call", funded)
+    if stage == "entry":
+        expire()
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), track_inflight(registry), pytest.raises(LimitReached) as caught:
+            await invoke(metered(capture))
+        assert caught.value.limit == ("stop" if reason == "closed" else "round_timeout_s")
+        assert _core_category(caught.value) is _SignalCategory.LIMIT
+        assert not capture.calls
+        await drain(scope, wait=False)
+        assert scope.tranche.pending() == 0
+        await scope.tranche.close()
+        assert run.charged(scope) == Amount()
 
 
 async def test_reserves_and_sends_metadata(tmp_path: Path) -> None:

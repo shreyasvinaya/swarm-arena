@@ -1084,7 +1084,7 @@ class RoundRunner:
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]
         contexts: list[_RoundContext | None] = [None for _ in agents]
-        agent_inflight = [_ActionInflight(inflight) for _ in agents]
+        agent_inflight = [_ActionInflight(inflight, round_deadline=deadline) for _ in agents]
         provider_cancelled = [anyio.Event() for _ in agents]
         provider_kill_at = [float("inf") for _ in agents]
         reasons: dict[str, str] = {}

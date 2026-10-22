@@ -152,7 +152,11 @@ def _defer_timer_error(error: BaseException) -> bool:
 class _ActionInflight(Inflight):
     """Keep one owned action visible to round stop and independently cancellable."""
 
-    def __init__(self, parent: Inflight) -> None:
+    def __init__(self, parent: Inflight, *, round_deadline: float = float("inf")) -> None:
+        self._round_deadline = min(
+            round_deadline,
+            parent._round_deadline if isinstance(parent, _ActionInflight) else float("inf"),
+        )
         self._parent = parent
         self._local = Inflight()
         self._scopes = self._local._scopes
@@ -275,6 +279,21 @@ class _ActionInflight(Inflight):
         return self._parent._add_completion(
             scope, grace_s=grace_s, generation=self._parent._cancel_generation
         )
+
+
+def _provider_round_deadline() -> float:
+    """Read the engine deadline inherited by this slot and its owned actions."""
+    registry = _inflight.get()
+    return registry._round_deadline if isinstance(registry, _ActionInflight) else float("inf")
+
+
+def _check_provider_admission() -> None:
+    """Refuse new calls without turning a round stop into an action timeout."""
+    if anyio.current_time() >= _provider_round_deadline():
+        raise _core_error(LimitReached, "round_timeout_s", "the manager round timed out")
+    registry = _inflight.get()
+    if registry is not None and registry.closed:
+        raise _core_error(LimitReached, "stop", "the round is stopping")
 
 
 @dataclass(frozen=True)
