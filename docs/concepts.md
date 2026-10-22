@@ -309,7 +309,10 @@ Cache keys include request parameters such as tools, schemas, temperature, seed 
 reasoning settings. Tracking metadata is excluded, so reservation and call IDs do
 not invalidate cache hits. Each per-call settings object carries string-valued
 run, goal, team, agent, round, role, reservation, call and model-alias metadata.
-The output limit is capped by the model catalog. An explicit temperature is sent
+The output limit is capped by the model catalog, including caller aliases such
+as `max_completion_tokens`, `max_output_tokens` and native `maxOutputTokens`.
+Provider generation envelopes retain the cap when they replace generated settings.
+An explicit temperature is sent
 with `drop_params=True`, allowing providers that reject that parameter to omit it.
 
 A response-cache hit costs zero. Proven origin links distinguish namespace,

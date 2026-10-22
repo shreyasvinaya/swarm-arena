@@ -55,6 +55,34 @@ _THINKING_CONTAINERS = (
     "output_config",
 )
 
+_OUTPUT_LIMIT_ALIASES = frozenset(
+    {
+        "max_tokens",
+        "max_completion_tokens",
+        "maxCompletionTokens",
+        "max_response_output_tokens",
+        "max_output_tokens",
+        "maxOutputTokens",
+        "maxTokens",
+        "maxTokenCount",
+        "max_tokens_to_sample",
+        "max_new_tokens",
+        "max_gen_len",
+        "num_predict",
+        "max_length",
+    }
+)
+_OUTPUT_ENVELOPES = {
+    "generationConfig": "maxOutputTokens",
+    "generation_config": "max_output_tokens",
+    "inferenceConfig": "maxTokens",
+    "inference_config": "max_tokens",
+    "textGenerationConfig": "maxTokenCount",
+    "config": "max_output_tokens",
+    "parameters": "maxOutputTokens",
+    "options": "num_predict",
+}
+
 
 def injection_points(spec: ModelSpec) -> list[dict[str, Any]] | None:
     """
@@ -195,6 +223,24 @@ def _thinking(settings: ModelSettings) -> bool:
     return enabled(settings.extra_args or {}) or (isinstance(body, Mapping) and enabled(body))
 
 
+def _output_limits(
+    value: Mapping[str, Any], cap: int | None, *, native_key: str | None = None
+) -> dict[str, Any]:
+    """Remove caller aliases and retain the cap in replacing provider envelopes."""
+    result: dict[str, Any] = {}
+    for key, option in value.items():
+        if key in _OUTPUT_LIMIT_ALIASES:
+            continue
+        if isinstance(option, Mapping) and key in (*_THINKING_CONTAINERS, *_OUTPUT_ENVELOPES):
+            option = _output_limits(option, cap, native_key=_OUTPUT_ENVELOPES.get(key))
+        result[key] = option
+    # A native generation object can replace the generated object wholesale.
+    # Keep its authoritative limit even when the caller supplied only temperature.
+    if native_key is not None and cap is not None:
+        result[native_key] = cap
+    return result
+
+
 def merge_model_settings(
     caller: ModelSettings,
     per_call: ModelSettings,
@@ -226,6 +272,8 @@ def merge_model_settings(
     The metered adapter must use this as its final merge before delegation.
     The SDK forwards extra_args metadata after its metadata field, so the
     escape-hatch metadata and LiteLLM preset keys are removed explicitly.
+    Output-limit aliases are removed from escape hatches; replacing native
+    generation envelopes receive the authoritative per-call output limit.
 
     Examples
     --------
@@ -261,5 +309,8 @@ def merge_model_settings(
             extra[key] = value
     if merged.temperature is not None:
         extra["drop_params"] = True
+    extra = _output_limits(extra, per_call.max_tokens)
+    if isinstance(body, Mapping):
+        body = _output_limits(body, per_call.max_tokens)
     metadata = {**(caller.metadata or {}), **(per_call.metadata or {})}
     return replace(merged, metadata=metadata or None, extra_args=extra or None, extra_body=body)

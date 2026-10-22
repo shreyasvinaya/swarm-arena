@@ -1,10 +1,12 @@
 """Per-call settings and authoritative adapter merges."""
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
 import anyio
+import httpx2 as httpx
 import litellm
 import pytest
 from _fakes.llm_run import open_llm_run
@@ -12,6 +14,7 @@ from agents import ModelSettings, ModelTracing
 from agents.extensions.models.litellm_model import LitellmModel
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
+from openai import AsyncOpenAI
 from openai.types.shared import Reasoning
 
 from swarm_arena._budget.llm_scope import LLMScope
@@ -355,3 +358,114 @@ async def test_gemini_native_thinking_bypasses_response_cache(
         with anyio.fail_after(10):
             await GLOBAL_LOGGING_WORKER.flush()
         backend.disk_cache.close()
+
+
+OUTPUT_LIMIT_ALIASES = (
+    "max_tokens",
+    "max_completion_tokens",
+    "maxCompletionTokens",
+    "max_response_output_tokens",
+    "max_output_tokens",
+    "maxOutputTokens",
+    "maxTokens",
+    "maxTokenCount",
+    "max_tokens_to_sample",
+    "max_new_tokens",
+    "max_gen_len",
+    "num_predict",
+    "max_length",
+)
+
+
+@pytest.mark.parametrize("alias", OUTPUT_LIMIT_ALIASES)
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested_body"])
+@pytest.mark.usefixtures("isolated_settings_upstream")
+async def test_output_alias_cannot_exceed_catalog_cap(
+    tmp_path: Path, alias: str, channel: str
+) -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http_client,
+        AsyncOpenAI(api_key="offline-test", http_client=http_client) as client,
+    ):
+        if channel == "extra_args":
+            caller = ModelSettings(extra_args={alias: 12000, "client": client})
+        elif channel == "extra_body":
+            caller = ModelSettings(extra_args={"client": client}, extra_body={alias: 12000})
+        else:
+            caller = ModelSettings(extra_args={"client": client, "extra_body": {alias: 12000}})
+        async with open_llm_run(tmp_path) as run:
+            ours = settings(run.scope("manager"))
+            merged = merge_model_settings(caller, ours)
+            await _invoke_model("openai/gpt-5", merged)
+    assert merged.max_tokens == 8000
+    assert captured[0]["max_completion_tokens"] <= 8000
+    assert all(captured[0].get(key, 0) <= 8000 for key in OUTPUT_LIMIT_ALIASES)
+
+
+@pytest.mark.parametrize("envelope", ["generationConfig", "generation_config"])
+@pytest.mark.parametrize("with_alias", [True, False])
+async def test_native_generation_config_cannot_override_catalog_cap(
+    tmp_path: Path, envelope: str, with_alias: bool
+) -> None:
+    from litellm.llms.vertex_ai.gemini.transformation import transform_request_body
+    from litellm.utils import get_optional_params
+
+    payload = {envelope: {"temperature": 0.5, **({"maxOutputTokens": 12000} if with_alias else {})}}
+    caller = ModelSettings(extra_body=payload)
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager")))
+    optional = get_optional_params(
+        model="gemini-2.5-flash",
+        custom_llm_provider="gemini",
+        max_tokens=merged.max_tokens,
+        extra_body=merged.extra_body,
+    )
+    body = transform_request_body(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gemini-2.5-flash",
+        optional_params=optional,
+        custom_llm_provider="gemini",
+        litellm_params={},
+        cached_content=None,
+    )
+    serialized = json.loads(json.dumps(body))
+    for key in ("generationConfig", "generation_config"):
+        if key in serialized:
+            config = serialized[key]
+            assert all(config.get(alias, 0) <= 8000 for alias in OUTPUT_LIMIT_ALIASES)
+            assert any(config.get(key) == 8000 for key in OUTPUT_LIMIT_ALIASES)
+    if with_alias:
+        assert payload[envelope]["maxOutputTokens"] == 12000
+
+
+def test_output_alias_inventory_and_input_schema_are_preserved() -> None:
+    from swarm_arena.llm._settings import _OUTPUT_LIMIT_ALIASES
+
+    assert set(OUTPUT_LIMIT_ALIASES) == _OUTPUT_LIMIT_ALIASES
+    schema = {"type": "object", "properties": {"max_tokens": {"type": "integer"}}}
+    caller = ModelSettings(extra_body={"tools": [{"parameters": schema}]})
+    assert (
+        merge_model_settings(caller, ModelSettings(max_tokens=100)).extra_body == caller.extra_body
+    )
