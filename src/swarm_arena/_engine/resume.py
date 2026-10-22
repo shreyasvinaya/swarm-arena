@@ -4,7 +4,7 @@ import asyncio
 import sys
 import threading
 from collections.abc import Awaitable, Callable
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
@@ -476,6 +476,33 @@ async def _acquire_lease(acquire: Callable[[], Lease], *, settle_timeout_s: floa
         outcome.contain(error, StorageError, "lease acquisition")
 
 
+async def _supervised_acquire(
+    store: Store,
+    epoch: int,
+    stops: StopState,
+    clock: RunClock | None,
+    config: RunConfig,
+    acquire: Callable[[], Lease],
+    *,
+    stopped: str,
+) -> Lease:
+    """Deliver acquisition under the owner's supervisor or release undelivered ownership."""
+    lease: Lease | None = None
+    try:
+        async with run_module._supervise_initialization(store, epoch, stops, clock, config):
+            lease = await _acquire_lease(acquire, settle_timeout_s=config.settle_timeout_s)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, stopped)
+        return lease
+    except BaseException:
+        if lease is not None:
+            with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                with suppress(BaseException):
+                    await _storage_io(lease.release)
+        raise
+
+
 _T = TypeVar("_T")
 
 
@@ -497,6 +524,7 @@ async def _take_over(
     stops: StopState | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
+    stops = StopState() if stops is None else stops
     while True:
         owner = await _lease_io(read_owner, store)
         if owner is None:
@@ -510,44 +538,24 @@ async def _take_over(
             await _validated_io(validate, doc)
         if before_acquire is not None:
             await before_acquire()
-        lease: Lease | None = None
-        supervisor = (
-            run_module._supervise_initialization(
-                store, doc.epoch + 1, stops, clock() if clock is not None else None, config
-            )
-            if stops is not None
-            else nullcontext()
-        )
         try:
-            try:
-                async with supervisor:
-                    lease = await _acquire_lease(
-                        partial(
-                            Lease.take_over,
-                            store,
-                            owner_id=uuid4().hex,
-                            host=host_id(),
-                            ttl_s=config.lease_ttl_s,
-                            force=force,
-                            expect_epoch=doc.epoch,
-                        ),
-                        settle_timeout_s=config.settle_timeout_s,
-                    )
-                    await anyio.lowlevel.checkpoint_if_cancelled()
-                if lease is None or (
-                    stops is not None and (stops.stop or stops.stop_now or stops.run_timeout)
-                ):
-                    raise _core_error(
-                        RuntimeError,
-                        "review import stopped" if review else "resume initialization stopped",
-                    )
-                return lease
-            except BaseException:
-                if lease is not None:
-                    with anyio.move_on_after(config.settle_timeout_s, shield=True):
-                        with suppress(BaseException):
-                            await _storage_io(lease.release)
-                raise
+            return await _supervised_acquire(
+                store,
+                doc.epoch + 1,
+                stops,
+                clock() if clock is not None else None,
+                config,
+                partial(
+                    Lease.take_over,
+                    store,
+                    owner_id=uuid4().hex,
+                    host=host_id(),
+                    ttl_s=config.lease_ttl_s,
+                    force=force,
+                    expect_epoch=doc.epoch,
+                ),
+                stopped="review import stopped" if review else "resume initialization stopped",
+            )
         except Fenced:
             current = await _lease_io(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:

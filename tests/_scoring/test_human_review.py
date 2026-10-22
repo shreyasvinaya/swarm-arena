@@ -1445,51 +1445,24 @@ async def test_import_stop_during_takeover_response(
     now: bool,
 ) -> None:
     import asyncio
-    import threading
-    from functools import partial
 
     import anyio
-    from _fakes.llm_run import HeldOperation
+    from _fakes.lease_acquisition import HeldOwnerResponse
 
-    from swarm_arena._engine import run as run_module
     from swarm_arena._engine.control import request_stop
-    from swarm_arena._model.canonical import utc_now
-    from swarm_arena._store.local import LocalStore
 
-    held, released = HeldOperation(), threading.Event()
-    replace, release = LocalStore.replace, Lease.release
-
-    def hold_takeover(store: LocalStore, key: str, data: bytes, **kwargs: Any) -> str:
-        result = replace(store, key, data, **kwargs)
-        if key == "control/owner.json" and not held.entered.is_set():
-            held.wait()
-        return result
-
-    def release_owner(lease: Lease) -> None:
-        release(lease)
-        released.set()
-
-    monkeypatch.setattr(LocalStore, "replace", hold_takeover)
-    monkeypatch.setattr(Lease, "release", release_owner)
-    monkeypatch.setattr(
-        run_module, "watch_stop_files", partial(run_module.watch_stop_files, interval_s=0.01)
-    )
+    held = HeldOwnerResponse()
+    held.install(monkeypatch, takeover=True)
     task = asyncio.create_task(
         HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
     )
     try:
         await held.ready()
         assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
-        with anyio.fail_after(3), pytest.raises(RuntimeError, match="^review import stopped$"):
+        with anyio.fail_after(3), pytest.raises(RuntimeError, match=r"^review import stopped$"):
             await asyncio.shield(task)
     finally:
-        if not task.done():
-            task.cancel()
-        await held.finish()
-        await asyncio.gather(task, return_exceptions=True)
-    assert await anyio.to_thread.run_sync(released.wait, 5)
-    owner = read_owner(review_run.store)
-    assert owner is not None
-    assert owner[0].expires_at <= utc_now()
+        await held.finish(task)
+    await held.assert_released()
     assert not _reviews(run_config)
     assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))

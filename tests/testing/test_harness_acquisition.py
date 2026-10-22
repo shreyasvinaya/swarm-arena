@@ -1,18 +1,15 @@
-"""Public owners supervise storage responses before lease acquisition returns."""
+"""Offline conformance owns acquisition interruption and late release."""
 
 import asyncio
-from threading import Event
 from typing import Any
 
 import anyio
 import pytest
-from _fakes.llm_run import HeldOperation
+from _fakes.lease_acquisition import HeldOwnerResponse
 from _fakes.tools import GOAL, NoopManager
 
 from swarm_arena import FunctionTool, Limits, ProgramJudge, RunConfig
 from swarm_arena._engine import run as run_module
-from swarm_arena._journal.lease import Lease, read_owner
-from swarm_arena._model.canonical import utc_now
 from swarm_arena._store.local import LocalStore
 from swarm_arena.testing import check_judge, check_manager, make_candidate
 from swarm_arena.tool import ToolOutput
@@ -23,22 +20,10 @@ from swarm_arena.tool import ToolOutput
 async def test_conformance_acquisition_supervision(
     monkeypatch: pytest.MonkeyPatch, component: str, stop: str
 ) -> None:
-    held, released = HeldOperation(), Event()
-    create, release = LocalStore.create, Lease.release
-    stores: list[LocalStore] = []
+    held = HeldOwnerResponse()
+    held.install(monkeypatch)
     setups: list[bool] = []
     calls: list[bool] = []
-
-    def hold_owner(store: LocalStore, key: str, data: bytes) -> Any:
-        result = create(store, key, data)
-        if key == "control/owner.json":
-            stores.append(store)
-            held.wait()
-        return result
-
-    def release_owner(lease: Lease) -> None:
-        release(lease)
-        released.set()
 
     async def manager_call(self: NoopManager, ctx: Any) -> Any:
         calls.append(True)
@@ -48,8 +33,6 @@ async def test_conformance_acquisition_supervision(
         calls.append(True)
         raise AssertionError("judge must not run")
 
-    monkeypatch.setattr(LocalStore, "create", hold_owner)
-    monkeypatch.setattr(Lease, "release", release_owner)
     monkeypatch.setattr(NoopManager, "run_round", manager_call)
     monkeypatch.setattr(ProgramJudge, "judge", judge_call)
     monkeypatch.setattr(run_module, "_run_setups", [lambda config: setups.append(True)])
@@ -78,7 +61,7 @@ async def test_conformance_acquisition_supervision(
     try:
         await held.ready()
         if stop == "stop":
-            create(stores[0], "control/stop-e1", b"")
+            LocalStore.create(held.stores[0], "control/stop-e1", b"")
         elif stop == "cancel":
             task.cancel()
         with (
@@ -91,13 +74,6 @@ async def test_conformance_acquisition_supervision(
             await asyncio.shield(task)
         assert setups == calls == []
     finally:
-        if not task.done():
-            task.cancel()
-        # Even a broken non-abandonable acquisition must be released before joining.
-        await held.finish()
-        await asyncio.gather(task, return_exceptions=True)
-    assert await anyio.to_thread.run_sync(released.wait, 5)
-    owner = read_owner(stores[0])
-    assert owner is not None
-    assert owner[0].expires_at <= utc_now()
+        await held.finish(task)
+    await held.assert_released()
     assert setups == calls == []

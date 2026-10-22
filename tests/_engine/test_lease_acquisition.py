@@ -1,22 +1,19 @@
-"""Public owners supervise storage responses before lease acquisition returns."""
+"""Run and resume supervise committed owner responses before setup."""
 
 import asyncio
 from pathlib import Path
-from threading import Event
-from typing import Any
 
 import anyio
 import pytest
 from _fakes.finished import FinishedRun
-from _fakes.llm_run import HeldOperation
+from _fakes.lease_acquisition import HeldOwnerResponse
 from _fakes.run import plan
 
 from swarm_arena import RunConfig, Swarm
 from swarm_arena._engine import run as run_module
-from swarm_arena._journal.lease import Lease, read_owner
+from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
-from swarm_arena._model.canonical import utc_now
 from swarm_arena._store.local import LocalStore
 
 
@@ -29,35 +26,9 @@ async def test_engine_acquisition_supervision(
     component: str,
     stop: str,
 ) -> None:
-    held, released = HeldOperation(), Event()
-    create, replace, release = LocalStore.create, LocalStore.replace, Lease.release
-    stores: list[LocalStore] = []
+    held = HeldOwnerResponse()
+    held.install(monkeypatch, takeover=component == "resume")
     setups: list[bool] = []
-
-    def hold_owner(store: LocalStore, key: str, data: bytes) -> Any:
-        result = create(store, key, data)
-        if key == "control/owner.json":
-            stores.append(store)
-            held.wait()
-        return result
-
-    def hold_takeover(store: LocalStore, key: str, data: bytes, **kwargs: Any) -> Any:
-        result = replace(store, key, data, **kwargs)
-        if key == "control/owner.json":
-            stores.append(store)
-            held.wait()
-        return result
-
-    def release_owner(lease: Lease) -> None:
-        release(lease)
-        released.set()
-
-    monkeypatch.setattr(
-        LocalStore,
-        "create" if component == "run" else "replace",
-        hold_owner if component == "run" else hold_takeover,
-    )
-    monkeypatch.setattr(Lease, "release", release_owner)
     monkeypatch.setattr(run_module, "_run_setups", [lambda config: setups.append(True)])
     config = run_config if component == "run" else finished_run.config
     elapsed = 0.0
@@ -81,7 +52,9 @@ async def test_engine_acquisition_supervision(
     try:
         await held.ready()
         if stop == "stop":
-            create(stores[0], "control/stop-e1" if component == "run" else "control/stop-e2", b"")
+            LocalStore.create(
+                held.stores[0], "control/stop-e1" if component == "run" else "control/stop-e2", b""
+            )
         elif stop == "cancel":
             task.cancel()
         with (
@@ -94,12 +67,10 @@ async def test_engine_acquisition_supervision(
             await asyncio.shield(task)
         assert setups == []
     finally:
-        if not task.done():
-            task.cancel()
-        await held.finish()
-        await asyncio.gather(task, return_exceptions=True)
-    assert await anyio.to_thread.run_sync(released.wait, 5)
-    owner = read_owner(stores[0])
-    assert owner is not None
-    assert owner[0].expires_at <= utc_now()
+        await held.finish(task)
+    await held.assert_released()
+    if component == "run":
+        owner = read_owner(held.stores[0])
+        assert owner is not None
+        assert owner[0].head is None
     assert setups == []
