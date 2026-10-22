@@ -2559,6 +2559,16 @@ M3 implemented recording contract (supersedes the earlier sketch where different
   and `settle_timeout_s: float = 60`. Engine/session owners supply their live
   services through `_bound_run(..., config, stops, clock, state)`; low-level
   callers own equivalent cleanup. Binding validates indexes before installation.
+  The active binding includes the writer's owner epoch and identity. A strictly
+  newer epoch replaces its stale predecessor and abandons the predecessor's
+  pending callback work; equal/older epochs cannot replace it. Owner cleanup uses
+  `unbind_run(run_id, journal=journal)` so stale cleanup cannot remove a successor.
+  Callback call/reservation IDs carry their dispatch epoch. Detached unkeyed
+  callbacks after takeover must supply `metadata["owner_epoch"]` as a decimal
+  string (for example, `str(scope.journal.epoch)` captured at dispatch), or run in
+  the matching live `LLMScope`. A run ID alone cannot attribute an unkeyed report
+  after takeover and is ignored. Reports with stale epoch or scope identity are
+  ignored before payload uploads, journal append or settlement.
 - `record_call` additionally accepts `cache_identity: str | None = None`: an
   adapter-proven SHA-256 over namespace, effective cache key and generating
   response identity. It is journaled independently of request payload storage.

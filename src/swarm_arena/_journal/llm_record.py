@@ -30,7 +30,7 @@ from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model, _plain
-from swarm_arena._model.ids import IdGen
+from swarm_arena._model.ids import IdGen, run_tag
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.results import LLMCall
 from swarm_arena._model.run_config import RunConfig
@@ -114,6 +114,8 @@ class _Binding:
 
     def check(self) -> None:
         """Preserve the writer's actual terminal cause, including cleanup expiry."""
+        if not self.active:
+            raise _core_error(Fenced, "run ownership lost")
         self.journal._raise_if_fenced()
         if self.terminal is not None:
             raise self.terminal from None
@@ -149,7 +151,7 @@ def bind_run(
     Parameters
     ----------
     run_id : str
-        Owned run identifier. An active binding cannot be replaced.
+        Owned run identifier. A strictly newer writer epoch replaces its predecessor.
     journal : JournalWriter
         Entered writer on the current asyncio loop.
     ids : IdGen
@@ -184,14 +186,15 @@ def bind_run(
     --------
     >>> from unittest.mock import Mock
     >>> async def example() -> None:
-    ...     bind_run("demo", journal=Mock(spec=JournalWriter), ids=IdGen("demo", 1),
+    ...     bind_run("demo", journal=Mock(spec=JournalWriter, epoch=1), ids=IdGen("demo", 1),
     ...              artifacts=Mock(spec=ArtifactStore), tracing=TracingConfig(),
     ...              committed=[], request_sha256={})
     ...     unbind_run("demo")
     >>> anyio.run(example)
     """
     run_id = _context_string(run_id, "run_id")
-    if run_id in _bindings:
+    previous = _bindings.get(run_id)
+    if previous is not None and journal.epoch <= previous.journal.epoch:
         raise _core_error(ValueError, f"run {run_id} is already bound")
     if not math.isfinite(settle_timeout_s) or settle_timeout_s <= 0:
         raise _core_error(ValueError, "invalid settle_timeout_s")
@@ -220,28 +223,51 @@ def bind_run(
         identity = _digest(identities.get(call.id))
         if identity is not None and call.status == "ok" and not call.cache_hit:
             binding.original(identity, call.id)
+    if previous is not None:
+        _invalidate(previous)
     _bindings[run_id] = binding
 
 
-def unbind_run(run_id: str) -> None:
+def _invalidate(binding: _Binding) -> None:
+    """Retire adoption immediately and wake abandoned work on its owning loop."""
+    binding.active = False
+
+    def abandon() -> None:
+        for worker in tuple(binding.workers):
+            worker.cancel()
+        for entry in binding.pending.values():
+            entry.event.set()
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is binding.loop:
+        abandon()
+    elif not binding.loop.is_closed():
+        binding.loop.call_soon_threadsafe(abandon)
+
+
+def unbind_run(run_id: str, *, journal: JournalWriter | None = None) -> None:
     """Invalidate the binding and abandon callbacks before services close.
 
     Parameters
     ----------
     run_id : str
         Run to forget. Repeated calls are harmless.
+    journal : JournalWriter or None, optional
+        Owner identity. A stale owner cannot remove a successor. Omit only to
+        explicitly remove whichever binding is current.
 
     Examples
     --------
     >>> unbind_run("not-bound")
     """
-    binding = _bindings.pop(_context_string(run_id, "run_id"), None)
-    if binding is not None:
-        binding.active = False
-        for worker in tuple(binding.workers):
-            worker.cancel()
-        for entry in binding.pending.values():
-            entry.event.set()
+    run_id = _context_string(run_id, "run_id")
+    binding = _bindings.get(run_id)
+    if binding is not None and (journal is None or journal is binding.journal):
+        del _bindings[run_id]
+        _invalidate(binding)
 
 
 def open_call(
@@ -459,6 +485,7 @@ def _metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
     """Normalize only documented identifier fields in a preparation worker."""
     fields = (
         "run_id",
+        "owner_epoch",
         "reservation_id",
         "call_id",
         "goal_id",
@@ -679,6 +706,41 @@ async def _settle(binding: _Binding, entry: _Pending) -> None:
             raise
 
 
+def _owns_callback(binding: _Binding, meta: dict[str, str]) -> bool:
+    """Require owner provenance before routing a late report into a successor."""
+    if not binding.active:
+        return False
+    scope = current_llm_scope()
+    if (
+        scope is not None
+        and scope.run_id == meta.get("run_id")
+        and scope.journal is not binding.journal
+    ):
+        return False
+    epoch = str(binding.journal.epoch)
+    identified = False
+    if "owner_epoch" in meta:
+        if meta["owner_epoch"] != epoch:
+            return False
+        identified = True
+    tag = run_tag(meta.get("run_id", ""))
+    for key, prefix in (("call_id", "llm"), ("reservation_id", "r")):
+        value = meta.get(key)
+        if value:
+            match = re.fullmatch(rf"{prefix}-{tag}-e([0-9]+)-[0-9]+", value)
+            if match is not None:
+                if match[1] != epoch:
+                    return False
+                identified = True
+    # Initial owners retain legacy unkeyed reporting. After takeover, a detached
+    # unkeyed row must carry owner_epoch; run_id alone cannot identify its owner.
+    return (
+        identified
+        or binding.journal.epoch == 1
+        or (scope is not None and scope.journal is binding.journal)
+    )
+
+
 async def record_call(
     *,
     metadata: Mapping[str, Any],
@@ -704,6 +766,8 @@ async def record_call(
     ----------
     metadata : Mapping[str, Any]
         String tracking fields, including run_id, reservation_id and call_id.
+        Detached unkeyed reports after takeover must include owner_epoch (a
+        decimal string); epoch-bearing call/reservation IDs already identify it.
     model, provider : str
         Actual model and provider identifiers.
     usage : Usage
@@ -759,6 +823,8 @@ async def record_call(
         if meta.get("call_id") or meta.get("reservation_id") or litellm_call_id is not None:
             return None
         raise _core_error(ValueError, f"run {run_id} is not bound")
+    if not _owns_callback(binding, meta):
+        return None
     kwargs = dict(
         model=model,
         provider=provider,
@@ -785,6 +851,8 @@ async def record_call(
 async def _record(
     binding: _Binding, meta: dict[str, str], kwargs: dict[str, Any]
 ) -> LLMCall | None:
+    if not _owns_callback(binding, meta):
+        return None
     entry = binding.pending.get(meta.get("reservation_id", ""))
     cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
     reservation = binding.call_reservations.get(cid)
@@ -949,7 +1017,7 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     []
     """
     binding = _bindings.get(_context_string(scope.run_id, "run_id"))
-    if binding is None:
+    if binding is None or scope.journal is not binding.journal:
         return []
     entries = [entry for entry in binding.pending.values() if entry.scope is scope]
     binding.track_scope(scope)
@@ -1078,6 +1146,6 @@ async def _bound_run(
             failure = failure or error
         finally:
             if _bindings.get(run_id) is binding:
-                unbind_run(run_id)
+                unbind_run(run_id, journal=journal)
         if failure is not None and not failed:
             raise failure from None

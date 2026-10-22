@@ -1220,3 +1220,132 @@ async def test_bind_failure_leaves_no_partial_registry_entry(tmp_path: Path) -> 
                 request_sha256={},
             )
         assert "partial" not in _bindings
+
+
+@pytest.mark.parametrize(
+    ("tracking", "timing"),
+    [(kind, "late") for kind in ("both", "call", "reservation", "epoch", "unkeyed")]
+    + [("both", "metadata"), ("both", "model")],
+)
+async def test_takeover_rejects_stale_callback_and_cleanup(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, tracking: str, timing: str
+) -> None:
+    from _fakes.run import plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine.resume import resume_run
+    from swarm_arena._engine.round import EngineDeps
+    from swarm_arena._store.local import LocalStore
+
+    def as_run(deps: EngineDeps) -> LLMRun:
+        assert isinstance(deps.store, LocalStore)
+        return LLMRun(
+            deps.run_id,
+            deps.config,
+            deps.store,
+            deps.journal,
+            deps.artifacts,
+            deps.ledger,
+            deps.ids,
+            deps.stops,
+            deps.clock,
+        )
+
+    run_config = run_config.model_copy(update={"settle_timeout_s": 2})
+    await Swarm(run_config).run(plan(rounds=1), run_id="takeover")
+    old = await resume_run(run_config, "takeover", force=True, replanner=None)
+    new = None
+    task: asyncio.Task[LLMCall | None] | None = None
+    held = HeldOperation()
+
+    class SlowMetadata(dict[str, str]):
+        def get(self, key: object, default: Any = None) -> Any:
+            if key == "run_id":
+                held.wait()
+            return super().get(key, default)
+
+    class SlowUsage(Usage):
+        def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            held.wait()
+            return super().model_dump(*args, **kwargs)
+
+    try:
+        assert old.resumed is not None
+        old_deps = old.resumed._services.deps
+        assert old_deps is not None
+        old_run = as_run(old_deps)
+        old_scope, meta = await _open(old_run)
+        if tracking != "both":
+            if tracking != "call":
+                meta.pop("call_id")
+            if tracking != "reservation":
+                meta.pop("reservation_id")
+            if tracking == "epoch":
+                meta["owner_epoch"] = str(old_run.journal.epoch)
+        if timing != "late":
+            kwargs = record_kwargs(
+                SlowMetadata(meta) if timing == "metadata" else meta,
+                usage=SlowUsage() if timing == "model" else Usage(),
+            )
+            task = asyncio.create_task(record_call(**kwargs))
+            await held.ready()
+        new = await resume_run(run_config, "takeover", force=True, replanner=None)
+        assert new.resumed is not None
+        new_deps = new.resumed._services.deps
+        assert new_deps is not None
+        new_run = as_run(new_deps)
+        before = new_run.store.list("")
+
+        def forbidden(_: bytes) -> str:
+            pytest.fail("stale callback uploaded a payload")
+
+        with monkeypatch.context() as no_upload:
+            no_upload.setattr(new_run.artifacts, "put_bytes", forbidden)
+            no_upload.setattr(old_run.artifacts, "put_bytes", forbidden)
+            if task is not None:
+                await held.finish()
+                with anyio.fail_after(5):
+                    result = (await asyncio.gather(task, return_exceptions=True))[0]
+                assert result is None or isinstance(result, Fenced)
+            assert await record_call(**record_kwargs(meta, settle=False)) is None
+            with llm_scope(old_scope):
+                assert await record_call(**record_kwargs(meta, settle=False)) is None
+        assert pending_scope(meta) is None
+        assert await drain(old_scope, wait=False) == []
+        await old.resumed._services._aclose(failed=True)
+        assert new_run.store.list("") == before
+        assert new_run.calls() == []
+        # An older/equal owner cannot evict the successor, including on unbind.
+        with pytest.raises(ValueError, match="already bound"):
+            bind_run(
+                old_run.run_id,
+                journal=old_run.journal,
+                ids=old_run.ids,
+                artifacts=old_run.artifacts,
+                tracing=old_run.config.tracing,
+                committed=[],
+                request_sha256={},
+            )
+        unbind_run(old_run.run_id, journal=old_run.journal)
+        _, current = await _open(new_run)
+        call = await record_call(**record_kwargs(current))
+        assert call is not None
+        assert [item.id for item in new_run.calls()] == [call.id]
+        # Detached unkeyed rows can identify the current owner explicitly.
+        unkeyed = {
+            "run_id": new_run.run_id,
+            "owner_epoch": str(new_run.journal.epoch),
+            "goal_id": "g",
+            "role": "manager",
+        }
+        assert await record_call(**record_kwargs(unkeyed, settle=False)) is not None
+    finally:
+        held.release.set()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await held.finish()
+        assert old.resumed is not None
+        await old.resumed._services._aclose(failed=True)
+        if new is not None:
+            await new.aclose()
