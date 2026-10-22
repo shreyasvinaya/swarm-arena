@@ -210,6 +210,7 @@ class _ResumeServices:
                 journal.clock = clock
                 # The journal owns release even if supervision entry is cancelled.
                 async with run_module._supervise_writer(journal):
+                    board_failed = False
                     try:
                         # A successful force CAS must be auditable even if replay now refuses.
                         await journal.append_durable(
@@ -386,12 +387,15 @@ class _ResumeServices:
                                 await self.close.wait()
                         if self.resumed is None:
                             raise _core_error(RuntimeError, "resume initialization stopped")
+                    except BaseException:
+                        board_failed = True
+                        raise
                     finally:
                         if board is not None:
                             await run_module._close_board(
                                 board,
                                 config,
-                                failed=sys.exc_info()[0] is not None or self.run_failed,
+                                failed=board_failed or self.run_failed,
                             )
             if self.resumed is None:
                 raise _core_error(RuntimeError, "resume initialization stopped")

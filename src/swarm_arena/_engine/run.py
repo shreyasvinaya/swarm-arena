@@ -726,6 +726,7 @@ class RunRunner:
                                 )
                             await _setup_run(self.plans, config)
                             board = await _start_board(config)
+                            board_failed = False
                             try:
                                 await _open_board(
                                     board,
@@ -764,10 +765,11 @@ class RunRunner:
                                 )
                                 prepared()
                                 return await self._drive(deps, lease.doc.epoch)
+                            except BaseException:
+                                board_failed = True
+                                raise
                             finally:
-                                await _close_board(
-                                    board, config, failed=sys.exc_info()[0] is not None
-                                )
+                                await _close_board(board, config, failed=board_failed)
                     return await _finish_initialization_stop(store, journal, stops, config)
         finally:
             if not entered:
@@ -1240,6 +1242,7 @@ async def planning_session(
                             settle_timeout_s=config.settle_timeout_s,
                         )
                         failed = True
+                        failure: BaseException | None = None
                         try:
                             await journal.commit()
                             await _storage_io(_create, store, "run.toml", config.dumps().encode())
@@ -1249,19 +1252,28 @@ async def planning_session(
                                 yield scope
                             await anyio.lowlevel.checkpoint_if_cancelled()
                             failed = False
+                        except BaseException as error:
+                            failure = error
+                            raise
                         finally:
                             try:
                                 if not failed:
                                     await drain(scope, wait=True)
+                            except BaseException as error:
+                                failure = error
+                                raise
                             finally:
                                 with _stop_cleanup(config):
                                     await drain(scope, wait=False)
                                     outcome = await tranche.close()
-                                    reason = "planner failed" if failed else "planning complete"
-                                    error = sys.exc_info()[1]
-                                    if error is not None:
+                                    reason = (
+                                        "planner failed"
+                                        if failure is not None
+                                        else "planning complete"
+                                    )
+                                    if failure is not None:
                                         try:
-                                            classified = boundary.classify(error)
+                                            classified = boundary.classify(failure)
                                         except anyio.get_cancelled_exc_class():
                                             reason = "stopped"
                                         else:
