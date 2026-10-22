@@ -124,6 +124,10 @@ model calls. Already admitted calls finish and settle before the limit propagate
 Each LLM judge invocation drains its own child scope, so multiple LLM judges
 can compose sequentially or recursively while their owner retains all call links.
 
+A missing or out-of-scale anchor row in a later batch adds an `invalid` drift
+note and retains the first score and the later batch's call links. An invalid
+first appearance is not replaced by a later score.
+
 The rubric identity includes the rubric, scale, aggregation and single-model
 alias. A panel identity hashes its sorted aliases, retaining repeats; a reduced
 panel records its surviving aliases, including a single survivor. Core stamping

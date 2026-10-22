@@ -788,3 +788,55 @@ async def test_limit_stops_sibling_dispatch_and_preserves_inflight_charge(
         assert [call.model_alias for call in run.calls()] == ["draft"]
         assert run.calls()[0].error is None
         assert run.charged(scope).usd == pytest.approx(sum(call.cost_usd for call in run.calls()))
+
+
+@pytest.mark.parametrize("bad", ["missing", "out_of_scale"])
+@pytest.mark.parametrize("bad_first", [False, True])
+async def test_anchor_keeps_only_its_first_batch_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str, bad_first: bool
+) -> None:
+    fake = FakeModel([])
+
+    async def respond(*args: Any, **kwargs: Any) -> ModelResponse:
+        rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+        ids = [row["candidate"]["id"] for row in rows]
+        invalid = "c1" in ids if bad_first else "c3" in ids
+        payload = []
+        for row in rows:
+            anchor = row["candidate"]["id"] == "c0"
+            if anchor and invalid and bad == "missing":
+                continue
+            value = 11 if anchor and invalid else (9 if anchor else 5)
+            payload.append(
+                {"index": row["index"], "value": value, "verdict": "ok", "notes": "rubric"}
+            )
+        return await FakeModel([FakeTurn(text=json.dumps({"scores": payload}))]).get_response(
+            *args, **kwargs
+        )
+
+    monkeypatch.setattr(fake, "get_response", respond)
+    fake.register("a")
+    goal = Goal(id="g", namespace="n")
+    judge = LLMJudge(LLMJudge.Config(rubric="r", models=["a"], batch_size=3, anchors=1))
+    async with open_llm_run(tmp_path, config=configuration()) as run:
+        scope = run.scope("judge")
+        with llm_scope(scope):
+            scores = await judge.judge(
+                goal,
+                candidates(6),
+                JudgeContext(
+                    goal=goal,
+                    executor=Mock(),
+                    artifact_root=str(tmp_path),
+                    anchors=frozenset({"c0"}),
+                ),
+            )
+        by_id = {score.candidate_id: score for score in scores}
+        assert len(scores) == (5 if bad_first else 6)
+        if bad_first:
+            assert "c0" not in by_id
+        else:
+            assert by_id["c0"].value == 9
+            assert "invalid" in by_id["c0"].notes
+            assert "9.0" in by_id["c0"].notes
+            assert set(by_id["c0"].llm_call_ids) == {call.id for call in run.calls()}

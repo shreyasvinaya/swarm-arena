@@ -381,7 +381,7 @@ class LLMJudge(Judge):
             config.aggregate
         ]
         scores: dict[str, Score] = {}
-        later: dict[str, list[float]] = {candidate.id: [] for candidate in anchors}
+        later: dict[str, list[float | str]] = {candidate.id: [] for candidate in anchors}
         omitted: set[str] = set()
         for b, batch in enumerate(batches):
             for index, candidate in enumerate(batch):
@@ -392,7 +392,13 @@ class LLMJudge(Judge):
                     or not config.scale_min <= row["value"] <= config.scale_max
                     for row in rows
                 ):
-                    omitted.add(candidate.id)
+                    if candidate.id in scores and candidate.id in ctx.anchors:
+                        later[candidate.id].append("invalid")
+                        scores[candidate.id].llm_call_ids.extend(
+                            id for m in range(len(config.models)) for id in calls[m, b]
+                        )
+                    else:
+                        omitted.add(candidate.id)
                     continue
                 valid = [row for row in rows if row is not None]
                 votes = [row["value"] for row in valid]
