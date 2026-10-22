@@ -8,7 +8,7 @@ import anyio
 
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._errors import StorageError, _core_category, _is_core_control, _SignalCategory
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena.llm._hooks import BudgetExceeded
 from swarm_arena.llm._manager import _finish_accounting
 
@@ -117,8 +117,7 @@ async def _invocation(
             raise failure
         except BaseException as error:
             classified = boundary.classify(error)
-            if _core_category(classified) is _SignalCategory.TERMINAL:
-                raise classified from None
+            _raise_terminal(classified)
             if accounting_failure is not None:
                 boundary.contain(accounting_failure, StorageError, accounting_name)
             if _is_core_control(classified):

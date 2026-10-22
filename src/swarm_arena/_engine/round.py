@@ -68,7 +68,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, RoundSpec, TeamSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _has_core_fenced, _Outcome
+from swarm_arena._outcomes import _has_core_fenced, _Outcome, _raise_terminal
 from swarm_arena._planning.catalog_check import find_entry
 from swarm_arena._planning.policy import _INACTIVE
 from swarm_arena._planning.validate import judge_private_paths
@@ -908,8 +908,7 @@ class RoundRunner:
                         needed.update(providers)
                     except BaseException as error:
                         classified = boundary.classify(error)
-                        if _core_category(classified) is _SignalCategory.TERMINAL:
-                            raise classified from None
+                        _raise_terminal(classified)
                         # A connector preparation failure still belongs to its
                         # agent, as when preparation happens after the frontier.
                         self._provider_errors[slot.address] = classified
@@ -989,8 +988,7 @@ class RoundRunner:
                 except BaseException as error:
                     classified = boundary.classify(error)
                     category = _core_category(classified)
-                    if category is _SignalCategory.TERMINAL:
-                        raise classified from None
+                    _raise_terminal(classified)
                     if (
                         category is _SignalCategory.LIMIT
                         and isinstance(classified, LimitReached)

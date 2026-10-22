@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from swarm_arena._budget.amount import _MICROS_PER_USD, USD_LIMIT, _usd_from_micro_units
 from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._engine.run import register_run_setup
-from swarm_arena._errors import _core_category, _exception_type_name, _SignalCategory
+from swarm_arena._errors import _exception_type_name
 from swarm_arena._journal import llm_record as _recorder
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.context_strings import _context_string
@@ -24,7 +24,7 @@ from swarm_arena._model.detach import _plain
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.settings import CachePolicy
 from swarm_arena._model.tooling import Usage
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena.llm._cache import cache_identity, require_cache_extra, response_cache
 from swarm_arena.llm._catalog import _cost_micros, call_cost
 from swarm_arena.llm._langfuse import setup_langfuse
@@ -318,8 +318,7 @@ async def _on_owner(
         # The writer latch preserves cleanup expiry as well as actual fencing.
         # A registered sanitized hook failure alone is not terminal authority.
         binding.check()
-        if _core_category(classified) is _SignalCategory.TERMINAL:
-            raise classified from None
+        _raise_terminal(classified)
         _log.error("LLM callback failed (%s)", _exception_type_name(classified))
 
 

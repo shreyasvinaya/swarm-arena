@@ -10,6 +10,35 @@ from swarm_arena._errors import Fenced, _core_error, _exception_type_name, _is_c
 from swarm_arena._outcomes import _classify_outcome
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider", "diagnostic", "lookalike"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_raise_terminal_uses_only_classified_authority(kind: str, nested: bool) -> None:
+    from swarm_arena._errors import ProviderFailed, _core_signal, _stop_cleanup_error
+    from swarm_arena._outcomes import _raise_terminal
+    from swarm_arena.manager import LimitReached
+
+    error: BaseException = (
+        _stop_cleanup_error()
+        if kind == "terminal"
+        else _core_signal(LimitReached("stop", "the round is stopping"))
+        if kind == "limit"
+        else _core_error(ProviderFailed, "provider")
+        if kind == "provider"
+        else _core_error(RuntimeError, "safe diagnostic")
+        if kind == "diagnostic"
+        else RuntimeError("stop cleanup timed out")
+    )
+    if nested:
+        error = BaseExceptionGroup("transport", [BaseExceptionGroup("inner", [error])])
+    classified = _classify_outcome(error)
+    if kind == "terminal":
+        with pytest.raises(RuntimeError) as caught:
+            _raise_terminal(classified)
+        assert caught.value is classified
+    else:
+        assert _raise_terminal(classified) is None
+
+
 @pytest.mark.parametrize("registered", [False, True])
 @pytest.mark.parametrize("depth", [0, 4])
 @pytest.mark.parametrize("cancelled", [False, True])

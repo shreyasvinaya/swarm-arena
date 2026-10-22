@@ -18,10 +18,8 @@ from swarm_arena._budget.estimate import make_price_of
 from swarm_arena._errors import (
     ConfigError,
     PlanError,
-    _core_category,
     _core_error,
     _exception_type_name,
-    _SignalCategory,
 )
 from swarm_arena._exec.threads import _DaemonCall
 from swarm_arena._model.base import LLMRole, Origin
@@ -36,7 +34,7 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control, _raise_terminal
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
 from swarm_arena._planning.provenance import RefSite, _detach_plan, is_nested_ref, ref_sites, stamp
@@ -433,8 +431,7 @@ def _rule_configs(
             raise
         except BaseException as error:
             error = _classify_outcome(error)
-            if _core_category(error) is _SignalCategory.TERMINAL:
-                raise error from None
+            _raise_terminal(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
             continue
         try:
@@ -1037,8 +1034,7 @@ def _validate_round_refs(plan: Plan) -> None:
             raise
         except BaseException as error:
             error = _classify_outcome(error)
-            if _core_category(error) is _SignalCategory.TERMINAL:
-                raise error from None
+            _raise_terminal(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
     if errors:
         raise _core_error(PlanError, errors) from None
@@ -1173,8 +1169,7 @@ def admit_revision(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents

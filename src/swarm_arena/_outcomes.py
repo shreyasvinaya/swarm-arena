@@ -88,6 +88,12 @@ def _propagate_control(error: BaseException) -> None:
         raise classified from None
 
 
+def _raise_terminal(error: Exception) -> None:
+    """Raise an already-classified TERMINAL, leaving LIMIT/provider handling to its owner."""
+    if _core_category(error) is _SignalCategory.TERMINAL:
+        raise error from None
+
+
 class _Outcome:
     """Snapshot caller cancellation before an asynchronous extension boundary."""
 

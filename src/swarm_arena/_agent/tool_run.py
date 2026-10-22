@@ -20,12 +20,10 @@ from swarm_arena._errors import (
     ConfigError,
     Fenced,
     SoftError,
-    _core_category,
     _core_error,
     _core_signal,
     _exception_type_name,
     _is_core_signal,
-    _SignalCategory,
 )
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
@@ -40,7 +38,13 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
-from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome, _propagate_control
+from swarm_arena._outcomes import (
+    _classify_outcome,
+    _has_core_fenced,
+    _Outcome,
+    _propagate_control,
+    _raise_terminal,
+)
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
@@ -428,8 +432,7 @@ def _request(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         raise _core_signal(
             SoftError(f"invalid tool request: {_exception_type_name(error)}")
         ) from None
@@ -463,8 +466,7 @@ def _stage_settings(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
             raise error from None
         raise _core_signal(
@@ -509,8 +511,7 @@ def _stage(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
             raise error from None
         raise _core_signal(
@@ -730,8 +731,7 @@ async def _run(
         amount, providers = await _prepare_sync(estimate)
     except BaseException as error:
         error = outcome.classify(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         if _is_core_signal(error) and isinstance(error, LimitReached):
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -830,8 +830,7 @@ async def _run(
         inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
-        if _core_category(error) is _SignalCategory.TERMINAL:
-            raise error from None
+        _raise_terminal(error)
         if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -878,8 +877,7 @@ async def _run(
                 estimated = providers and usage.usd is None and usage.total_tokens == 0
         except BaseException as error:
             error = outcome.classify(error)
-            if _core_category(error) is _SignalCategory.TERMINAL:
-                raise error from None
+            _raise_terminal(error)
             warnings.append(f"tool error: {_exception_type_name(error)}")
             output = ToolOutput(status=RunStatus.ERROR)
             actual, estimated = Amount(), started and providers
@@ -921,8 +919,7 @@ async def _run(
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
         except BaseException as error:
             error = outcome.classify(error)
-            if _core_category(error) is _SignalCategory.TERMINAL:
-                raise error from None
+            _raise_terminal(error)
             warnings.append(f"fingerprint error: {_exception_type_name(error)}")
     if rt.journal.fenced.is_set():
         raise _core_error(Fenced, "run ownership lost")
