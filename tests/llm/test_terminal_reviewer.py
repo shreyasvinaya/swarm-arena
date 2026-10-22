@@ -5,6 +5,7 @@ import os
 import pty
 import select
 import signal
+import subprocess
 import sys
 import termios
 import time
@@ -16,6 +17,9 @@ from typing import Any
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import all_events
 
@@ -25,6 +29,32 @@ from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
 
 PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="requires POSIX thread signals")
+def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
+    with subprocess.Popen(
+        [sys.executable, "-m", "_fakes.editor_signal", str(tmp_path)],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=40)
+            assert process.returncode == 0, stdout + stderr
+        finally:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    evidence = json.loads(stdout)
+    assert evidence.pop("pid") > 0
+    assert evidence == {
+        "terminated_before_fallback": True,
+        "interrupted": True,
+        "reaped": True,
+    }
 
 
 @pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "stubborn"])

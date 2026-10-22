@@ -48,6 +48,7 @@ from swarm_arena._errors import (
     _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal import llm_record as _recorder
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head
@@ -646,10 +647,11 @@ class GoalRunner:
             force_no_cache_read=final,
         )
 
-    async def _close(self, tranche: Tranche) -> None:
-        with anyio.move_on_after(self.deps.config.settle_timeout_s):
-            while tranche.pending():  # noqa: ASYNC110 - external call settlement
-                await anyio.sleep(0.05)
+    async def _close(self, tranche: Tranche, *, wait: bool = True) -> None:
+        if wait:
+            with anyio.move_on_after(self.deps.config.settle_timeout_s):
+                while tranche.pending():  # noqa: ASYNC110 - external call settlement
+                    await anyio.sleep(0.05)
         # Charges and overflow are already authoritative in the ledger/journal.
         await tranche.close()
 
@@ -1725,8 +1727,16 @@ class GoalRunner:
                     # Report arrival and durable settlement have separate budgets.
                     with anyio.move_on_after(scope.settle_timeout_s) as report_timer:
                         with _local_timer_scope(report_timer) as report_wait:
-                            while tranche.pending():  # noqa: ASYNC110 - external call settlement
-                                await anyio.sleep(0.05)
+                            binding = _recorder._bindings.get(scope.run_id)
+                            if binding is not None and binding.journal is scope.journal:
+                                entries = [
+                                    entry
+                                    for entry in binding.pending.values()
+                                    if any(owner is scope for owner in entry.scope.lineage())
+                                    and entry.state != "abandoned"
+                                ]
+                                for entry in entries:
+                                    await entry.event.wait()
                     if report_wait.failure is not None:
                         raise report_wait.failure from None
                 except (KeyboardInterrupt, SystemExit):
@@ -1750,11 +1760,10 @@ class GoalRunner:
                         raise local_timer.failure from None
                     if timer.cancel_called:
                         raise _stop_cleanup_error()
-                # Legacy custom calls can reserve without a recorder entry.
-                # Preserve their report allowance; durable close remains under
-                # the writer's owned storage/settlement bounds.
+                # The report allowance is already spent. Direct reservations
+                # have no recorder to wait for and close conservatively now.
                 with anyio.CancelScope(shield=True):
-                    await self._close(tranche)
+                    await self._close(tranche, wait=False)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as cleanup_error:

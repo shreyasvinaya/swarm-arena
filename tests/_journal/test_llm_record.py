@@ -782,7 +782,7 @@ async def test_callback_from_another_event_loop_uses_the_bound_owner(tmp_path: P
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
 
 
-@pytest.mark.parametrize("stop", ["stop_now", "deadline"])
+@pytest.mark.parametrize("stop", ["stop", "stop_now", "deadline"])
 async def test_held_payload_expires_with_owner_and_never_uploads_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str
 ) -> None:
@@ -807,7 +807,7 @@ async def test_held_payload_expires_with_owner_and_never_uploads_response(
                     if stop == "deadline":
                         run.clock._rebase(run.config.limits.run_timeout_s)
                     else:
-                        run.stops.stop_now = True
+                        setattr(run.stops, stop, True)
                     with (
                         anyio.fail_after(2),
                         pytest.raises(RuntimeError, match="stop cleanup timed out"),
@@ -821,6 +821,74 @@ async def test_held_payload_expires_with_owner_and_never_uploads_response(
     finally:
         await held.finish()
     assert len(uploads) == 1
+
+
+@pytest.mark.parametrize("terminal_during_unwind", [False, True])
+async def test_expired_teardown_deadline_is_cleanup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_during_unwind: bool
+) -> None:
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena._journal.llm_record import _bindings
+
+    entered = anyio.Event()
+    run_ids: list[str] = []
+
+    async def held_close(self: Tranche) -> Any:
+        entered.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            # An owner/writer timeout can become visible while teardown is
+            # unwinding its own deadline cancellation.
+            if terminal_during_unwind:
+                _bindings[run_ids[0]].terminal = _stop_cleanup_error()
+
+    async def owner() -> None:
+        async with open_llm_run(tmp_path) as run:
+            run_ids.append(run.run_id)
+            scope, meta = await _open(run)
+            await record_call(**record_kwargs(meta))
+            await drain(scope, wait=False)
+            binding = _bindings[run.run_id]
+            binding.cleanup_at = anyio.current_time() + 0.15
+            monkeypatch.setattr(Tranche, "close", held_close)
+
+    with pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught:
+        await owner()
+    assert entered.is_set()
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert all(run_id not in _bindings for run_id in run_ids)
+
+
+async def test_teardown_deadline_preserves_captured_fencing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import _core_error
+    from swarm_arena._journal import llm_record
+
+    entered = anyio.Event()
+
+    async def held_close(self: Tranche) -> Any:
+        entered.set()
+        await anyio.sleep_forever()
+
+    async def fenced_drain(*args: Any, **kwargs: Any) -> list[str]:
+        raise _core_error(Fenced, "run ownership lost")
+
+    async def owner() -> None:
+        async with open_llm_run(tmp_path) as run:
+            scope, meta = await _open(run)
+            await record_call(**record_kwargs(meta))
+            await drain(scope, wait=False)
+            llm_record._bindings[run.run_id].cleanup_at = anyio.current_time() + 0.15
+            monkeypatch.setattr(llm_record, "drain", fenced_drain)
+            monkeypatch.setattr(Tranche, "close", held_close)
+
+    with pytest.raises(Fenced, match="run ownership lost"):
+        await owner()
+    assert entered.is_set()
 
 
 async def test_cancel_during_durable_settlement_retains_admitted_actual(

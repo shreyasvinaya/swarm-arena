@@ -3,17 +3,17 @@
 import json
 import statistics
 from collections.abc import Sequence
+from contextlib import AsyncExitStack
 from typing import Any, Final, Literal, Self, cast
 
 import anyio
 from pydantic import Field, JsonValue, model_validator
 
 from swarm_arena._board.digest import untrusted
-from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope, llm_scope
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine.stops import report_provider_failure
 from swarm_arena._errors import (
     ProviderFailed,
-    StorageError,
     _core_category,
     _is_core_control,
     _SignalCategory,
@@ -25,8 +25,8 @@ from swarm_arena._model.results import Candidate, Score
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext, _panel_drops, _PanelDrop
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
+from swarm_arena.llm._invocation import _invocation
 from swarm_arena.llm._langfuse import component_span
-from swarm_arena.llm._manager import _finish_accounting
 from swarm_arena.llm._structured import _captured_call_ids, structured_call
 
 JUDGE_SCHEMA: Final[dict[str, Any]] = {
@@ -241,56 +241,39 @@ class LLMJudge(Judge):
         scope = current_llm_scope()
         if scope is None:
             raise RuntimeError("LLM judge outside an LLM scope")
-        scope = scope.child()
-        with component_span(scope):
-            return await self._judge_owned(scope, goal, candidates, ctx)
+        async with AsyncExitStack() as tracing:
+            return await self._judge_owned(scope, goal, candidates, ctx, tracing)
 
     async def _judge_owned(
-        self, scope: LLMScope, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        self,
+        parent: LLMScope,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+        tracing: AsyncExitStack,
     ) -> list[Score]:
-        """Retain the invocation child through trace exit and accounting."""
-        interrupted = False
-        failure: BaseException | None = None
-        accounting_failure: BaseException | None = None
+        """Report provider evidence only after shared invocation accounting."""
         scores: list[Score] = []
         provider_errors: dict[int, Exception] = {}
         survivors: list[str] = []
+        failure: Exception | None = None
         boundary = _Outcome()
         try:
-            with llm_scope(scope):
+            async with _invocation(
+                parent,
+                name="judge",
+                error_type=RuntimeError,
+                accounting_name="LLM judge accounting",
+            ) as scope:
+                tracing.enter_context(component_span(scope))
                 scores = await self._judge(goal, candidates, ctx, provider_errors, survivors)
-        except BaseException as error:
-            failure = error
-            try:
-                boundary.classify(error)
-            except anyio.get_cancelled_exc_class() as cancelled:
-                interrupted = True
-                failure = cancelled
-            except BaseException as control:
-                failure = control
-        finally:
-            try:
-                await _finish_accounting(scope, interrupted=interrupted)
-            except (KeyboardInterrupt, SystemExit):
+        except Exception as error:
+            if _core_category(boundary.classify(error)) not in {
+                _SignalCategory.PROVIDER,
+                _SignalCategory.LIMIT,
+            }:
                 raise
-            except BaseException as cleanup_error:
-                accounting_failure = cleanup_error
-                failure = (
-                    BaseExceptionGroup("judge cleanup", [failure, cleanup_error])
-                    if failure is not None
-                    else cleanup_error
-                )
-        classified: Exception | None = None
-        if failure is not None:
-            classified = boundary.classify(failure)
-            if _core_category(classified) is _SignalCategory.TERMINAL:
-                raise classified from None
-            if accounting_failure is not None:
-                # Provider classification cannot establish successful settlement.
-                boundary.contain(accounting_failure, StorageError, "LLM judge accounting")
-            if _core_category(classified) not in {_SignalCategory.PROVIDER, _SignalCategory.LIMIT}:
-                boundary.contain(classified, RuntimeError, "LLM judge")
-        boundary.propagate_control(RuntimeError())
+            failure = error
         # Accounting must finish before reporting. A sibling LIMIT cannot erase
         # genuine provider evidence, but failed cleanup never advances the latch.
         reported: set[str] = set()
@@ -299,11 +282,8 @@ class LLMJudge(Judge):
             if error.provider not in reported:
                 await report_provider_failure(scope, error, source="judge")
                 reported.add(error.provider)
-        if classified is not None:
-            assert failure is not None
-            if type(failure) is BudgetExceeded or _core_category(failure) is _SignalCategory.LIMIT:
-                raise failure from None
-            raise classified from None
+        if failure is not None:
+            raise failure from None
         # The scoring runner carries these to the engine's atomic score commit.
         # Single-member and total failures have no surviving panel to describe.
         config = cast(LLMJudge.Config, self.config)

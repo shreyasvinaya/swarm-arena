@@ -731,7 +731,7 @@ class RoundRunner:
                 if stops.stop:
                     inflight.close()
                 if (stops.run_budget or self.goal_id in stops.goal_budget) and drain_until is None:
-                    inflight.close()
+                    inflight.close(budget=True)
                     drain_until = now + inflight.max_grace_s()
             if cancel_until is None and (
                 immediate or (drain_until is not None and now >= drain_until)

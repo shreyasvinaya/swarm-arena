@@ -1108,8 +1108,8 @@ async def test_waiting_continued_goal_converges_on_early_end(
 
     closed = anyio.Event()
 
-    def signalling_close(self: Inflight) -> None:
-        real_close(self)
+    def signalling_close(self: Inflight, *, budget: bool = False) -> None:
+        real_close(self, budget=budget)
         closed.set()
 
     monkeypatch.setattr(GoalRunner, "run", counted_goal)

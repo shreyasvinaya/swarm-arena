@@ -376,15 +376,22 @@ def _digest(value: str | None) -> str | None:
 
 async def _watch_owner(binding: _Binding, scope: anyio.CancelScope) -> None:
     """Bound foreign callback tasks by the same stop state and active clock."""
+    cleanup_at = float("inf")
     while True:
         if not binding.active:
             scope.cancel()
             return
         left = binding.clock.left(binding.limits.run_timeout_s)
-        if binding.stops.stop or binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
+        if binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
             binding.begin_cleanup()
-        if not math.isinf(binding.cleanup_at):
-            left = binding.cleanup_at - anyio.current_time()
+        elif binding.stops.stop and math.isinf(cleanup_at):
+            # Graceful judging retains its own limits. Bound this storage wait
+            # without spending later invocations' or teardown's allowance.
+            cleanup_at = anyio.current_time() + binding.settle_timeout_s
+            binding.journal._stop_storage()
+        deadline = min(cleanup_at, binding.cleanup_at)
+        if not math.isinf(deadline):
+            left = deadline - anyio.current_time()
         if left <= 0:
             binding.terminal = _stop_cleanup_error()
             scope.cancel()
@@ -1120,9 +1127,16 @@ async def _bound_run(
         raise
     finally:
         binding.closing = True
-        if _caller_cancelled():
+        if (
+            _caller_cancelled()
+            or binding.stops.stop
+            or binding.stops.stop_now
+            or binding.stops.run_timeout
+            or binding.clock.left(binding.limits.run_timeout_s) <= 0
+        ):
             binding.begin_cleanup()
         failure: BaseException | None = None
+        cleanup: anyio.CancelScope | None = None
         try:
             if binding.active:
                 with anyio.CancelScope(
@@ -1154,11 +1168,17 @@ async def _bound_run(
                         except BaseException as error:
                             failure = failure or error
                     binding.check()
-                if cleanup.cancel_called:
-                    failure = _stop_cleanup_error()
         except BaseException as error:
             failure = failure or error
         finally:
+            # A terminal check can escape before the with-body completes,
+            # after an inner handler captured this deadline's cancellation.
+            if (
+                cleanup is not None
+                and cleanup.cancel_called
+                and (failure is None or not _has_core_fenced(failure))
+            ):
+                failure = _stop_cleanup_error()
             if _bindings.get(run_id) is binding:
                 unbind_run(run_id, journal=journal)
         if failure is not None and not failed:

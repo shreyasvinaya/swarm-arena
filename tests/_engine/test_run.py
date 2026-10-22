@@ -286,6 +286,54 @@ async def test_resume_binding_keeps_the_rebased_acquired_head_clock(
     assert "rebase" not in _bindings
 
 
+async def test_graceful_stop_teardown_expiry_is_cleanup_error(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena._journal.llm_record import _bindings, drain
+
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
+    run_id = "graceful-teardown"
+    entered, exited = anyio.Event(), anyio.Event()
+    run_round = ScriptedManager.run_round
+    close = Tranche.close
+
+    async def stop_after_round(self: ScriptedManager, ctx: AgentContext) -> RoundReport:
+        result = await run_round(self, ctx)
+        scope = current_llm_scope()
+        assert scope is not None
+        await drain(scope, wait=False)
+        _bindings[scope.run_id].stops.stop = True
+        return result
+
+    async def held_close(self: Tranche) -> Any:
+        binding = _bindings.get(run_id)
+        if binding is not None and binding.closing:
+            assert binding.stops.stop
+            assert not binding.stops.stop_now
+            entered.set()
+            try:
+                await anyio.sleep_forever()
+            finally:
+                exited.set()
+        return await close(self)
+
+    monkeypatch.setattr(ScriptedManager, "run_round", stop_after_round)
+    monkeypatch.setattr(Tranche, "close", held_close)
+    with (
+        anyio.fail_after(20),
+        pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught,
+    ):
+        await Swarm(config).run(plan(rounds=1), run_id=run_id)
+    assert entered.is_set()
+    assert exited.is_set()
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert run_id not in _bindings
+    assert events(config, "goal_finished")
+
+
 async def test_run_folder_layout(run_config: RunConfig) -> None:
     with anyio.fail_after(30):
         out = await Swarm(run_config).run(plan())
@@ -1162,6 +1210,8 @@ async def test_driving_timeout_is_not_a_stop_command(
 async def test_replanner_and_curator_models_checked_before_start(
     role: str, run_config: RunConfig
 ) -> None:
+    if role == "curator":
+        pytest.importorskip("agents")
     from _fakes.planners import SequencePlanner
 
     class AliasPlanner(SequencePlanner):
