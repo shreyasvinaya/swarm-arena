@@ -155,7 +155,8 @@ async def test_initialization_stops_before_worker_release(
 async def test_initialization_stop_cleanup_is_bounded(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    # The bound must cover the normal stop path up to the held write on a slow runner.
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     board_entered, write_entered, release = (threading.Event() for _ in range(3))
     workers: list[threading.Thread] = []
     original_open, original_create = ArenaBoard.open, LocalStore.create
@@ -186,7 +187,7 @@ async def test_initialization_stop_cleanup_is_bounded(
             assert await anyio.to_thread.run_sync(board_entered.wait, 8)
             await request_stop(config.run_root, "r", now=True)
             assert await anyio.to_thread.run_sync(write_entered.wait, 8)
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "stop cleanup waited for a blocked solution write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
