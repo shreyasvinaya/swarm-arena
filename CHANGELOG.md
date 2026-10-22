@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Manager actions as SDK function tools, with validated schemas, per-call
+  provenance, bounded feedback-redacted results, untrusted board content,
+  recoverable soft errors, and terminal controls that stop further model turns.
+
 - Metered LLM calls reserve against committed tranche credit, protect per-call
   tracking and output caps, link requested tools to their call, and preserve
   registered budget, fencing and cleanup controls across SDK boundaries.
