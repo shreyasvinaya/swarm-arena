@@ -1,9 +1,11 @@
 """Rubric judging, anchors, panels, funding and accounting."""
 
 import json
+import math
+import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import Mock
 
 import pytest
@@ -593,3 +595,65 @@ async def test_anchor_in_only_batch_has_empty_later_values(tmp_path: Path) -> No
             )
         assert score.notes.endswith("anchor values in later batches: []")
         assert len(score.llm_call_ids) == 1
+
+
+@pytest.mark.parametrize("aggregate", ["mean", "median", "min", "max"])
+@pytest.mark.parametrize(
+    ("votes", "lower", "upper"),
+    [
+        ([1e308, 1e308], 0.0, 1.5e308),
+        ([sys.float_info.max, sys.float_info.max], 0.0, sys.float_info.max),
+        ([-sys.float_info.max, -sys.float_info.max], -sys.float_info.max, 2.0),
+        ([-sys.float_info.max, sys.float_info.max], -sys.float_info.max, sys.float_info.max),
+        ([5e-324, 5e-324], 5e-324, 2.0),
+        ([1e308, 1.2e308, 1.4e308, 1.6e308], 0.0, sys.float_info.max),
+    ],
+)
+async def test_aggregate_finite_extreme_votes(
+    aggregate: Literal["mean", "median", "min", "max"],
+    votes: list[float],
+    lower: float,
+    upper: float,
+) -> None:
+    from fractions import Fraction
+
+    from swarm_arena.testing import check_judge
+
+    aliases = tuple(f"member{i}" for i in range(len(votes)))
+    for alias, value in zip(aliases, votes, strict=True):
+        payload = {
+            "scores": [
+                {"index": i, "value": v, "verdict": "ok", "notes": ""}
+                for i, v in enumerate((value, 2.0))
+            ]
+        }
+        FakeModel([FakeTurn(text=json.dumps(payload))]).register(alias)
+    ordered = sorted(votes)
+    middle = ordered[(len(ordered) - 1) // 2 : len(ordered) // 2 + 1]
+    expected = {
+        "mean": float(sum(map(Fraction, votes)) / len(votes)),
+        "median": float(sum(map(Fraction, middle)) / len(middle)),
+        "min": min(votes),
+        "max": max(votes),
+    }[aggregate]
+    scores = await check_judge(
+        LLMJudge(
+            LLMJudge.Config(
+                rubric="r",
+                models=list(aliases),
+                aggregate=aggregate,
+                scale_min=lower,
+                scale_max=upper,
+            )
+        ),
+        Goal(id="g", namespace="n"),
+        candidates(2),
+        config=configuration(aliases),
+    )
+    assert [score.candidate_id for score in scores] == ["c0", "c1"]
+    assert [score.value for score in scores] == [expected, 2.0]
+    for score in scores:
+        assert score.value is not None
+        assert math.isfinite(score.value)
+        assert lower <= score.value <= upper
+    assert all(len(score.llm_call_ids) == len(votes) for score in scores)

@@ -365,7 +365,7 @@ class LLMJudge(Judge):
             if len(config.models) > 1
             else ""
         )
-        aggregate = {"mean": statistics.mean, "median": statistics.median, "min": min, "max": max}[
+        aggregate = {"mean": statistics.mean, "median": statistics.mean, "min": min, "max": max}[
             config.aggregate
         ]
         scores: dict[str, Score] = {}
@@ -383,7 +383,12 @@ class LLMJudge(Judge):
                     omitted.add(candidate.id)
                     continue
                 valid = [row for row in rows if row is not None]
-                value = float(aggregate([row["value"] for row in valid]))
+                votes = [row["value"] for row in valid]
+                if config.aggregate == "median":
+                    votes.sort()
+                    votes = votes[(len(votes) - 1) // 2 : len(votes) // 2 + 1]
+                # mean uses exact ratios, avoiding overflow and subnormal underflow.
+                value = float(aggregate(votes))
                 ids = [id for m in range(len(config.models)) for id in calls[m, b]]
                 if candidate.id in scores:
                     later.setdefault(candidate.id, []).append(value)

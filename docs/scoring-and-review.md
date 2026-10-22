@@ -114,6 +114,10 @@ its notes so drift is visible. Its call links include every batch that held it.
 The final judge scores all finalists in one call per member, regardless of
 `batch_size`. Anchors and the final judge never read the response cache.
 
+All four LLM judge aggregators preserve finite, in-scale votes as finite,
+in-scale scores, including votes near the floating-point limits. Mean and
+the median midpoint use exact-ratio summation before rounding to a float.
+
 The rubric identity includes the rubric, scale, aggregation and single-model
 alias. A panel identity hashes its sorted aliases, retaining repeats; a reduced
 panel records its surviving aliases, including a single survivor. Core stamping
