@@ -268,3 +268,33 @@ async def test_one_stop_watcher_spans_acquisition_setup_and_driver(
     assert not live
     if mode == "resume_retry":
         assert len(attempts) == 2
+
+
+async def test_stop_at_initialization_entry_has_stopped_outcome(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.lease_acquisition import stop_at_phase_entry
+
+    trigger, latched = stop_at_phase_entry(monkeypatch)
+    enter = run_module._RunJournal.__aenter__
+
+    async def entered(journal: run_module._RunJournal) -> run_module._RunJournal:
+        result = await enter(journal)
+        trigger.set()
+        return result
+
+    monkeypatch.setattr(run_module._RunJournal, "__aenter__", entered)
+    with (
+        anyio.fail_after(5),
+        pytest.raises(
+            RuntimeError,
+            match=r"^run initialization stopped before run_started$",
+        ),
+    ):
+        await Swarm(run_config).run(plan(rounds=1), run_id="r")
+    assert latched.is_set()
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "r"))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert owner[0].head is None

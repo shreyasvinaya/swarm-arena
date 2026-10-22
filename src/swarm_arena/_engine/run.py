@@ -188,8 +188,6 @@ async def _supervise_initialization(
     poller = _stop_watcher(store, epoch, stops)
     watcher_scope = anyio.CancelScope()
     with anyio.CancelScope() as preparation:
-        stops.on_change = preparation.cancel
-        poller.on_error = preparation.cancel
 
         async def watch() -> None:
             with watcher_scope:
@@ -208,6 +206,8 @@ async def _supervise_initialization(
             tasks.start_soon(watch)
             try:
                 await anyio.lowlevel.checkpoint()
+                stops.on_change = preparation.cancel
+                poller.on_error = preparation.cancel
                 if poller.error is not None:
                     raise poller.error
                 if stops.stop or stops.stop_now or stops.run_timeout:

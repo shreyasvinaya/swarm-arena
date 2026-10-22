@@ -11,8 +11,10 @@ import pytest
 from _fakes.llm_run import HeldOperation
 
 from swarm_arena._engine import run as run_module
+from swarm_arena._engine.stops import StopState
 from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._model.canonical import utc_now
+from swarm_arena._store.base import Store
 from swarm_arena._store.local import LocalStore
 
 
@@ -66,3 +68,17 @@ class HeldOwnerResponse:
         owner = read_owner(self.stores[0])
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
+
+
+def stop_at_phase_entry(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """Queue the retained poller's latch step at the next phase's entry checkpoint."""
+    trigger, latched = asyncio.Event(), asyncio.Event()
+
+    async def watch(store: Store, epoch: int, stops: StopState) -> None:
+        await trigger.wait()
+        stops.stop = True
+        latched.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(run_module, "watch_stop_files", watch)
+    return trigger, latched

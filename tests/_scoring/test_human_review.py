@@ -1466,3 +1466,36 @@ async def test_import_stop_during_takeover_response(
     await held.assert_released()
     assert not _reviews(run_config)
     assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
+
+
+async def test_import_stop_at_preparation_entry_has_stopped_outcome(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anyio
+    from _fakes.lease_acquisition import stop_at_phase_entry
+
+    from swarm_arena._model.canonical import utc_now
+
+    trigger, latched = stop_at_phase_entry(monkeypatch)
+    gettempdir = human_review.gettempdir
+
+    def tempdir() -> str:
+        trigger.set()
+        return gettempdir()
+
+    monkeypatch.setattr(human_review, "gettempdir", tempdir)
+    with anyio.fail_after(5), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+        await HumanReview("alice").import_csv(
+            review_run.run_id,
+            _file(tmp_path),
+            config=run_config,
+        )
+    assert latched.is_set()
+    owner = read_owner(review_run.store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
