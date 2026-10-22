@@ -2,9 +2,14 @@ import asyncio
 import io
 import json
 import os
+import pty
+import signal
+import termios
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import TracebackType
+from typing import Any
 
 import anyio
 import pytest
@@ -17,6 +22,120 @@ from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
 
 PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+
+
+@pytest.mark.parametrize(
+    "exit_path", ["success", "failure", "cancel", "stop", "deadline", "fence", "stubborn"]
+)
+async def test_editor_restores_real_tty_on_every_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.stops import RunClock
+    from swarm_arena._errors import Fenced
+    from swarm_arena._store.local import LocalStore
+
+    marker, released, terminated = (tmp_path / name for name in ("ready", "release", "term"))
+    editor = _editor(
+        tmp_path,
+        "import os, pathlib, signal, sys, time, tty\n"
+        f"ready = pathlib.Path({str(marker)!r})\n"
+        f"release = pathlib.Path({str(released)!r})\n"
+        f"term = pathlib.Path({str(terminated)!r})\n"
+        "def terminate(*args):\n    term.write_text('TERM')\n"
+        + ("    return\n" if exit_path == "stubborn" else "    sys.exit(0)\n")
+        + "signal.signal(signal.SIGTERM, terminate)\ntty.setraw(0)\n"
+        "ready.write_text(str(os.getpid()))\n"
+        "while not release.exists(): time.sleep(0.01)\n"
+        + ("sys.exit(1)\n" if exit_path == "failure" else ""),
+    )
+    master, slave = pty.openpty()
+    original_stdin = os.dup(0)
+    before = termios.tcgetattr(slave)
+    expired = anyio.Event()
+
+    def left(clock: RunClock, limit_s: float) -> float:
+        return 123456.0
+
+    class ControlledClock:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        async def sleep(self, seconds: float) -> None:
+            if seconds == 123456.0:
+                await expired.wait()
+            else:
+                await anyio.sleep(seconds)
+
+    if exit_path == "deadline":
+        monkeypatch.setattr(RunClock, "left", left)
+        monkeypatch.setattr(run_module, "anyio", ControlledClock())
+    reviewer = TerminalReviewer(stdin=io.StringIO("e\na\n"), stdout=io.StringIO(), editor=editor)
+    config = planner_config(tmp_path)
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    session = exit_path in {"stop", "deadline", "fence"}
+    replacement = None
+    task: asyncio.Task[Any] | None = None
+    pid = None
+    try:
+        os.dup2(slave, 0)
+        operation = (
+            CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(PLAN.goal, config, None)
+            if session
+            else reviewer.review(PLAN)
+        )
+        task = asyncio.create_task(operation)
+        with anyio.fail_after(40):
+            while not marker.exists() or not marker.read_text():
+                assert not task.done()
+                await anyio.lowlevel.checkpoint()
+            pid = int(marker.read_text())
+            assert not termios.tcgetattr(slave)[3] & termios.ICANON
+            if exit_path in {"success", "failure"}:
+                released.write_text("exit")
+                await task
+            elif exit_path in {"cancel", "stubborn"}:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                (directory,) = await anyio.to_thread.run_sync(
+                    lambda: list(Path(config.run_root).iterdir())
+                )
+                if exit_path == "deadline":
+                    expired.set()
+                elif exit_path == "stop":
+                    (directory / "control" / "stop-e1").write_text("")
+                else:
+                    replacement = force_take_over(
+                        LocalStore(directory), owner_id="replacement", host="test", ttl_s=60
+                    )
+                with pytest.raises(Fenced if exit_path == "fence" else RuntimeError):
+                    await task
+            after = termios.tcgetattr(slave)
+            # The kernel may set its pending-input bookkeeping bit on restore.
+            after[3] &= ~getattr(termios, "PENDIN", 0)
+            before[3] &= ~getattr(termios, "PENDIN", 0)
+            assert after == before
+            if exit_path not in {"success", "failure"}:
+                assert terminated.read_text() == "TERM"
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        if replacement is not None:
+            replacement.release()
+        os.dup2(original_stdin, 0)
+        os.close(original_stdin)
+        os.close(master)
+        os.close(slave)
 
 
 async def test_approve() -> None:

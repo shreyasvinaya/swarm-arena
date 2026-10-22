@@ -3,12 +3,15 @@
 import os
 import subprocess
 import sys
+import termios
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TextIO
 
 import anyio
 
+from swarm_arena._agent.context import _local_timer_scope
 from swarm_arena._cli.run_cmds import _readline
 from swarm_arena._errors import _core_error
 from swarm_arena._model.context_strings import _context_string
@@ -113,22 +116,33 @@ class TerminalReviewer:
             path = Path(directory) / "plan.toml"
             await _prepare(lambda: path.write_text(text, encoding="utf-8"))
             editor = self._editor or os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+            tty_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+            saved = termios.tcgetattr(tty_fd) if tty_fd is not None else None
             try:
-                process = await anyio.open_process(
-                    [editor, str(path)], stdin=None, stdout=None, stderr=subprocess.DEVNULL
-                )
-            except BaseException as error:
-                self._retry(boundary, error)
-                return None
-            async with process:
                 try:
-                    code = await process.wait()
-                except BaseException:
-                    with anyio.CancelScope(shield=True):
-                        if process.returncode is None:
-                            process.kill()
-                        await process.wait()
-                    raise
+                    process = await anyio.open_process(
+                        [editor, str(path)], stdin=None, stdout=None, stderr=subprocess.DEVNULL
+                    )
+                except BaseException as error:
+                    self._retry(boundary, error)
+                    return None
+                async with process:
+                    try:
+                        code = await process.wait()
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            if process.returncode is None:
+                                with suppress(ProcessLookupError):
+                                    process.terminate()
+                                grace = anyio.CancelScope(deadline=anyio.current_time() + 1.0)
+                                with _local_timer_scope(grace), grace:
+                                    await process.wait()
+                                if process.returncode is None:
+                                    process.kill()
+                                await process.wait()
+            finally:
+                if tty_fd is not None and saved is not None:
+                    termios.tcsetattr(tty_fd, termios.TCSANOW, saved)
             if code != 0:
                 print("editor failed", file=self._stdout)
                 return None
