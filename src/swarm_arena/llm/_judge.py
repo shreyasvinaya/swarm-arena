@@ -18,13 +18,12 @@ from swarm_arena._errors import (
     _is_core_control,
     _SignalCategory,
 )
-from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, _validate_config
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._outcomes import _Outcome
-from swarm_arena._scoring.judge import Judge, JudgeContext
+from swarm_arena._scoring.judge import Judge, JudgeContext, _panel_drops, _PanelDrop
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
 from swarm_arena.llm._manager import _finish_accounting
 from swarm_arena.llm._structured import _captured_call_ids, structured_call
@@ -273,6 +272,7 @@ class LLMJudge(Judge):
                     if failure is not None
                     else cleanup_error
                 )
+        classified: Exception | None = None
         if failure is not None:
             classified = boundary.classify(failure)
             if _core_category(classified) is _SignalCategory.TERMINAL:
@@ -280,48 +280,39 @@ class LLMJudge(Judge):
             if accounting_failure is not None:
                 # Provider classification cannot establish successful settlement.
                 boundary.contain(accounting_failure, StorageError, "LLM judge accounting")
-            if _core_category(classified) is _SignalCategory.PROVIDER:
-                failure = classified
-            elif _is_core_control(classified):
-                # A direct budget refusal retains its public SDK-compatible carrier.
-                if (
-                    type(failure) is BudgetExceeded
-                    or _core_category(failure) is _SignalCategory.LIMIT
-                ):
-                    raise failure from None
-                raise classified from None
-            else:
+            if _core_category(classified) not in {_SignalCategory.PROVIDER, _SignalCategory.LIMIT}:
                 boundary.contain(classified, RuntimeError, "LLM judge")
         boundary.propagate_control(RuntimeError())
-        # Only settled invocations publish drop receipts. Controls and failed
-        # cleanup above must never be mistaken for a completed provider batch.
-        config = cast(LLMJudge.Config, self.config)
-        panel = sha256_hex(canonical_json(cast(JsonValue, sorted(survivors))))
-        for member_index, error in sorted(provider_errors.items()):
-            await report_provider_failure(scope, error, source="judge")
+        # Accounting must finish before reporting. A sibling LIMIT cannot erase
+        # genuine provider evidence, but failed cleanup never advances the latch.
+        reported: set[str] = set()
+        for error in provider_errors.values():
             assert isinstance(error, ProviderFailed)
-            scope.journal.append(
-                EventDraft(
-                    type=EventType.PROVIDER_FAILED,
-                    goal_id=scope.goal_id,
-                    round=scope.round,
-                    payload={
-                        "variant": "receipt",
-                        "source": "judge",
-                        "provider": error.provider,
-                        "disposition": "panel_drop",
-                        "complete": True,
-                        "dropped_member": config.models[member_index],
-                        "member_index": member_index,
-                        "panel_hash": panel,
-                        "batch_id": ctx.batch_id,
-                    },
+            if error.provider not in reported:
+                await report_provider_failure(scope, error, source="judge")
+                reported.add(error.provider)
+        if classified is not None:
+            assert failure is not None
+            if type(failure) is BudgetExceeded or _core_category(failure) is _SignalCategory.LIMIT:
+                raise failure from None
+            raise classified from None
+        # The scoring runner carries these to the engine's atomic score commit.
+        # Single-member and total failures have no surviving panel to describe.
+        config = cast(LLMJudge.Config, self.config)
+        drops = _panel_drops.get()
+        if drops is not None and scores and survivors and len(config.models) > 1:
+            panel = sha256_hex(canonical_json(cast(JsonValue, sorted(survivors))))
+            for member_index, error in sorted(provider_errors.items()):
+                assert isinstance(error, ProviderFailed)
+                drops.append(
+                    _PanelDrop(
+                        provider=error.provider,
+                        dropped_member=config.models[member_index],
+                        member_index=member_index,
+                        panel_hash=panel,
+                        batch_id=ctx.batch_id,
+                    )
                 )
-            )
-        if provider_errors:
-            await scope.journal.commit()
-        if failure is not None:
-            raise failure from None
         return scores
 
     async def _judge(

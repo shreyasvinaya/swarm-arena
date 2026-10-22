@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import anyio
 
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
-from swarm_arena._errors import _core_category, _is_core_control, _SignalCategory
+from swarm_arena._errors import StorageError, _core_category, _is_core_control, _SignalCategory
 from swarm_arena._outcomes import _Outcome
 from swarm_arena.llm._hooks import BudgetExceeded
 from swarm_arena.llm._manager import _finish_accounting
@@ -64,6 +64,7 @@ async def _invocation(
     scope = parent.child()
     boundary = _Outcome()
     failure: BaseException | None = None
+    accounting_failure: BaseException | None = None
     interrupted = False
     try:
         with llm_scope(scope):
@@ -82,6 +83,7 @@ async def _invocation(
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as cleanup_error:
+            accounting_failure = cleanup_error
             failure = (
                 BaseExceptionGroup(f"{name} cleanup", [failure, cleanup_error])
                 if failure is not None
@@ -93,6 +95,10 @@ async def _invocation(
             raise failure
         except BaseException as error:
             classified = boundary.classify(error)
+            if _core_category(classified) is _SignalCategory.TERMINAL:
+                raise classified from None
+            if accounting_failure is not None:
+                boundary.contain(accounting_failure, StorageError, "LLM accounting")
             if _is_core_control(classified):
                 if (
                     type(failure) is BudgetExceeded

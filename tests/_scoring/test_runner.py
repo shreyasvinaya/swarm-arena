@@ -482,6 +482,7 @@ def test_judge_outcome_and_error_are_frozen_models() -> None:
     assert outcome.model_dump() == {
         "scores": [],
         "provider_failed": {},
+        "panel_drops": [],
         "errors": [{"candidate_id": "c-1", "judge": "quality", "reason": "no score"}],
     }
     with pytest.raises(ValueError, match="frozen"):

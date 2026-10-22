@@ -837,6 +837,17 @@ class GoalRunner:
                 )
             )
             return
+        for drop in outcome.panel_drops:
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PROVIDER_FAILED,
+                    round=round,
+                    variant="receipt",
+                    source="judge",
+                    disposition="panel_drop",
+                    **drop.model_dump(),
+                )
+            )
         remaining = len(outcome.scores) + len(outcome.errors)
 
         def append(kind: EventType, **payload: Any) -> Event:
@@ -1248,6 +1259,8 @@ class GoalRunner:
             except BaseException as error:
                 error = boundary.classify(error)
                 self.deps.journal._raise_if_fenced()
+                if isinstance(error, StorageError) and _is_core_signal(error):
+                    raise error from None
                 if _core_category(error) is _SignalCategory.PROVIDER:
                     assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
                     outcome = JudgeOutcome(
@@ -1387,6 +1400,8 @@ class GoalRunner:
             error = boundary.classify(error)
             self.deps.journal._raise_if_fenced()
             if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                raise error from None
+            if isinstance(error, StorageError) and _is_core_signal(error):
                 raise error from None
             provider_context: dict[str, Any] = {}
             if _core_category(error) is _SignalCategory.PROVIDER:

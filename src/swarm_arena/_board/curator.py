@@ -9,7 +9,12 @@ from inspect import isawaitable
 
 from swarm_arena._board.base import BoardView
 from swarm_arena._budget.llm_scope import current_llm_scope
-from swarm_arena._errors import _exception_type_name, _is_core_control
+from swarm_arena._errors import (
+    StorageError,
+    _exception_type_name,
+    _is_core_control,
+    _is_core_signal,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.llm_record import drain
 from swarm_arena._model.context_strings import _context_string
@@ -105,7 +110,7 @@ def _curator_error(error: BaseException) -> str:
     Ordinary hook failures remain component errors without provider authority.
     """
     error = _classify_outcome(error)
-    if _is_core_control(error):
+    if _is_core_control(error) or (isinstance(error, StorageError) and _is_core_signal(error)):
         raise error from None
     return f"curator error: {_exception_type_name(error)}"
 

@@ -867,12 +867,15 @@ async def test_empty_draft_member_is_excluded(monkeypatch: pytest.MonkeyPatch) -
     assert formatter.calls == []
 
 
-@pytest.mark.parametrize("aliases", [("a", "b", "c"), ("b",), ("a", "b", "a")])
+@pytest.mark.parametrize(
+    "aliases", [("a", "b", "c"), ("b",), ("b", "b"), ("a", "b", "b"), ("a", "b", "a")]
+)
 async def test_provider_panel_drop_reports_after_accounting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...]
 ) -> None:
+    import litellm
+
     from swarm_arena._engine.stops import provider_stops
-    from swarm_arena._errors import ProviderFailed, _core_error
     from swarm_arena._model.canonical import canonical_json, sha256_hex
     from swarm_arena._model.ref import Ref
     from swarm_arena._scoring.runner import judge_round
@@ -882,7 +885,9 @@ async def test_provider_panel_drop_reports_after_accounting(
         if alias == "b":
 
             async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
-                raise _core_error(ProviderFailed, "fake")
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE", llm_provider="untrusted", model="wrong"
+                )
 
             monkeypatch.setattr(fake, "get_response", fail)
         fake.register(alias)
@@ -909,7 +914,11 @@ async def test_provider_panel_drop_reports_after_accounting(
         service.register("late/d/four", frozenset({"fake"}), lambda: cancelled.append("late"))
         assert cancelled[-1] == "late"
         assert run.charged(scope).usd == pytest.approx(sum(c.cost_usd for c in run.calls()))
-        if aliases == ("b",):
+        assert not [
+            e for e in run.events("provider_failed") if e.payload.get("disposition") == "panel_drop"
+        ]
+        if set(aliases) == {"b"}:
+            assert outcome.panel_drops == []
             assert outcome.provider_failed
             assert not outcome.errors
             assert not outcome.scores
@@ -919,6 +928,14 @@ async def test_provider_panel_drop_reports_after_accounting(
                 sha256_hex(canonical_json(list(remaining)))
             }
             assert not outcome.errors
+
+            assert [drop.dropped_member for drop in outcome.panel_drops] == ["b"] * aliases.count(
+                "b"
+            )
+            assert {drop.panel_hash for drop in outcome.panel_drops} == {
+                sha256_hex(canonical_json(list(remaining)))
+            }
+            assert {drop.provider for drop in outcome.panel_drops} == {"fake"}
 
 
 async def test_recursive_provider_survivors_across_batches_near_scale_limit(
@@ -1011,9 +1028,7 @@ async def partial_panel_crash_driver(root: str) -> None:
 
         async def publish(self: JournalWriter) -> None:
             hit = any(
-                e.type == "score"
-                and e.payload.get("score", {}).get("judge") == "panel"
-                and "barrier_batch" in e.payload
+                e.type == "provider_failed" and e.payload.get("disposition") == "panel_drop"
                 for e in self._queue
             )
             await original(self)
@@ -1066,6 +1081,10 @@ async def test_partial_panel_public_resume_makes_no_new_calls(tmp_path: Path) ->
         for e in recorded
         if e.type == "score" and e.payload["score"]["judge"] == "panel"
     ]
+    drops = [e for e in recorded if e.payload.get("disposition") == "panel_drop"]
+    assert [e.payload["dropped_member"] for e in drops] == ["a", "b"]
+    assert {e.payload["panel_hash"] for e in drops} == {sha256_hex(canonical_json(["c", "c"]))}
+    assert all("complete" not in e.payload for e in drops)
     assert len(scores) == 6
     assert {s["panel_hash"] for s in scores} == {sha256_hex(canonical_json(["c", "c"]))}
     spies = [FakeModel([]) for _ in range(3)]
@@ -1149,3 +1168,62 @@ async def test_panel_accounting_failure_prevents_provider_completion(
         await scope.journal.commit()
         assert provider_stops(scope.journal).generations() == {}
         assert not run.events("provider_failed")
+
+
+async def test_provider_failure_is_reported_before_sibling_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+    import litellm
+
+    from swarm_arena import Limits
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.stops import provider_stops
+    from swarm_arena.llm import BudgetExceeded
+
+    failed = anyio.Event()
+    reserve = Tranche.reserve_call
+
+    async def ordered_reserve(self: Tranche, estimate: Amount) -> str:
+        if estimate.tokens > 1_000_000:
+            await failed.wait()
+        return await reserve(self, estimate)
+
+    monkeypatch.setattr(Tranche, "reserve_call", ordered_reserve)
+
+    class Down(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            failed.set()
+            raise litellm.ServiceUnavailableError(
+                message="PRIVATE", llm_provider="fake", model="fake/down"
+            )
+
+    Down([]).register("down")
+    huge = FakeModel([])
+    huge.register("huge")
+    config = configuration(("down", "huge"))
+    config.models.root["huge"] = config.models.root["huge"].model_copy(
+        update={"max_tokens": 5_000_000}
+    )
+    config = config.model_copy(update={"limits": Limits(max_tokens=1_000_000)})
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=config) as run:
+        scope = run.scope("judge")
+        cancelled: list[bool] = []
+        provider_stops(scope.journal).register(
+            "other/t/a", frozenset({"fake"}), lambda: cancelled.append(True)
+        )
+        with llm_scope(scope), pytest.raises(BudgetExceeded):
+            await LLMJudge("r", ["down", "huge"]).judge(
+                goal,
+                candidates(1),
+                JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
+            )
+        assert provider_stops(scope.journal).generations() == {"fake": 1}
+        assert cancelled == [True]
+        assert huge.calls == []
+        assert scope.tranche.pending() == 0
+        assert not [
+            e for e in run.events("provider_failed") if e.payload.get("variant") == "receipt"
+        ]

@@ -487,11 +487,17 @@ pruning on missing ranking evidence. At converge, paused ranking batches get
 one retry through normal admission and the shared provider service. A distinct
 batch identity makes a completed retry reusable on resume. Only a validated
 provider failure on that retry can produce `provider_failed` when no finalist
-passes; a recovered provider permits normal selection. A failed replanner keeps the current
-revision and records a safe `plan_rejected` completion, including the original
+passes; a recovered provider permits normal selection. A failed replanner keeps
+the current revision and records a safe `plan_rejected` completion, including the original
 `first_round` and any `join_retry`. A failed eligible curator records a completed
 skip without a `curated` event. These receipts survive takeover, so a missing
 decision or summary does not cause paid work to repeat.
+
+Each settled invocation reports a failed provider once, even when several panel
+members use it or a sibling is refused by the budget. A surviving panel carries
+its `panel_drop` metadata to the core, which commits it with the survivor scores.
+A drop describes a member loss, not whole-batch completion; single-member and
+all-member failures are failed batches instead.
 
 Failed judging and curation receipts are published only after accounting has a
 known disposition. Storage failures, settlement timeouts, fencing, terminal
@@ -507,4 +513,4 @@ policy retain their existing contained rejection/error-decision behavior.
 A registered usage overflow from a manager or judge takes the run-budget stop path:
 ordinary rounds end, and the free final selection can still run. A registered
 cleanup or storage terminal failure escapes the run even when no ledger or
-binding state accompanies it. Neither kind is recorded as a manager error.
+binding state accompanies it. Neither kind is recorded as a manager or judge error.

@@ -2716,3 +2716,154 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
     before = list(calls)
     await Swarm(config).resume("retry", force=True)
     assert calls == before
+
+
+@pytest.mark.parametrize("component", ["judge", "final", "planner", "curator"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str, cleanup_failure: bool
+) -> None:
+    import litellm  # noqa: TID251 - exercise the real adapter classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._errors import StorageError, _core_error
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation, _judge, _planner
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    calls: list[str] = []
+    fired: list[str] = []
+    role = "judge" if component == "final" else component
+
+    class Down(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            if component == "final" and round_ != "0":
+                rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+                return await FakeModel(
+                    [
+                        FakeTurn(
+                            text=json.dumps(
+                                {
+                                    "scores": [
+                                        {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                        for i in range(len(rows))
+                                    ]
+                                }
+                            )
+                        )
+                    ]
+                ).get_response(*args, **kwargs)
+            raise litellm.ServiceUnavailableError(
+                message="PRIVATE_COMPONENT_FAILURE", llm_provider="untrusted", model="wrong"
+            )
+
+    Down([]).register("down")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "down": ModelSpec(
+                        model="fake/down",
+                        roles=["judge", "planner", "curator"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=1,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000, max_agents_per_fingerprint=4),
+            curator=Ref.of(LLMCurator(model="down")) if component == "curator" else None,
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    if cleanup_failure:
+        module = _judge if role == "judge" else _planner if role == "planner" else _invocation
+        finish = module._finish_accounting
+
+        async def fail_accounting(scope: Any, *, interrupted: bool) -> None:
+            await finish(scope, interrupted=interrupted)
+            if component != "final" or scope.round == 0:
+                fired.append(scope.role)
+                raise _core_error(StorageError, "settlement storage unavailable")
+
+        monkeypatch.setattr(module, "_finish_accounting", fail_accounting)
+    plan = _plan(teams=3, rounds=2 if role == "planner" else 1)
+    if role == "judge":
+        panel = Ref.of(
+            LLMJudge(LLMJudge.Config(rubric="r", models=["down"], anchors=0))
+        ).model_copy(update={"name": "panel"})
+        plan = plan.model_copy(update={"judges": [Y_JUDGE, panel], "ranking": "panel"})
+    if role == "curator":
+        plan = plan.model_copy(
+            update={
+                "teams": [
+                    team.model_copy(
+                        update={
+                            "agents": [
+                                agent.model_copy(
+                                    update={
+                                        "manager": agent.manager.model_copy(
+                                            update={
+                                                "path": "_fakes.curators:PostingManager",
+                                                "config": {
+                                                    **agent.manager.config,
+                                                    "post_learnings": True,
+                                                },
+                                            }
+                                        )
+                                    }
+                                )
+                                for agent in team.agents
+                            ]
+                        }
+                    )
+                    for team in plan.teams
+                ]
+            }
+        )
+    swarm = Swarm(config, replanner=LLMPlanner("down") if role == "planner" else None)
+    if cleanup_failure:
+        with pytest.raises(Exception, match=r"settlement|TaskGroup") as caught:
+            await swarm.run(plan, run_id="component")
+        pending: list[BaseException] = [caught.value]
+        leaves: list[BaseException] = []
+        while pending:
+            error = pending.pop()
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+            else:
+                leaves.append(error)
+        assert any(isinstance(error, StorageError) for error in leaves)
+        assert fired == [role]
+    else:
+        await swarm.run(plan, run_id="component")
+    events = all_events(config)
+    assert calls
+    failures = [e for e in events if e.type == "provider_failed"]
+    if cleanup_failure:
+        assert not failures
+        assert not [e for e in events if e.type in {"judge_error", "plan_rejected", "curated"}]
+    else:
+        assert failures
+        assert {
+            e.payload["provider"] for e in failures if e.payload.get("variant") == "transition"
+        } == {"fake"}
+        if component == "planner":
+            assert (
+                next(e for e in events if e.type == "plan_rejected").payload["provider"] == "fake"
+            )
+        if component == "curator":
+            assert (
+                next(
+                    e for e in failures if e.payload.get("disposition") == "curator_skipped"
+                ).payload["accounting"]
+                == "settled"
+            )
+    assert "PRIVATE_COMPONENT_FAILURE" not in repr(events)

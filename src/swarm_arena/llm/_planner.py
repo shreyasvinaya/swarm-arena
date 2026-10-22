@@ -14,6 +14,7 @@ from swarm_arena._engine.run import mark_planning_session, planning_session
 from swarm_arena._errors import (
     ConfigError,
     PlanError,
+    StorageError,
     _core_category,
     _core_error,
     _is_core_control,
@@ -401,6 +402,7 @@ class LLMPlanner(Planner):
         scope = parent.child()
         boundary = _Outcome()
         failure: BaseException | None = None
+        accounting_failure: BaseException | None = None
         interrupted = False
         result: Plan | None = None
         try:
@@ -506,6 +508,7 @@ class LLMPlanner(Planner):
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as cleanup_error:
+                accounting_failure = cleanup_error
                 failure = (
                     BaseExceptionGroup("planner cleanup", [failure, cleanup_error])
                     if failure
@@ -513,6 +516,10 @@ class LLMPlanner(Planner):
                 )
         if failure is not None:
             classified = boundary.classify(failure)
+            if _core_category(classified) is _SignalCategory.TERMINAL:
+                raise classified from None
+            if accounting_failure is not None:
+                boundary.contain(accounting_failure, StorageError, "LLM accounting")
             if _is_core_control(classified):
                 if (
                     type(failure) is BudgetExceeded
