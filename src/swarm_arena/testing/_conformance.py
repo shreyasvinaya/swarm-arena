@@ -374,8 +374,18 @@ async def check_judge(
             ids=ids,
             batch_id="b-" + secrets.token_hex(4),
         )
-        returned = await built.judge(goal, candidates, ctx)
+        outcome = _Outcome()
+        try:
+            returned = await built.judge(goal, candidates, ctx)
+        except BaseException as error:
+            raise outcome.classify(error) from None
         await _assert_drained(scope)
+        try:
+            scope.tranche._ledger._check_usage_overflow()
+        except LimitReached:
+            raise _fail(
+                "TERMINAL control rule: Judge.judge() must propagate terminal overflow"
+            ) from None
         valid, scored = await run_sync_daemon(_check_scores, returned, candidates, ctx)
         stamped = await run_sync_daemon(
             partial(
@@ -495,8 +505,9 @@ async def check_manager(
         if harness.manager_errors:
             raise harness.manager_errors[0]
         return reports
-    except (LimitReached, _LLMContractError):
+    except (LimitReached, _LLMContractError, anyio.get_cancelled_exc_class()):
         raise
     except BaseException as error:
+        outcome.propagate_control(error)
         error = outcome.classify(error)
         raise AssertionError(f"manager raised {_exception_type_name(error)}") from error

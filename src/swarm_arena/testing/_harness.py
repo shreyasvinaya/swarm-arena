@@ -35,7 +35,14 @@ from swarm_arena._engine.run import (
     _supervise_writer,
 )
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, _core_error, _exception_type_name
+from swarm_arena._errors import (
+    Fenced,
+    _core_category,
+    _core_error,
+    _exception_type_name,
+    _is_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
@@ -259,8 +266,8 @@ class OfflineHarness:
         their rounds still receive barrier judging and closure, return empty
         reports, and do not prevent later rounds. Cancellation and fencing
         propagate. Returned reports are detached, strictly validated base copies.
-        Tranche outcomes may be ignored here: durable ``settle.usage_overflow``
-        and ledger exhaustion remain authoritative for subsequent admission.
+        Terminal overflow from settlement or the run ledger ends the harness
+        immediately and propagates its registered core control.
 
         Parameters
         ----------
@@ -569,6 +576,8 @@ class OfflineHarness:
                     report = await manager.run_round(AgentContext(rt, gate=lambda: None))
             except BaseException as error:
                 error = outcome.classify(error)
+                if _is_core_signal(error) and _core_category(error) is _SignalCategory.TERMINAL:
+                    raise error from None
                 if rt.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
                 if not isinstance(error, LimitReached):
@@ -581,7 +590,9 @@ class OfflineHarness:
                 # The bound run owns interrupted cleanup; healthy closure stays
                 # supervised by the existing run deadline and writer lifetime.
                 await _assert_drained(scope)
-                await rt.tranche.close()
+                closed = await rt.tranche.close()
+                if closed.overflow or rt.ledger.run_exhausted():
+                    rt.ledger._check_usage_overflow()
             if any(
                 c.requested_by_call is not None and c.requested_by_call not in scope.call_ids
                 for c in rt.own
