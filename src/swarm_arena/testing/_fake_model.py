@@ -18,13 +18,14 @@ from openai.types.responses import (
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.responses.response_usage import InputTokensDetails
 
+from swarm_arena._budget.amount import _MICROS_PER_USD, USD_LIMIT
 from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._errors import _core_error
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.tooling import Usage
-from swarm_arena.llm._catalog import call_cost, register_fake_model
+from swarm_arena.llm._catalog import _cost_micros, call_cost, register_fake_model
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -165,6 +166,9 @@ class FakeModel(Model):
         ------
         RuntimeError
             If this conversation has no turns left.
+        LimitReached
+            If authoritative usage exceeds the supported accounting range.
+            The recorder charges its supported ceiling and makes the run terminal.
         ValueError
             If supplied text is not a string or function arguments are not
             finite JSON objects. The core error names only the failing field.
@@ -274,12 +278,21 @@ class FakeModel(Model):
         if "run_id" in metadata:
             spec = pending.models.root[metadata["model_alias"]] if pending is not None else None
             request: dict[str, Any] = {"system": system_instructions, "input": input}
+            cost = 0.0
+            if spec is not None:
+                micros = round(_cost_micros(spec, usage))
+                # Only the recorder caps authoritative overflow and stops the run.
+                cost = (
+                    float(USD_LIMIT + 1)
+                    if micros > USD_LIMIT * _MICROS_PER_USD
+                    else call_cost(spec, usage, litellm_cost=None)
+                )
             await record_call(
                 metadata=metadata,
                 model=spec.model if spec is not None else f"fake/{self._name}",
                 provider=self.provider,
                 usage=usage,
-                cost_usd=call_cost(spec, usage, litellm_cost=None) if spec is not None else 0,
+                cost_usd=cost,
                 cache_hit=False,
                 latency_ms=0,
                 status="ok",

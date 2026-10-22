@@ -454,3 +454,32 @@ async def test_abandoned_fake_callback_starts_no_second_upload(
         finally:
             await held.finish()
         assert len(uploads) == 1
+
+
+async def test_authoritative_usage_overflow_reaches_the_recorder(tmp_path: Path) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena.manager import LimitReached
+
+    usage = Usage(input_tokens=2 * 10**15)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        settings = await tracked_settings(run, scope)
+        with pytest.raises(LimitReached) as caught:
+            await respond(
+                make_model([FakeTurn(text="overflow", usage=usage)]), model_settings=settings
+            )
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        await drain(scope, wait=False)
+        await scope.tranche.close()
+        await run.journal.commit()
+        [call] = run.calls()
+        assert call.cost_usd == USD_LIMIT
+        assert call.usage == usage
+        assert call.status == "error"
+        assert scope.call_ids == [call.id]
+        assert run.charged(scope).usd == USD_LIMIT
+        assert run.ledger.run_exhausted()
+        with pytest.raises(LimitReached) as refused:
+            await run.scope("manager", agent="later").tranche.reserve_call(Amount(usd=0.001))
+        assert _core_category(refused.value) is _SignalCategory.TERMINAL
