@@ -716,6 +716,7 @@ class RoundRunner:
         deadline: float,
     ) -> None:
         drain_until: float | None = None
+        budget_collection_until: float | None = None
         cancel_until: float | None = None
         while True:
             self._refresh_budget()
@@ -732,13 +733,19 @@ class RoundRunner:
                     inflight.close()
                 if (stops.run_budget or self.goal_id in stops.goal_budget) and drain_until is None:
                     inflight.close(budget=True)
-                    drain_until = now + inflight.max_grace_s()
+                    grace = inflight.max_grace_s()
+                    # Borrow a minimum admission drain from the existing collection
+                    # allowance; zero-grace jobs must survive this watcher tick.
+                    drain_until = now + max(grace, 1.0)
+                    budget_collection_until = now + 2 * grace + 5.0
             if cancel_until is None and (
                 immediate or (drain_until is not None and now >= drain_until)
             ):
                 inflight.close()
                 # Collection is owned by the executor and may outlive process grace.
                 cancel_until = now + inflight.max_grace_s() + 5.0
+                if budget_collection_until is not None:
+                    cancel_until = min(cancel_until, budget_collection_until)
                 inflight.cancel_all()
             if cancel_until is not None:
                 for scope, ctx in zip(scopes, contexts, strict=True):

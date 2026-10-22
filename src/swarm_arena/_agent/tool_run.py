@@ -97,7 +97,8 @@ class Inflight:
         scope : anyio.CancelScope
             Scope controlling one executor submission.
         grace_s : float, default=0.0
-            Effective job grace in seconds; retained through executor collection.
+            Effective job grace in seconds; tracked from reservation admission
+            through executor collection, including durable reservation writes.
         admitted_generation : int or None, default=None
             Cancellation generation of a reserved action allowed to drain after
             budget closure. Other closure kinds still refuse its start.
@@ -655,7 +656,24 @@ async def execute_tool_run(
 
         owner = _ToolReservation()
         try:
-            return await _run(rt, request, key, stage, overlay, warnings, tuple(read_ids), owner)
+            with anyio.CancelScope() as admission_scope:
+                try:
+                    return await _run(
+                        rt,
+                        request,
+                        key,
+                        stage,
+                        overlay,
+                        warnings,
+                        tuple(read_ids),
+                        owner,
+                        admission_scope,
+                    )
+                finally:
+                    inflight = _inflight.get()
+                    if inflight is not None:
+                        inflight.discard(admission_scope)
+            raise _core_signal(LimitReached("stop", "the round is stopping"))
         except BaseException as error:
             if not _has_core_fenced(error):
                 await _refund_undispatched(rt, owner)
@@ -674,6 +692,7 @@ async def _run(
     warnings: list[str],
     read_ids: Sequence[str],
     owner: _ToolReservation,
+    admission_scope: anyio.CancelScope,
 ) -> Candidate:
     """Own reservation, executor lifecycle, and the shielded completion sequence."""
     id = rt.ids.next("c")
@@ -708,12 +727,17 @@ async def _run(
     if inflight.closed or generation != inflight._cancel_generation:
         raise _core_signal(LimitReached("stop", "the round is stopping"))
 
+    grace_s = tool_grace(rt.tool)
+
     def on_admit(reservation: Reservation) -> None:
+        # The ledger calls this synchronously after booking, before durability.
+        inflight.add(admission_scope, grace_s=grace_s, admitted_generation=generation)
         owner.admitted = reservation
 
     res = await rt.ledger.reserve(
         rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
     )
+    await anyio.lowlevel.checkpoint()
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
@@ -760,7 +784,7 @@ async def _run(
                     round_timeout_s=rt.round_spec.tool_timeout_s,
                     limit_s=rt.limits.tool_timeout_s,
                 ),
-                grace_s=tool_grace(rt.tool),
+                grace_s=grace_s,
                 resources=rt.spec.resources,
                 env=tool_env_vars(
                     run_id=rt.repeats.run_id,
@@ -779,6 +803,7 @@ async def _run(
             with anyio.CancelScope() as run_scope:
                 try:
                     inflight.add(run_scope, grace_s=job.grace_s, admitted_generation=generation)
+                    inflight.discard(admission_scope)
                 except LimitReached as error:
                     admission_refusal = error
                     raise

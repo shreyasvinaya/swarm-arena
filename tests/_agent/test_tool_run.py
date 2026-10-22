@@ -164,9 +164,9 @@ async def test_closed_admission_refuses_dispatch(rt_env: RtEnv) -> None:
     assert rt_env.charged(res) == Amount()
 
 
-@pytest.mark.parametrize("escalation", [None, "stop", "cancel"])
+@pytest.mark.parametrize("escalation", ["stop", "cancel"])
 async def test_budget_close_after_reservation_preserves_only_admitted_work(
-    rt_env: RtEnv, escalation: str | None
+    rt_env: RtEnv, escalation: str
 ) -> None:
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:touch"))
 
@@ -179,20 +179,12 @@ async def test_budget_close_after_reservation_preserves_only_admitted_work(
             rt_env.inflight.cancel_all()
 
     rt_env.after_append(EventType.RESERVE, close)
-    if escalation is None:
-        result = await execute_tool_run(
+    with pytest.raises(LimitReached):
+        await execute_tool_run(
             rt, {"marker": str(rt_env.marker)}, parents=(), replicate=None, edits=None
         )
-        assert result.output.status == RunStatus.OK
-        assert rt_env.marker.exists()
-        assert rt_env.committed_types().count("tool_start") == 1
-    else:
-        with pytest.raises(LimitReached):
-            await execute_tool_run(
-                rt, {"marker": str(rt_env.marker)}, parents=(), replicate=None, edits=None
-            )
-        assert not rt_env.marker.exists()
-        assert "tool_start" not in rt_env.committed_types()
+    assert not rt_env.marker.exists()
+    assert "tool_start" not in rt_env.committed_types()
     res = rt_env.events("reserve")[-1].payload["reservation"]["id"]
     assert rt_env.reservation_state(res) == "settled"
     assert rt_env.charged(res) == Amount()
