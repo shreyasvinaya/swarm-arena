@@ -2756,7 +2756,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     from swarm_arena import Limits, Swarm
     from swarm_arena._errors import StorageError, _core_error
     from swarm_arena.config import ModelCatalog, ModelSpec
-    from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation, _judge
+    from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation
     from swarm_arena.testing import FakeModel, FakeTurn
 
     calls: list[str] = []
@@ -2810,8 +2810,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
         workspace_root=str(tmp_path / "ws"),
     )
     if cleanup_failure:
-        module = _judge if role == "judge" else _invocation
-        finish = module._finish_accounting
+        finish = _invocation._finish_accounting
 
         async def fail_accounting(scope: Any, *, interrupted: bool) -> None:
             await finish(scope, interrupted=interrupted)
@@ -2819,7 +2818,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
                 fired.append(scope.role)
                 raise _core_error(StorageError, "settlement storage unavailable")
 
-        monkeypatch.setattr(module, "_finish_accounting", fail_accounting)
+        monkeypatch.setattr(_invocation, "_finish_accounting", fail_accounting)
     plan = _plan(teams=3, rounds=2 if role == "planner" else 1)
     if role == "judge":
         panel = Ref.of(

@@ -14,7 +14,11 @@ from swarm_arena.llm._manager import _finish_accounting
 
 @asynccontextmanager
 async def _invocation(
-    parent: LLMScope, *, name: str, error_type: type[Exception]
+    parent: LLMScope,
+    *,
+    name: str,
+    error_type: type[Exception],
+    accounting_name: str = "LLM accounting",
 ) -> AsyncGenerator[LLMScope]:
     """
     Enter a child scope, contain failures and finish accounting before exit.
@@ -32,6 +36,9 @@ async def _invocation(
         Core component identifier, such as ``curator`` or ``planner``.
     error_type : type[Exception]
         Boundary type for an ordinary unregistered component failure.
+
+    accounting_name : str, default="LLM accounting"
+        Diagnostic site for an ordinary accounting failure.
 
     Yields
     ------
@@ -98,7 +105,7 @@ async def _invocation(
             if _core_category(classified) is _SignalCategory.TERMINAL:
                 raise classified from None
             if accounting_failure is not None:
-                boundary.contain(accounting_failure, StorageError, "LLM accounting")
+                boundary.contain(accounting_failure, StorageError, accounting_name)
             if _is_core_control(classified):
                 if (
                     type(failure) is BudgetExceeded

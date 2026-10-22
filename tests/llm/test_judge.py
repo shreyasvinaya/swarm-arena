@@ -9,6 +9,9 @@ from typing import Any, Literal
 from unittest.mock import Mock
 
 import pytest
+
+pytest.importorskip("agents")
+
 from _fakes.llm_run import open_llm_run
 from agents import ModelResponse
 
@@ -457,16 +460,16 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
     from _fakes.llm_components import LateFakeModel
 
     from swarm_arena._errors import _stop_cleanup_error
-    from swarm_arena.llm import _judge
+    from swarm_arena.llm import _invocation
 
-    finish = _judge._finish_accounting
+    finish = _invocation._finish_accounting
 
     async def cleanup(*args: Any, **kwargs: Any) -> None:
         await finish(*args, **kwargs)
         if cleanup_fails:
             raise _stop_cleanup_error()
 
-    monkeypatch.setattr(_judge, "_finish_accounting", cleanup)
+    monkeypatch.setattr(_invocation, "_finish_accounting", cleanup)
     release = anyio.Event()
     fake = LateFakeModel([turn(1)], delay_s=0, release=release)
     fake.register("a")
@@ -1141,7 +1144,7 @@ async def test_panel_accounting_failure_prevents_provider_completion(
 ) -> None:
     from swarm_arena._engine.stops import provider_stops
     from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
-    from swarm_arena.llm import _judge
+    from swarm_arena.llm import _invocation
 
     async def fail_provider(*args: Any, **kwargs: Any) -> ModelResponse:
         raise _core_error(ProviderFailed, "fake")
@@ -1154,7 +1157,7 @@ async def test_panel_accounting_failure_prevents_provider_completion(
         if alias == "b":
             monkeypatch.setattr(fake, "get_response", fail_provider)
         fake.register(alias)
-    monkeypatch.setattr(_judge, "_finish_accounting", fail_accounting)
+    monkeypatch.setattr(_invocation, "_finish_accounting", fail_accounting)
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=configuration(aliases)) as run:
         scope = run.scope("judge")
@@ -1227,3 +1230,55 @@ async def test_provider_failure_is_reported_before_sibling_limit(
         assert not [
             e for e in run.events("provider_failed") if e.payload.get("variant") == "receipt"
         ]
+
+
+@pytest.mark.parametrize("accounting_failure", [False, True])
+async def test_falsey_body_failure_matches_shared_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accounting_failure: bool
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import StorageError
+    from swarm_arena.llm import _invocation
+
+    secret = "JUDGE_FALSEY_SENTINEL_SECRET"
+
+    class FalseyError(Exception):
+        def __bool__(self) -> bool:
+            return False
+
+    async def fail_body(*args: Any, **kwargs: Any) -> Any:
+        raise FalseyError(secret)
+
+    async def finish(*args: Any, **kwargs: Any) -> None:
+        if accounting_failure:
+            raise ValueError(secret)
+
+    monkeypatch.setattr(LLMJudge, "_judge", fail_body)
+    monkeypatch.setattr(_invocation, "_finish_accounting", finish)
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=configuration()) as run:
+        parent = run.scope("judge")
+        expected = StorageError if accounting_failure else RuntimeError
+        with pytest.raises(expected) as shared:
+            async with _invocation._invocation(
+                parent,
+                name="judge",
+                error_type=RuntimeError,
+                accounting_name="LLM judge accounting",
+            ):
+                raise FalseyError(secret)
+        with llm_scope(parent), pytest.raises(expected) as judge:
+            await LLMJudge("r", ["a"]).judge(
+                goal,
+                candidates(1),
+                JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
+            )
+        assert type(judge.value) is type(shared.value)
+        assert str(judge.value) == str(shared.value)
+        assert str(judge.value) == (
+            "LLM judge accounting failed: ValueError"
+            if accounting_failure
+            else "LLM judge failed: FalseyError"
+        )
+        assert_secret_absent(judge.value, secret)
