@@ -386,7 +386,7 @@ class ArenaBoard(Board):
             except (StorageError, OSError, ValueError) as error:
                 outcome.propagate_control(error)
                 _LOG.warning("cannot read planning session %s", session_id)
-                sessions[key] = None
+                # An unreadable session is not a capture; retry next refresh.
         return sessions
 
     def open(self, run_id: str, run_root: str, namespaces: Sequence[str]) -> None:

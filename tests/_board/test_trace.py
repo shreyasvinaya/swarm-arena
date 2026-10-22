@@ -1263,3 +1263,43 @@ def test_llm_visibility_does_not_merge_equal_run_ids_across_sources(tmp_path: Pa
             assert reader.llm_calls("same-run", namespaces=["private"])[0].team == "private"
     finally:
         board.close()
+
+
+def test_session_read_error_is_retried_at_unchanged_producing_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    from swarm_arena._board import arena
+    from swarm_arena._errors import StorageError
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    session = FakeRun(run.run_root, "session")
+    session.commit(_record(_call(session, "planner-call", "planner")))
+    plan = run.plan()
+    plan.payload["planning_session"] = session.run_id
+    run.commit(plan, run.candidate("c"))
+    add_pointer(str(tmp_path / "arena"), run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    original = arena.read_owner
+    reads: list[int] = []
+
+    def owner(store: Any) -> Any:
+        if store.url == session.store.url:
+            reads.append(1)
+            if len(reads) == 1:
+                raise StorageError("TRANSIENT_SESSION_SECRET")
+        return original(store)
+
+    monkeypatch.setattr(arena, "read_owner", owner)
+    try:
+        first = board.frontier()
+        assert "planning session session: not found" in trace(board, "c")
+        assert board.frontier() == first
+        assert any("llm planner-call " in line for line in trace(board, "c"))
+        assert reads == [1, 1]
+        board.frontier()
+        assert reads == [1, 1]
+    finally:
+        board.close()
