@@ -299,6 +299,34 @@ async def test_charge_reservation_settles_the_estimate(tmp_path: Path) -> None:
         assert run.charged(scope) == ESTIMATE
 
 
+async def test_cache_hit_and_unknown_spend_flags_are_rejected(tmp_path: Path) -> None:
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        with pytest.raises(ValueError, match="LLM record preparation failed") as caught:
+            await record_call(
+                **record_kwargs(
+                    meta,
+                    cache_hit=True,
+                    charge_reservation=True,
+                    status="error",
+                    error="CONTRADICTORY_FLAGS_SECRET",
+                    usage=Usage(),
+                    cost_usd=0,
+                )
+            )
+        assert_secret_absent(caught.value, "CONTRADICTORY_FLAGS_SECRET")
+        await run.journal.commit()
+        assert run.calls() == []
+        assert run.charged(scope) == ESTIMATE
+        with pytest.raises(ValueError, match="LLM record preparation failed"):
+            await drain(scope, wait=False)
+        (placeholder,) = run.calls()
+        assert placeholder.id == meta["call_id"]
+        assert placeholder.cache_hit is False
+        assert run.charged(scope) == ESTIMATE
+        assert list(run.state().llm_calls) == [meta["call_id"]]
+
+
 async def test_settle_error_after_claim_wakes_drain_and_reraises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -489,6 +489,8 @@ def _prepare_call(
     cache_hit = kwargs["cache_hit"]
     if type(cache_hit) is not bool:
         raise ValueError("invalid cache_hit")
+    if cache_hit and kwargs["charge_reservation"]:
+        raise ValueError("cache_hit and charge_reservation are mutually exclusive")
     estimated = kwargs["charge_reservation"] and entry is not None
     overflow = not cache_hit and cost > USD_LIMIT and not estimated
     if estimated:

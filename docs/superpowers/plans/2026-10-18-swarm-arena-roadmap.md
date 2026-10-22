@@ -2603,6 +2603,10 @@ own calls; it never closes the tranche. Owned exit drains every scope before
 closing each distinct tranche once, and closes only when that tranche's count
 reaches zero. Direct and batched reservations follow the same ownership rule.
 
+`cache_hit=True` together with `charge_reservation=True` is malformed input:
+reject it value-free during preparation, before adoption. Unknown-spend fallback
+must never turn a cache hit into a paid call.
+
 ### R4.14 Journal event types — M1b (additions noted)
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
