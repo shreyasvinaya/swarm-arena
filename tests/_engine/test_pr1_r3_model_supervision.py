@@ -4,7 +4,10 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, get_ident
+from typing import Any
 
 import anyio
 import pytest
@@ -61,7 +64,7 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
         stopped = (
             (tmp_path / "done.json").exists() if cause == "stop" else process.poll() is not None
         )
-        # The fake serializer releases itself after 12 s; completion must come first.
+        # The serializer stays held until cleanup releases it (60 s backstop only).
         serializer_returned = (tmp_path / "dump-exited").exists()
         after = (tmp_path / "heartbeat").read_text()
         evidence = {
@@ -97,3 +100,36 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
             if process.poll() is None:
                 process.kill()
                 process.communicate(timeout=5)
+
+
+def test_serializer_marker_is_published_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes import pr1_r3_models as fake
+
+    monkeypatch.setattr(fake, "ROOT", tmp_path)
+    monkeypatch.setattr(fake, "LOOP_THREAD", get_ident())
+    marker = tmp_path / "dump-entered"
+    (tmp_path / "release").write_text("release")
+    opened, release_write = Event(), Event()
+    original_write = Path.write_text
+
+    def paused_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if path.parent == tmp_path and path.name.startswith("dump-entered"):
+            original_write(path, "", *args, **kwargs)
+            opened.set()
+            assert release_write.wait(10), "marker write was not released"
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", paused_write)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(fake.BlockingScore.maximize(1.0).model_dump)
+        try:
+            assert opened.wait(10), "serializer did not start publishing"
+            assert not marker.exists(), "reader can observe an incomplete marker"
+        finally:
+            release_write.set()
+            result.result(timeout=10)
+    thread_ids = json.loads(marker.read_text())
+    assert thread_ids["loop_thread"] == get_ident()
+    assert thread_ids["hook_thread"] != get_ident()

@@ -226,6 +226,11 @@ start and report `NO_RESULT` with reason `stopped`. A stop arriving during
 convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
 
+When budget exhaustion races with a new tool request, `LimitReached.limit` may
+be `budget` at the budget gate or `stop` after the round closes admission.
+Both outcomes refuse new work. Recovery retains the charged lost reservation
+and the recovered ledger balances regardless of which refusal arrives first.
+
 A graceful stop that preempts the round policy journals the default `Decision()`
 without pruning. If a stop or deadline cuts a judging barrier short, candidates
 that have no ranking score stay unranked even after resume. The round closes,
