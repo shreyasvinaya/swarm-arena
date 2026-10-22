@@ -263,7 +263,7 @@ async def test_outbound_merge_keeps_metadata_caps_cache_and_retry_authority(
     tmp_path: Path, bypass: bool
 ) -> None:
     capture = FakeModel([FakeTurn(text="ok")])
-    policy = CachePolicy(backend="disk", namespace="approved")
+    policy = CachePolicy(backend="disk", disk_dir=str(tmp_path / "cache"), namespace="approved")
     caller = ModelSettings(
         max_tokens=9000,
         metadata={"reservation_id": "forged"},
