@@ -4,7 +4,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from swarm_arena._cli import arena_cmds
+from swarm_arena._cli import arena_cmds, plan_cmd
 from swarm_arena._cli.run_cmds import register
 from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
 from swarm_arena._version import __version__
@@ -20,6 +20,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     register(sub)
     arena_cmds.register(sub)
+    plan_cmd.register(sub)
     return parser
 
 

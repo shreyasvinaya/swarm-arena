@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `swarm-arena plan` validates and estimates manual plans or saves catalog-admitted
+  LLM and terminal-reviewed proposals with planning-session provenance, safe output
+  handling, and shared interrupt cleanup.
+
 - Candidate trace and board pages show recorded planner, manager, tool and judge
   LLM calls, standalone planning provenance, cache origins and trace URLs; run
   pages report per-agent prompt-cache rates and response-cache hit counts from
