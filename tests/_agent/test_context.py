@@ -253,7 +253,7 @@ async def test_extra_action_counts_as_board_read(ctx_env: CtxEnv) -> None:
     ctx = await ctx_env.script_ctx()
     assert await ctx.call_action("list_files", {}) == {
         "files": ["problem/a.phyk", "problem/run.py"]
-    }  # M1a Task 19 shape
+    }
     assert ctx_env.counters.board_reads == 1
     with pytest.raises(SoftError):
         await ctx.call_action("nope", {})
