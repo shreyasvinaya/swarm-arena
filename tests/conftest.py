@@ -191,12 +191,21 @@ async def finished_run(tmp_path: Path, anyio_backend: str) -> "FinishedRun":
     return run
 
 
+def pytest_sessionstart() -> None:
+    """Report a pre-existing default disk cache once, before collecting tests."""
+    if (Path.cwd() / ".litellm_cache").exists():
+        pytest.exit(
+            "pre-existing LiteLLM disk cache in cwd: remove it before running tests",
+            returncode=1,
+        )
+
+
 @pytest.fixture(autouse=True)
 def no_cwd_disk_cache() -> Iterator[None]:
-    """Reject LiteLLM's default disk directory without importing optional extras."""
-    working_dir = Path.cwd()
+    """Reject a default disk directory created during the current test."""
+    cache = Path.cwd() / ".litellm_cache"
+    existed = cache.exists()
     yield
-    for directory in {working_dir, Path.cwd()}:
-        assert not (directory / ".litellm_cache").exists(), (
-            "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
-        )
+    assert existed or not cache.exists(), (
+        "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
+    )
