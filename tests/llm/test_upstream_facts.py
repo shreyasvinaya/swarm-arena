@@ -976,6 +976,7 @@ async def test_metered_call_has_one_provider_dispatch_with_retry_policy(
 
     from swarm_arena import RunConfig as ArenaRunConfig
     from swarm_arena._budget.llm_scope import llm_scope
+    from swarm_arena._errors import ProviderFailed, _core_category, _SignalCategory
     from swarm_arena._journal.llm_record import drain
     from swarm_arena.config import ModelCatalog, ModelSpec
     from swarm_arena.llm._hooks import MeteredModel
@@ -1033,7 +1034,9 @@ async def test_metered_call_has_one_provider_dispatch_with_retry_policy(
                 error = caught
         await drain(scope, wait=False)
         assert len(attempts) == 1
-        assert isinstance(error, litellm.InternalServerError)
+        assert isinstance(error, ProviderFailed)
+        assert error.provider == "openai"
+        assert _core_category(error) is _SignalCategory.PROVIDER
         assert len(model.call_ids) == len(owned.calls()) == 1
         assert attempts[0]["metadata"]["reservation_id"] == owned.calls()[0].reservation_id
         assert attempts[0]["num_retries"] == attempts[0]["max_retries"] == 0
