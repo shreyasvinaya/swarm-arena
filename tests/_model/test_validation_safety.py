@@ -1,6 +1,7 @@
 """Exercise the shared validation boundary and stable diagnostics."""
 
 import ast
+import gc
 import importlib
 import importlib.metadata
 import json
@@ -185,7 +186,10 @@ def _model_classes() -> list[type[BaseModel]]:
         ]
     )
     _import_modules(swarm_arena.__path__, "swarm_arena.")
-    found.extend(_runtime_models())
+    # Subclass registries are weak: discard unreachable factory classes before
+    # inventorying live models, identically in every pytest worker.
+    gc.collect()
+    found.extend(sorted(_runtime_models(), key=lambda cls: (cls.__module__, cls.__qualname__)))
     return list(dict.fromkeys(found))
 
 
@@ -427,3 +431,16 @@ def test_root_catalog_redacts_data_keys_colliding_with_schema_names() -> None:
     assert_secret_absent(caught.value, secret, sanitized=True)
     # RootModel.root is a serialization field, not an input mapping key identifier.
     assert all(item["loc"][0] == "<…>" for item in caught.value.errors())
+
+
+def test_inventory_ignores_unreachable_dynamic_models() -> None:
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        compile_object_schema("UnreachableInventoryProbe", {"count": {"type": "integer"}})
+        models = _model_classes()
+        assert "UnreachableInventoryProbe" not in {model.__name__ for model in models}
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
