@@ -2642,6 +2642,129 @@ async def test_llm_judge_usage_overflow_finishes_run(
     assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])
 
 
+@pytest.mark.parametrize("retry", [False, True])
+async def test_graceful_stop_judging_outlives_settlement_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry: bool
+) -> None:
+    pytest.importorskip("agents")
+    import asyncio
+
+    import anyio
+    import litellm  # noqa: TID251 - real provider failure classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._journal.llm_record import _bindings
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    entered = [anyio.Event() for _ in range(3 if retry else 2)]
+    release = [anyio.Event() for _ in entered]
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            metadata = args[2].metadata or {}
+            index = len(calls)
+            calls.append(metadata["round"])
+            entered[index].set()
+            await release[index].wait()
+            if retry and index == 0:
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE_PROVIDER_DIAGNOSTIC", llm_provider="fake", model="scorer"
+                )
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            return await FakeModel(
+                [
+                    FakeTurn(
+                        text=json.dumps(
+                            {
+                                "scores": [
+                                    {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                    for i in range(len(rows))
+                                ]
+                            }
+                        )
+                    )
+                ]
+            ).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    barrier = GoalRunner._barrier
+
+    async def stop_before_barrier(self: GoalRunner, *args: Any, **kwargs: Any) -> bool:
+        self.deps.stops.stop = True
+        return await barrier(self, *args, **kwargs)
+
+    monkeypatch.setattr(GoalRunner, "_barrier", stop_before_barrier)
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    task = asyncio.create_task(
+        Swarm(config).run(
+            _plan(teams=1, rounds=1, judges=[panel], ranking="panel"), run_id="graceful"
+        )
+    )
+
+    def finished(completed: asyncio.Task[Any]) -> None:
+        for event in entered:
+            event.set()
+
+    task.add_done_callback(finished)
+    try:
+        for index, event in enumerate(entered):
+            with anyio.fail_after(10):
+                await event.wait()
+            if task.done():
+                await task
+                break
+            # Hold actual judge work, after proving that the invocation entered.
+            # Each call stays well inside its judge/round/run limits.
+            if index:
+                with anyio.move_on_after(config.settle_timeout_s + 0.5):
+                    await anyio.Event().wait()
+            release[index].set()
+        with anyio.fail_after(10):
+            result = await task
+    finally:
+        for event in release:
+            event.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    events = all_events(config)
+    assert calls == (["1", "0", "0"] if retry else ["1", "0"])
+    assert result["g"]
+    assert [e for e in events if e.type == "goal_finished"]
+    assert not [e for e in events if e.type == "judge_error"]
+    assert (Path(config.run_root) / "graceful/goals/g/solution.json").exists()
+    assert "graceful" not in _bindings
+    if retry:
+        assert len([e for e in events if e.payload.get("barrier_batch", {}).get("retry_of")]) == 1
+
+
 @pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
 async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
     pytest.importorskip("agents")

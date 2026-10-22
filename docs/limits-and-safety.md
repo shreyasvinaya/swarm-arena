@@ -246,6 +246,13 @@ a fresh score. Executor shutdown is also shielded and bounded by that same
 setting. A shutdown timeout preserves the original result or exception, and
 shutdown failure never replaces an exception already raised by the run.
 
+After a graceful `stop`, reserve-funded barrier and final judging, including a
+paused-ranking retry at converge, retain their judge/round timeouts and the run
+deadline. Their combined duration does not consume one `settle_timeout_s`
+window. Each post-stop accounting/storage wait remains bounded, and real
+drain/teardown has its own settlement allowance after that work. Teardown
+deadline expiry raises the value-free `stop cleanup timed out` error.
+
 Stop files are scoped to the live ownership epoch: `control/stop-e<epoch>` and
 `control/stop-now-e<epoch>`, polled every two seconds. An old stop file does not
 stop a resumed epoch. `Swarm.stop(now=True)` requests the immediate mode in
