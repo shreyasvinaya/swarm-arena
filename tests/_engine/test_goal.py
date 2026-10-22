@@ -1558,7 +1558,9 @@ async def test_curator_cancellation_retains_settlement_finality(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.create_task(runner._curate_round(1))
     else:
-        with anyio.fail_after(3):
+        # A missing report uses the full settlement allowance before durable
+        # close; leave headroom for stop detection, I/O, and CI scheduling.
+        with anyio.fail_after(5 * env.deps.config.settle_timeout_s):
             async with anyio.create_task_group() as group:
                 group.start_soon(runner._curate_round, 1)
                 await pending.wait()
