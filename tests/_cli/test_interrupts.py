@@ -2,6 +2,9 @@
 
 import asyncio
 import signal
+import subprocess
+import sys
+from pathlib import Path
 
 import anyio
 import pytest
@@ -68,4 +71,77 @@ async def test_nested_prompt_and_grace_restore_outer_callback() -> None:
         arrived = anyio.Event()
         await send()
     assert calls == ["outer", "grace", "outer"]
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_third_interrupt_finishes_runner_once(tmp_path: Path) -> None:
+    code = """
+import asyncio, gc, json, signal
+import anyio
+from swarm_arena._cli.run_cmds import _interruptible
+
+errors = []
+async def operation():
+    loop = asyncio.get_running_loop()
+    def report(loop, context):
+        errors.append(context["message"])
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(report)
+    loop.call_soon(signal.raise_signal, signal.SIGINT)
+    try:
+        await anyio.sleep_forever()
+    finally:
+        with anyio.CancelScope(shield=True):
+            loop.call_soon(signal.raise_signal, signal.SIGINT)
+            loop.call_soon(signal.raise_signal, signal.SIGINT)
+            await anyio.sleep_forever()
+
+caught = 0
+try:
+    anyio.run(_interruptible, operation, backend="asyncio")
+except KeyboardInterrupt:
+    caught += 1
+gc.collect()
+print(json.dumps({
+    "caught": caught,
+    "restored": signal.getsignal(signal.SIGINT) is signal.default_int_handler,
+    "errors": errors,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    import json
+
+    assert json.loads(result.stdout) == {"caught": 1, "restored": True, "errors": []}
+    assert "never retrieved" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+async def test_nested_owner_restore_never_removes_signal_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    remove = loop.remove_signal_handler
+    removed = []
+
+    def observe(sig: int) -> bool:
+        removed.append(sig)
+        return remove(sig)
+
+    def interrupt() -> None:
+        pass
+
+    monkeypatch.setattr(loop, "remove_signal_handler", observe)
+    before = signal.getsignal(signal.SIGINT)
+    with _sigint_wakeup(interrupt):
+        with _sigint_wakeup(interrupt):
+            pass
+        assert removed == []
+    assert removed == [signal.SIGINT]
     assert signal.getsignal(signal.SIGINT) is before

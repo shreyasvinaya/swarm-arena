@@ -97,9 +97,9 @@ async def _interruptible(operation: Callable[[], Awaitable[None]]) -> None:
         with _sigint_wakeup(interrupt):
             await operation()
     except asyncio.CancelledError:
-        if not interrupts:
+        if not interrupts or interrupts >= 3:
             raise
-    if interrupts:
+    if 0 < interrupts < 3:
         raise KeyboardInterrupt
 
 
@@ -120,11 +120,11 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
     # Python runs it. add_signal_handler installs a wakeup fd written by the
     # low-level signal handler, including when a worker receives the signal.
     def interrupt() -> None:
-        if on_interrupt is not None:
-            on_interrupt()
-            return
         try:
-            handler(signal.SIGINT, None)
+            if on_interrupt is not None:
+                on_interrupt()
+            else:
+                handler(signal.SIGINT, None)
         except (KeyboardInterrupt, SystemExit):
             # An escaping callback ends Runner.run before prompt cleanup.
             # Expose its handler now so its restoration check can succeed.
@@ -140,17 +140,17 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
     finally:
         _interrupt_owner.reset(token)
         current_handler = signal.getsignal(signal.SIGINT)
-        loop.remove_signal_handler(signal.SIGINT)
-        # Removal resets SIGINT to default_int_handler. Restore the saved
-        # handler only while we still own the temporary one; otherwise retain
-        # the current owner's handler, including Runner's earlier restoration.
-        if current_handler is temporary_handler:
-            if owner is not None:
-                loop.add_signal_handler(signal.SIGINT, owner)
-            else:
+        if current_handler is temporary_handler and owner is not None:
+            # Replace the callback without dropping the wakeup fd or SIGINT ownership.
+            loop.add_signal_handler(signal.SIGINT, owner)
+        else:
+            loop.remove_signal_handler(signal.SIGINT)
+            # Removal resets SIGINT to default_int_handler. Restore only the
+            # handler we still own; retain any earlier Runner restoration.
+            if current_handler is temporary_handler:
                 signal.signal(signal.SIGINT, handler)
-        elif signal.getsignal(signal.SIGINT) is not current_handler:
-            signal.signal(signal.SIGINT, current_handler)
+            elif signal.getsignal(signal.SIGINT) is not current_handler:
+                signal.signal(signal.SIGINT, current_handler)
 
 
 async def _readline(stdin: TextIO) -> str:
