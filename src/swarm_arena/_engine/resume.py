@@ -538,7 +538,8 @@ async def _take_over(
                     stops is not None and (stops.stop or stops.stop_now or stops.run_timeout)
                 ):
                     raise _core_error(
-                        RuntimeError, "review import stopped" if review else "resume initialization stopped"
+                        RuntimeError,
+                        "review import stopped" if review else "resume initialization stopped",
                     )
                 return lease
             except BaseException:
