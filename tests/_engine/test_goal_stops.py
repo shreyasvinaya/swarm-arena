@@ -4,6 +4,7 @@ import json
 import threading
 from collections.abc import Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -13,7 +14,7 @@ from _fakes.engine import EngineEnv
 from _fakes.planners import SequencePlanner
 from _fakes.tools import ProviderJudge
 
-from swarm_arena import Goal, Plan, ProgramJudge, Ref, RunConfig
+from swarm_arena import Goal, Limits, Plan, ProgramJudge, Ref, RunConfig
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
@@ -788,7 +789,9 @@ async def test_writer_timeout_bypasses_component_error_handlers(
 
 
 @pytest.mark.parametrize("site", ["final", "replan", "policy"])
-@pytest.mark.parametrize("kind", ["cleanup", "overflow", "fence", "validation", "cancel", "group"])
+@pytest.mark.parametrize(
+    "kind", ["cleanup", "overflow", "fence", "limit", "validation", "cancel", "group"]
+)
 @pytest.mark.parametrize("nested", [False, True])
 async def test_goal_handlers_use_registered_categories(
     env: EngineEnv,
@@ -811,6 +814,7 @@ async def test_goal_handlers_use_registered_categories(
             LimitReached, "usage_overflow", "budget exhausted by usage overflow"
         ),
         "fence": _core_error(Fenced, "run ownership lost"),
+        "limit": _core_error(LimitReached, "budget", "budget used up"),
         "validation": _core_error(ValueError, "invalid field"),
         "cancel": _classify_outcome(asyncio.CancelledError(secret)),
         "group": _classify_outcome(BaseExceptionGroup(secret, [asyncio.CancelledError(secret)])),
@@ -851,11 +855,21 @@ async def test_goal_handlers_use_registered_categories(
         assert not env.events("plan_rejected")
         assert not env.events("decision")
         assert not env.events("judge_error")
+    elif kind == "limit" and site == "final":
+        assert await operation == []
+        assert (runner.status, runner.reason) == ("no_result", "final slice used up")
+        assert not env.events("judge_error")
     else:
         await operation
         await env.deps.journal.commit()
         event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
         assert env.events(event_kind)
+        if kind == "limit":
+            payload = env.events(event_kind)[-1].payload
+            if site == "replan":
+                assert payload["errors"] == ["planner error: LimitReached"]
+            else:
+                assert payload["decision"]["policy"] == "policy error: LimitReached"
         assert secret not in str([event.payload for event in env.events(event_kind)])
     assert invocations == [site]
 
@@ -900,3 +914,31 @@ async def test_goal_handler_caller_cancellation_wins_terminal_outcome(
     assert not env.events("plan_rejected")
     assert not env.events("decision")
     assert not env.events("judge_error")
+
+
+class TestPlannerBudgetRefusal:
+    @pytest.fixture
+    def run_config(self, tmp_path: Path, artifact_root: str) -> RunConfig:
+        return RunConfig(
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=artifact_root,
+            lease_ttl_s=60,
+            limits=Limits(max_usd=1, max_tokens=1_000_000),
+        )
+
+    async def test_refused_planner_still_finishes_goal(self, env: EngineEnv) -> None:
+        class BudgetPlanner(SequencePlanner):
+            async def plan(self, goal: Goal, config: RunConfig, history: History | None) -> Plan:
+                scope = current_llm_scope()
+                assert scope is not None
+                await scope.tranche.reserve_call(Amount(usd=50, tokens=10))
+                raise AssertionError("reservation unexpectedly succeeded")
+
+        plan = _plan(teams=1, rounds=2)
+        runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=BudgetPlanner([plan]))
+        with anyio.fail_after(30):
+            outcome = await runner.run()
+        assert outcome.status == "no_result"
+        assert len(env.events("goal_finished")) == 1
+        assert env.events("plan_rejected")[-1].payload["errors"] == ["planner error: LimitReached"]

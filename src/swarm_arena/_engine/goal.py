@@ -36,6 +36,7 @@ from swarm_arena._errors import (
     Fenced,
     PlanError,
     StorageError,
+    _core_category,
     _core_error,
     _exception_type_name,
     _is_core_control,
@@ -1131,7 +1132,7 @@ class GoalRunner:
         except BaseException as error:
             error = boundary.classify(error)
             self.deps.journal._raise_if_fenced()
-            if _is_core_control(error):
+            if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
                 raise error from None
             self.deps.journal.append(
                 self._draft(
@@ -1289,7 +1290,7 @@ class GoalRunner:
         except BaseException as error:
             error = boundary.classify(error)
             self.deps.journal._raise_if_fenced()
-            if _is_core_control(error):
+            if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
                 raise error from None
             decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
