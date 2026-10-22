@@ -79,7 +79,10 @@ async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> N
             stack.enter_context(_registered_manager("opus")),
             stack.enter_context(_registered_manager("sonnet", random=True)),
         ]
-        fakes.extend(stack.enter_context(_registered_judge(alias)) for alias in ("gpt", "haiku"))
+        fakes.extend(
+            stack.enter_context(_registered_judge(alias, prefer_larger_f=True))
+            for alias in ("gpt", "haiku")
+        )
         swarm = Swarm(config)
         result = await swarm.run(plan)
         assert swarm.run_id == run_dir(config).name
@@ -139,16 +142,19 @@ async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> N
         assert {(c.round, c.team, c.agent) for c in produced} == admitted
         assert all(c.output.status == "ok" for c in produced)
         assert plan.ranking_name() == "f"
-        final_scores = [
-            event.payload["score"]
-            for event in events(config, "score")
-            if event.round == 0 and event.payload["score"]["judge"] == "f"
+        barrier_scores = [
+            event.payload["score"] for event in events(config, "score") if event.round != 0
         ]
-        assert final_scores
-        assert events(config, "final_order")[-1].payload["candidate_ids"] == [
-            score["candidate_id"]
-            for score in sorted(final_scores, key=lambda score: score["value"])
-        ]
+        f_scores = {s["candidate_id"]: s["value"] for s in barrier_scores if s["judge"] == "f"}
+        panel_scores = {
+            s["candidate_id"]: s["value"] for s in barrier_scores if s["judge"] == "llm"
+        }
+        assert set(f_scores) == set(panel_scores) == {c.id for c in produced}
+        f_order = sorted(f_scores, key=lambda id: f_scores[id])
+        expected = f_order[: plan.converge.top_n]
+        assert events(config, "final_order")[-1].payload["candidate_ids"] == expected
+        # The advisory panel deliberately prefers the opposite objective order.
+        assert sorted(panel_scores, key=lambda id: panel_scores[id], reverse=True) == f_order[::-1]
 
         # Completed public resumes must not repeat a paid manager or judge call.
         before = all_events(config)

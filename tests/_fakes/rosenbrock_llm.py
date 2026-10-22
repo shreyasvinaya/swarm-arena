@@ -29,14 +29,20 @@ def _micros(usd: float) -> int:
     return int(units)
 
 
-def _judge_turn(n: int, usage: Usage | None) -> FakeTurn:
+def _judge_turn(n: int, usage: Usage | None, *, values: list[float] | None = None) -> FakeTurn:
     from swarm_arena.testing import FakeTurn
 
     return FakeTurn(
         text=json.dumps(
             {
                 "scores": [
-                    {"index": i, "value": float(i), "verdict": "ok", "notes": ""} for i in range(n)
+                    {
+                        "index": i,
+                        "value": float(i) if values is None else values[i],
+                        "verdict": "ok",
+                        "notes": "",
+                    }
+                    for i in range(n)
                 ]
             }
         ),
@@ -45,7 +51,9 @@ def _judge_turn(n: int, usage: Usage | None) -> FakeTurn:
 
 
 @contextmanager
-def _registered_judge(alias: str, *, usage: Usage | None = None) -> Generator[FakeModel]:
+def _registered_judge(
+    alias: str, *, usage: Usage | None = None, prefer_larger_f: bool = False
+) -> Generator[FakeModel]:
     from swarm_arena.testing import FakeModel
 
     with registered_model([], name=alias) as fake, pytest.MonkeyPatch.context() as patch:
@@ -54,7 +62,18 @@ def _registered_judge(alias: str, *, usage: Usage | None = None) -> Generator[Fa
             # Candidate IDs identify the actual batch independently of prompt wrappers.
             ids = set(re.findall(r'"id"\s*:\s*"(c-[^"]+)"', args[1]))
             assert ids
-            delegate = FakeModel([_judge_turn(len(ids), usage)])
+            values = None
+            if prefer_larger_f:
+                candidates = [
+                    json.JSONDecoder().raw_decode(args[1], match.end())[0]
+                    for match in re.finditer(r'"candidate"\s*:\s*', args[1])
+                ]
+                assert len(candidates) == len(ids)
+                assert {c["id"] for c in candidates} == ids
+                # A bounded, increasing score makes this maximizing panel oppose f.
+                objectives = [c["output"]["data"]["f"] for c in candidates]
+                values = [f / (1 + f) for f in objectives]
+            delegate = FakeModel([_judge_turn(len(ids), usage, values=values)])
             response = await delegate.get_response(*args, **kwargs)
             fake.calls.extend(delegate.calls)
             return response
