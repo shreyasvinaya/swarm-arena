@@ -2483,8 +2483,8 @@ async def test_accounting_terminal_never_commits_provider_receipt(
 
     close = GoalRunner._close
 
-    async def fail_close(self: GoalRunner, tranche: Tranche) -> None:
-        await close(self, tranche)
+    async def fail_close(self: GoalRunner, tranche: Tranche, *, wait: bool = True) -> None:
+        await close(self, tranche, wait=wait)
         holder = "judges" if phase == "barrier" else phase
         if tranche._holder.endswith(f"/:{holder}"):
             raise _core_error(
@@ -2943,3 +2943,106 @@ async def test_paused_ranking_retry_obeys_stop_and_join_boundaries(
     assert bool(retries) is permitted
     if not permitted:
         assert env.events("no_result")[-1].payload == {"reason": "no passing candidate"}
+
+
+@pytest.mark.parametrize("mode", ["direct", "recorded", "abandoned"])
+async def test_curator_report_wait_only_counts_recorded_calls_once(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._engine import goal as goal_module
+    from swarm_arena._journal import llm_record as recorder
+
+    runner = await _curation_checkpoint(env)
+    waiting = False
+    allowances: list[float] = []
+    polls: list[float] = []
+    waits: list[int] = []
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal waiting
+        scope = current_llm_scope()
+        assert scope is not None
+        estimate = Amount(usd=0.01)
+        reservation = await scope.tranche.reserve_call(estimate)
+        if mode != "direct":
+            recorder.open_call(
+                scope,
+                reservation_id=reservation,
+                estimate=estimate,
+                model_alias="model",
+                model="fake/model",
+                provider="fake",
+            )
+            entry = recorder._bindings[scope.run_id].pending[reservation]
+            original_wait = entry.event.wait
+
+            async def wait() -> None:
+                waits.append(1)
+                await original_wait()
+
+            class ObservedEvent:
+                async def wait(self) -> None:
+                    await wait()
+
+                def set(self) -> None:
+                    original_event.set()
+
+            original_event = entry.event
+            entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
+            if mode == "abandoned":
+                recorder.abandon_call(scope, reservation)
+        waiting = True
+        raise KeyError("CURATOR_REPORT_SENTINEL")
+
+    @contextmanager
+    def report_timer(seconds: float) -> Any:
+        if waiting:
+            allowances.append(seconds)
+        # Expire a report allowance at its first checkpoint, without a clock race.
+        with anyio.move_on_after(0 if waiting else seconds) as timer:
+            yield timer
+
+    async def poll(seconds: float) -> None:
+        if waiting:
+            polls.append(seconds)
+            pytest.fail("report waiting must use recorder events, never tranche polling")
+        await anyio.lowlevel.checkpoint()
+
+    api = SimpleNamespace(**vars(anyio))
+    api.move_on_after = report_timer
+    api.sleep = poll
+    monkeypatch.setattr(goal_module, "anyio", api)
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    recorder.bind_run(
+        env.deps.run_id,
+        journal=env.deps.journal,
+        ids=env.deps.ids,
+        artifacts=env.deps.artifacts,
+        tracing=env.deps.config.tracing,
+        committed=[],
+        request_sha256={},
+        stops=env.deps.stops,
+        clock=env.deps.clock,
+        limits=env.deps.config.limits,
+        settle_timeout_s=env.deps.config.settle_timeout_s,
+    )
+    try:
+        await runner._curate_round(1)
+    finally:
+        recorder.unbind_run(env.deps.run_id)
+    await env.deps.journal.commit()
+    assert len(env.events("curated")) == 1
+    assert waiting, env.events("curated")[0].payload
+    assert allowances == [env.deps.config.settle_timeout_s]
+    assert polls == []
+    assert waits == ([1] if mode == "recorded" else [])
+    assert len(env.events("llm_call")) == int(mode != "direct")
+    assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01

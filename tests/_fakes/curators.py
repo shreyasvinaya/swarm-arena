@@ -265,12 +265,12 @@ async def refusal_crash_driver(root: str, boundary: str) -> None:
         if hit:
             os._exit(91)
 
-    async def close(self: GoalRunner, tranche: Tranche) -> None:
+    async def close(self: GoalRunner, tranche: Tranche, *, wait: bool = True) -> None:
         if boundary == "reserve_exhausted":
             # Force the valid schedule where the control event commits before
             # receipt admission. The writer still publishes the real journal.
             await self.deps.journal.commit()
-        await original_close(self, tranche)
+        await original_close(self, tranche, wait=wait)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(JournalWriter, "_publish", publish)
