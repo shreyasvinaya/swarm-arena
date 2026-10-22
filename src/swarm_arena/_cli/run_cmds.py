@@ -13,8 +13,9 @@ import asyncio
 import io
 import signal
 import sys
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from os import get_blocking, read, set_blocking
 from pathlib import Path
@@ -73,6 +74,35 @@ def register(sub: argparse._SubParsersAction) -> None:
     resume.set_defaults(handler=_resume)
 
 
+_interrupt_owner: ContextVar[Callable[[], None] | None] = ContextVar(
+    "cli_interrupt_owner", default=None
+)
+
+
+async def _interruptible(operation: Callable[[], Awaitable[None]]) -> None:
+    """Keep repeated SIGINT inside the CLI until cancellation cleanup finishes."""
+    task = asyncio.current_task()
+    assert task is not None
+    interrupts = 0
+
+    def interrupt() -> None:
+        nonlocal interrupts
+        interrupts += 1
+        if interrupts == 1:
+            task.cancel()
+        elif interrupts >= 3:
+            raise KeyboardInterrupt
+
+    try:
+        with _sigint_wakeup(interrupt):
+            await operation()
+    except asyncio.CancelledError:
+        if not interrupts:
+            raise
+    if interrupts:
+        raise KeyboardInterrupt
+
+
 @contextmanager
 def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[None]:
     """Wake the selector even when SIGINT is delivered to another OS thread."""
@@ -81,6 +111,8 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
         yield
         return
     loop = asyncio.get_running_loop()
+    on_interrupt = on_interrupt or _interrupt_owner.get()
+    token = _interrupt_owner.set(on_interrupt)
 
     # Runner's Python signal handler cannot wake an idle main thread until
     # Python runs it. add_signal_handler installs a wakeup fd written by the
@@ -103,6 +135,7 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
     try:
         yield
     finally:
+        _interrupt_owner.reset(token)
         current_handler = signal.getsignal(signal.SIGINT)
         loop.remove_signal_handler(signal.SIGINT)
         # Removal resets SIGINT to default_int_handler. Restore the saved
@@ -210,7 +243,7 @@ def _run(args: argparse.Namespace) -> int:
     if not args.yes and not sys.stdin.isatty():
         print("run requires a terminal or --yes", file=sys.stderr)
         return 2
-    anyio.run(_run_async, args, backend="asyncio")
+    anyio.run(_interruptible, partial(_run_async, args), backend="asyncio")
     return 0
 
 
@@ -221,7 +254,7 @@ async def _status_async(run_dir: Path) -> None:
 
 def _status(args: argparse.Namespace) -> int:
     """Dispatch status using the asyncio backend."""
-    anyio.run(_status_async, args.run_dir.resolve(), backend="asyncio")
+    anyio.run(_interruptible, partial(_status_async, args.run_dir.resolve()), backend="asyncio")
     return 0
 
 
@@ -229,6 +262,7 @@ def _stop(args: argparse.Namespace) -> int:
     """Request the selected run's current epoch stop key."""
     run_dir = args.run_dir.resolve()
     anyio.run(
+        _interruptible,
         partial(request_stop, str(run_dir.parent), run_dir.name, now=args.now),
         backend="asyncio",
     )
@@ -248,5 +282,5 @@ async def _resume_async(args: argparse.Namespace) -> None:
 def _resume(args: argparse.Namespace) -> int:
     """Dispatch resume using the asyncio backend."""
     args.run_dir = args.run_dir.resolve()
-    anyio.run(_resume_async, args, backend="asyncio")
+    anyio.run(_interruptible, partial(_resume_async, args), backend="asyncio")
     return 0
