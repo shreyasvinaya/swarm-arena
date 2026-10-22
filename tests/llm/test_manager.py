@@ -1047,6 +1047,51 @@ else:
     assert len(fake.calls) == 1
 
 
+async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import WRITE, PyTool
+
+    cfg = config(
+        limits=Limits(max_tokens=10_000_000, max_usd=100, max_tool_runs_per_round=1),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    current = plan(rounds=1, tool=PyTool({"code": WRITE.format("{'data': {'y': 1.0}}")}))
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(path="swarm_arena.llm:AgentsSDKManager", config={"model": "opus"})
+            }
+        )
+    )
+    fake = register(
+        [
+            FakeTurn(
+                tool_calls=(("run_tool", {"inputs": {"n": 1}}), ("run_tool", {"inputs": {"n": 2}}))
+            ),
+            finish("must not run"),
+        ]
+    )
+    with anyio.fail_after(20):
+        await Swarm(cfg).run(current, run_id="owned-cap")
+    events = all_events(cfg)
+    (start,) = [event for event in events if event.type == "tool_start"]
+    (end,) = [event for event in events if event.type == "tool_end"]
+    assert start.task_id == end.task_id
+    assert end.payload["candidate"]["output"]["data"] == {"y": 1.0}
+    assert {event.payload["reservation"]["id"] for event in events if event.type == "reserve"} == {
+        event.payload["id"] for event in events if event.type == "settle"
+    }
+    status = next(event for event in events if event.type == "agent_status")
+    assert status.payload["status"] != "starved"
+    assert status.payload["reason"] == "limit reached"
+    assert end.seq < status.seq
+    assert len(fake.calls) == 1
+
+
 @pytest.mark.parametrize("owner", ["task", "scope"])
 async def test_caller_cancellation_gracefully_finishes_owned_tool_without_cancelling_peer(
     tmp_path: Path, ctx_env: CtxEnv, owner: str
