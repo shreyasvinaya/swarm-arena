@@ -187,23 +187,39 @@ def test_output_outside_goal_dir_is_a_usage_error(
     assert not Path(files.config.run_root).exists()
 
 
-@pytest.mark.parametrize("target", ["directory", "symlink"])
+@pytest.mark.parametrize("target", ["directory", "dangling", "symlink"])
+@pytest.mark.parametrize("force", [False, True])
 def test_output_target_errors_are_safe(
-    files: PlanningFiles, target: str, capsys: pytest.CaptureFixture[str]
+    files: PlanningFiles,
+    target: str,
+    force: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     pytest.importorskip("agents")
+    from swarm_arena._cli import plan_cmd
+
+    fake = fake_planner()
     out = files.output()
     if target == "directory":
-        fake_planner()
         out.mkdir()
     else:
-        outside = files.run.parent / SECRET
-        outside.write_text(SECRET)
-        out.symlink_to(outside)
-    assert call("plan", "--llm", "--model", "planner", "--force", files.run, files.goal) in {1, 2}
+        destination = out.parent / SECRET
+        if target == "symlink":
+            destination.write_text(SECRET)
+        out.symlink_to(destination)
+
+    def unexpected_runner(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid output entered the async runner")
+
+    monkeypatch.setattr(plan_cmd.anyio, "run", unexpected_runner)
+    flags = ["--force"] if force else []
+    assert call("plan", "--llm", "--model", "planner", *flags, files.run, files.goal) == 1
     captured = capsys.readouterr()
     assert SECRET not in captured.err
     assert "planning session:" not in captured.out
+    assert not fake.calls
+    assert not Path(files.config.run_root).exists()
 
 
 def test_missing_extra_has_safe_install_hint(
@@ -337,7 +353,10 @@ def test_success_inside_synchronous_except(files: PlanningFiles) -> None:
     assert files.output().exists()
 
 
-def test_together_prompt_repeated_sigint_finishes_owned_cleanup(tmp_path: Path) -> None:
+@pytest.mark.parametrize("interrupts", [2, 3])
+def test_together_prompt_repeated_sigint_finishes_owned_cleanup(
+    tmp_path: Path, interrupts: int
+) -> None:
     pytest.importorskip("agents")
     import pty
     import select
@@ -350,28 +369,54 @@ def test_together_prompt_repeated_sigint_finishes_owned_cleanup(tmp_path: Path) 
     result = tmp_path / "result.json"
     code = f"""
 import json, os, signal, termios
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 import anyio
 from _fakes.plan_cli import planning_files
 from _fakes.planning_llm import planner_output
 from _fakes.run import all_events
-from swarm_arena._cli import plan_cmd
+from swarm_arena._cli import plan_cmd, run_cmds
 from swarm_arena._cli.main import main
 from swarm_arena.testing import FakeModel, FakeTurn
 files = planning_files(Path.cwd())
 FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
+wakeup = run_cmds._sigint_wakeup
+@contextmanager
+def observed_wakeup(on_interrupt=None):
+    count = 0
+    def observed():
+        nonlocal count
+        count += 1
+        try:
+            on_interrupt()
+        except KeyboardInterrupt:
+            if count == 3:
+                print('received-third-force', flush=True)
+            raise
+        if count == 2:
+            print('received-second', flush=True)
+    with wakeup(observed if on_interrupt is not None else None):
+        yield
+run_cmds._sigint_wakeup = observed_wakeup
 original = plan_cmd.planning_session
+async def hold():
+    with anyio.CancelScope(shield=True):
+        print('cleanup-ready', flush=True)
+        await anyio.wait_readable({release_read})
+        os.read({release_read}, 1)
 @asynccontextmanager
 async def held_cleanup(*args):
-    async with original(*args) as scope:
-        try:
-            yield scope
-        finally:
-            with anyio.CancelScope(shield=True):
-                print('cleanup-ready', flush=True)
-                await anyio.wait_readable({release_read})
-                os.read({release_read}, 1)
+    try:
+        async with original(*args) as scope:
+            try:
+                yield scope
+            finally:
+                if {interrupts} == 2:
+                    await hold()
+    finally:
+        # Exercise force-exit after real journal cleanup, without cancelling its tasks.
+        if {interrupts} == 3:
+            await hold()
 plan_cmd.planning_session = held_cleanup
 handler = signal.getsignal(signal.SIGINT)
 before = termios.tcgetattr(0)
@@ -400,7 +445,6 @@ Path({str(result)!r}).write_text(json.dumps({{
     os.close(slave)
     os.close(release_read)
     output = bytearray()
-    reaped = False
 
     def until(marker: bytes) -> None:
         deadline = time.monotonic() + 60
@@ -417,12 +461,15 @@ Path({str(result)!r}).write_text(json.dumps({{
         os.write(master, b"\x03")
         until(b"cleanup-ready")
         os.write(master, b"\x03")
+        until(b"received-second")
+        if interrupts == 3:
+            os.write(master, b"\x03")
+            until(b"received-third-force")
         os.write(release_write, b"x")
         deadline = time.monotonic() + 30
         while True:
             status = process.poll()
             if status is not None:
-                reaped = True
                 break
             assert time.monotonic() < deadline, bytes(output)
             if select.select([master], [], [], 0.05)[0]:
@@ -440,9 +487,12 @@ Path({str(result)!r}).write_text(json.dumps({{
         assert b"Traceback" not in output
         assert b"never retrieved" not in output
     finally:
-        with suppress(ProcessLookupError):
+        # Reap an exited child before signalling its process group (macOS zombies).
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
-        if not reaped:
+        if process.poll() is None:
             process.kill()
         process.wait(timeout=10)
         os.close(master)
@@ -602,3 +652,145 @@ assert main(['plan', '--llm', '--model', 'planner',
     assert "swarm-arena[llm]" in proc.stderr
     assert SECRET not in proc.stderr
     assert not Path(files.config.run_root).exists()
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("stage", ["start", "sync"])
+def test_output_interrupt_abandons_publication(tmp_path: Path, force: bool, stage: str) -> None:
+    pytest.importorskip("agents")
+    code = f"""
+import json, os, signal, threading
+from pathlib import Path
+from _fakes.plan_cli import planning_files
+from _fakes.planning_llm import planner_output
+from swarm_arena._cli import plan_cmd
+from swarm_arena._cli.main import main
+from swarm_arena.testing import FakeModel, FakeTurn
+files = planning_files(Path.cwd())
+FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
+if {force!r}:
+    files.output().write_text('original')
+started, release, finished = threading.Event(), threading.Event(), threading.Event()
+write = plan_cmd._write_plan
+fsync = os.fsync
+local = threading.local()
+def hold():
+    started.set()
+    assert release.wait(20)
+def sync(fd):
+    if getattr(local, 'writing', False) and {stage!r} == 'sync':
+        hold()
+    return fsync(fd)
+plan_cmd.os.fsync = sync
+def held(*args):
+    try:
+        local.writing = True
+        if {stage!r} == 'start':
+            hold()
+        return write(*args)
+    finally:
+        finished.set()
+plan_cmd._write_plan = held
+def interrupt():
+    assert started.wait(20)
+    os.kill(os.getpid(), signal.SIGINT)
+worker = threading.Thread(target=interrupt)
+worker.start()
+try:
+    status = main(['plan', '--llm', '--model', 'planner',
+                   *(['--force'] if {force!r} else []), str(files.run), str(files.goal)])
+finally:
+    release.set()
+    worker.join(20)
+assert not worker.is_alive()
+assert finished.wait(20)
+assert status == 130, status
+assert files.output().read_text() == 'original' if {force!r} else not files.output().exists()
+assert not list(files.goal.parent.glob('.swarm-plan-*'))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "interrupted" in proc.stderr
+    assert "plan written:" not in proc.stdout
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_output_preserves_permissions(tmp_path: Path, force: bool) -> None:
+    from swarm_arena._cli.plan_cmd import _write_plan
+
+    output = tmp_path / "plan.toml"
+    if force:
+        output.write_text("old")
+        output.chmod(0o604)
+    previous = os.umask(0o027)
+    try:
+        _write_plan(output, "new", force)
+    finally:
+        os.umask(previous)
+    assert output.read_text() == "new"
+    assert output.stat().st_mode & 0o777 == (0o604 if force else 0o640)
+    assert not list(tmp_path.glob(".swarm-plan-*"))
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_output_is_synced_before_publication(
+    tmp_path: Path, force: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    from swarm_arena._cli import plan_cmd
+
+    output = tmp_path / "plan.toml"
+    if force:
+        output.write_text("old")
+    synced: set[str] = set()
+    fsync = os.fsync
+    publish = os.replace if force else os.link
+
+    def sync(fd: int) -> None:
+        synced.add("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        fsync(fd)
+
+    def observed(source: Any, destination: Any) -> None:
+        assert synced == {"file", "directory"}
+        assert Path(source).read_text() == "new"
+        publish(source, destination)
+
+    monkeypatch.setattr(plan_cmd.os, "fsync", sync)
+    monkeypatch.setattr(plan_cmd.os, "replace" if force else "link", observed)
+    plan_cmd._write_plan(output, "new", force)
+    assert output.read_text() == "new"
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("stage", ["file", "directory"])
+def test_output_sync_failure_preserves_destination(
+    tmp_path: Path, force: bool, stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    from swarm_arena._cli import plan_cmd
+
+    output = tmp_path / "plan.toml"
+    if force:
+        output.write_text("old")
+    fsync = os.fsync
+
+    def fail(fd: int) -> None:
+        kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        if kind == stage:
+            raise OSError("sync failed")
+        fsync(fd)
+
+    monkeypatch.setattr(plan_cmd.os, "fsync", fail)
+    with pytest.raises(OSError, match="sync failed"):
+        plan_cmd._write_plan(output, "new", force)
+    assert output.read_text() == "old" if force else not output.exists()
+    assert not list(tmp_path.glob(".swarm-plan-*"))

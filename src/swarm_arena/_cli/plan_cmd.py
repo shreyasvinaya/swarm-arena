@@ -2,10 +2,12 @@
 
 import argparse
 import os
+import stat
 import sys
 from functools import partial
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from secrets import token_hex
+from threading import Event
 
 import anyio
 from pydantic import ValidationError
@@ -79,23 +81,42 @@ def _manual(config: RunConfig, source: Path) -> tuple[Amount, list[str]]:
     return estimate, warnings
 
 
-def _write_plan(path: Path, text: str, force: bool) -> None:
-    """Publish complete bytes, preserving an existing file unless explicitly replaced."""
-    temporary: Path | None = None
+def _write_plan(path: Path, text: str, force: bool, cancelled: Event | None = None) -> None:
+    """Sync complete bytes and publish only while the awaiting CLI still owns the write."""
+    temporary = path.parent / f".swarm-plan-{token_hex(16)}"
+    created = False
     try:
-        with NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=".swarm-plan-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
+        mode = None
+        if force and os.path.lexists(path):
+            current = path.lstat().st_mode
+            if not stat.S_ISREG(current):
+                raise _core_error(ValueError, "plan output must be a regular file")
+            mode = stat.S_IMODE(current)
+        # Let open apply the process umask without changing that process-global setting.
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
-        if force:
-            os.replace(temporary, path)
-        else:
-            os.link(temporary, path)
+            stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+            if cancelled is not None and cancelled.is_set():
+                return
+            if force:
+                os.replace(temporary, path)
+            else:
+                os.link(temporary, path)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except FileExistsError:
         raise _core_error(ValueError, "plan output already exists; use --force") from None
     finally:
-        if temporary is not None:
+        if created:
             temporary.unlink(missing_ok=True)
 
 
@@ -127,10 +148,12 @@ async def _generate(args: argparse.Namespace, output: Path) -> None:
         result = mark_planning_session(result, scope)
     # No lease remains: output publication cannot precede failed session cleanup.
     boundary = _Outcome()
+    cancelled = Event()
     try:
         text = await run_sync_daemon(result.dumps)
-        await anyio.to_thread.run_sync(_write_plan, output, text, args.force)
+        await run_sync_daemon(_write_plan, output, text, args.force, cancelled)
     except BaseException as error:
+        cancelled.set()
         boundary.contain(error, ValueError, "plan output")
     print(f"plan written: {output}")
     print(f"planning session: {scope.run_id}")
@@ -168,8 +191,11 @@ def _plan(args: argparse.Namespace) -> int:
         if output.resolve().parent != base_dir or output.parent.resolve() != base_dir:
             print("plan output must be in the goal file's directory", file=sys.stderr)
             return 2
-        if output.exists() and not args.force:
-            raise _core_error(ValueError, "plan output already exists; use --force")
+        if os.path.lexists(output):
+            if not stat.S_ISREG(output.lstat().st_mode):
+                raise _core_error(ValueError, "plan output must be a regular file")
+            if not args.force:
+                raise _core_error(ValueError, "plan output already exists; use --force")
     elif (
         args.model is not None
         or args.instructions is not None

@@ -73,7 +73,12 @@ the working directory. Defaults are `goals/plan.llm.toml` and
 `goals/plan.together.toml`. An existing output is refused with exit 1 unless
 `--force` is supplied; an output outside the goal directory is a usage error
 (exit 2). Publication replaces the complete file atomically and checks for an
-existing file again when publishing without `--force`.
+existing file again when publishing without `--force`. A directory or symlink
+at the output path is refused before the planning session starts, even with
+`--force`. New files use the process umask; replacement preserves the existing
+file's permission mode. The complete file and its directory are synced before
+publication. Cancellation during preparation of the output prevents publication;
+the abandoned worker removes its temporary file when the pending I/O returns.
 
 The goal and catalog files resolve against the goal file's directory, using the
 same parent-directory convention as `Plan.load` even for a symlinked goal file. Source
