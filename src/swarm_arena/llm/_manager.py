@@ -260,12 +260,6 @@ class AgentsSDKManager(Manager):
                                 actions.stop(caller=True)
                                 group.cancel_scope.shield = True
                         group.cancel_scope.shield = True
-                # A completed tool can exhaust the ledger before its result
-                # rendering hits an ordinary context gate. Preserve that source.
-                try:
-                    scope.tranche._ledger._check_usage_overflow()
-                except LimitReached as error:
-                    local_timer.record(error)
                 if local_timer.failure is not None:
                     failure = (
                         BaseExceptionGroup("manager action unwind", [failure, local_timer.failure])

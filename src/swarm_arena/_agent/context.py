@@ -15,6 +15,7 @@ from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, _inflight, _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
+from swarm_arena._budget.amount import USD_LIMIT
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
@@ -599,6 +600,20 @@ class AgentContext:
                 edits=edits,
                 read_ids=read_ids,
             )
+            if (
+                isinstance(inflight, _ActionInflight)
+                and candidate.output.usage.usd is not None
+                and candidate.output.usage.usd > USD_LIMIT
+            ):
+                # Only this returned core result proves an owned overflow source.
+                # Preserve the ledger's registered outcome before a later read
+                # gate can replace it with an ordinary budget limit.
+                try:
+                    self._rt.ledger._check_usage_overflow()
+                except LimitReached as error:
+                    for timer in _local_timers.get():
+                        timer.record(error)
+                    raise
             return self._manager(candidate)
 
     def my_candidates(self) -> list[Candidate]:

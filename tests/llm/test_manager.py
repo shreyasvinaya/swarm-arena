@@ -1342,3 +1342,39 @@ async def test_nested_tool_stops_settle_and_preserve_next_round_budget(
         )
     assert shares["sdk"] == shares["baseline"]
 
+
+async def test_peer_overflow_during_join_preserves_finished_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena.llm._actions import _OwnedActions
+
+    joining, overflowed = anyio.Event(), anyio.Event()
+    original_wait = _OwnedActions.wait
+
+    async def held_join(self: _OwnedActions) -> None:
+        joining.set()
+        await overflowed.wait()
+        await original_wait(self)
+
+    monkeypatch.setattr(_OwnedActions, "wait", held_join)
+    register([finish("keep this report")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        peer = run.scope("manager", agent="peer")
+        reservation = await peer.tranche.reserve_call(Amount(usd=1))
+
+        async def overflow_peer() -> None:
+            await joining.wait()
+            await run.ledger.settle_overflow(reservation, Amount(usd=USD_LIMIT))
+            overflowed.set()
+
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as group:
+                group.start_soon(overflow_peer)
+                with llm_scope(run.scope("manager", agent="finishing")):
+                    report = await AgentsSDKManager(model="opus").run_round(context())
+        assert report.summary == "keep this report"
+        assert any(e.payload.get("usage_overflow") for e in run.events("settle"))
+        with pytest.raises(LimitReached) as caught:
+            await run.ledger.reserve(":run", Amount(usd=1), kind="tool", goal_id="g")
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
