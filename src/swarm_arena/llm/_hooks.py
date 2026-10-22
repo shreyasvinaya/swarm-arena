@@ -28,6 +28,7 @@ from agents.models.interface import ModelTracing
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import TypeAdapter
 
+from swarm_arena._agent.context import _check_provider_admission
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
@@ -47,11 +48,12 @@ from swarm_arena._errors import (
 )
 from swarm_arena._errors import _unwrap_control as _unwrap_control
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._journal.llm_record import abandon_call, open_call
+from swarm_arena._journal.llm_record import abandon_call, open_call, record_call
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.catalog import ModelSpec
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import finite_json
+from swarm_arena._model.tooling import Usage
 from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena.llm._cache import bypass_response_cache, cache_namespace, cache_switches
 from swarm_arena.llm._catalog import build_model, call_estimate
@@ -313,6 +315,9 @@ class MeteredModel(Model):
     """
     Reserve each non-streaming model call against the current LLM scope.
 
+    An owning slot's round deadline and registry also gate provider entry.
+    Closure during settings preparation records a zero-cost refused call.
+
     Parameters
     ----------
     inner : agents.Model
@@ -494,6 +499,7 @@ class MeteredModel(Model):
             if conversation_id is not None
             else None
         )
+        _check_provider_admission()
         if self.admission_check is not None:
             self.admission_check()
         outcome = _Outcome()
@@ -504,6 +510,7 @@ class MeteredModel(Model):
             carrier = _sdk_control(classified)
             raise carrier if carrier is not None else classified from None
         try:
+            _check_provider_admission()
             if self.admission_check is not None:
                 self.admission_check()
             call_id = open_call(
@@ -558,6 +565,30 @@ class MeteredModel(Model):
         request_outcome = _Outcome()
         try:
             sent = await _prepare(settings)
+            try:
+                _check_provider_admission()
+            except LimitReached:
+                # Registration preceded asynchronous settings preparation, but no
+                # provider ran. Record a zero-cost refusal instead of a charged
+                # missing-report placeholder when the owner drains the call.
+                assert sent.metadata is not None
+                await record_call(
+                    metadata=sent.metadata,
+                    model=spec.model,
+                    provider=spec.provider,
+                    usage=Usage(),
+                    cost_usd=0,
+                    cache_hit=False,
+                    latency_ms=None,
+                    status="error",
+                    error="round call admission closed",
+                    request=None,
+                    response=None,
+                    litellm_call_id=None,
+                    tool_call_ids=(),
+                    settle=True,
+                )
+                raise
             response = await self.inner.get_response(
                 request.system,
                 request.items,

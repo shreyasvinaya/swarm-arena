@@ -925,6 +925,79 @@ async def test_caller_cancellation_wins_over_terminal_drain(
             await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_delayed_manager_setup_keeps_engine_round_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import WRITE_THEN_SLEEP
+
+    from swarm_arena._engine.round import RoundRunner
+    from swarm_arena.llm import _manager
+
+    deadlines: list[float] = []
+    manager_deadlines: list[float] = []
+    provider_entries: list[float] = []
+    watch, prepare = RoundRunner._watch, _manager._prepare
+    timer_scope = _manager._local_timer_scope
+    response = FakeModel.get_response
+
+    async def observed_watch(self: RoundRunner, *args: Any) -> None:
+        deadlines.append(args[-1])
+        await watch(self, *args)
+
+    async def held_prepare(hook: Any, *args: Any, **kwargs: Any) -> Any:
+        if hook.__name__ == "prepare":
+            release = anyio.Event()
+            handle = asyncio.get_running_loop().call_at(deadlines[-1] - 1, release.set)
+            try:
+                with anyio.fail_after(10):
+                    await release.wait()
+            finally:
+                handle.cancel()
+        return await prepare(hook, *args, **kwargs)
+
+    def observed_timer(scope: anyio.CancelScope, **kwargs: Any) -> Any:
+        manager_deadlines.append(scope.deadline)
+        return timer_scope(scope, **kwargs)
+
+    async def observed_response(self: FakeModel, *args: Any, **kwargs: Any) -> Any:
+        provider_entries.append(anyio.current_time() - deadlines[-1])
+        return await response(self, *args, **kwargs)
+
+    monkeypatch.setattr(RoundRunner, "_watch", observed_watch)
+    monkeypatch.setattr(_manager, "_prepare", held_prepare)
+    monkeypatch.setattr(_manager, "_local_timer_scope", observed_timer)
+    monkeypatch.setattr(FakeModel, "get_response", observed_response)
+    cfg = config(
+        limits=Limits(max_tokens=10_000_000, max_usd=100, round_timeout_s=3),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    current = plan(rounds=1, tool=PyTool({"code": WRITE_THEN_SLEEP, "grace_s": 3}))
+    register([FakeTurn(tool_calls=(("run_tool", {"inputs": {"n": 1}}),), usage=Usage())])
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(path="swarm_arena.llm:AgentsSDKManager", config={"model": "opus"})
+            }
+        )
+    )
+    with anyio.fail_after(30):
+        await Swarm(cfg).run(current, run_id="delayed-manager")
+    assert provider_entries
+    assert all(value < 0 for value in provider_entries)
+    assert len(provider_entries) == 1
+    assert manager_deadlines == deadlines
+    events = all_events(cfg)
+    assert len([event for event in events if event.type == "tool_start"]) == 1
+    assert {event.payload["reservation"]["id"] for event in events if event.type == "reserve"} == {
+        event.payload["id"] for event in events if event.type == "settle"
+    }
+
+
 async def test_round_timeout_settles_owned_tools_and_preserves_next_round_shares(
     tmp_path: Path,
 ) -> None:

@@ -32,6 +32,9 @@ PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
 
 
 @pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="requires POSIX thread signals")
+@pytest.mark.skipif(
+    not getattr(sys, "_is_gil_enabled", lambda: True)(), reason="requires GIL selector ordering"
+)
 def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
     with subprocess.Popen(
         [sys.executable, "-m", "_fakes.editor_signal", str(tmp_path)],

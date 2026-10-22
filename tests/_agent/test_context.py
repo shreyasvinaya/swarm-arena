@@ -1383,3 +1383,25 @@ async def test_closed_registry_refusal_does_not_charge(
     assert ctx_env.counters.tool_runs == 0
     assert not ctx_env.events("reserve")
     assert not ctx_env.events("tool_start")
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_owned_action_inherits_engine_provider_deadline(expired: bool) -> None:
+    from swarm_arena._agent.context import (
+        _ActionInflight,
+        _check_provider_admission,
+        _provider_round_deadline,
+    )
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+
+    deadline = anyio.current_time() + (-1 if expired else 60)
+    slot = _ActionInflight(Inflight(), round_deadline=deadline)
+    action = _ActionInflight(slot)
+    with track_inflight(action):
+        assert _provider_round_deadline() == deadline
+        if not expired:
+            _check_provider_admission()
+            slot.close()
+        with pytest.raises(LimitReached) as caught:
+            _check_provider_admission()
+        assert caught.value.limit == ("round_timeout_s" if expired else "stop")

@@ -9,7 +9,7 @@ from agents.agent import StopAtTools
 from agents.exceptions import MaxTurnsExceeded
 from pydantic import Field
 
-from swarm_arena._agent.context import AgentContext, _local_timer_scope
+from swarm_arena._agent.context import AgentContext, _local_timer_scope, _provider_round_deadline
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._errors import _core_error, _is_core_control, _stop_cleanup_error
@@ -229,7 +229,10 @@ class AgentsSDKManager(Manager):
 
             agent, input_text = await _prepare(prepare)
             timer = anyio.CancelScope(
-                deadline=anyio.current_time() + scope.limits.effective_round_timeout_s()
+                deadline=min(
+                    _provider_round_deadline(),
+                    anyio.current_time() + scope.limits.effective_round_timeout_s(),
+                )
             )
             with _local_timer_scope(timer, relay_provider_stop=True) as local_timer:
                 async with anyio.create_task_group() as group:
