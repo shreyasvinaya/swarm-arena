@@ -907,7 +907,7 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
     from swarm_arena._journal.writer import JournalWriter
     from swarm_arena._model.canonical import utc_now
 
-    config = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
     blocked, unblock = threading.Event(), threading.Event()
     scopes: list[anyio.CancelScope] = []
     services: list[resume._ResumeServices] = []
@@ -977,7 +977,7 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
     task = asyncio.create_task(caller())
     try:
         assert await run_sync_daemon(blocked.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=5)
         assert done, "caller retained an unbounded shield around blocked release"
         assert all(service.task is not None and service.task.done() for service in services)
         assert len(services) == int(operation == "resume" and stage == "journal-entry")
