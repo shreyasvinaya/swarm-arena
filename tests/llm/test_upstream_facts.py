@@ -964,3 +964,95 @@ def test_openai_stop_and_logit_bias_remain_cacheable(
     merged = merge_model_settings(caller, ModelSettings(extra_args={"cache": cache}))
     assert getattr(merged, channel)[parameter] == value
     assert (merged.extra_args or {})["cache"] == cache
+
+
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested_body"])
+async def test_metered_call_has_one_provider_dispatch_with_retry_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str
+) -> None:
+    pytest.importorskip("tenacity", reason="retry fact requires uv run --with tenacity==9.2.1")
+    import litellm.main as main
+    from _fakes.llm_run import open_llm_run
+
+    from swarm_arena import RunConfig as ArenaRunConfig
+    from swarm_arena._budget.llm_scope import llm_scope
+    from swarm_arena._journal.llm_record import drain
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm._hooks import MeteredModel
+
+    attempts: list[dict[str, Any]] = []
+
+    def provider(**kwargs: Any) -> litellm.ModelResponse:
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise litellm.InternalServerError(
+                "provider fault", model=kwargs["model"], llm_provider="openai"
+            )
+        return litellm.ModelResponse(
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            choices=[{"message": {"role": "assistant", "content": "ok"}}],
+        )
+
+    controls = {"retry_policy": {"InternalServerErrorRetries": 2}}
+    caller = (
+        ModelSettings(extra_args={"extra_body": controls})
+        if channel == "nested_body"
+        else ModelSettings(extra_args=controls)
+        if channel == "extra_args"
+        else ModelSettings(extra_body=controls)
+    )
+    spec = ModelSpec(
+        model="openai/gpt-4o",
+        roles=["manager"],
+        max_tokens=100,
+        prices=ModelSpec.Prices(input=1, output=3),
+    )
+    cfg = ArenaRunConfig(models=ModelCatalog({"m": spec}), settle_timeout_s=2)
+    monkeypatch.setattr(main, "completion", provider)
+    # A process default must not reinstate retries after caller controls are stripped.
+    monkeypatch.setattr(litellm, "num_retries", 3)
+    async with open_llm_run(tmp_path, config=cfg) as owned:
+        scope = owned.scope("manager")
+        model = MeteredModel(LitellmModel(spec.model), alias="m", spec=spec, namespace="n")
+        error: Exception | None = None
+        with llm_scope(scope):
+            try:
+                await model.get_response(
+                    None,
+                    [],
+                    caller,
+                    [],
+                    None,
+                    [],
+                    ModelTracing.DISABLED,
+                    previous_response_id=None,
+                    conversation_id=None,
+                    prompt=None,
+                )
+            except Exception as caught:
+                error = caught
+        await drain(scope, wait=False)
+        assert len(attempts) == 1
+        assert isinstance(error, litellm.InternalServerError)
+        assert len(model.call_ids) == len(owned.calls()) == 1
+        assert attempts[0]["metadata"]["reservation_id"] == owned.calls()[0].reservation_id
+        assert attempts[0]["num_retries"] == attempts[0]["max_retries"] == 0
+        assert "retry_policy" not in attempts[0]
+        assert "retry_policy" not in (attempts[0].get("extra_body") or {})
+
+
+def test_pinned_retry_and_fallback_inventory_covers_upstream_controls() -> None:
+    from litellm.constants import RUNTIME_UPDATABLE_ROUTER_SETTINGS
+    from litellm.router_utils.fallback_event_handlers import _PER_REQUEST_FALLBACK_CONTROL_KEYS
+
+    from swarm_arena.llm._hooks import _PROVIDER_ATTEMPT_CONTROLS
+
+    assert importlib.metadata.version("litellm").startswith("1.107.")
+    upstream = {
+        key
+        for key in RUNTIME_UPDATABLE_ROUTER_SETTINGS
+        if any(term in key for term in ("retry", "retries", "fallback"))
+    } | set(_PER_REQUEST_FALLBACK_CONTROL_KEYS)
+    assert upstream <= _PROVIDER_ATTEMPT_CONTROLS
+    # The direct completion wrappers have controls outside the router inventory.
+    assert {"context_window_fallback_dict", "retry_strategy"} <= _PROVIDER_ATTEMPT_CONTROLS

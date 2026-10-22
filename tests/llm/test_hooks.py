@@ -678,3 +678,50 @@ async def test_global_fallbacks_refuse_before_reserving(
             await invoke(metered(capture))
         assert run.events("reserve") == []
         assert capture.calls == []
+
+
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested_body"])
+async def test_all_provider_attempt_controls_are_stripped(tmp_path: Path, channel: str) -> None:
+    from agents.retry import ModelRetrySettings
+
+    controls = {
+        "num_retries": 4,
+        "max_retries": 4,
+        "retry_policy": {"InternalServerErrorRetries": 4},
+        "model_group_retry_policy": {"m": {"InternalServerErrorRetries": 4}},
+        "retry_strategy": "constant_retry",
+        "retry_after": 1,
+        "fallbacks": ["fake/other"],
+        "context_window_fallback_dict": {"fake/m": "fake/other"},
+        "context_window_fallbacks": [{"fake/m": ["fake/other"]}],
+        "content_policy_fallbacks": [{"fake/m": ["fake/other"]}],
+        "max_fallbacks": 4,
+        "default_fallbacks": ["fake/other"],
+        "fallback_on_unsupported_params": True,
+        "disable_fallbacks": False,
+    }
+    payload = {**controls, "seed": 42}
+    caller = (
+        ModelSettings(extra_args={"extra_body": payload})
+        if channel == "nested_body"
+        else ModelSettings(extra_args=payload)
+        if channel == "extra_args"
+        else ModelSettings(extra_body=payload)
+    )
+    caller.retry = ModelRetrySettings(max_retries=2)
+    caller.metadata = {"retry_policy": "ordinary metadata"}
+    capture = FakeModel([FakeTurn(text="ok")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            await invoke(metered(capture), caller)
+    sent = capture.calls[0]["model_settings"]
+    assert sent.extra_args["num_retries"] == sent.extra_args["max_retries"] == 0
+    actual = sent.extra_args["extra_body"] if channel == "nested_body" else getattr(sent, channel)
+    for key in controls:
+        if channel == "extra_args" and key in {"num_retries", "max_retries"}:
+            continue
+        assert key not in actual, key
+    assert actual["seed"] == 42
+    assert payload == {**controls, "seed": 42}
+    assert sent.retry == caller.retry
+    assert sent.metadata["retry_policy"] == "ordinary metadata"

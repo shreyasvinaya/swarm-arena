@@ -143,8 +143,10 @@ Each admitted call gets its own reservation ID and preallocated LLM call ID.
 Callbacks settle by reservation ID, including concurrent identical requests.
 The output cap never exceeds the catalog's `max_tokens`; estimates include
 serialized prompts, input items, tools and output schemas. Provider-managed
-retries are disabled so hidden attempts cannot share one reservation. Runner
-retries, when enabled, enter the metered path again with a fresh reservation.
+retry and fallback controls, including policy overrides in extra arguments or
+bodies, are stripped; numeric retries are forced to zero so hidden attempts
+cannot share one reservation. Runner retries, when enabled, enter the metered
+path again with a fresh reservation.
 
 Scope owners drain before closing their tranche. A missing report after
 `settle_timeout_s` produces an `estimated:` call error charged at the reservation;

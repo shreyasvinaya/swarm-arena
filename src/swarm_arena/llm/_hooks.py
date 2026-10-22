@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from functools import lru_cache
 from typing import Any, TypeVar, cast
 from weakref import WeakKeyDictionary
@@ -268,24 +268,46 @@ def _prepare_settings(settings: ModelSettings) -> ModelSettings:
     return ModelSettings(**values)
 
 
+# LiteLLM 1.107: main/utils retry wrappers, router request controls and
+# RUNTIME_UPDATABLE_ROUTER_SETTINGS. Keep the corresponding upstream facts
+# current when upgrading. SDK ModelSettings.retry belongs to Runner, whose
+# retries re-enter get_response and receive separate reservations.
+_PROVIDER_ATTEMPT_CONTROLS = frozenset(
+    {
+        "num_retries",
+        "max_retries",
+        "retry_policy",
+        "model_group_retry_policy",
+        "retry_strategy",
+        "retry_after",
+        "fallbacks",
+        "context_window_fallback_dict",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
+        "default_fallbacks",
+        "max_fallbacks",
+        "fallback_on_unsupported_params",
+        "disable_fallbacks",
+    }
+)
+
+
 def _without_retries(settings: ModelSettings) -> ModelSettings:
-    """Disable hidden provider attempts; Runner retries re-enter metering."""
-    extra = dict(settings.extra_args or {})
-    extra.pop("fallbacks", None)
-    extra.pop("context_window_fallback_dict", None)
-    extra.update(num_retries=0, max_retries=0)
-    # Body escape hatches must not reinstate provider-managed retries.
-    body = settings.extra_body
-    if isinstance(body, dict):
-        body = {
-            key: value for key, value in body.items() if key not in {"num_retries", "max_retries"}
+    """Strip hidden-attempt controls, then set authoritative zero retry counts."""
+
+    def strip(values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: strip(value)
+            if key in {"extra_args", "extra_body"} and isinstance(value, dict)
+            else value
+            for key, value in values.items()
+            if key not in _PROVIDER_ATTEMPT_CONTROLS
         }
-    nested = extra.get("extra_body")
-    if isinstance(nested, dict):
-        extra["extra_body"] = {
-            key: value for key, value in nested.items() if key not in {"num_retries", "max_retries"}
-        }
-    return replace(settings, extra_args=extra, extra_body=body)
+
+    values = strip({field.name: getattr(settings, field.name) for field in fields(ModelSettings)})
+    # Omitting numeric controls would allow LiteLLM's process defaults to win.
+    values["extra_args"] = {**(values["extra_args"] or {}), "num_retries": 0, "max_retries": 0}
+    return ModelSettings(**values)
 
 
 class MeteredModel(Model):
