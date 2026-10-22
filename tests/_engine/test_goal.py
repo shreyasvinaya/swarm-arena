@@ -2557,6 +2557,7 @@ async def test_curator_accounting_failure_prevents_provider_completion(
 async def test_llm_judge_usage_overflow_finishes_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, ranking: str
 ) -> None:
+    pytest.importorskip("agents")
     from _fakes.engine import with_executor
     from _fakes.run import all_events
 
@@ -2642,6 +2643,7 @@ async def test_llm_judge_usage_overflow_finishes_run(
 
 @pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
 async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
+    pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
     from _fakes.run import all_events
@@ -2745,6 +2747,7 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
 async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str, cleanup_failure: bool
 ) -> None:
+    pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
     from _fakes.run import all_events
