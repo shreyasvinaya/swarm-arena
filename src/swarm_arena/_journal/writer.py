@@ -43,6 +43,7 @@ class JournalWriter:
     last confirmed expiry. Fatal failures disable publication and wake all waiters.
     Native cancellation or another escaping base exception also wakes durable
     waiters and disables admission before propagating out of the writer task.
+    Engine owners distinguish that stop from an earlier storage or lease failure.
     Settlement exhaustion raises ``RuntimeError('stop cleanup timed out')``;
     authority loss and other fatal publication failures raise ``Fenced``.
     After settlement exhaustion, a release attempt has its own
@@ -124,6 +125,7 @@ class JournalWriter:
         self._stopping = False
         self._entered = False
         self._failure: Exception | None = None
+        self._stopped = False
         self._settlement_expired = False
         self._tasks: TaskGroup | None = None
 
@@ -149,6 +151,8 @@ class JournalWriter:
         self._tasks = anyio.create_task_group()
         await self._tasks.__aenter__()
         self._entered = True
+        # Runner.close can cancel this task before its first step in the same loop
+        # iteration; an unstarted coroutine cannot execute the failure latch below.
         self._tasks.start_soon(self._run)
         return self
 
@@ -561,6 +565,7 @@ class JournalWriter:
                         await self._release_after_timeout()
         except BaseException:
             # Native task cancellation bypasses AnyIO shields, including during release.
+            self._stopped = not self.fenced.is_set()
             self._fail(_core_error(Fenced, "journal writer stopped"))
             raise
         finally:

@@ -463,7 +463,7 @@ raise SystemExit(status)
         until(b"cleanup-ready")
         os.write(master, b"\x03")
         until(b"received-second")
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + (15 if interrupts == 3 and inside_session else 30)
         if interrupts == 3:
             os.write(master, b"\x03")
             until(b"received-third-force", timeout=15)
@@ -496,6 +496,8 @@ raise SystemExit(status)
         assert b"interrupted" in output
         assert b"Traceback" not in output
         assert b"never retrieved" not in output
+        assert b"unhandled exception" not in output
+        assert b"during asyncio.run() shutdown" not in output
     finally:
         # Reap an exited child before signalling its process group (macOS zombies).
         with suppress(subprocess.TimeoutExpired):

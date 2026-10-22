@@ -153,6 +153,8 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
                 error = caught
             finally:
                 watchers.cancel_scope.cancel()
+    if journal._stopped and isinstance(error, anyio.get_cancelled_exc_class()):
+        raise error
     journal._raise_if_fenced()
     if error is not None:
         raise error
@@ -507,6 +509,7 @@ class RunRunner:
         self.resumed = resumed
         self._used = False
         self._queue_changed = anyio.Event()
+        self._journal: JournalWriter | None = None
 
     async def run(self) -> dict[str, list[Candidate]]:
         """
@@ -553,6 +556,8 @@ class RunRunner:
             except BaseException as error:
                 failed = True
                 if _has_fenced(error):
+                    if services.deps.journal._stopped:
+                        raise anyio.get_cancelled_exc_class()() from None
                     raise _core_error(Fenced) from None
                 raise
             finally:
@@ -661,6 +666,8 @@ class RunRunner:
         except BaseException as exc:
             failed = True
             if _has_fenced(exc):
+                if self._journal is not None and self._journal._stopped:
+                    raise anyio.get_cancelled_exc_class()() from None
                 raise _core_error(Fenced) from None
             raise
         finally:
@@ -711,6 +718,7 @@ class RunRunner:
                 settle_timeout_s=config.settle_timeout_s,
             ) as journal:
                 entered = True
+                self._journal = journal
                 async with _supervise_writer(journal):
                     async with _supervise_initialization(
                         store, lease.doc.epoch, stops, clock, config

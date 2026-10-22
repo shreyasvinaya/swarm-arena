@@ -148,7 +148,10 @@ async def test_nested_owner_restore_never_removes_signal_handler(
 
 
 @pytest.mark.parametrize("command", ["run", "resume"])
-def test_third_interrupt_during_settlement_exits(tmp_path: Path, command: str) -> None:
+@pytest.mark.parametrize("settle_after_force", [True, False], ids=["settle", "nosettle"])
+def test_third_interrupt_during_settlement_exits(
+    tmp_path: Path, command: str, settle_after_force: bool
+) -> None:
     import os
     import select
     import time
@@ -220,7 +223,8 @@ async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
         finally:
             with anyio.CancelScope(shield=True):
                 print('settlement-resumed', flush=True)
-                await settle(self, *args, **kwargs)
+                if {settle_after_force!r}:
+                    await settle(self, *args, **kwargs)
 Ledger._settle = held_settle
 handler = signal.getsignal(signal.SIGINT)
 status = main(argv)
@@ -267,6 +271,9 @@ raise SystemExit(status)
         assert b"handler-restored=True" in output
         assert b"interrupted" in output
         assert b"never retrieved" not in output
+        assert b"Traceback" not in output
+        assert b"unhandled exception" not in output
+        assert b"during asyncio.run() shutdown" not in output
     finally:
         from contextlib import suppress
 

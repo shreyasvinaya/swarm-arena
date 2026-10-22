@@ -157,6 +157,7 @@ class _ResumeServices:
         self.run_failed = False
         self.preparation_scope: anyio.CancelScope | None = None
         self.cancel_preparation = False
+        self._journal: run_module._RunJournal | None = None
 
     async def _serve(self) -> None:
         """Let a cancelled preparing caller interrupt abandonable user hooks."""
@@ -187,6 +188,7 @@ class _ResumeServices:
                 sync_interval_s=config.sync_interval_s,
                 settle_timeout_s=config.settle_timeout_s,
             )
+            self._journal = journal
             if head != self.validated_head:
                 validated = False
                 async with run_module._supervise_initialization(
@@ -442,6 +444,8 @@ class _ResumeServices:
                 await asyncio.shield(self.task)
         if self.failure is not None and not failed:
             if run_module._has_fenced(self.failure):
+                if self._journal is not None and self._journal._stopped:
+                    raise anyio.get_cancelled_exc_class()() from None
                 raise _core_error(Fenced) from None
             raise self.failure
 

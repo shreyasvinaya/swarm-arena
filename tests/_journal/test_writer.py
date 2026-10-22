@@ -957,3 +957,38 @@ async def test_settlement_timeout_bounds_the_release_attempt(
     owner = read_owner(store)
     assert owner is not None
     assert owner[0].head is None
+
+
+@pytest.mark.parametrize("failure_type", [Fenced, StorageError])
+async def test_writer_stop_retains_earlier_failure_provenance(
+    store: LocalStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    task: asyncio.Task[None] | None = None
+    started = anyio.Event()
+    remaining = JournalWriter._remaining
+
+    def observed_remaining(writer: JournalWriter) -> float:
+        nonlocal task
+        task = asyncio.current_task()
+        started.set()
+        return remaining(writer)
+
+    monkeypatch.setattr(JournalWriter, "_remaining", observed_remaining)
+    async with _writer(store, tmp_path) as writer:
+        with anyio.fail_after(5):
+            await started.wait()
+        assert task is not None
+        error = failure_type("earlier failure")
+        writer._fail(error)
+        with anyio.CancelScope(shield=True):
+            task.cancel("later-cancel-secret")
+            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+                await task
+            assert writer._failure is error
+            assert not writer._stopped
+            with pytest.raises(Fenced) as caught:
+                writer._raise_if_fenced()
+            assert "later-cancel-secret" not in "".join(traceback.format_exception(caught.value))
