@@ -2628,3 +2628,110 @@ async def test_later_round_stop_does_not_inherit_drain_note(
         )
     assert _has_drain_note(failure)
     assert not _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("mismatch", [False, True])
+async def test_conformance_stops_when_accounting_read_is_interrupted(
+    kind: str, mismatch: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._store.local import LocalStore
+    from swarm_arena.testing import _harness
+
+    loop = asyncio.get_running_loop()
+    entered, reserving, closing = anyio.Event(), anyio.Event(), anyio.Event()
+    release = threading.Event()
+    workers: list[threading.Thread] = []
+    stragglers: list[asyncio.Task[str]] = []
+    scopes: list[Any] = []
+    accounting_store: list[Any] = []
+    baseline = dict(llm_record._bindings)
+    original_reserve, original_close = Ledger.reserve, Tranche.close
+    original_chain, original_read = _harness._read_chain, LocalStore.read
+
+    async def reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        reserving.set()
+        await closing.wait()
+        return await original_reserve(self, *args, **kwargs)
+
+    async def close(self: Tranche) -> Any:
+        closing.set()
+        return await original_close(self)
+
+    async def read_chain(store: Any, head: Any) -> Any:
+        accounting_store.append(store)
+        return await original_chain(store, head)
+
+    def read(self: LocalStore, key: str) -> Any:
+        if accounting_store and self is accounting_store[0] and key.startswith("journal/"):
+            workers.append(threading.current_thread())
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(30):
+                raise AssertionError("accounting read safety release expired")
+        return original_read(self, key)
+
+    async def prepare() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        scopes.append(scope)
+        if mismatch:
+            stragglers.append(asyncio.create_task(scope.tranche.reserve_call(Amount(usd=0.001))))
+            await reserving.wait()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await prepare()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await prepare()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(Ledger, "reserve", reserve)
+    monkeypatch.setattr(Tranche, "close", close)
+    monkeypatch.setattr(_harness, "_read_chain", read_chain)
+    monkeypatch.setattr(LocalStore, "read", read)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    task = asyncio.create_task(_run_conformance_kind(kind))
+    try:
+        with anyio.fail_after(10):
+            await entered.wait()
+            # Expire the actual owner's allowance only once the accounting read is held.
+            llm_record._bindings[scopes[0].run_id].stops.run_timeout = True
+            with pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+                await task
+        assert not release.is_set()
+        assert scopes[0].tranche._closed
+        assert llm_record._bindings == baseline
+    finally:
+        release.set()
+        task.cancel()
+        for straggler in stragglers:
+            straggler.cancel()
+        await asyncio.gather(task, *stragglers, return_exceptions=True)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+    accounting_store.clear()
+    committed = read_committed(scopes[0].journal._store)
+    assert committed is not None
+    events = committed[1]
+    assert not [event for event in events if event.type == "llm_call"]
+    settled = sum(
+        (Amount(usd=event.payload["actual"]["usd"]) for event in events if event.type == "settle"),
+        Amount(),
+    )
+    assert settled == Amount(usd=0.001 if mismatch else 0)

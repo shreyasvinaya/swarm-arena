@@ -267,7 +267,6 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                 try:
                     with llm_scope(scope):
                         yield scope, ids
-                    completed = True
                 except BaseException as error:
                     escaping = error
                     raise
@@ -277,6 +276,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                         await tranche.close()
                         ledger._check_usage_overflow()
                         await _assert_accounted(scope, store)
+                        completed = True
     finally:
         if not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
