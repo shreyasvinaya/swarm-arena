@@ -276,7 +276,9 @@ class AgentsSDKManager(Manager):
                     raise failure
             if timer.cancel_called:
                 raise TimeoutError
-            report = RoundReport(summary=deps.summary or str(result.final_output or ""))
+            report = RoundReport(
+                summary=deps.summary if deps.summary is not None else str(result.final_output or "")
+            )
         except BaseException as error:
             failure = error
             interrupted = (timer is not None and timer.cancel_called) or isinstance(

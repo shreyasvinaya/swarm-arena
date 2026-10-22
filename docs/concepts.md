@@ -177,7 +177,8 @@ Use `save_notes` to retain private state between rounds. Instructions do not
 change an agent's tool-and-model fingerprint.
 
 The model calls `finish_round(summary=...)` to end the round immediately; ordinary
-final text can also end it. The manager has no structured output schema or hosted
+final text can also end it. The first accepted finish summary is retained, including
+an empty string; later finish calls return a soft tool error. The manager has no structured output schema or hosted
 tools. Core limits bound model turns, round duration, action work and spending.
 `action_timeout_s` defaults to 60 seconds for actions other than `run_tool`, whose
 timing belongs to the core. `parallel_tool_calls` defaults to true, with each action

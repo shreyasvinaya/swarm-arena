@@ -254,6 +254,8 @@ async def _act(
         await ctx.save_notes(args["text"])
         return _render({"ok": True})
     if name == "finish_round":
+        if deps.summary is not None:
+            raise _core_error(SoftError, "round already finished")
         deps.summary = args["summary"]
         return _render({"ok": True})
     result = await ctx.call_action(name, args)
@@ -352,6 +354,8 @@ def _tool(
     arguments: type[_Arguments] | None,
     timeout: float | None,
 ) -> FunctionTool:
+    finish_lock = anyio.Lock() if name == "finish_round" else None
+
     async def execute(tool_context: ToolContext[Any], raw: str) -> str:
         outcome = _Outcome()
         error: BaseException | None = None
@@ -393,11 +397,17 @@ def _tool(
         )
         return _render({"error": message})
 
+    async def ordered(tool_context: ToolContext[Any], raw: str) -> str:
+        if finish_lock is not None:
+            async with finish_lock:
+                return await execute(tool_context, raw)
+        return await execute(tool_context, raw)
+
     async def invoke(tool_context: ToolContext[Any], raw: str) -> str:
         owner = _owned_actions.get()
         if owner is None:
-            return await execute(tool_context, raw)
-        return await owner.call(lambda: execute(tool_context, raw), core_tool=name == "run_tool")
+            return await ordered(tool_context, raw)
+        return await owner.call(lambda: ordered(tool_context, raw), core_tool=name == "run_tool")
 
     return set_function_tool_failure_error_function(
         FunctionTool(

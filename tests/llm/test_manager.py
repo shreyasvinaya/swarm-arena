@@ -1092,6 +1092,58 @@ async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path) -> Non
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("summaries", [("",), ("A", "B"), ("", "B")])
+async def test_first_finish_round_summary_is_preserved(
+    tmp_path: Path, summaries: tuple[str, ...]
+) -> None:
+    fake = register(
+        [FakeTurn(tool_calls=tuple(("finish_round", {"summary": value}) for value in summaries))]
+    )
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            report = await AgentsSDKManager(model="opus").run_round(context())
+        assert report.summary == summaries[0]
+        assert len(fake.calls) == 1
+
+
+async def test_later_finish_round_call_returns_a_soft_tool_error() -> None:
+    from agents import Agent, Runner
+    from agents import RunConfig as SDKRunConfig
+    from agents.agent import StopAtTools
+    from agents.items import ToolCallOutputItem
+
+    from swarm_arena.llm._actions import build_tools
+    from swarm_arena.llm._hooks import _prepare
+    from swarm_arena.llm._linking import CallLinks, ManagerDeps
+
+    ctx = context()
+    deps = ManagerDeps(ctx=ctx, links=CallLinks())
+    tools = await _prepare(lambda: build_tools(ctx, deps, action_timeout_s=60))
+    fake = FakeModel(
+        [
+            FakeTurn(
+                tool_calls=(("finish_round", {"summary": "A"}), ("finish_round", {"summary": "B"}))
+            )
+        ]
+    )
+    result = await Runner.run(
+        Agent(
+            name="summary",
+            model=fake,
+            tools=[*tools],
+            tool_use_behavior=StopAtTools(stop_at_tool_names=["finish_round"]),
+        ),
+        "go",
+        context=deps,
+        run_config=SDKRunConfig(tracing_disabled=True),
+    )
+    outputs = [
+        json.loads(item.output) for item in result.new_items if isinstance(item, ToolCallOutputItem)
+    ]
+    assert deps.summary == "A"
+    assert outputs == [{"ok": True}, {"error": "round already finished"}]
+
+
 @pytest.mark.parametrize("owner", ["task", "scope"])
 async def test_caller_cancellation_gracefully_finishes_owned_tool_without_cancelling_peer(
     tmp_path: Path, ctx_env: CtxEnv, owner: str
