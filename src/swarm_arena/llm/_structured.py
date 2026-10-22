@@ -2,6 +2,7 @@
 
 import json
 import math
+from collections.abc import Callable
 from contextvars import ContextVar
 from typing import Any
 
@@ -213,6 +214,7 @@ async def structured_call(
     name: str,
     no_cache_read: bool,
     temperature: float | None,
+    admission_check: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """
     Return parsed output and every metered call id; the component owns drain.
@@ -237,6 +239,9 @@ async def structured_call(
         Force response-cache bypass on both stages.
     temperature : float or None
         Sampling temperature.
+
+    admission_check : Callable[[], None] or None, optional
+        Invocation gate preventing new funded stages after a sibling limit.
 
     Returns
     -------
@@ -274,6 +279,7 @@ async def structured_call(
             no_cache_read=no_cache_read,
             temperature=temperature,
             max_tokens=cap,
+            admission_check=admission_check,
         )
         try:
             response = await model.get_response(

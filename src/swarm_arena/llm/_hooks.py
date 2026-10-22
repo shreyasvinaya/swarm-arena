@@ -318,6 +318,10 @@ class MeteredModel(Model):
     max_tokens : int or None, optional
         Output cap, never larger than the catalog cap.
 
+    admission_check : Callable[[], None] or None, optional
+        Component gate checked before funding and again before call registration.
+        Already registered calls complete normally.
+
     Attributes
     ----------
     call_ids : list[str]
@@ -343,6 +347,7 @@ class MeteredModel(Model):
         no_cache_read: bool = False,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> None:
         self.inner = inner
         self.alias = _context_string(alias, "alias")
@@ -352,6 +357,7 @@ class MeteredModel(Model):
         self.no_cache_read = no_cache_read
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.admission_check = admission_check
         self.call_ids: list[str] = []
 
     def _cap(self, caller: ModelSettings) -> int:
@@ -474,6 +480,8 @@ class MeteredModel(Model):
             if conversation_id is not None
             else None
         )
+        if self.admission_check is not None:
+            self.admission_check()
         outcome = _Outcome()
         try:
             rid = await scope.tranche.reserve_call(estimate)
@@ -482,6 +490,8 @@ class MeteredModel(Model):
             carrier = _sdk_control(classified)
             raise carrier if carrier is not None else classified from None
         try:
+            if self.admission_check is not None:
+                self.admission_check()
             call_id = open_call(
                 scope,
                 reservation_id=rid,

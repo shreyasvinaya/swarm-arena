@@ -265,7 +265,10 @@ class LLMJudge(Judge):
             classified = boundary.classify(failure)
             if _is_core_control(classified):
                 # A direct budget refusal retains its public SDK-compatible carrier.
-                if type(failure) is BudgetExceeded:
+                if (
+                    type(failure) is BudgetExceeded
+                    or _core_category(failure) is _SignalCategory.LIMIT
+                ):
                     raise failure from None
                 raise classified from None
             boundary.contain(classified, RuntimeError, "LLM judge")
@@ -295,8 +298,14 @@ class LLMJudge(Judge):
         calls: dict[tuple[int, int], list[str]] = {}
         failed: set[int] = set()
         controls: list[BaseException] = []
+        first_limit: BaseException | None = None
+
+        def check_admission() -> None:
+            if first_limit is not None:
+                raise first_limit
 
         async def member(member_index: int, batch_index: int) -> None:
+            nonlocal first_limit
             outcome = _Outcome()
             batch = batches[batch_index]
             captured: list[str] = []
@@ -326,6 +335,7 @@ class LLMJudge(Judge):
                     schema=JUDGE_SCHEMA,
                     name="judge",
                     temperature=0,
+                    admission_check=check_admission,
                     no_cache_read=not ctx.read_cache
                     or ctx.final
                     or any(c.id in ctx.anchors for c in batch),
@@ -341,6 +351,8 @@ class LLMJudge(Judge):
             except BaseException as error:
                 classified = outcome.classify(error)
                 if _is_core_control(classified):
+                    if _core_category(classified) is _SignalCategory.LIMIT and first_limit is None:
+                        first_limit = error
                     controls.append(error if isinstance(error, BudgetExceeded) else classified)
                 else:
                     failed.add(member_index)
@@ -354,10 +366,8 @@ class LLMJudge(Judge):
                     group.start_soon(member, m, b)
         if controls:
             classified = _Outcome().classify(BaseExceptionGroup("judge controls", controls))
-            if _core_category(classified) is _SignalCategory.LIMIT:
-                for error in controls:
-                    if isinstance(error, BudgetExceeded):
-                        raise error
+            if _core_category(classified) is _SignalCategory.LIMIT and first_limit is not None:
+                raise first_limit
             raise classified from None
         live = [m for m in range(len(config.models)) if m not in failed]
         if not live:

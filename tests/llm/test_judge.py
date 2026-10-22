@@ -714,3 +714,77 @@ async def test_swarm_with_multiple_llm_ranking_members(
     for event in events:
         if event.type == "score":
             assert set(event.payload["score"]["llm_call_ids"]) <= calls
+
+
+async def test_limit_stops_sibling_dispatch_and_preserves_inflight_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    from swarm_arena import Limits
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena.llm import BudgetExceeded, _judge, _structured
+
+    draft_started, refused = anyio.Event(), anyio.Event()
+    original_reserve = Tranche.reserve_call
+
+    async def reserve(self: Tranche, estimate: Any) -> str:
+        if estimate.tokens > 1000000:
+            await draft_started.wait()
+        return await original_reserve(self, estimate)
+
+    monkeypatch.setattr(Tranche, "reserve_call", reserve)
+    original_structured = _judge.structured_call
+    refusals: list[BaseException] = []
+
+    async def structured(**kwargs: Any) -> tuple[dict[str, Any], list[str]]:
+        try:
+            return await original_structured(**kwargs)
+        except BudgetExceeded as error:
+            refusals.append(error)
+            refused.set()
+            raise
+
+    monkeypatch.setattr(_judge, "structured_call", structured)
+    monkeypatch.setattr(_structured, "supports", lambda spec, feature: spec.model != "fake/draft")
+    draft = FakeModel([FakeTurn(text="reasoning")])
+    original_response = draft.get_response
+
+    async def held(*args: Any, **kwargs: Any) -> ModelResponse:
+        draft_started.set()
+        await refused.wait()
+        return await original_response(*args, **kwargs)
+
+    monkeypatch.setattr(draft, "get_response", held)
+    draft.register("draft")
+    formatter = FakeModel([turn(1)])
+    formatter.register("fmt")
+    huge = FakeModel([])
+    huge.register("huge")
+    config = configuration(("draft", "fmt", "huge"))
+    config.models.root["huge"] = config.models.root["huge"].model_copy(
+        update={"max_tokens": 5000000}
+    )
+    config.models.root["fmt"] = config.models.root["fmt"].model_copy(
+        update={
+            "prices": ModelSpec.Prices(input=0.5, output=1),
+        }
+    )
+    config = config.model_copy(update={"limits": Limits(max_tokens=1000000)})
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=config) as run:
+        scope = run.scope("judge")
+        with llm_scope(scope), anyio.fail_after(10), pytest.raises(BudgetExceeded) as caught:
+            await LLMJudge("r", ["draft", "huge"]).judge(
+                goal,
+                candidates(1),
+                JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
+            )
+        assert caught.value is refusals[0]
+        assert len(draft.calls) == 1
+        assert not formatter.calls
+        assert not huge.calls
+        assert scope.tranche.pending() == 0
+        assert [call.model_alias for call in run.calls()] == ["draft"]
+        assert run.calls()[0].error is None
+        assert run.charged(scope).usd == pytest.approx(sum(call.cost_usd for call in run.calls()))

@@ -893,3 +893,31 @@ async def test_refused_call_registration_refunds_before_provider_dispatch(
         await run.journal.commit()
         assert run.calls() == []
         assert run.charged(scope) == Amount()
+
+
+@pytest.mark.parametrize("stop_at", [1, 2])
+async def test_admission_gate_refusal_releases_unused_reservation(
+    tmp_path: Path, stop_at: int
+) -> None:
+    refusal = _core_error(LimitReached, "stop", "call admission closed")
+    checked = 0
+
+    def check() -> None:
+        nonlocal checked
+        checked += 1
+        if checked == stop_at:
+            raise refusal
+
+    capture = FakeModel([FakeTurn(text="unused")])
+    model = metered(capture, admission_check=check)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("judge")
+        with llm_scope(scope), pytest.raises(LimitReached) as caught:
+            await invoke(model)
+        assert caught.value is refusal
+        assert capture.calls == []
+        assert model.call_ids == []
+        assert run.calls() == []
+        assert scope.tranche.pending() == 0
+        assert run.charged(scope) == Amount()
+        assert len(run.events("reserve")) == stop_at - 1
