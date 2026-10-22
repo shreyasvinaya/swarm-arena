@@ -43,7 +43,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "moto[server]>=5",
+    "moto[server]>=5.1.5",
     "numpydoc>=1.11",
     "pytest>=9,<10",
     "pytest-split>=0.11",

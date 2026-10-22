@@ -454,21 +454,58 @@ async def test_calls_without_swarm_metadata_are_ignored(monkeypatch: pytest.Monk
         await CallLogger().async_log_failure_event(kw, object(), _START, _END)
 
 
-async def test_acompletion_mock_response_is_recorded_and_settled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("defer_callback", [False, True])
+async def test_acompletion_mock_response_is_recorded_and_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defer_callback: bool
+) -> None:
+    entered, release, recorded = anyio.Event(), anyio.Event(), anyio.Event()
+    callback = CallLogger.async_log_success_event
+    flush = GLOBAL_LOGGING_WORKER.flush
+
+    async def observed(
+        self: CallLogger, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        entered.set()
+        if defer_callback:
+            await release.wait()
+        await callback(self, kwargs, response_obj, start_time, end_time)
+        recorded.set()
+
+    async def flush_releasing_callback() -> None:
+        release.set()
+        await flush()
+
+    monkeypatch.setattr(CallLogger, "async_log_success_event", observed)
+    monkeypatch.setattr(GLOBAL_LOGGING_WORKER, "flush", flush_releasing_callback)
     async with open_llm_run(tmp_path, config=_config()) as run:
         install(run.config)
         scope = run.scope("judge")
         kw = await _open(run, scope)
-        await litellm.acompletion(
-            model="openai/gpt-4o-mini",
-            messages=kw["messages"],
-            mock_response="ok",
-            metadata=kw["litellm_params"]["metadata"],
-        )
-        with anyio.fail_after(10):
-            assert await drain(scope, wait=True) == []
-        assert len(run.calls()) == 1
-        assert run.calls()[0].status == "ok"
+        try:
+            await litellm.acompletion(
+                model="openai/gpt-4o-mini",
+                messages=kw["messages"],
+                mock_response="ok",
+                metadata=kw["litellm_params"]["metadata"],
+            )
+            with anyio.fail_after(10):
+                await entered.wait()
+                if defer_callback:
+                    assert not recorded.is_set()
+                    assert run.calls() == []
+                # Completion returns before the queued callback finishes accounting.
+                await GLOBAL_LOGGING_WORKER.flush()
+                assert await drain(scope, wait=True) == []
+            assert recorded.is_set()
+            assert len(run.calls()) == 1
+            assert run.calls()[0].status == "ok"
+            assert run.charged(scope) == Amount(
+                tokens=run.calls()[0].usage.total_tokens, usd=run.calls()[0].cost_usd
+            )
+        finally:
+            release.set()
+            with anyio.fail_after(10):
+                await flush()
 
 
 async def test_response_cache_hit_end_to_end(tmp_path: Path) -> None:
@@ -487,7 +524,9 @@ async def test_response_cache_hit_end_to_end(tmp_path: Path) -> None:
                 metadata=kw["litellm_params"]["metadata"],
                 cache={"use-cache": True, "namespace": "judge"},
             )
-            assert await drain(scope, wait=True) == []
+            with anyio.fail_after(10):
+                await GLOBAL_LOGGING_WORKER.flush()
+                assert await drain(scope, wait=True) == []
         first, second = run.calls()
         assert (second.cache_hit, second.cost_usd, second.cached_from_call_id) == (
             True,

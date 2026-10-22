@@ -4331,7 +4331,7 @@ provides-extras = ["s3", "llm", "cache", "langfuse"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "moto", extras = ["server"], specifier = ">=5" },
+    { name = "moto", extras = ["server"], specifier = ">=5.1.5" },
     { name = "numpydoc", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=9,<10" },
     { name = "pytest-split", specifier = ">=0.11" },

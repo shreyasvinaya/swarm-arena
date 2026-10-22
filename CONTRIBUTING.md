@@ -100,7 +100,10 @@ filesystem writes under `tmp_path`, bind test servers to port 0, and reap childr
 in fixture teardown or `finally`. Collection must produce identical node IDs in
 every worker; inventories built from weak subclass registries must discard
 unreachable classes and use stable ordering. Process-local monkeypatches do not
-require serial execution.
+require serial execution. Tests that assert authoritative LiteLLM accounting
+after `acompletion` must flush its background logging worker before draining
+the scope; completion itself does not await the callback. The moto development
+floor includes conditional S3 `IfMatch` support, required by store CAS tests.
 
 The committed `.test_durations` balances shards with `least_duration`.
 Each CI shard refreshes its measured subset using `--store-durations
