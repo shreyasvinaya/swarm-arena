@@ -183,9 +183,11 @@ tools. Core limits bound model turns, round duration, action work and spending.
 timing belongs to the core. `parallel_tool_calls` defaults to true, with each action
 linked to its originating LLM call. Usage accounting drains before the manager
 returns; interrupted calls are conservatively charged without waiting for a late
-provider report. Registered terminal cleanup and ownership loss take precedence
-over the ordinary round-time limit. Genuine caller cancellation retains highest
-precedence. See the [LLM API](api/llm.md).
+provider report. Actions run in the manager's task group, so SDK cancellation
+cannot discard an admitted tool run. Every exit waits for owned actions before
+accounting drains; the core's tool cancellation and grace rules govern in-flight
+work. Registered terminal cleanup and ownership loss take precedence over the
+ordinary round-time limit. Genuine caller cancellation retains highest precedence. See the [LLM API](api/llm.md).
 
 An agent sees the board at the round's recorded frontier plus its own new work.
 `best(part=...)` reads the agent's own group or an explicitly declared sibling

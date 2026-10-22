@@ -16,11 +16,13 @@ from pydantic import ConfigDict, ValidationError, create_model
 
 from swarm_arena._agent.context import (
     AgentContext,
+    _ActionInflight,
     _defer_timer_error,
     _local_timer_scope,
     _LocalTimer,
 )
 from swarm_arena._agent.manager import LimitReached
+from swarm_arena._agent.tool_run import _inflight, track_inflight
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import (
@@ -264,6 +266,7 @@ class _OwnedCall:
 
     scope: anyio.CancelScope = field(default_factory=lambda: anyio.CancelScope(shield=True))
     finished: anyio.Event = field(default_factory=anyio.Event)
+    inflight: _ActionInflight | None = None
     result: str = ""
     error: BaseException | None = None
 
@@ -277,10 +280,11 @@ class _OwnedActions:
         self.calls: set[_OwnedCall] = set()
         self.accepting = True
 
-    async def call(self, operation: Callable[[], Awaitable[str]]) -> str:
+    async def call(self, operation: Callable[[], Awaitable[str]], *, core_tool: bool) -> str:
         if not self.accepting:
             raise _core_error(LimitReached, "stop", "the round is stopping")
-        call = _OwnedCall()
+        parent = _inflight.get() if core_tool else None
+        call = _OwnedCall(inflight=_ActionInflight(parent) if parent is not None else None)
         self.calls.add(call)
         self.group.start_soon(self._run, operation, call)
         await call.finished.wait()
@@ -292,7 +296,11 @@ class _OwnedActions:
         try:
             with call.scope, _local_timer_scope(call.scope) as local:
                 try:
-                    call.result = await operation()
+                    if call.inflight is None:
+                        call.result = await operation()
+                    else:
+                        with track_inflight(call.inflight):
+                            call.result = await operation()
                 except BaseException as error:
                     call.error = error
                     self.timer.record(error)
@@ -302,10 +310,15 @@ class _OwnedActions:
             self.calls.discard(call)
             call.finished.set()
 
-    def stop(self) -> None:
+    def stop(self, *, caller: bool) -> None:
         self.accepting = False
         for call in self.calls:
-            call.scope.cancel()
+            if call.inflight is not None:
+                if caller:
+                    call.inflight.close()
+                    call.inflight.cancel_all()
+            else:
+                call.scope.cancel()
 
     async def wait(self) -> None:
         while self.calls:
@@ -384,7 +397,7 @@ def _tool(
         owner = _owned_actions.get()
         if owner is None:
             return await execute(tool_context, raw)
-        return await owner.call(lambda: execute(tool_context, raw))
+        return await owner.call(lambda: execute(tool_context, raw), core_tool=name == "run_tool")
 
     return set_function_tool_failure_error_function(
         FunctionTool(

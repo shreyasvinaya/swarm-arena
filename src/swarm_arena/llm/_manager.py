@@ -244,12 +244,12 @@ class AgentsSDKManager(Manager):
                             failure = error
                         actions.accepting = False
                         if failure is not None or timer.cancel_called:
-                            actions.stop()
+                            actions.stop(caller=False)
                         try:
                             outcome.propagate_control(RuntimeError())
                         except anyio.get_cancelled_exc_class() as error:
                             failure = error
-                            actions.stop()
+                            actions.stop(caller=True)
                             group.cancel_scope.shield = True
                         while True:
                             try:
@@ -257,9 +257,15 @@ class AgentsSDKManager(Manager):
                                 break
                             except anyio.get_cancelled_exc_class() as error:
                                 failure = error
-                                actions.stop()
+                                actions.stop(caller=True)
                                 group.cancel_scope.shield = True
                         group.cancel_scope.shield = True
+                # A completed tool can exhaust the ledger before its result
+                # rendering hits an ordinary context gate. Preserve that source.
+                try:
+                    scope.tranche._ledger._check_usage_overflow()
+                except LimitReached as error:
+                    local_timer.record(error)
                 if local_timer.failure is not None:
                     failure = (
                         BaseExceptionGroup("manager action unwind", [failure, local_timer.failure])

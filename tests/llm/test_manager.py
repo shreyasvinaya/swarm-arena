@@ -21,7 +21,7 @@ from _fakes.secrecy import assert_secret_absent
 from agents.exceptions import AgentsException
 from pydantic import ValidationError
 
-from swarm_arena import Limits, Ref, RunConfig
+from swarm_arena import Limits, Ref, RunConfig, ScriptedManager, Swarm
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import llm_scope
 from swarm_arena._errors import (
@@ -38,7 +38,7 @@ from swarm_arena.config import ModelCatalog, ModelSpec
 from swarm_arena.llm import AgentsSDKManager, BudgetExceeded
 from swarm_arena.manager import AgentContext, LimitReached, Manager, RoundReport
 from swarm_arena.testing import FakeModel, FakeTurn
-from swarm_arena.tool import Action
+from swarm_arena.tool import Action, Usage
 
 
 class Inputs(FrozenModel):
@@ -893,3 +893,229 @@ async def test_caller_cancellation_wins_over_terminal_drain(
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_round_timeout_settles_owned_tools_and_preserves_next_round_shares(
+    tmp_path: Path,
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import WRITE_THEN_SLEEP, PyTool
+
+    shares: dict[str, Any] = {}
+    for kind in ("scripted", "sdk"):
+        root = tmp_path / kind
+        cfg = config(
+            limits=Limits(max_tokens=10_000_000, max_usd=100, round_timeout_s=2),
+            run_root=str(root / "runs"),
+            artifact_root=str(root / "artifacts"),
+            arena_root=str(root / "arena"),
+        )
+        current = plan(rounds=2, tool=PyTool({"code": WRITE_THEN_SLEEP, "grace_s": 3}))
+        if kind == "sdk":
+            # Zero paid usage makes the budget comparison exact in both dimensions.
+            fake = register(
+                [FakeTurn(tool_calls=(("run_tool", {"inputs": {"n": 1}}),), usage=Usage())]
+            )
+            manager = Ref(path="swarm_arena.llm:AgentsSDKManager", config={"model": "opus"})
+        else:
+            manager = Ref.of(
+                ScriptedManager([{"inputs": {"n": number}, "round": number} for number in (1, 2)])
+            )
+        current.teams[0].agents[0] = (
+            current.teams[0].agents[0].model_copy(update={"manager": manager})
+        )
+        with anyio.fail_after(30):
+            await Swarm(cfg).run(current, run_id=f"owned-{kind}")
+        events = all_events(cfg)
+        starts = [event for event in events if event.type == "tool_start"]
+        ends = [event for event in events if event.type == "tool_end"]
+        assert len(starts) == len(ends) == 2
+        assert {event.task_id for event in starts} == {event.task_id for event in ends}
+        assert all(event.payload["candidate"]["output"]["status"] == "cancelled" for event in ends)
+        reserved = {
+            event.payload["reservation"]["id"] for event in events if event.type == "reserve"
+        }
+        settled = {event.payload["id"] for event in events if event.type == "settle"}
+        assert reserved == settled
+        for end in ends:
+            status = next(
+                event
+                for event in events
+                if event.type == "agent_status" and event.round == end.round
+            )
+            assert end.seq < status.seq
+        shares[kind] = next(
+            event.payload["shares"]
+            for event in events
+            if event.type == "round_started" and event.round == 2
+        )
+        if kind == "sdk":
+            assert len(fake.calls) == 2
+    assert shares["sdk"] == shares["scripted"]
+
+
+async def test_parallel_overflow_keeps_both_owned_tool_completions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import PyTool
+
+    ready = tmp_path / "slow-ready"
+    code = f"""
+import json, os, time
+from pathlib import Path
+n = json.load(open("swarm/request.json"))["params"]["n"]
+ready = Path({str(ready)!r})
+if n == 1:
+    json.dump({{"data": {{"y": 1.0}}}}, open(os.environ["SWARM_ARENA_RESULT"], "w"))
+    ready.touch()
+    time.sleep(600)
+else:
+    deadline = time.monotonic() + 10
+    while not ready.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    json.dump({{"data": {{"y": 2.0}}, "usage": {{"usd": 1e300}}}},
+              open(os.environ["SWARM_ARENA_RESULT"], "w"))
+"""
+    cfg = config(
+        limits=Limits(max_tokens=10_000_000, max_usd=100),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    current = plan(rounds=1, tool=PyTool({"code": code, "grace_s": 3}))
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(path="swarm_arena.llm:AgentsSDKManager", config={"model": "opus"})
+            }
+        )
+    )
+    fake = register(
+        [
+            FakeTurn(
+                tool_calls=(("run_tool", {"inputs": {"n": 1}}), ("run_tool", {"inputs": {"n": 2}}))
+            ),
+            finish("must not run"),
+        ]
+    )
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine.round import _RoundContext
+    from swarm_arena.llm import _manager
+
+    active_contexts: list[AgentContext] = []
+    outcomes: list[_SignalCategory | None] = []
+    drain_checks: list[bool] = []
+    original_round, original_drain = AgentsSDKManager.run_round, _manager.drain
+
+    async def observed_round(self: AgentsSDKManager, ctx: AgentContext) -> RoundReport:
+        active_contexts.append(ctx)
+        try:
+            return await original_round(self, ctx)
+        except BaseException as error:
+            outcomes.append(_core_category(error))
+            raise
+
+    async def checked_drain(scope: LLMScope, *, wait: bool) -> list[str]:
+        assert cast(_RoundContext, active_contexts[0])._running_tools == 0
+        assert len([event for event in all_events(cfg) if event.type == "tool_end"]) == 2
+        result = await original_drain(scope, wait=wait)
+        with pytest.raises(LimitReached) as caught:
+            await scope.tranche._ledger.reserve(":run", Amount(usd=1), kind="tool", goal_id="g")
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        assert caught.value.limit == "usage_overflow"
+        drain_checks.append(True)
+        return result
+
+    monkeypatch.setattr(AgentsSDKManager, "run_round", observed_round)
+    monkeypatch.setattr(_manager, "drain", checked_drain)
+    with anyio.fail_after(30):
+        await Swarm(cfg).run(current, run_id="owned-overflow")
+    events = all_events(cfg)
+    starts = [event for event in events if event.type == "tool_start"]
+    ends = [event for event in events if event.type == "tool_end"]
+    assert len(starts) == len(ends) == 2
+    assert {event.task_id for event in starts} == {event.task_id for event in ends}
+    assert drain_checks == [True]
+    assert outcomes == [_SignalCategory.TERMINAL]
+    assert any(event.payload.get("usage_overflow") for event in events if event.type == "settle")
+    status = next(event for event in events if event.type == "agent_status")
+    assert all(event.seq < status.seq for event in ends)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("owner", ["task", "scope"])
+async def test_caller_cancellation_gracefully_finishes_owned_tool_without_cancelling_peer(
+    tmp_path: Path, ctx_env: CtxEnv, owner: str
+) -> None:
+    from _fakes.tools import PyTool
+
+    ready, release = tmp_path / "peer-ready", tmp_path / "peer-release"
+    owned_ready = tmp_path / "owned-ready"
+    code = f"""
+import json, os, time
+from pathlib import Path
+n = json.load(open("swarm/request.json"))["params"]["n"]
+json.dump({{"data": {{"y": n}}}}, open(os.environ["SWARM_ARENA_RESULT"], "w"))
+if n == 1:
+    Path({str(owned_ready)!r}).touch()
+    time.sleep(60)
+else:
+    Path({str(ready)!r}).touch()
+    deadline = time.monotonic() + 15
+    while not Path({str(release)!r}).exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+"""
+    tool = PyTool({"code": code, "grace_s": 0.2})
+    ctx, peer = ctx_env.ctx(tool=tool), ctx_env.ctx(tool=tool, agent="b")
+    fake = register([FakeTurn(tool_calls=(("run_tool", {"inputs": {"n": 1}}),)), finish()])
+    owner_scope, cancelled = anyio.CancelScope(), anyio.Event()
+    async with open_llm_run(tmp_path / "llm", config=config()) as run:
+
+        async def manage() -> None:
+            with llm_scope(run.scope("manager")), owner_scope:
+                try:
+                    await AgentsSDKManager(model="opus").run_round(ctx)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    if owner == "task":
+                        raise
+                    return
+                pytest.fail("caller cancellation became a report")
+
+        task = asyncio.create_task(manage())
+        peer_task = asyncio.create_task(peer.run_tool({"n": 2}))
+        try:
+            with anyio.fail_after(10):
+                await ctx_env.env.wait_for(ready)
+                await ctx_env.env.wait_for(owned_ready)
+                assert len(ctx_env.env.events("tool_start")) == 2
+                if owner == "task":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    owner_scope.cancel()
+                    await task
+                assert cancelled.is_set()
+                assert not peer_task.done()
+                release.touch()
+                candidate = await peer_task
+            assert candidate.output.status == "ok"
+            assert len(ctx_env.env.events("tool_end")) == 2
+            assert {
+                event.payload["reservation"]["id"] for event in ctx_env.env.events("reserve")
+            } == {event.payload["id"] for event in ctx_env.env.events("settle")}
+            assert len(run.events("reserve")) == len(run.events("settle")) == 1
+            assert len(fake.calls) == 1
+        finally:
+            release.touch()
+            if not task.done():
+                task.cancel()
+            if not peer_task.done():
+                ctx_env.env.inflight.cancel_all()
+            await asyncio.gather(task, peer_task, return_exceptions=True)

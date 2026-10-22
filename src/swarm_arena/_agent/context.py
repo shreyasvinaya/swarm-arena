@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
-from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
+from swarm_arena._agent.tool_run import Inflight, _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
@@ -121,6 +121,56 @@ def _defer_timer_error(error: BaseException) -> bool:
     for timer in timers:
         timer.record(error)
     return True
+
+
+class _ActionInflight(Inflight):
+    """Keep one owned action visible to round stop and independently cancellable."""
+
+    def __init__(self, parent: Inflight) -> None:
+        self._parent = parent
+        self._local = Inflight()
+        self._scopes = self._local._scopes
+
+    @property
+    def closed(self) -> bool:
+        return self._parent.closed or self._local.closed
+
+    @closed.setter
+    def closed(self, value: bool) -> None:
+        self._local.closed = value
+
+    @property
+    def _cancel_generation(self) -> int:
+        return self._parent._cancel_generation + self._local._cancel_generation
+
+    @_cancel_generation.setter
+    def _cancel_generation(self, value: int) -> None:
+        self._local._cancel_generation = value - self._parent._cancel_generation
+
+    def add(self, scope: anyio.CancelScope, *, grace_s: float = 0.0) -> None:
+        self._local.add(scope, grace_s=grace_s)
+        try:
+            self._parent.add(scope, grace_s=grace_s)
+        except BaseException:
+            self._local.discard(scope)
+            raise
+
+    def discard(self, scope: anyio.CancelScope) -> None:
+        self._local.discard(scope)
+        self._parent.discard(scope)
+
+    def cancel_all(self) -> None:
+        self._local.cancel_all()
+
+    def _add_completion(self, scope: anyio.CancelScope, *, grace_s: float, generation: int) -> bool:
+        if generation != self._cancel_generation:
+            return False
+        self._local._add_completion(
+            scope, grace_s=grace_s, generation=self._local._cancel_generation
+        )
+        return self._parent._add_completion(
+            scope, grace_s=grace_s, generation=self._parent._cancel_generation
+        )
 
 
 @dataclass(frozen=True)
