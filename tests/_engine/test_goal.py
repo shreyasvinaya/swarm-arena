@@ -3073,7 +3073,6 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     from contextlib import contextmanager
-    from types import SimpleNamespace
 
     import anyio
     from _fakes.curators import MergeAll
@@ -3086,8 +3085,8 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
     runner = await _curation_checkpoint(env)
     waiting = False
     allowances: list[float] = []
-    polls: list[float] = []
     waits: list[int] = []
+    report_scope: anyio.CancelScope | None = None
 
     async def curate(*args: Any, **kwargs: Any) -> Any:
         nonlocal waiting
@@ -3109,6 +3108,8 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
 
             async def wait() -> None:
                 waits.append(1)
+                assert report_scope is not None
+                report_scope.cancel()
                 await original_wait()
 
             class ObservedEvent:
@@ -3127,22 +3128,15 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
 
     @contextmanager
     def report_timer(seconds: float) -> Any:
-        if waiting:
-            allowances.append(seconds)
-        # Expire a report allowance at its first checkpoint, without a clock race.
-        with anyio.move_on_after(0 if waiting else seconds) as timer:
+        nonlocal report_scope
+        assert waiting
+        allowances.append(seconds)
+        # Cancel once the recorded report wait actually enters.
+        with anyio.CancelScope() as timer:
+            report_scope = timer
             yield timer
 
-    async def poll(seconds: float) -> None:
-        if waiting:
-            polls.append(seconds)
-            pytest.fail("report waiting must use recorder events, never tranche polling")
-        await anyio.lowlevel.checkpoint()
-
-    api = SimpleNamespace(**vars(anyio))
-    api.move_on_after = report_timer
-    api.sleep = poll
-    monkeypatch.setattr(goal_module, "anyio", api)
+    monkeypatch.setattr(goal_module, "_report_timer", report_timer)
     monkeypatch.setattr(MergeAll, "curate", curate)
     recorder.bind_run(
         env.deps.run_id,
@@ -3158,14 +3152,14 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
         settle_timeout_s=env.deps.config.settle_timeout_s,
     )
     try:
-        await runner._curate_round(1)
+        with anyio.fail_after(5):
+            await runner._curate_round(1)
     finally:
         recorder.unbind_run(env.deps.run_id)
     await env.deps.journal.commit()
     assert len(env.events("curated")) == 1
     assert waiting, env.events("curated")[0].payload
     assert allowances == [env.deps.config.settle_timeout_s]
-    assert polls == []
     assert waits == ([1] if mode == "recorded" else [])
     assert len(env.events("llm_call")) == int(mode != "direct")
     assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01

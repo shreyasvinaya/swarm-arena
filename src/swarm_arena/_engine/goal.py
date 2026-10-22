@@ -83,6 +83,11 @@ from swarm_arena._scoring.runner import (
 _T = TypeVar("_T")
 
 
+def _report_timer(seconds: float) -> anyio.CancelScope:
+    """Give curator report arrival one allowance, separate from settlement."""
+    return anyio.move_on_after(seconds)
+
+
 @dataclass
 class GoalOutcome:
     """
@@ -1725,7 +1730,7 @@ class GoalRunner:
             if not interrupted:
                 try:
                     # Report arrival and durable settlement have separate budgets.
-                    with anyio.move_on_after(scope.settle_timeout_s) as report_timer:
+                    with _report_timer(scope.settle_timeout_s) as report_timer:
                         with _local_timer_scope(report_timer) as report_wait:
                             binding = _recorder._bindings.get(scope.run_id)
                             if binding is not None and binding.journal is scope.journal:
