@@ -1500,3 +1500,75 @@ async def test_queued_r0_carries_planning_session(run_config: RunConfig) -> None
         and entries[0][0].planner_call_ids == ("llm-1",)
         for entries in state.plans.values()
     )
+
+
+@pytest.mark.parametrize("stop", ["deadline", "stop", "cancel"])
+async def test_planning_acquisition_is_supervised_before_owner_response(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+) -> None:
+    from threading import Event as ThreadEvent
+
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena import Goal
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._journal.lease import Lease
+
+    held, released = HeldOperation(), ThreadEvent()
+    create, release = LocalStore.create, Lease.release
+    setups: list[bool] = []
+    yielded: list[bool] = []
+
+    def hold_owner(store: LocalStore, key: str, data: bytes) -> Any:
+        result = create(store, key, data)
+        if key == "control/owner.json":
+            held.wait()
+        return result
+
+    def release_owner(lease: Lease) -> None:
+        release(lease)
+        released.set()
+
+    monkeypatch.setattr(LocalStore, "create", hold_owner)
+    monkeypatch.setattr(Lease, "release", release_owner)
+    monkeypatch.setattr(run_module, "_run_setups", [lambda config: setups.append(True)])
+    config = _planning_config(run_config)
+    config = with_limits(config, run_timeout_s=0.2 if stop == "deadline" else 30)
+
+    async def enter() -> None:
+        async with run_module.planning_session(
+            config, Goal(id="g", namespace="n"), _session_planner()
+        ):
+            yielded.append(True)
+
+    task = asyncio.create_task(enter())
+    try:
+        await held.ready()
+        (session,) = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
+        if stop == "stop":
+            (session / "control/stop-e1").write_text("")
+        elif stop == "cancel":
+            task.cancel()
+        with (
+            anyio.fail_after(3),
+            pytest.raises(
+                asyncio.CancelledError if stop == "cancel" else RuntimeError,
+                match=None if stop == "cancel" else "planning session stopped",
+            ),
+        ):
+            await asyncio.shield(task)
+        assert setups == []
+        assert yielded == []
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await held.finish()
+        assert await anyio.to_thread.run_sync(released.wait, 5)
+    owner = read_owner(LocalStore(session))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert setups == []
+    assert yielded == []

@@ -193,7 +193,9 @@ explicitly to the shared draft/admission helper; storage roots and generated
 metadata do not select a source directory.
 
 Outside a running scope, planning opens its own leased, journaled session with
-registered run setups, a live timeout/stop clock, and a budget ledger. Calls are
+registered run setups, a live timeout/stop clock, and a budget ledger. The active
+allowance includes lease acquisition, even while the backend holds its response;
+a stop or expiry during acquisition prevents setup and scope entry. Calls are
 drained before return; stopped setup cannot yield a usable scope. Success and
 interruption both retain committed usage for replay. No executor or board is
 started for this session.

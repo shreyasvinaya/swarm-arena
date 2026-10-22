@@ -1146,22 +1146,23 @@ async def planning_session(
     run_id = new_run_id(utc_now())
     store = await _storage_io(lambda: open_store(config.run_root).child(run_id))
     artifacts = await _storage_io(lambda: ArtifactStore(open_store(config.artifact_root)))
-    lease = await _acquire_lease(
-        partial(
-            Lease.acquire_new,
-            store,
-            owner_id=uuid4().hex,
-            host=socket.gethostname(),
-            ttl_s=config.lease_ttl_s,
-        ),
-        settle_timeout_s=config.settle_timeout_s,
-    )
     clock, stops = RunClock(0), StopState()
+    lease: Lease | None = None
     entered = completed = False
     try:
-        async with (
-            _supervise_initialization(store, lease.doc.epoch, stops, clock, config),
-            _RunJournal(
+        async with _supervise_initialization(store, 1, stops, clock, config):
+            lease = await _acquire_lease(
+                partial(
+                    Lease.acquire_new,
+                    store,
+                    owner_id=uuid4().hex,
+                    host=socket.gethostname(),
+                    ttl_s=config.lease_ttl_s,
+                ),
+                settle_timeout_s=config.settle_timeout_s,
+            )
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            async with _RunJournal(
                 store,
                 lease,
                 run_id=run_id,
@@ -1169,111 +1170,112 @@ async def planning_session(
                 local_path=_local_journal_path(run_id, lease.doc.epoch),
                 sync_interval_s=config.sync_interval_s,
                 settle_timeout_s=config.settle_timeout_s,
-            ) as journal,
-        ):
-            entered = True
-            journal.clock = clock
-            async with _supervise_writer(journal):
-                ids = IdGen(run_id, lease.doc.epoch)
-                ledger = Ledger(
-                    config.limits,
-                    reserve_fraction=config.reserve_fraction,
-                    goal_weights=config.goal_weights,
-                    journal=journal,
-                    ids=ids,
-                )
-                async with _bound_run(
-                    run_id,
-                    journal=journal,
-                    ids=ids,
-                    artifacts=artifacts,
-                    config=config,
-                    stops=stops,
-                    clock=clock,
-                    state=RunState(),
-                ):
-                    journal.append(
-                        EventDraft(
-                            type=EventType.RUN_CONFIG,
-                            payload={"config": config.model_dump(mode="json")},
-                        )
-                    )
-                    journal.append(
-                        EventDraft(
-                            type=EventType.RUN_STARTED,
-                            payload={
-                                "planning": True,
-                                "warnings": warnings,
-                                "final_slices": {goal.id: Amount().model_dump()},
-                            },
-                        )
-                    )
-                    await ledger.hold_final_slices({goal.id: Amount()})
-                    ledger.open_goal(goal.id)
-                    journal.append(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
-                    tranche = Tranche(
-                        ledger,
-                        f"{goal.id}/:planner",
-                        goal.id,
-                        size=Amount(
-                            tokens=config.limits.llm_tranche_tokens,
-                            usd=config.limits.llm_tranche_usd,
-                        ),
-                    )
-                    scope = LLMScope(
-                        role="planner",
-                        run_id=run_id,
-                        goal_id=goal.id,
-                        team="",
-                        agent="",
-                        round=0,
-                        candidate_id=None,
-                        tranche=tranche,
+            ) as journal:
+                entered = True
+                journal.clock = clock
+                async with _supervise_writer(journal):
+                    ids = IdGen(run_id, lease.doc.epoch)
+                    ledger = Ledger(
+                        config.limits,
+                        reserve_fraction=config.reserve_fraction,
+                        goal_weights=config.goal_weights,
                         journal=journal,
-                        artifacts=artifacts,
-                        models=config.models,
-                        tracing=config.tracing,
-                        cache=config.cache,
-                        limits=config.limits,
-                        settle_timeout_s=config.settle_timeout_s,
+                        ids=ids,
                     )
-                    failed = True
-                    try:
-                        await journal.commit()
-                        await _storage_io(_create, store, "run.toml", config.dumps().encode())
-                        await _setup_run((), config)
-                        await anyio.lowlevel.checkpoint_if_cancelled()
-                        with llm_scope(scope):
-                            yield scope
-                        await anyio.lowlevel.checkpoint_if_cancelled()
-                        failed = False
-                    finally:
+                    async with _bound_run(
+                        run_id,
+                        journal=journal,
+                        ids=ids,
+                        artifacts=artifacts,
+                        config=config,
+                        stops=stops,
+                        clock=clock,
+                        state=RunState(),
+                    ):
+                        journal.append(
+                            EventDraft(
+                                type=EventType.RUN_CONFIG,
+                                payload={"config": config.model_dump(mode="json")},
+                            )
+                        )
+                        journal.append(
+                            EventDraft(
+                                type=EventType.RUN_STARTED,
+                                payload={
+                                    "planning": True,
+                                    "warnings": warnings,
+                                    "final_slices": {goal.id: Amount().model_dump()},
+                                },
+                            )
+                        )
+                        await ledger.hold_final_slices({goal.id: Amount()})
+                        ledger.open_goal(goal.id)
+                        journal.append(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
+                        tranche = Tranche(
+                            ledger,
+                            f"{goal.id}/:planner",
+                            goal.id,
+                            size=Amount(
+                                tokens=config.limits.llm_tranche_tokens,
+                                usd=config.limits.llm_tranche_usd,
+                            ),
+                        )
+                        scope = LLMScope(
+                            role="planner",
+                            run_id=run_id,
+                            goal_id=goal.id,
+                            team="",
+                            agent="",
+                            round=0,
+                            candidate_id=None,
+                            tranche=tranche,
+                            journal=journal,
+                            artifacts=artifacts,
+                            models=config.models,
+                            tracing=config.tracing,
+                            cache=config.cache,
+                            limits=config.limits,
+                            settle_timeout_s=config.settle_timeout_s,
+                        )
+                        failed = True
                         try:
-                            if not failed:
-                                await drain(scope, wait=True)
+                            await journal.commit()
+                            await _storage_io(_create, store, "run.toml", config.dumps().encode())
+                            await _setup_run((), config)
+                            await anyio.lowlevel.checkpoint_if_cancelled()
+                            with llm_scope(scope):
+                                yield scope
+                            await anyio.lowlevel.checkpoint_if_cancelled()
+                            failed = False
                         finally:
-                            with _stop_cleanup(config):
-                                await drain(scope, wait=False)
-                                outcome = await tranche.close()
-                                if outcome.overflow:
-                                    ledger._check_usage_overflow()
-                                await _record_stop(journal, stops)
-                                journal.append(
-                                    EventDraft(
-                                        type=EventType.GOAL_FINISHED,
-                                        goal_id=goal.id,
-                                        payload={
-                                            "reason": "stopped" if failed else "planning complete"
-                                        },
+                            try:
+                                if not failed:
+                                    await drain(scope, wait=True)
+                            finally:
+                                with _stop_cleanup(config):
+                                    await drain(scope, wait=False)
+                                    outcome = await tranche.close()
+                                    if outcome.overflow:
+                                        ledger._check_usage_overflow()
+                                    await _record_stop(journal, stops)
+                                    journal.append(
+                                        EventDraft(
+                                            type=EventType.GOAL_FINISHED,
+                                            goal_id=goal.id,
+                                            payload={
+                                                "reason": "stopped"
+                                                if failed
+                                                else "planning complete"
+                                            },
+                                        )
                                     )
-                                )
-                                await ledger.end_goal(goal.id)
-                                await journal.commit()
-                    completed = True
+                                    await ledger.end_goal(goal.id)
+                                    await journal.commit()
+                        completed = True
         if not completed or stops.stop or stops.stop_now or stops.run_timeout:
             raise _core_error(RuntimeError, "planning session stopped") from None
     finally:
-        if not entered:
+        if lease is not None and not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):
                     await _storage_io(lease.release)
