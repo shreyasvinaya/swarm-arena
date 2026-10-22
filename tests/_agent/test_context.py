@@ -1315,3 +1315,41 @@ async def test_provider_timer_preserves_stronger_control(control: str) -> None:
         assert _core_category(timer.failure) is (
             _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
         )
+
+
+@pytest.mark.parametrize("closed_registry", ["parent", "action"])
+@pytest.mark.parametrize("limit", ["budget", "run_timeout_s", "stop"])
+async def test_run_tool_preserves_live_gate_after_registry_closes(
+    ctx_env: CtxEnv, closed_registry: str, limit: str
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+    from swarm_arena._engine.stops import StopState
+
+    state = StopState()
+    parent = Inflight()
+    owned = _ActionInflight(parent)
+    stopped = anyio.Event()
+    ctx = ctx_env.ctx(gate=state.gate_for(ctx_env.rt.goal_id))
+
+    async def stop() -> None:
+        if limit == "budget":
+            state.goal_budget.add(ctx_env.rt.goal_id)
+        elif limit == "run_timeout_s":
+            state.run_timeout = True
+        else:
+            state.stop = True
+        (parent if closed_registry == "parent" else owned).close()
+        stopped.set()
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(stop)
+            await stopped.wait()
+            with track_inflight(owned), pytest.raises(LimitReached) as caught:
+                await ctx.run_tool({"x": 1.0})
+    assert caught.value.limit == limit
+    assert _is_core_signal(caught.value)
+    assert ctx_env.counters.turns == ctx_env.counters.tool_runs == 0
+    assert not ctx_env.events("reserve")
+    assert not ctx_env.events("tool_start")
