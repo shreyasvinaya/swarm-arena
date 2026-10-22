@@ -2607,6 +2607,14 @@ reaches zero. Direct and batched reservations follow the same ownership rule.
 reject it value-free during preparation, before adoption. Unknown-spend fallback
 must never turn a cache hit into a paid call.
 
+Healthy live acknowledgement, scope drain and tranche close have no fixed
+`settle_timeout_s` deadline: they remain supervised by the owner's run clock,
+stop state and fencing. The cleanup allowance begins only after stop, run
+deadline or actual cancellation. Owner interruption shares one deadline across
+remaining accounting; cancelled-call retries retain their allowance until settled,
+then retire it so later healthy work is unaffected. Pending-report waiting still
+uses its separate `settle_timeout_s` bound.
+
 ### R4.14 Journal event types — M1b (additions noted)
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.

@@ -63,6 +63,7 @@ class _Pending:
     overflow: bool = False
     settled: bool = False
     error: Exception | None = None
+    cleanup_at: float = float("inf")
 
 
 @dataclass
@@ -90,6 +91,13 @@ class _Binding:
     closing: bool = False
     terminal: Exception | None = None
     overflow_notified: set[int] = field(default_factory=set)
+    cleanup_at: float = float("inf")
+
+    def begin_cleanup(self) -> None:
+        """Start the owner's allowance once, only upon actual interruption."""
+        if math.isinf(self.cleanup_at):
+            self.cleanup_at = anyio.current_time() + self.settle_timeout_s
+            self.journal._stop_storage()
 
     def track_scope(self, scope: LLMScope) -> None:
         """Count each funded scope once until all its accounting has drained."""
@@ -341,22 +349,28 @@ def _digest(value: str | None) -> str | None:
 
 async def _watch_owner(binding: _Binding, scope: anyio.CancelScope) -> None:
     """Bound foreign callback tasks by the same stop state and active clock."""
-    grace: float | None = None
     while True:
         if not binding.active:
             scope.cancel()
             return
         left = binding.clock.left(binding.limits.run_timeout_s)
         if binding.stops.stop or binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
-            binding.journal._stop_storage()
-            if grace is None:
-                grace = anyio.current_time() + binding.settle_timeout_s
-            left = grace - anyio.current_time()
-            if left <= 0:
-                binding.terminal = _stop_cleanup_error()
-                scope.cancel()
-                return
+            binding.begin_cleanup()
+        if not math.isinf(binding.cleanup_at):
+            left = binding.cleanup_at - anyio.current_time()
+        if left <= 0:
+            binding.terminal = _stop_cleanup_error()
+            scope.cancel()
+            return
         await anyio.sleep(min(0.05, max(0.001, left)))
+
+
+def _caller_cancelled() -> bool:
+    """Observe actual caller state before entering a cleanup shield."""
+    task = asyncio.current_task()
+    return anyio.get_current_task().has_pending_cancellation() or (
+        task is not None and task.cancelling() > 0
+    )
 
 
 async def _watch_writer(binding: _Binding, scope: anyio.CancelScope) -> None:
@@ -624,9 +638,11 @@ async def _settle(binding: _Binding, entry: _Pending) -> None:
         return
     outcome = _Outcome()
     try:
-        # Protection from caller cancellation is bounded independently of a
-        # provider report wait. The writer retains its own lease/stop limits.
-        with anyio.move_on_after(binding.settle_timeout_s, shield=True) as cleanup:
+        # Healthy acknowledgement has no report-wait deadline. A retry after
+        # cancellation retains the original cleanup allowance instead of resetting it.
+        with anyio.CancelScope(
+            deadline=entry.cleanup_at, shield=not math.isinf(entry.cleanup_at)
+        ) as cleanup:
             completed, result = await _owned(
                 binding,
                 partial(
@@ -647,13 +663,20 @@ async def _settle(binding: _Binding, entry: _Pending) -> None:
             return
         assert result is not None
         entry.settled = True
+        entry.cleanup_at = float("inf")
         if result.overflow:
             binding.overflow_notified.add(id(entry.scope.tranche))
             raise _core_signal(
                 LimitReached("usage_overflow", "reported usage exceeds the supported range")
             )
     except BaseException as error:
-        outcome.contain(error, StorageError, "LLM settlement")
+        try:
+            outcome.contain(error, StorageError, "LLM settlement")
+        except asyncio.CancelledError:
+            entry.cleanup_at = min(
+                entry.cleanup_at, anyio.current_time() + binding.settle_timeout_s
+            )
+            raise
 
 
 async def record_call(
@@ -821,6 +844,10 @@ async def _record(
         # never becomes an error-bearing placeholder or a terminal-control forgery.
         if _has_core_fenced(caught):
             binding.terminal = _core_error(Fenced, "run ownership lost")
+        if entry is not None and isinstance(caught, asyncio.CancelledError) and _caller_cancelled():
+            entry.cleanup_at = min(
+                entry.cleanup_at, anyio.current_time() + binding.settle_timeout_s
+            )
         if (
             entry is not None
             and isinstance(caught, Exception)
@@ -939,7 +966,10 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     binding.drained.add(id(scope))
     placeholders: list[str] = []
     failure: Exception | None = None
-    with anyio.move_on_after(scope.settle_timeout_s, shield=True) as cleanup:
+    cleanup_at = min(entry.cleanup_at for entry in entries)
+    if _caller_cancelled():
+        cleanup_at = min(cleanup_at, anyio.current_time() + scope.settle_timeout_s)
+    with anyio.CancelScope(deadline=cleanup_at, shield=not math.isinf(cleanup_at)) as cleanup:
         for entry in entries:
             binding.check()
             for worker in tuple(entry.workers):
@@ -1003,10 +1033,14 @@ async def _bound_run(
         raise
     finally:
         binding.closing = True
+        if _caller_cancelled():
+            binding.begin_cleanup()
         failure: BaseException | None = None
         try:
             if binding.active:
-                with anyio.move_on_after(config.settle_timeout_s, shield=True) as cleanup:
+                with anyio.CancelScope(
+                    deadline=binding.cleanup_at, shield=not math.isinf(binding.cleanup_at)
+                ) as cleanup:
                     for scope in binding.scopes.values():
                         try:
                             await drain(scope, wait=False)

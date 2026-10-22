@@ -904,6 +904,159 @@ async def test_durable_settlement_timeout_is_not_fencing_with_a_valid_lease(
         await held.finish()
 
 
+@pytest.mark.parametrize("site", ["record", "drain", "owner_drain", "owner_close"])
+@pytest.mark.parametrize("signal", ["release", "stop", "deadline", "cancel", "scope_cancel"])
+async def test_healthy_settlement_outlives_cleanup_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, signal: str
+) -> None:
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._journal.lease import read_owner
+    from swarm_arena._journal.llm_record import _bindings
+    from swarm_arena._model.canonical import utc_now
+
+    held = HeldOperation()
+    runs: list[LLMRun] = []
+    scopes: list[LLMScope] = []
+    config = RunConfig(settle_timeout_s=0.15, lease_ttl_s=60)
+    owner_cancel = anyio.CancelScope()
+
+    async def owner() -> None:
+        with owner_cancel, monkeypatch.context() as patch:
+            async with open_llm_run(tmp_path, config=config) as run:
+                runs.append(run)
+                scope = run.scope("manager")
+                if site == "owner_close":
+                    scope = replace(
+                        scope,
+                        tranche=Tranche(run.ledger, ":run", "g", size=Amount(usd=0.25)),
+                    )
+                scopes.append(scope)
+                _, meta = await _open(run, scope)
+                if site != "record":
+                    await record_call(**record_kwargs(meta, settle=False))
+                    await run.journal.commit()
+                create = run.store.create
+
+                def block(key: str, data: bytes) -> str:
+                    if key.startswith("journal/"):
+                        held.wait()
+                    return create(key, data)
+
+                patch.setattr(run.store, "create", block)
+                if site == "record":
+                    await record_call(**record_kwargs(meta))
+                elif site == "drain":
+                    assert await drain(scope, wait=False) == []
+
+    task = asyncio.create_task(owner())
+    try:
+        await held.ready()
+        # A deliberately held healthy write must remain live beyond this knob.
+        done, _ = await asyncio.wait([task], timeout=config.settle_timeout_s * 3)
+        assert not done, "healthy accounting used the post-interruption timer"
+        (run,) = runs
+        assert not run.stops.stop
+        assert not run.stops.stop_now
+        assert not run.stops.run_timeout
+        assert run.clock.left(config.limits.run_timeout_s) > 0
+        assert not run.journal.fenced.is_set()
+        assert _bindings[run.run_id].terminal is None
+        owner_doc = read_owner(run.store)
+        assert owner_doc is not None
+        assert owner_doc[0].expires_at > utc_now()
+        if signal == "release":
+            held.release.set()
+            with anyio.fail_after(5):
+                await task
+            assert run.charged(scopes[0]) == Amount(tokens=120, usd=0.002)
+            assert len(run.calls()) == 1
+        else:
+            if signal == "stop":
+                run.stops.stop_now = True
+            elif signal == "deadline":
+                run.clock._rebase(config.limits.run_timeout_s)
+            elif signal == "scope_cancel":
+                owner_cancel.cancel()
+            else:
+                task.cancel()
+            done, _ = await asyncio.wait([task], timeout=2)
+            assert done, "interrupted accounting outlived its cleanup allowance"
+            if signal == "cancel":
+                assert task.cancelled()
+            elif signal == "scope_cancel":
+                assert task.result() is None
+            else:
+                error = task.exception()
+                assert isinstance(error, RuntimeError)
+                assert not isinstance(error, Fenced)
+                assert str(error) == "stop cleanup timed out"
+            assert run.events("settle") == []
+            committed_ids = [call.id for call in run.calls()]
+            await held.finish()
+            assert [call.id for call in run.calls()] == committed_ids
+            assert run.events("settle") == []
+        assert run.run_id not in _bindings
+    finally:
+        held.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await held.finish()
+
+
+async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        entered = anyio.Event()
+
+        async def delayed(*args: Any) -> Any:
+            entered.set()
+            await anyio.sleep_forever()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(scope.tranche, "settle_call", delayed)
+            task = asyncio.create_task(record_call(**record_kwargs(meta)))
+            try:
+                with anyio.fail_after(5):
+                    await entered.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert await drain(scope, wait=False) == []
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+
+        next_scope, next_meta = await _open(run)
+        held = HeldOperation()
+        create = run.store.create
+
+        def block(key: str, data: bytes) -> str:
+            if key.startswith("journal/"):
+                held.wait()
+            return create(key, data)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(run.store, "create", block)
+            task = asyncio.create_task(record_call(**record_kwargs(next_meta)))
+            try:
+                await held.ready()
+                done, _ = await asyncio.wait([task], timeout=run.config.settle_timeout_s * 1.25)
+                assert not done
+                held.release.set()
+                with anyio.fail_after(5):
+                    assert await task is not None
+            finally:
+                held.release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await held.finish()
+        assert run.charged(next_scope) == Amount(tokens=120, usd=0.002)
+
+
 async def test_held_payload_stops_on_real_takeover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
