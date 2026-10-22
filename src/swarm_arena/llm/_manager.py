@@ -9,7 +9,7 @@ from agents.agent import StopAtTools
 from agents.exceptions import MaxTurnsExceeded
 from pydantic import Field
 
-from swarm_arena._agent.context import AgentContext
+from swarm_arena._agent.context import AgentContext, _local_timer_scope
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._errors import _core_error, _is_core_control, _stop_cleanup_error
@@ -19,7 +19,7 @@ from swarm_arena._model.planning_types import RoundReport
 from swarm_arena._model.ref import _ConfigInputModel, _validate_config, config_or_fields
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.io import _storage_io
-from swarm_arena.llm._actions import build_tools
+from swarm_arena.llm._actions import _own_actions, build_tools
 from swarm_arena.llm._cache import cache_namespace
 from swarm_arena.llm._catalog import build_model
 from swarm_arena.llm._hooks import BudgetExceeded, BudgetHooks, MeteredModel, _prepare, _sdk_control
@@ -222,15 +222,52 @@ class AgentsSDKManager(Manager):
                 return agent, round_input(ctx, seed_inputs=self.config.seed_inputs)
 
             agent, input_text = await _prepare(prepare)
-            with anyio.fail_after(scope.limits.effective_round_timeout_s()) as timer:
-                result = await Runner.run(
-                    agent,
-                    input_text,
-                    context=deps,
-                    max_turns=scope.limits.max_turns_per_round,
-                    hooks=BudgetHooks(),
-                    run_config=SDKRunConfig(tracing_disabled=not scope.tracing.langfuse),
-                )
+            timer = anyio.CancelScope(
+                deadline=anyio.current_time() + scope.limits.effective_round_timeout_s()
+            )
+            with _local_timer_scope(timer) as local_timer:
+                async with anyio.create_task_group() as group:
+                    with _own_actions(group, local_timer) as actions:
+                        try:
+                            with timer:
+                                result = await Runner.run(
+                                    agent,
+                                    input_text,
+                                    context=deps,
+                                    max_turns=scope.limits.max_turns_per_round,
+                                    hooks=BudgetHooks(),
+                                    run_config=SDKRunConfig(
+                                        tracing_disabled=not scope.tracing.langfuse
+                                    ),
+                                )
+                        except BaseException as error:
+                            failure = error
+                        actions.accepting = False
+                        if failure is not None or timer.cancel_called:
+                            actions.stop()
+                        try:
+                            outcome.propagate_control(RuntimeError())
+                        except anyio.get_cancelled_exc_class() as error:
+                            failure = error
+                            actions.stop()
+                            group.cancel_scope.shield = True
+                        while True:
+                            try:
+                                await actions.wait()
+                                break
+                            except anyio.get_cancelled_exc_class() as error:
+                                failure = error
+                                actions.stop()
+                                group.cancel_scope.shield = True
+                        group.cancel_scope.shield = True
+                if local_timer.failure is not None:
+                    failure = (
+                        BaseExceptionGroup("manager action unwind", [failure, local_timer.failure])
+                        if failure is not None
+                        else local_timer.failure
+                    )
+                if failure is not None:
+                    raise failure
             if timer.cancel_called:
                 raise TimeoutError
             report = RoundReport(summary=deps.summary or str(result.final_output or ""))

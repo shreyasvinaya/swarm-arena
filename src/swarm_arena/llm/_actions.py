@@ -2,7 +2,10 @@
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
 import anyio
@@ -11,7 +14,13 @@ from agents.tool import default_tool_timeout_error_message, set_function_tool_fa
 from agents.tool_context import ToolContext
 from pydantic import ConfigDict, ValidationError, create_model
 
-from swarm_arena._agent.context import AgentContext, _action_timer_scope
+from swarm_arena._agent.context import (
+    AgentContext,
+    _defer_timer_error,
+    _local_timer_scope,
+    _LocalTimer,
+)
+from swarm_arena._agent.manager import LimitReached
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import (
@@ -249,6 +258,77 @@ async def _act(
     return await _prepare(lambda: _render(result, board=True))
 
 
+@dataclass(eq=False)
+class _OwnedCall:
+    """Deliver an owned action result without giving the SDK task cancellation authority."""
+
+    scope: anyio.CancelScope = field(default_factory=lambda: anyio.CancelScope(shield=True))
+    finished: anyio.Event = field(default_factory=anyio.Event)
+    result: str = ""
+    error: BaseException | None = None
+
+
+class _OwnedActions:
+    """Own all action bodies until core work has completed and controls are collected."""
+
+    def __init__(self, group: anyio.abc.TaskGroup, timer: _LocalTimer) -> None:
+        self.group = group
+        self.timer = timer
+        self.calls: set[_OwnedCall] = set()
+        self.accepting = True
+
+    async def call(self, operation: Callable[[], Awaitable[str]]) -> str:
+        if not self.accepting:
+            raise _core_error(LimitReached, "stop", "the round is stopping")
+        call = _OwnedCall()
+        self.calls.add(call)
+        self.group.start_soon(self._run, operation, call)
+        await call.finished.wait()
+        if call.error is not None:
+            raise call.error
+        return call.result
+
+    async def _run(self, operation: Callable[[], Awaitable[str]], call: _OwnedCall) -> None:
+        try:
+            with call.scope, _local_timer_scope(call.scope) as local:
+                try:
+                    call.result = await operation()
+                except BaseException as error:
+                    call.error = error
+                    self.timer.record(error)
+            if local.failure is not None:
+                self.timer.record(local.failure)
+        finally:
+            self.calls.discard(call)
+            call.finished.set()
+
+    def stop(self) -> None:
+        self.accepting = False
+        for call in self.calls:
+            call.scope.cancel()
+
+    async def wait(self) -> None:
+        while self.calls:
+            await next(iter(self.calls)).finished.wait()
+
+
+_owned_actions: ContextVar[_OwnedActions | None] = ContextVar("manager_owned_actions", default=None)
+
+
+@contextmanager
+def _own_actions(
+    group: anyio.abc.TaskGroup, timer: _LocalTimer
+) -> Generator[_OwnedActions, None, None]:
+    """Bind one manager-owned action group through SDK-created invocation tasks."""
+    owner = _OwnedActions(group, timer)
+    token = _owned_actions.set(owner)
+    try:
+        yield owner
+    finally:
+        owner.accepting = False
+        _owned_actions.reset(token)
+
+
 def _tool(
     ctx: AgentContext,
     deps: ManagerDeps,
@@ -259,18 +339,22 @@ def _tool(
     arguments: type[_Arguments] | None,
     timeout: float | None,
 ) -> FunctionTool:
-    async def invoke(tool_context: ToolContext[Any], raw: str) -> str:
+    async def execute(tool_context: ToolContext[Any], raw: str) -> str:
         outcome = _Outcome()
         error: BaseException | None = None
         result = ""
         deadline = math.inf if timeout is None else anyio.current_time() + timeout
-        with anyio.CancelScope(deadline=deadline) as scope, _action_timer_scope(scope):
+        with anyio.CancelScope(deadline=deadline) as scope, _local_timer_scope(scope):
             try:
                 call_id = _context_string(tool_context.tool_call_id, "tool_call_id")
                 args = await _prepare(lambda: _parse(raw, arguments))
                 result = await _act(ctx, deps, name, args, call_id)
             except BaseException as caught:
                 error = caught
+        if error is not None:
+            # An enclosing round timer may cancel the SDK invocation task. Its
+            # owner retains the control even if the SDK discards this failure.
+            _defer_timer_error(error)
         # Exiting our scope removes only its own cancellation requests. The
         # captured caller outcome now gives real owner cancellation precedence.
         # Check normal returns too: a handler may have swallowed cancellation.
@@ -295,6 +379,12 @@ def _tool(
             else f"internal error in {name}: {_exception_type_name(classified)}"
         )
         return _render({"error": message})
+
+    async def invoke(tool_context: ToolContext[Any], raw: str) -> str:
+        owner = _owned_actions.get()
+        if owner is None:
+            return await execute(tool_context, raw)
+        return await owner.call(lambda: execute(tool_context, raw))
 
     return set_function_tool_failure_error_function(
         FunctionTool(

@@ -18,6 +18,7 @@ from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
+    Fenced,
     SoftError,
     _core_error,
     _core_signal,
@@ -70,26 +71,56 @@ _nested: ContextVar[tuple[_ActionLifetime, ...]] = ContextVar("agent_nested_acti
 
 
 @dataclass(eq=False)
-class _ActionTimer:
-    """Defer unwind classification to the adapter that owns this timer."""
+class _LocalTimer:
+    """Keep derived cancellation and unwind controls owned by a local timer."""
 
     scope: anyio.CancelScope
     live: bool = True
+    failure: Exception | None = None
+
+    def record(self, error: BaseException) -> None:
+        """Retain only registered controls using the shared authority precedence."""
+        if not self.live:
+            return
+        combined = (
+            BaseExceptionGroup("local timer unwind", [self.failure, error])
+            if self.failure is not None
+            else error
+        )
+        try:
+            classified = _classify_outcome(combined)
+        except Fenced as fenced:
+            classified = fenced
+        if _is_core_control(classified):
+            self.failure = classified
 
 
-_action_timer: ContextVar[_ActionTimer | None] = ContextVar("agent_action_timer", default=None)
+_local_timers: ContextVar[tuple[_LocalTimer, ...]] = ContextVar("agent_local_timers", default=())
 
 
 @contextmanager
-def _action_timer_scope(scope: anyio.CancelScope) -> Generator[None, None, None]:
-    """Keep timer cancellation distinct until the adapter checks its caller."""
-    timer = _ActionTimer(scope)
-    token = _action_timer.set(timer)
+def _local_timer_scope(scope: anyio.CancelScope) -> Generator[_LocalTimer, None, None]:
+    """Keep timer provenance live until its owner finishes bounded cleanup."""
+    parents = tuple(timer for timer in _local_timers.get() if timer.live)
+    timer = _LocalTimer(scope)
+    token = _local_timers.set((*parents, timer))
     try:
-        yield
+        yield timer
     finally:
         timer.live = False
-        _action_timer.reset(token)
+        _local_timers.reset(token)
+
+
+def _defer_timer_error(error: BaseException) -> bool:
+    """Retain registered unwind controls until the timer owner checks its caller."""
+    timers = tuple(
+        timer for timer in _local_timers.get() if timer.live and timer.scope.cancel_called
+    )
+    if not timers:
+        return False
+    for timer in timers:
+        timer.record(error)
+    return True
 
 
 @dataclass(frozen=True)
@@ -1064,10 +1095,9 @@ class AgentContext:
         try:
             return await action.handler(self, validated)
         except BaseException as error:
-            timer = _action_timer.get()
-            if timer is not None and timer.live and timer.scope.cancel_called:
-                # Only the enclosing adapter can distinguish this timer from
-                # caller cancellation after its cancel scope has exited.
+            if _defer_timer_error(error):
+                # Only the timer owner can distinguish derived cancellation
+                # from caller cancellation after its cancel scope has exited.
                 raise
             error = outcome.classify(error)
             if _is_core_control(error) or (

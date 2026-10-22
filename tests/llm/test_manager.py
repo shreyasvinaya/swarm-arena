@@ -27,15 +27,18 @@ from swarm_arena._budget.llm_scope import llm_scope
 from swarm_arena._errors import (
     ConfigError,
     Fenced,
+    _core_category,
     _core_error,
     _is_core_control,
+    _SignalCategory,
     _stop_cleanup_error,
 )
-from swarm_arena._model.base import FrozenModel
+from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena.config import ModelCatalog, ModelSpec
 from swarm_arena.llm import AgentsSDKManager, BudgetExceeded
 from swarm_arena.manager import AgentContext, LimitReached, Manager, RoundReport
 from swarm_arena.testing import FakeModel, FakeTurn
+from swarm_arena.tool import Action
 
 
 class Inputs(FrozenModel):
@@ -632,36 +635,198 @@ print(any(isinstance(c, CallLogger) for c in litellm.callbacks))
     assert all(e.payload["call"]["error"] is None for e in after)
 
 
-@pytest.mark.parametrize("terminal", [False, True])
-async def test_round_timer_preserves_terminal_unwind_and_refuses_swallowed_timeout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    terminal: bool,
+@pytest.mark.parametrize("kind", ["cleanup", "fence"])
+@pytest.mark.parametrize("timer_first", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_real_action_control_beats_round_timer(
+    tmp_path: Path, ctx_env: CtxEnv, kind: str, timer_first: bool, nested: bool
 ) -> None:
-    from types import SimpleNamespace
+    entered, unwinding, release, finished = (anyio.Event() for _ in range(4))
 
-    from swarm_arena.llm import _manager
+    async def handler(context: AgentContext, args: Inputs) -> JsonValue:
+        entered.set()
+        try:
+            if timer_first:
+                await anyio.sleep_forever()
+        finally:
+            unwinding.set()
+            with anyio.CancelScope(shield=True):
+                await release.wait()
+            finished.set()
+            cause = (
+                _stop_cleanup_error()
+                if kind == "cleanup"
+                else _core_error(Fenced, "run ownership lost")
+            )
+            if nested:
+                raise BaseExceptionGroup("secret-unwind", [asyncio.CancelledError(), cause])
+            raise cause
 
-    register([finish()])
+    ctx = ctx_env.ctx()
+    ctx.actions = (Action(name="held", description="Held", input_model=Inputs, handler=handler),)
+    fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
+    timeout = 0.5 if timer_first else 60.0
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=timeout))) as run:
+        with llm_scope(run.scope("manager")):
+            task = asyncio.create_task(AgentsSDKManager(model="opus").run_round(ctx))
+        try:
+            with anyio.fail_after(5):
+                await unwinding.wait()
+                assert entered.is_set()
+                release.set()
+                with pytest.raises(RuntimeError) as caught:
+                    await task
+            expected = _SignalCategory.TERMINAL if kind == "cleanup" else _SignalCategory.FENCED
+            assert _core_category(caught.value) is expected
+            assert finished.is_set()
+            assert task.cancelling() == 0
+            assert len(fake.calls) == 1
+            assert_secret_absent(caught.value, "secret-unwind")
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            with anyio.fail_after(5):
+                await finished.wait()
 
-    async def interrupted_runner(*args: Any, **kwargs: Any) -> Any:
+
+@pytest.mark.parametrize("kind", ["cleanup", "fence"])
+@pytest.mark.parametrize("timer_first", [False, True])
+@pytest.mark.parametrize("owner", ["task", "scope"])
+async def test_real_caller_cancellation_beats_round_timer_and_action_control(
+    tmp_path: Path, ctx_env: CtxEnv, kind: str, timer_first: bool, owner: str
+) -> None:
+    entered, unwinding, release, finished = (anyio.Event() for _ in range(4))
+
+    async def handler(context: AgentContext, args: Inputs) -> JsonValue:
+        entered.set()
         try:
             await anyio.sleep_forever()
-        except anyio.get_cancelled_exc_class():
-            if terminal:
-                raise _stop_cleanup_error() from None
-            return SimpleNamespace(final_output="late success")
+        finally:
+            unwinding.set()
+            with anyio.CancelScope(shield=True):
+                await release.wait()
+            finished.set()
+            raise (
+                _stop_cleanup_error()
+                if kind == "cleanup"
+                else _core_error(Fenced, "run ownership lost")
+            )
 
-    monkeypatch.setattr(_manager.Runner, "run", interrupted_runner)
-    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=0.05))) as run:
-        with llm_scope(run.scope("manager")), pytest.raises(RuntimeError) as caught:
-            await AgentsSDKManager(model="opus").run_round(context())
-        assert _is_core_control(caught.value)
-        if terminal:
-            assert not isinstance(caught.value, LimitReached)
-        else:
-            assert isinstance(caught.value, LimitReached)
-            assert caught.value.limit == "round_timeout_s"
+    ctx = ctx_env.ctx()
+    ctx.actions = (Action(name="held", description="Held", input_model=Inputs, handler=handler),)
+    fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
+    owner_scope = anyio.CancelScope()
+    cancelled = anyio.Event()
+    timeout = 0.5 if timer_first else 60.0
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=timeout))) as run:
+
+        async def manage() -> None:
+            with llm_scope(run.scope("manager")), owner_scope:
+                try:
+                    await AgentsSDKManager(model="opus").run_round(ctx)
+                except asyncio.CancelledError:
+                    if owner == "task":
+                        raise
+                    cancelled.set()
+                    return
+                pytest.fail("caller cancellation became a report")
+
+        task = asyncio.create_task(manage())
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+                if timer_first:
+                    await unwinding.wait()
+                if owner == "task":
+                    task.cancel()
+                else:
+                    owner_scope.cancel()
+                await unwinding.wait()
+                release.set()
+                if owner == "task":
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    await task
+                    assert cancelled.is_set()
+            assert finished.is_set()
+            assert len(fake.calls) == 1
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            with anyio.fail_after(5):
+                await finished.wait()
+
+
+@pytest.mark.parametrize("swallow", [False, True])
+async def test_real_action_round_expiry_is_an_ordinary_limit(
+    tmp_path: Path, ctx_env: CtxEnv, swallow: bool
+) -> None:
+    finished = anyio.Event()
+
+    async def handler(context: AgentContext, args: Inputs) -> JsonValue:
+        try:
+            await anyio.sleep_forever()
+        except asyncio.CancelledError:
+            if swallow:
+                return {"late": "success"}
+            raise
+        finally:
+            finished.set()
+
+    ctx = ctx_env.ctx()
+    ctx.actions = (Action(name="held", description="Held", input_model=Inputs, handler=handler),)
+    fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=0.5))) as run:
+        with (
+            llm_scope(run.scope("manager")),
+            anyio.fail_after(5),
+            pytest.raises(LimitReached) as caught,
+        ):
+            await AgentsSDKManager(model="opus").run_round(ctx)
+        assert _core_category(caught.value) is _SignalCategory.LIMIT
+        assert caught.value.limit == "round_timeout_s"
+        assert finished.is_set()
+        assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_round_timer_preserves_fencing_across_parallel_action_unwind(
+    tmp_path: Path, ctx_env: CtxEnv, reverse: bool
+) -> None:
+    raised: list[str] = []
+
+    async def cleanup(context: AgentContext, args: Inputs) -> JsonValue:
+        try:
+            await anyio.sleep_forever()
+        finally:
+            raised.append("cleanup")
+            raise _stop_cleanup_error()
+
+    async def fence(context: AgentContext, args: Inputs) -> JsonValue:
+        try:
+            await anyio.sleep_forever()
+        finally:
+            raised.append("fence")
+            raise _core_error(Fenced, "run ownership lost")
+
+    ctx = ctx_env.ctx()
+    ctx.actions = tuple(
+        Action(name=name, description=name, input_model=Inputs, handler=handler)
+        for name, handler in (("cleanup", cleanup), ("fence", fence))
+    )
+    names = ("fence", "cleanup") if reverse else ("cleanup", "fence")
+    fake = register([FakeTurn(tool_calls=tuple((name, {}) for name in names)), finish()])
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=0.5))) as run:
+        with llm_scope(run.scope("manager")), anyio.fail_after(5), pytest.raises(Fenced) as caught:
+            await AgentsSDKManager(model="opus").run_round(ctx)
+        assert sorted(raised) == ["cleanup", "fence"]
+        assert _core_category(caught.value) is _SignalCategory.FENCED
+        assert len(fake.calls) == 1
 
 
 async def test_final_text_is_the_summary(tmp_path: Path) -> None:
