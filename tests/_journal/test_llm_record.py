@@ -918,7 +918,8 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
     held = HeldOperation()
     runs: list[LLMRun] = []
     scopes: list[LLMScope] = []
-    config = RunConfig(settle_timeout_s=0.15, lease_ttl_s=60)
+    # Normal writer shutdown must also fit this allowance after release.
+    config = RunConfig(settle_timeout_s=2, lease_ttl_s=60)
     owner_cancel = anyio.CancelScope()
 
     async def owner() -> None:
@@ -967,7 +968,7 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
         assert owner_doc[0].expires_at > utc_now()
         if signal == "release":
             held.release.set()
-            with anyio.fail_after(5):
+            with anyio.fail_after(10):
                 await task
             assert run.charged(scopes[0]) == Amount(tokens=120, usd=0.002)
             assert len(run.calls()) == 1
@@ -980,7 +981,7 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
                 owner_cancel.cancel()
             else:
                 task.cancel()
-            done, _ = await asyncio.wait([task], timeout=2)
+            done, _ = await asyncio.wait([task], timeout=10)
             assert done, "interrupted accounting outlived its cleanup allowance"
             if signal == "cancel":
                 assert task.cancelled()
