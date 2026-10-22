@@ -110,9 +110,11 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
     if current_thread() is not main_thread() or not callable(handler):
         yield
         return
+    owner = _interrupt_owner.get()
+    if owner is not None and on_interrupt is None:
+        yield
+        return
     loop = asyncio.get_running_loop()
-    on_interrupt = on_interrupt or _interrupt_owner.get()
-    token = _interrupt_owner.set(on_interrupt)
 
     # Runner's Python signal handler cannot wake an idle main thread until
     # Python runs it. add_signal_handler installs a wakeup fd written by the
@@ -130,6 +132,7 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
                 signal.signal(signal.SIGINT, handler)
             raise
 
+    token = _interrupt_owner.set(interrupt)
     loop.add_signal_handler(signal.SIGINT, interrupt)
     temporary_handler = signal.getsignal(signal.SIGINT)
     try:
@@ -142,7 +145,10 @@ def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[
         # handler only while we still own the temporary one; otherwise retain
         # the current owner's handler, including Runner's earlier restoration.
         if current_handler is temporary_handler:
-            signal.signal(signal.SIGINT, handler)
+            if owner is not None:
+                loop.add_signal_handler(signal.SIGINT, owner)
+            else:
+                signal.signal(signal.SIGINT, handler)
         elif signal.getsignal(signal.SIGINT) is not current_handler:
             signal.signal(signal.SIGINT, current_handler)
 

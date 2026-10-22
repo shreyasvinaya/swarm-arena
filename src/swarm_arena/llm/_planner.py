@@ -397,9 +397,7 @@ class LLMPlanner(Planner):
             errors, _ = await _prepare(lambda: check_models({"planner": self.models()}, config))
             if errors:
                 raise _core_error(ValueError, "\n".join(errors))
-            frozen = await _freeze_draft_goal(
-                goal, base_dir=base_dir, artifacts=scope.artifacts
-            )
+            frozen = await _freeze_draft_goal(goal, base_dir=base_dir, artifacts=scope.artifacts)
             revisions = history.revisions if history else []
             current = revisions[-1] if revisions else None
             prompt = await _prepare(
@@ -452,8 +450,7 @@ class LLMPlanner(Planner):
                 namespace=frozen.namespace,
                 system=(
                     "Select catalog entries and only their settable settings. "
-                    "Keep human components with keep_teams and keep_parts. "
-                    + self._instructions
+                    "Keep human components with keep_teams and keep_parts. " + self._instructions
                 ),
                 user=prompt,
                 schema=PLANNER_SCHEMA,

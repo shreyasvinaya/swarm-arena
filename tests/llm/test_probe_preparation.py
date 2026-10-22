@@ -23,7 +23,7 @@ async def test_probe_preparation_preserves_upstream_type(
 
     monkeypatch.setattr(_hooks, "build_model", fail)
     async with open_llm_run(tmp_path, config=planner_config(tmp_path)) as run:
-        with pytest.raises(ValueError) as caught:
+        with pytest.raises(ValueError, match="LLM preparation failed: ImportError") as caught:
             await _hooks.probe_provider("fake", run.scope("planner"))
         assert _exception_type_name(caught.value) == "ImportError"
         assert_secret_absent(caught.value, secret)
