@@ -1183,12 +1183,8 @@ class RoundRunner:
                     outcome.propagate_control(provider_timer.failure)
             except BaseException as error:
                 error = outcome.classify(error)
-                if self.deps.journal.fenced.is_set():
-                    raise _core_error(Fenced, "run ownership lost") from None
-                if (
-                    provider_timer.provider_stopped
-                    and _core_category(error) is _SignalCategory.TERMINAL
-                ):
+                self.deps.journal._raise_if_fenced()
+                if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
                     raise error from None
                 if _core_category(error) is _SignalCategory.PROVIDER:
                     assert isinstance(error, ProviderFailed)  # noqa: PT017 - core type narrowing

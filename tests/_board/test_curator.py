@@ -336,3 +336,10 @@ async def test_engine_curator_drain_has_a_bound(
     await env.deps.journal.commit()
     assert env.events("curated") == []
     assert all(event.payload["learning"]["author"] != "curator" for event in env.events("learning"))
+
+
+async def test_prepare_curator_reraises_provider_failed() -> None:
+    from swarm_arena._errors import ProviderFailed
+
+    with pytest.raises(ProviderFailed):
+        await run(Returning(_core_error(ProviderFailed, "anthropic")), [])

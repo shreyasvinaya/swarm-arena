@@ -99,7 +99,11 @@ class Curator(Configurable, ABC):
 
 
 def _curator_error(error: BaseException) -> str:
-    """Preserve rebuilt core controls and contain untrusted exception values."""
+    """Preserve validated provider/control signals; return only type diagnostics.
+
+    The owning goal settles the invocation before recording a provider skip.
+    Ordinary hook failures remain component errors without provider authority.
+    """
     error = _classify_outcome(error)
     if _is_core_control(error):
         raise error from None

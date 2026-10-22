@@ -2947,3 +2947,49 @@ The transition name is stored in `transition`. Allowed failure sources are
 `manager`, `tool`, `judge`, `planner`, and `curator`. Goal completion clears
 its address causes. Recovery is run-wide; activation waits for each address's
 own fresh round.
+
+
+### Delivered non-agent failure and receipt interfaces
+
+These additions supplement R3, R4.13.4, R4.13.11, R4.13.13 and the R4.14 event
+registry. They refine the earlier provider-state note: receipt variants do not
+change provider latch state, but their operation dispositions are now folded.
+
+| Registry | Delivered interface and semantics |
+|---|---|
+| R3 / R4.13.11 | `_scoring/runner.py`, `_scoring/lexicographic.py`: category-aware inner and recursive preparation boundaries preserve validated PROVIDER, LIMIT, TERMINAL and FENCED signals, with genuine caller cancellation precedence. |
+| R4.13.11 | `JudgeOutcome.provider_failed: dict[str, str] = {}` identifies judge names and providers within one main/part context. The engine aggregates separate batch receipts by part and ref; a failed ranking group skips policy, while a non-ranking failure does not. `final_judge` re-raises validated provider signals and registered limits. |
+| R4.13.4 | `GoalState.provider_batches: dict[str, dict[str, Any]]` folds completed failed barrier/final identities; `skipped_policies: dict[int, dict[str, Any]]` folds round policy skips. Failed curation adds its `decision_seq` to `curated_decisions`. |
+| R4.13.13 | Barrier identity adds lifecycle to goal/revision/round/part/ref/input membership. Completion carries that identity plus `key`, `members`, `anchors`, `ranking`, `managers_complete`. Recovery reads completed batches before judge preparation or funding and does not repeat managers once a barrier completion proves they finished. |
+| R4.13.13 | Final provider-failure receipts retain the existing pre-final `key`, goal/lifecycle/revision/ref/members/candidates, order, status and reason. Recovery restores `no_result/provider_failed` before convergence can reselect from final scores. |
+| R4.13.13 | A state-free registered manager TERMINAL propagates; it is never recorded as a manager error followed by another round. |
+
+`provider_failed` operation records use `variant="receipt"`, `source`,
+`disposition`, and `complete=true`:
+
+- `provider_failed` (source `judge`): `accounting="settled"`,
+  `provider_failed: {judge_name: provider}` and exactly one `barrier_batch` or
+  `final_batch` completion identity. There are zero SCORE/JUDGE_ERROR events for
+  that failed batch. Publication follows its accounting disposition.
+- `panel_drop` (source `judge`): `provider`, `dropped_member`, `member_index`,
+  survivor `panel_hash`, and invocation `batch_id`. This records a member drop,
+  not whole-batch completion; survivor SCORE events carry the batch receipt.
+  Repeated members and the whole-invocation survivor set are retained.
+- `policy_skipped` (source `judge`): `round`, `revision`, `lifecycle`, failed
+  ranking `batches`, `paused=true`, `managers_complete=true`,
+  `barrier_complete=true`, `policy="skipped"`, `curation="ineligible"`.
+  No DECISION is fabricated. Closure, replan boundaries and page repair continue.
+- `curator_skipped` (source `curator`): `provider`, `round`, `revision`,
+  `decision_seq`, `accounting="settled"`. No CURATED event is fabricated.
+
+A provider-failed planner uses a normal PLAN_REJECTED receipt with added
+`provider` and `disposition="provider_failed"`, beside its shared-service
+transition. `first_round`, optional `join_retry` and safe type-only errors retain
+their existing meanings. All source transitions use the shared ProviderStops
+service; receipts do not invent extra generations or agent stops.
+
+An ordinary final judge error may still produce reason `provider_failed`, meaning
+no final order, without any provider transition or provider receipt. Barrier
+LIMIT becomes `reserve_exhausted`; final LIMIT becomes `no_result` with that same
+reason. Replan/policy LIMIT containment is unchanged. Storage/accounting terminal
+failures, fencing and genuine caller cancellation never become provider receipts.

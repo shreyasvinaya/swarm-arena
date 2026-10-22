@@ -10,7 +10,9 @@ from pydantic import Field, JsonValue, model_validator
 
 from swarm_arena._board.digest import untrusted
 from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
-from swarm_arena._errors import _core_category, _is_core_control, _SignalCategory
+from swarm_arena._engine.stops import report_provider_failure
+from swarm_arena._errors import ProviderFailed, _core_category, _is_core_control, _SignalCategory
+from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, _validate_config
@@ -237,10 +239,12 @@ class LLMJudge(Judge):
         interrupted = False
         failure: BaseException | None = None
         scores: list[Score] = []
+        provider_errors: dict[int, Exception] = {}
+        survivors: list[str] = []
         boundary = _Outcome()
         try:
             with llm_scope(scope):
-                scores = await self._judge(goal, candidates, ctx)
+                scores = await self._judge(goal, candidates, ctx, provider_errors, survivors)
         except BaseException as error:
             failure = error
             try:
@@ -263,7 +267,9 @@ class LLMJudge(Judge):
                 )
         if failure is not None:
             classified = boundary.classify(failure)
-            if _is_core_control(classified):
+            if _core_category(classified) is _SignalCategory.PROVIDER:
+                failure = classified
+            elif _is_core_control(classified):
                 # A direct budget refusal retains its public SDK-compatible carrier.
                 if (
                     type(failure) is BudgetExceeded
@@ -271,12 +277,47 @@ class LLMJudge(Judge):
                 ):
                     raise failure from None
                 raise classified from None
-            boundary.contain(classified, RuntimeError, "LLM judge")
+            else:
+                boundary.contain(classified, RuntimeError, "LLM judge")
         boundary.propagate_control(RuntimeError())
+        # Only settled invocations publish drop receipts. Controls and failed
+        # cleanup above must never be mistaken for a completed provider batch.
+        config = cast(LLMJudge.Config, self.config)
+        panel = sha256_hex(canonical_json(cast(JsonValue, sorted(survivors))))
+        for member_index, error in sorted(provider_errors.items()):
+            await report_provider_failure(scope, error, source="judge")
+            assert isinstance(error, ProviderFailed)
+            scope.journal.append(
+                EventDraft(
+                    type=EventType.PROVIDER_FAILED,
+                    goal_id=scope.goal_id,
+                    round=scope.round,
+                    payload={
+                        "variant": "receipt",
+                        "source": "judge",
+                        "provider": error.provider,
+                        "disposition": "panel_drop",
+                        "complete": True,
+                        "dropped_member": config.models[member_index],
+                        "member_index": member_index,
+                        "panel_hash": panel,
+                        "batch_id": ctx.batch_id,
+                    },
+                )
+            )
+        if provider_errors:
+            await scope.journal.commit()
+        if failure is not None:
+            raise failure from None
         return scores
 
     async def _judge(
-        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        self,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+        provider_errors: dict[int, Exception],
+        survivors: list[str],
     ) -> list[Score]:
         scope = current_llm_scope()
         assert scope is not None
@@ -350,7 +391,10 @@ class LLMJudge(Judge):
                 results[member_index, batch_index] = values, ids
             except BaseException as error:
                 classified = outcome.classify(error)
-                if _is_core_control(classified):
+                if _core_category(classified) is _SignalCategory.PROVIDER:
+                    provider_errors.setdefault(member_index, classified)
+                    failed.add(member_index)
+                elif _is_core_control(classified):
                     if _core_category(classified) is _SignalCategory.LIMIT and first_limit is None:
                         first_limit = error
                     controls.append(error if isinstance(error, BudgetExceeded) else classified)
@@ -370,7 +414,10 @@ class LLMJudge(Judge):
                 raise first_limit
             raise classified from None
         live = [m for m in range(len(config.models)) if m not in failed]
+        survivors.extend(config.models[m] for m in live)
         if not live:
+            if provider_errors:
+                raise provider_errors[min(provider_errors)] from None
             return []
         panel = (
             sha256_hex(canonical_json(cast(JsonValue, sorted(config.models[m] for m in live))))

@@ -64,6 +64,10 @@ class GoalState(FrozenModel):
         Policy decisions with their round numbers.
     curated_decisions : list[int], default=[]
         Committed policy event sequences with a completed curation batch.
+    provider_batches : dict[str, dict], default={}
+        Completed provider-failed judging identities, keyed by batch digest.
+    skipped_policies : dict[int, dict], default={}
+        Provider-paused rounds with managers/barrier complete and curation ineligible.
     frontiers : dict[int, Frontier], default={}
         Snapshots for ordinary and converge rounds.
     end_reason : str or None, default=None
@@ -122,6 +126,8 @@ class GoalState(FrozenModel):
     agents: dict[str, AgentStatus] = {}
     decisions: list[tuple[int, Decision]] = []
     curated_decisions: list[int] = []
+    provider_batches: dict[str, dict[str, Any]] = {}
+    skipped_policies: dict[int, dict[str, Any]] = {}
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
     no_result_reason: str | None = None
@@ -598,6 +604,32 @@ class RunState:
                     *goal.decisions,
                     (payload["round"], Decision.model_validate(payload["decision"])),
                 ]
+            case EventType.PROVIDER_FAILED:
+                if payload.get("variant") == "receipt" and payload.get("complete") is True:
+                    disposition = payload.get("disposition")
+                    if disposition == "provider_failed":
+                        record = payload.get("barrier_batch") or payload.get("final_batch")
+                        if not isinstance(record, dict) or type(record.get("key")) is not str:
+                            raise _core_error(ValueError, "invalid provider batch receipt")
+                        updates["provider_batches"] = {
+                            **goal.provider_batches,
+                            record["key"]: record,
+                        }
+                    elif disposition == "policy_skipped":
+                        if (
+                            payload.get("policy") != "skipped"
+                            or payload.get("curation") != "ineligible"
+                        ):
+                            raise _core_error(ValueError, "invalid skipped policy receipt")
+                        updates["skipped_policies"] = {
+                            **goal.skipped_policies,
+                            event.round: payload,
+                        }
+                    elif disposition == "curator_skipped":
+                        decision_seq = payload.get("decision_seq")
+                        if type(decision_seq) is not int or decision_seq < 1:
+                            raise _core_error(ValueError, "invalid curation decision_seq")
+                        updates["curated_decisions"] = [*goal.curated_decisions, decision_seq]
             case EventType.CURATED:
                 # Summary learning events own indexing; this receipt only closes a phase.
                 decision_seq = payload.get("decision_seq")

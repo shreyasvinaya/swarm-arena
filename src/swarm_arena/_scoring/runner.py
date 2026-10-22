@@ -3,7 +3,12 @@
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import (
+    ProviderFailed,
+    _core_category,
+    _exception_type_name,
+    _SignalCategory,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.detach import _detach_model
@@ -54,15 +59,19 @@ class JudgeOutcome(FrozenModel):
         Finite scores stamped with the judging context's id source.
     errors : list[JudgeError]
         At most one error per candidate per judge, in batch order.
+    provider_failed : dict[str, str], optional
+        Judge names mapped to validated providers for this context's main/part group.
+        Failed batches contain no scores or fabricated candidate errors.
 
     Examples
     --------
     >>> JudgeOutcome(scores=[], errors=[]).model_dump()
-    {'scores': [], 'errors': []}
+    {'scores': [], 'errors': [], 'provider_failed': {}}
     """
 
     scores: list[Score]
     errors: list[JudgeError]
+    provider_failed: dict[str, str] = {}
 
 
 def _prepare_check_result(result: object) -> CheckResult:
@@ -249,6 +258,10 @@ async def _judge_batch(
         stamped = _stamp_score_ids(prepared, ctx.ids)
     except BaseException as error:
         error = outcome.classify(error)
+        if _core_category(error) is _SignalCategory.PROVIDER and not ctx.final:
+            assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+            return JudgeOutcome(scores=[], errors=[], provider_failed={name: error.provider})
+        outcome.propagate_control(error)
         stamped = []
         raised = f"{_exception_type_name(error)}: judge raised"
 
@@ -319,11 +332,12 @@ async def judge_round(
     --------
     >>> import asyncio
     >>> asyncio.run(judge_round('g', [], [], [], lambda judge: None)).model_dump()
-    {'scores': [], 'errors': []}
+    {'scores': [], 'errors': [], 'provider_failed': {}}
     """
     eligible = [candidate for candidate in candidates if not candidate.gated_out]
     scores: list[Score] = []
     errors: list[JudgeError] = []
+    provider_failed: dict[str, str] = {}
     if not eligible:
         return JudgeOutcome(scores=scores, errors=errors)
     for ref, judge in judges:
@@ -339,7 +353,8 @@ async def judge_round(
         )
         scores.extend(outcome.scores)
         errors.extend(outcome.errors)
-    return JudgeOutcome(scores=scores, errors=errors)
+        provider_failed.update(outcome.provider_failed)
+    return JudgeOutcome(scores=scores, errors=errors, provider_failed=provider_failed)
 
 
 async def final_judge(
@@ -387,7 +402,7 @@ async def final_judge(
     ...     executor=Mock(), artifact_root='/artifacts')
     >>> order, outcome = asyncio.run(final_judge('g', (Ref.of(judge), judge), [], context))
     >>> (order, outcome.model_dump(), context.final, context.read_cache)
-    ([], {'scores': [], 'errors': []}, True, False)
+    ([], {'scores': [], 'errors': [], 'provider_failed': {}}, True, False)
     """
     ctx.final = True
     ctx.read_cache = False

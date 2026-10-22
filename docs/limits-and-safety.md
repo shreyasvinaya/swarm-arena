@@ -472,3 +472,30 @@ probe or clear its saved causes, and still writes the paused agent's STOPPED
 round status. A fresh resumed round may recover its reserved
 slots without exceeding `max_agents_total`. Permanent disposition or goal
 completion releases the reservation.
+
+
+### Failures outside agents
+
+Judges, panel members, replanners and curators use the same run-wide provider
+latch as managers and tools. A provider outage in one goal therefore pauses all
+matching agents, including later registrations, while their capacity remains
+reserved until recovery or permanent disposition.
+
+A failed non-ranking judge leaves its scores missing. A failed ranking judge
+skips the round's policy and makes curation ineligible; it never authorizes
+pruning on missing ranking evidence. A failed replanner keeps the current
+revision and records a safe `plan_rejected` completion, including the original
+`first_round` and any `join_retry`. A failed eligible curator records a completed
+skip without a `curated` event. These receipts survive takeover, so a missing
+decision or summary does not cause paid work to repeat.
+
+Failed judging and curation receipts are published only after accounting has a
+known disposition. Storage failures, settlement timeouts, fencing, terminal
+usage overflow and genuine caller cancellation are not provider failures and
+cannot manufacture these receipts. Error messages carry identifiers and type
+names, never prompts, outputs or provider diagnostic text.
+
+A registered judge budget refusal at the barrier records `reserve_exhausted`
+and ends ordinary rounds in select-only mode. At final judging it produces
+`no_result` with reason `reserve_exhausted`. Registered limits in replanning and
+policy retain their existing contained rejection/error-decision behavior.
