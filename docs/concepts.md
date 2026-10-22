@@ -193,7 +193,9 @@ remaining handler work. An action timeout closes admission and starts graceful
 cancellation of its nested runs, waits for their completion and settlement, then
 cancels the rest of the handler. If that action deadline prevents the handler
 from starting more work, the model receives the action-timeout message and can
-continue the round. A concurrent round or sibling stop still ends the round.
+continue the round. A concurrent run, round or sibling stop still ends the round,
+including a live admission stop that the engine watcher has not yet applied to
+the tool registry.
 Registered terminal cleanup and ownership loss take precedence over the ordinary
 round-time limit. Overflow from an owned action ends this manager; an otherwise
 completed report is preserved when a peer overflows the shared budget.

@@ -1526,3 +1526,51 @@ async def test_action_timeout_refusals_stay_local_unless_the_round_stops(
             tool_name="loop", timeout_seconds=2
         )
         assert status.payload["reason"] == ""
+
+
+async def test_live_gate_stop_after_action_timeout_ends_round(
+    tmp_path: Path, ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._engine.stops import StopState
+
+    stops = StopState()
+    ctx = ctx_env.ctx()
+    ctx._gate = stops.gate_for("g")
+    original_stop = _ActionInflight.stop
+    observed: list[bool] = []
+
+    def stop(self: _ActionInflight, scope: anyio.CancelScope, *, cancel: bool) -> None:
+        original_stop(self, scope, cancel=cancel)
+        observed.append(self._parent.closed)
+        stops.stop = True
+
+    monkeypatch.setattr(_ActionInflight, "stop", stop)
+
+    async def handler(context: AgentContext, args: Inputs) -> dict[str, Any]:
+        try:
+            await anyio.sleep_forever()
+        finally:
+            await context.call_action("noop", {})
+        return {}
+
+    async def noop(context: AgentContext, args: Inputs) -> dict[str, Any]:
+        pytest.fail("stopped gate admitted an action")
+
+    ctx.actions = (
+        Action(name="held", description="held", input_model=Inputs, handler=handler),
+        Action(name="noop", description="noop", input_model=Inputs, handler=noop),
+    )
+    fake = register([FakeTurn(tool_calls=(("held", {}),)), finish("continued despite stop")])
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=60))) as run:
+        with (
+            llm_scope(run.scope("manager")),
+            anyio.fail_after(10),
+            pytest.raises(LimitReached) as caught,
+        ):
+            await AgentsSDKManager(model="opus", action_timeout_s=0.1).run_round(ctx)
+    assert caught.value.limit == "stop"
+    assert _core_category(caught.value) is _SignalCategory.LIMIT
+    assert observed == [False]
+    assert stops.stop
+    assert len(fake.calls) == 1

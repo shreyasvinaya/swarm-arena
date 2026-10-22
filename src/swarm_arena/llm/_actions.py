@@ -395,7 +395,9 @@ def _tool(
         if error is None and not scope.cancel_called:
             return result
         carrier = (
-            None if inflight.is_timeout_refusal(classified, timer) else _sdk_control(classified)
+            None
+            if inflight.is_timeout_refusal(classified, timer, ctx)
+            else _sdk_control(classified)
         )
         if carrier is not None:
             raise carrier from None

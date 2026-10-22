@@ -163,7 +163,7 @@ class _ActionInflight(Inflight):
         if not self._runs:
             scope.cancel()
 
-    def is_timeout_refusal(self, error: Exception, timer: _LocalTimer) -> bool:
+    def is_timeout_refusal(self, error: Exception, timer: _LocalTimer, ctx: "AgentContext") -> bool:
         """Recognize an ordinary stop caused solely by this action's timer."""
         return (
             _core_category(error) is _SignalCategory.LIMIT
@@ -173,6 +173,8 @@ class _ActionInflight(Inflight):
             and self._local.closed
             and self._stop_scopes == {timer.scope}
             and not self._parent.closed
+            # The live stop latch can precede the engine watcher closing the parent.
+            and ctx._gate() is None
             and not any(
                 other.live
                 and other is not timer
