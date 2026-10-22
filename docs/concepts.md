@@ -1,6 +1,6 @@
 # Concepts
 
-The current release runs local swarms with manual plans, scripted managers,
+The current release runs local swarms with manual plans, scripted and LLM managers,
 checks, judges, and pruning policies. This page explains how they fit together;
 see the [public API](api/swarm_arena.md) for their interfaces.
 
@@ -139,17 +139,55 @@ The public kit's `swarm_arena.testing.read_output_file` and `read_logs` read and
 verify output/log artifact bytes. See the runnable
 [four-file kit example](own-files.md#try-it-offline).
 
-## Manager
+## Managers
 
 A `Manager` chooses an agent's actions during one round through its
 `AgentContext`: run a tool, read candidates or learnings, publish a learning,
 save notes, or call a tool action. It returns a `RoundReport`. `ScriptedManager`
 executes configured requests without a model. A tool exception becomes an error
-candidate; a manager exception ends only that agent's round.
+candidate; an ordinary manager exception ends only that agent's round.
+Registered ownership and terminal cleanup failures retain their core stop behavior.
+
+`AgentsSDKManager` uses the optional Agents SDK integration (`uv add
+"swarm-arena[llm]"`) to choose these actions. Its `model` is an alias in the
+run configuration's model catalog and must permit the `manager` role:
+
+```python
+from swarm_arena import Ref
+from swarm_arena.manager import Manager
+
+manager = Ref(
+    path="swarm_arena.llm:AgentsSDKManager",
+    config={"model": "opus", "instructions": "Explore promising learning rates."},
+).build(Manager)
+assert manager.models() == ("opus",)
+```
+
+The corresponding manager line in an agent's TOML table is:
+
+```toml
+manager = { path = "swarm_arena.llm:AgentsSDKManager", config = { model = "opus" } }
+```
+
+Each round starts a fresh conversation. Stable system instructions include the
+learning guide, manager instructions, tool description, goal and selected frozen
+reference files. Changing facts—round, fidelity, remaining budget, private notes,
+resume history, seed inputs and the fixed board digest—are supplied separately.
+Use `save_notes` to retain private state between rounds. Instructions do not
+change an agent's tool-and-model fingerprint.
+
+The model calls `finish_round(summary=...)` to end the round immediately; ordinary
+final text can also end it. The manager has no structured output schema or hosted
+tools. Core limits bound model turns, round duration, action work and spending.
+`action_timeout_s` defaults to 60 seconds for actions other than `run_tool`, whose
+timing belongs to the core. `parallel_tool_calls` defaults to true, with each action
+linked to its originating LLM call. Usage accounting drains before the manager
+returns; interrupted calls are conservatively charged without waiting for a late
+provider report. See the [LLM API](api/llm.md).
 
 An agent sees the board at the round's recorded frontier plus its own new work.
-`best(part=...)` reads only the agent's own group. Candidate and learning reads
-automatically populate `read_ids` provenance for subsequent tool runs. Converge
+`best(part=...)` reads the agent's own group or an explicitly declared sibling
+group. Candidate and learning reads automatically populate `read_ids` provenance for subsequent tool runs. Converge
 agents get read-only `seed_parents`, prepended to their explicit parents. Check
 feedback permissions still apply to those parents. See the
 [manager API](api/manager.md) and [scoring guide](scoring-and-review.md).

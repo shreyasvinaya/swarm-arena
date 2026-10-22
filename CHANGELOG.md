@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AgentsSDKManager runs a fresh metered Agents SDK conversation each round,
+  exposes authorized context actions and finish_round, honors core limits, and
+  drains usage accounting on success, failure, timeout and cancellation.
+
 - Manager actions as SDK function tools, with validated schemas, per-call
   provenance, bounded feedback-redacted results, untrusted board content,
   recoverable soft errors, and terminal controls that stop further model turns.

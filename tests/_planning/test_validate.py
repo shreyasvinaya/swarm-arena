@@ -2380,3 +2380,35 @@ def test_model_checks_cover_admitted_roles_without_rebuilding(
     role = "manager" if site in {"manager", "converge"} else "judge"
     assert seen[0][role] == ["m"]
     assert built_managers == 1
+
+
+def test_instructions_do_not_change_the_fingerprint() -> None:
+    pytest.importorskip("agents")
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    original = _plan(agents_per_team=3, same_tool=True)
+    agents = [
+        spec.model_copy(
+            update={
+                "manager": Ref(
+                    path="swarm_arena.llm:AgentsSDKManager",
+                    config={"model": "opus", "instructions": instructions},
+                )
+            }
+        )
+        for spec, instructions in zip(original.teams[0].agents, ("a", "b", "c"), strict=True)
+    ]
+    plan = original.model_copy(
+        update={"teams": [original.teams[0].model_copy(update={"agents": agents})]}
+    )
+    cfg = RunConfig(
+        models=ModelCatalog({"opus": ModelSpec(model="fake/opus", roles=["manager"])}),
+        limits=Limits(max_agents_per_fingerprint=2, max_tokens=100_000),
+    )
+    two_agents = plan.model_copy(
+        update={"teams": [plan.teams[0].model_copy(update={"agents": agents[:2]})]}
+    )
+    assert validate_plan(two_agents, cfg) == []
+    with pytest.raises(PlanError, match="max_agents_per_fingerprint"):
+        validate_plan(plan, cfg)
