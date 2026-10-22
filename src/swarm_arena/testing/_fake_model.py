@@ -19,6 +19,7 @@ from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.responses.response_usage import InputTokensDetails
 
 from swarm_arena._budget.llm_scope import current_llm_scope
+from swarm_arena._errors import _core_error
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.data import finite_json
@@ -169,7 +170,8 @@ class FakeModel(Model):
         RuntimeError
             If this conversation has no turns left.
         ValueError
-            If function arguments are not finite JSON objects.
+            If supplied text is not a string or function arguments are not
+            finite JSON objects. The core error names only the failing field.
 
         Examples
         --------
@@ -218,6 +220,17 @@ class FakeModel(Model):
         if not turns:
             raise RuntimeError("FakeModel has no turns left")
         turn = turns.popleft()
+        if turn.text is not None and not isinstance(turn.text, str):
+            raise _core_error(ValueError, "invalid text") from None
+        prepared_calls: list[tuple[str, str]] = []
+        for name, args in turn.tool_calls:
+            if not isinstance(args, dict):
+                raise _core_error(ValueError, "invalid arguments") from None
+            try:
+                arguments = canonical_json(finite_json(args)).decode("utf-8")
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                raise _core_error(ValueError, "invalid arguments") from None
+            prepared_calls.append((name, arguments))
         self._response_count += 1
         output: list[TResponseOutputItem] = []
         if turn.text is not None:
@@ -233,11 +246,7 @@ class FakeModel(Model):
                 )
             )
         tool_ids: list[tuple[str, str]] = []
-        for name, args in turn.tool_calls:
-            try:
-                arguments = canonical_json(finite_json(args)).decode("utf-8")
-            except (TypeError, ValueError, OverflowError, RecursionError):
-                raise ValueError("invalid fake tool arguments") from None
+        for name, arguments in prepared_calls:
             self._tool_count += 1
             call_id = f"fake-{name}-{self._tool_count}"
             output.append(

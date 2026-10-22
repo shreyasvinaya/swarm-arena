@@ -6,7 +6,7 @@ import traceback
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import anyio
 import pytest
@@ -16,17 +16,37 @@ from agents import Agent, Model, ModelResponse, ModelSettings, Runner
 from agents import RunConfig as SDKRunConfig
 from agents.models.interface import ModelTracing
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage
+from pydantic import ValidationError
 
 from swarm_arena import RunConfig
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+from swarm_arena._errors import _is_core_signal
 from swarm_arena._journal.llm_record import drain, open_call
 from swarm_arena.config import ModelCatalog, ModelSpec
 from swarm_arena.llm._catalog import build_model
 from swarm_arena.testing import FakeModel, FakeTurn
+from swarm_arena.testing import _fake_model as fake_model_module
 from swarm_arena.tool import Usage
 
 pytestmark = pytest.mark.anyio
+REVIEW_MARKER = "REVIEW_SECRET"
+
+
+def assert_value_free_field_error(error: ValueError, field: str) -> None:
+    rendered = [
+        str(error),
+        repr(error),
+        repr(error.args),
+        "".join(traceback.format_exception(error)),
+    ]
+    if isinstance(error, ValidationError):
+        rendered.extend([str(error.errors()), error.json()])
+    assert all(REVIEW_MARKER not in value for value in rendered)
+    assert error.args == (f"invalid {field}",)
+    assert error.__cause__ is None
+    assert not getattr(error, "__notes__", [])
+    assert _is_core_signal(error)
 
 
 @pytest.fixture(autouse=True)
@@ -338,7 +358,7 @@ async def test_script_arguments_are_detached_between_models_and_conversations() 
 
 async def test_nonfinite_tool_arguments_have_value_free_errors() -> None:
     model = make_model([FakeTurn(tool_calls=(("run_tool", {"sentinel-secret": float("nan")}),))])
-    with pytest.raises(ValueError, match="invalid fake tool arguments") as caught:
+    with pytest.raises(ValueError, match="invalid arguments") as caught:
         await respond(model)
     assert "sentinel-secret" not in "".join(traceback.format_exception(caught.value))
     assert "sentinel-secret" not in repr(caught.value.args)
@@ -346,6 +366,53 @@ async def test_nonfinite_tool_arguments_have_value_free_errors() -> None:
     assert "sentinel-secret" not in repr(caught.value)
     assert not getattr(caught.value, "__notes__", [])
     assert caught.value.__cause__ is None
+    assert_value_free_field_error(caught.value, "arguments")
+
+
+@pytest.mark.parametrize("text", [{"payload": REVIEW_MARKER}, [REVIEW_MARKER], 42, True])
+async def test_malformed_text_is_rejected_without_exposing_values(text: Any) -> None:
+    model = make_model([FakeTurn(text=text)])
+    with pytest.raises(ValueError, match="text") as caught:
+        await respond(model)
+    assert_value_free_field_error(caught.value, "text")
+
+
+@pytest.mark.parametrize("arguments", [[REVIEW_MARKER], None, 42])
+async def test_nonobject_tool_arguments_are_rejected_without_exposing_values(
+    arguments: Any,
+) -> None:
+    model = make_model([FakeTurn(text="valid", tool_calls=(("run_tool", arguments),))])
+    with pytest.raises(ValueError, match="arguments") as caught:
+        await respond(model)
+    assert_value_free_field_error(caught.value, "arguments")
+
+
+async def test_arguments_are_validated_before_any_sdk_model_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def sdk_model(**kwargs: Any) -> NoReturn:
+        raise AssertionError("SDK model constructed before argument validation")
+
+    for name in (
+        "ResponseOutputMessage",
+        "ResponseOutputText",
+        "ResponseFunctionToolCall",
+        "SDKUsage",
+        "InputTokensDetails",
+        "ModelResponse",
+    ):
+        monkeypatch.setattr(fake_model_module, name, sdk_model)
+    model = make_model(
+        [
+            FakeTurn(
+                text="valid",
+                tool_calls=(("first", {}), ("second", [REVIEW_MARKER])),
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="arguments") as caught:
+        await respond(model)
+    assert_value_free_field_error(caught.value, "arguments")
 
 
 async def test_abandoned_fake_callback_starts_no_second_upload(
