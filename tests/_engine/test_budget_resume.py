@@ -11,6 +11,7 @@ from _engine.test_barrier_recovery import MeteredTool, _calls, _config, _history
 
 from swarm_arena import ConvergeSpec, Plan, Ref, RunConfig, ScriptedManager, Swarm
 from swarm_arena._budget.amount import USD_LIMIT
+from swarm_arena._engine.stops import StopState
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena.tool import CompletedRun, ToolOutput, ToolRequest, Usage
@@ -189,3 +190,43 @@ async def test_resume_budget_stop_crashed_at_converge_finishes_from_reserve(tmp_
     assert RunState.from_events(after).goals["g"].finished
     solution = json.loads((tmp_path / "runs/paid/goals/g/solution.json").read_text())
     assert solution["status"] == "ok"
+
+
+async def test_stop_after_replayed_budget_still_cancels_resume_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _budget_config(tmp_path)
+    await Swarm(config).run(_budget_plan(tmp_path, False), run_id="paid")
+    before = _history(tmp_path)
+    tools = (tmp_path / "tools.log").read_bytes()
+    judges = _calls(tmp_path)
+    budget_replayed = anyio.Event()
+    set_flag = StopState.__setattr__
+
+    def stop_after_budget(stops: StopState, name: str, value: object) -> None:
+        was_budget = getattr(stops, "run_budget", False)
+        set_flag(stops, name, value)
+        if name == "run_budget" and value is True and not was_budget:
+            assert stops.on_change is not None
+            stops.stop = True
+            budget_replayed.set()
+
+    monkeypatch.setattr(StopState, "__setattr__", stop_after_budget)
+    failures: list[RuntimeError] = []
+
+    async def resume() -> None:
+        try:
+            await Swarm(config).resume("paid", force=True)
+        except RuntimeError as error:
+            failures.append(error)
+
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(resume)
+            await budget_replayed.wait()
+
+    assert [str(error) for error in failures] == ["resume initialization stopped"]
+    added = [event for event in _history(tmp_path) if event.seq > before[-1].seq]
+    assert [event.type for event in added] == ["takeover"]
+    assert (tmp_path / "tools.log").read_bytes() == tools
+    assert _calls(tmp_path) == judges
