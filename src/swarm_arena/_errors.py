@@ -192,6 +192,62 @@ class _SignalSnapshot:
 _CORE_SIGNALS: WeakKeyDictionary[Exception, _SignalSnapshot] = WeakKeyDictionary()
 _SignalT = TypeVar("_SignalT", bound=Exception)
 
+# Optional transports register their exact types without importing their SDK here.
+_CARRIER_TYPES: dict[type[Exception], str] = {}
+_CARRIERS: WeakKeyDictionary[Exception, tuple[type[Exception], Exception]] = WeakKeyDictionary()
+
+
+def _register_carrier_type(kind: type[Exception], name: str) -> None:
+    """Declare a transport type and its public diagnostic name at module load."""
+    _CARRIER_TYPES[kind] = name
+
+
+def _carrier_name(error: BaseException) -> str | None:
+    """Recognize carrier families for diagnostics only, never for authority."""
+    return next(
+        (
+            _CARRIER_TYPES[cast(type[Exception], kind)]
+            for kind in type(error).__mro__
+            if kind in _CARRIER_TYPES
+        ),
+        None,
+    )
+
+
+def _register_carrier(carrier: Exception, core: Exception) -> None:
+    """Retain a vetted control outside the transport's transferable attributes."""
+    if type(carrier) not in _CARRIER_TYPES or not _is_core_control(core):
+        raise TypeError("expected a registered transport and core control")
+    _CARRIERS[carrier] = (type(carrier), core)
+
+
+def _unwrap_control(error: BaseException) -> BaseException:
+    """Restore only exact issued carriers, recursively through exception groups."""
+    pending = [(error, False)]
+    restored: dict[int, BaseException] = {}
+    while pending:
+        current, visited = pending.pop()
+        result = current
+        if isinstance(current, BaseExceptionGroup):
+            if not visited:
+                pending.append((current, True))
+                pending.extend((child, False) for child in current.exceptions)
+                continue
+            children = [restored[id(child)] for child in current.exceptions]
+            if any(
+                child is not original
+                for child, original in zip(children, current.exceptions, strict=True)
+            ):
+                result = BaseExceptionGroup("SDK outcomes", children)
+        elif type(current) in _CARRIER_TYPES:
+            saved = _CARRIERS.get(cast(Exception, current))
+            if saved is not None and type(current) is saved[0]:
+                rebuilt = _rebuild_core_signal(saved[1])
+                assert rebuilt is not None
+                result = rebuilt
+        restored[id(current)] = result
+    return restored[id(error)]
+
 
 def _core_error(
     cls: type[_SignalT], *args: Any, _category: _SignalCategory | None = None
@@ -273,7 +329,7 @@ def _exception_type_name(error: BaseException) -> str:
         return "RuntimeError"
     if type(error) is _CoreValueError:
         return "ValueError"
-    return type(error).__name__
+    return _carrier_name(error) or type(error).__name__
 
 
 def _with_exception_type(error: _SignalT, name: str) -> _SignalT:

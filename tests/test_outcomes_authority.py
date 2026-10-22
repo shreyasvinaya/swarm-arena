@@ -198,3 +198,31 @@ def test_public_context_gate_cannot_mint_terminal_overflow() -> None:
         ctx.scores_of("c-1")
     # Gate validation is owned by the action adapter; rejection there is also safe.
     assert _core_category(caught.value) is not _SignalCategory.TERMINAL
+
+
+def test_carrier_bridge_preserves_unrelated_group_diagnostic_type() -> None:
+    class HookFailures(ExceptionGroup):
+        pass
+
+    error = HookFailures("private", [ValueError("private")])
+    result = _classify_outcome(error)
+    assert _exception_type_name(result) == "HookFailures"
+    assert str(result) == "supervised hook failed: HookFailures"
+
+
+def test_core_classifier_does_not_import_optional_sdk() -> None:
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import swarm_arena._outcomes; "
+            "assert not any(name.split('.')[0] in {'agents', 'litellm'} for name in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

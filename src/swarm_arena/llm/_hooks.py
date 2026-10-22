@@ -4,8 +4,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, fields
 from functools import lru_cache
-from typing import Any, TypeVar, cast
-from weakref import WeakKeyDictionary
+from typing import Any, TypeVar
 
 import anyio
 import litellm
@@ -35,8 +34,10 @@ from swarm_arena._errors import (
     Fenced,
     _core_error,
     _is_core_control,
-    _rebuild_core_signal,
+    _register_carrier,
+    _register_carrier_type,
 )
+from swarm_arena._errors import _unwrap_control as _unwrap_control
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.llm_record import abandon_call, open_call
 from swarm_arena._model.canonical import canonical_json
@@ -86,25 +87,8 @@ class _SDKControl(AgentsException):
     """Cross an SDK boundary without granting its mutable fields authority."""
 
 
-_CARRIERS: WeakKeyDictionary[AgentsException, Exception] = WeakKeyDictionary()
-
-
-def _unwrap_control(error: BaseException) -> BaseException:
-    """Unwrap exact, privately issued carriers before the shared classifier.
-
-    Consumers capture _Outcome on their awaiting loop before SDK work, unwrap
-    after their owned drain, then classify with that same outcome. A carrier's
-    mutable attributes and copied user subclasses never supply provenance.
-    """
-    if type(error) is BudgetExceeded or type(error) is _SDKControl:
-        core = _CARRIERS.get(cast(AgentsException, error))
-        if core is not None:
-            rebuilt = _rebuild_core_signal(core)
-            assert rebuilt is not None
-            return rebuilt
-    if isinstance(error, BaseExceptionGroup):
-        return BaseExceptionGroup("SDK outcomes", [_unwrap_control(e) for e in error.exceptions])
-    return error
+_register_carrier_type(BudgetExceeded, "BudgetExceeded")
+_register_carrier_type(_SDKControl, "RuntimeError")
 
 
 def _sdk_control(error: BaseException) -> AgentsException | None:
@@ -116,7 +100,7 @@ def _sdk_control(error: BaseException) -> AgentsException | None:
     of a carrier into a tool-error response. Ordinary failures return None.
     """
     try:
-        core = _classify_outcome(_unwrap_control(error))
+        core = _classify_outcome(error)
     except Fenced as fenced:
         core = fenced
     if not _is_core_control(core):
@@ -126,7 +110,7 @@ def _sdk_control(error: BaseException) -> AgentsException | None:
         if type(core) is LimitReached and core.limit == "budget"
         else _SDKControl(str(core))
     )
-    _CARRIERS[carrier] = core
+    _register_carrier(carrier, core)
     return carrier
 
 

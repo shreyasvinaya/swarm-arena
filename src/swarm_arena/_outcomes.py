@@ -7,6 +7,7 @@ import anyio
 
 from swarm_arena._errors import (
     Fenced,
+    _carrier_name,
     _core_category,
     _core_error,
     _exception_type_name,
@@ -14,6 +15,7 @@ from swarm_arena._errors import (
     _is_core_signal,
     _rebuild_core_signal,
     _SignalCategory,
+    _unwrap_control,
     _with_exception_type,
 )
 
@@ -36,6 +38,7 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
         # A hook can catch genuine cancellation and replace its message. The
         # pending caller state wins, independently of that untrusted outcome.
         raise asyncio.CancelledError() from None
+    error = _unwrap_control(error)
     if _has_core_fenced(error):
         raise _core_error(Fenced, "run ownership lost") from None
     # Nested groups cannot demote terminal cleanup or overflow to a hook
@@ -60,8 +63,10 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
         return rebuilt
     from swarm_arena._agent.manager import LimitReached
 
-    if isinstance(error, (Fenced, LimitReached, BaseExceptionGroup)) or not isinstance(
-        error, Exception
+    if (
+        isinstance(error, (Fenced, LimitReached, BaseExceptionGroup))
+        or not isinstance(error, Exception)
+        or _carrier_name(error) is not None
     ):
         name = _exception_type_name(error)
         return _with_exception_type(

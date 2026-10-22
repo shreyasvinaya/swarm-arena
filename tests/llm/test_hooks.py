@@ -551,12 +551,14 @@ async def test_user_raised_cancellation_is_a_diagnostic_not_a_control(
 
 
 @pytest.mark.parametrize("site", ["final", "replan", "policy"])
-@pytest.mark.parametrize("kind", ["cleanup", "overflow", "fence"])
+@pytest.mark.parametrize("kind", ["cleanup", "overflow", "fence", "budget"])
+@pytest.mark.parametrize("unwrap", [False, True])
 async def test_carried_control_reaches_each_goal_handler_without_another_turn(
     env: EngineEnv,
     monkeypatch: pytest.MonkeyPatch,
     site: str,
     kind: str,
+    unwrap: bool,
 ) -> None:
     from _engine.test_goal import _plan
     from _fakes.board import candidate
@@ -567,6 +569,7 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
     plan = _plan(teams=1, rounds=1)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
     core = {
+        "budget": _core_error(LimitReached, "budget", "budget used up"),
         "cleanup": _stop_cleanup_error(),
         "overflow": _core_error(
             LimitReached,
@@ -599,7 +602,7 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
             )
         except BaseException as error:
             # Component adapters unwrap after their owned accounting cleanup.
-            raise _unwrap_control(error) from None
+            raise _unwrap_control(error) if unwrap else error from None
         raise AssertionError("control must stop the SDK")
 
     monkeypatch.setattr(runner, "_supervised_step", invoke_sdk)
@@ -610,13 +613,30 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
         if site == "replan"
         else runner._round_decision(1)
     )
-    with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
-        await operation
-    assert _is_core_control(caught.value)
-    assert_secret_absent(caught.value, "private-carrier-mutation")
+    if kind == "budget":
+        result = await operation
+        await env.deps.journal.commit()
+        if site == "final":
+            assert result == []
+            assert (runner.status, runner.reason) == ("no_result", "final slice used up")
+        elif site == "replan":
+            assert result is False
+            assert env.events("plan_rejected")[-1].payload["errors"] == [
+                "planner error: LimitReached"
+            ]
+        else:
+            assert (
+                env.events("decision")[-1].payload["decision"]["policy"]
+                == "policy error: LimitReached"
+            )
+    else:
+        with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
+            await operation
+        assert _is_core_control(caught.value)
+        assert_secret_absent(caught.value, "private-carrier-mutation")
+        assert not env.events("plan_rejected")
+        assert not env.events("decision")
     assert len(capture.calls) == 1
-    assert not env.events("plan_rejected")
-    assert not env.events("decision")
     assert not env.events("judge_error")
 
 
@@ -773,3 +793,68 @@ async def test_overflow_advice_and_hook_match_reservation_while_settlement_waits
             entry.lock.release()
             await task
             await other.close()
+
+
+@pytest.mark.parametrize("form", ["forged", "copy", "deepcopy", "pickle", "subclass"])
+def test_unissued_sdk_carriers_are_public_diagnostics(form: str) -> None:
+    import copy
+    import pickle
+
+    from swarm_arena._errors import _exception_type_name
+    from swarm_arena._outcomes import _classify_outcome
+    from swarm_arena.llm._hooks import _SDKControl
+
+    class Derived(_SDKControl):
+        pass
+
+    carrier = _sdk_control(_stop_cleanup_error())
+    assert carrier is not None
+    carrier.args = ("private-value",)
+    carrier.__dict__.update(message="private-value")
+    forged = {
+        "forged": lambda: _SDKControl("private-value"),
+        "copy": lambda: copy.copy(carrier),
+        "deepcopy": lambda: copy.deepcopy(carrier),
+        "pickle": lambda: pickle.loads(pickle.dumps(carrier)),
+        "subclass": lambda: Derived("private-value"),
+    }[form]()
+    result = _classify_outcome(forged)
+    assert not _is_core_control(result)
+    assert isinstance(result, RuntimeError)
+    assert _exception_type_name(result) == "RuntimeError"
+    assert "_SDKControl" not in str(result)
+    assert_secret_absent(result, "private-value")
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_shared_classifier_preserves_raw_carrier_precedence(fenced: bool, cancelled: bool) -> None:
+    from swarm_arena._errors import _core_category
+    from swarm_arena._outcomes import _classify_outcome
+
+    cores = [_stop_cleanup_error(), _core_error(LimitReached, "budget", "budget used up")]
+    if fenced:
+        cores.append(_core_error(Fenced, "run ownership lost"))
+    carriers = [_sdk_control(core) for core in cores]
+    assert all(isinstance(carrier, Exception) for carrier in carriers)
+    group = ExceptionGroup("private", [ExceptionGroup("nested", cast(list[Exception], carriers))])
+    if cancelled or fenced:
+        with pytest.raises(asyncio.CancelledError if cancelled else Fenced):
+            _classify_outcome(group, cancelled=cancelled)
+    else:
+        result = _classify_outcome(group)
+        assert _core_category(result) is _SignalCategory.TERMINAL
+        assert str(result) == "stop cleanup timed out"
+
+
+def test_shared_classifier_unwraps_deep_carrier_groups_iteratively() -> None:
+    from swarm_arena._errors import _core_category
+    from swarm_arena._outcomes import _classify_outcome
+
+    carrier = _sdk_control(_stop_cleanup_error())
+    assert carrier is not None
+    error: Exception = carrier
+    for _ in range(1500):
+        error = ExceptionGroup("private", [error])
+    result = _classify_outcome(error)
+    assert _core_category(result) is _SignalCategory.TERMINAL

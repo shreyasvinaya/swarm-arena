@@ -158,6 +158,9 @@ creates no LLM call record and costs zero.
 `BudgetExceeded` is both an SDK exception and a `LimitReached`. Registered
 fencing, terminal cleanup failure and usage overflow stop the SDK operation
 without another model turn; sanitized hook failures do not gain that authority.
+The shared core classifier restores exact issued SDK carriers, including nested
+carriers, from private provenance. Copied, caller-created or subclassed carriers
+remain diagnostics. Caller cancellation takes precedence over carried controls.
 Usage overflow retains conservative charges. Exact journal/ledger equality
 applies to finalized, non-overflow accounting; fencing or interrupted publication
 can leave a reservation conservatively charged. Gateway enforcement of external
