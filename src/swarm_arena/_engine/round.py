@@ -435,6 +435,7 @@ class RoundRunner:
         self._provider_tools: dict[str, Tool] = {}
         self._provider_sets: dict[str, frozenset[str]] = {}
         self._provider_errors: dict[str, Exception] = {}
+        self._provider_abandoned: set[str] = set()
         self.round_spec, self.rounds_left = round_spec, rounds_left
         self.resumed = {key: tuple(pairs) for key, pairs in resumed.items()}
         self.repeat_entries = tuple(repeat_entries)
@@ -876,30 +877,42 @@ class RoundRunner:
             for p in paused.get(slot.address, ())
         }
         if service.generations():
-            for slot in self.agents:
-                if slot.status in _INACTIVE and slot.status != AgentStatus.STOPPED:
-                    continue
-                boundary = _Outcome()
-                try:
-                    if slot.manager is None:
-                        slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
-                    execution_ref = await run_sync_daemon(
-                        effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
-                    )
-                    tool = await run_sync_daemon(execution_ref.build, Tool)
-                    providers = await run_sync_daemon(
-                        agent_providers, slot.manager, tool, self.deps.config.models
-                    )
-                    self._provider_tools[slot.address] = tool
-                    self._provider_sets[slot.address] = providers
-                    needed.update(providers)
-                except BaseException as error:
-                    classified = boundary.classify(error)
-                    if _core_category(classified) is _SignalCategory.TERMINAL:
-                        raise classified from None
-                    # A connector preparation failure still belongs to its
-                    # agent, as when preparation happens after the frontier.
-                    self._provider_errors[slot.address] = classified
+            deadline = round_deadline(
+                anyio.current_time(),
+                self.deps.config.limits.effective_round_timeout_s(),
+                self.deps.clock.left(self.deps.config.limits.run_timeout_s),
+            )
+
+            async def resolve(slot: AgentSlot) -> None:
+                with anyio.move_on_at(deadline) as preparation:
+                    boundary = _Outcome()
+                    try:
+                        if slot.manager is None:
+                            slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
+                        execution_ref = await run_sync_daemon(
+                            effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
+                        )
+                        tool = await run_sync_daemon(execution_ref.build, Tool)
+                        providers = await run_sync_daemon(
+                            agent_providers, slot.manager, tool, self.deps.config.models
+                        )
+                        self._provider_tools[slot.address] = tool
+                        self._provider_sets[slot.address] = providers
+                        needed.update(providers)
+                    except BaseException as error:
+                        classified = boundary.classify(error)
+                        if _core_category(classified) is _SignalCategory.TERMINAL:
+                            raise classified from None
+                        # A connector preparation failure still belongs to its
+                        # agent, as when preparation happens after the frontier.
+                        self._provider_errors[slot.address] = classified
+                if preparation.cancel_called:
+                    self._provider_abandoned.add(slot.address)
+
+            async with anyio.create_task_group() as tasks:
+                for slot in self.agents:
+                    if slot.status not in _INACTIVE or slot.status == AgentStatus.STOPPED:
+                        tasks.start_soon(resolve, slot)
         generations = service.generations()
         providers = sorted(needed & generations.keys())
         for provider in providers:
@@ -1104,6 +1117,8 @@ class RoundRunner:
                     track_inflight(agent_inflight[index]),
                 ):
                     await anyio.lowlevel.checkpoint()
+                    if slot.address in self._provider_abandoned:
+                        return
                     if slot.address in self._provider_errors:
                         raise self._provider_errors[slot.address]
                     if slot.manager is None:

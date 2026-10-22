@@ -1831,3 +1831,69 @@ async def test_provider_probe_preserves_owner_controls(
         with pytest.raises(Fenced if control == "fenced" else RuntimeError):
             await runner._probe_stopped(2)
     assert stops.stopped()[slot.address] == {"anthropic"}
+
+
+@pytest.mark.parametrize("component", [Tool, Manager], ids=["tool", "manager"])
+async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, component: type[Tool] | type[Manager]
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+
+    release = threading.Event()
+    entered: set[str] = set()
+    workers: list[threading.Thread] = []
+    original = Ref.build
+    peer_calls: list[str] = []
+    probes: list[str] = []
+
+    def blocked(self: Ref, base: type[Any]) -> Any:
+        if self.name in {"stuck-a", "stuck-b"} and base is component:
+            workers.append(threading.current_thread())
+            entered.add(self.name)
+            assert release.wait(5), "constructor release deadline"
+        return original(self, base)
+
+    class Peer(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            peer_calls.append("ran")
+            return RoundReport(summary="peer ran")
+
+    slots = [_runner("a"), _runner("b"), _with_manager("peer", Peer())]
+    for slot in slots[:2]:
+        if component is Tool:
+            slot.tool_ref = slot.tool_ref.model_copy(update={"name": "stuck-" + slot.spec.name})
+        else:
+            slot.manager = None
+            slot.spec = slot.spec.model_copy(
+                update={
+                    "manager": slot.spec.manager.model_copy(
+                        update={"name": "stuck-" + slot.spec.name}
+                    )
+                }
+            )
+    e = env.with_limits(round_timeout_s=0.2, run_timeout_s=30.0)
+    service = e.deps.provider_stops
+    service.register(slots[2].address, frozenset({"fake"}), lambda: None)
+    await service.fail("fake", source="manager")
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        probes.append(provider)
+        return True
+
+    monkeypatch.setattr(Ref, "build", blocked)
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    start = anyio.current_time()
+    try:
+        with anyio.fail_after(2):
+            out = await _round(e, slots).run(1)
+        assert anyio.current_time() - start < 1.5
+        assert entered == {"stuck-a", "stuck-b"}
+        assert probes == ["fake"]
+        assert peer_calls == ["ran"]
+        assert out.reasons["t/a"] == out.reasons["t/b"] == "runtime preparation cancelled"
+        assert out.statuses["t/peer"] == AgentStatus.FINISHED
+    finally:
+        release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
