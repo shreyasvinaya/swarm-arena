@@ -1023,6 +1023,11 @@ async def await_reports(scope: LLMScope) -> None:
     scope : LLMScope
         Scope whose calls and descendant calls have finished dispatching.
 
+    Raises
+    ------
+    RuntimeError
+        If the caller has no finite effective deadline.
+
     Notes
     -----
     The caller supplies the single ``settle_timeout_s`` report timer, separate
@@ -1034,8 +1039,14 @@ async def await_reports(scope: LLMScope) -> None:
     Examples
     --------
     >>> from types import SimpleNamespace
-    >>> anyio.run(await_reports, SimpleNamespace(run_id="absent"))
+    >>> async def example():
+    ...     with anyio.move_on_after(1):
+    ...         await await_reports(SimpleNamespace(run_id="absent"))
+    >>> anyio.run(example)
     """
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    if not math.isfinite(anyio.current_effective_deadline()):
+        raise _core_error(RuntimeError, "report wait requires a finite deadline") from None
     binding = _bindings.get(_context_string(scope.run_id, "run_id"))
     if binding is None or scope.journal is not binding.journal:
         return

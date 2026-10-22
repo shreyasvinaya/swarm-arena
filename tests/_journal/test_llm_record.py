@@ -35,33 +35,50 @@ async def test_graceful_report_timeout_survives_delayed_loop(
 ) -> None:
     from threading import Timer
 
-    from swarm_arena._journal.llm_record import _bindings
+    from swarm_arena._journal import llm_record
 
     held = HeldOperation()
     release: Timer | None = None
     try:
         async with open_llm_run(tmp_path) as run:
             scope, meta = await _open(run)
-            left = run.clock.left
-            checks = 0
+            watch_owner = llm_record._watch_owner
+            report_watchers: set[asyncio.Task[Any]] = set()
 
-            def delayed_clock(timeout: float) -> float:
-                nonlocal checks, release
-                checks += 1
-                if checks == 2:
-                    # Hold the loop inside the watcher across report expiry,
-                    # before the report timer can deliver its cancellation.
-                    release = Timer(scope.settle_timeout_s + 0.1, held.release.set)
-                    release.start()
-                    held.wait()
-                return left(timeout)
+            async def observed_watcher(
+                binding: Any, owner: anyio.CancelScope, interrupt_reports: bool = False
+            ) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                if interrupt_reports:
+                    report_watchers.add(task)
+                try:
+                    await watch_owner(binding, owner, interrupt_reports)
+                finally:
+                    report_watchers.discard(task)
 
-            monkeypatch.setattr(run.clock, "left", delayed_clock)
+            class DelayedPolling:
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(anyio, name)
+
+                async def sleep(self, delay: float) -> None:
+                    nonlocal release
+                    if asyncio.current_task() in report_watchers and release is None:
+                        # Hold the report watcher's first poll across expiry,
+                        # before the report timer can deliver its cancellation.
+                        release = Timer(scope.settle_timeout_s + 0.1, held.release.set)
+                        release.start()
+                        held.wait()
+                        return
+                    await anyio.sleep(delay)
+
+            monkeypatch.setattr(llm_record, "_watch_owner", observed_watcher)
+            monkeypatch.setattr(llm_record, "anyio", DelayedPolling())
             run.stops.stop = True
             assert await drain(scope, wait=True) == [meta["call_id"]]
             assert held.entered.is_set()
             assert held.exited.is_set()
-            assert _bindings[run.run_id].terminal is None
+            assert llm_record._bindings[run.run_id].terminal is None
             assert not run.journal._settlement_expired
             call = run.calls()[0]
             assert call.error is not None
@@ -72,6 +89,76 @@ async def test_graceful_report_timeout_survives_delayed_loop(
         if release is not None:
             release.cancel()
             release.join()
+
+
+async def test_stop_now_interrupts_drain_report_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        entered, returned = anyio.Event(), anyio.Event()
+        watch_owner, await_reports = llm_record._watch_owner, llm_record.await_reports
+
+        async def observed_watcher(
+            binding: Any, owner: anyio.CancelScope, interrupt_reports: bool = False
+        ) -> None:
+            if interrupt_reports:
+                entered.set()
+            await watch_owner(binding, owner, interrupt_reports)
+
+        async def observed_reports(scope: LLMScope) -> None:
+            await await_reports(scope)
+            # A report-timer expiry cancels this frame before reaching here.
+            returned.set()
+
+        monkeypatch.setattr(llm_record, "_watch_owner", observed_watcher)
+        monkeypatch.setattr(llm_record, "await_reports", observed_reports)
+        task = asyncio.create_task(drain(scope, wait=True))
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+                run.stops.stop_now = True
+                assert await task == [meta["call_id"]]
+            assert returned.is_set()
+            assert llm_record._bindings[run.run_id].terminal is None
+            call = run.calls()[0]
+            assert call.error is not None
+            assert call.error.startswith("estimated:")
+            assert run.charged(scope) == ESTIMATE
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_await_reports_requires_finite_deadline(tmp_path: Path) -> None:
+    from swarm_arena._errors import _is_core_signal
+    from swarm_arena._journal.llm_record import await_reports
+
+    async with open_llm_run(tmp_path) as run:
+        # An empty scope makes a missing guard return immediately, not hang.
+        scope = run.scope("curator", agent="PRIVATE_UNBOUNDED_REPORT")
+        with (
+            anyio.CancelScope(shield=True),
+            pytest.raises(
+                RuntimeError, match=r"^report wait requires a finite deadline$"
+            ) as caught,
+        ):
+            await await_reports(scope)
+        assert _is_core_signal(caught.value)
+        assert_secret_absent(caught.value, "PRIVATE_UNBOUNDED_REPORT")
+
+
+async def test_await_reports_preserves_pending_caller_cancellation(tmp_path: Path) -> None:
+    from swarm_arena._journal.llm_record import await_reports
+
+    async with open_llm_run(tmp_path) as run:
+        scope, _ = await _open(run)
+        with anyio.move_on_after(0) as cancelled:
+            await await_reports(scope)
+        assert cancelled.cancelled_caught
+        await drain(scope, wait=False)
 
 
 async def test_empty_drained_scope_cannot_admit_another_call(tmp_path: Path) -> None:
@@ -1663,7 +1750,12 @@ async def test_await_reports_stops_on_real_takeover(tmp_path: Path) -> None:
                         original_event.set()
 
                 entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
-                task = asyncio.create_task(llm_record.await_reports(scope))
+
+                async def wait_for_reports() -> None:
+                    with anyio.fail_after(scope.settle_timeout_s):
+                        await llm_record.await_reports(scope)
+
+                task = asyncio.create_task(wait_for_reports())
                 try:
                     with anyio.fail_after(5):
                         await entered.wait()
