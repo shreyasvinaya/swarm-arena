@@ -840,3 +840,28 @@ async def test_anchor_keeps_only_its_first_batch_score(
             assert "invalid" in by_id["c0"].notes
             assert "9.0" in by_id["c0"].notes
             assert set(by_id["c0"].llm_call_ids) == {call.id for call in run.calls()}
+
+
+async def test_empty_draft_member_is_excluded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm_arena.llm import _structured
+    from swarm_arena.testing import check_judge
+
+    empty = FakeModel([FakeTurn(text="")])
+    empty.register("a")
+    FakeModel([turn(1, 6)]).register("b")
+    formatter = FakeModel([turn(1, 10)])
+    formatter.register("fmt")
+    config = configuration(("a", "b", "fmt"))
+    config.models.root["fmt"] = config.models.root["fmt"].model_copy(
+        update={
+            "prices": ModelSpec.Prices(input=0.5, output=1),
+        }
+    )
+    monkeypatch.setattr(_structured, "supports", lambda spec, feature: spec.model != "fake/a")
+    scores = await check_judge(
+        LLMJudge("r", ["a", "b"]), Goal(id="g", namespace="n"), candidates(1), config=config
+    )
+    assert len(scores) == 1
+    assert scores[0].value == 6
+    assert len(scores[0].llm_call_ids) == 2
+    assert formatter.calls == []

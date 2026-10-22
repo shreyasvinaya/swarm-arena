@@ -312,6 +312,8 @@ async def structured_call(
         text = await call(alias, spec, user, output_schema)
     else:
         draft = await call(alias, spec, user, None)
+        if not draft.strip():
+            raise _core_error(ValueError, "empty structured draft")
         formatter = await _prepare(lambda: _formatter(alias, role, models))
         formatter_spec = models.resolve(formatter, role)
         native = supports(formatter_spec, "response_schema")

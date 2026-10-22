@@ -200,3 +200,44 @@ async def test_invalid_call_output_is_value_free(tmp_path: Path, text: str) -> N
             )
         await drain(scope, wait=True)
         assert_secret_absent(caught.value, "secret-invalid-json")
+
+
+@pytest.mark.parametrize("draft", ["", " \n\t"])
+async def test_empty_draft_never_starts_formatter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str
+) -> None:
+    from swarm_arena.llm import _structured
+
+    prices = ModelSpec.Prices(input=1, output=2)
+    models = ModelCatalog(
+        {
+            alias: ModelSpec(model=f"fake/{alias}", roles=["judge"], max_tokens=1000, prices=prices)
+            for alias in ("a", "fmt")
+        }
+    )
+    first = FakeModel([FakeTurn(text=draft)])
+    formatter = FakeModel([FakeTurn(text='{"scores": []}')])
+    first.register("a")
+    formatter.register("fmt")
+    monkeypatch.setattr(_structured, "supports", lambda spec, feature: spec.model == "fake/fmt")
+    async with open_llm_run(tmp_path, config=RunConfig(models=models, settle_timeout_s=2)) as run:
+        scope = run.scope("judge")
+        with llm_scope(scope), pytest.raises(ValueError, match="empty structured draft"):
+            await structured_call(
+                alias="a",
+                role="judge",
+                models=models,
+                namespace="n",
+                system="r",
+                user="c",
+                schema=SCHEMA,
+                name="scores",
+                no_cache_read=True,
+                temperature=0,
+            )
+        await drain(scope, wait=True)
+        assert len(first.calls) == 1
+        assert formatter.calls == []
+        assert len(run.calls()) == 1
+        assert scope.tranche.pending() == 0
+        assert run.charged(scope).usd == pytest.approx(run.calls()[0].cost_usd)

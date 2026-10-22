@@ -118,6 +118,9 @@ All four LLM judge aggregators preserve finite, in-scale votes as finite,
 in-scale scores, including votes near the floating-point limits. Mean and
 the median midpoint use exact-ratio summation before rounding to a float.
 
+An empty or whitespace-only first-stage answer fails that member without
+starting a formatting call. Its first-stage usage remains accounted.
+
 After a panel member reaches a funding limit, the invocation admits no further
 model calls. Already admitted calls finish and settle before the limit propagates.
 
