@@ -857,7 +857,9 @@ class GoalRunner:
         for error in outcome.errors:
             append(EventType.JUDGE_ERROR, **error.model_dump())
 
-    async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
+    async def _barrier(
+        self, candidates: Sequence[Candidate], round: int, *, retry: dict[str, Any] | None = None
+    ) -> bool:
         """Reuse committed batches, funding only missing barrier outcomes."""
         tranches = [self._tranche("judges")]
         reservations: dict[str, tuple[Reservation, Amount, bool]] = {}
@@ -865,7 +867,9 @@ class GoalRunner:
         try:
             try:
                 completed, funded = await self._supervised_step(
-                    partial(self._barrier_work, candidates, round, tranches, reservations),
+                    partial(
+                        self._barrier_work, candidates, round, tranches, reservations, retry=retry
+                    ),
                     final=True,
                 )
             except BaseException as error:
@@ -914,6 +918,7 @@ class GoalRunner:
         """Settle, latch and commit one zero-output batch before the next ref."""
         await self._close(scope.tranche)
         await self._report_judge_failure(outcome, before)
+        completion["providers"] = sorted(set(outcome.provider_failed.values()))
         self._publish_scores(outcome, scope, round, barrier_batch=completion)
         await self._refresh()
 
@@ -923,6 +928,8 @@ class GoalRunner:
         round: int,
         tranches: list[Tranche],
         reservations: dict[str, tuple[Reservation, Amount, bool]],
+        *,
+        retry: dict[str, Any] | None = None,
     ) -> bool:
         for part in [None, *(p.name for p in self.plan.parts)]:
             batch = [
@@ -936,6 +943,10 @@ class GoalRunner:
                 continue
             _, refs, _ = part_scoring(self.plan, part)
             for ref in refs:
+                if retry is not None and (
+                    part != retry["part"] or ref.model_dump(mode="json") != retry["ref"]
+                ):
+                    continue
                 identity: dict[str, Any] = {
                     "goal_id": self.goal_id,
                     "lifecycle": self._lifecycle(),
@@ -945,6 +956,8 @@ class GoalRunner:
                     "ref": ref.model_dump(mode="json"),
                     "candidates": sorted(c.id for c in batch),
                 }
+                if retry is not None:
+                    identity["retry_of"] = retry["key"]
                 key = sha256_hex(canonical_json(identity))
                 if key in self.recorded.goals[self.goal_id].provider_batches or any(
                     event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
@@ -1070,8 +1083,53 @@ class GoalRunner:
                     tranches.append(self._tranche("judges"))
                 else:
                     self._publish_scores(outcome, scope, round, barrier_batch=completion)
+                    if retry is not None and outcome.scores:
+                        for provider in set(retry.get("providers", [])):
+                            if provider in before:
+                                await self.deps.provider_stops.recover(
+                                    provider, generation=before[provider]
+                                )
                     await self._refresh()
         return True
+
+    async def _retry_ranking(self) -> bool:
+        """Retry each paused ranking batch once, reusing durable retry completions."""
+        records = list(self.recorded.goals[self.goal_id].provider_batches.values())
+        paused = [
+            record
+            for record in records
+            if record.get("ranking")
+            and not record.get("retry_of")
+            and record.get("lifecycle") == self._lifecycle()
+            and record.get("revision") == self.plan.revision
+        ]
+        # A later successful batch may already have ranked the paused candidates.
+        state = self._round_state()
+        paused = [
+            record
+            for record in paused
+            if not set(record["candidates"]).issubset(
+                {
+                    score.candidate_id
+                    for score in state.scores
+                    if score.judge == self._ranking_name(record["part"])
+                }
+            )
+        ]
+        for record in paused:
+            if self._stop():
+                break
+            candidates = [
+                self.recorded.candidates[id]
+                for id in record["candidates"]
+                if id in self.recorded.candidates
+            ]
+            if not await self._barrier(candidates, 0, retry=record):
+                break
+        return any(
+            record.get("retry_of") in {item["key"] for item in paused}
+            for record in self.recorded.goals[self.goal_id].provider_batches.values()
+        )
 
     def _final_identity(self, finalists: Sequence[Candidate]) -> dict[str, Any]:
         """Bind final inputs to the lifecycle, plan, judge and candidate boundary."""
@@ -1938,6 +1996,7 @@ class GoalRunner:
                     boundary.propagate_control(error)
                     raise
         finalists: list[Candidate] = []
+        ranking_still_failed = False
         if self.status != "no_result":
             self._stop()
             if self.join_phase != "replan":
@@ -1950,6 +2009,7 @@ class GoalRunner:
                 await self.deps.journal.commit()
             boundary = _Outcome()
             try:
+                ranking_still_failed = await self._retry_ranking()
                 finalists = await converge(self, select_only=self.select_only)
             except BaseException as error:
                 boundary.propagate_control(error)
@@ -1957,13 +2017,10 @@ class GoalRunner:
         self._stop()
         if not finalists and not (self.final_parts and any(self.final_parts.values())):
             if self.status != "no_result":
-                paused = any(
-                    r.get("ranking") and r.get("lifecycle") == self._lifecycle()
-                    for r in self.recorded.goals[self.goal_id].provider_batches.values()
-                )
                 self.status, self.reason = (
                     "no_result",
-                    self.reason or ("provider_failed" if paused else "no passing candidate"),
+                    self.reason
+                    or ("provider_failed" if ranking_still_failed else "no passing candidate"),
                 )
             self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
         else:

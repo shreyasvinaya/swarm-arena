@@ -2203,7 +2203,7 @@ async def test_provider_barrier_receipts_and_policy_eligibility(
     out = await runner.run()
     failures = env.events("provider_failed")
     batches = [e for e in failures if "barrier_batch" in e.payload]
-    assert len(batches) == 1
+    assert len(batches) == (2 if ranking_failure else 1)
     assert batches[0].payload["complete"] is True
     assert batches[0].payload["disposition"] == "provider_failed"
     assert batches[0].payload["barrier_batch"]["part"] is None
@@ -2326,6 +2326,7 @@ async def test_state_free_reservation_terminal_escapes_manager(
     [
         "batch",
         "policy",
+        "ranking_retry",
         "final",
         "final_scores",
         "curator",
@@ -2375,9 +2376,13 @@ async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) ->
     with anyio.fail_after(60):
         result = await Swarm(config, replanner=FailingPlanner()).resume("failure", force=True)
     after = all_events(config)
-    if boundary in {"batch", "policy", "final", "final_scores", "curator", "join"}:
+    if boundary in {"batch", "ranking_retry", "final", "final_scores", "curator", "join"}:
         for name, contents in calls_before.items():
             assert (tmp_path / name).read_text() == contents
+    if boundary == "policy":
+        assert (tmp_path / "judge-calls").read_text() == calls_before[
+            "judge-calls"
+        ] + "0:None:False\n"
     if boundary == "planner":
         assert (tmp_path / "planner-calls").read_text() == calls_before["planner-calls"]
     if boundary in {"closed", "page_before", "page_after"}:
@@ -2394,7 +2399,10 @@ async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) ->
         assert result["g"] == []
         assert events(config, "no_result")[-1].payload["reason"] == "provider_failed"
     if boundary == "parts":
-        assert (tmp_path / "judge-calls").read_text().splitlines() == ["1:a:False", "1:b:False"]
+        assert (tmp_path / "judge-calls").read_text().splitlines() == [
+            "1:a:False",
+            "1:b:False",
+        ]
         failed_parts = {
             e.payload["barrier_batch"]["part"]
             for e in after
@@ -2608,3 +2616,103 @@ async def test_llm_judge_usage_overflow_finishes_run(
     assert (Path(config.run_root) / "overflow/goals/g/solution.json").exists()
     assert bool(result["g"]) is (ranking == "y")
     assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])
+
+
+@pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
+async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
+    import litellm  # noqa: TID251 - exercise the real adapter classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            if recovery == "provider" or round_ != "0":
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE_PROVIDER_DIAGNOSTIC", llm_provider="untrusted", model="wrong"
+                )
+            if recovery == "ordinary":
+                raise ValueError("PRIVATE_PROVIDER_DIAGNOSTIC")
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            return await FakeModel(
+                [
+                    FakeTurn(
+                        text=json.dumps(
+                            {
+                                "scores": [
+                                    {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                    for i in range(len(rows))
+                                ]
+                            }
+                        )
+                    )
+                ]
+            ).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=1,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    result = await Swarm(config).run(
+        _plan(rounds=1, judges=[Y_JUDGE, panel], ranking="panel"), run_id="retry"
+    )
+    events = all_events(config)
+    assert calls == (["1", "0", "0"] if recovery == "healthy" else ["1", "0"])
+    assert bool(result["g"]) is (recovery == "healthy")
+    failures = [e for e in events if e.type == "provider_failed"]
+    assert bool([e for e in events if e.type == "judge_error"]) is (recovery == "ordinary")
+    assert not [e for e in events if e.type == "decision"]
+    skipped = next(e for e in failures if e.payload.get("disposition") == "policy_skipped")
+    candidates = {
+        e.payload["candidate"]["id"]
+        for e in events
+        if e.type == "tool_end" and "candidate" in e.payload
+    }
+    ranked_before_skip = {
+        e.payload["score"]["candidate_id"]
+        for e in events
+        if e.type == "score" and e.seq < skipped.seq and e.payload["score"]["judge"] == "panel"
+    }
+    assert candidates
+    assert not ranked_before_skip
+    retries = [e for e in events if e.payload.get("barrier_batch", {}).get("retry_of")]
+    assert len(retries) == 1
+    assert bool([e for e in failures if e.payload.get("transition") == "recovered"]) is (
+        recovery == "healthy"
+    )
+    assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in repr(events)
+    if recovery != "healthy":
+        assert next(e for e in events if e.type == "no_result").payload["reason"] == (
+            "provider_failed" if recovery == "provider" else "no passing candidate"
+        )
+    before = list(calls)
+    await Swarm(config).resume("retry", force=True)
+    assert calls == before

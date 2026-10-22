@@ -155,6 +155,7 @@ async def crash_driver(root: str, boundary: str) -> None:
                 and "barrier_batch" in e.payload
                 and e.type == "provider_failed"
             )
+            or (boundary == "ranking_retry" and e.payload.get("barrier_batch", {}).get("retry_of"))
             or (boundary == "policy" and e.payload.get("disposition") == "policy_skipped")
             or (boundary == "curator" and e.payload.get("disposition") == "curator_skipped")
             or (final and "final_batch" in e.payload)

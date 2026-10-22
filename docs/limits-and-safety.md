@@ -483,7 +483,11 @@ reserved until recovery or permanent disposition.
 
 A failed non-ranking judge leaves its scores missing. A failed ranking judge
 skips the round's policy and makes curation ineligible; it never authorizes
-pruning on missing ranking evidence. A failed replanner keeps the current
+pruning on missing ranking evidence. At converge, paused ranking batches get
+one retry through normal admission and the shared provider service. A distinct
+batch identity makes a completed retry reusable on resume. Only a validated
+provider failure on that retry can produce `provider_failed` when no finalist
+passes; a recovered provider permits normal selection. A failed replanner keeps the current
 revision and records a safe `plan_rejected` completion, including the original
 `first_round` and any `join_retry`. A failed eligible curator records a completed
 skip without a `curated` event. These receipts survive takeover, so a missing
