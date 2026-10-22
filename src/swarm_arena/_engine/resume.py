@@ -493,7 +493,7 @@ async def _take_over(
     validate: Callable[[OwnerDoc], None] | None = None,
     before_acquire: Callable[[], Awaitable[None]] | None = None,
     review: bool = False,
-    clock: RunClock | None = None,
+    clock: Callable[[], RunClock | None] | None = None,
     stops: StopState | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
@@ -512,7 +512,9 @@ async def _take_over(
             await before_acquire()
         lease: Lease | None = None
         supervisor = (
-            run_module._supervise_initialization(store, doc.epoch + 1, stops, clock, config)
+            run_module._supervise_initialization(
+                store, doc.epoch + 1, stops, clock() if clock is not None else None, config
+            )
             if stops is not None
             else nullcontext()
         )
@@ -535,7 +537,9 @@ async def _take_over(
                 if lease is None or (
                     stops is not None and (stops.stop or stops.stop_now or stops.run_timeout)
                 ):
-                    raise _core_error(RuntimeError, "resume initialization stopped")
+                    raise _core_error(
+                        RuntimeError, "review import stopped" if review else "resume initialization stopped"
+                    )
                 return lease
             except BaseException:
                 if lease is not None:
@@ -600,7 +604,8 @@ async def resume_run(
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
 
-    clock, stops = RunClock(0), StopState()
+    clock: RunClock | None = None
+    stops = StopState()
     validated_head: Head | None = None
     model_warnings: list[str] = []
 
@@ -609,7 +614,10 @@ async def resume_run(
         _, state = _read(store, doc)
         _check(state, config)
         _restore_import_paths(state)
-        clock._rebase(state.run_elapsed_s)
+        if clock is None:
+            clock = RunClock(state.run_elapsed_s)
+        else:
+            clock._rebase(state.run_elapsed_s)
         validated_head = doc.head
 
     async def check_startup_models() -> None:
@@ -623,7 +631,7 @@ async def resume_run(
         force=force,
         validate=validate,
         before_acquire=check_startup_models,
-        clock=clock,
+        clock=lambda: clock,
         stops=stops,
     )
     assert clock is not None
