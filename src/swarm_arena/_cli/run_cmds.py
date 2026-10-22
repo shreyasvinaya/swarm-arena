@@ -79,17 +79,34 @@ def _sigint_wakeup() -> Generator[None]:
         yield
         return
     loop = asyncio.get_running_loop()
+
     # Runner's Python signal handler cannot wake an idle main thread until
     # Python runs it. add_signal_handler installs a wakeup fd written by the
     # low-level signal handler, including when a worker receives the signal.
-    loop.add_signal_handler(signal.SIGINT, lambda: handler(signal.SIGINT, None))
+    def interrupt() -> None:
+        try:
+            handler(signal.SIGINT, None)
+        except (KeyboardInterrupt, SystemExit):
+            # An escaping callback ends Runner.run before prompt cleanup.
+            # Expose its handler now so its restoration check can succeed.
+            if signal.getsignal(signal.SIGINT) is temporary_handler:
+                signal.signal(signal.SIGINT, handler)
+            raise
+
+    loop.add_signal_handler(signal.SIGINT, interrupt)
+    temporary_handler = signal.getsignal(signal.SIGINT)
     try:
         yield
     finally:
+        current_handler = signal.getsignal(signal.SIGINT)
         loop.remove_signal_handler(signal.SIGINT)
-        # Preserve Runner's cancellation / repeated-Ctrl-C handling, including
-        # its own restoration of the caller's handler when anyio.run returns.
-        signal.signal(signal.SIGINT, handler)
+        # Removal resets SIGINT to default_int_handler. Restore the saved
+        # handler only while we still own the temporary one; otherwise retain
+        # the current owner's handler, including Runner's earlier restoration.
+        if current_handler is temporary_handler:
+            signal.signal(signal.SIGINT, handler)
+        elif signal.getsignal(signal.SIGINT) is not current_handler:
+            signal.signal(signal.SIGINT, current_handler)
 
 
 async def _prompt() -> bool:

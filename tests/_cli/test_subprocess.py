@@ -173,6 +173,67 @@ def test_terminal_prompt_subprocess(
     assert not Path(run_config.artifact_root).exists()
 
 
+def test_prompt_sigint_during_handler_registration(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, os, signal
+from collections.abc import Callable
+from swarm_arena._cli.main import main
+before = signal.getsignal(signal.SIGINT)
+original = asyncio.SelectorEventLoop.add_signal_handler
+def register(
+    loop: asyncio.AbstractEventLoop, sig: int, callback: Callable[..., object], *args: object
+) -> None:
+    original(loop, sig, callback, *args)
+    # Exercise signal delivery before registration returns to _sigint_wakeup.
+    signal.raise_signal(signal.SIGINT)
+asyncio.SelectorEventLoop.add_signal_handler = register
+assert main() == 130
+assert os.get_blocking(0)
+assert signal.getsignal(signal.SIGINT) is before
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_double_sigint_restores_caller_handler(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, os, signal
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+before = signal.getsignal(signal.SIGINT)
+original = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    loop = asyncio.get_running_loop()
+    loop.call_soon(signal.raise_signal, signal.SIGINT)
+    loop.call_soon(signal.raise_signal, signal.SIGINT)
+    await original(fd)
+run_cmds.wait_readable = wait
+assert main() == 130
+assert os.get_blocking(0)
+assert signal.getsignal(signal.SIGINT) is before
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
 def test_prompt_sigint_delivered_to_blocked_stdin_reader(
     inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
 ) -> None:
