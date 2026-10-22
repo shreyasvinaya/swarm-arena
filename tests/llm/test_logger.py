@@ -863,3 +863,123 @@ async def test_cache_hit_without_usage_is_still_free(tmp_path: Path) -> None:
         assert await drain(scope, wait=True) == []
         assert run.calls()[0].cache_hit is True
         assert run.charged(scope) == Amount()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("pricing", ["catalog", "provider", "provider_cache"])
+async def test_computed_usage_overflow_stops_later_reservations(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure: bool,
+    pricing: str,
+) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._errors import _is_core_signal
+    from swarm_arena.manager import LimitReached
+
+    cfg = _config()
+    if pricing != "catalog":
+        cfg = cfg.model_copy(
+            update={
+                "models": ModelCatalog(
+                    root={
+                        "m": ModelSpec(
+                            model="anthropic/claude-sonnet-4-6",
+                            roles=["judge"],
+                        )
+                    }
+                )
+            }
+        )
+    assert cfg.limits.max_tokens is None
+    assert cfg.limits.max_usd is None
+    response = _response(
+        prompt_tokens=10**16,
+        completion_tokens=0,
+        **(
+            {
+                "prompt_tokens_details": {
+                    "cache_creation_tokens": 10**16,
+                    "cache_creation_token_details": {
+                        "ephemeral_5m_input_tokens": 10**15,
+                        "ephemeral_1h_input_tokens": 9 * 10**15,
+                    },
+                },
+            }
+            if pricing == "provider_cache"
+            else {}
+        ),
+    )
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        scope = run.scope("judge")
+        kw = await _open(run, scope)
+        if pricing != "catalog":
+            kw["response_cost"] = None
+        if failure:
+            kw["exception"] = ModifyResponseException(
+                message="blocked",
+                model="m",
+                request_data={},
+                original_response=response,
+            )
+        logger = CallLogger()
+        callback = logger.async_log_failure_event if failure else logger.async_log_success_event
+        with pytest.raises(LimitReached) as caught:
+            await callback(kw, None if failure else response, None, None)
+        assert caught.value.limit == "usage_overflow"
+        assert _is_core_signal(caught.value)
+        (call,) = run.calls()
+        assert call.cost_usd == USD_LIMIT
+        assert call.usage.total_tokens == 10**16
+        assert call.error == "usage_overflow: charged at the supported USD limit"
+        assert run.charged(scope) == Amount(tokens=10**16, usd=USD_LIMIT)
+        assert run.events("settle")[0].payload["usage_overflow"] is True
+        followup = run.scope("judge")
+        for tranche in (scope.tranche, followup.tranche):
+            with pytest.raises(LimitReached) as later:
+                await tranche.reserve_call(Amount(tokens=1, usd=0.001))
+            assert later.value.limit == "usage_overflow"
+        assert await drain(scope, wait=False) == []
+        assert await drain(followup, wait=False) == []
+        assert len(run.calls()) == 1
+        assert "LLM callback failed" not in caplog.text
+
+
+@pytest.mark.parametrize("input_price", [1.0, 1.0000000000000004])
+async def test_computed_charge_rounding_to_ceiling_is_not_overflow(
+    tmp_path: Path,
+    input_price: float,
+) -> None:
+    from swarm_arena._budget.amount import USD_LIMIT
+
+    cfg = _config().model_copy(
+        update={
+            "models": ModelCatalog(
+                root={
+                    "m": ModelSpec(
+                        model="openai/gpt-4o-mini",
+                        roles=["judge"],
+                        prices=ModelSpec.Prices(input=input_price, output=2),
+                    )
+                }
+            )
+        }
+    )
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        scope = run.scope("judge")
+        kw = await _open(run, scope)
+        await CallLogger().async_log_success_event(
+            kw,
+            _response(prompt_tokens=10**15, completion_tokens=0),
+            None,
+            None,
+        )
+        (call,) = run.calls()
+        assert call.cost_usd == USD_LIMIT
+        assert call.status == "ok"
+        assert call.error is None
+        followup = run.scope("judge")
+        rid = await followup.tranche.reserve_call(Amount(tokens=1))
+        await followup.tranche.settle_call(rid, Amount())
+        assert await drain(scope, wait=False) == []
+        assert await drain(followup, wait=False) == []

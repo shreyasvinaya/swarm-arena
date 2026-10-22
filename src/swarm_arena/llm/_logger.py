@@ -13,7 +13,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._budget.amount import USD_LIMIT
+from swarm_arena._budget.amount import _MICROS_PER_USD, USD_LIMIT, _usd_from_micro_units
 from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._engine.run import register_run_setup
 from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
@@ -27,7 +27,7 @@ from swarm_arena._model.settings import CachePolicy
 from swarm_arena._model.tooling import Usage
 from swarm_arena._outcomes import _Outcome
 from swarm_arena.llm._cache import cache_identity, require_cache_extra, response_cache
-from swarm_arena.llm._catalog import call_cost
+from swarm_arena.llm._catalog import _cost_micros, call_cost
 
 _log = logging.getLogger("swarm_arena.llm")
 _install_lock = RLock()
@@ -220,9 +220,17 @@ def _event(
     if hit or unknown:
         cost = 0.0
     elif spec is not None:
-        # The recorder owns the terminal overflow seam; Amount cannot represent
-        # an over-range authoritative report before that seam consumes it.
-        if not (spec.prices is None and isinstance(cost, (int, float)) and cost > USD_LIMIT):
+        if spec.prices is not None or cost is None:
+            micros = round(_cost_micros(spec, usage))
+            # Preserve the exact pricing/rounding before bounded conversion.
+            # A finite over-range marker feeds the recorder's existing seam;
+            # only that seam caps the record and makes accounting terminal.
+            cost = (
+                float(USD_LIMIT + 1)
+                if micros > USD_LIMIT * _MICROS_PER_USD
+                else _usd_from_micro_units(micros)
+            )
+        elif not (isinstance(cost, (int, float)) and cost > USD_LIMIT):
             cost = call_cost(spec, usage, litellm_cost=cost)
     elif cost is None:
         cost = 0.0
