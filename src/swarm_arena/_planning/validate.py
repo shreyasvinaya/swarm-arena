@@ -1,18 +1,22 @@
 """Admit frozen revisions after import-free authorization and aggregate plan rules."""
 
 import re
+import threading
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from tempfile import TemporaryFile
+from typing import Any, BinaryIO, TypeVar, cast
 
+import anyio
+import anyio.from_thread
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
 from swarm_arena._budget.estimate import make_price_of
 from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
-from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._exec.threads import _DaemonCall
 from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, ModelSpec, _human_only_inputs
@@ -1165,16 +1169,21 @@ def admit_revision(
 
 
 class _DraftArtifacts(ArtifactStore):
-    """Collect immutable snapshot bytes before the async owner publishes them."""
+    """Spool immutable bytes without retaining the aggregate source set in RAM."""
 
-    def __init__(self) -> None:
-        self.payloads: dict[str, bytes] = {}
+    def __init__(self, spool: BinaryIO, abandoned: threading.Event) -> None:
+        self.spool, self.abandoned = spool, abandoned
+        self.payloads: dict[str, tuple[int, int]] = {}
 
     def put_bytes(self, data: bytes) -> str:
-        """Stage one file without performing external storage operations."""
-        data = memoryview(data).tobytes()
+        """Hash and spool each unique file before destination publication."""
+        if self.abandoned.is_set():
+            raise _core_error(RuntimeError, "draft preparation stopped")
         digest = sha256_hex(data)
-        self.payloads[digest] = data
+        if digest not in self.payloads:
+            offset = self.spool.tell()
+            self.spool.write(data)
+            self.payloads[digest] = offset, len(data)
         return digest
 
 
@@ -1186,21 +1195,59 @@ def _publish_draft_artifact(artifacts: ArtifactStore, digest: str, data: bytes) 
 
 
 async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: ArtifactStore) -> _T:
-    """Prepare in a daemon and publish each file separately under the caller."""
+    """Validate in a daemon, then stream frozen files through the owning task.
 
-    def prepare() -> tuple[_T, dict[str, bytes]]:
-        staging = _DraftArtifacts()
-        result = operation(staging)
-        return result, staging.payloads
-
+    The worker owns its temporary spool through success, failure and abandonment.
+    Acknowledgement bounds the handoff to one file; only the awaiting owner may
+    start a destination upload. Cancelling that owner releases the worker to
+    close its spool, including when preparation or an upload returns late.
+    """
     boundary = _Outcome()
-    try:
-        result, payloads = await run_sync_daemon(prepare)
-    except BaseException as error:
-        boundary.contain(error, ValueError, "draft admission")
-    for digest, data in payloads.items():
-        await _storage_io(_publish_draft_artifact, artifacts, digest, data)
-    return result
+    token = anyio.lowlevel.current_token()
+    acknowledged, abandoned = threading.Event(), threading.Event()
+    sender, receiver = anyio.create_memory_object_stream[tuple[str, bytes] | None](1)
+
+    def offer(item: tuple[str, bytes] | None) -> None:
+        anyio.from_thread.run_sync(sender.send_nowait, item, token=token)
+
+    def prepare() -> _T:
+        try:
+            with TemporaryFile() as spool:
+                staging = _DraftArtifacts(spool, abandoned)
+                result = operation(staging)
+                for digest, (offset, size) in staging.payloads.items():
+                    acknowledged.clear()
+                    if abandoned.is_set():
+                        raise _core_error(RuntimeError, "draft preparation stopped")
+                    spool.seek(offset)
+                    data = spool.read(size)
+                    offer((digest, data))
+                    acknowledged.wait()
+                    del data
+                    if abandoned.is_set():
+                        raise _core_error(RuntimeError, "draft preparation stopped")
+                return result
+        finally:
+            if not abandoned.is_set():
+                offer(None)
+
+    async with sender, receiver:
+        worker = _DaemonCall(prepare)
+        try:
+            async for item in receiver:
+                if item is None:
+                    break
+                digest, data = item
+                del item
+                await _storage_io(_publish_draft_artifact, artifacts, digest, data)
+                del data
+                acknowledged.set()
+            return await worker.result()
+        except BaseException as error:
+            boundary.contain(error, ValueError, "draft admission")
+        finally:
+            abandoned.set()
+            acknowledged.set()
 
 
 async def _freeze_draft_goal(goal: Goal, *, base_dir: Path, artifacts: ArtifactStore) -> Goal:

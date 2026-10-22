@@ -2,7 +2,9 @@
 
 import contextlib
 import sys
+import threading
 import traceback
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
 
@@ -2491,7 +2493,9 @@ async def test_initial_draft_cannot_claim_human_catalog_authority(
 
 
 async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_spool_closed: threading.Event,
 ) -> None:
     import asyncio
 
@@ -2526,6 +2530,7 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
         task.cancel()
         with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
             await task
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
         await held.finish()
         assert len(uploaded) == 1
     finally:
@@ -2534,3 +2539,136 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
             task.cancel()
             with contextlib.suppress(BaseException):
                 await task
+
+
+@pytest.mark.parametrize("count", [4, 24])
+async def test_draft_snapshot_retains_only_one_file_at_first_upload(
+    tmp_path: Path, count: int
+) -> None:
+    import gc
+    import tracemalloc
+
+    from swarm_arena._model.canonical import sha256_hex
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    size = 1024 * 1024
+    for index in range(count):
+        (tmp_path / str(index)).write_bytes(bytes([index]) * size)
+
+    class Sink(ArtifactStore):
+        def __init__(self) -> None:
+            self.live: list[int] = []
+
+        def put_bytes(self, data: bytes) -> str:
+            self.live.append(tracemalloc.get_traced_memory()[0])
+            return sha256_hex(data)
+
+    sink = Sink()
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = await _freeze_draft_goal(
+            Goal(id="g", namespace="n", files=FileSet(globs=["*"])),
+            base_dir=tmp_path,
+            artifacts=sink,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(result.files.manifest) == len(sink.live) == count
+    assert sink.live[0] < 3 * size
+    assert peak < 5 * size
+
+
+async def test_draft_snapshot_uploads_frozen_bytes_once_per_digest(tmp_path: Path) -> None:
+    from swarm_arena._model.canonical import sha256_hex
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    (tmp_path / "a").write_bytes(b"first")
+    (tmp_path / "b").write_bytes(b"second")
+    (tmp_path / "c").write_bytes(b"first")
+
+    class Sink(ArtifactStore):
+        def __init__(self) -> None:
+            self.uploaded: list[bytes] = []
+
+        def put_bytes(self, data: bytes) -> str:
+            if not self.uploaded:
+                (tmp_path / "b").write_bytes(b"changed after snapshot")
+            self.uploaded.append(data)
+            return sha256_hex(data)
+
+    sink = Sink()
+    result = await _freeze_draft_goal(
+        Goal(id="g", namespace="n", files=FileSet(globs=["*"])), base_dir=tmp_path, artifacts=sink
+    )
+    assert sink.uploaded == [b"first", b"second"]
+    assert result.files.manifest == {
+        "a": sha256_hex(b"first"),
+        "b": sha256_hex(b"second"),
+        "c": sha256_hex(b"first"),
+    }
+
+
+@pytest.fixture
+def draft_spool_closed(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    from swarm_arena._planning import validate
+
+    original = validate.TemporaryFile
+    closed = threading.Event()
+
+    @contextlib.contextmanager
+    def tracked() -> Generator[Any]:
+        try:
+            with original() as spool:
+                yield spool
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(validate, "TemporaryFile", tracked)
+    return closed
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
+    tmp_path: Path,
+    draft_spool_closed: threading.Event,
+    cancel: bool,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._planning.validate import _draft_work
+
+    held = HeldOperation()
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        staging.put_bytes(b"snapshot")
+        if cancel:
+            held.wait()
+            return Goal(id="g", namespace="n")
+        raise ValueError("secret-sentinel")
+
+    task = asyncio.create_task(_draft_work(prepare, artifacts))
+    try:
+        if cancel:
+            await held.ready()
+            task.cancel()
+            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+                await task
+            await held.finish()
+        else:
+            with pytest.raises(ValueError, match="draft admission failed") as caught:
+                await task
+            assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+    finally:
+        if cancel:
+            await held.finish()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
