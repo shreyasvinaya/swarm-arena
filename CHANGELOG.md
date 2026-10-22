@@ -49,7 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Offline manager and judge conformance checks run in isolated, bound LLM scopes with
   registered run setups, verify self-drain and requesting-call provenance,
   force parallel manager tool calls, and accept a model catalog through
-  `check_judge(..., config=...)`.
+  `check_judge(..., config=...)`. OfflineHarness and check_manager classify
+  user-created limit exceptions as manager errors while registered limits,
+  including nested groups, end only the affected round.
 
 - AgentsSDKManager runs a fresh metered Agents SDK conversation each round,
   exposes authorized context actions and finish_round, honors core limits, and
@@ -58,9 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manager actions as SDK function tools, with validated schemas, per-call
   provenance, bounded feedback-redacted results, untrusted board content,
   recoverable soft errors, and terminal controls that stop further model turns.
-- OfflineHarness and check_manager classify user-created limit exceptions as
-  manager errors while registered limits, including nested groups, end only
-  the affected round.
 
 - Metered LLM calls reserve against committed tranche credit, protect per-call
   tracking and output caps, link requested tools to their call, and preserve
