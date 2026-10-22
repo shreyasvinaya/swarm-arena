@@ -396,6 +396,19 @@ M3 core recording additions to R3.1 (these extend the existing module rows):
 | `_budget/llm_scope.py`, `_budget/tranche.py` | Required limits/settlement timeout; normalized overflow settlement seam | +M3 | `tests/_budget/test_llm_scope.py`, `tests/_budget/test_tranche.py` |
 | `_engine/run.py`, `_engine/resume.py` | Authorized registration bootstrap and bindings inside entered service owners | +M3 | `tests/_engine/test_run.py`, `tests/_engine/test_initialization_stop.py` |
 
+M3 invocation and integration additions to R3.1 (these extend the existing module rows):
+
+| Path | Added responsibility | M | Tests |
+|---|---|---|---|
+| `llm/_invocation.py` | Shared child-invocation and accounting helper used by planner, judge and curator | M3 | `tests/llm/test_invocation.py` |
+| `_agent/runtime.py` | Share the journal owner's run-wide `ProviderStops` service with managers | +M3 | `tests/_agent/test_runtime.py` |
+| `_agent/tool_run.py` | Link tool requests to their originating LLM call through `requested_by_call` | +M3 | `tests/_agent/test_tool_run.py` |
+| `_engine/goal.py` | Own replanner and curator LLM scopes, settle component accounting and publish recoverable provider-failure receipts | +M3 | `tests/_engine/test_goal.py` |
+| `_engine/round.py` | Own manager LLM scopes and accounting, enforce provider stops and recovery probes, and bind call admission to the round deadline | +M3 | `tests/_engine/test_round.py` |
+| `_board/curator.py` | Drain invocation calls before validating summary call provenance and preserve registered provider/control outcomes | +M3 | `tests/_board/test_curator.py` |
+| `_cli/main.py` | Register the `plan` command with its LLM and collaborative planning handlers | +M3 | `tests/_cli/test_main.py` |
+| `testing/_harness.py` | Bind offline manager/judge LLM scopes, run registered setups, verify self-drain and exact accounting, and check requesting-call provenance | +M3 | `tests/testing/test_harness.py` |
+
 ### R3.2 Other test files (not 1:1 with a module)
 
 | Path | Responsibility | M |
@@ -3004,7 +3017,8 @@ change provider latch state, but their operation dispositions are now folded.
 | R4.13.13 | A state-free registered manager TERMINAL propagates; it is never recorded as a manager error followed by another round. |
 
 `provider_failed` operation records use `variant="receipt"`, `source`,
-`disposition`, and `complete=true`:
+and `disposition`. Completed failed batches, policy skips and curator skips
+also carry `complete=true`:
 
 - `provider_failed` (source `judge`): `accounting="settled"`,
   `provider_failed: {judge_name: provider}` and exactly one `barrier_batch` or
@@ -3012,7 +3026,7 @@ change provider latch state, but their operation dispositions are now folded.
   that failed batch. Publication follows its accounting disposition.
 - `panel_drop` (source `judge`): `provider`, `dropped_member`, `member_index`,
   survivor `panel_hash`, and invocation `batch_id`. This records a member drop,
-  not whole-batch completion; survivor SCORE events carry the batch receipt.
+  with no `complete` field; survivor SCORE events carry batch completion.
   Repeated members and the whole-invocation survivor set are retained.
 - `policy_skipped` (source `judge`): `round`, `revision`, `lifecycle`, failed
   ranking `batches`, `paused=true`, `managers_complete=true`,
