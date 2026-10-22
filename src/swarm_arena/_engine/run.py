@@ -30,7 +30,13 @@ from swarm_arena._engine.manifest import RunManifest, build_manifest_async
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._engine.stops import ProviderStops, RunClock, StopState, _StopWatcher, watch_stop_files
+from swarm_arena._engine.stops import (
+    ProviderStops,
+    RunClock,
+    StopState,
+    _StopWatcher,
+    watch_stop_files,
+)
 from swarm_arena._errors import (
     AlreadyExists,
     Fenced,

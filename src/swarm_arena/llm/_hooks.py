@@ -768,8 +768,11 @@ def is_provider_failure(exc: BaseException) -> bool:
         "overloaded_error",
         "service_unavailable",
     }
-    if codes:
-        return any(code in known for code in codes)
+    if any(code in known for code in codes):
+        return True
+    generic = {"invalid_request_error", "bad_request", "bad_request_error", "invalid_request"}
+    if any(code not in generic for code in codes):
+        return False
     return "credit balance" in str(exc).lower()
 
 

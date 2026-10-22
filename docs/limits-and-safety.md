@@ -438,7 +438,9 @@ For example, a tool can write
 Anthropic through either their manager or tool pause; unrelated agents continue.
 The optional LLM adapter recognizes authentication, permission, rate-limit,
 connection, timeout and service failures. Credit failures use structured error
-fields first, with a message fallback confined to the adapter. Provider messages
+fields first, with a message fallback confined to the adapter. Generic request-error
+types do not suppress the credit-balance fallback; a specific identifying code
+takes precedence. Provider messages
 are never copied into engine errors or provider events.
 
 Paused agents retain scheduler capacity. At the next fresh round, including
@@ -463,6 +465,7 @@ lost ownership and terminal budget controls retain their precedence.
 
 Provider generations and address causes are journaled and restored on resume,
 independently of the current model catalog. A restarted partial round does not
-probe or clear its saved causes. A fresh resumed round may recover its reserved
+probe or clear its saved causes, and still writes the paused agent's STOPPED
+round status. A fresh resumed round may recover its reserved
 slots without exceeding `max_agents_total`. Permanent disposition or goal
 completion releases the reservation.

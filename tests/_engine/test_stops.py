@@ -343,3 +343,40 @@ async def test_provider_reporter_child_scope_and_safe_variant(
     with pytest.raises(RuntimeError):
         await report_provider_failure(child, ProviderFailed("openai"), source="planner")
     assert service.generations() == {"openai": 1}
+
+
+def test_register_probe_example_restores_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    import doctest
+
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as module
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        return True
+
+    monkeypatch.setattr(module, "_probe", probe)
+    test = doctest.DocTestParser().get_doctest(
+        module.register_probe.__doc__ or "", vars(module).copy(), "register_probe", None, 0
+    )
+    assert doctest.DocTestRunner().run(test).failed == 0
+    assert module._probe is probe
+
+
+def test_agent_providers_resolves_manager_catalog_and_tool_union() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._agent.manager import Manager
+    from swarm_arena._engine.stops import agent_providers
+    from swarm_arena._tooling.tool import Tool
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    manager, tool = Mock(spec=Manager), Mock(spec=Tool)
+    manager.models.return_value = ("a", "b")
+    tool.providers.return_value = frozenset({"openai", "gemini"})
+    catalog = ModelCatalog(
+        {
+            "a": ModelSpec(model="anthropic/a", roles=["manager"]),
+            "b": ModelSpec(model="openai/b", roles=["manager"]),
+        }
+    )
+    assert agent_providers(manager, tool, catalog) == {"anthropic", "openai", "gemini"}

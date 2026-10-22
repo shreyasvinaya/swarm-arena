@@ -2877,6 +2877,11 @@ async def test_provider_causes_survive_takeover_and_only_fresh_round_probes(
     monkeypatch.setattr(stops_module, "_probe", probe)
     await Swarm(c.config).resume(c.run_id, force=True)
     assert seen == [("retired-provider", 2)]
+    paused = next(e for e in _events(c, "agent_status") if e.agent == "a" and e.round == 1)
+    assert (paused.payload["status"], paused.payload["reason"]) == (
+        "stopped",
+        "provider unavailable",
+    )
     starts = [e for e in _events(c, "tool_start") if e.agent == "a"]
     assert [e.round for e in starts] == ([2] if healthy is True else [])
     transitions = [e.payload for e in _events(c, "provider_failed")]

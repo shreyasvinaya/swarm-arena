@@ -938,7 +938,7 @@ async def test_admission_gate_refusal_releases_unused_reservation(
     ],
 )
 async def test_provider_failures_are_classified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     import httpx
     import litellm
@@ -957,7 +957,18 @@ async def test_provider_failures_are_classified(
     )
     fake = FakeModel([])
 
+    from swarm_arena.llm._logger import CallLogger
+
+    logged: list[bool] = []
+
     async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        await CallLogger().async_log_failure_event(
+            {"exception": error, "litellm_params": {"metadata": args[2].metadata}},
+            None,
+            None,
+            None,
+        )
+        logged.append(True)
         raise error
 
     monkeypatch.setattr(fake, "get_response", fail)
@@ -970,7 +981,19 @@ async def test_provider_failures_are_classified(
         assert_secret_absent(caught.value, "private-sentinel")
         assert_secret_absent(caught.value, "private-provider")
         await drain(scope, wait=False)
-        assert "private-sentinel" not in repr(run.events("llm_call"))
+        assert logged == [True]
+        assert len(run.calls()) == 1
+        assert run.calls()[0].error == "estimated: provider spend unknown; charged in full"
+        assert "private-sentinel" not in repr(run.events("llm_call")) + caplog.text
+
+        def artifacts_are_safe() -> bool:
+            return all(
+                b"private-sentinel" not in p.read_bytes()
+                for p in tmp_path.rglob("*")
+                if p.is_file()
+            )
+
+        assert await anyio.to_thread.run_sync(artifacts_are_safe)
 
 
 async def test_other_errors_are_not_provider_failures(
@@ -1001,7 +1024,11 @@ async def test_probe_sends_max_tokens_one(tmp_path: Path, monkeypatch: pytest.Mo
     async with open_llm_run(
         tmp_path,
         config=config(
-            cache=CachePolicy(backend="disk", roles={"manager": {"read": True, "write": True}})
+            cache=CachePolicy(
+                backend="disk",
+                disk_dir=str(tmp_path / "probe-cache"),
+                roles={"manager": {"read": True, "write": True}},
+            )
         ),
     ) as run:
         scope = run.scope("manager")
@@ -1096,7 +1123,13 @@ async def test_probe_catalog_roles_and_controls(
 
 
 @pytest.mark.parametrize(
-    ("code", "expected"), [("insufficient_quota", True), ("invalid_tools", False)]
+    ("code", "expected"),
+    [
+        ("insufficient_quota", True),
+        ("invalid_tools", False),
+        ("invalid_request_error", True),
+        ("bad_request", True),
+    ],
 )
 def test_provider_structured_code_precedes_message(code: str, expected: bool) -> None:
     import litellm
@@ -1126,12 +1159,30 @@ async def test_provider_stop_keeps_sdk_owned_siblings_until_drain(
     from tests.llm.test_manager import config as manager_config
 
     release = tmp_path / "release"
-    ready = tmp_path / "ready"
+    from swarm_arena._exec.executor import Job
+    from swarm_arena._exec.local import LocalExecutor
+    from swarm_arena._model.tooling import ToolOutput
+
+    ready = anyio.Event()
+    started = 0
+    original_submit = LocalExecutor.submit
+
+    async def submit(self: LocalExecutor, job: Job) -> ToolOutput:
+        async def on_started(info: Job.Started) -> None:
+            nonlocal started
+            if job.on_started is not None:
+                await job.on_started(info)
+            started += 1
+            if started == 2:
+                ready.set()
+
+        return await original_submit(self, replace(job, on_started=on_started))
+
+    monkeypatch.setattr(LocalExecutor, "submit", submit)
     code = f"""
 import json, os, time
 from pathlib import Path
 n = json.load(open('swarm/request.json'))['params']['n']
-Path({str(ready)!r} + str(n)).touch()
 while not Path({str(release)!r}).exists():
     time.sleep(0.01)
 json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
@@ -1177,8 +1228,7 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
     async def fail_provider() -> None:
         try:
             with anyio.fail_after(15):
-                while not all([await anyio.Path(str(ready) + str(i)).exists() for i in (1, 2)]):
-                    await anyio.lowlevel.checkpoint()
+                await ready.wait()
             assert runtimes
             await runtimes[0].stops.fail("fake", source="judge")
         finally:

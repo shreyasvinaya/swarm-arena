@@ -1654,7 +1654,7 @@ json.dump({'data': {}, 'failed_provider': 'fake'} if n == 1 else {'data': {'y': 
     ]
 
 
-@pytest.mark.parametrize("failure", ["ordinary", "budget"])
+@pytest.mark.parametrize("failure", ["ordinary", "budget", "nonbool"])
 async def test_provider_probe_failure_is_goal_local(
     run_config: RunConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -1682,6 +1682,8 @@ json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_
 
     async def probe(provider: str, scope: LLMScope) -> bool:
         calls.append(scope.round)
+        if failure == "nonbool":
+            return "not a bool"  # ty: ignore[invalid-return-type]
         if failure == "budget":
             await scope.tranche.reserve_call(Amount(usd=1_000_000))
         raise KeyError("private-probe-message")
@@ -1704,7 +1706,7 @@ json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_
             e.type == "agent_status" and e.goal_id == "g" and e.agent == "peer" and e.round == 3
             for e in ev
         )
-        assert "KeyError" in caplog.text
+        assert ("ValueError" if failure == "nonbool" else "KeyError") in caplog.text
     assert "private-probe-message" not in caplog.text + str([e.payload for e in ev])
 
 
@@ -1778,3 +1780,66 @@ json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_
         and e.payload["candidate"]["output"]["status"] == "ok"
         for e in all_events(cfg)
     )
+
+
+async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._agent.context import AgentContext
+    from swarm_arena._agent.manager import RoundReport
+    from swarm_arena._engine.stops import ProviderStops
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=2, default_run_reservation=Estimate(usd=0.1)
+    )
+    g = plan(goal_id="g", rounds=1, tool=ProviderPyTool({"code": WRITE}))
+    h = plan(goal_id="h", rounds=1, tool=ProviderPyTool({"code": WRITE}))
+    h.teams[0].agents.append(
+        plan(goal_id="h", rounds=1).teams[0].agents[0].model_copy(update={"name": "healthy"})
+    )
+    registered, stopped = anyio.Event(), anyio.Event()
+    addresses: set[str] = set()
+    services: list[ProviderStops] = []
+    original_register, original_run = ProviderStops.register, ScriptedManager.run_round
+
+    def register(
+        self: ProviderStops, address: str, providers: frozenset[str], cancel: Callable[[], None]
+    ) -> None:
+        original_register(self, address, providers, cancel)
+        addresses.add(address)
+        services.append(self)
+        if len(addresses) == 3:
+            registered.set()
+
+    async def run_round(self: ScriptedManager, ctx: AgentContext) -> RoundReport:
+        await stopped.wait()
+        return await original_run(self, ctx)
+
+    async def fail() -> None:
+        await registered.wait()
+        await services[0].fail("fake", source="manager")
+        stopped.set()
+
+    monkeypatch.setattr(ProviderStops, "register", register)
+    monkeypatch.setattr(ScriptedManager, "run_round", run_round)
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(fail)
+            await Swarm(cfg).run([g, h], run_id="provider-cross-goal")
+    ev = all_events(cfg)
+    failure = next(
+        e for e in ev if e.type == "provider_failed" and e.payload.get("transition") == "failed"
+    )
+    assert failure.payload["stopped"] == ["g/t0/a0", "h/t0/a0"]
+    statuses = {(e.goal_id, e.agent): e.payload["status"] for e in ev if e.type == "agent_status"}
+    assert statuses == {
+        ("g", "a0"): "stopped",
+        ("h", "a0"): "stopped",
+        ("h", "healthy"): "finished",
+    }
+    assert any(e.type == "tool_end" and e.agent == "healthy" for e in ev)
+    assert not any(e.type == "tool_start" and e.agent == "a0" for e in ev)

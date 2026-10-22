@@ -943,7 +943,7 @@ class RoundRunner:
                         operation = await run_sync_daemon(provider_module._probe, provider, scope)
                         healthy = await operation
                     if type(healthy) is not bool:
-                        raise _core_error(TypeError, "provider probe must return bool")
+                        raise _core_error(ValueError, "provider probe must return bool")
             except BaseException as error:
                 failure = error
                 try:
@@ -1224,7 +1224,18 @@ class RoundRunner:
         candidates: list[Candidate] = []
         learnings: list[Learning] = []
         statuses: dict[str, AgentStatus] = {}
-        for slot, rt, ctx in zip(agents, runtimes, contexts, strict=True):
+        active_addresses = {slot.address for slot in agents}
+        paused_slots = [
+            slot
+            for slot in self.agents
+            if slot.address not in active_addresses and slot.status == AgentStatus.STOPPED
+        ]
+        for slot, rt, ctx in zip(
+            [*agents, *paused_slots],
+            [*runtimes, *(None for _ in paused_slots)],
+            [*contexts, *(None for _ in paused_slots)],
+            strict=True,
+        ):
             key = f"{slot.team.name}/{slot.spec.name}"
             own_learnings: list[Learning] = []
             previous_status = slot.status

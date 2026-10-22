@@ -306,7 +306,11 @@ def register_probe(fn: Callable[[str, LLMScope], Awaitable[bool]] | None) -> Non
 
     Examples
     --------
-    >>> register_probe(None)
+    >>> previous = _probe
+    >>> try:
+    ...     register_probe(None)
+    ... finally:
+    ...     register_probe(previous)
     """
     global _probe
     _probe = fn
