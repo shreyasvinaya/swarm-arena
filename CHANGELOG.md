@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Offline manager and judge conformance checks run in bound LLM scopes with
+  registered run setups, verify self-drain and requesting-call provenance,
+  force parallel manager tool calls, and accept a model catalog through
+  `check_judge(..., config=...)`.
+
 - AgentsSDKManager runs a fresh metered Agents SDK conversation each round,
   exposes authorized context actions and finish_round, honors core limits, and
   drains usage accounting on success, failure, timeout and cancellation.

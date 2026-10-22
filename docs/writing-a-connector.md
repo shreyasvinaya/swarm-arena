@@ -317,7 +317,7 @@ breaks its contract:
   The goal id must equal `candidate.goal_id`, or the kit raises `ValueError`
   before running the check. Omitting `goal` selects the kit's `check` goal,
   which is valid only for candidates with `goal_id="check"`.
-- `check_judge(judge, goal, candidates, *, executor)` judges one batch and
+- `check_judge(judge, goal, candidates, *, executor=None, config=None)` judges one batch and
   returns the stamped scores. Every candidate's `goal_id` must match the
   supplied goal id, or the kit raises `ValueError` before running the judge.
   Each score is validated again in strict mode, as
@@ -436,9 +436,12 @@ For a component that resolves a catalog alias, register the instance and use
 the corresponding `fake/` model in the run configuration:
 
 ```python
-from swarm_arena import RunConfig
+import asyncio
+
+from swarm_arena import Goal, RunConfig, ScriptTool
 from swarm_arena.config import ModelCatalog, ModelSpec
-from swarm_arena.testing import FakeModel, FakeTurn
+from swarm_arena.llm import AgentsSDKManager
+from swarm_arena.testing import FakeModel, FakeTurn, check_manager
 
 model = FakeModel(
     [
@@ -458,11 +461,32 @@ config = RunConfig(
         }
     )
 )
+reports = asyncio.run(
+    check_manager(
+        AgentsSDKManager(model="manager", parallel_tool_calls=False),
+        goal=Goal(id="g", namespace="offline"),
+        tool=ScriptTool(command=["python", "-c", "print('ready')"]),
+        rounds=1,
+        config=config,
+    )
+)
+assert reports[0].summary == "done"
+assert model.calls[0]["model_settings"].parallel_tool_calls is True
 ```
 
-Pass this configuration to the manager harness and configure the manager to
-use alias `manager`. Judge scripts can instead return their expected JSON as
-`FakeTurn.text` with a catalog alias authorized for `judge`. Every metered
+The kit rebuilds a manager with `parallel_tool_calls=True` when its Config
+supports that field. It binds the temporary run before invoking registered run
+setups, and opens a fresh manager scope for each round. A component that leaves
+LLM calls undrained raises an `AssertionError` naming the drain rule; a manager
+candidate linked to a call outside that round's scope fails the
+`requested_by_call` rule. Cleanup settles outstanding reservations before
+closing the owned services.
+
+`check_judge(judge, goal, candidates, config=config)` similarly opens a bound
+judge scope with a funded tranche. Omitting `config` uses `RunConfig()` defaults.
+Judge scripts can return their expected JSON as `FakeTurn.text` with a catalog
+alias authorized for `judge`. Both helpers run registered setups once per run,
+so real LiteLLM components receive the call logger too. Every metered
 fake call uses the real recorder, payload storage and reservation settlement;
 the default turn consumes 100 input and 20 output tokens, costing $0.00014
 at the example prices. Direct SDK calls without run metadata only replay turns.

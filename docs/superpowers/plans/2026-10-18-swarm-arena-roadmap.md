@@ -1550,6 +1550,8 @@ async def check_judge(judge: Judge | Ref, goal: Goal, candidates: Sequence[Candi
                       executor: Executor | None = None, config: RunConfig | None = None) -> list[Score]: ...   # M1a (+M3 config)
     # [plan] M3 adds config (additive; §9 rule 4): an LLMJudge needs a model catalog and an LLMScope to run offline.
     # None → RunConfig defaults.
+    # Implemented: config supplies models/cache/tracing/limits to a bound temporary judge run;
+    # registered setups run after construction, and self-drain is checked before tranche closure.
 async def check_manager(manager: Manager | Ref, *, goal: Goal, tool: Tool | Ref, rounds: int = 1,
                         limits: Limits | None = None, config: RunConfig | None = None) -> list[RoundReport]: ...  # M1b (+M3 parallel calls)
 # testing/_candidates.py — M1a

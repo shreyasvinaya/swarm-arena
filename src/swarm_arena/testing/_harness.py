@@ -5,7 +5,8 @@ import shutil
 import sys
 import tempfile
 import warnings
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -22,10 +23,13 @@ from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.digest import build_digest
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
+from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
+from swarm_arena._engine.resume import _acquire_lease
 from swarm_arena._engine.run import (
     _close_board,
     _open_board,
+    _setup_run,
     _supervise_initialization,
     _supervise_writer,
 )
@@ -35,7 +39,10 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import Lease
+from swarm_arena._journal.llm_record import _bound_run, drain
+from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.base import CallRole
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.detach import _detach_model
@@ -51,6 +58,7 @@ from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.validate import judge_private_paths
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.runner import judge_round
+from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.io import _storage_io
 from swarm_arena._store.local import LocalStore
 from swarm_arena._tooling.staging import tool_identity
@@ -59,6 +67,137 @@ from swarm_arena.testing._components import _build
 from swarm_arena.testing._contracts import _fail, _strict_copy
 from swarm_arena.testing._execution import _executor, _failed_runs, _failed_runs_on
 from swarm_arena.testing._state import _artifact_root, _artifacts
+
+
+class _LLMContractError(AssertionError):
+    """Identify a core-owned LLM conformance rule without connector text."""
+
+
+async def _assert_drained(scope: LLMScope) -> None:
+    """Check self-drain while the owner can still settle a broken component."""
+    if await drain(scope, wait=False):
+        raise _LLMContractError("LLM drain rule: component must drain its calls before returning")
+
+
+def _scope(
+    role: CallRole,
+    goal: Goal,
+    tranche: Tranche,
+    journal: JournalWriter,
+    config: RunConfig,
+    artifacts: ArtifactStore,
+    *,
+    round: int = 0,
+    team: str = "",
+    agent: str = "",
+) -> LLMScope:
+    """Use the harness's entered services and effective run settings."""
+    return LLMScope(
+        role=role,
+        run_id="local",
+        goal_id=goal.id,
+        team=team,
+        agent=agent,
+        round=round,
+        candidate_id=None,
+        tranche=tranche,
+        journal=journal,
+        artifacts=artifacts,
+        models=config.models,
+        tracing=config.tracing,
+        cache=config.cache,
+        limits=config.limits,
+        settle_timeout_s=config.settle_timeout_s,
+    )
+
+
+@asynccontextmanager
+async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[LLMScope]:
+    """Own an isolated judge run, including initialization and callback cleanup."""
+    root = await _storage_io(OfflineHarness._run_folder)
+    store = LocalStore(root / "runs" / "local")
+    config = config.model_copy(
+        update={
+            "run_root": str(root / "runs"),
+            "artifact_root": _artifact_root(),
+        }
+    )
+    lease = await _acquire_lease(
+        partial(
+            Lease.acquire_new, store, owner_id="testing", host="local", ttl_s=config.lease_ttl_s
+        ),
+        settle_timeout_s=config.settle_timeout_s,
+    )
+    ids = IdGen("local", lease.doc.epoch)
+    stops, clock = StopState(), RunClock(0)
+    artifacts = _artifacts()
+    completed = False
+    entered = False
+    try:
+        async with JournalWriter(
+            store,
+            lease,
+            run_id="local",
+            next_seq=1,
+            local_path=root / "journal.jsonl",
+            sync_interval_s=config.sync_interval_s,
+            settle_timeout_s=config.settle_timeout_s,
+        ) as journal:
+            entered = True
+            async with (
+                _supervise_writer(journal),
+                _supervise_initialization(store, lease.doc.epoch, stops, clock, config),
+                _bound_run(
+                    "local",
+                    journal=journal,
+                    ids=ids,
+                    artifacts=artifacts,
+                    config=config,
+                    stops=stops,
+                    clock=clock,
+                    state=RunState(),
+                ),
+            ):
+                ledger = Ledger(
+                    config.limits,
+                    reserve_fraction=config.reserve_fraction,
+                    goal_weights=None,
+                    journal=journal,
+                    ids=ids,
+                )
+                await journal.append_durable(
+                    EventDraft(
+                        type=EventType.RUN_CONFIG,
+                        payload={"config": config.model_dump(mode="json")},
+                    )
+                )
+                await ledger.hold_final_slices({goal.id: Amount()})
+                await journal.append_durable(
+                    EventDraft(
+                        type=EventType.RUN_STARTED,
+                        payload={"final_slices": {goal.id: Amount().model_dump()}},
+                    )
+                )
+                ledger.open_goal(goal.id)
+                await journal.append_durable(
+                    EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id)
+                )
+                await _setup_run((), config)
+                tranche = OfflineHarness._tranche(ledger, ":run", goal.id, config.limits)
+                scope = _scope("judge", goal, tranche, journal, config, artifacts)
+                try:
+                    with llm_scope(scope):
+                        yield scope
+                    completed = True
+                finally:
+                    await drain(scope, wait=False)
+    finally:
+        if not entered:
+            with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                with suppress(BaseException):
+                    await _storage_io(lease.release)
+    if not completed:
+        raise _core_error(RuntimeError, "offline harness stopped")
 
 
 class OfflineHarness:
@@ -195,6 +334,8 @@ class OfflineHarness:
             )
         )
         completed = False
+        stops, clock = StopState(), RunClock(0)
+        artifacts = _artifacts()
         async with (
             _executor(None) as executor,
             _failed_runs_on(executor),
@@ -208,8 +349,16 @@ class OfflineHarness:
                 settle_timeout_s=config.settle_timeout_s,
             ) as journal,
             _supervise_writer(journal),
-            _supervise_initialization(
-                self.store, lease.doc.epoch, StopState(), RunClock(0), config
+            _supervise_initialization(self.store, lease.doc.epoch, stops, clock, config),
+            _bound_run(
+                "local",
+                journal=journal,
+                ids=ids,
+                artifacts=artifacts,
+                config=config,
+                stops=stops,
+                clock=clock,
+                state=RunState(),
             ),
         ):
             ledger = Ledger(
@@ -234,6 +383,7 @@ class OfflineHarness:
             )
             ledger.open_goal(goal.id)
             await journal.append_durable(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
+            await _setup_run((), config)
             spec = AgentSpec(
                 name="agent",
                 rationale="Offline manager check",
@@ -294,7 +444,7 @@ class OfflineHarness:
                     journal=journal,
                     board=board,
                     executor=executor,
-                    artifacts=_artifacts(),
+                    artifacts=artifacts,
                     ids=ids,
                     config=config,
                     resumed=(),
@@ -398,8 +548,20 @@ class OfflineHarness:
             )
             manager_error: Exception | None = None
             outcome = _Outcome()
+            scope = _scope(
+                "manager",
+                rt.goal,
+                rt.tranche,
+                rt.journal,
+                rt.config,
+                rt.artifacts,
+                round=number,
+                team=rt.team.name,
+                agent=rt.spec.name,
+            )
             try:
-                report = await manager.run_round(AgentContext(rt, gate=lambda: None))
+                with llm_scope(scope):
+                    report = await manager.run_round(AgentContext(rt, gate=lambda: None))
             except BaseException as error:
                 error = outcome.classify(error)
                 if rt.journal.fenced.is_set():
@@ -411,8 +573,18 @@ class OfflineHarness:
             finally:
                 self.candidates.extend(c for c in rt.own if isinstance(c, Candidate))
                 self.learnings.extend(item for item in rt.own if isinstance(item, Learning))
-                with anyio.CancelScope(shield=True):
-                    await rt.tranche.close()
+                # The bound run owns interrupted cleanup; healthy closure stays
+                # supervised by the existing run deadline and writer lifetime.
+                await _assert_drained(scope)
+                await rt.tranche.close()
+            if any(
+                c.requested_by_call is not None and c.requested_by_call not in scope.call_ids
+                for c in rt.own
+                if isinstance(c, Candidate)
+            ):
+                raise _LLMContractError(
+                    "requested_by_call rule: candidate must name a call in its manager scope"
+                )
             if manager_error is not None:
                 reason = f"manager error: {_exception_type_name(manager_error)}"
                 rt.journal.append(
