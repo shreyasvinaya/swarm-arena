@@ -25,3 +25,42 @@ def test_core_imports_load_no_optional_dependency() -> None:
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert done.stdout.strip() == "[]"
+
+
+def test_testing_facade_does_not_load_agents() -> None:
+    code = """
+import sys
+import swarm_arena.testing as testing
+sys.path.insert(0, 'tests')
+import _fakes.fake_models
+assert 'agents' not in sys.modules
+assert 'litellm' not in sys.modules
+assert {'FakeModel', 'FakeTurn'} <= set(testing.__all__) <= set(dir(testing))
+assert 'agents' not in sys.modules
+assert not hasattr(testing, 'unknown_testing_name')
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )
+
+
+def test_testing_lazy_exports_publish_and_cache() -> None:
+    code = """
+import importlib.metadata
+try:
+    importlib.metadata.version('openai-agents')
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(0)
+import swarm_arena.testing as testing
+assert 'FakeModel' not in vars(testing)
+model = testing.FakeModel
+assert vars(testing)['FakeModel'] is model
+assert testing.FakeModel is model
+assert model.__module__ == model.get_response.__module__ == 'swarm_arena.testing'
+assert 'FakeTurn' not in vars(testing)
+assert testing.FakeTurn.__module__ == 'swarm_arena.testing'
+assert dir(testing) == sorted(set(dir(testing)))
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )

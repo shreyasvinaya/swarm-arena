@@ -31,6 +31,7 @@ PUBLIC["swarm_arena"] += ["Chain", "KeepTopTeams", "Patience", "SuccessiveHalvin
 PUBLIC["swarm_arena"] += ["ScriptedManager"]
 PUBLIC["swarm_arena"] += ["Swarm"]
 PUBLIC["swarm_arena.testing"] += ["check_manager"]
+PUBLIC["swarm_arena.testing"] += ["FakeModel", "FakeTurn"]
 PUBLIC["swarm_arena"] += ["Ref"]
 PUBLIC["swarm_arena"] += ["validate_plan"]
 PUBLIC["swarm_arena"] += ["Goal"]
@@ -126,6 +127,11 @@ def test_all_snapshot(module: str) -> None:
 def test_names_report_public_module(module: str) -> None:
     mod = importlib.import_module(module)
     for name in mod.__all__:
+        if module == "swarm_arena.testing" and name in {"FakeModel", "FakeTurn"}:
+            try:
+                importlib.metadata.version("openai-agents")
+            except importlib.metadata.PackageNotFoundError:
+                continue
         obj = getattr(mod, name)
         if isinstance(obj, type) or inspect.isfunction(obj):
             assert obj.__module__ == module, name

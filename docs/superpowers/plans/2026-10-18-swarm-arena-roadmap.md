@@ -1571,6 +1571,9 @@ class FakeTurn:
 class FakeModel:                                # implements agents.models.interface.Model
     def __init__(self, turns: Sequence[FakeTurn], *, provider: str = "fake") -> None: ...
     def register(self, name: str) -> None: ...  # makes ModelSpec(model="fake/<name>") resolve to this model
+    calls: list[dict[str, Any]]                  # received system, input, model_settings, tools, output_schema, tracing
+    # Independent replay queues per scoped conversation (run/goal/team/agent/round/role/candidate)
+    # or explicit SDK conversation_id; fresh model factories restore registrations between tests/runs.
 ```
 
 `testing.__all__` [plan] = `check_tool`, `check_check`, `check_judge`, `check_manager`, `make_candidate`, `read_output_file`, `read_logs`, `FakeModel`, `FakeTurn`. `FakeModel` calls emit `LLMCall` records through the same core `record_call` function as the LiteLLM logger (R4.13.19), so the ledger and journal path is the same below the LiteLLM boundary.

@@ -1,5 +1,6 @@
 import enum
 import importlib
+import importlib.metadata
 import inspect
 import pydoc
 import types
@@ -81,6 +82,11 @@ def public_objects() -> list[str]:
         for name in mod.__all__:
             dotted = f"{module}.{name}"
             names.append(dotted)
+            if module == "swarm_arena.testing" and name in {"FakeModel", "FakeTurn"}:
+                try:
+                    importlib.metadata.version("openai-agents")
+                except importlib.metadata.PackageNotFoundError:
+                    continue
             obj = getattr(mod, name)
             if isinstance(obj, type):
                 names.extend(_members(obj, dotted))
@@ -94,6 +100,8 @@ def _is_enum(name: str) -> bool:
 
 @pytest.mark.parametrize("name", public_objects())
 def test_numpydoc(name: str) -> None:
+    if name.startswith(("swarm_arena.testing.FakeModel", "swarm_arena.testing.FakeTurn")):
+        pytest.importorskip("agents")
     errors = [
         (code, msg)
         for code, msg in numpydoc.validate.validate(name)["errors"]

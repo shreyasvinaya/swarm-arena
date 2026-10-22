@@ -407,6 +407,79 @@ instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
 
+### Testing managers and judges offline
+
+Install the optional SDK with `uv add 'swarm-arena[llm]'`. Importing
+`swarm_arena.testing` itself does not load the SDK; accessing `FakeModel` or
+`FakeTurn` loads it. No API key is needed for scripted calls:
+
+```python
+import asyncio
+
+from agents import Agent, Runner
+from agents import RunConfig as SDKRunConfig
+from swarm_arena.testing import FakeModel, FakeTurn
+
+model = FakeModel([FakeTurn(text="ready")])
+result = asyncio.run(
+    Runner.run(
+        Agent(name="offline", model=model),
+        "Check the connector",
+        run_config=SDKRunConfig(tracing_disabled=True),
+    )
+)
+assert result.final_output == "ready"
+assert model.calls[0]["input"]
+```
+
+For a component that resolves a catalog alias, register the instance and use
+the corresponding `fake/` model in the run configuration:
+
+```python
+from swarm_arena import RunConfig
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.testing import FakeModel, FakeTurn
+
+model = FakeModel(
+    [
+        FakeTurn(tool_calls=(("run_tool", {"inputs": {"x": 1}}),)),
+        FakeTurn(text="done"),
+    ]
+)
+model.register("connector")
+config = RunConfig(
+    models=ModelCatalog(
+        {
+            "manager": ModelSpec(
+                model="fake/connector",
+                roles=["manager"],
+                prices=ModelSpec.Prices(input=1.0, output=2.0),
+            ),
+        }
+    )
+)
+```
+
+Pass this configuration to the manager harness and configure the manager to
+use alias `manager`. Judge scripts can instead return their expected JSON as
+`FakeTurn.text` with a catalog alias authorized for `judge`. Every metered
+fake call uses the real recorder, payload storage and reservation settlement;
+the default turn consumes 100 input and 20 output tokens, costing $0.00014
+at the example prices. Direct SDK calls without run metadata only replay turns.
+
+Each scoped conversation (run, goal, team, agent, round, role and candidate)
+has a separate replay queue. An explicit SDK `conversation_id` also separates
+queues; unscoped calls without an ID consume one sequence. Concurrent agents
+therefore do not alternate through one shared script. Tool-call IDs are unique
+within the model, starting with `fake-run_tool-1` for `run_tool`.
+
+Create and register a fresh model for each independent test or run to reset
+history and replace consumed registrations. Registration is process-local;
+test fixtures should restore previous registrations on teardown. Reusing an
+instance under a new scoped run ID starts a new queue but retains `calls`.
+Exhaustion raises `RuntimeError` containing `no turns left`; streaming raises
+`NotImplementedError("FakeModel does not stream")`.
+
 ### Testing a round override
 
 Pass round context explicitly to exercise a later round or replicate. Keep
