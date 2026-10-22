@@ -486,6 +486,11 @@ candidate linked to a call outside that round's scope fails the
 closing the owned services. Concurrent helper invocations use separate run
 identities and services.
 
+The offline kit has no engine deadline watcher for in-flight tool runs. If an
+LLM manager's round timer fires during a core tool run, the tool finishes under
+core rules: `round_timeout_s` does not cut the in-flight run in the kit;
+`tool_timeout_s` bounds it.
+
 `check_judge(judge, goal, candidates, config=config)` similarly opens a bound
 judge scope with a funded tranche. Omitting `config` uses `RunConfig()` defaults.
 Judge scripts can return their expected JSON as `FakeTurn.text` with a catalog

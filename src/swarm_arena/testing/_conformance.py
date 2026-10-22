@@ -475,6 +475,13 @@ async def check_manager(
     ValueError
         If components cannot be built or snapshotted, or rounds is not positive.
 
+    Notes
+    -----
+    The offline kit has no engine deadline watcher for in-flight tool runs.
+    If an LLM manager's round timer fires during a core tool run, the tool
+    finishes under core rules: ``round_timeout_s`` does not cut the in-flight
+    run in the kit; ``tool_timeout_s`` bounds it.
+
     Examples
     --------
     >>> import anyio
