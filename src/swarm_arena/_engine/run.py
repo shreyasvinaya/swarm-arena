@@ -18,6 +18,7 @@ import anyio
 
 from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.base import Board
+from swarm_arena._board.curator import Curator
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import final_slice_estimate, make_price_of, worst_case_estimate
 from swarm_arena._budget.ledger import Ledger
@@ -46,7 +47,9 @@ from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.base import LLMRole
 from swarm_arena._model.canonical import canonical_json, utc_now
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ids import IdGen, new_run_id
 from swarm_arena._model.plan import Plan, Resources, RoundSpec
@@ -57,7 +60,7 @@ from swarm_arena._outcomes import _has_core_fenced as _has_fenced
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import _detach_plan, ref_sites, stamp
-from swarm_arena._planning.validate import _goal_key_errors, admit_revision
+from swarm_arena._planning.validate import _goal_key_errors, admit_revision, check_models
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store, _read_blob, open_store
 from swarm_arena._store.io import _create, _storage_io
@@ -215,6 +218,17 @@ def _require_asyncio() -> None:
 def _build_executor(config: RunConfig) -> Executor:
     """Build the executor through one replaceable seam shared with resume."""
     return config.executor.build(Executor)
+
+
+def _startup_models(config: RunConfig, replanner: Planner | None) -> tuple[list[str], list[str]]:
+    """Build startup components and normalize their hooks entirely in the worker."""
+    uses: dict[LLMRole, list[str]] = {}
+    if replanner is not None:
+        uses["planner"] = [_context_string(a, "alias") for a in replanner.models()]
+    if config.curator is not None:
+        curator = config.curator.build(Curator)
+        uses["curator"] = [_context_string(a, "alias") for a in curator.models()]
+    return check_models(uses, config)
 
 
 def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[str, Amount]]:
@@ -498,19 +512,45 @@ class RunRunner:
                 for plan in self.plans:
                     if str(plan.base_dir) not in sys.path:
                         sys.path.append(str(plan.base_dir))
-                    frozen, notes = await anyio.to_thread.run_sync(
-                        partial(
-                            admit_revision,
-                            stamp(plan, origin=plan.origin, parent=None),
-                            self.config,
-                            staged,
+                    outcome = _Outcome()
+                    try:
+                        frozen, notes = await run_sync_daemon(
+                            partial(
+                                admit_revision,
+                                stamp(plan, origin=plan.origin, parent=None),
+                                self.config,
+                                staged,
+                            )
                         )
-                    )
+                    except KeyboardInterrupt:
+                        raise
+                    except BaseException as error:
+                        classified = outcome.classify(error)
+                        if isinstance(classified, PlanError):
+                            raise classified from None
+                        raise _core_error(
+                            PlanError, [f"admission failed: {_exception_type_name(classified)}"]
+                        ) from None
                     admitted.append(frozen)
                     warnings.extend(notes)
                 if collisions := _goal_key_errors(admitted):
                     raise _core_error(PlanError, collisions)
                 self.plans = admitted
+                outcome = _Outcome()
+                try:
+                    model_errors, model_warnings = await run_sync_daemon(
+                        _startup_models, self.config, self.replanner
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as error:
+                    error = outcome.classify(error)
+                    raise _core_error(
+                        ValueError, f"model checks failed: {_exception_type_name(error)}"
+                    ) from None
+                if model_errors:
+                    raise _core_error(ValueError, "\n".join(model_errors)) from None
+                warnings.extend(model_warnings)
                 outcome = _Outcome()
                 try:
                     estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)

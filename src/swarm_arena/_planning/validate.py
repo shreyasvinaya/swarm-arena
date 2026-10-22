@@ -2,17 +2,21 @@
 
 import re
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
+from swarm_arena._budget.estimate import make_price_of
 from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
+from swarm_arena._model.base import LLMRole
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
+from swarm_arena._model.catalog import CatalogEntry, ModelSpec, _human_only_inputs
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import json_equal
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import FileSet, Goal, GoalKey
 from swarm_arena._model.locations import _safe_location
 from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
@@ -32,7 +36,7 @@ from swarm_arena._tooling.staging import tool_root
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
-ModelCheck = Callable[[Plan, RunConfig], tuple[list[str], list[str]]]
+ModelCheck = Callable[[Mapping[LLMRole, Sequence[str]], RunConfig], tuple[list[str], list[str]]]
 _MODEL_CHECKS: list[ModelCheck] = []
 _T = TypeVar("_T")
 _BASES: dict[str, type[Configurable]] = {
@@ -701,6 +705,144 @@ def _rule_part_files(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> 
     ]
 
 
+def _normalized_uses(uses: Mapping[LLMRole, Sequence[str]]) -> dict[LLMRole, list[str]]:
+    """Detach aliases before any comparison, hashing or registered hook call."""
+    return {
+        cast(LLMRole, _context_string(role, "role")): list(
+            dict.fromkeys(_context_string(alias, "alias") for alias in aliases)
+        )
+        for role, aliases in uses.items()
+    }
+
+
+def check_llm_aliases(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> list[str]:
+    """
+    Check role permissions, the token cap, and required model prices.
+
+    Parameters
+    ----------
+    uses : Mapping[LLMRole, Sequence[str]]
+        Model aliases declared by role, never raw provider/model names.
+    config : RunConfig
+        Human-approved model catalog and run limits.
+
+    Returns
+    -------
+    list[str]
+        Identifier-only errors for invalid aliases, roles or missing limits/prices.
+
+    Notes
+    -----
+    Price hooks run synchronously; async callers use supervised daemon preparation.
+
+    Examples
+    --------
+    >>> check_llm_aliases({}, RunConfig())
+    []
+    """
+    uses = _safe_call("/models", partial(_normalized_uses, uses))
+    errors: list[str] = []
+    if any(uses.values()) and config.limits.max_tokens is None:
+        errors.append("/models: limits.max_tokens is required when model aliases are used")
+    price_of = make_price_of(config.models)
+    priced: set[str] = set()
+    for role, aliases in uses.items():
+        if role not in {"manager", "judge", "planner", "curator"}:
+            errors.append(f"/models: unknown role {role!r}")
+            continue
+        for alias in aliases:
+            spec = config.models.root.get(alias)
+            if spec is None or role not in spec.roles:
+                errors.append(f"/models: alias {alias!r} is not allowed for role {role!r}")
+                continue
+            if config.limits.max_usd is not None and alias not in priced:
+                priced.add(alias)
+                try:
+
+                    def known_price(alias: str = alias) -> bool:
+                        prices = price_of(alias)
+                        if prices is None:
+                            return False
+                        _detach_model(ModelSpec.Prices, prices)
+                        return True
+
+                    if not _safe_call("/models", known_price):
+                        errors.append(f"/models: alias {alias!r} has no known price")
+                except PlanError as error:
+                    errors.extend(error.errors)
+    return errors
+
+
+def check_models(
+    uses: Mapping[LLMRole, Sequence[str]], config: RunConfig
+) -> tuple[list[str], list[str]]:
+    """
+    Run core alias validation followed by every registered capability check.
+
+    Parameters
+    ----------
+    uses : Mapping[LLMRole, Sequence[str]]
+        Role-to-alias declarations from admitted components or startup hooks.
+    config : RunConfig
+        Catalog and budget limits supplied by the human.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        Core and hook errors, followed by hook warnings, as plain strings.
+
+    Notes
+    -----
+    Hook calls and returned-data normalization are synchronous and belong in
+    supervised daemon preparation when invoked by an asynchronous owner.
+
+    Examples
+    --------
+    >>> check_models({}, RunConfig())
+    ([], [])
+    """
+    uses = _safe_call("/models", partial(_normalized_uses, uses))
+    errors = check_llm_aliases(uses, config)
+    warnings: list[str] = []
+    for hook in tuple(_MODEL_CHECKS):
+        try:
+
+            def invoke(hook: ModelCheck = hook) -> tuple[list[str], list[str]]:
+                hook_errors, hook_warnings = hook(
+                    {role: list(aliases) for role, aliases in uses.items()}, config
+                )
+                return (
+                    [_context_string(e, "model error") for e in hook_errors],
+                    [_context_string(w, "model warning") for w in hook_warnings],
+                )
+
+            hook_errors, hook_warnings = _safe_call("/models", invoke)
+            errors.extend(hook_errors)
+            warnings.extend(hook_warnings)
+        except PlanError as error:
+            errors.extend(error.errors)
+    return errors, warnings
+
+
+def _model_uses(built: Mapping[str, Configurable]) -> dict[LLMRole, list[str]]:
+    """Collect admitted managers and recursive/main/part judges from the cache."""
+    uses: dict[LLMRole, list[str]] = {}
+    for pointer, component in built.items():
+        role: LLMRole
+        if isinstance(component, Manager):
+            role = "manager"
+        elif isinstance(component, Judge):
+            role = "judge"
+        else:
+            continue
+        aliases = _safe_call(
+            pointer,
+            lambda component=component: [_context_string(a, "alias") for a in component.models()],
+        )
+        uses.setdefault(role, []).extend(aliases)
+    return _normalized_uses(uses)
+
+
 def register_model_check(check: ModelCheck) -> None:
     """
     Register an optional model admission hook.
@@ -708,13 +850,13 @@ def register_model_check(check: ModelCheck) -> None:
     Parameters
     ----------
     check : ModelCheck
-        Callable accepting plan and config and returning errors and warnings.
+        Callable accepting a role-to-aliases map and config and returning errors and warnings.
         Hook diagnostics must contain identifiers only, never secret values.
 
     Examples
     --------
     >>> before = len(_MODEL_CHECKS)
-    >>> register_model_check(lambda plan, config: ([], []))
+    >>> register_model_check(lambda uses, config: ([], []))
     >>> len(_MODEL_CHECKS) == before + 1
     True
     >>> _ = _MODEL_CHECKS.pop()
@@ -804,13 +946,11 @@ def validate_plan(
         errors.extend(_rule_private_files(plan, config, history, built=built, private=private))
     except PlanError as error:
         errors.extend(error.errors)
-    for hook in _MODEL_CHECKS:
-        try:
-            hook_errors, hook_warnings = _safe_call("/models", partial(hook, plan, config))
-            errors.extend(hook_errors)
-            warnings.extend(hook_warnings)
-        except PlanError as error:
-            errors.extend(error.errors)
+    try:
+        model_errors, warnings = check_models(_model_uses(built), config)
+        errors.extend(model_errors)
+    except PlanError as error:
+        errors.extend(error.errors)
     if errors:
         raise _core_error(PlanError, errors) from None
     return warnings

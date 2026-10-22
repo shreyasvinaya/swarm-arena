@@ -337,3 +337,33 @@ def test_converge_variants_apply_to_final_slice() -> None:
         for address, tool in _tools(plan, _FixedEstimateTool(usd=3)).items()
     }
     assert final_slice_estimate(plan, RunConfig(), tools, lambda a: None).usd == 18
+
+
+def test_manager_tokens_priced_through_registered_source() -> None:
+    pytest.importorskip("litellm")
+    from swarm_arena.llm._catalog import price_of_model
+
+    register_price_source(price_of_model)
+    current = _plan(rounds=3)
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(
+            update={"manager": Ref(path="_fakes.tools:NoopManager", config={"models": ["s"]})}
+        )
+    )
+    config = RunConfig(
+        models=ModelCatalog(
+            {
+                "s": ModelSpec(
+                    model="anthropic/claude-sonnet-4-6", roles=["manager"], max_tokens=8000
+                )
+            }
+        )
+    )
+    estimate = worst_case_estimate(
+        [current], config, _tools(current, _FreeTool()), make_price_of(config.models)
+    )
+    price = price_of_model("anthropic/claude-sonnet-4-6")
+    assert price is not None
+    assert estimate.usd >= 3 * 20 * 8000 * price.output / 1e6

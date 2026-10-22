@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Manager prompts keep system instructions and frozen reference files ahead of round facts;
   shared untrusted-content wrapping removes embedded markers before digest byte capping.
+- Model alias, role, capability and price validation for plans, replanners and
+  curators; exact cache-lifetime-aware LLM costs, conservative call estimates,
+  and LiteLLM or registered offline model construction.
 
 - Optional `llm`, `cache`, and `langfuse` dependencies, an LLM import guard,
   bundled LiteLLM prices, and offline upstream compatibility checks.

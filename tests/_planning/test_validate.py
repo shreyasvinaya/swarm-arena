@@ -229,9 +229,10 @@ def errs(plan: Plan, cfg: RunConfig, **kw: Any) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _clear_model_checks() -> Any:
+    before = validation._MODEL_CHECKS[:]
     validation._MODEL_CHECKS.clear()
     yield
-    validation._MODEL_CHECKS.clear()
+    validation._MODEL_CHECKS[:] = before
 
 
 def test_valid_plan_passes() -> None:
@@ -637,13 +638,13 @@ def test_non_human_part_files_outside_main_manifest_rejected() -> None:
 
 
 def test_all_errors_listed_and_model_check_hook() -> None:
-    register_model_check(lambda plan, cfg: (["model error"], ["model warning"]))
+    register_model_check(lambda uses, cfg: (["model error"], ["model warning"]))
     with pytest.raises(PlanError) as err:
         validate_plan(_plan(teams=5, rationale=" "), RunConfig())
     assert len(err.value.errors) == 3
     assert "model error" in err.value.errors
     validation._MODEL_CHECKS.clear()
-    register_model_check(lambda plan, cfg: ([], ["model warning"]))
+    register_model_check(lambda uses, cfg: ([], ["model warning"]))
     assert validate_plan(_plan(), RunConfig()) == ["model warning"]
 
 
@@ -2112,3 +2113,270 @@ async def test_admitted_default_tool_retains_identity_at_consumers(
     assert warnings == []
     assert overlay == {"work.txt": digest}
     assert stage.root["work.txt"] == digest
+
+
+def _model_plan(alias: str) -> Plan:
+    plan = _plan()
+    plan.teams[0].agents[0] = (
+        plan.teams[0]
+        .agents[0]
+        .model_copy(
+            update={"manager": Ref(path="_fakes.tools:NoopManager", config={"models": [alias]})}
+        )
+    )
+    return plan
+
+
+def test_llm_alias_unknown_or_wrong_role_rejected() -> None:
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    for config in [
+        RunConfig(),
+        RunConfig(models=ModelCatalog({"x": ModelSpec(model="fake/m", roles=["judge"])})),
+    ]:
+        with pytest.raises(PlanError) as error:
+            validate_plan(_model_plan("x"), config)
+        assert any(
+            "alias 'x'" in message and "role 'manager'" in message for message in error.value.errors
+        )
+
+
+def test_max_tokens_required_when_llm_component_used() -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    cfg = RunConfig(
+        limits=Limits(max_tokens=None),
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+    )
+    assert any("max_tokens" in e for e in errs(_model_plan("m"), cfg))
+
+
+def test_unpriced_model_rejected_when_max_usd_set() -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    cfg = RunConfig(
+        limits=Limits(max_usd=1),
+        models=ModelCatalog({"m": ModelSpec(model="fake/unpriced", roles=["manager"])}),
+    )
+    assert any("no known price" in e for e in errs(_model_plan("m"), cfg))
+
+
+def test_check_models_runs_registered_checks_on_a_role_map() -> None:
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    seen = []
+    register_model_check(lambda uses, config: (seen.append(uses) or [], ["warning"]))
+    cfg = RunConfig(
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000}),
+        models=ModelCatalog({"p": ModelSpec(model="fake/p", roles=["planner"])}),
+    )
+    assert check_models({"planner": ["p"]}, cfg) == ([], ["warning"])
+    assert seen == [{"planner": ["p"]}]
+
+
+def test_fresh_process_first_validation_runs_model_checks() -> None:
+    import os
+    import subprocess
+    import sys
+
+    pytest.importorskip("litellm")
+    plan = _model_plan("r1")
+    plan.teams[0].agents[0] = (
+        plan.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(path="_fakes.llm_components:AliasManager", config={"model": "r1"})
+            }
+        )
+    )
+    script = (
+        "from swarm_arena import Plan, RunConfig, validate_plan\n"
+        "from swarm_arena.config import ModelCatalog, ModelSpec\n"
+        f"plan = Plan.model_validate_json({plan.model_dump_json()!r})\n"
+        "config = RunConfig(models=ModelCatalog({'r1': ModelSpec("
+        "model='deepseek/deepseek-reasoner', roles=['manager'])}))\n"
+        "validate_plan(plan, config)\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    proc = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode != 0
+    assert "function calling" in proc.stderr
+
+
+@pytest.mark.parametrize("site", ["manager", "judge", "nested member of a Lexicographic judge"])
+def test_rejected_ref_is_never_imported_or_built(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    (tmp_path / "evil_mod.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(tmp_path / 'imported')!r}).touch()\n"
+        "class X:\n    def __init__(self):\n"
+        f"        Path({str(tmp_path / 'built')!r}).touch()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    r0 = _plan()
+    rev = r0.model_copy(deep=True)
+    evil = Ref(path="evil_mod:X", name="evil")
+    if site == "manager":
+        rev.teams[0].agents[0] = rev.teams[0].agents[0].model_copy(update={"manager": evil})
+    else:
+        if site != "judge":
+            evil = Ref(
+                path="swarm_arena.scoring:Lexicographic",
+                name="evil",
+                config={"judges": [evil.model_dump(exclude_none=True)]},
+            )
+        rev = rev.model_copy(update={"judges": [*rev.judges, evil]})
+    rev = stamp(rev, origin="autonomous", parent=r0)
+    cfg = RunConfig()
+    if site == "nested member of a Lexicographic judge":
+        cfg = RunConfig(
+            planner_catalog=PlannerCatalog(
+                entries=[
+                    CatalogEntry(
+                        name="panel",
+                        kind="judge",
+                        ref=evil.path,
+                        config=evil.config,
+                        description="Panel",
+                    )
+                ]
+            )
+        )
+    with pytest.raises(PlanError) as error:
+        validate_plan(rev, cfg, history=[r0])
+    assert any("not in the planner catalog" in m for m in error.value.errors)
+    if site == "nested member of a Lexicographic judge":
+        assert any("/config/judges/0" in m for m in error.value.errors)
+    assert not (tmp_path / "imported").exists()
+    assert not (tmp_path / "built").exists()
+    assert "evil_mod" not in sys.modules
+
+
+def test_model_hooks_and_prices_hide_exception_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm_arena._budget import estimate
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    def fail(*args: object) -> Any:
+        raise RuntimeError(BOUNDARY_SECRET)
+
+    cfg = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000, "max_usd": 1}),
+    )
+    monkeypatch.setattr(estimate, "_price_sources", [fail])
+    register_model_check(fail)
+    errors, warnings = check_models({"manager": ["m"]}, cfg)
+    assert warnings == []
+    assert errors == ["/models: RuntimeError", "/models: RuntimeError"]
+    with pytest.raises(PlanError) as error:
+        validate_plan(_model_plan("m"), cfg)
+    assert_secret_absent(error.value, BOUNDARY_SECRET)
+
+
+def test_model_aliases_and_hook_diagnostics_are_plain_strings() -> None:
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    class Strange(str):
+        def __hash__(self) -> int:
+            raise AssertionError("subclass hash ran")
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("subclass comparison ran")
+
+        def __str__(self) -> str:
+            raise AssertionError("subclass str ran")
+
+    register_model_check(lambda uses, config: ([], [Strange("warning")]))
+    cfg = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000}),
+    )
+    errors, warnings = check_models({"manager": [Strange("m")]}, cfg)
+    assert errors == []
+    assert warnings == ["warning"]
+    assert type(warnings[0]) is str
+
+
+@pytest.mark.parametrize("site", ["manager", "converge", "judge", "part", "nested"])
+def test_model_checks_cover_admitted_roles_without_rebuilding(
+    site: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    current = _model_plan("m")
+    if site == "converge":
+        current = current.model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=current.teams[0].model_copy(update={"name": "final"})
+                ),
+                "teams": [],
+            }
+        )
+    if site in {"judge", "part", "nested"}:
+        pytest.importorskip("litellm")
+        judge = Ref(path="_fakes.llm_components:AliasJudge", config={"model": "m"}, name="a")
+        if site == "nested":
+            judge = Ref(
+                path="swarm_arena.scoring:Lexicographic",
+                name="a",
+                config={"judges": [judge.model_dump(exclude_none=True)]},
+            )
+        if site == "part":
+            current = current.model_copy(
+                update={
+                    "parts": [
+                        PartSpec(
+                            name="p",
+                            goal=Goal(id="p", namespace="demo", files=FileSet(manifest={})),
+                            judges=[judge],
+                            ranking="a",
+                        )
+                    ]
+                }
+            )
+            current.teams[0] = current.teams[0].model_copy(update={"part": "p"})
+            current = current.model_copy(
+                update={
+                    "converge": ConvergeSpec(
+                        mode="team", team=TeamSpec(name="final", rationale="Join", agents=[])
+                    )
+                }
+            )
+        else:
+            current = current.model_copy(update={"judges": [judge]})
+        current.teams[0].agents[0] = (
+            current.teams[0].agents[0].model_copy(update={"manager": MANAGER})
+        )
+    built_managers = 0
+    original = Ref.build
+
+    def build(self: Ref, base: type[Any]) -> Any:
+        nonlocal built_managers
+        if base is Manager:
+            built_managers += 1
+        return original(self, base)
+
+    monkeypatch.setattr(Ref, "build", build)
+    seen = []
+    register_model_check(lambda uses, config: (seen.append(uses) or [], []))
+    cfg = RunConfig(
+        limits=Limits(max_tokens=10000),
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager", "judge"])}),
+    )
+    assert validate_plan(current, cfg) == []
+    role = "manager" if site in {"manager", "converge"} else "judge"
+    assert seen[0][role] == ["m"]
+    assert built_managers == 1

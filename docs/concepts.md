@@ -192,3 +192,70 @@ changed limits. Later solution views show the latest lifecycle; earlier final
 orders and stop reasons remain in the journal. See
 [Limits and safety](limits-and-safety.md#stop-modes-and-resume) before takeover
 or changing limits, and [Planning modes](planning-modes.md) for runnable plans.
+
+## Models
+
+Install the optional integration with `uv add 'swarm-arena[llm]'`. The human's
+`RunConfig` declares the provider models available to LLM components:
+
+```toml
+[limits]
+max_tokens = 1000000
+
+[models.opus]
+model = "anthropic/claude-opus-5-5"
+max_tokens = 8000
+roles = ["manager", "judge", "planner"]
+prompt_cache = { ttl = "5m" }
+
+[models.gpt]
+model = "openai/gpt-6"
+roles = ["manager", "judge"]
+
+[models.flash]
+model = "gemini/gemini-3-flash"
+roles = ["judge", "curator"]
+prices = { input = 0.3, output = 2.5 }
+```
+
+Components declare **aliases only**, such as `opus` or `flash`. Every used alias
+must exist in the catalog and allow its caller's role. A run using any model
+alias requires `limits.max_tokens`; each model's `max_tokens` remains its output
+limit. With `limits.max_usd` set, every used alias must also have a known price.
+Unused catalog entries do not require prices or capabilities.
+
+Plan admission authorizes raw component references before importing or building
+them. It then validates aliases from the built managers and judges, including
+nested judges, part scoring, and convergence. Replanners and curators receive
+the same checks before run publication. Managers require function calling.
+Judges, planners, and curators without response-schema support produce a
+**two-stage** warning: a free-text answer needs a subsequent formatting call.
+Offline `fake/` models support both capabilities and must be registered before
+model construction.
+
+Importing `swarm_arena.llm` registers capability and price checks and sets
+`LITELLM_LOCAL_MODEL_COST_MAP=True` before loading LiteLLM. Fallback prices use
+its bundled map, so importing does not fetch a changing remote price table.
+Explicit catalog `prices` are USD per million tokens and override the provider's
+reported response cost. Otherwise an authoritative response cost wins, followed
+by the bundled-map calculation. An unpriced model without a dollar cap can
+report zero cost when no authoritative response cost is available.
+
+`Usage.input_tokens` excludes cache reads and writes. Explicit prices charge
+ordinary input, output, cache reads, and cache writes separately; a missing
+cache-read price defaults to input and a missing cache-write price defaults to
+twice input. An explicit zero cache price stays zero. Provider fallback pricing
+retains the reported five-minute and one-hour write subsets. Unsplit writes
+use the largest of those tariffs and twice input, even if the requested TTL
+was five minutes. For Sonnet 4.6, 100 five-minute writes and 900 one-hour writes
+cost 5,775 micro-dollars, using rates of $3.75 and $6 per million respectively.
+All token-price products are added as exact decimal rationals and rounded once
+to whole micro-dollars, with ties to even.
+
+Per-call reservation estimates use `ceil(prompt_chars / 3)` input tokens and
+the output allowance. Include the complete serialized input, tools, and schema
+in `prompt_chars`. Estimated input costs `max(2 * input, cache_write)` per token.
+Character-to-token conversion is a heuristic; actual supported costs above the
+estimate are charged in full. A two-stage final judge also needs funding for
+its formatter's full input and output. An output-only judge allowance does not
+establish that both complete calls fit.

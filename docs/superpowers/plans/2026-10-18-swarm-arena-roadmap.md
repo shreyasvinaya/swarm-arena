@@ -410,6 +410,7 @@ M3 core recording additions to R3.1 (these extend the existing module rows):
 | `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
 | `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
+| `tests/_fakes/llm_components.py` | Import-triggered alias manager, judge and curator fixtures for model admission and startup checks | M3 |
 | `tests/_fakes/llm_run.py` | `open_llm_run`, real owned writer/ledger fixture, committed calls/charges and held-worker readiness/release controls | M3 |
 | `tests/_fakes/agent_ctx.py` | In-memory `FakeAgentContext` fields, actions, failure injection and requesting-call records | M3 |
 | `tests/test_lease_io_boundary.py` | Includes core LLM recorder and future `llm/*.py` modules in the lease-held storage guard | +M3 |
@@ -2283,6 +2284,9 @@ ModelCheck = Callable[[Mapping[LLMRole, Sequence[str]], RunConfig], tuple[list[s
     # [plan] a role → aliases map, not a Plan: the replanner, the curator, and a planning session have no plan. M1b
     # ships Callable[[Plan, RunConfig], tuple[list[str], list[str]]]; M3 Task 3 changes it to this form.
 def register_model_check(check: ModelCheck) -> None: ...                 # swarm_arena.llm registers at import (M3)
+def check_llm_aliases(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> list[str]: ...
+    # Core alias/role, max_tokens and known-price rules. Hooks and returned strings/prices are normalized
+    # in synchronous preparation; asynchronous owners use the supervised abandonable daemon boundary.
 def check_models(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> tuple[list[str], list[str]]: ...
     # M3, _planning/validate.py: alias, max_tokens, and price errors, then every registered ModelCheck. The one entry
     # point for validate_plan, _engine/run.py (replanner, curator), and planning_session (R4.13.13).

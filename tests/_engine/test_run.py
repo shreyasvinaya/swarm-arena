@@ -1,6 +1,8 @@
 import asyncio
 import json
 import sys
+from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from unittest.mock import Mock
@@ -1154,3 +1156,126 @@ async def test_driving_timeout_is_not_a_stop_command(
     assert {e.goal_id: e.payload["reason"] for e in events(config, "goal_finished")}[
         "b"
     ] == "stopped"
+
+
+@pytest.mark.parametrize("role", ["planner", "curator"])
+async def test_replanner_and_curator_models_checked_before_start(
+    role: str, run_config: RunConfig
+) -> None:
+    from _fakes.planners import SequencePlanner
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("nope",)
+
+    current = plan(rounds=1)
+    config = run_config
+    replanner = AliasPlanner([current]) if role == "planner" else None
+    if role == "curator":
+        pytest.importorskip("litellm")
+        config = config.model_copy(
+            update={
+                "curator": Ref(path="_fakes.llm_components:AliasCurator", config={"model": "nope"})
+            }
+        )
+    with pytest.raises(ValueError, match="nope"):
+        await Swarm(config, replanner=replanner).run(current)
+    assert await anyio.to_thread.run_sync(
+        lambda: not Path(config.run_root).exists() or not list(Path(config.run_root).iterdir())
+    )
+
+
+async def test_replanner_capabilities_checked_before_start(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena._planning import validate as validation
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("p",)
+
+    monkeypatch.setattr(
+        validation,
+        "_MODEL_CHECKS",
+        [lambda uses, config: (["planner capability refused"] if uses.get("planner") else [], [])],
+    )
+    config = run_config.model_copy(
+        update={"models": ModelCatalog({"p": ModelSpec(model="fake/p", roles=["planner"])})}
+    )
+    current = plan(rounds=1)
+    with pytest.raises(ValueError, match="planner capability refused"):
+        await Swarm(config, replanner=AliasPlanner([current])).run(current)
+    assert await anyio.to_thread.run_sync(
+        lambda: not Path(config.run_root).exists() or not list(Path(config.run_root).iterdir())
+    )
+
+
+async def test_startup_model_warning_reaches_approval(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena._planning import validate as validation
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("p",)
+
+    monkeypatch.setattr(
+        validation,
+        "_MODEL_CHECKS",
+        [lambda uses, config: ([], ["two-stage planner"] if uses.get("planner") else [])],
+    )
+    config = with_limits(run_config, max_tokens=1_000_000).model_copy(
+        update={"models": ModelCatalog({"p": ModelSpec(model="fake/p", roles=["planner"])})}
+    )
+    seen = []
+
+    async def approve(estimate: Estimate, warnings: Sequence[str]) -> bool:
+        seen.extend(warnings)
+        return False
+
+    current = plan(rounds=1)
+    with pytest.raises(RuntimeError, match="run not approved"):
+        await Swarm(config, replanner=AliasPlanner([current])).run(current, approve=approve)
+    assert "two-stage planner" in seen
+
+
+async def test_startup_model_hook_is_abandonable(run_config: RunConfig) -> None:
+    import threading
+
+    from _fakes.planners import SequencePlanner
+
+    entered = threading.Event()
+    release = threading.Event()
+    workers: list[threading.Thread] = []
+
+    class HeldPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(15)
+            return ()
+
+    current = plan(rounds=1)
+    task = asyncio.create_task(Swarm(run_config, replanner=HeldPlanner([current])).run(current))
+    try:
+        with anyio.fail_after(5):
+            assert await anyio.to_thread.run_sync(entered.wait, 4)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+    assert await anyio.to_thread.run_sync(lambda: not Path(run_config.run_root).exists())
