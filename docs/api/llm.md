@@ -5,6 +5,7 @@ adds response-cache backends; `langfuse` adds optional tracing dependencies.
 Importing the package pins LiteLLM to its bundled model cost map for reproducible
 prices. Importing the core package does not load these optional integrations.
 
-```{automodule} swarm_arena.llm
-:members:
+```{eval-rst}
+.. automodule:: swarm_arena.llm
+   :members:
 ```

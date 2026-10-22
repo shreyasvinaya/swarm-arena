@@ -182,6 +182,10 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
     assert 'id="swarm_arena.Goal"' in root_api
     assert 'id="swarm_arena.Plan.loads"' in root_api
     assert "Parameters" in root_api
+    llm = (output / "api" / "llm.html").read_text()
+    assert 'id="swarm_arena.llm.AgentsSDKManager"' in llm
+    testing = (output / "api" / "testing.html").read_text()
+    assert 'id="swarm_arena.testing.FakeModel"' in testing
     protocol = RenderedText()
     protocol.feed((output / "api" / "protocol.html").read_text())
     assert "data=..." in "".join(protocol.chunks).replace(" ", "")
