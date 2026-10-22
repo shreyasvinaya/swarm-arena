@@ -231,6 +231,23 @@ def _startup_models(config: RunConfig, replanner: Planner | None) -> tuple[list[
     return check_models(uses, config)
 
 
+async def _check_startup_models(config: RunConfig, replanner: Planner | None) -> list[str]:
+    """Validate startup hooks in an abandonable worker before ownership."""
+    outcome = _Outcome()
+    try:
+        errors, warnings = await run_sync_daemon(_startup_models, config, replanner)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        error = outcome.classify(error)
+        raise _core_error(
+            ValueError, f"model checks failed: {_exception_type_name(error)}"
+        ) from None
+    if errors:
+        raise _core_error(ValueError, "\n".join(errors)) from None
+    return warnings
+
+
 def _estimates(plans: Sequence[Plan], config: RunConfig) -> tuple[Amount, dict[str, Amount]]:
     """Bound each address by all its known effective variants and empty inputs."""
     tools: dict[str, Sequence[tuple[Tool, ToolRequest]]] = {}
@@ -536,21 +553,7 @@ class RunRunner:
                 if collisions := _goal_key_errors(admitted):
                     raise _core_error(PlanError, collisions)
                 self.plans = admitted
-                outcome = _Outcome()
-                try:
-                    model_errors, model_warnings = await run_sync_daemon(
-                        _startup_models, self.config, self.replanner
-                    )
-                except KeyboardInterrupt:
-                    raise
-                except BaseException as error:
-                    error = outcome.classify(error)
-                    raise _core_error(
-                        ValueError, f"model checks failed: {_exception_type_name(error)}"
-                    ) from None
-                if model_errors:
-                    raise _core_error(ValueError, "\n".join(model_errors)) from None
-                warnings.extend(model_warnings)
+                warnings.extend(await _check_startup_models(self.config, self.replanner))
                 outcome = _Outcome()
                 try:
                     estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)

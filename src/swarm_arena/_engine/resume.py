@@ -3,7 +3,7 @@
 import asyncio
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -113,6 +113,14 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
     return continued
 
 
+def _restore_import_paths(state: RunState) -> None:
+    """Make recorded component locations available before invoking their hooks."""
+    for revisions in state.plans.values():
+        directory = str(revisions[0][0].base_dir)
+        if directory not in sys.path:
+            sys.path.append(directory)
+
+
 class _ResumeServices:
     """Keep the AnyIO writer context in one task across preparation and execution."""
 
@@ -126,11 +134,13 @@ class _ResumeServices:
         force: bool,
         clock: RunClock,
         validated_head: Head,
+        model_warnings: list[str],
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
         self.validated_head = validated_head
+        self.model_warnings = model_warnings
         self.ready, self.close = anyio.Event(), anyio.Event()
         self.failure: BaseException | None = None
         self.resumed: ResumeState | None = None
@@ -199,7 +209,10 @@ class _ResumeServices:
                     try:
                         # A successful force CAS must be auditable even if replay now refuses.
                         await journal.append_durable(
-                            EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
+                            EventDraft(
+                                type=EventType.TAKEOVER,
+                                payload={"force": self.force, "warnings": self.model_warnings},
+                            )
                         )
                         events, state = await _validated_io(_read, self.store, lease.doc)
                         replay_prepared()
@@ -221,10 +234,7 @@ class _ResumeServices:
                             self.order.extend(
                                 g for g in state.plans if state.goals[g].status == "queued"
                             )
-                            for revisions in state.plans.values():
-                                directory = str(revisions[0][0].base_dir)
-                                if directory not in sys.path:
-                                    sys.path.append(directory)
+                            _restore_import_paths(state)
                             ids = IdGen(self.run_id, lease.doc.epoch, counters=state.id_counters)
                             ledger = Ledger.replay(state, journal=journal, ids=ids)
                             artifacts = ArtifactStore(
@@ -473,6 +483,7 @@ async def _take_over(
     *,
     force: bool,
     validate: Callable[[OwnerDoc], None] | None = None,
+    before_acquire: Callable[[], Awaitable[None]] | None = None,
     review: bool = False,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
@@ -487,6 +498,8 @@ async def _take_over(
             raise _core_error(ValueError, f"run {run_id} has no committed events")
         if validate is not None:
             await _validated_io(validate, doc)
+        if before_acquire is not None:
+            await before_acquire()
         try:
             return await _acquire_lease(
                 partial(
@@ -539,7 +552,8 @@ async def resume_run(
     ------
     ValueError
         A goal's agent peak exceeds the run-wide limit, no committed state
-        exists, a replay payload is invalid, or a budget cap decreases.
+        exists, a replay payload is invalid, a budget cap decreases, or startup
+        model validation refuses the replanner or curator before takeover.
     ChainError
         The committed journal chain is broken or a segment is missing.
     RuntimeError
@@ -557,22 +571,37 @@ async def resume_run(
 
     clock: RunClock | None = None
     validated_head: Head | None = None
+    model_warnings: list[str] = []
 
     def validate(doc: OwnerDoc) -> None:
         nonlocal clock, validated_head
         _, state = _read(store, doc)
         _check(state, config)
+        _restore_import_paths(state)
         if clock is None:
             clock = RunClock(state.run_elapsed_s)
         else:
             clock._rebase(state.run_elapsed_s)
         validated_head = doc.head
 
-    lease = await _take_over(config, run_id, store, force=force, validate=validate)
+    async def check_startup_models() -> None:
+        nonlocal model_warnings
+        model_warnings = await run_module._check_startup_models(config, replanner)
+
+    lease = await _take_over(
+        config, run_id, store, force=force, validate=validate, before_acquire=check_startup_models
+    )
     assert clock is not None
     assert validated_head is not None
     services = _ResumeServices(
-        config, run_id, store, lease, force=force, clock=clock, validated_head=validated_head
+        config,
+        run_id,
+        store,
+        lease,
+        force=force,
+        clock=clock,
+        validated_head=validated_head,
+        model_warnings=model_warnings,
     )
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:

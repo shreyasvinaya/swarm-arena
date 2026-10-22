@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
 import pytest
@@ -2509,3 +2509,265 @@ async def test_resume_segment_failure_is_contained(
     assert _is_core_signal(caught.value)
     assert marker not in "".join(traceback.format_exception(caught.value))
     assert store.read("control/owner.json") == owner
+
+
+@pytest.fixture
+async def model_resume_run(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> tuple[RunConfig, LocalStore]:
+    """Cancel a public three-round run during round two, as in the resume probe."""
+    import asyncio
+
+    from _fakes.run import plan
+
+    config = with_limits(run_config, max_tokens=1_000_000_000, max_usd=1_000_000)
+    ready = anyio.Event()
+
+    async def pause(self: ScriptedManager, ctx: AgentContext) -> RoundReport:
+        if ctx.round == 2:
+            ready.set()
+            await anyio.sleep_forever()
+        return RoundReport()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ScriptedManager, "run_round", pause)
+        current = Plan.loads(plan(rounds=3).dumps(), base_dir=Path(config.run_root).parent)
+        task = asyncio.create_task(Swarm(config).run(current, run_id="model-resume"))
+        task.add_done_callback(lambda _: ready.set())
+        try:
+            with anyio.fail_after(10):
+                await ready.wait()
+            if task.done():
+                await task
+                pytest.fail("seed finished before the round-two checkpoint")
+        finally:
+            task.cancel()
+            with anyio.fail_after(10):
+                await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+    return config, LocalStore(Path(config.run_root) / "model-resume")
+
+
+def _resume_bytes(store: LocalStore) -> dict[str, bytes]:
+    """Snapshot ownership, lease, journal and published files before takeover."""
+    return {key: store.read(key).data for key in store.list("")}
+
+
+@pytest.mark.parametrize("role", ["planner", "curator"])
+@pytest.mark.parametrize("invalid", ["unknown", "token_cap", "role", "price", "capability"])
+async def test_resume_startup_models_refused_before_takeover(
+    model_resume_run: tuple[RunConfig, LocalStore],
+    monkeypatch: pytest.MonkeyPatch,
+    role: Literal["planner", "curator"],
+    invalid: str,
+) -> None:
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    from swarm_arena._planning import validate as validation
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    config, store = model_resume_run
+    calls: list[str] = []
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            calls.append("models")
+            return ("nope",)
+
+        async def plan(self, goal: Goal, config: RunConfig, history: Any) -> Plan:
+            calls.append("plan")
+            return await super().plan(goal, config, history)
+
+    if role == "curator":
+        pytest.importorskip("litellm")
+        from _fakes.llm_components import AliasCurator
+
+        def models(self: AliasCurator) -> tuple[str, ...]:
+            calls.append("models")
+            return ("nope",)
+
+        monkeypatch.setattr(AliasCurator, "models", models)
+        config = config.model_copy(
+            update={
+                "curator": Ref(path="_fakes.llm_components:AliasCurator", config={"model": "nope"})
+            }
+        )
+    expected = {
+        "unknown": "alias 'nope' is not allowed",
+        "token_cap": "limits.max_tokens is required",
+        "role": "alias 'nope' is not allowed",
+        "price": "alias 'nope' has no known price",
+        "capability": "startup capability refused",
+    }[invalid]
+    if invalid != "unknown":
+        config = config.model_copy(
+            update={
+                "models": ModelCatalog(
+                    {
+                        "nope": ModelSpec(
+                            model="fake/unpriced",
+                            roles=["manager"] if invalid == "role" else [role],
+                            prices=None
+                            if invalid == "price"
+                            else ModelSpec.Prices(input=1, output=1),
+                        )
+                    }
+                )
+            }
+        )
+    if invalid in {"unknown", "token_cap"}:
+        config = with_limits(config, max_tokens=None)
+    if invalid == "capability":
+        monkeypatch.setattr(
+            validation,
+            "_MODEL_CHECKS",
+            [lambda uses, cfg: (["startup capability refused"] if uses.get(role) else [], [])],
+        )
+    before = _resume_bytes(store)
+    owner = read_owner(store)
+    replanner = AliasPlanner([plan(rounds=3)]) if role == "planner" else None
+    with pytest.raises(ValueError, match=expected) as caught:
+        await Swarm(config, replanner=replanner).resume("model-resume", force=True)
+    if invalid == "unknown":
+        assert "limits.max_tokens is required" in str(caught.value)
+    assert calls == ["models"]
+    assert read_owner(store) == owner
+    assert _resume_bytes(store) == before
+
+
+@pytest.mark.parametrize("role", ["planner", "curator"])
+async def test_resume_startup_models_preserve_structured_warnings(
+    model_resume_run: tuple[RunConfig, LocalStore],
+    monkeypatch: pytest.MonkeyPatch,
+    role: Literal["planner", "curator"],
+) -> None:
+    pytest.importorskip("litellm")
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import _catalog
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("p",)
+
+    config, store = model_resume_run
+    config = config.model_copy(
+        update={
+            "models": ModelCatalog(
+                {
+                    "p": ModelSpec(
+                        model="fake/p", roles=[role], prices=ModelSpec.Prices(input=1, output=1)
+                    )
+                }
+            )
+        }
+    )
+    if role == "curator":
+        config = config.model_copy(
+            update={
+                "curator": Ref(path="_fakes.llm_components:AliasCurator", config={"model": "p"})
+            }
+        )
+    monkeypatch.setattr(_catalog, "supports", lambda spec, feature: False)
+    replanner = AliasPlanner([plan(rounds=3)]) if role == "planner" else None
+    await Swarm(config, replanner=replanner).resume("model-resume", force=True)
+    committed = read_committed(store)
+    assert committed is not None
+    takeovers = [e for e in committed[1] if e.type == "takeover"]
+    assert len(takeovers) == 1
+    assert takeovers[0].payload["warnings"] == [
+        f"alias 'p' for role '{role}' uses the two-stage fallback"
+    ]
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel", "held"])
+async def test_resume_startup_models_contain_hooks_before_takeover(
+    model_resume_run: tuple[RunConfig, LocalStore], failure: str
+) -> None:
+    import asyncio
+    import traceback
+
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    config, store = model_resume_run
+    before = _resume_bytes(store)
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    secret = "private-model-hook-value"
+
+    class HookPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            if failure == "error":
+                raise RuntimeError(secret)
+            if failure == "cancel":
+                raise asyncio.CancelledError(secret)
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(20)
+            return ()
+
+    task = asyncio.create_task(
+        Swarm(config, replanner=HookPlanner([plan(rounds=3)])).resume("model-resume", force=True)
+    )
+    try:
+        with anyio.fail_after(8):
+            if failure == "held":
+                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert _resume_bytes(store) == before
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not release.is_set()
+            else:
+                with pytest.raises(ValueError, match="model checks failed") as caught:
+                    await task
+                assert secret not in "".join(traceback.format_exception(caught.value))
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(8):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert _resume_bytes(store) == before
+
+
+async def test_resume_startup_models_restore_recorded_import_base(
+    model_resume_run: tuple[RunConfig, LocalStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    pytest.importorskip("litellm")
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    config, _ = model_resume_run
+    base = Path(config.run_root).parent
+    (base / "local_resume_curator.py").write_text(
+        "from _fakes.llm_components import AliasCurator\n", encoding="utf-8"
+    )
+    config = config.model_copy(
+        update={
+            "curator": Ref(path="local_resume_curator:AliasCurator", config={"model": "c"}),
+            "models": ModelCatalog(
+                {
+                    "c": ModelSpec(
+                        model="fake/c",
+                        roles=["curator"],
+                        prices=ModelSpec.Prices(input=1, output=1),
+                    )
+                }
+            ),
+        }
+    )
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry != str(base)])
+    try:
+        result = await Swarm(config).resume("model-resume", force=True)
+        assert set(result) == {"g"}
+    finally:
+        sys.modules.pop("local_resume_curator", None)

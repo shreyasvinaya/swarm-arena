@@ -227,9 +227,12 @@ Unused catalog entries do not require prices or capabilities.
 Plan admission authorizes raw component references before importing or building
 them. It then validates aliases from the built managers and judges, including
 nested judges, part scoring, and convergence. Replanners and curators receive
-the same checks before run publication. Managers require function calling.
+the same checks before run publication and before resume takes ownership.
+A refused resume leaves the epoch, lease and journal unchanged. Startup hooks
+run in cancellable daemon workers on both entry paths. Managers require function calling.
 Judges, planners, and curators without response-schema support produce a
 **two-stage** warning: a free-text answer needs a subsequent formatting call.
+On resume, these warnings are retained in the journal's takeover event.
 Offline `fake/` models support both capabilities and must be registered before
 model construction.
 
