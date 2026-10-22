@@ -129,6 +129,26 @@ async def test_all_judge_errors_writes_no_result(env: EngineEnv) -> None:
     assert json.loads(env.store.read("goals/g/solution.json").data)["status"] == "no_result"
 
 
+@pytest.mark.parametrize("flag", ["stop", "run_budget"])
+async def test_stop_without_passing_candidate_records_selection_reason(
+    env: EngineEnv, flag: str
+) -> None:
+    env.on_commit("round_closed", lambda ev: _raise_flag(env.deps.stops, flag, goal_id="g"))
+    raising = Ref.of(ProgramJudge("_fakes.tools:raising_score")).model_copy(update={"name": "y"})
+    outcome = await GoalRunner(
+        env.deps, goal_id="g", plan=_plan(judges=[raising]), replanner=None
+    ).run()
+    assert (outcome.status, outcome.reason, outcome.finalists) == (
+        "no_result",
+        "no passing candidate",
+        [],
+    )
+    assert env.events("no_result")[-1].payload == {"reason": "no passing candidate"}
+    assert (
+        json.loads(env.store.read("goals/g/solution.json").data)["reason"] == "no passing candidate"
+    )
+
+
 @pytest.mark.parametrize(
     ("flag", "reason", "select_only"),
     [
@@ -2612,7 +2632,9 @@ async def test_llm_judge_usage_overflow_finishes_run(
     events = all_events(config)
     assert not [e for e in events if e.type == "judge_error"]
     assert [e for e in events if e.type == "round_closed"]
-    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == "run budget"
+    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == (
+        "no passing candidate" if (source, ranking) == ("1", "panel") else "run budget"
+    )
     assert (Path(config.run_root) / "overflow/goals/g/solution.json").exists()
     assert bool(result["g"]) is (ranking == "y")
     assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])

@@ -2034,8 +2034,7 @@ class GoalRunner:
             if self.status != "no_result":
                 self.status, self.reason = (
                     "no_result",
-                    self.reason
-                    or ("provider_failed" if ranking_still_failed else "no passing candidate"),
+                    "provider_failed" if ranking_still_failed else "no passing candidate",
                 )
             self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
         else:
