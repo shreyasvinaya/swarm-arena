@@ -112,3 +112,13 @@ async def test_scope_inheritance_and_task_isolation() -> None:
     assert seen["planner"] is not None
     assert seen["planner"].role == "planner"
     assert current_llm_scope() is None
+
+
+def test_child_scope_inherits_services_with_separate_call_ids() -> None:
+    parent = _scope("judge")
+    child = parent.child()
+    assert child.parent is parent
+    assert child.tranche is parent.tranche
+    assert child.journal is parent.journal
+    assert child.call_ids is not parent.call_ids
+    assert list(child.lineage()) == [child, parent]

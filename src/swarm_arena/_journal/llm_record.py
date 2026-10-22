@@ -315,7 +315,7 @@ def open_call(
     if asyncio.get_running_loop() is not binding.loop:
         raise _core_error(ValueError, "open_call requires the bound owner loop")
     binding.check()
-    if binding.closing or id(scope) in binding.drained:
+    if binding.closing or any(id(owner) in binding.drained for owner in scope.lineage()):
         raise _core_error(ValueError, "LLM scope is drained")
     if scope.journal is not binding.journal or scope.artifacts is not binding.artifacts:
         raise _core_error(ValueError, "LLM scope does not belong to the bound run")
@@ -331,7 +331,8 @@ def open_call(
     cid = binding.ids.next("llm")
     binding.pending[rid] = _Pending(scope, cid, rid, estimate, alias, model, provider)
     binding.call_reservations[cid] = rid
-    binding.track_scope(scope)
+    for owner in scope.lineage():
+        binding.track_scope(owner)
     return cid
 
 
@@ -903,8 +904,10 @@ async def _record(
             entry.state = "claimed"
         _append(binding, call, prepared.request_sha, prepared.cache_identity)
         scope = entry.scope if entry is not None else current_llm_scope()
-        if scope is not None and scope.run_id == call.run_id and call.id not in scope.call_ids:
-            scope.call_ids.append(call.id)
+        if scope is not None and scope.run_id == call.run_id:
+            for owner in scope.lineage():
+                if call.id not in owner.call_ids:
+                    owner.call_ids.append(call.id)
         if entry is not None:
             entry.journaled = True
             entry.actual = prepared.actual
@@ -987,8 +990,9 @@ def _placeholder(binding: _Binding, entry: _Pending) -> None:
     _append(binding, call, None, None)
     entry.journaled = True
     entry.actual = entry.estimate
-    if call.id not in scope.call_ids:
-        scope.call_ids.append(call.id)
+    for owner in scope.lineage():
+        if call.id not in owner.call_ids:
+            owner.call_ids.append(call.id)
 
 
 async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
@@ -997,7 +1001,8 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     Parameters
     ----------
     scope : LLMScope
-        Exact scope whose calls are complete. It cannot open more calls after drain.
+        Scope whose own and descendant calls are complete. Neither it nor its
+        descendants can open more calls after drain.
     wait : bool
         Wait up to settle_timeout_s for reports; abandoned calls never wait.
 
@@ -1024,7 +1029,11 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     binding = _bindings.get(_context_string(scope.run_id, "run_id"))
     if binding is None or scope.journal is not binding.journal:
         return []
-    entries = [entry for entry in binding.pending.values() if entry.scope is scope]
+    entries = [
+        entry
+        for entry in binding.pending.values()
+        if any(owner is scope for owner in entry.scope.lineage())
+    ]
     binding.track_scope(scope)
     if not entries:
         binding.drained.add(id(scope))
@@ -1036,6 +1045,8 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
             for entry in entries:
                 if entry.state != "abandoned":
                     await _owned(binding, entry.event.wait)
+    for entry in entries:
+        binding.drained.add(id(entry.scope))
     binding.drained.add(id(scope))
     placeholders: list[str] = []
     failure: Exception | None = None
@@ -1064,7 +1075,10 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
         binding.terminal = _stop_cleanup_error()
     binding.check()
     if all(entry.settled for entry in entries):
-        binding.finish_scope(scope)
+        for tracked in tuple(binding.scopes.values()):
+            if any(owner is scope for owner in tracked.lineage()):
+                binding.drained.add(id(tracked))
+                binding.finish_scope(tracked)
     if failure is not None:
         raise failure from None
     return placeholders

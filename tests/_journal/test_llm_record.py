@@ -1485,3 +1485,41 @@ async def test_scope_close_overflow_keeps_ledger_terminal_category(tmp_path: Pat
     with pytest.raises(LimitReached) as later:
         await run.ledger.reserve(":run", Amount(), kind="call", goal_id="g")
     assert _core_category(later.value) is _SignalCategory.TERMINAL
+
+
+@pytest.mark.parametrize("reported", [False, True])
+async def test_parent_drain_covers_child_calls(tmp_path: Path, reported: bool) -> None:
+    async with open_llm_run(tmp_path) as run:
+        parent = run.scope("judge")
+        child = parent.child()
+        _, meta = await _open(run, child)
+        if reported:
+            await record_call(**record_kwargs(meta, settle=False))
+        await drain(parent, wait=False)
+        assert child.call_ids == parent.call_ids == [meta["call_id"]]
+        assert parent.tranche.pending() == 0
+        for scope in (parent, child, parent.child()):
+            with pytest.raises(ValueError, match="drained"):
+                open_call(
+                    scope,
+                    reservation_id="late",
+                    estimate=Amount(),
+                    model_alias="opus",
+                    model="anthropic/claude",
+                    provider="anthropic",
+                )
+
+
+async def test_child_drain_keeps_sibling_open(tmp_path: Path) -> None:
+    async with open_llm_run(tmp_path) as run:
+        parent = run.scope("judge")
+        first, second = parent.child(), parent.child()
+        _, one = await _open(run, first)
+        await drain(first, wait=False)
+        _, two = await _open(run, second)
+        await record_call(**record_kwargs(two))
+        await drain(parent, wait=False)
+        assert parent.call_ids == [one["call_id"], two["call_id"]]
+        assert first.call_ids == [one["call_id"]]
+        assert second.call_ids == [two["call_id"]]
+        assert parent.tranche.pending() == 0

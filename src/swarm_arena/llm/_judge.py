@@ -9,7 +9,7 @@ import anyio
 from pydantic import Field, JsonValue, model_validator
 
 from swarm_arena._board.digest import untrusted
-from swarm_arena._budget.llm_scope import current_llm_scope
+from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
 from swarm_arena._errors import _core_category, _is_core_control, _SignalCategory
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.goal import Goal
@@ -233,12 +233,14 @@ class LLMJudge(Judge):
         scope = current_llm_scope()
         if scope is None:
             raise RuntimeError("LLM judge outside an LLM scope")
+        scope = scope.child()
         interrupted = False
         failure: BaseException | None = None
         scores: list[Score] = []
         boundary = _Outcome()
         try:
-            scores = await self._judge(goal, candidates, ctx)
+            with llm_scope(scope):
+                scores = await self._judge(goal, candidates, ctx)
         except BaseException as error:
             failure = error
             try:

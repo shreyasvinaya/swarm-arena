@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._journal.writer import JournalWriter
@@ -53,6 +53,8 @@ class LLMScope:
         Bound for pending usage reports and owned post-stop settlement.
     force_no_cache_read : bool, default=False
         Disable cache reads for anchors and final judging.
+    parent : LLMScope or None, optional
+        Owning scope, whose drain and call links include this child.
     call_ids : list[str], optional
         Independently allocated list recording calls made within this scope.
 
@@ -71,6 +73,11 @@ class LLMScope:
     ...     current_llm_scope() is scope
     True
     >>> current_llm_scope() is None
+    True
+    >>> child = scope.child()
+    >>> child.tranche is scope.tranche
+    True
+    >>> list(child.lineage())[1] is scope
     True
     """
 
@@ -91,6 +98,38 @@ class LLMScope:
     settle_timeout_s: float
     force_no_cache_read: bool = False
     call_ids: list[str] = field(default_factory=list)
+    parent: "LLMScope | None" = field(default=None, repr=False, compare=False)
+
+    def child(self) -> "LLMScope":
+        """Create an invocation scope sharing this owner's funding and services.
+
+        Returns
+        -------
+        LLMScope
+            Child with independent drain lifetime and call identifiers.
+
+        Examples
+        --------
+        The class example creates a child sharing its parent's in-memory tranche.
+        """
+        return replace(self, parent=self, call_ids=[])
+
+    def lineage(self) -> Generator["LLMScope"]:
+        """Yield this scope followed by its owning ancestors.
+
+        Yields
+        ------
+        LLMScope
+            Each owner, innermost first.
+
+        Examples
+        --------
+        The class example walks a child's lineage to its parent without I/O.
+        """
+        scope: LLMScope | None = self
+        while scope is not None:
+            yield scope
+            scope = scope.parent
 
 
 _scope: ContextVar[LLMScope | None] = ContextVar("llm_scope", default=None)

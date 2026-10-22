@@ -657,3 +657,60 @@ async def test_aggregate_finite_extreme_votes(
         assert math.isfinite(score.value)
         assert lower <= score.value <= upper
     assert all(len(score.llm_call_ids) == len(votes) for score in scores)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_multiple_llm_composite_members(nested: bool) -> None:
+    from swarm_arena.scoring import Lexicographic
+    from swarm_arena.testing import check_judge
+
+    FakeModel([turn(2, 6)]).register("a")
+    FakeModel([turn(2, 8)]).register("b")
+    second = LLMJudge("secondary", ["b"])
+    judge = Lexicographic(
+        [LLMJudge("primary", ["a"]), Lexicographic([second]) if nested else second]
+    )
+    scores = await check_judge(
+        judge, Goal(id="g", namespace="n"), candidates(2), config=configuration(("a", "b"))
+    )
+    assert len(scores) == 2
+    assert all(score.key == (6.0, 8.0) for score in scores)
+    assert all(len(score.llm_call_ids) == 2 for score in scores)
+
+
+async def test_swarm_with_multiple_llm_ranking_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events, plan
+
+    from swarm_arena import Limits, Ref, Swarm
+    from swarm_arena.scoring import Lexicographic
+
+    fake = FakeModel([])
+
+    async def respond(*args: Any, **kwargs: Any) -> ModelResponse:
+        rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+        return await FakeModel([turn(len(rows))]).get_response(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "get_response", respond)
+    fake.register("a")
+    ref = Ref.of(Lexicographic([LLMJudge("primary", ["a"]), LLMJudge("secondary", ["a"])]))
+    ref = ref.model_copy(update={"name": "composite"})
+    planned = plan(rounds=1, agents=2).model_copy(update={"judges": [ref], "ranking": "composite"})
+    config = configuration().model_copy(
+        update={
+            "limits": Limits(max_tokens=1000000),
+            "run_root": str(tmp_path / "runs"),
+            "arena_root": str(tmp_path / "arena"),
+            "artifact_root": str(tmp_path / "artifacts"),
+        }
+    )
+    result = await Swarm(config).run(planned)
+    assert result["g"]
+    events = all_events(config)
+    assert not [event for event in events if event.type == "judge_error"]
+    calls = {event.payload["call"]["id"] for event in events if event.type == "llm_call"}
+    assert calls
+    for event in events:
+        if event.type == "score":
+            assert set(event.payload["score"]["llm_call_ids"]) <= calls
