@@ -15,7 +15,7 @@ from _fakes.engine import EngineEnv
 from _fakes.llm_components import LateFakeModel
 from _fakes.llm_run import open_llm_run
 
-from swarm_arena import Limits, Ref, RunConfig
+from swarm_arena import Limits, Plan, Ref, RunConfig, Swarm
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 from swarm_arena._budget.llm_scope import llm_scope
 from swarm_arena.board import BoardView, Curator, Learning
@@ -564,3 +564,131 @@ async def test_custom_curator_failure_waits_for_authoritative_usage(
         assert charged == pytest.approx(call["cost_usd"])
     finally:
         await fake.aclose()
+
+
+def run_configuration(root: Path) -> RunConfig:
+    from _fakes.engine import with_executor
+
+    return with_executor(
+        configuration().model_copy(
+            update={
+                "limits": Limits(max_tokens=1000000),
+                "run_root": str(root / "runs"),
+                "arena_root": str(root / "arena"),
+                "artifact_root": str(root / "artifacts"),
+                "curator": Ref.of(LLMCurator(model="cur")),
+            }
+        ),
+        workspace_root=str(root / "ws"),
+    )
+
+
+def posting_plan() -> Plan:
+    from _engine.test_goal import _plan
+
+    plan = _plan(teams=2, rounds=1)
+    for team in plan.teams:
+        manager = team.agents[0].manager
+        team.agents[0] = team.agents[0].model_copy(
+            update={
+                "manager": manager.model_copy(
+                    update={
+                        "path": "_fakes.curators:PostingManager",
+                        "config": {**manager.config, "post_learnings": True},
+                    }
+                ),
+            }
+        )
+    return plan
+
+
+async def test_run_curator_refusal_finishes_with_final_selection(tmp_path: Path) -> None:
+    from _fakes.run import all_events
+
+    fake = FakeModel([turn([group([0, 1])])])
+    fake.register("cur")
+    config = run_configuration(tmp_path)
+    config.models.root["cur"] = config.models.root["cur"].model_copy(
+        update={"prices": ModelSpec.Prices(input=1e5, output=1e5)}
+    )
+    config = config.model_copy(update={"limits": Limits(max_tokens=1000000, max_usd=10)})
+    with anyio.fail_after(60):
+        await Swarm(config).run(posting_plan(), run_id="refused")
+    events = all_events(config)
+    assert fake.calls == []
+    assert not [e for e in events if e.type == "llm_call"]
+    assert len([e for e in events if e.type == "reserve_exhausted"]) == 1
+    (receipt,) = [e for e in events if e.type == "curated"]
+    assert receipt.payload["errors"] == ["curator limit: budget"]
+    assert receipt.payload["summaries"] == []
+    assert [e for e in events if e.type == "goal_finished"][-1].payload[
+        "reason"
+    ] == "reserve_exhausted"
+    assert any(e.type == "final_order" for e in events)
+
+
+@pytest.mark.parametrize("resume", [False, True])
+async def test_run_curator_interruption_and_resume_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: bool
+) -> None:
+    from _fakes.run import all_events
+
+    from swarm_arena._engine.control import request_stop
+    from swarm_arena._journal.replay import RunState
+
+    entered = anyio.Event()
+    fake = FakeModel([])
+
+    async def hang(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(fake, "get_response", hang)
+    fake.register("cur")
+    config = run_configuration(tmp_path)
+
+    async def run() -> None:
+        await Swarm(config).run(posting_plan(), run_id="interrupted")
+
+    with anyio.fail_after(60):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(run)
+            await entered.wait()
+            if resume:
+                tasks.cancel_scope.cancel()
+            else:
+                await request_stop(config.run_root, "interrupted", now=False)
+    before = all_events(config)
+    state = RunState.from_events(before)
+    (first,) = list(state.llm_calls.values())
+    assert (first.error or "").startswith("estimated:")
+    assert not [e for e in before if e.type == "curated"]
+    assert not [item for item in state.learnings.values() if item.author == "curator"]
+    if resume:
+        FakeModel([turn([group([0, 1])])]).register("cur")
+        with anyio.fail_after(60):
+            await Swarm(config).resume("interrupted", force=True)
+        events = all_events(config)
+        state = RunState.from_events(events)
+        assert len(state.llm_calls) == 2
+        (summary,) = [item for item in state.learnings.values() if item.author == "curator"]
+        assert summary.posted_by_call != first.id
+        assert summary.posted_by_call in state.llm_calls
+        assert state.llm_calls[summary.posted_by_call].error is None
+        assert state.llm_calls[first.id] == first
+        (receipt,) = [e for e in events if e.type == "curated"]
+        assert receipt.payload["summaries"] == [summary.id]
+        assert receipt.payload["errors"] == []
+    else:
+        events = before
+        assert [e for e in events if e.type == "goal_finished"][-1].payload["reason"] == "stop"
+    reserves = {
+        e.payload["reservation"]["id"]
+        for e in events
+        if e.type == "reserve" and e.payload["reservation"]["holder"] == "g/:curator"
+    }
+    settles = {e.payload["id"]: e.payload["actual"]["usd"] for e in events if e.type == "settle"}
+    assert reserves <= settles.keys()
+    assert sum(settles[rid] for rid in reserves) == pytest.approx(
+        sum(call.cost_usd for call in state.llm_calls.values())
+    )

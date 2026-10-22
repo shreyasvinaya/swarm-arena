@@ -420,7 +420,8 @@ publication retains the core's conservative accounting rules.
 
 The engine assigns the final learning IDs and publishes the summaries and
 curation receipt atomically. Undo a mistaken merge with
-`swarm-arena learnings hide <summary-id>`; the source learnings remain intact.
+`swarm-arena learnings hide <summary-id> --namespace NS`; add `--config run.toml`
+when using a non-default arena. The source learnings remain intact.
 
 ## Round pages
 
