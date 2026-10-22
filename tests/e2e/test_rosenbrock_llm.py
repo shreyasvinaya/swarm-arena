@@ -3,10 +3,7 @@
 import json
 import math
 import os
-import shutil
-from collections.abc import Generator
-from contextlib import ExitStack, contextmanager
-from decimal import Decimal
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,80 +13,48 @@ import pytest
 pytest.importorskip("agents")
 
 from _fakes.fake_models import registered_model
+from _fakes.rosenbrock_llm import (
+    _example,
+    _manager_turns,
+    _micros,
+    _registered_judge,
+    _registered_manager,
+)
 from _fakes.run import all_events, events, run_dir
 from agents import ModelResponse
 
-from swarm_arena import Plan, RunConfig, Swarm
+from swarm_arena import RunConfig, Swarm
 from swarm_arena._journal.replay import RunState
 from swarm_arena.config import ModelCatalog, ModelSpec
 from swarm_arena.llm import LLMJudge
 from swarm_arena.testing import FakeModel, FakeTurn
-
-EXAMPLE = Path(__file__).resolve().parents[2] / "examples/rosenbrock"
-
-
-def _micros(usd: float) -> int:
-    units = Decimal(str(usd)) * 1_000_000
-    assert units == units.to_integral_value()
-    return int(units)
+from swarm_arena.tool import Usage
 
 
-def _judge_turn(n: int) -> FakeTurn:
-    return FakeTurn(
-        text=json.dumps(
-            {
-                "scores": [
-                    {"index": i, "value": float(i), "verdict": "ok", "notes": ""} for i in range(n)
-                ]
-            }
+async def test_judge_fake_counts_candidate_ids_without_prompt_delimiters() -> None:
+    from agents import ModelSettings
+    from agents.models.interface import ModelTracing
+
+    request = (
+        "A different prompt prefix: "
+        + json.dumps([{"candidate": {"id": "c-first"}}, {"candidate": {"id": "c-second"}}])
+        + " and a different suffix."
+    )
+    with _registered_judge("j") as fake:
+        response = await fake.get_response(
+            "rubric",
+            request,
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
         )
-    )
-
-
-@contextmanager
-def _registered_judge(alias: str) -> Generator[FakeModel]:
-    # Each response gets a fresh script matching the actual batch membership.
-    with registered_model([], name=alias) as fake, pytest.MonkeyPatch.context() as patch:
-
-        async def respond(*args: Any, **kwargs: Any) -> ModelResponse:
-            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
-            delegate = FakeModel([_judge_turn(len(rows))])
-            response = await delegate.get_response(*args, **kwargs)
-            fake.calls.extend(delegate.calls)
-            return response
-
-        patch.setattr(fake, "get_response", respond)
-        yield fake
-
-
-def _manager_turns(random: bool = False) -> list[FakeTurn]:
-    inputs = (
-        {"n": 2000, "radius": 2.0, "seed": 7}
-        if random
-        else {"lr": 0.001, "steps": 1000, "x0": -1.5, "y0": 2.0}
-    )
-    return [
-        FakeTurn(tool_calls=(("run_tool", {"inputs": inputs}),)),
-        FakeTurn(tool_calls=(("finish_round", {"summary": ""}),)),
-    ]
-
-
-def _example(root: Path) -> tuple[Plan, RunConfig]:
-    source = root / "source"
-    shutil.copytree(EXAMPLE, source)
-    plan = Plan.load(source / "plan_llm.toml")
-    config = RunConfig.load(source / "run_llm.toml")
-    return plan, config.model_copy(
-        update={
-            "run_root": str(root / "runs"),
-            "arena_root": str(root / "arena"),
-            "artifact_root": str(root / "artifacts"),
-            "settle_timeout_s": 2,
-            "executor": config.executor.model_copy(
-                update={"config": {"workspace_root": str(root / "ws")}}
-            ),
-        }
-    )
+        output = response.output[0].model_dump()
+        assert len(json.loads(output["content"][0]["text"])["scores"]) == 2
 
 
 async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> None:
@@ -111,11 +76,8 @@ async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> N
     )
     with ExitStack() as stack:
         fakes = [
-            stack.enter_context(registered_model(turns, name=alias))
-            for alias, turns in (
-                ("opus", _manager_turns()),
-                ("sonnet", _manager_turns(True)),
-            )
+            stack.enter_context(_registered_manager("opus")),
+            stack.enter_context(_registered_manager("sonnet", random=True)),
         ]
         fakes.extend(stack.enter_context(_registered_judge(alias)) for alias in ("gpt", "haiku"))
         swarm = Swarm(config)
@@ -125,7 +87,14 @@ async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> N
         assert result[plan.goal.id]
         assert {c.role for c in state.llm_calls.values()} == {"manager", "judge"}
         assert all(f.calls for f in fakes)
-        assert sum(len(f.calls) for f in fakes) == len(state.llm_calls)
+        assert {
+            call["model_settings"].metadata["call_id"] for fake in fakes for call in fake.calls
+        } == set(state.llm_calls)
+        assert all(c.status == "ok" for c in state.llm_calls.values())
+        assert all(c.error is None for c in state.llm_calls.values())
+        assert all(
+            c.usage == Usage(input_tokens=100, output_tokens=20) for c in state.llm_calls.values()
+        )
         settled = [
             r for r in state.reservations.values() if r.reservation["kind"] in {"tranche", "call"}
         ]
@@ -142,6 +111,44 @@ async def test_rosenbrock_with_llm_managers_and_judge_panel(tmp_path: Path) -> N
         assert all(s.llm_call_ids for s in state.scores.values() if s.judge == "llm")
         assert not events(config, "reserve_exhausted")
         assert not events(config, "judge_error")
+
+        statuses = events(config, "agent_status")
+        assert statuses
+        prunes = {
+            (event.round, address): reason
+            for event in events(config, "decision")
+            for address, reason in event.payload["decision"]["prune"].items()
+        }
+        for event in statuses:
+            if event.payload["status"] == "pruned":
+                reason = prunes.get(
+                    (event.round, f"{event.team}/{event.agent}"),
+                    prunes.get((event.round, event.team)),
+                )
+                assert reason
+                assert event.payload["reason"] == reason
+            else:
+                assert event.payload["status"] == "finished"
+                assert event.payload["reason"] == ""
+        admitted = {
+            (event.round, *holder.split("/")[1:])
+            for event in events(config, "round_started")
+            for holder in event.payload["shares"]
+        }
+        assert admitted
+        assert {(c.round, c.team, c.agent) for c in produced} == admitted
+        assert all(c.output.status == "ok" for c in produced)
+        assert plan.ranking_name() == "f"
+        final_scores = [
+            event.payload["score"]
+            for event in events(config, "score")
+            if event.round == 0 and event.payload["score"]["judge"] == "f"
+        ]
+        assert final_scores
+        assert events(config, "final_order")[-1].payload["candidate_ids"] == [
+            score["candidate_id"]
+            for score in sorted(final_scores, key=lambda score: score["value"])
+        ]
 
         # Completed public resumes must not repeat a paid manager or judge call.
         before = all_events(config)
