@@ -395,9 +395,10 @@ async def _watch_owner(
             if interrupt_reports:
                 scope.cancel()
                 return
-        elif binding.stops.stop and math.isinf(cleanup_at):
+        elif binding.stops.stop and not interrupt_reports and math.isinf(cleanup_at):
             # Graceful judging retains its own limits. Bound this storage wait
             # without spending later invocations' or teardown's allowance.
+            # Report arrival has its caller's timer, separate from storage.
             cleanup_at = anyio.current_time() + binding.settle_timeout_s
             binding.journal._stop_storage()
         deadline = min(cleanup_at, binding.cleanup_at)
@@ -1098,9 +1099,7 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     binding.check()
     if wait:
         with anyio.move_on_after(scope.settle_timeout_s):
-            for entry in entries:
-                if entry.state != "abandoned":
-                    await _owned(binding, entry.event.wait)
+            await await_reports(scope)
     for entry in entries:
         binding.drained.add(id(entry.scope))
     binding.drained.add(id(scope))

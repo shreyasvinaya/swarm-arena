@@ -118,6 +118,8 @@ including invalid output; available usage otherwise settles the reported amount.
 `settle_timeout_s` bounds the wait for pending call reports and post-stop or
 post-deadline settlement, including durable stop-result publication. Healthy
 live settlement remains under its owner's supervision without this fixed timer.
+Report arrival has its own timeout, including after a graceful stop; expiry
+records a conservative charge rather than a storage-cleanup failure.
 Without a committed settle, the reservation stays charged in full. Cancelling construction or command preparation
 before a committed start releases the reservation at zero while ownership is
 held; a late preparation result never launches or journals work.

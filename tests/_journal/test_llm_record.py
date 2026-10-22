@@ -30,6 +30,50 @@ from swarm_arena.tool import Usage
 ESTIMATE = Amount(tokens=9_000, usd=0.01)
 
 
+async def test_graceful_report_timeout_survives_delayed_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Timer
+
+    from swarm_arena._journal.llm_record import _bindings
+
+    held = HeldOperation()
+    release: Timer | None = None
+    try:
+        async with open_llm_run(tmp_path) as run:
+            scope, meta = await _open(run)
+            left = run.clock.left
+            checks = 0
+
+            def delayed_clock(timeout: float) -> float:
+                nonlocal checks, release
+                checks += 1
+                if checks == 2:
+                    # Hold the loop inside the watcher across report expiry,
+                    # before the report timer can deliver its cancellation.
+                    release = Timer(scope.settle_timeout_s + 0.1, held.release.set)
+                    release.start()
+                    held.wait()
+                return left(timeout)
+
+            monkeypatch.setattr(run.clock, "left", delayed_clock)
+            run.stops.stop = True
+            assert await drain(scope, wait=True) == [meta["call_id"]]
+            assert held.entered.is_set()
+            assert held.exited.is_set()
+            assert _bindings[run.run_id].terminal is None
+            assert not run.journal._settlement_expired
+            call = run.calls()[0]
+            assert call.error is not None
+            assert call.error.startswith("estimated:")
+            assert run.charged(scope) == ESTIMATE
+    finally:
+        held.release.set()
+        if release is not None:
+            release.cancel()
+            release.join()
+
+
 async def test_empty_drained_scope_cannot_admit_another_call(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
         scope = run.scope("planner", team="", agent="", round=0)
