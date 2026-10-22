@@ -1,10 +1,13 @@
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from _fakes.engine import CtxEnv
 from _fakes.pr1_r5_ids import HostileString, NotString, hostile
+from _fakes.tools import AlwaysFailCheck
 
-from swarm_arena import Limits
+from swarm_arena import Limits, ScriptTool
+from swarm_arena._agent.context import _prepare_metadata
 from swarm_arena._errors import SoftError, _core_category, _is_core_signal, _SignalCategory
 from swarm_arena.manager import LimitReached
 
@@ -139,3 +142,30 @@ async def test_agent_rejects_non_string_identifiers_before_admission(
         await invoke()
     assert ctx_env.counters.turns == 0
     assert ctx_env.counters.board_reads == 0
+
+
+async def test_bound_metadata_lookup_strings_are_detached(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = ctx_env.env.rt.tool
+    monkeypatch.setattr(tool, "get_description", lambda: hostile("description"))
+    monkeypatch.setattr(tool, "editable", lambda: (hostile("file.py"),))
+    check = AlwaysFailCheck()
+    # Feedback is connector metadata; no execution or scoring is needed here.
+    monkeypatch.setattr(check, "feedback", hostile("reasons"))
+    metadata = _prepare_metadata(tool, [(hostile("judge"), check)])
+    assert type(metadata.description) is str
+    assert all(type(path) is str for path in metadata.editable)
+    assert all(type(name) is str and type(mode) is str for name, mode in metadata.feedback.items())
+    assert metadata.feedback["judge"] == "reasons"
+
+
+@pytest.mark.parametrize("field", ["name", "description", "counts_as"])
+async def test_invalid_action_metadata_is_value_free(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    original = ScriptTool(command=["echo"]).extra_actions()[0]
+    action = replace(original, **{field: NotString()})
+    monkeypatch.setattr(ctx_env.env.rt.tool, "extra_actions", lambda: (action,))
+    with pytest.raises(SoftError, match="invalid tool metadata: TypeError"):
+        ctx_env.ctx()

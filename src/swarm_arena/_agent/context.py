@@ -103,22 +103,35 @@ class _ToolMetadata:
     feedback: Mapping[str, str]
 
 
+def _prepare_action(action: Action[Any]) -> Action[Any]:
+    """Detach connector metadata before any loop-owned action lookup."""
+    if not isinstance(action, Action):
+        raise TypeError("invalid action")
+    counts_as = _context_string(action.counts_as, "counts_as")
+    if counts_as not in {"board_read", "none"}:
+        raise TypeError("invalid action counter")
+    return Action(
+        name=_context_string(action.name, "name"),
+        description=_context_string(action.description, "description"),
+        input_model=action.input_model,
+        handler=action.handler,
+        counts_as=counts_as,
+    )
+
+
 def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolMetadata:
     """Read and validate metadata in the runner's abandonable daemon boundary."""
     try:
-        description = tool.get_description()
+        description = _context_string(tool.get_description(), "description")
         input_model = tool.get_input_model()
-        editable = tuple(tool.editable())
-        actions = tuple(tool.extra_actions())
-        feedback = {name: check.feedback for name, check in checks}
-        if not isinstance(description, str):
-            raise TypeError("invalid description")
+        editable = tuple(_context_string(path, "editable path") for path in tool.editable())
+        actions = tuple(_prepare_action(action) for action in tool.extra_actions())
+        feedback = {
+            _context_string(name, "check name"): _context_string(check.feedback, "feedback")
+            for name, check in checks
+        }
         if not isinstance(input_model, type) or not issubclass(input_model, BaseModel):
             raise TypeError("invalid input model")
-        if not all(isinstance(path, str) for path in editable):
-            raise TypeError("invalid editable paths")
-        if not all(isinstance(action, Action) for action in actions):
-            raise TypeError("invalid actions")
         if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
             raise TypeError("invalid feedback policy")
         return _ToolMetadata(description, input_model, editable, actions, feedback)
@@ -140,8 +153,10 @@ class AgentContext:
     are unsupported. Extra actions charge once, including their nested reads.
     Child tasks released after the enclosing action exits are charged normally.
     The runner prepares connector metadata in supervised daemon workers before
-    constructing this loop-owned context. Feedback uses the producing policy;
-    unknown policies hide reasons and details.
+    constructing this loop-owned context. Action metadata is copied into core
+    records with exact strings, as are editable paths and feedback identifiers,
+    so later lookups cannot invoke connector string hooks. Feedback uses the
+    producing policy; unknown policies hide reasons and details.
 
     Identifier and name arguments, including collection elements, are copied to
     exact strings at entry without invoking subclass hooks. Non-string values

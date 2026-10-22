@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from functools import partial
 from threading import Event, get_ident
 from typing import Any, cast
@@ -13,6 +14,7 @@ from _agent.conftest import rt_env as rt_env
 from _fakes.agent_ctx import FakeAgentContext
 from _fakes.board import score
 from _fakes.engine import CtxEnv
+from _fakes.pr1_r5_ids import hostile
 from _fakes.secrecy import assert_secret_absent
 from agents import Agent, FunctionTool, ModelResponse, Runner
 from agents import RunConfig as SDKRunConfig
@@ -24,6 +26,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field
 
 from swarm_arena import Limits, ScriptTool
+from swarm_arena._agent.context import _prepare_metadata
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 from swarm_arena._errors import (
     Fenced,
@@ -850,3 +853,47 @@ async def test_sdk_identifiers_are_normalized_without_subclass_hooks() -> None:
     assert type(tools[-1].name) is str
     result = await invoke(tools, deps, "custom", {}, call_id=Identifier("tool-id"))
     assert decoded(result) == {"called": True}
+
+
+@pytest.mark.parametrize("supervised", [False, True])
+async def test_real_context_normalizes_connector_action_identifiers(
+    ctx_env: CtxEnv, supervised: bool
+) -> None:
+    loop_thread = get_ident()
+    prepared_threads: list[int] = []
+    invoked: list[int] = []
+
+    async def handler(context: AgentContext, args: Empty) -> JsonValue:
+        invoked.append(get_ident())
+        return {"ok": True}
+
+    original = Action(
+        name=hostile("custom"),
+        description=hostile("Custom"),
+        input_model=Empty,
+        handler=handler,
+        counts_as=hostile("board_read"),  # ty: ignore[invalid-argument-type]
+    )
+
+    class NamedTool(ScriptTool):
+        def extra_actions(self) -> tuple[Action[Empty], ...]:  # ty: ignore[invalid-method-override]
+            prepared_threads.append(get_ident())
+            return (original,)
+
+    base = ctx_env.ctx()
+    rt = replace(base._rt, tool=NamedTool(command=["echo"]))
+    if supervised:
+        metadata = await _prepare(lambda: _prepare_metadata(rt.tool, rt.checks))
+        ctx = AgentContext.__new__(AgentContext)
+        ctx._bind(rt, gate=lambda: None, metadata=metadata)
+    else:
+        ctx = AgentContext(rt)
+    assert len(prepared_threads) == 1
+    assert (prepared_threads[0] != loop_thread) is supervised
+    assert type(ctx.actions[0].name) is str
+    assert type(ctx.actions[0].counts_as) is str
+    assert ctx.actions[0] is not original
+    tools, deps = await _prepare(partial(tool_set, ctx))
+    assert decoded(await invoke(tools, deps, "custom", {})) == {"ok": True}
+    assert invoked == [loop_thread]
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
