@@ -187,6 +187,8 @@ async def _supervise_initialization(
     Acquisition retains polling in StopState for the owner's full lifetime.
     Later phases reuse it; their exit cancels only their deadline task. Owner
     teardown joins the poller, including a backend wait abandoned on shutdown.
+    Budget latches block ordinary work, but allow setup and reserve-funded
+    finishing work to continue, including when replay discovers exhaustion.
     """
     outcome = _Outcome()
     error: BaseException | None = None
@@ -208,16 +210,19 @@ async def _supervise_initialization(
             poller.on_error = None
             watcher_scope.cancel()
 
+        def stop_preparation() -> None:
+            if stops.stop or stops.stop_now or stops.run_timeout:
+                preparation.cancel()
+
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(watch)
             try:
                 await anyio.lowlevel.checkpoint()
-                stops.on_change = preparation.cancel
+                stops.on_change = stop_preparation
                 poller.on_error = preparation.cancel
                 if poller.error is not None:
                     raise poller.error
-                if stops.stop or stops.stop_now or stops.run_timeout:
-                    preparation.cancel()
+                stop_preparation()
                 yield prepared
             except BaseException as caught:
                 error = caught

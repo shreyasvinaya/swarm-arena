@@ -221,9 +221,12 @@ Built-in provider probing and model-provider recovery are M3 work.
 | `swarm-arena stop --now RUN_DIR` | Cancel with grace and partial collection | Judge available candidates, select-only convergence; no converge team; retain best parts as `unjoined` |
 
 Run budget exhaustion drains work and finalizes from reserve; goal budget
-exhaustion affects that goal. Goals still queued at any early ending never
-start and report `NO_RESULT` with reason `stopped`. A stop arriving during
-convergence or final judging remains the lifecycle's termination reason.
+exhaustion affects that goal. Resume completes setup even when replayed usage
+has exhausted the work budget, then finishes interrupted convergence and final
+judging from the remaining reserve. Resuming a completed budget-stopped goal
+reuses its recorded result without repeating paid work. Goals still queued at
+any early ending never start and report `NO_RESULT` with reason `stopped`. A stop
+arriving during convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
 
 A graceful stop that preempts the round policy journals the default `Decision()`

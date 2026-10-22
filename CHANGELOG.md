@@ -120,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Swarm.resume` continues committed runs with auditable lease takeover,
   conservative lost-run accounting, restored round state, and repaired result views.
+  Replayed budget exhaustion permits setup and reserve-funded completion;
+  completed budget-stopped goals reuse recorded results without new paid work.
 
 - CLI `run`, `status`, `stop`, and `resume` commands support terminal approval,
   sorted plan directories, committed status, epoch-scoped stops, and saved or
