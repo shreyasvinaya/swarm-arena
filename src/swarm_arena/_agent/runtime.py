@@ -163,7 +163,7 @@ class AgentRuntime:
     >>> from dataclasses import fields, MISSING
     >>> from unittest.mock import Mock
     >>> services = {f.name: Mock(name=f.name) for f in fields(AgentRuntime)
-    ...             if f.default is MISSING and f.default_factory is MISSING}
+    ...             if f.init and f.default is MISSING and f.default_factory is MISSING}
     >>> services.update(address="g/t/a", holder="g/:final")
     >>> rt = AgentRuntime(**services)
     >>> rt.holder, rt.private_paths
