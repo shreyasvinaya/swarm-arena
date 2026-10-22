@@ -2521,3 +2521,90 @@ async def test_curator_accounting_failure_prevents_provider_completion(
         assert not env.events("curated")
         assert env.deps.provider_stops.generations() == {}
     assert calls == ["curator", "curator"]
+
+
+@pytest.mark.parametrize(
+    ("source", "ranking"), [("tool", "y"), ("1", "y"), ("1", "panel"), ("0", "panel")]
+)
+async def test_llm_judge_usage_overflow_finishes_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, ranking: str
+) -> None:
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._exec.local import LocalExecutor
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Usage
+
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            turn = FakeTurn(
+                text=json.dumps(
+                    {
+                        "scores": [
+                            {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                            for i in range(len(rows))
+                        ]
+                    }
+                ),
+                usage=Usage(input_tokens=10**16 if round_ == source else 1),
+            )
+            return await FakeModel([turn]).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=1,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    if source == "tool":
+        submit = LocalExecutor.submit
+        inflated: list[bool] = []
+
+        async def overflow(self: LocalExecutor, job: Any) -> Any:
+            output = await submit(self, job)
+            if job.kind == "tool" and not inflated:
+                inflated.append(True)
+                return output.model_copy(
+                    update={"usage": output.usage.model_copy(update={"usd": USD_LIMIT + 1})}
+                )
+            return output
+
+        monkeypatch.setattr(LocalExecutor, "submit", overflow)
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    result = await Swarm(config).run(
+        _plan(rounds=1, judges=[Y_JUDGE, panel], ranking=ranking), run_id="overflow"
+    )
+    events = all_events(config)
+    assert not [e for e in events if e.type == "judge_error"]
+    assert [e for e in events if e.type == "round_closed"]
+    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == "run budget"
+    assert (Path(config.run_root) / "overflow/goals/g/solution.json").exists()
+    assert bool(result["g"]) is (ranking == "y")
+    assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])

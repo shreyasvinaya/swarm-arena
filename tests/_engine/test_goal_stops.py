@@ -856,7 +856,12 @@ async def test_goal_handlers_use_registered_categories(
         if site == "replan"
         else runner._round_decision(1)
     )
-    if kind in {"cleanup", "overflow", "fence"}:
+    if kind == "overflow" and site == "final":
+        assert await operation == []
+        assert env.deps.stops.run_budget
+        assert (runner.status, runner.reason) == ("no_result", "run budget")
+        assert not env.events("judge_error")
+    elif kind in {"cleanup", "overflow", "fence"}:
         with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
             await operation
         assert_secret_absent(caught.value, secret)

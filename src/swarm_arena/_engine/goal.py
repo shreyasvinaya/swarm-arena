@@ -871,6 +871,13 @@ class GoalRunner:
             except BaseException as error:
                 error = boundary.classify(error)
                 self.deps.journal._raise_if_fenced()
+                if (
+                    _core_category(error) is _SignalCategory.TERMINAL
+                    and isinstance(error, LimitReached)
+                    and error.limit == "usage_overflow"
+                ):
+                    self.deps.stops.run_budget = True
+                    return False
                 if _core_category(error) is not _SignalCategory.LIMIT:
                     raise error from None
                 self.deps.journal.append(
@@ -1189,6 +1196,14 @@ class GoalRunner:
                         scores=[], errors=[], provider_failed={name: error.provider}
                     )
                 elif _is_core_control(error):
+                    if (
+                        _core_category(error) is _SignalCategory.TERMINAL
+                        and isinstance(error, LimitReached)
+                        and error.limit == "usage_overflow"
+                    ):
+                        self.deps.stops.run_budget = True
+                        self.status, self.reason = "no_result", "run budget"
+                        return []
                     if _core_category(error) is _SignalCategory.LIMIT:
                         self.status, self.reason = "no_result", "reserve_exhausted"
                         return []
@@ -1948,7 +1963,7 @@ class GoalRunner:
                 )
                 self.status, self.reason = (
                     "no_result",
-                    "provider_failed" if paused else "no passing candidate",
+                    self.reason or ("provider_failed" if paused else "no passing candidate"),
                 )
             self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
         else:
