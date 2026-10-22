@@ -1,7 +1,7 @@
 """Build metered per-call settings and protect them through SDK merges."""
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Any
 
 from agents import ModelSettings
@@ -23,9 +23,11 @@ _RESPONSE_CONTROLS = {
 }
 _PROMPT_CONTROLS = {"cache_control_injection_points", "enable_prompt_caching", "cache_control"}
 
-# The accepted spellings and provider mappings are pinned alongside the upstream facts.
+# Explicit thinking examples are pinned alongside the upstream facts. Cache
+# eligibility depends on the fail-closed allowlist, not completeness of this set.
 _THINKING_CONTROLS = frozenset(
     {
+        "think",
         "thinking",
         "reasoning",
         "reasoning_effort",
@@ -82,6 +84,182 @@ _OUTPUT_ENVELOPES = {
     "parameters": "maxOutputTokens",
     "options": "num_predict",
 }
+
+# Pinned non-thinking request controls. New SDK fields and provider keys are
+# ineligible until reviewed; the thinking facts are regression evidence only.
+_CACHE_SAFE_MODEL_FIELDS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "tool_choice",
+        "parallel_tool_calls",
+        "truncation",
+        "max_tokens",
+        "verbosity",
+        "metadata",
+        "store",
+        "prompt_cache_retention",
+        "include_usage",
+        "top_logprobs",
+        "preserve_raw_usage",
+        "timeout",
+        "extra_args",
+        "extra_body",
+    }
+)
+_CACHE_SAFE_SCALARS = (
+    frozenset(
+        {
+            "temperature",
+            "top_p",
+            "topP",
+            "top_k",
+            "topK",
+            "frequency_penalty",
+            "presence_penalty",
+            "parallel_tool_calls",
+            "truncation",
+            "verbosity",
+            "store",
+            "prompt_cache_retention",
+            "include_usage",
+            "top_logprobs",
+            "logprobs",
+            "seed",
+            "n",
+            "timeout",
+            "num_retries",
+            "max_retries",
+            "preserve_raw_usage",
+            "drop_params",
+            "caching",
+            "preset_cache_key",
+            "cache_key",
+            "cache_namespace",
+            "enable_prompt_caching",
+            "response_mime_type",
+        }
+    )
+    | _OUTPUT_LIMIT_ALIASES
+)
+_CACHE_SAFE_ENVELOPES = frozenset(
+    (*_THINKING_CONTAINERS, *_OUTPUT_ENVELOPES, "extra_args", "litellm_params")
+)
+_CACHE_OBJECT_FIELDS = {
+    "cache": frozenset({"use-cache", "no-cache", "no-store", "namespace", "ttl"}),
+    "stream_options": frozenset({"include_usage"}),
+    "cache_control": frozenset({"type", "ttl"}),
+}
+
+
+def _cache_scalar(value: Any) -> bool:
+    """Recognize ordinary scalar parameter values without inspecting payload data."""
+    return value is None or isinstance(value, str | bool | int | float)
+
+
+def _cache_object(value: Any, allowed: frozenset[str]) -> bool:
+    """Check a fixed, non-generation parameter object's field names and values."""
+    return isinstance(value, Mapping) and all(
+        key in allowed and _cache_scalar(item) for key, item in value.items()
+    )
+
+
+def _cache_response_format(value: Any) -> bool:
+    """Keep schema property names separate from provider request parameter names."""
+    if not isinstance(value, Mapping) or value.keys() - {"type", "json_schema"}:
+        return False
+    if not _cache_scalar(value.get("type")):
+        return False
+    schema = value.get("json_schema")
+    return schema is None or (
+        isinstance(schema, Mapping)
+        and not schema.keys() - {"name", "description", "strict", "schema"}
+        and all(_cache_scalar(item) for key, item in schema.items() if key != "schema")
+        and isinstance(schema.get("schema", {}), Mapping)
+    )
+
+
+def _cache_parameters(parameters: Mapping[str, Any]) -> bool:
+    """Fail closed on unknown keys, including inside known provider envelopes."""
+    pending = [parameters]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            return False
+        seen.add(id(current))
+        for key, value in current.items():
+            if key in _CACHE_SAFE_SCALARS:
+                if not _cache_scalar(value):
+                    return False
+            elif key in _CACHE_SAFE_ENVELOPES:
+                if not isinstance(value, Mapping):
+                    return False
+                pending.append(value)
+            elif key in _CACHE_OBJECT_FIELDS:
+                if not _cache_object(value, _CACHE_OBJECT_FIELDS[key]):
+                    return False
+            elif key in {"metadata", "litellm_metadata"}:
+                if not isinstance(value, Mapping) or not all(
+                    isinstance(name, str) and isinstance(item, str) for name, item in value.items()
+                ):
+                    return False
+            elif key == "response_format":
+                if not _cache_response_format(value):
+                    return False
+            elif key == "tool_choice":
+                if not isinstance(value, str) and not (
+                    isinstance(value, Mapping)
+                    and not value.keys() - {"type", "name", "function"}
+                    and all(
+                        _cache_scalar(item) for name, item in value.items() if name != "function"
+                    )
+                    and _cache_object(value.get("function", {}), frozenset({"name"}))
+                ):
+                    return False
+            elif key == "cache_control_injection_points":
+                if not isinstance(value, list):
+                    return False
+                for point in value:
+                    if (
+                        not isinstance(point, Mapping)
+                        or not _cache_object(
+                            {name: item for name, item in point.items() if name != "control"},
+                            frozenset({"location", "role", "index"}),
+                        )
+                        or not _cache_object(point.get("control", {}), frozenset({"type", "ttl"}))
+                    ):
+                        return False
+            elif key == "mock_response":
+                if not isinstance(value, str):
+                    return False
+            elif key == "client":
+                # A transport handle, not a provider generation-options object.
+                continue
+            elif key == "stream":
+                if value is not False and value is not None:
+                    return False
+            else:
+                return False
+    return True
+
+
+def _cache_settings(settings: ModelSettings) -> bool:
+    """Check every active SDK field against the pinned cache-safe inventory."""
+    for field in fields(settings):
+        value = getattr(settings, field.name)
+        if value is None:
+            continue
+        if field.name not in _CACHE_SAFE_MODEL_FIELDS:
+            return False
+        if field.name in {"extra_args", "extra_body"}:
+            if not isinstance(value, Mapping) or not _cache_parameters(value):
+                return False
+        elif not _cache_parameters({field.name: value}):
+            return False
+    return True
 
 
 def injection_points(spec: ModelSpec) -> list[dict[str, Any]] | None:
@@ -274,6 +452,8 @@ def merge_model_settings(
     escape-hatch metadata and LiteLLM preset keys are removed explicitly.
     Output-limit aliases are removed from escape hatches; replacing native
     generation envelopes receive the authoritative per-call output limit.
+    Only pinned non-thinking, non-streaming request parameters are cacheable;
+    unknown SDK fields or provider keys disable both directions without removal.
 
     Examples
     --------
@@ -284,7 +464,14 @@ def merge_model_settings(
     merged = caller.resolve(per_call)
     extra = dict(merged.extra_args or {})
     streamed = streamed or bool(extra.get("stream"))
-    disabled = streamed or thinking or _thinking(merged) or _bypass.get()
+    disabled = (
+        streamed
+        or thinking
+        or _thinking(merged)
+        or _bypass.get()
+        or not _cache_settings(caller)
+        or not _cache_settings(merged)
+    )
     protected = (
         _RESPONSE_CONTROLS
         | _PROMPT_CONTROLS

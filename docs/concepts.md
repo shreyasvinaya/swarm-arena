@@ -306,7 +306,14 @@ never read cached responses; their results may still be written when judge write
 are enabled. Streamed and thinking calls never read or write the response cache.
 Thinking controls include provider-native Gemini configs and budget fields,
 Bedrock reasoning configs and Fireworks template controls, including inside
-provider request envelopes. Explicit thinking controls bypass response caching.
+provider request envelopes. Explicit thinking controls, including Ollama `think`,
+bypass response caching.
+Response caching fails closed: every supplied SDK field and provider parameter
+must be in a pinned allowlist of known non-thinking, non-streaming controls.
+Unknown provider parameters disable both response-cache reads and writes,
+including unknown keys nested in provider request envelopes. The request still
+reaches the provider with those parameters. Schema properties and string-valued
+tracking metadata are payload data, not provider control parameters.
 Provider recovery probes bypass both directions. These restrictions take precedence
 over caller settings, including preset cache keys and provider extra arguments.
 

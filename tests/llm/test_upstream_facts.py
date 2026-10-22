@@ -744,6 +744,7 @@ async def test_multi_provider_closes_each_owned_provider_once(
 # Pinned provider thinking controls, including fields inside native request envelopes.
 # The settings detector's inventory is checked against these real transformations.
 THINKING_PARAMETER_CASES: dict[str, tuple[str, dict[str, Any], tuple[str, ...], Any]] = {
+    "think": ("ollama_chat", {"think": True}, ("think",), True),
     "thinking": (
         "gemini",
         {"thinking": {"type": "enabled", "budget_tokens": 1024}},
@@ -842,12 +843,14 @@ THINKING_PARAMETER_CASES: dict[str, tuple[str, dict[str, Any], tuple[str, ...], 
 def test_provider_thinking_parameter_maps_to_thinking_field(parameter: str) -> None:
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
     from litellm.llms.fireworks_ai.chat.transformation import FireworksAIConfig
+    from litellm.llms.ollama.chat.transformation import OllamaChatConfig
     from litellm.llms.vertex_ai.gemini.transformation import transform_request_body
     from litellm.utils import get_optional_params
 
     provider, request, path, expected = THINKING_PARAMETER_CASES[parameter]
     models = {
         "gemini": "gemini-2.5-flash",
+        "ollama_chat": "qwen3",
         "openrouter": "openai/gpt-5",
         "bedrock": "amazon.nova-2-lite-v1:0",
         "anthropic": "claude-opus-4-6",
@@ -870,8 +873,12 @@ def test_provider_thinking_parameter_maps_to_thinking_field(parameter: str) -> N
                 litellm_params={},
                 cached_content=None,
             )
-        elif provider in {"anthropic", "bedrock"}:
-            config = AnthropicConfig() if provider == "anthropic" else AmazonConverseConfig()
+        elif provider in {"anthropic", "bedrock", "ollama_chat"}:
+            config = {
+                "anthropic": AnthropicConfig,
+                "bedrock": AmazonConverseConfig,
+                "ollama_chat": OllamaChatConfig,
+            }[provider]()
             body = config.transform_request(
                 model=model,
                 messages=[{"role": "user", "content": "hi"}],
@@ -891,3 +898,43 @@ def test_thinking_detector_matches_pinned_parameter_inventory() -> None:
     from swarm_arena.llm._settings import _THINKING_CONTROLS
 
     assert THINKING_PARAMETER_CASES.keys() == _THINKING_CONTROLS
+
+
+@pytest.mark.parametrize("provider", ["ollama_chat", "ollama"])
+def test_ollama_think_maps_on_chat_and_completion_routes(provider: str) -> None:
+    from litellm.llms.ollama.chat.transformation import OllamaChatConfig
+    from litellm.llms.ollama.completion.transformation import OllamaConfig
+    from litellm.utils import get_optional_params
+
+    optional = get_optional_params(model="qwen3", custom_llm_provider=provider, think=True)
+    config = OllamaChatConfig() if provider == "ollama_chat" else OllamaConfig()
+    body = config.transform_request(
+        model="qwen3",
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params=optional,
+        litellm_params={},
+        headers={},
+    )
+    assert body["think"] is True
+
+
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body"])
+def test_unknown_provider_parameter_is_preserved_but_disables_response_cache(channel: str) -> None:
+    from litellm.utils import get_optional_params
+
+    from swarm_arena.llm._settings import merge_model_settings
+
+    native: dict[str, Any] = {"unlisted_native_mode": True}
+    # The pinned provider mapper accepts native controls beyond swarm-arena's inventory.
+    optional = get_optional_params(model="gpt-4o-mini", custom_llm_provider="openai", **native)
+    assert optional["extra_body"]["unlisted_native_mode"] is True
+    caller = (
+        ModelSettings(extra_args=native)
+        if channel == "extra_args"
+        else ModelSettings(extra_body=native)
+    )
+    merged = merge_model_settings(
+        caller, ModelSettings(extra_args={"cache": {"use-cache": True, "namespace": "A"}})
+    )
+    assert getattr(merged, channel)["unlisted_native_mode"] is True
+    assert "cache" not in (merged.extra_args or {})

@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -294,9 +295,17 @@ async def test_all_pinned_thinking_controls_disable_cache(
         assert "cache" not in (merged.extra_args or {})
 
 
+@pytest.mark.parametrize(
+    ("provider_model", "native"),
+    [
+        ("gemini/gemini-2.5-flash", {"thinkingConfig": {"thinkingBudget": 1024}}),
+        ("ollama_chat/qwen3", {"think": True}),
+        ("openai/gpt-4o-mini", {"unlisted_native_mode": True}),
+    ],
+)
 @pytest.mark.usefixtures("isolated_settings_upstream")
-async def test_gemini_native_thinking_bypasses_response_cache(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_native_controls_bypass_response_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_model: str, native: dict[str, Any]
 ) -> None:
     pytest.importorskip("diskcache")
     pytest.importorskip("fastapi")
@@ -322,7 +331,7 @@ async def test_gemini_native_thinking_bypasses_response_cache(
     monkeypatch.setattr(backend, "async_set_cache", capture_write)
     try:
         async with open_llm_run(tmp_path / "run") as run:
-            spec = ModelSpec(model="gemini/gemini-2.5-flash", roles=["manager"], max_tokens=8000)
+            spec = ModelSpec(model=provider_model, roles=["manager"], max_tokens=8000)
             ours = model_settings(
                 spec,
                 alias="gemini",
@@ -334,7 +343,7 @@ async def test_gemini_native_thinking_bypasses_response_cache(
                 write=True,
             )
             control = merge_model_settings(
-                ModelSettings(extra_args={"mock_response": "answer"}), ours
+                ModelSettings(extra_args={"mock_response": "answer", "seed": 17}), ours
             )
             await _invoke_model(spec.model, control)
             await logger.wait()
@@ -343,12 +352,12 @@ async def test_gemini_native_thinking_bypasses_response_cache(
             assert accesses["read"] > 0
             assert accesses["write"] == 1
             accesses.update(read=0, write=0)
-            thinking = {"thinkingBudget": 1024}
             merged = merge_model_settings(
-                ModelSettings(extra_args={"thinkingConfig": thinking, "mock_response": "answer"}),
+                ModelSettings(extra_args={**native, "mock_response": "answer"}),
                 ours,
             )
-            assert (merged.extra_args or {})["thinkingConfig"] == thinking
+            for key, value in native.items():
+                assert (merged.extra_args or {})[key] == value
             for _ in range(2):
                 await _invoke_model(spec.model, merged)
                 await logger.wait()
@@ -469,3 +478,111 @@ def test_output_alias_inventory_and_input_schema_are_preserved() -> None:
     assert (
         merge_model_settings(caller, ModelSettings(max_tokens=100)).extra_body == caller.extra_body
     )
+
+
+@dataclass
+class _FutureModelSettings(ModelSettings):
+    future_control: bool = True
+
+
+@pytest.mark.parametrize("key", ["unlisted_native_mode", "think"])
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "extra_query", "extra_headers"])
+@pytest.mark.parametrize("value", [True, False, None])
+async def test_unknown_parameter_disables_both_cache_directions(
+    tmp_path: Path, key: str, channel: str, value: Any
+) -> None:
+    payload = {key: value}
+    if channel == "extra_args":
+        caller = ModelSettings(extra_args=payload)
+    elif channel == "extra_body":
+        caller = ModelSettings(extra_body=payload)
+    elif channel == "extra_query":
+        caller = ModelSettings(extra_query=payload)
+    else:
+        caller = ModelSettings(extra_headers={key: str(value)})
+    original = dict(getattr(caller, channel))
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+    assert "cache" not in (merged.extra_args or {})
+    assert getattr(caller, channel) == original
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        "extra_body",
+        "generationConfig",
+        "generation_config",
+        "inferenceConfig",
+        "inference_config",
+        "textGenerationConfig",
+        "config",
+        "parameters",
+        "options",
+        "additionalModelRequestFields",
+        "additional_model_request_fields",
+        "chat_template_kwargs",
+    ],
+)
+async def test_unknown_nested_provider_key_disables_cache(tmp_path: Path, envelope: str) -> None:
+    caller = ModelSettings(extra_args={"extra_body": {envelope: {"unlisted_native_mode": True}}})
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+    assert "cache" not in (merged.extra_args or {})
+
+
+async def test_unlisted_sdk_field_disables_cache(tmp_path: Path) -> None:
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(
+            _FutureModelSettings(), settings(run.scope("manager"), read=True, write=True)
+        )
+    assert "cache" not in (merged.extra_args or {})
+
+
+async def test_schema_payload_is_not_a_provider_control_envelope(tmp_path: Path) -> None:
+    caller = ModelSettings(
+        extra_args={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {"type": "object", "properties": {"think": {"type": "boolean"}}},
+                },
+            }
+        }
+    )
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+    assert (merged.extra_args or {})["cache"] == {
+        "use-cache": True,
+        "no-cache": False,
+        "no-store": False,
+        "namespace": "physika",
+    }
+
+
+async def test_unknown_response_format_envelope_key_disables_cache(tmp_path: Path) -> None:
+    caller = ModelSettings(
+        extra_args={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {}, "unlisted_native_mode": True},
+            }
+        }
+    )
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+    assert "cache" not in (merged.extra_args or {})
+
+
+async def test_pinned_retry_controls_remain_cacheable(tmp_path: Path) -> None:
+    caller = ModelSettings(extra_args={"num_retries": 0, "max_retries": 0})
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+    assert (merged.extra_args or {})["cache"] == {
+        "use-cache": True,
+        "no-cache": False,
+        "no-store": False,
+        "namespace": "physika",
+    }
