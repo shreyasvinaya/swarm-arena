@@ -310,6 +310,8 @@ provider request envelopes. Explicit thinking controls, including Ollama `think`
 bypass response caching.
 Response caching fails closed: every supplied SDK field and provider parameter
 must be in a pinned allowlist of known non-thinking, non-streaming controls.
+This includes `stop` as a string or list of strings and `logit_bias` as a mapping
+from token IDs to finite numbers. Invalid shapes disable response caching.
 Unknown provider parameters disable both response-cache reads and writes,
 including unknown keys nested in provider request envelopes. The request still
 reaches the provider with those parameters. Schema properties and string-valued

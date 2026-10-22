@@ -586,3 +586,74 @@ async def test_pinned_retry_controls_remain_cacheable(tmp_path: Path) -> None:
         "no-store": False,
         "namespace": "physika",
     }
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("stop", "END"),
+        ("stop", ["END", "DONE"]),
+        ("stop", []),
+        ("logit_bias", {"42": -1, 43: 0.5}),
+        ("logit_bias", {}),
+    ],
+)
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested"])
+def test_valid_stop_and_logit_bias_preserve_cache(parameter: str, value: Any, channel: str) -> None:
+    payload = {parameter: value}
+    caller = (
+        ModelSettings(extra_body=payload)
+        if channel == "extra_body"
+        else ModelSettings(
+            extra_args={"extra_body": {"generationConfig": payload}}
+            if channel == "nested"
+            else payload
+        )
+    )
+    cache = {"use-cache": True, "no-cache": False, "no-store": False}
+    merged = merge_model_settings(caller, ModelSettings(extra_args={"cache": cache}))
+    assert (merged.extra_args or {})["cache"] == cache
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("stop", None),
+        ("stop", 1),
+        ("stop", True),
+        ("stop", ("END",)),
+        ("stop", ["PRIVATE_STOP", None]),
+        ("stop", {"think": "PRIVATE_STOP"}),
+        ("logit_bias", None),
+        ("logit_bias", "PRIVATE_BIAS"),
+        ("logit_bias", [("42", -1)]),
+        ("logit_bias", {"42": "PRIVATE_BIAS"}),
+        ("logit_bias", {"42": None}),
+        ("logit_bias", {"42": True}),
+        ("logit_bias", {"42": {"think": True}}),
+        ("logit_bias", {None: -1}),
+        ("logit_bias", {True: -1}),
+        ("logit_bias", {"42": float("nan")}),
+        ("logit_bias", {"42": float("inf")}),
+    ],
+)
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested"])
+def test_invalid_stop_and_logit_bias_disable_cache_without_errors(
+    parameter: str, value: Any, channel: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = {parameter: value}
+    caller = (
+        ModelSettings(extra_body=payload)
+        if channel == "extra_body"
+        else ModelSettings(extra_args={"extra_body": payload} if channel == "nested" else payload)
+    )
+    merged = merge_model_settings(caller, ModelSettings(extra_args={"cache": {"use-cache": True}}))
+    assert "cache" not in (merged.extra_args or {})
+    preserved = merged.extra_body if channel == "extra_body" else merged.extra_args
+    assert isinstance(preserved, dict)
+    if channel == "nested":
+        preserved = preserved["extra_body"]
+    assert isinstance(preserved, dict)
+    assert preserved[parameter] is value
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""

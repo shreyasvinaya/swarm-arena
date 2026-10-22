@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import fields, replace
+from math import isfinite
 from typing import Any
 
 from agents import ModelSettings
@@ -193,6 +194,20 @@ def _cache_parameters(parameters: Mapping[str, Any]) -> bool:
         for key, value in current.items():
             if key in _CACHE_SAFE_SCALARS:
                 if not _cache_scalar(value):
+                    return False
+            elif key == "stop":
+                if not isinstance(value, str) and not (
+                    isinstance(value, list) and all(isinstance(item, str) for item in value)
+                ):
+                    return False
+            elif key == "logit_bias":
+                if not isinstance(value, Mapping) or not all(
+                    isinstance(token, str | int)
+                    and not isinstance(token, bool)
+                    and type(bias) in (int, float)
+                    and (not isinstance(bias, float) or isfinite(bias))
+                    for token, bias in value.items()
+                ):
                     return False
             elif key in _CACHE_SAFE_ENVELOPES:
                 if not isinstance(value, Mapping):

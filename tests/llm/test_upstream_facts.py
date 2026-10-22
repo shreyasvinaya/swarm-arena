@@ -938,3 +938,29 @@ def test_unknown_provider_parameter_is_preserved_but_disables_response_cache(cha
     )
     assert getattr(merged, channel)["unlisted_native_mode"] is True
     assert "cache" not in (merged.extra_args or {})
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [("stop", "END"), ("stop", ["END", "DONE"]), ("logit_bias", {"42": -1, "43": 0.5})],
+)
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body"])
+def test_openai_stop_and_logit_bias_remain_cacheable(
+    parameter: str, value: Any, channel: str
+) -> None:
+    from litellm.utils import get_optional_params
+
+    from swarm_arena.llm._settings import merge_model_settings
+
+    native: dict[str, Any] = {parameter: value}
+    optional = get_optional_params(model="gpt-4o-mini", custom_llm_provider="openai", **native)
+    assert optional[parameter] == value
+    caller = (
+        ModelSettings(extra_args=native)
+        if channel == "extra_args"
+        else ModelSettings(extra_body=native)
+    )
+    cache = {"use-cache": True, "no-cache": False, "no-store": False, "namespace": "A"}
+    merged = merge_model_settings(caller, ModelSettings(extra_args={"cache": cache}))
+    assert getattr(merged, channel)[parameter] == value
+    assert (merged.extra_args or {})["cache"] == cache
