@@ -165,10 +165,71 @@ def test_terminal_prompt_subprocess(
         else:
             assert master is not None
             os.write(master, b"n\n")
-        # Include parent scheduling and interpreter shutdown on loaded CI hosts.
-        stdout, stderr = process.communicate(timeout=60)
+        # Allow scheduling noise, but keep prompt cancellation a behavior bound.
+        stdout, stderr = process.communicate(timeout=20)
         assert process.returncode == (130 if interrupt else 1), (output + stdout, stderr)
         assert stderr == (b"interrupted\n" if interrupt else b"run not approved\n")
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_sigint_delivered_to_blocked_stdin_reader(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, atexit, os, signal, sys, threading, time
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+reader_ready = threading.Event()
+deliver = threading.Event()
+sent = None
+def read_stdin() -> None:
+    # Open a separate file description: _prompt makes fd 0 nonblocking.
+    fd = os.open(os.ttyname(0), os.O_RDONLY)
+    reader_ready.set()
+    try:
+        os.read(fd, 1)
+    finally:
+        os.close(fd)
+reader = threading.Thread(target=read_stdin, daemon=True)
+reader.start()
+assert reader_ready.wait(5)
+def send() -> None:
+    global sent
+    assert deliver.wait(5)
+    sent = time.monotonic()
+    # Model process-directed SIGINT being delivered to a non-main thread.
+    # The reader remains blocked; it must not be joined to exit the process.
+    signal.pthread_kill(reader.ident, signal.SIGINT)
+sender = threading.Thread(target=send, daemon=True)
+sender.start()
+original_wait = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    # Dispatch only after the prompt has registered stdin and yielded. Keep
+    # the GIL until the loop blocks in its native selector, then wake sender.
+    asyncio.get_running_loop().call_soon(deliver.set)
+    await original_wait(fd)
+run_cmds.wait_readable = wait
+sys.setswitchinterval(1)
+def exiting() -> None:
+    assert sent is not None
+    assert reader.is_alive()
+    print(f"sigint-to-exit {time.monotonic() - sent}", flush=True)
+atexit.register(exiting)
+handler = signal.getsignal(signal.SIGINT)
+status = main()
+assert signal.getsignal(signal.SIGINT) is handler
+assert os.get_blocking(0)
+raise SystemExit(status)
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 130, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+        assert float(stdout.split(b"sigint-to-exit ")[1]) < 5, (stdout, stderr)
     assert not Path(run_config.run_root).exists()
     assert not Path(run_config.artifact_root).exists()
 

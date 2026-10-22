@@ -51,8 +51,10 @@ unlimited, the configured round and action limits still apply.
 Press Ctrl-C at the approval prompt or during `run` or `resume` to cancel.
 The CLI finishes bounded cancellation cleanup, prints `interrupted` to stderr,
 and exits with code 130. Cancelling approval leaves the run and artifact roots
-unwritten. The prompt uses nonblocking terminal reads without a reader thread
-or a buffered stdin lock, and restores stdin's mode afterward.
+unwritten. The terminal prompt uses nonblocking input and an event-loop signal
+wakeup, so Ctrl-C also exits when the OS delivers SIGINT to a worker thread.
+It needs no reader thread or buffered stdin lock and restores stdin's mode
+and the interrupt handler afterward.
 
 ## Tools, check, and judge
 

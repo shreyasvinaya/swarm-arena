@@ -1,5 +1,6 @@
 import os
 import re
+import signal
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
@@ -120,9 +121,11 @@ def test_run_without_tty_or_yes_exits_2_and_writes_nothing(
 def test_run_prompt_declined_exits_1(
     example: Example, monkeypatch: pytest.MonkeyPatch, terminal: None
 ) -> None:
+    handler = signal.getsignal(signal.SIGINT)
     answer = iter(b"n\n")
     monkeypatch.setattr(run_cmds, "read", lambda fd, size: bytes([next(answer)]))
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
+    assert signal.getsignal(signal.SIGINT) is handler
     assert not example.run_root.exists()
     assert not example.artifact_root.exists()
 

@@ -9,11 +9,15 @@ cancellation cleanup and prints ``interrupted`` without a traceback.
 """
 
 import argparse
+import asyncio
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from functools import partial
 from os import get_blocking, read, set_blocking
 from pathlib import Path
+from threading import current_thread, main_thread
 
 import anyio
 from anyio import wait_readable
@@ -67,25 +71,47 @@ def register(sub: argparse._SubParsersAction) -> None:
     resume.set_defaults(handler=_resume)
 
 
+@contextmanager
+def _sigint_wakeup() -> Generator[None]:
+    """Wake the selector even when SIGINT is delivered to another OS thread."""
+    handler = signal.getsignal(signal.SIGINT)
+    if current_thread() is not main_thread() or not callable(handler):
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    # Runner's Python signal handler cannot wake an idle main thread until
+    # Python runs it. add_signal_handler installs a wakeup fd written by the
+    # low-level signal handler, including when a worker receives the signal.
+    loop.add_signal_handler(signal.SIGINT, lambda: handler(signal.SIGINT, None))
+    try:
+        yield
+    finally:
+        loop.remove_signal_handler(signal.SIGINT)
+        # Preserve Runner's cancellation / repeated-Ctrl-C handling, including
+        # its own restoration of the caller's handler when anyio.run returns.
+        signal.signal(signal.SIGINT, handler)
+
+
 async def _prompt() -> bool:
     """Await terminal readiness without a thread startup or buffered stdin lock."""
     answer = bytearray()
     fd = sys.stdin.fileno()
     blocking = get_blocking(fd)
-    try:
-        set_blocking(fd, False)
-        while True:
-            await wait_readable(fd)
-            try:
-                chunk = read(fd, 1)
-            except BlockingIOError:
-                # A terminal signal may flush input after readiness was reported.
-                continue
-            if not chunk or chunk == b"\n":
-                break
-            answer.extend(chunk)
-    finally:
-        set_blocking(fd, blocking)
+    with _sigint_wakeup():
+        try:
+            set_blocking(fd, False)
+            while True:
+                await wait_readable(fd)
+                try:
+                    chunk = read(fd, 1)
+                except BlockingIOError:
+                    # A terminal signal may flush input after readiness was reported.
+                    continue
+                if not chunk or chunk == b"\n":
+                    break
+                answer.extend(chunk)
+        finally:
+            set_blocking(fd, blocking)
     return bytes(answer).strip().lower() in {b"y", b"yes"}
 
 
