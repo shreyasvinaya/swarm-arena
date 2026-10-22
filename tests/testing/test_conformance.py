@@ -2822,3 +2822,32 @@ async def test_check_judge_runs_an_llm_judge_offline(tmp_path: Path) -> None:
     scores = await check_judge(LLMJudge("r", ["m"]), GOAL, candidates, config=config)
     assert [s.candidate_id for s in scores] == [c.id for c in candidates]
     assert all(s.llm_call_ids for s in scores)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_check_tool_validation_exit_terminal(
+    monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from pydantic import BaseModel, model_validator
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    class Input(BaseModel):
+        a: int
+
+        @model_validator(mode="before")
+        @classmethod
+        def fail(cls, value: Any) -> Any:
+            reached.append(True)
+            error = _stop_cleanup_error()
+            if nested:
+                raise BaseExceptionGroup("tool", [BaseExceptionGroup("validation", [error])])
+            raise error
+
+    monkeypatch.setattr(FunctionTool, "get_input_model", lambda _: Input)
+    with pytest.raises(RuntimeError) as caught:
+        await check_tool(FunctionTool("_fakes.tools:add"), {"a": 1}, executor=RecordingExecutor())
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL

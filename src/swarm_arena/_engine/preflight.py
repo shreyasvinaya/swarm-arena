@@ -14,7 +14,7 @@ from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.plan import Plan, RoundSpec
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.base import open_store
@@ -81,8 +81,9 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     Raises
     ------
     RuntimeError
-        If construction, configuration or hooks fail. All failures are collected
-        as reference paths and exception types, without exception messages.
+        If construction, configuration or hooks fail. Ordinary failures are
+        collected as reference paths and exception types, without messages.
+        Registered TERMINAL/FENCED failures and caller cancellation propagate.
         Synchronous user work runs in a cancellable daemon thread. Each hook,
         including construction, is bounded by ``config.settle_timeout_s``.
 
@@ -103,6 +104,7 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
                 await run_sync_daemon(_run_hook, ref, base, overrides, seen)
         except BaseException as exc:
             exc = outcome.classify(exc)
+            _raise_terminal(exc)
             failures.append(f"- {ref.path}: {_exception_type_name(exc)}")
     outcome = _Outcome()
     try:
@@ -110,6 +112,7 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
             await run_sync_daemon(executor.preflight)
     except BaseException as exc:
         exc = outcome.classify(exc)
+        _raise_terminal(exc)
         failures.append(f"- {config.executor.path}: {_exception_type_name(exc)}")
     if failures:
         raise _core_error(RuntimeError, "preflight failed:\n" + "\n".join(failures)) from None

@@ -38,7 +38,7 @@ from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.validate import _rule_max_agents_total
 from swarm_arena._store.artifacts import ArtifactStore
@@ -283,6 +283,7 @@ class _ResumeServices:
                                                     killed.append(id)
                                         except BaseException as error:
                                             error = outcome.classify(error)
+                                            _raise_terminal(error)
                                             name = _exception_type_name(error)
                                             raise _core_error(
                                                 RuntimeError,

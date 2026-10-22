@@ -24,7 +24,7 @@ from swarm_arena._model.tooling import (
     ToolOutput,
     ToolRequest,
 )
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _propagate_control, _raise_terminal
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_ref
 from swarm_arena._tooling.result_file import NOTE_PREFIX, request_json
@@ -122,6 +122,7 @@ def _plan_tool(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        _raise_terminal(error)
         raise _sanitize_validation_error(model, error) from None
     request = ToolRequest(
         inputs=params,

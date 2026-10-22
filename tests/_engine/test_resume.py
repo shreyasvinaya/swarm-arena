@@ -1372,6 +1372,32 @@ async def test_preparation_failure_closes_and_sanitizes(
     assert owner[0].expires_at < utc_now()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_orphan_recovery_exit_terminal(
+    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+    spy = _SpyExecutor(Path(crashed.config.run_root) / "spy")
+
+    async def fail(started: Job.Started) -> bool:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("resume", [BaseExceptionGroup("orphan", [error])])
+        raise error
+
+    monkeypatch.setattr(spy, "kill_orphan", fail)
+    config = crashed.config_with(spy, monkeypatch)
+    with pytest.raises(RuntimeError) as caught:
+        await resume_run(config, crashed.run_id, force=True, replanner=None)
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert spy.closed_count == 1
+    assert not _events(crashed, "run_lost")
+
+
 async def test_post_takeover_limit_recheck_is_auditable(
     crashed: Crashed, monkeypatch: pytest.MonkeyPatch
 ) -> None:

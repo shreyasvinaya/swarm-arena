@@ -582,6 +582,36 @@ async def test_rejected_revision_is_journaled_and_old_plan_kept(
     assert out.status == "finished"
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_replanned_preflight_exit_terminal(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena._engine import goal as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    async def fail(*args: Any) -> None:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("preflight", [BaseExceptionGroup("revision", [error])])
+        raise error
+
+    current = _admitted(env, _plan(teams=1), tmp_path)
+    _catalog_env(env, current, **{"catalog-agent": current.teams[0].agents[0].tool})
+    monkeypatch.setattr(module, "run_preflight", fail)
+    runner = GoalRunner(env.deps, goal_id="g", plan=current, replanner=SequencePlanner([current]))
+    with pytest.raises(RuntimeError) as caught:
+        await runner.run()
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    await env.deps.journal.commit()
+    assert not env.events("plan_rejected")
+
+
 async def test_planner_exception_is_type_only_and_skipped(env: EngineEnv) -> None:
     from swarm_arena import RunConfig
     from swarm_arena.planning import History, Planner

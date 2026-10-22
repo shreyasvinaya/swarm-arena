@@ -64,7 +64,7 @@ from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.tooling import RunStatus
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _raise_terminal
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import _detach_plan, stamp
@@ -1531,6 +1531,7 @@ class GoalRunner:
             await run_preflight([plan], self.deps.config, self.deps.executor)
         except BaseException as error:
             error = outcome.classify(error)
+            _raise_terminal(error)
             raise PlanError([f"preflight failed: {_exception_type_name(error)}"]) from None
 
     def _stop(self) -> bool:

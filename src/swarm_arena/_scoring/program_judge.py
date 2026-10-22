@@ -11,7 +11,7 @@ from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import _ConfigInputModel, import_path, load_object
 from swarm_arena._model.results import Candidate, Score
-from swarm_arena._outcomes import _Outcome, _propagate_control
+from swarm_arena._outcomes import _Outcome, _propagate_control, _raise_terminal
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -191,6 +191,7 @@ class ProgramJudge(Judge):
         Score isolated candidate copies in daemon threads and retain failures.
 
         There is no scoring time limit. Cancellation abandons the running call.
+        Registered TERMINAL/FENCED failures propagate before candidate errors.
 
         Parameters
         ----------
@@ -251,6 +252,7 @@ class ProgramJudge(Judge):
             except BaseException as error:
                 name = _exception_type_name(error)
                 error = outcome.classify(error)
+                _raise_terminal(error)
                 ctx.judge_error(candidate.id, f"{name}: scoring function raised")
                 continue
             if reason is not None:

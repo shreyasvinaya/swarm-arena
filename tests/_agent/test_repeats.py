@@ -22,6 +22,29 @@ from swarm_arena._model.tooling import ParentRef, RunStatus, ToolOutput, ToolReq
 from swarm_arena.testing import make_candidate
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_next_replicate_exit_terminal(
+    rt: AgentRuntime, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from swarm_arena._agent import repeats as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    def fail(**kwargs: object) -> str:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("repeat", [BaseExceptionGroup("key", [error])])
+        raise error
+
+    monkeypatch.setattr(module, "repeat_key", fail)
+    with pytest.raises(RuntimeError) as caught:
+        rt.repeats.next_replicate(rt, ToolRequest())
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 @dataclass
 class _Journal:
     events: list[EventDraft] = field(default_factory=list)
