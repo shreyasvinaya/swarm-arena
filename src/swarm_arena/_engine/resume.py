@@ -139,10 +139,12 @@ class _ResumeServices:
         clock: RunClock,
         validated_head: Head,
         model_warnings: list[str],
+        stops: StopState,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
+        self.stops = stops
         self.validated_head = validated_head
         self.model_warnings = model_warnings
         self.ready, self.close = anyio.Event(), anyio.Event()
@@ -174,7 +176,7 @@ class _ResumeServices:
         assert head is not None
         try:
             path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
-            stops = StopState()
+            stops = self.stops
             clock = self.clock
             journal = run_module._RunJournal(
                 self.store,
@@ -421,6 +423,7 @@ class _ResumeServices:
                     except BaseException as error:
                         if self.failure is None:
                             self.failure = error
+            await run_module._close_stop_watcher(self.stops)
             self.closed = True
             self.ready.set()
 
@@ -485,17 +488,22 @@ async def _supervised_acquire(
     acquire: Callable[[], Lease],
     *,
     stopped: str,
+    retain: bool = True,
 ) -> Lease:
     """Deliver acquisition under the owner's supervisor or release undelivered ownership."""
     lease: Lease | None = None
     try:
-        async with run_module._supervise_initialization(store, epoch, stops, clock, config):
+        async with run_module._supervise_initialization(
+            store, epoch, stops, clock, config, retain=retain
+        ):
             lease = await _acquire_lease(acquire, settle_timeout_s=config.settle_timeout_s)
             await anyio.lowlevel.checkpoint_if_cancelled()
         if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
             raise _core_error(RuntimeError, stopped)
         return lease
     except BaseException:
+        if not retain:
+            await run_module._close_stop_watcher(stops)
         if lease is not None:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):
@@ -524,48 +532,54 @@ async def _take_over(
     stops: StopState | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
+    retain = stops is not None
     stops = StopState() if stops is None else stops
-    while True:
-        owner = await _lease_io(read_owner, store)
-        if owner is None:
-            if review:
-                raise FileNotFoundError(f"run {run_id} has no control/owner.json")
-            raise _core_error(ValueError, "run has no committed owner")
-        doc, _ = owner
-        if doc.head is None:
-            raise _core_error(ValueError, f"run {run_id} has no committed events")
-        if validate is not None:
-            await _validated_io(validate, doc)
-        if before_acquire is not None:
-            await before_acquire()
-        try:
-            return await _supervised_acquire(
-                store,
-                doc.epoch + 1,
-                stops,
-                clock() if clock is not None else None,
-                config,
-                partial(
-                    Lease.take_over,
+    try:
+        while True:
+            owner = await _lease_io(read_owner, store)
+            if owner is None:
+                if review:
+                    raise FileNotFoundError(f"run {run_id} has no control/owner.json")
+                raise _core_error(ValueError, "run has no committed owner")
+            doc, _ = owner
+            if doc.head is None:
+                raise _core_error(ValueError, f"run {run_id} has no committed events")
+            if validate is not None:
+                await _validated_io(validate, doc)
+            if before_acquire is not None:
+                await before_acquire()
+            try:
+                return await _supervised_acquire(
                     store,
-                    owner_id=uuid4().hex,
-                    host=host_id(),
-                    ttl_s=config.lease_ttl_s,
-                    force=force,
-                    expect_epoch=doc.epoch,
-                ),
-                stopped="review import stopped" if review else "resume initialization stopped",
-            )
-        except Fenced:
-            current = await _lease_io(read_owner, store)
-            if current is None or current[0].epoch != doc.epoch:
-                epoch = current[0].epoch if current else "missing"
-                message = (
-                    f"another owner took the run (epoch {epoch})"
-                    if review
-                    else "a concurrent resume took the run"
+                    doc.epoch + 1,
+                    stops,
+                    clock() if clock is not None else None,
+                    config,
+                    partial(
+                        Lease.take_over,
+                        store,
+                        owner_id=uuid4().hex,
+                        host=host_id(),
+                        ttl_s=config.lease_ttl_s,
+                        force=force,
+                        expect_epoch=doc.epoch,
+                    ),
+                    stopped="review import stopped" if review else "resume initialization stopped",
+                    retain=retain,
                 )
-                raise _core_error(Fenced, f"run {run_id}: {message}") from None
+            except Fenced:
+                current = await _lease_io(read_owner, store)
+                if current is None or current[0].epoch != doc.epoch:
+                    epoch = current[0].epoch if current else "missing"
+                    message = (
+                        f"another owner took the run (epoch {epoch})"
+                        if review
+                        else "a concurrent resume took the run"
+                    )
+                    raise _core_error(Fenced, f"run {run_id}: {message}") from None
+    except BaseException:
+        await run_module._close_stop_watcher(stops)
+        raise
 
 
 async def resume_run(
@@ -654,6 +668,7 @@ async def resume_run(
         clock=clock,
         validated_head=validated_head,
         model_warnings=model_warnings,
+        stops=stops,
     )
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:

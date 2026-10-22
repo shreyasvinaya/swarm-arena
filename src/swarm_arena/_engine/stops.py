@@ -1,6 +1,7 @@
 """Latch admission stops and measure active run time."""
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import monotonic
 
@@ -12,6 +13,38 @@ from swarm_arena._errors import StorageError
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store
+
+
+class _StopWatcher:
+    """Retain one polling task while its owner's cancellation callback changes."""
+
+    def __init__(self, watch: Callable[[], Awaitable[None]]) -> None:
+        self.error: BaseException | None = None
+        self.on_error: Callable[[], None] | None = None
+        self.failed = anyio.Event()
+        self.task = asyncio.create_task(self._run(watch), name="stop-file-watcher")
+
+    async def _run(self, watch: Callable[[], Awaitable[None]]) -> None:
+        try:
+            await watch()
+        except BaseException as error:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            self.error = error
+            self.failed.set()
+            if self.on_error is not None:
+                self.on_error()
+
+    async def wait_error(self) -> None:
+        await self.failed.wait()
+        assert self.error is not None
+        raise self.error
+
+    async def close(self) -> None:
+        with anyio.CancelScope(shield=True):
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
 
 @dataclass
@@ -47,6 +80,8 @@ class StopState:
     run_budget: bool = False
     goal_budget: set[str] = field(default_factory=set)
     on_change: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    _watcher: _StopWatcher | None = field(default=None, init=False, repr=False, compare=False)
 
     def __setattr__(self, name: str, value: object) -> None:
         """Wake scheduling only for a newly latched run-wide stop."""
