@@ -18,6 +18,7 @@ from _fakes.agent_ctx import FakeAgentContext
 from _fakes.engine import CtxEnv
 from _fakes.llm_run import HeldOperation, open_llm_run
 from _fakes.secrecy import assert_secret_absent
+from _fakes.tools import PyTool
 from agents.exceptions import AgentsException
 from pydantic import ValidationError
 
@@ -1047,7 +1048,8 @@ else:
     assert len(fake.calls) == 1
 
 
-async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("nested", [False, True])
+async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path, nested: bool) -> None:
     from _fakes.run import all_events, plan
     from _fakes.tools import WRITE, PyTool
 
@@ -1057,7 +1059,12 @@ async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path) -> Non
         artifact_root=str(tmp_path / "artifacts"),
         arena_root=str(tmp_path / "arena"),
     )
-    current = plan(rounds=1, tool=PyTool({"code": WRITE.format("{'data': {'y': 1.0}}")}))
+    current = plan(
+        rounds=1,
+        tool=(NestedActionTool if nested else PyTool)(
+            {"code": WRITE.format("{'data': {'y': 1.0}}")}
+        ),
+    )
     current.teams[0].agents[0] = (
         current.teams[0]
         .agents[0]
@@ -1070,7 +1077,9 @@ async def test_parallel_over_cap_keeps_admitted_candidate(tmp_path: Path) -> Non
     fake = register(
         [
             FakeTurn(
-                tool_calls=(("run_tool", {"inputs": {"n": 1}}), ("run_tool", {"inputs": {"n": 2}}))
+                tool_calls=(("nested", {"x": 1}), ("nested", {"x": 2}))
+                if nested
+                else (("run_tool", {"inputs": {"n": 1}}), ("run_tool", {"inputs": {"n": 2}}))
             ),
             finish("must not run"),
         ]
@@ -1145,8 +1154,9 @@ async def test_later_finish_round_call_returns_a_soft_tool_error() -> None:
 
 
 @pytest.mark.parametrize("owner", ["task", "scope"])
+@pytest.mark.parametrize("nested", [False, True])
 async def test_caller_cancellation_gracefully_finishes_owned_tool_without_cancelling_peer(
-    tmp_path: Path, ctx_env: CtxEnv, owner: str
+    tmp_path: Path, ctx_env: CtxEnv, owner: str, nested: bool
 ) -> None:
     from _fakes.tools import PyTool
 
@@ -1167,9 +1177,10 @@ else:
         assert time.monotonic() < deadline
         time.sleep(0.01)
 """
-    tool = PyTool({"code": code, "grace_s": 0.2})
+    tool = (NestedActionTool if nested else PyTool)({"code": code, "grace_s": 0.2})
     ctx, peer = ctx_env.ctx(tool=tool), ctx_env.ctx(tool=tool, agent="b")
-    fake = register([FakeTurn(tool_calls=(("run_tool", {"inputs": {"n": 1}}),)), finish()])
+    call = ("nested", {}) if nested else ("run_tool", {"inputs": {"n": 1}})
+    fake = register([FakeTurn(tool_calls=(call,)), finish()])
     owner_scope, cancelled = anyio.CancelScope(), anyio.Event()
     async with open_llm_run(tmp_path / "llm", config=config()) as run:
 
@@ -1216,3 +1227,118 @@ else:
             if not peer_task.done():
                 ctx_env.env.inflight.cancel_all()
             await asyncio.gather(task, peer_task, return_exceptions=True)
+
+
+class NestedActionTool(PyTool):
+    """Exercise nested core work followed by indefinitely waiting action code."""
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        ready: str = ""
+
+    def extra_actions(self) -> list[Action[Any]]:
+        async def nested(ctx: AgentContext, args: Inputs) -> JsonValue:
+            await ctx.run_tool({"n": int(args.x) if args.x else ctx.round})
+            await anyio.sleep_forever()
+
+        async def capper(ctx: AgentContext, args: Inputs) -> JsonValue:
+            ready = f"{cast(NestedActionTool.Config, self.config).ready}-{ctx.round}"
+            with anyio.fail_after(10):
+                while not await anyio.Path(ready).exists():
+                    await anyio.lowlevel.checkpoint()
+            await ctx.run_tool({"n": 99})
+            return None
+
+        return [
+            Action(
+                name="nested", description="Run nested work.", input_model=Inputs, handler=nested
+            ),
+            Action(name="capper", description="Reach the cap.", input_model=Inputs, handler=capper),
+        ]
+
+
+@pytest.mark.parametrize("stop", ["round", "sibling", "action"])
+async def test_nested_tool_stops_settle_and_preserve_next_round_budget(
+    tmp_path: Path, stop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import WRITE_THEN_SLEEP
+
+    from swarm_arena.llm import _manager
+
+    shares: dict[str, Any] = {}
+    original_drain = _manager.drain
+    for kind in ("baseline", "sdk"):
+        root = tmp_path / kind
+        ready = root / "ready"
+        code = WRITE_THEN_SLEEP
+        if stop == "sibling":
+            code = (
+                "import json, os, time; from pathlib import Path; "
+                "json.dump({'data': {'y': 1.0}}, open(os.environ['SWARM_ARENA_RESULT'], 'w')); "
+                f"n = json.load(open('swarm/request.json'))['params']['n']; "
+                f"Path({str(ready)!r} + '-' + str(n)).touch(); time.sleep(1)"
+            )
+        cfg = config(
+            limits=Limits(
+                max_tokens=10_000_000,
+                max_usd=100,
+                max_tool_runs_per_round=1 if stop == "sibling" else 20,
+                round_timeout_s=2
+                if stop == "round" or (stop == "action" and kind == "baseline")
+                else 60,
+            ),
+            run_root=str(root / "runs"),
+            artifact_root=str(root / "artifacts"),
+            arena_root=str(root / "arena"),
+        )
+        current = plan(
+            rounds=2, tool=NestedActionTool({"code": code, "grace_s": 0.3, "ready": str(ready)})
+        )
+        if kind == "sdk":
+            calls: tuple[tuple[str, dict[str, Any]], ...] = (("nested", {}),)
+            if stop == "sibling":
+                calls += (("capper", {}),)
+            turns = [FakeTurn(tool_calls=calls, usage=Usage())]
+            if stop == "action":
+                turns.append(
+                    FakeTurn(tool_calls=(("finish_round", {"summary": "done"}),), usage=Usage())
+                )
+            register(turns)
+            manager = Ref.of(
+                AgentsSDKManager(model="opus", action_timeout_s=2 if stop == "action" else 60)
+            )
+        else:
+            manager = Ref.of(ScriptedManager([{"inputs": {"n": n}, "round": n} for n in (1, 2)]))
+        current.teams[0].agents[0] = (
+            current.teams[0].agents[0].model_copy(update={"manager": manager})
+        )
+
+        async def checked_drain(scope: Any, *, wait: bool, cfg: RunConfig = cfg) -> list[str]:
+            events = all_events(cfg)
+            assert len([e for e in events if e.type == "tool_start"]) == len(
+                [e for e in events if e.type == "tool_end"]
+            )
+            return await original_drain(scope, wait=wait)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_manager, "drain", checked_drain)
+            with anyio.fail_after(30):
+                await Swarm(cfg).run(current, run_id=f"nested-{kind}")
+        events = all_events(cfg)
+        starts = [e for e in events if e.type == "tool_start"]
+        ends = [e for e in events if e.type == "tool_end"]
+        assert len(starts) == len(ends) == 2
+        assert {e.task_id for e in starts} == {e.task_id for e in ends}
+        assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+            e.payload["id"] for e in events if e.type == "settle"
+        }
+        assert all(
+            e.payload["candidate"]["output"]["status"]
+            == ("ok" if stop == "sibling" else "cancelled")
+            for e in ends
+        )
+        shares[kind] = next(
+            e.payload["shares"] for e in events if e.type == "round_started" and e.round == 2
+        )
+    assert shares["sdk"] == shares["baseline"]
+

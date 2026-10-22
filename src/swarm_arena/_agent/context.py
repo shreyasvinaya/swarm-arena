@@ -1,7 +1,7 @@
 """Expose loop-owned, limit-checked actions to manager connectors."""
 
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import get_ident
@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
-from swarm_arena._agent.tool_run import Inflight, _prepare_sync, execute_tool_run
+from swarm_arena._agent.tool_run import Inflight, _inflight, _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.llm_scope import current_requesting_call
@@ -130,6 +130,36 @@ class _ActionInflight(Inflight):
         self._parent = parent
         self._local = Inflight()
         self._scopes = self._local._scopes
+        self._runs = 0
+        self._accepting = True
+        self._stop_scopes: set[anyio.CancelScope] = set()
+
+    @contextmanager
+    def run(self) -> Generator[None]:
+        """Retain a core run through every submission gap and final settlement."""
+        if not self._accepting or self.closed:
+            raise _core_error(LimitReached, "stop", "the round is stopping")
+        self._runs += 1
+        try:
+            yield
+        finally:
+            self._runs -= 1
+            if not self._runs:
+                for scope in self._stop_scopes:
+                    scope.cancel()
+
+    def stop(self, scope: anyio.CancelScope, *, cancel: bool) -> None:
+        """Close admission, optionally start core grace, then stop handler work."""
+        # A run already entered may still be preparing its reservation or
+        # submission. Non-caller stops refuse new run entries without cutting
+        # that work; deadlines and callers also close submission admission.
+        self._accepting = False
+        self._stop_scopes.add(scope)
+        if cancel:
+            self.close()
+            self.cancel_all()
+        if not self._runs:
+            scope.cancel()
 
     @property
     def closed(self) -> bool:
@@ -551,18 +581,25 @@ class AgentContext:
         --------
         >>> candidate = await ctx.run_tool({"x": 1.0})  # doctest: +SKIP
         """
-        parents = tuple(_context_string(value, "parents") for value in parents)
-        edits = (
-            None
-            if edits is None
-            else {_context_string(path, "edits path"): text for path, text in edits.items()}
-        )
-        self._charge()
-        read_ids = tuple(self._read_ids)
-        candidate = await execute_tool_run(
-            self._rt, inputs, parents=parents, replicate=replicate, edits=edits, read_ids=read_ids
-        )
-        return self._manager(candidate)
+        inflight = _inflight.get()
+        with inflight.run() if isinstance(inflight, _ActionInflight) else nullcontext():
+            parents = tuple(_context_string(value, "parents") for value in parents)
+            edits = (
+                None
+                if edits is None
+                else {_context_string(path, "edits path"): text for path, text in edits.items()}
+            )
+            self._charge()
+            read_ids = tuple(self._read_ids)
+            candidate = await execute_tool_run(
+                self._rt,
+                inputs,
+                parents=parents,
+                replicate=replicate,
+                edits=edits,
+                read_ids=read_ids,
+            )
+            return self._manager(candidate)
 
     def my_candidates(self) -> list[Candidate]:
         """

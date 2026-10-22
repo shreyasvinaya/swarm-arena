@@ -22,7 +22,7 @@ from swarm_arena._agent.context import (
     _LocalTimer,
 )
 from swarm_arena._agent.manager import LimitReached
-from swarm_arena._agent.tool_run import _inflight, track_inflight
+from swarm_arena._agent.tool_run import Inflight, _inflight, track_inflight
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import (
@@ -268,7 +268,9 @@ class _OwnedCall:
 
     scope: anyio.CancelScope = field(default_factory=lambda: anyio.CancelScope(shield=True))
     finished: anyio.Event = field(default_factory=anyio.Event)
-    inflight: _ActionInflight | None = None
+    inflight: _ActionInflight = field(
+        default_factory=lambda: _ActionInflight(_inflight.get() or Inflight())
+    )
     result: str = ""
     error: BaseException | None = None
 
@@ -282,11 +284,10 @@ class _OwnedActions:
         self.calls: set[_OwnedCall] = set()
         self.accepting = True
 
-    async def call(self, operation: Callable[[], Awaitable[str]], *, core_tool: bool) -> str:
+    async def call(self, operation: Callable[[], Awaitable[str]]) -> str:
         if not self.accepting:
             raise _core_error(LimitReached, "stop", "the round is stopping")
-        parent = _inflight.get() if core_tool else None
-        call = _OwnedCall(inflight=_ActionInflight(parent) if parent is not None else None)
+        call = _OwnedCall()
         self.calls.add(call)
         self.group.start_soon(self._run, operation, call)
         await call.finished.wait()
@@ -298,11 +299,8 @@ class _OwnedActions:
         try:
             with call.scope, _local_timer_scope(call.scope) as local:
                 try:
-                    if call.inflight is None:
+                    with track_inflight(call.inflight):
                         call.result = await operation()
-                    else:
-                        with track_inflight(call.inflight):
-                            call.result = await operation()
                 except BaseException as error:
                     call.error = error
                     self.timer.record(error)
@@ -315,12 +313,7 @@ class _OwnedActions:
     def stop(self, *, caller: bool) -> None:
         self.accepting = False
         for call in self.calls:
-            if call.inflight is not None:
-                if caller:
-                    call.inflight.close()
-                    call.inflight.cancel_all()
-            else:
-                call.scope.cancel()
+            call.inflight.stop(call.scope, cancel=caller)
 
     async def wait(self) -> None:
         while self.calls:
@@ -360,14 +353,32 @@ def _tool(
         outcome = _Outcome()
         error: BaseException | None = None
         result = ""
-        deadline = math.inf if timeout is None else anyio.current_time() + timeout
-        with anyio.CancelScope(deadline=deadline) as scope, _local_timer_scope(scope):
-            try:
-                call_id = _context_string(tool_context.tool_call_id, "tool_call_id")
-                args = await _prepare(lambda: _parse(raw, arguments))
-                result = await _act(ctx, deps, name, args, call_id)
-            except BaseException as caught:
-                error = caught
+        parent = _inflight.get()
+        inflight = (
+            parent if isinstance(parent, _ActionInflight) else _ActionInflight(parent or Inflight())
+        )
+        finished = anyio.Event()
+        scope = anyio.CancelScope()
+
+        async def expire() -> None:
+            assert timeout is not None
+            with anyio.move_on_after(timeout) as clock:
+                await finished.wait()
+            if clock.cancel_called:
+                inflight.stop(scope, cancel=True)
+
+        with scope, _local_timer_scope(scope), track_inflight(inflight):
+            async with anyio.create_task_group() as timers:
+                if timeout is not None:
+                    timers.start_soon(expire)
+                try:
+                    call_id = _context_string(tool_context.tool_call_id, "tool_call_id")
+                    args = await _prepare(lambda: _parse(raw, arguments))
+                    result = await _act(ctx, deps, name, args, call_id)
+                except BaseException as caught:
+                    error = caught
+                finally:
+                    finished.set()
         if error is not None:
             # An enclosing round timer may cancel the SDK invocation task. Its
             # owner retains the control even if the SDK discards this failure.
@@ -407,7 +418,7 @@ def _tool(
         owner = _owned_actions.get()
         if owner is None:
             return await ordered(tool_context, raw)
-        return await owner.call(lambda: ordered(tool_context, raw), core_tool=name == "run_tool")
+        return await owner.call(lambda: ordered(tool_context, raw))
 
     return set_function_tool_failure_error_function(
         FunctionTool(
