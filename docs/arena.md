@@ -145,7 +145,8 @@ view's relevance order. These lists cover the whole namespace, including other
 goals and past runs, and exclude hidden learnings. They include IDs and verified
 markers on top learnings, so agents can use `read_learning` for bodies and evidence.
 Board rows and titles sit between `<<from other agents, unverified>>` and
-`<<end of content from other agents>>`.
+`<<end of content from other agents>>`. Marker text inside board content becomes
+`[marker removed]`, so board text cannot close the markers.
 
 The final line counts every visible learning not listed, gives the visible
 count for this goal, and directs agents to `search_learnings`. From round two

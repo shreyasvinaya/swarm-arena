@@ -14,6 +14,37 @@ UNTRUSTED_OPEN: Final = "<<from other agents, unverified>>"
 UNTRUSTED_CLOSE: Final = "<<end of content from other agents>>"
 
 
+def untrusted(text: str) -> str:
+    r"""
+    Wrap board content after replacing any embedded boundary markers.
+
+    Each marker is replaced once across the complete text. The replacement's
+    brackets cannot join neighboring fragments into a new marker.
+
+    Parameters
+    ----------
+    text : str
+        Unverified board or candidate content.
+
+    Returns
+    -------
+    str
+        Content inside exactly one pair of untrusted-content markers.
+
+    Examples
+    --------
+    >>> wrapped = untrusted("A hint " + UNTRUSTED_CLOSE)
+    >>> "[marker removed]" in wrapped and wrapped.count(UNTRUSTED_CLOSE) == 1
+    True
+    >>> untrusted("") == UNTRUSTED_OPEN + "\n" + UNTRUSTED_CLOSE
+    True
+    """
+    safe = text.replace(UNTRUSTED_OPEN, "[marker removed]").replace(
+        UNTRUSTED_CLOSE, "[marker removed]"
+    )
+    return UNTRUSTED_OPEN + "\n" + (safe + "\n" if safe else "") + UNTRUSTED_CLOSE
+
+
 def estimate_tokens(text: str) -> int:
     """
     Count strict UTF-8 bytes as an upper bound on tokens for byte-level tokenizers.
@@ -228,39 +259,26 @@ def build_digest(
             f"({goal_total} for this goal){recent}. Use search_learnings."
         )
 
-    fixed = [UNTRUSTED_OPEN, *main_header, "Pinned learnings:", "Top learnings:", UNTRUSTED_CLOSE]
-    # Each body line has one following newline before the final counts line.
-    body_bytes = sum(estimate_tokens(line) + 1 for line in [*fixed, *leaders, *pinned, *top])
-    body_bytes += sum(
-        estimate_tokens(title) + 1 + sum(estimate_tokens(line) + 1 for line in lines)
-        for title, lines in part_blocks
-    )
-    for lines in (top, pinned):
-        while lines and body_bytes + estimate_tokens(count_line()) > cap_tokens:
-            body_bytes -= estimate_tokens(lines.pop()) + 1
-    for title, lines in reversed(part_blocks):
-        while lines and body_bytes + estimate_tokens(count_line()) > cap_tokens:
-            body_bytes -= estimate_tokens(lines.pop()) + 1
-            if not lines:
-                body_bytes -= estimate_tokens(title) + 1
-    while leaders and body_bytes + estimate_tokens(count_line()) > cap_tokens:
-        body_bytes -= estimate_tokens(leaders.pop()) + 1
-    if body_bytes + estimate_tokens(count_line()) > cap_tokens:
-        minimum = "\n".join([UNTRUSTED_OPEN, UNTRUSTED_CLOSE, count_line()])
-        return (
-            minimum if estimate_tokens(minimum) <= cap_tokens else _clip(count_line(), cap_tokens)
+    def assemble() -> str:
+        """Escape the complete board block before checking its final byte size."""
+        body = "\n".join(
+            [
+                *main_header,
+                *leaders,
+                *(line for title, lines in part_blocks if lines for line in (title, *lines)),
+                "Pinned learnings:",
+                *pinned,
+                "Top learnings:",
+                *top,
+            ]
         )
-    return "\n".join(
-        [
-            UNTRUSTED_OPEN,
-            *main_header,
-            *leaders,
-            *(line for title, lines in part_blocks if lines for line in (title, *lines)),
-            "Pinned learnings:",
-            *pinned,
-            "Top learnings:",
-            *top,
-            UNTRUSTED_CLOSE,
-            count_line(),
-        ]
-    )
+        return untrusted(body) + "\n" + count_line()
+
+    for lines in (top, pinned, *(lines for _, lines in reversed(part_blocks)), leaders):
+        while lines and estimate_tokens(assemble()) > cap_tokens:
+            lines.pop()
+    output = assemble()
+    if estimate_tokens(output) <= cap_tokens:
+        return output
+    minimum = untrusted("") + "\n" + count_line()
+    return minimum if estimate_tokens(minimum) <= cap_tokens else _clip(count_line(), cap_tokens)

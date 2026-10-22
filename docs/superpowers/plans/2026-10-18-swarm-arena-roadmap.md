@@ -312,7 +312,7 @@ Rules [plan]:
 | `_board/base.py` | `Board`, `BoardView` ABCs | M1b +M2 | `tests/_board/test_base.py` |
 | `_board/run_board.py` | `RunBoard`: this run only, in memory (deleted in M2) | M1b | `tests/_board/test_run_board.py` |
 | `_board/frontier.py` | Build frontiers (this run's mark in M1b, every run read in M2). It does not commit: `_engine/round.py` journals them | M1b +M2 | `tests/_board/test_frontier.py` |
-| `_board/digest.py` | Digest builder with the token cap | M1b +M2 | `tests/_board/test_digest.py` |
+| `_board/digest.py` | Digest builder with the token cap | M1b +M2 +M3 | `tests/_board/test_digest.py` |
 | `_board/curator.py` | `Curator` ABC and the round-end hook | M2 | `tests/_board/test_curator.py` |
 | `_board/arena.py` | `ArenaBoard` | M2 | `tests/_board/test_arena.py` |
 | `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier | M2 | `tests/_board/test_cache.py` |
@@ -357,7 +357,7 @@ Rules [plan]:
 | `llm/_settings.py` | `ModelSettings` per call: caching, metadata, cache args | M3 | `tests/llm/test_settings.py` |
 | `llm/_logger.py` | `CallLogger`: maps LiteLLM `kwargs` and `response_obj` to the core `record_call` | M3 | `tests/llm/test_logger.py` |
 | `llm/_cache.py` | Response-cache setup from `CachePolicy` | M3 | `tests/llm/test_cache.py` |
-| `llm/_prompts.py` | Prompt layout and untrusted markers | M3 | `tests/llm/test_prompts.py` |
+| `llm/_prompts.py` | Prompt layout | M3 | `tests/llm/test_prompts.py` |
 | `llm/_structured.py` | Structured output and the two-stage fallback | M3 | `tests/llm/test_structured.py` |
 | `llm/_hooks.py` | `RunHooks` pre-check, `BudgetExceeded` | M3 | `tests/llm/test_hooks.py` |
 | `llm/_actions.py` | `@function_tool` wrappers for `AgentContext` actions | M3 | `tests/llm/test_actions.py` |
@@ -411,6 +411,7 @@ M3 core recording additions to R3.1 (these extend the existing module rows):
 | `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
 | `tests/_fakes/llm_run.py` | `open_llm_run`, real owned writer/ledger fixture, committed calls/charges and held-worker readiness/release controls | M3 |
+| `tests/_fakes/agent_ctx.py` | In-memory `FakeAgentContext` fields, actions, failure injection and requesting-call records | M3 |
 | `tests/test_lease_io_boundary.py` | Includes core LLM recorder and future `llm/*.py` modules in the lease-held storage guard | +M3 |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
@@ -2393,6 +2394,9 @@ the standalone planning-session API remains a separate implementation.
 ```python
 def build_frontier(board_reads: Sequence[tuple[str, str, Head]], reviews: Sequence[str],
                    curation: Sequence[str]) -> Frontier: ...
+def untrusted(text: str) -> str: ...             # M3
+    # Wrap with the shared untrusted markers after replacing embedded markers with "[marker removed]".
+    # build_digest wraps its board block with this helper before checking the final byte cap.
 def build_digest(view: BoardView, *, goal: GoalKey, run_id: str, round: int,
                  ranking: str | Mapping[str | None, str], cap_tokens: int, k: int = 5) -> str: ...
     # A str ranks every group under one judge; a mapping selects each group's judge (None is the main group),
