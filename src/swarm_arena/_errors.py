@@ -244,8 +244,6 @@ def _core_signal(error: _SignalT, *, _category: _SignalCategory | None = None) -
             category = (
                 _SignalCategory.FENCED
                 if type(error) is Fenced
-                else _SignalCategory.TERMINAL
-                if type(error) is LimitReached and error.limit == "usage_overflow"
                 else _SignalCategory.LIMIT
                 if type(error) is LimitReached
                 else _SignalCategory.DIAGNOSTIC

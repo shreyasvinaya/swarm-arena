@@ -21,7 +21,7 @@ from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine.stops import RunClock, StopState
-from swarm_arena._errors import Fenced, StorageError, _core_error, _core_signal, _stop_cleanup_error
+from swarm_arena._errors import Fenced, StorageError, _core_error, _stop_cleanup_error
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
@@ -693,9 +693,7 @@ async def _settle(binding: _Binding, entry: _Pending) -> None:
         entry.cleanup_at = float("inf")
         if result.overflow:
             binding.overflow_notified.add(id(entry.scope.tranche))
-            raise _core_signal(
-                LimitReached("usage_overflow", "reported usage exceeds the supported range")
-            )
+            entry.scope.tranche._ledger._check_usage_overflow()
     except BaseException as error:
         try:
             outcome.contain(error, StorageError, "LLM settlement")
@@ -1138,12 +1136,7 @@ async def _bound_run(
                                 and key not in binding.overflow_notified
                             ):
                                 binding.overflow_notified.add(key)
-                                raise _core_signal(
-                                    LimitReached(
-                                        "usage_overflow",
-                                        "reported usage exceeds the supported range",
-                                    )
-                                )
+                                tranche._ledger._check_usage_overflow()
                         except BaseException as error:
                             failure = failure or error
                     binding.check()

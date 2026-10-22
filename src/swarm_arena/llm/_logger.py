@@ -12,11 +12,10 @@ from litellm.caching.caching import Cache
 from litellm.integrations.custom_logger import CustomLogger
 from pydantic import BaseModel
 
-from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import _MICROS_PER_USD, USD_LIMIT, _usd_from_micro_units
 from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._engine.run import register_run_setup
-from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
+from swarm_arena._errors import _core_category, _exception_type_name, _SignalCategory
 from swarm_arena._journal import llm_record as _recorder
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.context_strings import _context_string
@@ -318,9 +317,8 @@ async def _on_owner(
         # The writer latch preserves cleanup expiry as well as actual fencing.
         # A registered sanitized hook failure alone is not terminal authority.
         binding.check()
-        control = _rebuild_core_signal(classified)
-        if isinstance(control, LimitReached) and control.limit == "usage_overflow":
-            raise control from None
+        if _core_category(classified) is _SignalCategory.TERMINAL:
+            raise classified from None
         _log.error("LLM callback failed (%s)", _exception_type_name(classified))
 
 

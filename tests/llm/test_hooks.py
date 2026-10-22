@@ -35,6 +35,7 @@ from swarm_arena._errors import (
     _core_error,
     _is_core_control,
     _rebuild_core_signal,
+    _SignalCategory,
     _stop_cleanup_error,
 )
 from swarm_arena._journal.llm_record import drain
@@ -302,7 +303,10 @@ async def test_sdk_carrier_stops_before_another_model_turn(kind: str, nested: bo
         "fence": _core_error(Fenced, "run ownership lost"),
         "budget": _core_error(LimitReached, "budget", "budget used up"),
         "overflow": _core_error(
-            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+            LimitReached,
+            "usage_overflow",
+            "budget exhausted by usage overflow",
+            _category=_SignalCategory.TERMINAL,
         ),
         "cleanup": _stop_cleanup_error(),
     }[kind]
@@ -565,7 +569,10 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
     core = {
         "cleanup": _stop_cleanup_error(),
         "overflow": _core_error(
-            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+            LimitReached,
+            "usage_overflow",
+            "budget exhausted by usage overflow",
+            _category=_SignalCategory.TERMINAL,
         ),
         "fence": _core_error(Fenced, "run ownership lost"),
     }[kind]

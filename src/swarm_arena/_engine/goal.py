@@ -1031,7 +1031,7 @@ class GoalRunner:
                 error = boundary.classify(error)
                 self.deps.journal._raise_if_fenced()
                 if _is_core_control(error):
-                    if type(error) is LimitReached and error.limit != "usage_overflow":
+                    if _core_category(error) is _SignalCategory.LIMIT:
                         self.status, self.reason = "no_result", "final slice used up"
                         return []
                     raise error from None

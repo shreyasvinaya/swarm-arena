@@ -22,7 +22,13 @@ from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import goal as goal_module
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced, _core_error, _is_core_signal, _stop_cleanup_error
+from swarm_arena._errors import (
+    Fenced,
+    _core_error,
+    _is_core_signal,
+    _SignalCategory,
+    _stop_cleanup_error,
+)
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -790,7 +796,8 @@ async def test_writer_timeout_bypasses_component_error_handlers(
 
 @pytest.mark.parametrize("site", ["final", "replan", "policy"])
 @pytest.mark.parametrize(
-    "kind", ["cleanup", "overflow", "fence", "limit", "validation", "cancel", "group"]
+    "kind",
+    ["cleanup", "overflow", "fence", "limit", "misleading_limit", "validation", "cancel", "group"],
 )
 @pytest.mark.parametrize("nested", [False, True])
 async def test_goal_handlers_use_registered_categories(
@@ -811,10 +818,14 @@ async def test_goal_handlers_use_registered_categories(
     errors: dict[str, BaseException] = {
         "cleanup": _stop_cleanup_error(),
         "overflow": _core_error(
-            LimitReached, "usage_overflow", "budget exhausted by usage overflow"
+            LimitReached,
+            "usage_overflow",
+            "budget exhausted by usage overflow",
+            _category=_SignalCategory.TERMINAL,
         ),
         "fence": _core_error(Fenced, "run ownership lost"),
         "limit": _core_error(LimitReached, "budget", "budget used up"),
+        "misleading_limit": _core_error(LimitReached, "usage_overflow", "local refusal"),
         "validation": _core_error(ValueError, "invalid field"),
         "cancel": _classify_outcome(asyncio.CancelledError(secret)),
         "group": _classify_outcome(BaseExceptionGroup(secret, [asyncio.CancelledError(secret)])),
@@ -855,7 +866,7 @@ async def test_goal_handlers_use_registered_categories(
         assert not env.events("plan_rejected")
         assert not env.events("decision")
         assert not env.events("judge_error")
-    elif kind == "limit" and site == "final":
+    elif kind in {"limit", "misleading_limit"} and site == "final":
         assert await operation == []
         assert (runner.status, runner.reason) == ("no_result", "final slice used up")
         assert not env.events("judge_error")
@@ -864,7 +875,7 @@ async def test_goal_handlers_use_registered_categories(
         await env.deps.journal.commit()
         event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
         assert env.events(event_kind)
-        if kind == "limit":
+        if kind in {"limit", "misleading_limit"}:
             payload = env.events(event_kind)[-1].payload
             if site == "replan":
                 assert payload["errors"] == ["planner error: LimitReached"]

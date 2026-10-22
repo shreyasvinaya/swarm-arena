@@ -152,3 +152,49 @@ async def test_containment_preserves_nested_cleanup_but_not_hook_control_tags() 
         _Outcome().contain(forged, StorageError, "storage")
     assert not _is_core_control(caught.value)
     assert_secret_absent(caught.value, "secret")
+
+
+@pytest.mark.parametrize("reason", ["budget", "usage_overflow", "caller-selected"])
+def test_registered_limit_reason_cannot_grant_terminal_authority(reason: str) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena.manager import LimitReached
+
+    error = _core_error(LimitReached, reason, "local refusal")
+    assert _core_category(error) is _SignalCategory.LIMIT
+    result = _classify_outcome(ExceptionGroup("hook", [error]))
+    assert _core_category(result) is _SignalCategory.LIMIT
+    assert isinstance(result, LimitReached)
+    assert result.limit == reason
+
+
+def test_public_context_gate_cannot_mint_terminal_overflow() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena import AgentSpec, Goal, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena.manager import AgentContext, LimitReached
+
+    tool = ScriptTool(command=["echo"])
+    spec = AgentSpec(name="a", rationale="x", tool=Ref.of(tool), manager=Ref(path="example:M"))
+    runtime = Mock(
+        goal=Goal(id="g", namespace="demo"),
+        goal_id="g",
+        address="g/t/a",
+        team=TeamSpec(name="t", rationale="x", agents=[spec]),
+        round=1,
+        round_spec=RoundSpec(),
+        digest="",
+        resumed=(),
+        checks=[],
+        tool=tool,
+        own=[],
+        limits=Limits(),
+        watchdog=Mock(limit=None),
+        counters=Mock(turns=0, board_reads=0, learnings=0),
+    )
+    runtime.spec = spec
+    ctx = AgentContext(runtime, gate=lambda: LimitReached("usage_overflow", "caller-selected"))
+    with pytest.raises((LimitReached, ValueError)) as caught:
+        ctx.scores_of("c-1")
+    # Gate validation is owned by the action adapter; rejection there is also safe.
+    assert _core_category(caught.value) is not _SignalCategory.TERMINAL

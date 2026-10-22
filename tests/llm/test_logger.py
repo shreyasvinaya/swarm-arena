@@ -874,7 +874,7 @@ async def test_computed_usage_overflow_stops_later_reservations(
     pricing: str,
 ) -> None:
     from swarm_arena._budget.amount import USD_LIMIT
-    from swarm_arena._errors import _is_core_signal
+    from swarm_arena._errors import _core_category, _is_core_signal, _SignalCategory
     from swarm_arena.manager import LimitReached
 
     cfg = _config()
@@ -927,6 +927,7 @@ async def test_computed_usage_overflow_stops_later_reservations(
         with pytest.raises(LimitReached) as caught:
             await callback(kw, None if failure else response, None, None)
         assert caught.value.limit == "usage_overflow"
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
         assert _is_core_signal(caught.value)
         (call,) = run.calls()
         assert call.cost_usd == USD_LIMIT
@@ -983,3 +984,43 @@ async def test_computed_charge_rounding_to_ceiling_is_not_overflow(
         await followup.tranche.settle_call(rid, Amount())
         assert await drain(scope, wait=False) == []
         assert await drain(followup, wait=False) == []
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_callback_propagates_category_not_limit_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    terminal: bool,
+) -> None:
+    from swarm_arena._errors import (
+        _core_category,
+        _core_error,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
+
+    error = (
+        _stop_cleanup_error()
+        if terminal
+        else _core_error(LimitReached, "usage_overflow", "ordinary local refusal")
+    )
+
+    async def refuse(**kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(_logger, "record_call", refuse)
+    async with open_llm_run(tmp_path, config=_config()) as run:
+        scope = run.scope("judge")
+        kw = await _open(run, scope)
+        callback = CallLogger().async_log_success_event(kw, _response(), _START, _END)
+        if terminal:
+            with pytest.raises(RuntimeError, match="stop cleanup timed out") as caught:
+                await callback
+            assert _core_category(caught.value) is _SignalCategory.TERMINAL
+            assert "LLM callback failed" not in caplog.text
+        else:
+            await callback
+            assert "LLM callback failed (LimitReached)" in caplog.text
+        await drain(scope, wait=False)

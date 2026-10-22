@@ -10,7 +10,7 @@ import anyio
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount, _usd_from_micro_units
 from swarm_arena._budget.split import equal_shares, round_pool, weighted_shares
-from swarm_arena._errors import _core_error, _core_signal
+from swarm_arena._errors import _core_error, _core_signal, _SignalCategory
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
@@ -760,7 +760,10 @@ class Ledger:
     def _check_usage_overflow(self) -> None:
         """Reject local and durable admission after untrustworthy usage."""
         if self._overflow_reservation is not None:
-            raise _core_signal(LimitReached("usage_overflow", "budget exhausted by usage overflow"))
+            raise _core_signal(
+                LimitReached("usage_overflow", "budget exhausted by usage overflow"),
+                _category=_SignalCategory.TERMINAL,
+            )
 
     async def _settle(
         self,
