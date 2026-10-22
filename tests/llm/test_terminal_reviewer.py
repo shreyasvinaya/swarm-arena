@@ -157,6 +157,26 @@ async def test_eof(text: str) -> None:
         await TerminalReviewer(stdin=io.StringIO(text), stdout=io.StringIO()).review(PLAN)
 
 
+@pytest.mark.parametrize("source", ["approve", "feedback", "empty", "feedback_eof", "devnull"])
+async def test_descriptor_input_and_eof(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "answers"
+    contents = {"approve": "a\n", "feedback": "f\nmore teams\n", "empty": "", "feedback_eof": "f\n"}
+    if source == "devnull":
+        path = Path(os.devnull)
+    else:
+        path.write_text(contents[source])
+    with os.fdopen(os.open(path, os.O_RDONLY)) as stdin:
+        reviewer = TerminalReviewer(stdin=stdin, stdout=io.StringIO())
+        with anyio.fail_after(5):
+            if source in {"empty", "feedback_eof", "devnull"}:
+                with pytest.raises(RuntimeError, match="terminal input ended"):
+                    await reviewer.review(PLAN)
+            else:
+                result = await reviewer.review(PLAN)
+                assert result == (Approve() if source == "approve" else Feedback("more teams"))
+        assert os.get_blocking(stdin.fileno())
+
+
 def _editor(tmp_path: Path, body: str) -> str:
     script = tmp_path / "editor"
     script.write_text("#!/usr/bin/env python3\n" + body)

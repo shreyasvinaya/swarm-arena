@@ -122,11 +122,12 @@ async def _readline(stdin: TextIO) -> str:
         try:
             set_blocking(fd, False)
             while True:
-                await wait_readable(fd)
+                await anyio.lowlevel.checkpoint()
                 try:
                     chunk = read(fd, 1)
                 except BlockingIOError:
-                    # A terminal signal may flush input after readiness was reported.
+                    # Files and device EOF need no poller; wait only for empty pipes/ttys.
+                    await wait_readable(fd)
                     continue
                 if not chunk:
                     break
