@@ -2593,6 +2593,62 @@ async def test_conformance_accepts_exact_closed_scope_accounting(
     assert await _run_conformance_kind(kind)
 
 
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_accepts_a_round_total_above_one_amount(
+    kind: Literal["manager", "judge"], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two direct calls of 6e8 USD each: neither overflows, but the round total exceeds USD_LIMIT.
+    pytest.importorskip("agents")
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena.llm._hooks import MeteredModel
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Usage
+
+    turn = FakeTurn(text="x", usage=Usage(input_tokens=6 * 10**14))
+    fake = FakeModel([turn, turn])
+    fake.register("m")
+    config = _llm_config(role=kind)
+    config = config.model_copy(
+        update={"limits": config.limits.model_copy(update={"llm_tranche_usd": 0.00001})}
+    )
+
+    async def calls() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        model = MeteredModel(fake, alias="m", spec=config.models.resolve("m", kind), namespace="t")
+        sdk = sys.modules["agents"]
+        for _ in range(2):
+            await model.get_response(
+                "sys",
+                "hi",
+                sdk.ModelSettings(),
+                [],
+                None,
+                [],
+                sdk.models.interface.ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await calls()
+        return RoundReport(summary="ok")
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await calls()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    assert await _run_conformance_kind(kind, config=config)
+    assert len(fake.calls) == 2
+
+
 async def test_later_round_stop_does_not_inherit_drain_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -299,7 +299,8 @@ async def check_judge(
     log. If the call raises an error instead (a failed contract assert, or an
     error from ``judge()`` itself), each command with any status but ``ok``
     adds that text as a note to the error, which is otherwise passed on
-    unchanged. An undrained normal return is an assertion failure; an existing
+    unchanged. An undrained normal return is an assertion failure, and so is a
+    closed charge that differs from the journaled LLM call costs; an existing
     failure or caller interruption keeps its outcome and receives a value-free
     drain-rule note.
 
@@ -331,7 +332,8 @@ async def check_judge(
         If the judge identity is not stable, an optional Judge method returns
         the wrong type, or ``judge()`` does not return a list of valid
         ``Score`` objects, returns a score for an unknown candidate, or two
-        scores for one candidate, or leaves LLM calls undrained.
+        scores for one candidate, leaves LLM calls undrained, or its closed
+        charge differs from the journaled LLM call costs.
     RuntimeError
         If a registered run setup fails or owned core cleanup fails.
     ValueError
@@ -439,7 +441,8 @@ async def check_manager(
     Registered run setups execute after component construction, inside the
     bound temporary run. Each round has a manager LLM scope. The kit forces
     ``parallel_tool_calls=True`` when the manager's Config has that field and
-    asserts self-drain and requesting-call membership before returning reports.
+    asserts self-drain, closed-charge accounting against the journaled LLM call
+    costs, and requesting-call membership before returning reports.
     A drain violation annotates an existing failure or owner interruption with
     a value-free note; a normal return raises the drain-rule AssertionError.
 
@@ -467,7 +470,8 @@ async def check_manager(
     ------
     AssertionError
         If the manager raises, returns a malformed report, leaves LLM calls
-        undrained, or links a candidate to a call outside its round scope.
+        undrained, closes a round whose charge differs from its journaled LLM
+        call costs, or links a candidate to a call outside its round scope.
         Component failures name only the exception type; the original cause
         may contain connector text, as permitted by the kit diagnostic policy.
         LLM contract failures name the violated rule.

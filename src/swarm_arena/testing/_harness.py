@@ -122,17 +122,16 @@ async def _assert_accounted(scope: LLMScope, store: Store) -> None:
     tranche = scope.tranche
     reservations = {batch.id for batch in tranche._batches}
     reservations.update(cid for cid, call in tranche._calls.items() if call.batch is None)
-    charged = Amount()
-    for reservation in reservations:
-        charged += Amount(usd=tranche._ledger._charges[reservation].usd)
+    # Sum whole micro-dollars: a correct round may total more than one Amount can hold.
+    charged = sum(tranche._ledger._charges[reservation]._micro_usd for reservation in reservations)
     head = await scope.journal.commit()
-    recorded = Amount()
+    recorded = 0
     if head is not None:
         call_ids = set(scope.call_ids)
         for _, events in await _read_chain(store, head):
             for event in events:
                 if event.type == EventType.LLM_CALL and event.payload["call"]["id"] in call_ids:
-                    recorded += Amount(usd=event.payload["call"]["cost_usd"])
+                    recorded += Amount(usd=event.payload["call"]["cost_usd"])._micro_usd
     if charged != recorded:
         raise _LLMContractError(_DRAIN_RULE)
 
