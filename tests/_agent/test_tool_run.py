@@ -24,20 +24,37 @@ from swarm_arena.executor import Executor, Job
 from swarm_arena.manager import LimitReached
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
 @pytest.mark.parametrize("nested", [False, True])
-def test_request_hook_preserves_terminal(nested: bool) -> None:
+def test_request_hook_control_disposition(kind: str, nested: bool) -> None:
     from swarm_arena._agent.tool_run import _request_hook
-    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
 
     def fail() -> None:
-        error = _stop_cleanup_error()
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
         if nested:
             raise BaseExceptionGroup("request", [BaseExceptionGroup("hook", [error])])
         raise error
 
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(RuntimeError if kind == "terminal" else SoftError) as caught:
         _request_hook(fail)
-    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -408,6 +425,42 @@ class _OutputExecutor(_QueuedExecutor):
         if isinstance(self.output, Exception):
             raise self.output
         return self.output
+
+
+@pytest.mark.parametrize("kind", ["limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_started_tool_check_control_disposition(
+    rt_env: RtEnv, kind: str, nested: bool
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import ProviderFailed, _core_signal
+    from swarm_arena._scoring.check import Check
+
+    error: BaseException = (
+        _core_signal(LimitReached("stop", "the round is stopping"))
+        if kind == "limit"
+        else _core_error(ProviderFailed, "provider")
+    )
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(side_effect=error))
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK)),
+        checks=[("check", check)],
+    )
+    candidate = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert len(rt_env.events("tool_start")) == len(rt_env.events("tool_end")) == 1
+    assert candidate.output.status is RunStatus.OK
+    assert len(candidate.checks) == 1
+    assert not candidate.checks[0].passed
+    assert candidate.checks[0].reasons == [
+        f"check error: {'LimitReached' if kind == 'limit' else 'ProviderFailed'}"
+    ]
+    assert rt_env.reservation_state(candidate) == "settled"
+    assert rt.board.get_candidate(candidate.id) == candidate
+    assert candidate in rt.own
 
 
 async def test_final_request_matches_stage_job_candidate_and_repeat_key(rt_env: RtEnv) -> None:

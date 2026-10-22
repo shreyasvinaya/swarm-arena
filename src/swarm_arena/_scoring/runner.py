@@ -16,7 +16,7 @@ from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import (
     Judge,
@@ -96,7 +96,9 @@ async def run_checks(
 
     Each check receives its own shallow context copy, sharing the executor and
     id source. Invalid results fail closed after lax model revalidation. Check
-    exceptions expose only their types, while registered controls always propagate.
+    exceptions expose only their types. Registered TERMINAL and FENCED failures
+    and genuine caller cancellation propagate; ordinary LIMIT/provider signals
+    remain failed check results so started tool work can finish settlement.
     Returned-model serializers and validation run in a cancellable daemon;
     callers retain control of the check's deadline and interruption result.
 
@@ -138,8 +140,8 @@ async def run_checks(
         try:
             result = await check.check(candidate, copy(ctx))
         except BaseException as error:
-            outcome.propagate_control(error)
             error = outcome.classify(error)
+            _raise_terminal(error)
             results.append(
                 CheckResult(
                     check=name,
@@ -151,7 +153,8 @@ async def run_checks(
         try:
             valid = await run_sync_daemon(_prepare_check_result, result)
         except BaseException as error:
-            outcome.propagate_control(error)
+            error = outcome.classify(error)
+            _raise_terminal(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
         results.append(valid.model_copy(update={"check": name}))
     return results

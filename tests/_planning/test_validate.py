@@ -47,19 +47,36 @@ from swarm_arena._tooling.files import snapshot_plan, snapshot_ref
 from swarm_arena._tooling.tool import effective_tool_ref
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
 @pytest.mark.parametrize("nested", [False, True])
-def test_safe_call_preserves_terminal(nested: bool) -> None:
-    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+def test_safe_call_control_disposition(kind: str, nested: bool) -> None:
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
 
     def fail() -> None:
-        error = _stop_cleanup_error()
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
         if nested:
             raise BaseExceptionGroup("admission", [BaseExceptionGroup("hook", [error])])
         raise error
 
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(RuntimeError if kind == "terminal" else PlanError) as caught:
         validation._safe_call("/refs", fail)
-    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )
 
 
 @pytest.mark.parametrize("nested", [False, True])

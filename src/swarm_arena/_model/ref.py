@@ -28,7 +28,7 @@ from swarm_arena._model.base import (
 )
 from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _propagate_control, _raise_terminal
 
 
 class EmptyConfig(_SafeModel):
@@ -241,8 +241,8 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
-                _propagate_control(error)
                 error = _classify_outcome(error)
+                _raise_terminal(error)
                 safe = _sanitize_validation_error(model_cls, error)
             except RecursionError:
                 safe = None

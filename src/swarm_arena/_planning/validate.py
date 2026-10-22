@@ -117,8 +117,8 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     except KeyboardInterrupt:
         raise
     except BaseException as error:
-        _propagate_control(error)
         error = _classify_outcome(error)
+        _raise_terminal(error)
         raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
 
 

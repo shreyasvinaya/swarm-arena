@@ -1407,19 +1407,36 @@ async def test_owned_action_inherits_engine_provider_deadline(expired: bool) -> 
         assert caught.value.limit == ("round_timeout_s" if expired else "stop")
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
 @pytest.mark.parametrize("nested", [False, True])
-def test_prepare_metadata_preserves_terminal(nested: bool) -> None:
+def test_prepare_metadata_control_disposition(kind: str, nested: bool) -> None:
     from unittest.mock import Mock
 
     from swarm_arena._agent.context import _prepare_metadata
-    from swarm_arena._errors import _stop_cleanup_error
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
 
     def fail() -> None:
-        error = _stop_cleanup_error()
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
         if nested:
             raise BaseExceptionGroup("metadata", [BaseExceptionGroup("hook", [error])])
         raise error
 
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(RuntimeError if kind == "terminal" else SoftError) as caught:
         _prepare_metadata(Mock(get_description=fail), [])
-    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )

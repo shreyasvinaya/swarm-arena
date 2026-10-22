@@ -42,7 +42,6 @@ from swarm_arena._outcomes import (
     _classify_outcome,
     _has_core_fenced,
     _Outcome,
-    _propagate_control,
     _raise_terminal,
 )
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
@@ -356,8 +355,8 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     except KeyboardInterrupt:
         raise
     except BaseException as error:
-        _propagate_control(error)
         error = _classify_outcome(error)
+        _raise_terminal(error)
         raise _core_signal(
             SoftError(f"invalid tool request: {_exception_type_name(error)}")
         ) from None

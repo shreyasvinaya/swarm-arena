@@ -48,6 +48,39 @@ async def test_run_checks_preserves_terminal(nested: bool) -> None:
     assert _core_category(caught.value) is _SignalCategory.TERMINAL
 
 
+@pytest.mark.parametrize("kind", ["limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["check", "result"])
+async def test_check_control_disposition(
+    monkeypatch: pytest.MonkeyPatch, kind: str, nested: bool, site: str
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import _core_signal
+    from swarm_arena._scoring import runner as module
+    from swarm_arena.manager import LimitReached
+
+    error: BaseException = (
+        _core_signal(LimitReached("stop", "the round is stopping"))
+        if kind == "limit"
+        else _core_error(ProviderFailed, "provider")
+    )
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(return_value=CheckResult(check="c", passed=True)))
+    if site == "check":
+        check.check.side_effect = error
+    else:
+        monkeypatch.setattr(module, "_prepare_check_result", Mock(side_effect=error))
+    [result] = await run_checks(_cand(), [("check", check)], _check_ctx())
+    assert not result.passed
+    assert result.reasons == (
+        [f"check error: {'LimitReached' if kind == 'limit' else 'ProviderFailed'}"]
+        if site == "check"
+        else ["check error: invalid result"]
+    )
+
+
 def _cand(candidate_id: str = "c-1", *, failed: bool = False, **fields: Any) -> Candidate:
     checks = [CheckResult(check="gate", passed=False)] if failed else []
     defaults: dict[str, Any] = {"id": candidate_id, "checks": checks}
