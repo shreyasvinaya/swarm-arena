@@ -897,3 +897,53 @@ async def test_real_context_normalizes_connector_action_identifiers(
     assert decoded(await invoke(tools, deps, "custom", {})) == {"ok": True}
     assert invoked == [loop_thread]
     assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
+
+
+async def test_sdk_action_timer_refusal_at_turn_limit_stays_soft(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = ctx_env.ctx(gate=lambda: None)
+    ctx_env.counters.turns = ctx_env.rt.limits.max_turns_per_round
+    refused: list[LimitReached] = []
+
+    async def save_notes(text: str) -> None:
+        try:
+            await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await ctx.run_tool({"x": 1.0})
+                except LimitReached as error:
+                    refused.append(error)
+                    raise
+
+    monkeypatch.setattr(ctx, "save_notes", save_notes)
+    deps = ManagerDeps(ctx=ctx, links=CallLinks())
+    tools = build_tools(ctx, deps, action_timeout_s=0.05)
+    model = FakeModel(
+        [FakeTurn(tool_calls=(("save_notes", {"text": "note"}),)), FakeTurn(text="recovered")]
+    )
+    counters_before = len(ctx_env.events("agent_counters"))
+    with anyio.fail_after(5):
+        result = await Runner.run(
+            Agent(name="test", tools=[*tools], model=model),
+            "go",
+            context=deps,
+            run_config=SDKRunConfig(tracing_disabled=True),
+        )
+    assert [error.limit for error in refused] == ["stop"]
+    assert all(_is_core_control(error) for error in refused)
+    assert result.final_output == "recovered"
+    assert len(model.calls) == 2
+    outputs = [
+        item["output"]
+        for item in model.calls[-1]["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert outputs == ["Tool 'save_notes' timed out after 0.05 seconds."]
+    await ctx_env.rt.journal.commit()
+    assert ctx_env.counters.turns == ctx_env.rt.limits.max_turns_per_round
+    assert len(ctx_env.events("agent_counters")) == counters_before
+    assert ctx_env.counters.tool_runs == 0
+    assert not ctx_env.events("reserve")
+    assert not ctx_env.events("tool_start")

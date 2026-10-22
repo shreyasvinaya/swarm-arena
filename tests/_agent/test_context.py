@@ -1329,27 +1329,57 @@ async def test_run_tool_preserves_live_gate_after_registry_closes(
     state = StopState()
     parent = Inflight()
     owned = _ActionInflight(parent)
-    stopped = anyio.Event()
     ctx = ctx_env.ctx(gate=state.gate_for(ctx_env.rt.goal_id))
+    if limit == "budget":
+        state.goal_budget.add(ctx_env.rt.goal_id)
+    elif limit == "run_timeout_s":
+        state.run_timeout = True
+    else:
+        state.stop = True
+    (parent if closed_registry == "parent" else owned).close()
 
-    async def stop() -> None:
-        if limit == "budget":
-            state.goal_budget.add(ctx_env.rt.goal_id)
-        elif limit == "run_timeout_s":
-            state.run_timeout = True
-        else:
-            state.stop = True
-        (parent if closed_registry == "parent" else owned).close()
-        stopped.set()
-
-    with anyio.fail_after(2):
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(stop)
-            await stopped.wait()
-            with track_inflight(owned), pytest.raises(LimitReached) as caught:
-                await ctx.run_tool({"x": 1.0})
+    with (
+        anyio.fail_after(2),
+        track_inflight(owned),
+        pytest.raises(LimitReached) as caught,
+    ):
+        await ctx.run_tool({"x": 1.0})
     assert caught.value.limit == limit
     assert _is_core_signal(caught.value)
     assert ctx_env.counters.turns == ctx_env.counters.tool_runs == 0
+    assert not ctx_env.events("reserve")
+    assert not ctx_env.events("tool_start")
+
+
+@pytest.mark.parametrize("closed_registry", ["parent", "action"])
+@pytest.mark.parametrize("exhausted", [False, True], ids=["fresh", "at-turn-limit"])
+async def test_closed_registry_refusal_does_not_charge(
+    ctx_env: CtxEnv, closed_registry: str, exhausted: bool
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+
+    parent = Inflight()
+    owned = _ActionInflight(parent)
+    ctx = ctx_env.ctx(gate=lambda: None)
+    if exhausted:
+        ctx_env.counters.turns = ctx_env.rt.limits.max_turns_per_round
+    turns_before = ctx_env.counters.turns
+    (parent if closed_registry == "parent" else owned).close()
+    counters_before = len(ctx_env.events("agent_counters"))
+    with track_inflight(owned), pytest.raises(LimitReached) as caught:
+        await ctx.run_tool({"x": 1.0})
+    assert caught.value.limit == "stop"
+    assert _core_category(caught.value) is _SignalCategory.LIMIT
+    assert _is_core_signal(caught.value)
+    await ctx_env.rt.journal.commit()
+    assert (
+        ctx_env.counters.turns - turns_before,
+        len(ctx_env.events("agent_counters")) - counters_before,
+    ) == (
+        0,
+        0,
+    )
+    assert ctx_env.counters.tool_runs == 0
     assert not ctx_env.events("reserve")
     assert not ctx_env.events("tool_start")
