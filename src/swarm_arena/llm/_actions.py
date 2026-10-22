@@ -1,15 +1,17 @@
 """Adapt authorized manager actions to bounded, value-safe SDK function tools."""
 
 import json
+import math
 from collections.abc import Sequence
 from typing import Any, Final, Literal
 
+import anyio
 from agents import FunctionTool
-from agents.tool import set_function_tool_failure_error_function
+from agents.tool import default_tool_timeout_error_message, set_function_tool_failure_error_function
 from agents.tool_context import ToolContext
 from pydantic import ConfigDict, ValidationError, create_model
 
-from swarm_arena._agent.context import AgentContext
+from swarm_arena._agent.context import AgentContext, _action_timer_scope
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted
 from swarm_arena._budget.llm_scope import requesting_call
 from swarm_arena._errors import (
@@ -259,25 +261,40 @@ def _tool(
 ) -> FunctionTool:
     async def invoke(tool_context: ToolContext[Any], raw: str) -> str:
         outcome = _Outcome()
-        try:
-            call_id = _context_string(tool_context.tool_call_id, "tool_call_id")
-            args = await _prepare(lambda: _parse(raw, arguments))
-            return await _act(ctx, deps, name, args, call_id)
-        except BaseException as error:
+        error: BaseException | None = None
+        result = ""
+        deadline = math.inf if timeout is None else anyio.current_time() + timeout
+        with anyio.CancelScope(deadline=deadline) as scope, _action_timer_scope(scope):
             try:
-                classified = outcome.classify(_unwrap_control(error))
-            except Fenced as fenced:
-                classified = fenced
-            carrier = _sdk_control(classified)
-            if carrier is not None:
-                raise carrier from None
-            safe = _rebuild_core_signal(classified)
-            message = (
-                str(safe)
-                if isinstance(safe, SoftError)
-                else f"internal error in {name}: {_exception_type_name(classified)}"
+                call_id = _context_string(tool_context.tool_call_id, "tool_call_id")
+                args = await _prepare(lambda: _parse(raw, arguments))
+                result = await _act(ctx, deps, name, args, call_id)
+            except BaseException as caught:
+                error = caught
+        # Exiting our scope removes only its own cancellation requests. The
+        # captured caller outcome now gives real owner cancellation precedence.
+        # Check normal returns too: a handler may have swallowed cancellation.
+        try:
+            classified = outcome.classify(
+                _unwrap_control(error if error is not None else TimeoutError())
             )
-            return _render({"error": message})
+        except Fenced as fenced:
+            classified = fenced
+        if error is None and not scope.cancel_called:
+            return result
+        carrier = _sdk_control(classified)
+        if carrier is not None:
+            raise carrier from None
+        if scope.cancel_called:
+            assert timeout is not None
+            return default_tool_timeout_error_message(tool_name=name, timeout_seconds=timeout)
+        safe = _rebuild_core_signal(classified)
+        message = (
+            str(safe)
+            if isinstance(safe, SoftError)
+            else f"internal error in {name}: {_exception_type_name(classified)}"
+        )
+        return _render({"error": message})
 
     return set_function_tool_failure_error_function(
         FunctionTool(
@@ -286,7 +303,7 @@ def _tool(
             params_json_schema=schema,
             on_invoke_tool=invoke,
             strict_json_schema=False,
-            timeout_seconds=timeout,
+            timeout_seconds=None,
             timeout_behavior="error_as_result",
         ),
         None,
@@ -312,7 +329,10 @@ def build_tools(
     deps : ManagerDeps
         Invocation-local LLM call links and final summary.
     action_timeout_s : float
-        SDK timeout for every action except run_tool, whose clocks are core-owned.
+        Adapter-owned timeout for every action except run_tool, whose clocks
+        are core-owned. Ordinary timeouts return the SDK's timeout message;
+        terminal or fenced unwind causes escape as controls. Caller cancellation
+        takes precedence over both. The SDK's own tool timer is disabled.
 
     Returns
     -------
@@ -340,6 +360,12 @@ def build_tools(
     """
     outcome = _Outcome(capture_caller=False)
     try:
+        if (
+            type(action_timeout_s) not in (int, float)
+            or not math.isfinite(action_timeout_s)
+            or action_timeout_s <= 0
+        ):
+            raise _core_error(ValueError, "action timeout must be a positive finite number")
         run_arguments = _EditableRunArguments if ctx.editable else _RunArguments
         definitions: dict[str, tuple[type[_Arguments], str]] = {
             "run_tool": (run_arguments, _context_string(ctx.tool_description, "description")),

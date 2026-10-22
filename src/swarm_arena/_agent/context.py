@@ -1,6 +1,7 @@
 """Expose loop-owned, limit-checked actions to manager connectors."""
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import get_ident
@@ -66,6 +67,29 @@ class _ActionLifetime:
 
 
 _nested: ContextVar[tuple[_ActionLifetime, ...]] = ContextVar("agent_nested_actions", default=())
+
+
+@dataclass(eq=False)
+class _ActionTimer:
+    """Defer unwind classification to the adapter that owns this timer."""
+
+    scope: anyio.CancelScope
+    live: bool = True
+
+
+_action_timer: ContextVar[_ActionTimer | None] = ContextVar("agent_action_timer", default=None)
+
+
+@contextmanager
+def _action_timer_scope(scope: anyio.CancelScope) -> Generator[None, None, None]:
+    """Keep timer cancellation distinct until the adapter checks its caller."""
+    timer = _ActionTimer(scope)
+    token = _action_timer.set(timer)
+    try:
+        yield
+    finally:
+        timer.live = False
+        _action_timer.reset(token)
 
 
 @dataclass(frozen=True)
@@ -1025,6 +1049,11 @@ class AgentContext:
         try:
             return await action.handler(self, validated)
         except BaseException as error:
+            timer = _action_timer.get()
+            if timer is not None and timer.live and timer.scope.cancel_called:
+                # Only the enclosing adapter can distinguish this timer from
+                # caller cancellation after its cancel scope has exited.
+                raise
             error = outcome.classify(error)
             if _is_core_control(error) or (
                 _is_core_signal(error) and isinstance(error, (SoftError, LimitReached))

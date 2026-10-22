@@ -120,7 +120,7 @@ def test_run_tool_has_no_sdk_timeout() -> None:
 def test_other_actions_time_out_as_results() -> None:
     tools, _ = tool_set(fake_context(actions=tuple(ScriptTool(command=["echo"]).extra_actions())))
     assert {(t.timeout_seconds, t.timeout_behavior) for t in tools if t.name != "run_tool"} == {
-        (60.0, "error_as_result")
+        (None, "error_as_result")
     }
 
 
@@ -275,6 +275,124 @@ async def test_real_action_terminal_cleanup_reaches_sdk_without_another_turn(
     assert str(control) == "stop cleanup timed out"
     assert len(model.calls) == 1
     assert_secret_absent(caught.value, "secret-action")
+
+
+@pytest.mark.parametrize("kind", ["cleanup", "fence"])
+@pytest.mark.parametrize("timer_first", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_real_action_control_beats_owned_timer(
+    ctx_env: CtxEnv, kind: str, timer_first: bool, nested: bool
+) -> None:
+    entered = anyio.Event()
+    raised: list[str] = []
+
+    async def handler(context: AgentContext, args: Empty) -> JsonValue:
+        entered.set()
+        try:
+            if timer_first:
+                await anyio.sleep_forever()
+        finally:
+            raised.append(kind)
+            cause = (
+                _stop_cleanup_error()
+                if kind == "cleanup"
+                else _core_error(Fenced, "run ownership lost")
+            )
+            if nested:
+                raise BaseExceptionGroup("secret-unwind", [asyncio.CancelledError(), cause])
+            raise cause
+
+    ctx = ctx_env.ctx()
+    ctx.actions = (Action(name="held", description="Held", input_model=Empty, handler=handler),)
+    deps = ManagerDeps(ctx=ctx, links=CallLinks())
+    tools = await _prepare(lambda: build_tools(ctx, deps, action_timeout_s=1.0))
+    model = FakeModel([FakeTurn(tool_calls=(("held", {}),)), FakeTurn(text="must not run")])
+    with anyio.fail_after(10), pytest.raises(AgentsException) as caught:
+        await Runner.run(
+            Agent(name="test", tools=[*tools], model=model),
+            "go",
+            context=deps,
+            run_config=SDKRunConfig(tracing_disabled=True),
+        )
+    assert entered.is_set()
+    assert raised == [kind]
+    control = _unwrap_control(caught.value)
+    assert _is_core_control(control)
+    assert str(control) == ("stop cleanup timed out" if kind == "cleanup" else "run ownership lost")
+    assert len(model.calls) == 1
+    assert_secret_absent(caught.value, "secret-unwind")
+
+
+@pytest.mark.parametrize("kind", ["cleanup", "fence"])
+@pytest.mark.parametrize("timer_first", [False, True])
+@pytest.mark.parametrize("owner", ["task", "scope"])
+async def test_real_owner_cancellation_beats_timer_and_unwind_control(
+    ctx_env: CtxEnv, kind: str, timer_first: bool, owner: str
+) -> None:
+    entered, unwinding, release = anyio.Event(), anyio.Event(), anyio.Event()
+    raised: list[str] = []
+
+    async def handler(context: AgentContext, args: Empty) -> JsonValue:
+        entered.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            unwinding.set()
+            with anyio.CancelScope(shield=True):
+                try:
+                    await release.wait()
+                finally:
+                    raised.append(kind)
+                    raise (
+                        _stop_cleanup_error()
+                        if kind == "cleanup"
+                        else _core_error(Fenced, "run ownership lost")
+                    )
+
+    ctx = ctx_env.ctx()
+    ctx.actions = (Action(name="held", description="Held", input_model=Empty, handler=handler),)
+    deps = ManagerDeps(ctx=ctx, links=CallLinks())
+    tools = await _prepare(
+        lambda: build_tools(ctx, deps, action_timeout_s=1.0 if timer_first else 60.0)
+    )
+    model = FakeModel([FakeTurn(tool_calls=(("held", {}),)), FakeTurn(text="must not run")])
+    owner_scope = anyio.CancelScope()
+
+    async def run() -> None:
+        with owner_scope:
+            await Runner.run(
+                Agent(name="test", tools=[*tools], model=model),
+                "go",
+                context=deps,
+                run_config=SDKRunConfig(tracing_disabled=True),
+            )
+            pytest.fail("owner cancellation became a tool response")
+
+    task = asyncio.create_task(run())
+    try:
+        with anyio.fail_after(10):
+            await entered.wait()
+            if timer_first:
+                await unwinding.wait()
+            if owner == "task":
+                task.cancel()
+            else:
+                owner_scope.cancel()
+            await unwinding.wait()
+            release.set()
+            if owner == "task":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await task
+                assert owner_scope.cancelled_caught
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert raised == [kind]
+    assert len(model.calls) == 1
 
 
 async def test_requested_by_call_comes_from_the_tool_call_id() -> None:
@@ -520,13 +638,18 @@ async def test_schema_hooks_run_in_abandonable_preparation() -> None:
     assert finished.is_set()
 
 
-async def test_real_caller_cancellation_is_not_a_tool_result() -> None:
+@pytest.mark.parametrize("swallow", [False, True])
+async def test_real_caller_cancellation_is_not_a_tool_result(swallow: bool) -> None:
     entered = anyio.Event()
 
     class Waiting(FakeAgentContext):
         async def save_notes(self, text: str) -> None:
             entered.set()
-            await anyio.sleep_forever()
+            try:
+                await anyio.sleep_forever()
+            except asyncio.CancelledError:
+                if not swallow:
+                    raise
 
     tools, deps = tool_set(Waiting(input_model=Inputs))
     task = asyncio.create_task(invoke(tools, deps, "save_notes", {"text": "hello"}))
@@ -631,7 +754,12 @@ async def test_sdk_action_timeout_is_a_result_and_cancels_work() -> None:
     assert cancelled.is_set()
     assert len(model.calls) == 2
     assert result.final_output == "recovered"
-    assert "timed out" in json.dumps(model.calls[-1]["input"])
+    outputs = [
+        item["output"]
+        for item in model.calls[-1]["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert outputs == ["Tool 'save_notes' timed out after 0.05 seconds."]
 
 
 @pytest.mark.parametrize("kind", ["fence", "limit", "cleanup"])
