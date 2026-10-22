@@ -45,6 +45,7 @@ from swarm_arena.llm._reviewer import (
     _review_work,
 )
 from swarm_arena.llm._structured import DictOutputSchema, structured_call
+from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 
 _ENTRY: Final[dict[str, Any]] = {
     "type": "object",
@@ -623,13 +624,17 @@ class CollaborativePlanner(Planner):
         base_dir: Path,
     ) -> Plan:
         """Review with the explicit source root supplied by file-based callers."""
-        if current_llm_scope() is None:
-            async with planning_session(config, goal, self) as scope:
-                result = mark_planning_session(
-                    await self._review(goal, config, history, base_dir=base_dir), scope
-                )
-            return result
-        return await self._review(goal, config, history, base_dir=base_dir)
+        try:
+            if current_llm_scope() is None:
+                async with planning_session(config, goal, self) as scope:
+                    result = mark_planning_session(
+                        await self._review(goal, config, history, base_dir=base_dir), scope
+                    )
+                return result
+            return await self._review(goal, config, history, base_dir=base_dir)
+        finally:
+            if isinstance(self._reviewer, TerminalReviewer):
+                self._reviewer._clear_edit()
 
     async def _review(
         self,

@@ -364,6 +364,9 @@ async def test_terminal_session_exits_without_resurrection(
                     ):
                         await task
             assert os.get_blocking(read_fd)
+            assert reviewer._edit_bytes == b""
+            assert reviewer._draft_text == ""
+            assert not reviewer._retry_edit
             events = all_events(config)
             assert len([e for e in events if e.type == "goal_finished"]) == 1
             if mode == "deadline":

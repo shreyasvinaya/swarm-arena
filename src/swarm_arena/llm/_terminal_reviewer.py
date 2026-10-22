@@ -115,6 +115,12 @@ class TerminalReviewer:
         self._retry_edit = True
         print(diagnostic, file=self._stdout)
 
+    def _clear_edit(self) -> None:
+        """Release retained human text at the end of a collaborative session."""
+        self._draft_text = ""
+        self._edit_bytes = b""
+        self._retry_edit = False
+
     def _retry(self, boundary: _Outcome, error: BaseException, label: str) -> None:
         try:
             boundary.contain(error, RuntimeError, label)

@@ -298,9 +298,11 @@ Edited plans pass the same catalog admission as generated drafts, preserve
 their source directory, and cannot change the frozen human main goal. Its title,
 description, metadata, namespace, id, inputs and file declarations are all fixed;
 edited snapshots must still identify the original frozen files. A refused edit
-prints a safe admission diagnostic and asks for another review of the same draft,
+prints a safe admission diagnostic to stdout and returns the same draft to the
+reviewer for another review (including custom reviewers),
 retaining the edited text for repair without another paid model call. Each refused
 edit counts toward `max_iterations`; giving feedback requests a new draft instead.
+The terminal adapter clears retained edits when the collaborative session ends.
 Approval cannot authorize a mutation of the offered draft: return
 `Edited(plan)` to propose changes explicitly. Custom async reviewers must
 cooperate with cancellation.

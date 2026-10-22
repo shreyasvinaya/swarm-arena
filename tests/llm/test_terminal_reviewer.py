@@ -406,6 +406,35 @@ async def test_admission_refusal_keeps_edits_for_repair(tmp_path: Path) -> None:
     assert "edited plan admission refused" in out.getvalue()
 
 
+async def test_reused_reviewer_does_not_reopen_previous_session_edit(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    reopened = tmp_path / "reopened"
+    editor = _editor(
+        tmp_path,
+        "import pathlib, sys\np = pathlib.Path(sys.argv[1])\nt = p.read_text()\n"
+        f"first = pathlib.Path({str(first)!r})\n"
+        "if not first.exists():\n    first.write_text('1')\n"
+        "    p.write_text(t.replace('title = \"\"', 'title = \"refused old edit\"'))\n"
+        "else:\n"
+        f"    pathlib.Path({str(reopened)!r}).write_text(t)\n",
+    )
+    FakeModel([FakeTurn(text=json.dumps(planner_output())) for _ in range(2)]).register("planner")
+    reviewer = TerminalReviewer(stdin=io.StringIO("e\ne\n"), stdout=io.StringIO(), editor=editor)
+    planner = CollaborativePlanner(LLMPlanner("planner"), reviewer, max_iterations=1)
+    config = planner_config(tmp_path)
+    with pytest.raises(RuntimeError, match="plan not approved after 1 review"):
+        await planner.plan(PLAN.goal, config, None)
+    assert reviewer._edit_bytes == b""
+    assert reviewer._draft_text == ""
+    assert not reviewer._retry_edit
+    result = await planner.plan(PLAN.goal, config, None)
+    assert result.goal.title == ""
+    assert "refused old edit" not in reopened.read_text()
+    assert reviewer._edit_bytes == b""
+    assert reviewer._draft_text == ""
+    assert not reviewer._retry_edit
+
+
 async def test_editor_failure_asks_again(tmp_path: Path) -> None:
     editor = _editor(
         tmp_path, 'import sys\nsys.stderr.write("secret-sentinel-editor-failure")\nsys.exit(7)\n'
