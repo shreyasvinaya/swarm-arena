@@ -26,7 +26,8 @@ from swarm_arena._facade import publish as _publish
 from swarm_arena.llm._hooks import BudgetExceeded
 from swarm_arena.llm._judge import LLMJudge
 from swarm_arena.llm._manager import AgentsSDKManager
+from swarm_arena.llm._planner import LLMPlanner
 
-__all__: list[str] = ["AgentsSDKManager", "BudgetExceeded", "LLMJudge"]
+__all__: list[str] = ["AgentsSDKManager", "BudgetExceeded", "LLMJudge", "LLMPlanner"]
 
 _publish(__name__, __all__)

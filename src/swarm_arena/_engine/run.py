@@ -22,6 +22,8 @@ from swarm_arena._board.curator import Curator
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.estimate import final_slice_estimate, make_price_of, worst_case_estimate
 from swarm_arena._budget.ledger import Ledger
+from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.goal import GoalRunner, r0_revision_draft
 from swarm_arena._engine.manifest import RunManifest, build_manifest_async
@@ -42,7 +44,7 @@ from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
-from swarm_arena._journal.llm_record import _bound_run
+from swarm_arena._journal.llm_record import _bound_run, drain
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
@@ -51,6 +53,7 @@ from swarm_arena._model.base import LLMRole
 from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
+from swarm_arena._model.goal import Goal
 from swarm_arena._model.ids import IdGen, new_run_id
 from swarm_arena._model.plan import Plan, Resources, RoundSpec
 from swarm_arena._model.results import Candidate
@@ -1060,3 +1063,217 @@ async def write_review_export(state: RunState, store: Store, head: Head) -> None
             existing = await _review_io(_read_blob, store, key)
             if existing.data != data:
                 raise _core_error(StorageError, "review export bytes differ") from None
+
+
+def mark_planning_session(plan: Plan, scope: LLMScope) -> Plan:
+    """Copy a plan with its standalone session and completed planner calls.
+
+    Parameters
+    ----------
+    plan : Plan
+        Generated plan whose model fields remain unchanged.
+    scope : LLMScope
+        Planning scope after its calls have drained.
+
+    Returns
+    -------
+    Plan
+        Copy retaining its base directory and validated private provenance.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> from swarm_arena import Goal
+    >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
+    >>> mark_planning_session(plan, Mock(run_id="r-p", call_ids=["llm-1"])).planning_session
+    'r-p'
+    """
+    marked = plan.model_copy()
+    marked._set_planner_provenance(scope.run_id, scope.call_ids)
+    return marked
+
+
+def _planning_models(config: RunConfig, goal: Goal, planner: Planner) -> tuple[Goal, list[str]]:
+    """Detach the human goal and validate only the planner before any writes."""
+    goal = _detach_model(Goal, goal)
+    aliases = [_context_string(alias, "alias") for alias in planner.models()]
+    errors, warnings = check_models({"planner": aliases}, config)
+    if errors:
+        raise _core_error(ValueError, "\n".join(errors)) from None
+    return goal, warnings
+
+
+@asynccontextmanager
+async def planning_session(
+    config: RunConfig, goal: Goal, planner: Planner
+) -> AsyncGenerator[LLMScope]:
+    """Own a journaled planning lifetime without starting an executor or board.
+
+    Parameters
+    ----------
+    config : RunConfig
+        Human model catalog, budgets, storage and settlement settings.
+    goal : Goal
+        Human goal receiving the planner allocation.
+    planner : Planner
+        Component declaring its required model aliases.
+
+    Yields
+    ------
+    LLMScope
+        Planner scope under active-time, stop and lease supervision.
+
+    Raises
+    ------
+    ValueError
+        If model checks fail before storage is written.
+    RuntimeError
+        If initialization or planning stops before successful completion.
+
+    Examples
+    --------
+    >>> async with planning_session(config, goal, planner) as scope:  # doctest: +SKIP
+    ...     result = await planner.plan(goal, config, None)
+    """
+    from swarm_arena._engine.resume import _acquire_lease
+
+    _require_asyncio()
+    boundary = _Outcome()
+    try:
+        goal, warnings = await run_sync_daemon(_planning_models, config, goal, planner)
+    except BaseException as error:
+        boundary.contain(error, ValueError, "planning model checks")
+    run_id = new_run_id(utc_now())
+    store = await _storage_io(lambda: open_store(config.run_root).child(run_id))
+    artifacts = await _storage_io(lambda: ArtifactStore(open_store(config.artifact_root)))
+    lease = await _acquire_lease(
+        partial(
+            Lease.acquire_new,
+            store,
+            owner_id=uuid4().hex,
+            host=socket.gethostname(),
+            ttl_s=config.lease_ttl_s,
+        ),
+        settle_timeout_s=config.settle_timeout_s,
+    )
+    clock, stops = RunClock(0), StopState()
+    entered = completed = False
+    try:
+        async with (
+            _supervise_initialization(store, lease.doc.epoch, stops, clock, config),
+            _RunJournal(
+                store,
+                lease,
+                run_id=run_id,
+                next_seq=1,
+                local_path=_local_journal_path(run_id, lease.doc.epoch),
+                sync_interval_s=config.sync_interval_s,
+                settle_timeout_s=config.settle_timeout_s,
+            ) as journal,
+        ):
+            entered = True
+            journal.clock = clock
+            async with _supervise_writer(journal):
+                ids = IdGen(run_id, lease.doc.epoch)
+                ledger = Ledger(
+                    config.limits,
+                    reserve_fraction=config.reserve_fraction,
+                    goal_weights=config.goal_weights,
+                    journal=journal,
+                    ids=ids,
+                )
+                async with _bound_run(
+                    run_id,
+                    journal=journal,
+                    ids=ids,
+                    artifacts=artifacts,
+                    config=config,
+                    stops=stops,
+                    clock=clock,
+                    state=RunState(),
+                ):
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_CONFIG,
+                            payload={"config": config.model_dump(mode="json")},
+                        )
+                    )
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_STARTED,
+                            payload={
+                                "planning": True,
+                                "warnings": warnings,
+                                "final_slices": {goal.id: Amount().model_dump()},
+                            },
+                        )
+                    )
+                    await ledger.hold_final_slices({goal.id: Amount()})
+                    ledger.open_goal(goal.id)
+                    journal.append(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
+                    tranche = Tranche(
+                        ledger,
+                        f"{goal.id}/:planner",
+                        goal.id,
+                        size=Amount(
+                            tokens=config.limits.llm_tranche_tokens,
+                            usd=config.limits.llm_tranche_usd,
+                        ),
+                    )
+                    scope = LLMScope(
+                        role="planner",
+                        run_id=run_id,
+                        goal_id=goal.id,
+                        team="",
+                        agent="",
+                        round=0,
+                        candidate_id=None,
+                        tranche=tranche,
+                        journal=journal,
+                        artifacts=artifacts,
+                        models=config.models,
+                        tracing=config.tracing,
+                        cache=config.cache,
+                        limits=config.limits,
+                        settle_timeout_s=config.settle_timeout_s,
+                    )
+                    failed = True
+                    try:
+                        await journal.commit()
+                        await _storage_io(_create, store, "run.toml", config.dumps().encode())
+                        await _setup_run((), config)
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        with llm_scope(scope):
+                            yield scope
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        failed = False
+                    finally:
+                        try:
+                            if not failed:
+                                await drain(scope, wait=True)
+                        finally:
+                            with _stop_cleanup(config):
+                                await drain(scope, wait=False)
+                                outcome = await tranche.close()
+                                if outcome.overflow:
+                                    ledger._check_usage_overflow()
+                                await _record_stop(journal, stops)
+                                journal.append(
+                                    EventDraft(
+                                        type=EventType.GOAL_FINISHED,
+                                        goal_id=goal.id,
+                                        payload={
+                                            "reason": "stopped" if failed else "planning complete"
+                                        },
+                                    )
+                                )
+                                await ledger.end_goal(goal.id)
+                                await journal.commit()
+                    completed = True
+        if not completed or stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, "planning session stopped") from None
+    finally:
+        if not entered:
+            with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                with suppress(BaseException):
+                    await _storage_io(lease.release)

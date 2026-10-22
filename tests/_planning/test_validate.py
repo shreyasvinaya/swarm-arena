@@ -1,5 +1,6 @@
 """Exercise plan admission, revision authority, and frozen file boundaries."""
 
+import contextlib
 import sys
 import traceback
 from pathlib import Path
@@ -2412,3 +2413,124 @@ def test_instructions_do_not_change_the_fingerprint() -> None:
     assert validate_plan(two_agents, cfg) == []
     with pytest.raises(PlanError, match="max_agents_per_fingerprint"):
         validate_plan(plan, cfg)
+
+
+async def test_draft_admission_uses_explicit_base_dir_and_keeps_provenance(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/run.py").write_text("print('source')")
+    original = _plan(tool=CATALOG_TOOL, judges=[J_B], ranking="b", base_dir=tmp_path)
+    original = original.model_copy(
+        update={"goal": original.goal.model_copy(update={"files": FileSet(globs=["problem/*"])})}
+    )
+    path = tmp_path / "plan.toml"
+    path.write_text(original.dumps())
+    loaded = Plan.load(path)
+    assert Path.cwd() != loaded.base_dir
+    current, _ = admit_revision(loaded, CFG_WITH_CATALOG, artifacts)
+    frozen_goal = await _freeze_draft_goal(
+        loaded.goal, base_dir=loaded.base_dir, artifacts=artifacts
+    )
+    proposed = mark_planning_session(current, Mock(run_id="r-p", call_ids=["llm-1"]))
+    admitted = await _admit_draft(
+        proposed,
+        CFG_WITH_CATALOG,
+        artifacts,
+        frozen_goal=frozen_goal,
+        base_dir=loaded.base_dir,
+        history=[current],
+        origin="autonomous",
+    )
+    assert admitted.goal.key() == current.goal.key()
+    assert admitted.base_dir == loaded.base_dir
+    assert admitted.planning_session == "r-p"
+    assert admitted.planner_call_ids == ("llm-1",)
+    assert (admitted.origin, admitted.revision, admitted.parent_revision) == ("autonomous", 1, 0)
+
+
+@pytest.mark.parametrize("change", ["inputs", "files", "mutate-inputs"])
+async def test_initial_draft_cannot_replace_frozen_human_goal(
+    tmp_path: Path, artifacts: ArtifactStore, change: str
+) -> None:
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    goal = Goal(id="g", namespace="demo", inputs={"value": "original"})
+    frozen = await _freeze_draft_goal(goal, base_dir=tmp_path, artifacts=artifacts)
+    if change == "mutate-inputs":
+        goal.inputs["value"] = "secret-sentinel"
+        altered = goal
+    elif change == "inputs":
+        altered = goal.model_copy(update={"inputs": {"value": "secret-sentinel"}})
+    else:
+        altered = goal.model_copy(update={"files": FileSet(manifest={"problem/data": "a" * 64})})
+    proposed = _plan().model_copy(update={"goal": altered, "origin": "human"})
+    with pytest.raises(PlanError, match="frozen main goal") as caught:
+        await _admit_draft(
+            proposed, CFG_WITH_CATALOG, artifacts, frozen_goal=frozen, base_dir=tmp_path
+        )
+    assert_secret_absent(caught.value, "secret-sentinel")
+
+
+async def test_initial_draft_cannot_claim_human_catalog_authority(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    proposed = _plan(tool=Ref(path="_fakes.import_canary:Tool"))
+    sys.modules.pop("_fakes.import_canary", None)
+    frozen = await _freeze_draft_goal(proposed.goal, base_dir=tmp_path, artifacts=artifacts)
+    with pytest.raises(PlanError, match="catalog"):
+        await _admit_draft(proposed, RunConfig(), artifacts, frozen_goal=frozen, base_dir=tmp_path)
+    assert "_fakes.import_canary" not in sys.modules
+
+
+async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/a").write_text("a")
+    (tmp_path / "problem/b").write_text("b")
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    held = HeldOperation()
+    uploaded: list[bytes] = []
+    original = artifacts.put_bytes
+
+    def put(data: bytes) -> str:
+        uploaded.append(data)
+        held.wait()
+        return original(data)
+
+    monkeypatch.setattr(artifacts, "put_bytes", put)
+    task = asyncio.create_task(
+        _freeze_draft_goal(
+            Goal(id="g", namespace="n", files=FileSet(globs=["problem/*"])),
+            base_dir=tmp_path,
+            artifacts=artifacts,
+        )
+    )
+    try:
+        await held.ready()
+        task.cancel()
+        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            await task
+        await held.finish()
+        assert len(uploaded) == 1
+    finally:
+        await held.finish()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task

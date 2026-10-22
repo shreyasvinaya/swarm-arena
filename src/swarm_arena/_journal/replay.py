@@ -345,6 +345,9 @@ class RunState:
                     plan = Plan._from_data(payload["plan"], base_dir=Path(payload["base_dir"]))
                 else:
                     plan = Plan.model_validate(payload["plan"])
+                plan._set_planner_provenance(
+                    payload.get("planning_session"), payload.get("planner_call_ids", ())
+                )
                 if revisions and revisions[-1][0].parts != plan.parts:
                     self.goals[event.goal_id] = self.goals[event.goal_id].model_copy(
                         update={"kept_parts": {}, "join_attempts": 0, "join_failures": []}

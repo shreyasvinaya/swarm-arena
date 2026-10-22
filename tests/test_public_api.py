@@ -122,7 +122,7 @@ try:
 except importlib.metadata.PackageNotFoundError:
     pass
 else:
-    PUBLIC["swarm_arena.llm"] = ["AgentsSDKManager", "BudgetExceeded", "LLMJudge"]
+    PUBLIC["swarm_arena.llm"] = ["AgentsSDKManager", "BudgetExceeded", "LLMJudge", "LLMPlanner"]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))

@@ -527,7 +527,9 @@ async def test_replanner_runs_in_planner_scope_and_revisions_journal_call_ids(
     plan = _admitted(env, _plan(teams=1), tmp_path)
     _catalog_env(env, plan, **{"catalog-agent": plan.teams[0].agents[0].tool})
     planner = _ScopeProbePlanner(AddAgentPlanner("catalog-agent"))
-    await GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner).run()
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
+    await runner.run()
+    assert runner.plan.planner_call_ids == ("llm-p1",)
     s: LLMScope = planner.seen[0]
     assert (s.role, s.goal_id, s.team, s.agent, s.round, s.candidate_id) == (
         "planner",
@@ -2078,3 +2080,79 @@ async def test_page_storage_preserves_control_and_chain_errors(kind: str) -> Non
 
     with pytest.raises(expected):
         await _page_storage(operation)
+
+
+async def test_llm_join_revision_is_admitted(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from _fakes.planning_llm import planner_config
+    from _fakes.run import events
+
+    from swarm_arena import Swarm
+    from swarm_arena.llm import LLMPlanner
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Estimate
+
+    config = planner_config(tmp_path)
+    config = config.model_copy(
+        update={
+            "limits": config.limits.model_copy(
+                update={
+                    "max_rounds": 2,
+                    "default_run_reservation": Estimate(tokens=0, usd=0),
+                }
+            )
+        }
+    )
+    initial = _parts_plan(rounds=2, fail_join=True).model_copy(update={"rounds": [RoundSpec()]})
+    from swarm_arena.config import CatalogEntry, PlannerCatalog
+
+    tool = initial.teams[0].agents[0].tool
+    config = config.model_copy(
+        update={
+            "planner_catalog": PlannerCatalog(
+                entries=[
+                    *config.planner_catalog.entries,
+                    CatalogEntry(
+                        name="part-tool",
+                        kind="tool",
+                        ref=tool.path,
+                        config=tool.config,
+                        description="Approved part work in extra rounds",
+                    ),
+                ]
+            )
+        }
+    )
+    fake = FakeModel(
+        [
+            FakeTurn(
+                text=json.dumps(
+                    {
+                        "keep_teams": ["a1", "b1"],
+                        "keep_parts": ["a", "b"],
+                        "rounds": [{}],
+                    }
+                )
+            )
+        ]
+    )
+    fake.register("planner")
+    await Swarm(config, replanner=LLMPlanner("planner")).run(initial)
+    revisions = events(config, "plan_revision")
+    assert [e.payload["plan"]["revision"] for e in revisions] == [0, 1], events(
+        config, "plan_rejected"
+    )
+    assert revisions[1].payload["planner_call_ids"]
+    assert events(config, "join_failed")
+    assert "join_failures" in json.dumps(fake.calls[0], default=str)
+
+
+async def test_r0_payload_links_the_planning_session(env: EngineEnv) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+
+    initial = mark_planning_session(_plan(rounds=1), Mock(run_id="r-p", call_ids=["llm-1"]))
+    await GoalRunner(env.deps, goal_id="g", plan=initial, replanner=None).run()
+    r0 = env.events("plan_revision")[0].payload
+    assert (r0["planning_session"], r0["planner_call_ids"]) == ("r-p", ["llm-1"])

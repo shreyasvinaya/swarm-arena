@@ -433,3 +433,35 @@ def test_malformed_nested_ref_diagnostics_hide_values() -> None:
     with pytest.raises(ValidationError) as caught:
         ref_sites(plan)
     assert_secret_absent(caught.value, secret, sanitized=True)
+
+
+def test_detach_and_stamp_keep_planner_metadata(tmp_path: Path) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+    from swarm_arena._planning.provenance import _detach_plan
+
+    source = Plan.loads(_plan().dumps(), base_dir=tmp_path)
+    marked = mark_planning_session(source, Mock(run_id="r-p", call_ids=["llm-1", "llm-2"]))
+    for result in (
+        _detach_plan(marked),
+        stamp(marked, origin="llm", parent=None),
+        marked.model_copy(deep=True),
+    ):
+        assert result.base_dir == tmp_path
+        assert result.planning_session == "r-p"
+        assert result.planner_call_ids == ("llm-1", "llm-2")
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("_planning_session", "../secret-sentinel"), ("_planner_call_ids", [object()])],
+)
+def test_detach_validates_private_planner_metadata(field: str, bad: Any) -> None:
+    from swarm_arena._planning.provenance import _detach_plan
+
+    plan = _plan()
+    setattr(plan, field, bad)
+    with pytest.raises(ValueError, match=r"invalid planner|invalid planning") as caught:
+        _detach_plan(plan)
+    assert_secret_absent(caught.value, "secret-sentinel")

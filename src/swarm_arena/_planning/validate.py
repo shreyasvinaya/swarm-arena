@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
@@ -11,7 +12,8 @@ from pydantic import BaseModel
 from swarm_arena._agent.manager import Manager
 from swarm_arena._budget.estimate import make_price_of
 from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
-from swarm_arena._model.base import LLMRole
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, ModelSpec, _human_only_inputs
 from swarm_arena._model.context_strings import _context_string
@@ -23,13 +25,14 @@ from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
-from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
+from swarm_arena._planning.provenance import RefSite, _detach_plan, is_nested_ref, ref_sites, stamp
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.io import _storage_io
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
 from swarm_arena._tooling.paths import fold_key, matches
 from swarm_arena._tooling.staging import tool_root
@@ -1159,3 +1162,99 @@ def admit_revision(
         frozen, config, history=history, other_active_agents=other_active_agents
     )
     return frozen, warnings
+
+
+class _DraftArtifacts(ArtifactStore):
+    """Collect immutable snapshot bytes before the async owner publishes them."""
+
+    def __init__(self) -> None:
+        self.payloads: dict[str, bytes] = {}
+
+    def put_bytes(self, data: bytes) -> str:
+        """Stage one file without performing external storage operations."""
+        data = memoryview(data).tobytes()
+        digest = sha256_hex(data)
+        self.payloads[digest] = data
+        return digest
+
+
+def _publish_draft_artifact(artifacts: ArtifactStore, digest: str, data: bytes) -> None:
+    """Validate backend results inside the per-object storage worker."""
+    actual = _context_string(artifacts.put_bytes(data), "artifact digest")
+    if actual != digest:
+        raise ValueError("invalid artifact digest")
+
+
+async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: ArtifactStore) -> _T:
+    """Prepare in a daemon and publish each file separately under the caller."""
+
+    def prepare() -> tuple[_T, dict[str, bytes]]:
+        staging = _DraftArtifacts()
+        result = operation(staging)
+        return result, staging.payloads
+
+    boundary = _Outcome()
+    try:
+        result, payloads = await run_sync_daemon(prepare)
+    except BaseException as error:
+        boundary.contain(error, ValueError, "draft admission")
+    for digest, data in payloads.items():
+        await _storage_io(_publish_draft_artifact, artifacts, digest, data)
+    return result
+
+
+async def _freeze_draft_goal(goal: Goal, *, base_dir: Path, artifacts: ArtifactStore) -> Goal:
+    """Freeze the human goal before generation, using the caller's source root."""
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        detached = _detach_model(Goal, goal)
+        files = snapshot_fileset(detached.files, Path(base_dir).resolve(), staging)
+        return detached.model_copy(update={"files": files})
+
+    return await _draft_work(prepare, artifacts)
+
+
+async def _admit_draft(
+    plan: Plan,
+    config: RunConfig,
+    artifacts: ArtifactStore,
+    *,
+    frozen_goal: Goal,
+    base_dir: Path,
+    history: Sequence[Plan] = (),
+    origin: Origin = "llm",
+    admit: Callable[..., tuple[Plan, list[str]]] = admit_revision,
+) -> Plan:
+    """Stamp, compare frozen identity and admit a generated or edited draft.
+
+    Async callers retain stop/clock/lease supervision across this operation.
+    Preparation cannot publish artifacts; the owner uploads each staged object
+    only after successful authorization and validation. The explicit directory
+    is the loaded plan's root, or cwd for a direct initial Python call.
+    """
+
+    def prepare(staging: ArtifactStore) -> Plan:
+        if origin == "human":
+            raise _core_error(PlanError, ["draft origin must be non-human"])
+        revisions = [_detach_plan(previous) for previous in history]
+        frozen = _detach_model(Goal, frozen_goal)
+        proposed = stamp(
+            _detach_plan(plan), origin=origin, parent=revisions[-1] if revisions else None
+        )
+        proposed._base_dir = Path(base_dir).resolve()
+        candidate_goal = proposed.goal
+        if not candidate_goal.files.snapshotted:
+            candidate_goal = candidate_goal.model_copy(
+                update={
+                    "files": snapshot_fileset(candidate_goal.files, proposed.base_dir, staging),
+                }
+            )
+        if candidate_goal.key() != frozen.key():
+            raise _core_error(PlanError, ["/goal: main goal differs from the frozen main goal"])
+        proposed = proposed.model_copy(update={"goal": frozen})
+        admitted, _ = admit(proposed, config, staging, history=revisions)
+        if admitted.goal.key() != frozen.key():
+            raise _core_error(PlanError, ["/goal: main goal differs from the frozen main goal"])
+        return admitted
+
+    return await _draft_work(prepare, artifacts)

@@ -454,6 +454,10 @@ Signatures only; bodies are `...`. The comment above each block names the privat
 
 ### R4.1 `swarm_arena` (top level)
 
+Planner provenance validation: private session and call IDs are normalized safe
+identifier components. Detachment, stamping, admission and replay retain them;
+TOML preserves only the validated first-line session link and its source directory.
+
 ```python
 # _model/ref.py — M1a
 class Ref(FrozenModel):
@@ -2234,6 +2238,18 @@ def ranked(candidates: Iterable[Candidate], scores: Iterable[Score], *, identity
 
 #### R4.13.12 Planning internals — M1b
 
+Generated-draft boundary in `_planning/validate.py`:
+`async _freeze_draft_goal(goal: Goal, *, base_dir: Path, artifacts: ArtifactStore) -> Goal`
+freezes the human identity before generation. `async _admit_draft(plan: Plan,
+config: RunConfig, artifacts: ArtifactStore, *, frozen_goal: Goal, base_dir: Path,
+history: Sequence[Plan] = (), origin: Origin = "llm",
+admit: Callable[..., tuple[Plan, list[str]]] = admit_revision) -> Plan` stamps and
+compares the main GoalKey before and after shared admission. The admission
+callable preserves the engine's existing supervised admission seam. File bytes
+are staged in the daemon, then uploaded one object at a time through owned
+storage boundaries. Direct initial Python generation uses cwd; history uses
+r0's base_dir; file-based callers supply their loaded directory explicitly.
+
 ```python
 class RefSite(FrozenModel):
     pointer: str                                     # JSON pointer in the plan, e.g. "/teams/0/agents/1/tool"
@@ -2402,6 +2418,12 @@ preserve the prepared handoff, drain/close before unbinding, and clean up failed
 setup. A completed resume never constructs a manager merely for registration.
 The private `_bound_run` context is also the ownership seam for planning sessions;
 the standalone planning-session API remains a separate implementation.
+
+Standalone planning uses the initialization and writer supervisors, a real
+clock, one setup/bind lifetime and a registered goal before its planner tranche.
+It validates models before writes, honors tracing consent, and drains/closes on
+all exits. A stopped setup cannot yield. `LLMPlanner._draft_at(..., base_dir: Path)`
+is the explicit-directory internal generation entry point.
 
 #### R4.13.14 Board internals — M1b (`RunBoard`, frontier, digest), M2 (rest)
 
@@ -2720,6 +2742,12 @@ with `one response-cache policy per process`. A run without a cache policy leave
 the process installation alone and relies on its per-call cache controls.
 
 ### R4.14 Journal event types — M1b (additions noted)
+
+Planning provenance payload extension: every `plan_revision`, including an
+autonomous revision, carries `planning_session` and validated `planner_call_ids`.
+The r0 builder includes these for queued goals. Replay restores both private
+attributes and keeps the original base_dir. A standalone `run_started` sets
+`planning: true`, warnings and zero final slices before registering its goal.
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
 

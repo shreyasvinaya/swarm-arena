@@ -64,7 +64,7 @@ from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import _detach_plan, stamp
-from swarm_arena._planning.validate import admit_revision
+from swarm_arena._planning.validate import _admit_draft, admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.ranking import ranked
 from swarm_arena._scoring.runner import (
@@ -120,7 +120,7 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
     Returns
     -------
     EventDraft
-        Plan, origin, base directory, and empty run planner-call ids.
+        Plan, origin, base directory, planning session and planner-call ids.
 
     Examples
     --------
@@ -136,7 +136,8 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "plan": plan.model_dump(mode="json"),
             "origin": plan.origin,
             "base_dir": str(base_dir),
-            "planner_call_ids": [],
+            "planner_call_ids": list(plan.planner_call_ids),
+            "planning_session": plan.planning_session,
             "first_round": 1,
         },
     )
@@ -1165,16 +1166,17 @@ class GoalRunner:
 
             async def prepare() -> Plan:
                 # Admission can execute extension Config validators.
-                admitted, _ = await run_sync_daemon(
-                    partial(
-                        admit_revision,
-                        revision,
-                        self.deps.config,
-                        self.deps.artifacts,
-                        history=self.history,
-                        other_active_agents=0,
-                    )
+                admitted = await _admit_draft(
+                    revision,
+                    self.deps.config,
+                    self.deps.artifacts,
+                    frozen_goal=self.history[0].goal,
+                    base_dir=self.history[0].base_dir,
+                    history=self.history,
+                    origin="autonomous",
+                    admit=admit_revision,
                 )
+                admitted._set_planner_provenance(admitted.planning_session, tuple(scope.call_ids))
                 if (
                     self._join_retry_number is not None
                     and admitted.rounds_total(self.deps.config.limits) <= self.rounds_closed
@@ -1199,7 +1201,8 @@ class GoalRunner:
                         EventType.PLAN_REVISION,
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
-                        planner_call_ids=list(scope.call_ids),
+                        planner_call_ids=list(admitted.planner_call_ids),
+                        planning_session=admitted.planning_session,
                         first_round=self.rounds_closed + 1,
                     )
                 )

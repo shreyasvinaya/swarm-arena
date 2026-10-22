@@ -1279,3 +1279,224 @@ async def test_startup_model_hook_is_abandonable(run_config: RunConfig) -> None:
             await anyio.to_thread.run_sync(worker.join, 5)
             assert not worker.is_alive()
     assert await anyio.to_thread.run_sync(lambda: not Path(run_config.run_root).exists())
+
+
+def _planning_config(
+    config: RunConfig, *, tokens: int | None = 1000, usd: float | None = None
+) -> RunConfig:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    return config.model_copy(
+        update={
+            "limits": Limits(max_tokens=tokens, max_usd=usd),
+            "models": ModelCatalog(
+                {"p": ModelSpec(model="unpriced/planner-test", roles=["planner"], max_tokens=10)}
+            ),
+            "settle_timeout_s": 2,
+        }
+    )
+
+
+def _session_planner() -> Any:
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena import Goal, Plan
+
+    class Planner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("p",)
+
+    return Planner([Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])])
+
+
+async def test_planning_session_needs_max_tokens(run_config: RunConfig) -> None:
+    from swarm_arena import Goal
+    from swarm_arena._engine.run import planning_session
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        async with planning_session(
+            _planning_config(run_config, tokens=None),
+            Goal(id="g", namespace="n"),
+            _session_planner(),
+        ):
+            pytest.fail("invalid session yielded")
+    assert not await anyio.Path(run_config.run_root).exists()
+
+
+async def test_planning_session_rejects_an_unpriced_model_with_max_usd(
+    run_config: RunConfig,
+) -> None:
+    from swarm_arena import Goal
+    from swarm_arena._engine.run import planning_session
+
+    with pytest.raises(ValueError, match="no known price"):
+        async with planning_session(
+            _planning_config(run_config, usd=1), Goal(id="g", namespace="n"), _session_planner()
+        ):
+            pytest.fail("unpriced session yielded")
+    assert not await anyio.Path(run_config.run_root).exists()
+
+
+async def test_planning_session_runs_model_checks(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena import Goal
+    from swarm_arena._engine.run import planning_session
+    from swarm_arena._planning import validate
+
+    uses: list[Any] = []
+
+    def check(roles: Any, config: RunConfig) -> tuple[list[str], list[str]]:
+        uses.append(dict(roles))
+        return [], ["planner warning"]
+
+    monkeypatch.setattr(validate, "_MODEL_CHECKS", [check])
+    config = _planning_config(run_config)
+    async with planning_session(config, Goal(id="g", namespace="n"), _session_planner()):
+        pass
+    assert uses == [{"planner": ["p"]}]
+    started = next(e for e in all_events(config) if e.type == "run_started")
+    assert started.payload["planning"] is True
+    assert "planner warning" in started.payload["warnings"]
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_planning_session_releases_lease_and_unbinds(
+    run_config: RunConfig, interrupted: bool
+) -> None:
+    from _fakes.llm_run import record_kwargs
+
+    from swarm_arena import Goal
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._engine.run import planning_session
+    from swarm_arena._journal.llm_record import open_call, record_call
+    from swarm_arena.manager import LimitReached
+    from swarm_arena.tool import Usage
+
+    config = _planning_config(run_config, tokens=20).model_copy(update={"reserve_fraction": 0})
+    scope = None
+    try:
+        async with planning_session(
+            config, Goal(id="g", namespace="n"), _session_planner()
+        ) as scope:
+            assert current_llm_scope() is scope
+            rid = await scope.tranche.reserve_call(Amount(tokens=20))
+            cid = open_call(
+                scope,
+                reservation_id=rid,
+                model_alias="p",
+                model="unpriced/planner-test",
+                provider="unpriced",
+                estimate=Amount(tokens=20),
+            )
+            if interrupted:
+                raise asyncio.CancelledError()
+            await record_call(
+                **record_kwargs(
+                    {
+                        "run_id": scope.run_id,
+                        "goal_id": "g",
+                        "team": "",
+                        "agent": "",
+                        "round": "0",
+                        "role": "planner",
+                        "model_alias": "p",
+                        "reservation_id": rid,
+                        "call_id": cid,
+                    },
+                    cost_usd=0,
+                    usage=Usage(input_tokens=20),
+                )
+            )
+    except asyncio.CancelledError:
+        assert interrupted
+    assert scope is not None
+    assert current_llm_scope() is None
+    owner = read_owner(LocalStore(Path(config.run_root) / scope.run_id))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    with pytest.raises(ValueError, match="not bound"):
+        await record_call(**record_kwargs({"run_id": scope.run_id}, settle=False))
+    state = RunState.from_events(all_events(config))
+    assert len(state.llm_calls) == 1
+    assert list(state.llm_calls) == scope.call_ids
+    assert state.run_elapsed_s > 0
+    assert [e.type for e in all_events(config)][:2] == ["run_config", "run_started"]
+    recovered = Ledger.replay(state, journal=Mock(), ids=IdGen(scope.run_id, 2))
+    with pytest.raises(LimitReached):
+        await recovered.reserve(":run", Amount(tokens=1), kind="call", goal_id="g")
+
+
+@pytest.mark.parametrize("stop", ["stop", "cancel"])
+async def test_planning_session_stopped_setup_never_yields(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena import Goal
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._journal import llm_record
+
+    held = HeldOperation()
+    monkeypatch.setattr(run_module, "_run_setups", [lambda config: held.wait()])
+    config = _planning_config(run_config)
+    yielded: list[bool] = []
+
+    async def enter() -> None:
+        async with run_module.planning_session(
+            config, Goal(id="g", namespace="n"), _session_planner()
+        ):
+            yielded.append(True)
+
+    task = asyncio.create_task(enter())
+    try:
+        await held.ready()
+        (session,) = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
+        if stop == "stop":
+            (session / "control" / "stop-e1").write_text("")
+        else:
+            task.cancel()
+        with anyio.fail_after(10), pytest.raises((RuntimeError, asyncio.CancelledError)):
+            await task
+        assert yielded == []
+        assert session.name not in llm_record._bindings
+        owner = read_owner(LocalStore(session))
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+        assert RunState.from_events(all_events(config)).goals["g"].finished
+        before = all_events(config)
+        await held.finish()
+        assert all_events(config) == before
+    finally:
+        await held.finish()
+        if not task.done():
+            task.cancel()
+            with suppress(BaseException):
+                await task
+
+
+async def test_queued_r0_carries_planning_session(run_config: RunConfig) -> None:
+    from swarm_arena._engine.run import mark_planning_session
+
+    config = with_limits(run_config, max_concurrent_goals=1)
+    plans = [
+        mark_planning_session(
+            plan(goal_id=name, rounds=1), Mock(run_id="r-planning", call_ids=["llm-1"])
+        )
+        for name in ("g", "queued")
+    ]
+    await Swarm(config).run(plans)
+    revisions = events(config, "plan_revision")
+    assert {e.goal_id for e in revisions} == {"g", "queued"}
+    assert all(
+        (e.payload["planning_session"], e.payload["planner_call_ids"]) == ("r-planning", ["llm-1"])
+        for e in revisions
+    )
+    state = RunState.from_events(all_events(config))
+    assert all(
+        entries[0][0].planning_session == "r-planning"
+        and entries[0][0].planner_call_ids == ("llm-1",)
+        for entries in state.plans.values()
+    )

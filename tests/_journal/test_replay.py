@@ -1036,3 +1036,27 @@ def test_replay_accepts_review_imported() -> None:
     )
     assert state.scores == {}
     assert state.id_counters["s"] == 42
+
+
+def test_replay_restores_planner_provenance_and_base_dir(tmp_path: Path) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.goal import r0_revision_draft
+    from swarm_arena._engine.run import mark_planning_session
+
+    plan = mark_planning_session(_plan(), Mock(run_id="r-p", call_ids=["llm-1"]))
+    draft = r0_revision_draft(plan, tmp_path)
+    state = RunState.from_events([_ev(1, "plan_revision", draft.payload, goal_id="g")])
+    restored = state.plans["g"][0][0]
+    assert (restored.planning_session, restored.planner_call_ids) == ("r-p", ("llm-1",))
+    assert restored.base_dir == tmp_path
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("planning_session", "../secret-sentinel"), ("planner_call_ids", [123])]
+)
+def test_replay_refuses_invalid_planner_provenance(key: str, value: Any) -> None:
+    payload = {"plan": _plan().model_dump(mode="json"), "origin": "human", key: value}
+    with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
+        RunState.from_events([_ev(1, "plan_revision", payload, goal_id="g")])
+    assert_secret_absent(caught.value, "secret-sentinel")

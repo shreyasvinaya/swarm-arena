@@ -166,9 +166,64 @@ run, including historical part keys and finished goals. Resume restores those
 reservations and historical board reads from every admitted revision. A later
 revision cannot assign another goal a key that appeared only in an older revision.
 
-## Later planning modes
+## LLM planning
 
-Built-in LLM planning, interactive **together** planning, and **autonomous**
-planning are M3 features. The public `Planner` interface and optional
-`Swarm(..., replanner=...)` support custom revision producers now; they do not
-install a model integration. Human review and the shared arena arrive in M2.
+Install the `llm` extra and configure a model alias with the `planner` role,
+`limits.max_tokens`, and a human-maintained `planner_catalog`. If `max_usd` is
+set, all declared models need prices. `LLMPlanner` checks aliases before opening
+a standalone planning session or making a paid call.
+
+```python
+from swarm_arena.llm import LLMPlanner
+
+# config contains your model aliases, limits, and permitted component entries.
+plan = await LLMPlanner("planner").plan(goal, config, None)
+```
+
+The model selects catalog entry names and fills only their `settable` fields.
+Entry kind, fixed settings, nested output shapes and authorization are checked
+before execution. The core assigns `origin="llm"` and revision zero; model output
+cannot assign human provenance. The human main goal, inputs and resolved files
+are frozen before generation. A completed draft cannot change that identity.
+
+A direct initial Python call resolves relative goal and catalog files against
+its current working directory. With history, the original admitted plan's
+`base_dir` is used. Internal file-based callers supply that source directory
+explicitly to the shared draft/admission helper; storage roots and generated
+metadata do not select a source directory.
+
+Outside a running scope, planning opens its own leased, journaled session with
+registered run setups, a live timeout/stop clock, and a budget ledger. Calls are
+drained before return; stopped setup cannot yield a usable scope. Success and
+interruption both retain committed usage for replay. No executor or board is
+started for this session.
+
+`plan.planning_session` links to that session and `plan.planner_call_ids` lists
+its calls. Both properties are read-only. `plan.dumps()` writes a first-line
+`# swarm-arena planning session: <run id>` comment. Loading TOML preserves the
+validated session link and source directory, while call IDs become empty;
+read the linked journal for those calls. Initial `plan_revision` records carry
+this link even for queued goals, and replay restores the recorded provenance.
+
+## Autonomous planning
+
+Pass `replanner=LLMPlanner("planner")` to `Swarm(config, ...)`. The planner uses
+the fixed history supplied by the engine: scores, untrusted learning titles,
+pruning decisions, remaining budget, completed rounds and join failures.
+Join-failure replans use the same admission path as ordinary revisions.
+
+Replans keep all current plan-level checks and judges, ranking and policy;
+additional catalog checks may be appended. `keep_teams` and `keep_parts` retain
+named human components unchanged, including non-catalog ScriptTool teams and
+part-specific checks, judges and ranking. A kept name must exist and cannot
+also be newly defined. New parts inherit main scoring and can use only the
+main goal's frozen files, never judge-private files.
+
+An explicit new round schedule includes completed rounds, including completed
+implicit rounds. Empty output rounds retain the current schedule. Every draft
+passes shared authorization, file admission and component preflight before the
+engine publishes an autonomous revision under the run's admission lock.
+Rejected proposals keep the current revision. Fencing, terminal accounting
+failures and caller cancellation propagate as controls.
+
+Interactive **together** planning remains a later M3 feature.

@@ -305,4 +305,5 @@ def _detach_plan(value: object) -> Plan:
     base_dir = value.base_dir
     plan = _detach_model(Plan, value)
     plan._base_dir = type(plan.base_dir)(str(base_dir))
+    plan._set_planner_provenance(value.planning_session, value.planner_call_ids)
     return plan
