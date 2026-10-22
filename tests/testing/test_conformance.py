@@ -2130,3 +2130,32 @@ async def test_conformance_preserves_native_caller_cancellation(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_rejects_reservations_without_calls(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    scopes: list[Any] = []
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scopes.append(await _reserve_conformance_call(opened=False))
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scopes.append(await _reserve_conformance_call(opened=False))
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(AssertionError, match="drain rule"):
+        await _run_conformance_kind(kind)
+    assert scopes[0].tranche._closed

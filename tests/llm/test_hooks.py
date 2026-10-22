@@ -858,3 +858,38 @@ def test_shared_classifier_unwraps_deep_carrier_groups_iteratively() -> None:
         error = ExceptionGroup("private", [error])
     result = _classify_outcome(error)
     assert _core_category(result) is _SignalCategory.TERMINAL
+
+
+@pytest.mark.parametrize("drained", [False, True])
+async def test_refused_call_registration_refunds_before_provider_dispatch(
+    tmp_path: Path,
+    drained: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena.llm import _hooks
+
+    failure = ValueError("registration refused")
+
+    def refuse(*args: Any, **kwargs: Any) -> str:
+        raise failure
+
+    fake = FakeModel([FakeTurn(text="unused")])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        if drained:
+            await drain(scope, wait=False)
+        else:
+            monkeypatch.setattr(_hooks, "open_call", refuse)
+        with (
+            llm_scope(scope),
+            pytest.raises(ValueError, match=r"registration refused|scope is drained") as caught,
+        ):
+            await invoke(metered(fake))
+        if not drained:
+            assert caught.value is failure
+        assert fake.calls == []
+        assert scope.tranche.pending() == 0
+        await scope.tranche.close()
+        await run.journal.commit()
+        assert run.calls() == []
+        assert run.charged(scope) == Amount()

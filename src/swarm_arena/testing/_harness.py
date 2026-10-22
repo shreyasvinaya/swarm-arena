@@ -83,7 +83,8 @@ class _LLMContractError(AssertionError):
 
 async def _assert_drained(scope: LLMScope) -> None:
     """Check self-drain while the owner can still settle a broken component."""
-    if await drain(scope, wait=False):
+    missing = await drain(scope, wait=False)
+    if missing or scope.tranche.pending() != 0:
         raise _LLMContractError("LLM drain rule: component must drain its calls before returning")
 
 

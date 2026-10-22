@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from typing import Any, TypeVar
@@ -480,14 +481,22 @@ class MeteredModel(Model):
             classified = outcome.classify(_unwrap_control(error))
             carrier = _sdk_control(classified)
             raise carrier if carrier is not None else classified from None
-        call_id = open_call(
-            scope,
-            reservation_id=rid,
-            estimate=estimate,
-            model_alias=self.alias,
-            model=spec.model,
-            provider=spec.provider,
-        )
+        try:
+            call_id = open_call(
+                scope,
+                reservation_id=rid,
+                estimate=estimate,
+                model_alias=self.alias,
+                model=spec.model,
+                provider=spec.provider,
+            )
+        except BaseException:
+            # Registration refused before provider dispatch: no usage was possible.
+            # Keep the refusal if durable accounting also fails; owner cleanup
+            # retains the reservation and genuine cancellation still propagates.
+            with suppress(Exception):
+                await scope.tranche.settle_call(rid, Amount())
+            raise
         self.call_ids.append(call_id)
 
         def settings() -> ModelSettings:
