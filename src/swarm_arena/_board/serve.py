@@ -21,6 +21,7 @@ from swarm_arena._board.cache import LearningFilter
 from swarm_arena._board.human_ops import _apply_human_operation
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._board.pointers import _validate_namespace
+from swarm_arena._board.trace import cache_stats
 from swarm_arena._errors import _core_error
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.results import Learning
@@ -161,7 +162,26 @@ def _candidate_page(state: _ArenaReader, namespaces: Sequence[str], identifier: 
             pending.extend(parent.parent_ids)
     body += " ".join(_link("candidate", parent) for parent in ancestors) or "-"
     lines = state.trace(namespaces, identifier)
+    body += f'<p><a href="/run/{_e(quote(item.run_id, safe=""))}/llm">LLM cache statistics</a></p>'
     return body + f"<h2>Trace</h2><pre>{_e(chr(10).join(lines))}</pre>"
+
+
+def _llm_page(state: _ArenaReader, identifier: str) -> str:
+    """Render token-cache rates and response hits from the request's reader."""
+    stats = cache_stats(state.llm_calls(identifier))
+    body = (
+        f"<h1>LLM calls: {_e(identifier)}</h1><table><thead><tr>"
+        "<th>Agent / role</th><th>Calls</th><th>Input tokens</th>"
+        "<th>Cache read tokens</th><th>Cache write tokens</th>"
+        "<th>Cache hit rate</th><th>Response hits</th></tr></thead><tbody>"
+    )
+    for key, row in sorted(stats.items()):
+        body += (
+            f"<tr><td>{_e(key)}</td><td>{row.calls}</td><td>{row.input_tokens}</td>"
+            f"<td>{row.cache_read_tokens}</td><td>{row.cache_write_tokens}</td>"
+            f"<td>{row.hit_rate:.1%}</td><td>{row.response_hits}</td></tr>"
+        )
+    return body + "</tbody></table>"
 
 
 def make_server(
@@ -375,6 +395,8 @@ def make_server(
                         body = _candidate_page(
                             state, names, unquote(parsed.path[len("/candidate/") :])
                         )
+                    elif parsed.path.startswith("/run/") and parsed.path.endswith("/llm"):
+                        body = _llm_page(state, unquote(parsed.path[len("/run/") : -len("/llm")]))
                     else:
                         raise KeyError("route")
                 self._reply(200, body)

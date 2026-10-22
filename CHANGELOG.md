@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Candidate trace and board pages show recorded planner, manager, tool and judge
+  LLM calls, standalone planning provenance, cache origins and trace URLs; run
+  pages report per-agent prompt-cache rates and response-cache hit counts from
+  the same retained committed generation, without requiring LLM extras.
+
 - Provider failures outside agents preserve panel survivor identities, pause ranking
   policies, and skip replanning or curation with durable completion receipts;
   resume reuses failed batches and skipped phases without repeating paid work.

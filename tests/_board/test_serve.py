@@ -332,13 +332,13 @@ def test_run_filter_defaults_to_selected_run(server: Server) -> None:
 
 
 def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.MonkeyPatch) -> None:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from swarm_arena._board.cache import ArenaCache
-    from swarm_arena._board.trace import _lines
+    from swarm_arena._board.trace import _lines, _SessionCalls
     from swarm_arena._model.board_types import Frontier
     from swarm_arena._model.plan import Plan
-    from swarm_arena._model.results import Candidate
+    from swarm_arena._model.results import Candidate, LLMCall
 
     def lines(
         cache: ArenaCache,
@@ -346,10 +346,12 @@ def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.Mon
         candidate: Candidate,
         seq: int,
         revisions: Sequence[Plan],
+        calls: Mapping[str, Mapping[str, LLMCall]],
+        sessions: Mapping[str, _SessionCalls | None],
     ) -> list[str]:
         server.run.commit(server.run.score("s-later", "c-child", 99, judge="late-score"))
         server.board.frontier()
-        return _lines(cache, frontier, candidate, seq, revisions)
+        return _lines(cache, frontier, candidate, seq, revisions, calls, sessions)
 
     monkeypatch.setattr("swarm_arena._board.trace._lines", lines)
     assert "late-score" not in get(server, "/candidate/c-child")
@@ -608,3 +610,112 @@ def test_first_reader_open_publishes_namespaces_before_frontier(tmp_path: Path) 
         http.server_close()
     finally:
         board.close()
+
+
+def test_candidate_page_lists_llm_calls(server: Server) -> None:
+    from _fakes.trace_calls import _seed
+
+    _seed(server.run)
+    body = get(server, "/candidate/c-llm")
+    assert "manager-call" in body
+    assert "local/model" in body
+
+
+def test_run_llm_page_shows_cache_hit_rate_per_agent(server: Server) -> None:
+    from _fakes.trace_calls import _seed
+
+    _seed(server.run)
+    body = get(server, "/run/r1/llm")
+    assert "fd-solver/tuner-1" in body
+    assert "50.0%" in body
+    assert ":manager" in body  # The source-only failed probe is included.
+    with pytest.raises(HTTPError) as error:
+        get(server, "/run/absent/llm")
+    assert error.value.code == 404
+    error.value.close()
+
+
+@pytest.mark.parametrize("path", ["/candidate/c-llm", "/run/r1/llm"])
+def test_llm_get_retains_calls_during_refresh_and_close(
+    server: Server, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    from _fakes.trace_calls import _call, _record, _seed
+
+    from swarm_arena._board.arena import _ArenaReader
+
+    _seed(server.run)
+    get(server, path)  # Publish the initial server generation.
+    entered, release, closing = Event(), Event(), Event()
+    method = "trace" if path.startswith("/candidate") else "llm_calls"
+    original = getattr(_ArenaReader, method)
+    stop = server.board._lifetime.stop
+
+    def held(self: _ArenaReader, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(10)
+        return original(self, *args, **kwargs)
+
+    def stopping() -> None:
+        stop()
+        closing.set()
+
+    monkeypatch.setattr(_ArenaReader, method, held)
+    monkeypatch.setattr(server.board._lifetime, "stop", stopping)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(get, server, path)
+        close = None
+        try:
+            assert entered.wait(5)
+            server.run.commit(
+                _record(
+                    _call(
+                        server.run,
+                        "late-call",
+                        "tool",
+                        candidate_id="c-llm",
+                        team="late-team",
+                        agent="late-agent",
+                    )
+                )
+            )
+            server.board.frontier()
+            # The old GET remains pinned while refresh publishes newer calls.
+            close = pool.submit(server.board.close)
+            assert closing.wait(5)
+            assert not close.done()
+        finally:
+            release.set()
+        body = pending.result(timeout=5)
+        assert "late-call" not in body
+        assert "late-team" not in body
+        if path.startswith("/candidate"):
+            assert "manager-call" in body
+        else:
+            assert "50.0%" in body
+        assert close is not None
+        close.result(timeout=5)
+
+
+def test_llm_pages_escape_recorded_metadata_and_check_host(server: Server) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    server.run.commit(
+        _record(
+            _call(
+                server.run,
+                "escaped",
+                model="<script>model</script>",
+                team="<img src=x>",
+                agent='"agent',
+                trace_url="javascript:<script>trace</script>",
+            )
+        )
+    )
+    body = get(server, "/run/r1/llm")
+    assert "&lt;img src=x&gt;/&quot;agent" in body
+    assert "<img" not in body
+    request = Request(server.url + "/run/r1/llm", headers={"Host": "evil.example"})
+    with pytest.raises(HTTPError) as error:
+        urlopen(request, timeout=5)
+    assert error.value.code == 403
+    error.value.close()

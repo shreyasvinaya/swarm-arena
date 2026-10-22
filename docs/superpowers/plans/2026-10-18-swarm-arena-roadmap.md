@@ -2486,6 +2486,35 @@ def human_object_order(name: str) -> tuple[str, str]: ...   # (timestamp in the 
 def human_object_name(now: datetime) -> str: ...            # "<YYYYMMDDTHHMMSS.mmmZ>-<random 8 hex>.jsonl" [plan]
 ```
 
+LLM trace and viewer projections extend these internals without a public facade
+addition or SQL schema change (schema 4). The published generation retains calls,
+restored revision provenance and standalone session heads before any composite read.
+
+```python
+# _board/trace.py
+class CacheStats(FrozenModel):
+    calls: int; input_tokens: int; cache_read_tokens: int; cache_write_tokens: int; response_hits: int
+    @property
+    def hit_rate(self) -> float: ...  # reads / (ordinary input + reads + writes), or 0.0
+
+def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]: ...  # standalone: one authority read
+
+def format_llm_step(call: LLMCall) -> str: ...
+def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]: ...  # team/agent, else :role
+# ArenaCache publication seam; never called by a pinned composite reader:
+# _committed_state(mark: Frontier.Mark) -> RunState
+# _ArenaReader.llm_calls(run_id: str) -> list[LLMCall] returns detached committed calls.
+```
+
+Memo identity includes the normalized producing root, run ID and full committed
+head. Calls are counted once across namespace caches; candidate-less calls remain
+included. Standalone sessions resolve only beneath the producing root and keep
+recorded completion reasons. Trace preserves round-applicable plans, recorded
+base_dir, producing-run score links, parent-linked child IDs and recorded cache
+origins; it performs no reader-time refresh or replay. The viewer adds
+`/run/<run-id>/llm` under its existing Host and escaped-HTML rules. Round pages
+remain immutable.
+
 #### R4.13.15 Gateway — M4
 
 ```python

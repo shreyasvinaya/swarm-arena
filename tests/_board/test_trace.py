@@ -702,3 +702,293 @@ def test_trace_keeps_captured_generation_across_publication(
         assert any(line.startswith("score    later ") for line in current)
     finally:
         board.close()
+
+
+def test_trace_shows_llm_steps_in_order(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _seed as seed_llm
+
+    run = FakeRun(str(tmp_path / "runs"), "llm-run")
+    seed_llm(run)
+    add_pointer(str(tmp_path / "arena"), run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        lines = trace(board, "c-llm")
+        positions = [
+            next(i for i, line in enumerate(lines) if text in line)
+            for text in (
+                "plan     ",
+                "planner-call",
+                "manager-call",
+                "run      ",
+                "tool-call",
+                "check    ",
+                "judge-call",
+                "judge-child",
+                "score    ",
+                "learning ",
+            )
+        ]
+        assert positions == sorted(positions)
+        assert "tokens=120 cost=$0.000140" in "\n".join(lines)
+        assert sum("llm judge-call " in line for line in lines) == 1
+        assert "panel=survivin" in "\n".join(lines)
+        assert "failed-probe" not in "\n".join(lines)
+    finally:
+        board.close()
+
+
+def test_format_llm_step_marks_cache_hits(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _call
+
+    from swarm_arena._board.trace import format_llm_step
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    hit = _call(run, "hit", cache_hit=True, cached_from_call_id="llm-3f9a1c2b-e1-0001")
+    assert format_llm_step(hit).endswith("cache-hit-of=llm-3f9a1c2b-e1-0001")
+    unknown = hit.model_copy(update={"cached_from_call_id": None, "trace_url": "https://trace/1"})
+    assert format_llm_step(unknown).endswith("https://trace/1")
+    assert "cache-hit-of=" not in format_llm_step(unknown)
+
+
+def test_cache_stats_per_agent(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _call
+
+    from swarm_arena._board.trace import cache_stats
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    stats = cache_stats(
+        [
+            _call(run, "a", team="fd-solver", agent="tuner-1"),
+            _call(run, "b", "judge", cache_hit=True),
+        ]
+    )
+    assert stats["fd-solver/tuner-1"].hit_rate == 0.5
+    assert stats[":judge"].response_hits == 1
+    assert stats[":judge"].calls == 1
+    assert cache_stats([_call(run, "zero", usage=Usage())])[":manager"].hit_rate == 0
+
+
+def test_llm_calls_of_run_reads_one_authority_and_ignores_orphans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    from swarm_arena._board import trace as module
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    run.commit(_record(_call(run, "committed")))
+    run.orphan(_record(_call(run, "orphan")))
+    original = module.read_owner
+    reads = []
+
+    def owner(store: Any) -> Any:
+        reads.append(1)
+        return original(store)
+
+    monkeypatch.setattr(module, "read_owner", owner)
+    assert list(module.llm_calls_of_run(run.store)) == ["committed"]
+    assert reads == [1]
+
+
+@pytest.mark.parametrize("reason", [None, "planning complete", "planner failed", "run budget"])
+def test_trace_shows_planning_session_calls_for_r0(tmp_path: Path, reason: str | None) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    root = str(tmp_path / "producer")
+    session = FakeRun(root, "planning-session")
+    session.commit(
+        EventDraft(type=EventType.RUN_STARTED, payload={"planning": True}),
+        EventDraft(type=EventType.GOAL_STARTED, goal_id="g1"),
+        _record(_call(session, "session-planner", "planner")),
+    )
+    if reason is not None:
+        session.commit(
+            EventDraft(
+                type=EventType.GOAL_FINISHED,
+                goal_id="g1",
+                payload={"reason": reason},
+            )
+        )
+    run = FakeRun(root, "r")
+    plan = run.plan()
+    plan.payload.update(planning_session=session.run_id, base_dir=str(tmp_path / "plan-source"))
+    run.commit(plan, run.candidate("c"))
+    add_pointer(str(tmp_path / "arena"), run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        lines = trace(board, "c")
+        assert any("session-planner planner" in line for line in lines)
+        if reason:
+            assert f"planning session planning-session: {reason}" in lines
+        retained = board._read_state().plans["r"].revisions["g1"][0]
+        assert retained.base_dir == tmp_path / "plan-source"
+        session.commit(_record(_call(session, "session-late", "planner")))
+        assert trace(board, "c") == lines
+        board.frontier()
+        assert any("session-late" in line for line in trace(board, "c"))
+        # An autonomous revision uses its own recorded IDs, without a session link.
+        revision = run.plan(revision=1, first_round=2)
+        revision.payload.update(planning_session=None, planner_call_ids=["in-run-planner"])
+        run.commit(
+            _record(_call(run, "in-run-planner", "planner")),
+            revision,
+            run.candidate("c-next", round=2),
+        )
+        board.frontier()
+        following = "\n".join(trace(board, "c-next"))
+        assert "in-run-planner" in following
+        assert "session-planner" not in following
+    finally:
+        board.close()
+
+
+def test_trace_missing_session_is_safe_and_pinned(tmp_path: Path) -> None:
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    draft = run.plan()
+    draft.payload["planning_session"] = "missing"
+    run.commit(draft, run.candidate("c"))
+    add_pointer(str(tmp_path / "arena"), run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        assert "planning session missing: not found" in trace(board, "c")
+    finally:
+        board.close()
+
+
+def test_published_calls_are_source_aware_detached_and_namespace_unique(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    boards = []
+    try:
+        for index in range(2):
+            directory = tmp_path / str(index)
+            run = FakeRun(str(directory / "runs"), "same-run")
+            run.commit(run.plan(), _record(_call(run, "same-call", model=f"local/{index}")))
+            add_pointer(str(directory / "arena"), run, "toy")
+            add_pointer(str(directory / "arena"), run, "alpha")
+            board = ArenaBoard(
+                arena_root=str(directory / "arena"), cache_dir=str(directory / "cache")
+            )
+            board.open("", "", ["toy"])
+            board.open("", "", ["alpha"])
+            boards.append(board)
+            board.frontier()
+            with board._read_namespace() as reader:
+                calls = reader.llm_calls("same-run")
+                assert [c.model for c in calls] == [f"local/{index}"]
+                calls[0].tool_calls.append({"id": "mutated"})
+                assert not reader.llm_calls("same-run")[0].tool_calls
+    finally:
+        for board in boards:
+            board.close()
+
+
+def test_trace_cli_core_only_uses_producer_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from contextvars import Context
+
+    from _fakes.trace_calls import _call, _record
+    from _fakes.trace_calls import _seed as seed_llm
+
+    from swarm_arena import RunConfig
+    from swarm_arena._cli.main import main
+
+    run = FakeRun(str(tmp_path / "producer"), "cli-run")
+    seed_llm(run)
+    session = FakeRun(run.run_root, "session")
+    session.commit(_record(_call(session, "right-session", "planner")))
+    from swarm_arena import Goal
+
+    run.goal = Goal(id="queued-goal", namespace="toy")
+    revision = run.plan(first_round=1)
+    revision.payload["planning_session"] = session.run_id
+    run.commit(revision, run.candidate("queued-candidate"))
+    add_pointer(str(tmp_path / "arena"), run)
+    # The viewer config points somewhere else, with the same session identifier.
+    config = RunConfig(
+        run_root=str(tmp_path / "other"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    wrong = FakeRun(config.run_root, session.run_id)
+    wrong.commit(_record(_call(wrong, "wrong-session", "planner")))
+    path = tmp_path / "run.toml"
+    path.write_text(config.dumps())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        code = executor.submit(
+            Context().run,
+            main,
+            ["trace", "queued-candidate", "--namespace", "toy", "--config", str(path)],
+        ).result(timeout=10)
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "right-session" in output
+    assert "wrong-session" not in output
+
+
+def test_llm_composite_read_performs_no_refresh_replay_or_authority_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.trace_calls import _seed as seed_llm
+
+    from swarm_arena._board.trace import cache_stats
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    seed_llm(run)
+    add_pointer(str(tmp_path / "arena"), run)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+
+        def forbidden(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("pinned LLM read performed preparation")
+
+        monkeypatch.setattr(board, "frontier", forbidden)
+        monkeypatch.setattr(ArenaCache, "_committed_state", forbidden)
+        monkeypatch.setattr(RunState, "from_events", forbidden)
+        monkeypatch.setattr("swarm_arena._board.trace.read_owner", forbidden)
+        monkeypatch.setattr("swarm_arena._board.arena.read_owner", forbidden)
+        assert "planner-call" in "\n".join(trace(board, "c-llm"))
+        with board._read_namespace() as reader:
+            assert cache_stats(reader.llm_calls("r"))[":manager"].calls == 1
+    finally:
+        board.close()
+
+
+def test_run_projection_memo_includes_source_root(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"))
+    caches = []
+    try:
+        for name in ("left", "right"):
+            directory = tmp_path / name
+            run = FakeRun(str(directory / "runs"), "same-run")
+            head = run.commit(run.plan(), _record(_call(run, "same-call", model=f"local/{name}")))
+            cache = ArenaCache(directory / "toy.sqlite")
+            caches.append(cache)
+            ingest_run(cache, run.store, run.run_id, run.run_root, head)
+            mark = Frontier.Mark(run_id=run.run_id, run_root=run.run_root, **head.model_dump())
+            projection = board._plans_at(cache, mark)
+            assert projection.calls["same-call"].model == f"local/{name}"
+            assert board._plans_at(cache, mark) is projection
+    finally:
+        for cache in caches:
+            cache.close()
+        board.close()
+
+
+def test_llm_calls_of_run_without_committed_head(tmp_path: Path) -> None:
+    from swarm_arena._board.trace import llm_calls_of_run
+
+    assert llm_calls_of_run(open_store(str(tmp_path / "absent"))) == {}
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    assert llm_calls_of_run(run.store) == {}
