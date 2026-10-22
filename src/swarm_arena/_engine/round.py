@@ -432,6 +432,9 @@ class RoundRunner:
         """Copy incoming round and resume carriers before launching tasks."""
         self.deps, self.goal_id, self.plan = deps, goal_id, plan
         self.agents = tuple(agents)
+        self._provider_tools: dict[str, Tool] = {}
+        self._provider_sets: dict[str, frozenset[str]] = {}
+        self._provider_errors: dict[str, Exception] = {}
         self.round_spec, self.rounds_left = round_spec, rounds_left
         self.resumed = {key: tuple(pairs) for key, pairs in resumed.items()}
         self.repeat_entries = tuple(repeat_entries)
@@ -519,7 +522,9 @@ class RoundRunner:
         execution_ref = await run_sync_daemon(
             effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
         )
-        tool = await run_sync_daemon(execution_ref.build, Tool)
+        tool = self._provider_tools.get(slot.address)
+        if tool is None:
+            tool = await run_sync_daemon(execution_ref.build, Tool)
         entry = await run_sync_daemon(
             find_entry, slot.tool_ref, "tool", deps.config.planner_catalog
         )
@@ -864,15 +869,39 @@ class RoundRunner:
         for slot in self.agents:
             if slot.address in paused and slot.status not in _INACTIVE:
                 slot.status = AgentStatus.STOPPED
-        providers = sorted(
-            {
-                p
-                for slot in self.agents
-                if slot.status == AgentStatus.STOPPED
-                for p in paused.get(slot.address, ())
-            }
-        )
+        needed = {
+            p
+            for slot in self.agents
+            if slot.status == AgentStatus.STOPPED
+            for p in paused.get(slot.address, ())
+        }
+        if service.generations():
+            for slot in self.agents:
+                if slot.status in _INACTIVE and slot.status != AgentStatus.STOPPED:
+                    continue
+                boundary = _Outcome()
+                try:
+                    if slot.manager is None:
+                        slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
+                    execution_ref = await run_sync_daemon(
+                        effective_tool_ref, slot.tool_ref, self.round_spec.tool_overrides
+                    )
+                    tool = await run_sync_daemon(execution_ref.build, Tool)
+                    providers = await run_sync_daemon(
+                        agent_providers, slot.manager, tool, self.deps.config.models
+                    )
+                    self._provider_tools[slot.address] = tool
+                    self._provider_sets[slot.address] = providers
+                    needed.update(providers)
+                except BaseException as error:
+                    classified = boundary.classify(error)
+                    if _core_category(classified) is _SignalCategory.TERMINAL:
+                        raise classified from None
+                    # A connector preparation failure still belongs to its
+                    # agent, as when preparation happens after the frontier.
+                    self._provider_errors[slot.address] = classified
         generations = service.generations()
+        providers = sorted(needed & generations.keys())
         for provider in providers:
             generation = generations.get(provider)
             if generation is None:
@@ -1075,13 +1104,17 @@ class RoundRunner:
                     track_inflight(agent_inflight[index]),
                 ):
                     await anyio.lowlevel.checkpoint()
+                    if slot.address in self._provider_errors:
+                        raise self._provider_errors[slot.address]
                     if slot.manager is None:
                         slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
                     rt = await self._runtime(slot, round, frontier, private_paths, parents)
                     runtimes[index] = rt
-                    providers = await run_sync_daemon(
-                        agent_providers, slot.manager, rt.tool, self.deps.config.models
-                    )
+                    providers = self._provider_sets.get(slot.address)
+                    if providers is None:
+                        providers = await run_sync_daemon(
+                            agent_providers, slot.manager, rt.tool, self.deps.config.models
+                        )
 
                     def cancel_after_tools() -> None:
                         registry = agent_inflight[index]

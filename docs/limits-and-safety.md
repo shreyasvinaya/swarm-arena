@@ -443,7 +443,8 @@ are never copied into engine errors or provider events.
 
 Paused agents retain scheduler capacity. At the next fresh round, including
 convergence, the engine probes each failed provider needed by that goal before
-building its frontier or allocating shares. The probe uses the goal's judges
+building its frontier or allocating shares. This includes newly queued goals
+and converge teams even when no paused address remains for the provider. The probe uses the goal's judges
 budget, a manager scope, input `ping`, and `max_tokens=1`; both response-cache
 reads and writes are bypassed. Accounting drains before its tranche closes.
 With no probe adapter or no catalog alias for the saved provider, recovery

@@ -1706,3 +1706,75 @@ json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_
         )
         assert "KeyError" in caplog.text
     assert "private-probe-message" not in caplog.text + str([e.payload for e in ev])
+
+
+@pytest.mark.parametrize("destination", ["queued", "converge"])
+async def test_fresh_slots_probe_outstanding_provider_latch(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, destination: str
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena import ConvergeSpec
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=1, default_run_reservation=Estimate(usd=0.1)
+    )
+    code = """
+import json, os
+json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=1, tool=ProviderPyTool({"code": code}))
+    healthy = plan(
+        goal_id="h",
+        rounds=1,
+        tool=ProviderPyTool(
+            {
+                "code": code.replace(
+                    "{'data': {}, 'failed_provider': 'fake'}", "{'data': {'y': 10.0}}"
+                )
+            }
+        ),
+    )
+    if destination == "queued":
+        plans = [g, healthy]
+        expected = ("fake", "h", 1)
+    else:
+        # A passing main-round peer permits a converge team to run.
+        peer = plan(goal_id="g", rounds=1).teams[0].agents[0].model_copy(update={"name": "peer"})
+        g.teams[0].agents.append(peer)
+        healthy.teams[0].agents[0] = (
+            healthy.teams[0]
+            .agents[0]
+            .model_copy(update={"manager": Ref.of(ScriptedManager([{"inputs": {"n": 50}}]))})
+        )
+        g = g.model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=healthy.teams[0].model_copy(update={"name": "conv"})
+                )
+            }
+        )
+        plans = [g]
+        expected = ("fake", "g", 2)
+    seen: list[tuple[str, str, int]] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        seen.append((provider, scope.goal_id, scope.round))
+        assert not any(
+            e.type == "tool_start" and e.goal_id == expected[1] and e.round == expected[2]
+            for e in all_events(cfg)
+        )
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(cfg).run(plans, run_id="outstanding-provider")
+    assert seen == [expected]
+    assert any(
+        e.type == "tool_end"
+        and e.goal_id == expected[1]
+        and e.round == expected[2]
+        and e.payload["candidate"]["output"]["status"] == "ok"
+        for e in all_events(cfg)
+    )
