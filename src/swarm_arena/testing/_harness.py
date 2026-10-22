@@ -195,19 +195,27 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
             "artifact_root": _artifact_root(),
         }
     )
-    lease = await _acquire_lease(
-        partial(
-            Lease.acquire_new, store, owner_id="testing", host="local", ttl_s=config.lease_ttl_s
-        ),
-        settle_timeout_s=config.settle_timeout_s,
-    )
-    ids = IdGen(run_id, lease.doc.epoch)
     stops, clock = StopState(), RunClock(0)
+    lease: Lease | None = None
     artifacts = _artifacts()
     drain_outcome = _DrainOutcome()
-    completed = False
-    entered = False
+    completed = entered = False
     try:
+        async with _supervise_initialization(store, 1, stops, clock, config):
+            lease = await _acquire_lease(
+                partial(
+                    Lease.acquire_new,
+                    store,
+                    owner_id="testing",
+                    host="local",
+                    ttl_s=config.lease_ttl_s,
+                ),
+                settle_timeout_s=config.settle_timeout_s,
+            )
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, "offline harness stopped")
+        ids = IdGen(run_id, lease.doc.epoch)
         async with (
             _retain_drain_outcome(drain_outcome),
             JournalWriter(
@@ -277,7 +285,7 @@ async def _judge_scope(goal: Goal, config: RunConfig) -> AsyncGenerator[tuple[LL
                         await _assert_accounted(scope, store)
                         completed = True
     finally:
-        if not entered:
+        if lease is not None and not entered:
             with anyio.move_on_after(config.settle_timeout_s, shield=True):
                 with suppress(BaseException):
                     await _storage_io(lease.release)
@@ -377,7 +385,7 @@ class OfflineHarness:
         Notes
         -----
         ``limits.run_timeout_s`` bounds the harness's active work, including
-        preparation after lease acquisition. Expiry interrupts the work and
+        lease acquisition and preparation. Expiry interrupts the work and
         releases owned services through their bounded cleanup paths.
 
         Examples
@@ -413,150 +421,165 @@ class OfflineHarness:
             snapshot, judge, _ = await anyio.to_thread.run_sync(_build, ref, Judge, goal)
             built_judges.append((snapshot, judge))
         ranking = built_judges[0][0].component_name() if built_judges else ":unscored"
-        lease = await anyio.to_thread.run_sync(
-            partial(
-                Lease.acquire_new,
-                self.store,
-                owner_id="testing",
-                host="local",
-                ttl_s=config.lease_ttl_s,
-            )
-        )
-        ids = IdGen(run_id, lease.doc.epoch)
-        completed = False
         stops, clock = StopState(), RunClock(0)
+        lease: Lease | None = None
+        completed = entered = False
         artifacts = _artifacts()
-        async with (
-            _retain_drain_outcome(self._drain_outcome),
-            _executor(None) as executor,
-            _failed_runs_on(executor),
-            JournalWriter(
-                self.store,
-                lease,
-                run_id=run_id,
-                next_seq=1,
-                local_path=root / "journal.jsonl",
-                sync_interval_s=config.sync_interval_s,
-                settle_timeout_s=config.settle_timeout_s,
-            ) as journal,
-            _supervise_writer(journal),
-            _supervise_initialization(self.store, lease.doc.epoch, stops, clock, config),
-            _bound_run(
-                run_id,
-                journal=journal,
-                ids=ids,
-                artifacts=artifacts,
-                config=config,
-                stops=stops,
-                clock=clock,
-                state=RunState(),
-            ),
-        ):
-            ledger = Ledger(
-                limits,
-                reserve_fraction=config.reserve_fraction,
-                goal_weights=None,
-                journal=journal,
-                ids=ids,
-            )
-            await journal.append_durable(
-                EventDraft(
-                    type=EventType.RUN_CONFIG,
-                    payload={"config": config.model_dump(mode="json")},
-                )
-            )
-            await ledger.hold_final_slices({goal.id: Amount()})
-            await journal.append_durable(
-                EventDraft(
-                    type=EventType.RUN_STARTED,
-                    payload={"final_slices": {goal.id: Amount().model_dump()}},
-                )
-            )
-            ledger.open_goal(goal.id)
-            await journal.append_durable(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
-            await _setup_run((), config)
-            spec = AgentSpec(
-                name="agent",
-                rationale="Offline manager check",
-                tool=base_ref,
-                manager=Ref.of(manager),
-            )
-            team = TeamSpec(name="team", rationale="Offline manager check", agents=[spec])
-            address = f"{goal.id}/team/agent"
-            round_spec = RoundSpec()
-            plan = Plan(goal=goal, teams=[team], judges=[ref for ref, _ in built_judges])
-            await journal.append_durable(
-                EventDraft(
-                    type=EventType.PLAN_REVISION,
-                    goal_id=goal.id,
-                    payload={
-                        "plan": plan.model_dump(mode="json"),
-                        "origin": "human",
-                        "first_round": 1,
-                    },
-                )
-            )
-            board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
-            board_failed = False
-            try:
-                await _open_board(board, config, run_id, [goal.namespace])
-                view = await _storage_io(
-                    board.snapshot,
-                    goal.key(),
-                    await _storage_io(lambda: _detach_model(Frontier, board.frontier())),
-                )
-                rt = AgentRuntime(
-                    address=address,
-                    holder=address,
-                    goal_id=goal.id,
-                    goal=goal,
-                    goal_key=goal.key(),
-                    part=None,
-                    team=team,
-                    spec=spec,
-                    round=1,
-                    round_spec=round_spec,
-                    fidelity=round_spec.effective_fidelity(),
-                    tool=built_tool,
-                    tool_ref=base_ref,
-                    execution_ref=execution_ref,
-                    tool_identity=tool_identity(base_ref, None),
-                    catalog_entry=None,
-                    checks=[],
-                    view=view,
-                    own=[],
-                    digest="",
-                    notes="",
-                    ledger=ledger,
-                    tranche=self._tranche(ledger, address, goal.id, limits),
-                    limits=limits,
-                    counters=AgentCounters(),
-                    repeats=RepeatIndex(run_id),
-                    watchdog=Watchdog(limits),
-                    journal=journal,
-                    board=board,
-                    executor=executor,
-                    artifacts=artifacts,
-                    ids=ids,
-                    config=config,
-                    resumed=(),
-                    rankings={"": ranking},
-                    private_paths=judge_private_paths(
-                        Plan(
-                            goal=goal,
-                            teams=[team],
-                            judges=[ref for ref, _ in built_judges],
-                        )
+        try:
+            async with _supervise_initialization(self.store, 1, stops, clock, config):
+                lease = await _acquire_lease(
+                    partial(
+                        Lease.acquire_new,
+                        self.store,
+                        owner_id="testing",
+                        host="local",
+                        ttl_s=config.lease_ttl_s,
                     ),
+                    settle_timeout_s=config.settle_timeout_s,
                 )
-                with track_inflight(Inflight()):
-                    reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
-                completed = True
-            except BaseException:
-                board_failed = True
-                raise
-            finally:
-                await _close_board(board, config, failed=board_failed)
+                await anyio.lowlevel.checkpoint_if_cancelled()
+            if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
+                raise _core_error(RuntimeError, "offline harness stopped")
+            ids = IdGen(run_id, lease.doc.epoch)
+            async with (
+                _retain_drain_outcome(self._drain_outcome),
+                _executor(None) as executor,
+                _failed_runs_on(executor),
+                JournalWriter(
+                    self.store,
+                    lease,
+                    run_id=run_id,
+                    next_seq=1,
+                    local_path=root / "journal.jsonl",
+                    sync_interval_s=config.sync_interval_s,
+                    settle_timeout_s=config.settle_timeout_s,
+                ) as journal,
+                _supervise_writer(journal),
+                _supervise_initialization(self.store, lease.doc.epoch, stops, clock, config),
+                _bound_run(
+                    run_id,
+                    journal=journal,
+                    ids=ids,
+                    artifacts=artifacts,
+                    config=config,
+                    stops=stops,
+                    clock=clock,
+                    state=RunState(),
+                ),
+            ):
+                entered = True
+                ledger = Ledger(
+                    limits,
+                    reserve_fraction=config.reserve_fraction,
+                    goal_weights=None,
+                    journal=journal,
+                    ids=ids,
+                )
+                await journal.append_durable(
+                    EventDraft(
+                        type=EventType.RUN_CONFIG,
+                        payload={"config": config.model_dump(mode="json")},
+                    )
+                )
+                await ledger.hold_final_slices({goal.id: Amount()})
+                await journal.append_durable(
+                    EventDraft(
+                        type=EventType.RUN_STARTED,
+                        payload={"final_slices": {goal.id: Amount().model_dump()}},
+                    )
+                )
+                ledger.open_goal(goal.id)
+                await journal.append_durable(
+                    EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id)
+                )
+                await _setup_run((), config)
+                spec = AgentSpec(
+                    name="agent",
+                    rationale="Offline manager check",
+                    tool=base_ref,
+                    manager=Ref.of(manager),
+                )
+                team = TeamSpec(name="team", rationale="Offline manager check", agents=[spec])
+                address = f"{goal.id}/team/agent"
+                round_spec = RoundSpec()
+                plan = Plan(goal=goal, teams=[team], judges=[ref for ref, _ in built_judges])
+                await journal.append_durable(
+                    EventDraft(
+                        type=EventType.PLAN_REVISION,
+                        goal_id=goal.id,
+                        payload={
+                            "plan": plan.model_dump(mode="json"),
+                            "origin": "human",
+                            "first_round": 1,
+                        },
+                    )
+                )
+                board = ArenaBoard(arena_root=str(root / "arena"), cache_dir=str(root / "cache"))
+                board_failed = False
+                try:
+                    await _open_board(board, config, run_id, [goal.namespace])
+                    view = await _storage_io(
+                        board.snapshot,
+                        goal.key(),
+                        await _storage_io(lambda: _detach_model(Frontier, board.frontier())),
+                    )
+                    rt = AgentRuntime(
+                        address=address,
+                        holder=address,
+                        goal_id=goal.id,
+                        goal=goal,
+                        goal_key=goal.key(),
+                        part=None,
+                        team=team,
+                        spec=spec,
+                        round=1,
+                        round_spec=round_spec,
+                        fidelity=round_spec.effective_fidelity(),
+                        tool=built_tool,
+                        tool_ref=base_ref,
+                        execution_ref=execution_ref,
+                        tool_identity=tool_identity(base_ref, None),
+                        catalog_entry=None,
+                        checks=[],
+                        view=view,
+                        own=[],
+                        digest="",
+                        notes="",
+                        ledger=ledger,
+                        tranche=self._tranche(ledger, address, goal.id, limits),
+                        limits=limits,
+                        counters=AgentCounters(),
+                        repeats=RepeatIndex(run_id),
+                        watchdog=Watchdog(limits),
+                        journal=journal,
+                        board=board,
+                        executor=executor,
+                        artifacts=artifacts,
+                        ids=ids,
+                        config=config,
+                        resumed=(),
+                        rankings={"": ranking},
+                        private_paths=judge_private_paths(
+                            Plan(
+                                goal=goal,
+                                teams=[team],
+                                judges=[ref for ref, _ in built_judges],
+                            )
+                        ),
+                    )
+                    with track_inflight(Inflight()):
+                        reports = await self._rounds(manager, rt, rounds, ranking, built_judges)
+                    completed = True
+                except BaseException:
+                    board_failed = True
+                    raise
+                finally:
+                    await _close_board(board, config, failed=board_failed)
+        finally:
+            if lease is not None and not entered:
+                with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                    with suppress(BaseException):
+                        await _storage_io(lease.release)
         if not completed:
             error = _core_error(RuntimeError, "offline harness stopped")
             self._drain_outcome.note(error)

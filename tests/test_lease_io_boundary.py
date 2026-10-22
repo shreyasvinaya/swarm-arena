@@ -83,11 +83,6 @@ _ALLOW = {
         "OfflineHarness.run_rounds",
         "execution_ref.build",
     ): "Before acquisition.",
-    (
-        "testing/_harness.py",
-        "OfflineHarness.run_rounds",
-        "Lease.acquire_new",
-    ): "Initial acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_failed_runs"): "After writer release.",
     (
         "testing/_harness.py",
