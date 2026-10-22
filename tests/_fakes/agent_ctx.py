@@ -8,7 +8,9 @@ from pydantic import BaseModel
 
 from swarm_arena import AgentSpec, Goal, Ref, RoundSpec, Score
 from swarm_arena._budget.llm_scope import current_requesting_call
+from swarm_arena._errors import SoftError
 from swarm_arena._model.base import JsonValue
+from swarm_arena._scoring.runner import for_manager
 from swarm_arena.board import Candidate, Learning, Row
 from swarm_arena.tool import Action, Estimate, ParentRef, ToolOutput, ToolRequest
 
@@ -28,7 +30,14 @@ class FakeAgentContext:
 
     Tests pass this fixture as ``cast(AgentContext, fake)``. It intentionally
     does not model frontier authorization or accounting; those use real core
-    contexts. ``raise_on`` injects an exact exception at any action/read and
+    contexts. ``rows`` is fixed own-group membership; ``part`` names that
+    group (None for main). ``sibling_rows`` explicitly declares additional
+    groups, using the empty string for main, independently of producer labels.
+    ``feedback_by_candidate`` supplies each producing candidate's check policy;
+    absent/unknown policies hide private feedback through the core projection.
+    ``learnings`` holds lookup-visible items in snapshot order, while
+    ``own_learnings`` records own publications for newest-first search.
+    ``raise_on`` injects an exact exception at any action/read and
     ``requesting_calls`` records the active call before tool and learning work.
 
     Examples
@@ -57,6 +66,10 @@ class FakeAgentContext:
     learnings: list[Learning] = field(default_factory=list)
     scores: list[Score] = field(default_factory=list)
     rows: list[Row] = field(default_factory=list)
+    part: str | None = None
+    sibling_rows: dict[str, list[Row]] = field(default_factory=dict)
+    feedback_by_candidate: dict[str, dict[str, str]] = field(default_factory=dict)
+    own_learnings: list[Learning] = field(default_factory=list)
     artifact_bytes: dict[str, bytes] = field(default_factory=dict)
     action_handlers: dict[str, Callable[[Mapping[str, Any]], Awaitable[JsonValue]]] = field(
         default_factory=dict
@@ -65,6 +78,12 @@ class FakeAgentContext:
     def _raise(self, name: str) -> None:
         if error := self.raise_on.get(name):
             raise error
+
+    def _manager(self, candidate: Candidate) -> Candidate:
+        """Apply the shared producing-policy projection to a detached copy."""
+        return for_manager(
+            candidate.model_copy(deep=True), self.feedback_by_candidate.get(candidate.id, {})
+        )
 
     def add_candidate(self, id: str) -> Candidate:
         """Seed an in-memory prior result.
@@ -124,7 +143,7 @@ class FakeAgentContext:
             }
         )
         self.candidates[-1] = candidate
-        return candidate.model_copy(deep=True)
+        return self._manager(candidate)
 
     def my_candidates(self) -> list[Candidate]:
         """Return detached seeded and newly made results.
@@ -135,7 +154,7 @@ class FakeAgentContext:
         []
         """
         self._raise("my_candidates")
-        return [item.model_copy(deep=True) for item in self.candidates]
+        return [self._manager(item) for item in self.candidates]
 
     def scores_of(self, candidate_id: str) -> list[Score]:
         """Return seeded scores for an identifier.
@@ -158,7 +177,7 @@ class FakeAgentContext:
         scope: Literal["goal", "namespace"] = "goal",
         limit: int = 10,
     ) -> list[Learning]:
-        """Search seeded visible learning text in the selected scope.
+        """Search newest own items before snapshot items in the selected scope.
 
         Examples
         --------
@@ -166,18 +185,25 @@ class FakeAgentContext:
         []
         """
         self._raise("search_learnings")
-        return [
-            item.model_copy(deep=True)
-            for item in self.learnings
-            if not item.hidden
-            and item.namespace == self.goal.namespace
-            and (scope == "namespace" or item.goal_id == self.goal.id)
-            and set(tags).issubset(item.tags)
-            and (
-                query.casefold() in item.title.casefold()
-                or query.casefold() in item.text.casefold()
+        if scope not in ("goal", "namespace"):
+            raise SoftError("invalid learning scope")
+
+        def matches(item: Learning) -> bool:
+            return (
+                not item.hidden
+                and item.namespace == self.goal.namespace
+                and (scope == "namespace" or item.goal_id == self.goal.id)
+                and set(tags).issubset(item.tags)
+                and (
+                    query.casefold() in item.title.casefold()
+                    or query.casefold() in item.text.casefold()
+                )
             )
-        ][: max(0, limit)]
+
+        own = [item for item in reversed(self.own_learnings) if matches(item)]
+        found = [item for item in self.learnings if matches(item)][: max(0, limit)]
+        unique = {item.id: item for item in [*own, *found]}
+        return [item.model_copy(deep=True) for item in list(unique.values())[: max(0, limit)]]
 
     def read_learning(self, id: str) -> Learning:
         """Return a detached seeded learning.
@@ -204,14 +230,18 @@ class FakeAgentContext:
         'c-1'
         """
         self._raise("get_candidate")
-        return next(item.model_copy(deep=True) for item in self.candidates if item.id == id)
+        return next(self._manager(item) for item in self.candidates if item.id == id)
 
     def _read_artifact(self, sha256: str) -> bytes:
         self._raise("_read_artifact")
         return self.artifact_bytes[sha256]
 
     def best(self, k: int, *, part: str | None = None) -> list[Row]:
-        """Return seeded ranked rows for the requested group.
+        """Return fixed own/sibling membership with the real context's selectors.
+
+        None selects the own group; the empty string selects main. A named
+        sibling must be explicitly declared, even when its rows are empty.
+        Recorded producer part labels do not determine membership.
 
         Examples
         --------
@@ -219,7 +249,14 @@ class FakeAgentContext:
         []
         """
         self._raise("best")
-        return [item.model_copy(deep=True) for item in self.rows if item.part == part][: max(0, k)]
+        group = (self.part or "") if part is None else part
+        if group in self.sibling_rows:
+            rows = self.sibling_rows[group]
+        elif group == (self.part or ""):
+            rows = self.rows
+        else:
+            raise SoftError("part outside board snapshot")
+        return [item.model_copy(deep=True) for item in rows[: max(0, k)]]
 
     async def post_learning(
         self,
@@ -257,6 +294,7 @@ class FakeAgentContext:
             posted_by_call=call,
         )
         self.learnings.append(hint)
+        self.own_learnings.append(hint)
         return hint.model_copy(deep=True)
 
     async def save_notes(self, text: str) -> None:

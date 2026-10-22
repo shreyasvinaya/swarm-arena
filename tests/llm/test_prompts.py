@@ -10,6 +10,7 @@ from swarm_arena import Goal, RoundSpec
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, build_digest
 from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.llm_scope import requesting_call
+from swarm_arena._errors import SoftError
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.io import _storage_io
 from swarm_arena.llm._prompts import manager_instructions, reference_files, round_input
@@ -294,7 +295,8 @@ async def test_fake_context_detached_reads_and_extra_action() -> None:
     )
     fake.rows.append(row)
     assert fake.best(1) == [row]
-    assert fake.best(1, part="other") == []
+    with pytest.raises(SoftError, match="part outside board snapshot"):
+        fake.best(1, part="other")
     fake.artifact_bytes["hash"] = b"text"
     assert fake._read_artifact("hash") == b"text"
 
