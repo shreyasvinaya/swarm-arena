@@ -145,3 +145,136 @@ async def test_nested_owner_restore_never_removes_signal_handler(
         assert removed == []
     assert removed == [signal.SIGINT]
     assert signal.getsignal(signal.SIGINT) is before
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+def test_third_interrupt_during_settlement_exits(tmp_path: Path, command: str) -> None:
+    import os
+    import select
+    import time
+
+    code = f"""
+import signal
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+import anyio
+from _fakes.run import plan
+from swarm_arena import RunConfig, Swarm
+from swarm_arena._budget.ledger import Ledger
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+from swarm_arena._engine.round import EngineDeps
+from swarm_arena._engine.run import RunRunner
+from swarm_arena._model.results import Candidate
+
+root = Path.cwd()
+config = RunConfig(run_root=str(root / 'runs'), artifact_root=str(root / 'artifacts'),
+                   arena_root=str(root / 'arena'), settle_timeout_s=2)
+example = plan(rounds=1)
+(root / 'run.toml').write_text(config.dumps())
+(root / 'plan.toml').write_text(example.dumps())
+if {command!r} == 'resume':
+    queue = RunRunner._queue
+    # Persist a queued goal so resume exercises real recovered dispatch and settlement.
+    async def queued(self: RunRunner, deps: EngineDeps) -> dict[str, list[Candidate]]:
+        return {{}}
+    RunRunner._queue = queued
+    swarm = Swarm(config)
+    anyio.run(swarm.run, example)
+    RunRunner._queue = queue
+    argv = ['resume', str(root / 'runs' / swarm.run_id)]
+else:
+    argv = ['run', '--yes', str(root / 'run.toml'), str(root / 'plan.toml')]
+
+first_interrupt = anyio.Event()
+wakeup = run_cmds._sigint_wakeup
+@contextmanager
+def observed_wakeup(on_interrupt: Callable[[], None] | None = None) -> Iterator[None]:
+    count = 0
+    def observed() -> None:
+        nonlocal count
+        count += 1
+        try:
+            assert on_interrupt is not None
+            on_interrupt()
+        finally:
+            if count == 1:
+                first_interrupt.set()
+            print('received-' + str(count), flush=True)
+    with wakeup(observed if on_interrupt is not None else None):
+        yield
+run_cmds._sigint_wakeup = observed_wakeup
+settle = Ledger._settle
+async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
+    try:
+        with anyio.CancelScope(shield=True):
+            print('settlement-ready', flush=True)
+            await first_interrupt.wait()
+    finally:
+        try:
+            with anyio.CancelScope(shield=True):
+                print('cleanup-ready', flush=True)
+                await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                print('settlement-resumed', flush=True)
+                await settle(self, *args, **kwargs)
+Ledger._settle = held_settle
+handler = signal.getsignal(signal.SIGINT)
+status = main(argv)
+print('handler-restored=' + str(signal.getsignal(signal.SIGINT) is handler), flush=True)
+raise SystemExit(status)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-u", "-c", code],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        start_new_session=True,
+    )
+    stdout = process.stdout
+    assert stdout is not None
+    output = bytearray()
+
+    def until(marker: bytes, timeout: float = 60) -> None:
+        deadline = time.monotonic() + timeout
+        while marker not in output:
+            assert time.monotonic() < deadline, bytes(output)
+            if select.select([stdout], [], [], 0.05)[0]:
+                chunk = os.read(stdout.fileno(), 65536)
+                assert chunk, bytes(output)
+                output.extend(chunk)
+
+    try:
+        until(b"settlement-ready")
+        process.send_signal(signal.SIGINT)
+        until(b"cleanup-ready")
+        process.send_signal(signal.SIGINT)
+        until(b"received-2")
+        deadline = time.monotonic() + 15
+        process.send_signal(signal.SIGINT)
+        until(b"received-3", timeout=15)
+        try:
+            rest, _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"third interrupt did not exit: {bytes(output)!r}")
+        output.extend(rest)
+        assert process.returncode == 130, bytes(output)
+        assert b"settlement-resumed" in output
+        assert b"handler-restored=True" in output
+        assert b"interrupted" in output
+        assert b"never retrieved" not in output
+    finally:
+        from contextlib import suppress
+
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        stdout.close()

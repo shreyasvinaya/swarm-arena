@@ -353,9 +353,9 @@ def test_success_inside_synchronous_except(files: PlanningFiles) -> None:
     assert files.output().exists()
 
 
-@pytest.mark.parametrize("interrupts", [2, 3])
+@pytest.mark.parametrize(("interrupts", "inside_session"), [(2, True), (3, False), (3, True)])
 def test_together_prompt_repeated_sigint_finishes_owned_cleanup(
-    tmp_path: Path, interrupts: int
+    tmp_path: Path, interrupts: int, inside_session: bool
 ) -> None:
     pytest.importorskip("agents")
     import pty
@@ -411,11 +411,11 @@ async def held_cleanup(*args):
             try:
                 yield scope
             finally:
-                if {interrupts} == 2:
+                if {inside_session!r}:
                     await hold()
     finally:
         # Exercise force-exit after real journal cleanup, without cancelling its tasks.
-        if {interrupts} == 3:
+        if not {inside_session!r}:
             await hold()
 plan_cmd.planning_session = held_cleanup
 handler = signal.getsignal(signal.SIGINT)
@@ -430,6 +430,7 @@ Path({str(result)!r}).write_text(json.dumps({{
     'finished': [e.payload.get('reason') for e in all_events(files.config)
                  if e.type == 'goal_finished'],
 }}))
+raise SystemExit(status)
 """
     master, slave = pty.openpty()
     process = subprocess.Popen(
@@ -446,8 +447,8 @@ Path({str(result)!r}).write_text(json.dumps({{
     os.close(release_read)
     output = bytearray()
 
-    def until(marker: bytes) -> None:
-        deadline = time.monotonic() + 60
+    def until(marker: bytes, timeout: float = 60) -> None:
+        deadline = time.monotonic() + timeout
         while marker not in output:
             assert time.monotonic() < deadline, bytes(output)
             if select.select([master], [], [], 0.05)[0]:
@@ -462,11 +463,11 @@ Path({str(result)!r}).write_text(json.dumps({{
         until(b"cleanup-ready")
         os.write(master, b"\x03")
         until(b"received-second")
+        deadline = time.monotonic() + 15
         if interrupts == 3:
             os.write(master, b"\x03")
-            until(b"received-third-force")
+            until(b"received-third-force", timeout=15)
         os.write(release_write, b"x")
-        deadline = time.monotonic() + 30
         while True:
             status = process.poll()
             if status is not None:
@@ -475,15 +476,24 @@ Path({str(result)!r}).write_text(json.dumps({{
             if select.select([master], [], [], 0.05)[0]:
                 with suppress(OSError):
                     output.extend(os.read(master, 65536))
-        assert status == 0, bytes(output)
+        while select.select([master], [], [], 0)[0]:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+        assert status == 130, bytes(output)
         assert json.loads(result.read_text()) == {
             "status": 130,
             "handler_restored": True,
             "tty_restored": True,
             "blocking_restored": True,
             "saved": False,
-            "finished": ["stopped"],
+            "finished": [] if interrupts == 3 and inside_session else ["stopped"],
         }, bytes(output)
+        assert b"interrupted" in output
         assert b"Traceback" not in output
         assert b"never retrieved" not in output
     finally:
