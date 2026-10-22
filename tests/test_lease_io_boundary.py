@@ -190,6 +190,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_journal/writer.py",
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",
+        _ROOT / "_planning/validate.py",
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
         _ROOT / "_exec/local_run.py",
@@ -211,6 +212,29 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
     assert not violations, "unprotected worker calls:\n" + "\n".join(violations)
     assert used == set(_ALLOW), "remove obsolete worker exceptions"
     assert all(_ALLOW.values())
+
+
+def test_guard_scans_planning_draft_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_planning/validate.py"
+    original = Path.read_text
+    source = target.read_text()
+    publication = "await _storage_io(_publish_draft_artifact, artifacts, digest, data)"
+    unsafe = source.replace(
+        publication,
+        "await anyio.to_thread.run_sync(_publish_draft_artifact, artifacts, digest, data)",
+    )
+    assert unsafe != source
+    assert any(
+        function == "_draft_work" and callback == "_publish_draft_artifact"
+        for function, callback, _ in _worker_calls(unsafe)
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_planning/validate.py:\d+: _draft_work"):
+        test_lease_owned_modules_use_abandonable_workers()
 
 
 def test_guard_finds_nested_calls_and_ignores_docstrings() -> None:
