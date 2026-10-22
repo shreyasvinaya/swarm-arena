@@ -1,20 +1,25 @@
 """Per-call settings and authoritative adapter merges."""
 
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import anyio
 import litellm
 import pytest
 from _fakes.llm_run import open_llm_run
-from agents import ModelSettings
+from agents import ModelSettings, ModelTracing
+from agents.extensions.models.litellm_model import LitellmModel
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
 from openai.types.shared import Reasoning
 
 from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._model.base import LLMRole
 from swarm_arena.config import CachePolicy, ModelSpec
-from swarm_arena.llm._cache import bypass_response_cache, cache_switches
+from swarm_arena.llm._cache import bypass_response_cache, cache_switches, response_cache
 from swarm_arena.llm._settings import injection_points, merge_model_settings, model_settings
-from tests.llm.test_upstream_facts import _invoke_adapter
+from tests.llm.test_upstream_facts import THINKING_PARAMETER_CASES, _CaptureLogger, _invoke_adapter
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:pydantic._internal._generate_schema"
@@ -233,3 +238,120 @@ async def test_merged_caller_temperature_also_drops_unsupported_params(tmp_path:
         merged = merge_model_settings(ModelSettings(temperature=0), settings(run.scope("manager")))
         assert merged.temperature == 0
         assert (merged.extra_args or {})["drop_params"] is True
+
+
+@pytest.fixture
+async def isolated_settings_upstream(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    for name in (
+        "callbacks",
+        "success_callback",
+        "failure_callback",
+        "input_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+        "_async_input_callback",
+    ):
+        monkeypatch.setattr(litellm, name, [])
+    monkeypatch.setattr(litellm, "cache", None)
+    try:
+        yield
+    finally:
+        with anyio.fail_after(10):
+            await GLOBAL_LOGGING_WORKER.flush()
+            await GLOBAL_LOGGING_WORKER.stop()
+            await close_litellm_async_clients()
+
+
+async def _invoke_model(model: str, merged: ModelSettings) -> Any:
+    return await LitellmModel(model).get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=merged,
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+
+@pytest.mark.parametrize("parameter", THINKING_PARAMETER_CASES)
+@pytest.mark.parametrize("channel", ["extra_args", "extra_body", "nested_body"])
+async def test_all_pinned_thinking_controls_disable_cache(
+    tmp_path: Path, parameter: str, channel: str
+) -> None:
+    _, request, _, _ = THINKING_PARAMETER_CASES[parameter]
+    if channel == "extra_args":
+        caller = ModelSettings(extra_args=request)
+    elif channel == "extra_body":
+        caller = ModelSettings(extra_body=request)
+    else:
+        caller = ModelSettings(extra_args={"extra_body": request})
+    async with open_llm_run(tmp_path) as run:
+        merged = merge_model_settings(caller, settings(run.scope("manager"), read=True, write=True))
+        assert "cache" not in (merged.extra_args or {})
+
+
+@pytest.mark.usefixtures("isolated_settings_upstream")
+async def test_gemini_native_thinking_bypasses_response_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("diskcache")
+    pytest.importorskip("fastapi")
+    cache = response_cache(CachePolicy(backend="disk", disk_dir=str(tmp_path / "cache")))
+    logger = _CaptureLogger()
+    monkeypatch.setattr(litellm, "cache", cache)
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    backend = cast(Any, cache.cache)
+    read, write = backend.async_get_cache, backend.async_set_cache
+    accesses = {"read": 0, "write": 0}
+    written = anyio.Event()
+
+    async def capture_read(key: str, **kwargs: Any) -> Any:
+        accesses["read"] += 1
+        return await read(key, **kwargs)
+
+    async def capture_write(key: str, value: Any, **kwargs: Any) -> None:
+        accesses["write"] += 1
+        await write(key, value, **kwargs)
+        written.set()
+
+    monkeypatch.setattr(backend, "async_get_cache", capture_read)
+    monkeypatch.setattr(backend, "async_set_cache", capture_write)
+    try:
+        async with open_llm_run(tmp_path / "run") as run:
+            spec = ModelSpec(model="gemini/gemini-2.5-flash", roles=["manager"], max_tokens=8000)
+            ours = model_settings(
+                spec,
+                alias="gemini",
+                scope=run.scope("manager"),
+                reservation_id="r-1",
+                call_id="llm-1",
+                namespace="A",
+                read=True,
+                write=True,
+            )
+            control = merge_model_settings(
+                ModelSettings(extra_args={"mock_response": "answer"}), ours
+            )
+            await _invoke_model(spec.model, control)
+            await logger.wait()
+            with anyio.fail_after(10):
+                await written.wait()
+            assert accesses["read"] > 0
+            assert accesses["write"] == 1
+            accesses.update(read=0, write=0)
+            thinking = {"thinkingBudget": 1024}
+            merged = merge_model_settings(
+                ModelSettings(extra_args={"thinkingConfig": thinking, "mock_response": "answer"}),
+                ours,
+            )
+            assert (merged.extra_args or {})["thinkingConfig"] == thinking
+            for _ in range(2):
+                await _invoke_model(spec.model, merged)
+                await logger.wait()
+                assert not logger.success[-1][0]["cache_hit"]
+                assert accesses == {"read": 0, "write": 0}
+    finally:
+        with anyio.fail_after(10):
+            await GLOBAL_LOGGING_WORKER.flush()
+        backend.disk_cache.close()

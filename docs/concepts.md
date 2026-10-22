@@ -299,6 +299,9 @@ The response cache uses `default_off`: each allowed call opts in with independen
 read and write switches and its effective namespace. Anchors and the final judge
 never read cached responses; their results may still be written when judge writes
 are enabled. Streamed and thinking calls never read or write the response cache.
+Thinking controls include provider-native Gemini configs and budget fields,
+Bedrock reasoning configs and Fireworks template controls, including inside
+provider request envelopes. Explicit thinking controls bypass response caching.
 Provider recovery probes bypass both directions. These restrictions take precedence
 over caller settings, including preset cache keys and provider extra arguments.
 

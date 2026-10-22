@@ -739,3 +739,155 @@ async def test_multi_provider_closes_each_owned_provider_once(
     monkeypatch.setattr(multi, "_fallback_providers", {"duplicate": provider})
     await multi.aclose()
     assert provider.closes == 1
+
+
+# Pinned provider thinking controls, including fields inside native request envelopes.
+# The settings detector's inventory is checked against these real transformations.
+THINKING_PARAMETER_CASES: dict[str, tuple[str, dict[str, Any], tuple[str, ...], Any]] = {
+    "thinking": (
+        "gemini",
+        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+        ("generationConfig", "thinkingConfig", "thinkingBudget"),
+        1024,
+    ),
+    "reasoning": ("openrouter", {"reasoning": {"effort": "high"}}, ("reasoning", "effort"), "high"),
+    "reasoning_effort": (
+        "gemini",
+        {"reasoning_effort": "low"},
+        ("generationConfig", "thinkingConfig", "thinkingBudget"),
+        1024,
+    ),
+    "thinkingConfig": (
+        "gemini",
+        {"thinkingConfig": {"thinkingBudget": 1024}},
+        ("generationConfig", "thinkingConfig", "thinkingBudget"),
+        1024,
+    ),
+    "thinking_config": (
+        "gemini",
+        {"thinking_config": {"thinking_budget": 1024}},
+        ("generationConfig", "thinking_config", "thinking_budget"),
+        1024,
+    ),
+    "budget_tokens": (
+        "gemini",
+        {"thinking": {"type": "enabled", "budget_tokens": 2048}},
+        ("generationConfig", "thinkingConfig", "thinkingBudget"),
+        2048,
+    ),
+    "thinkingBudget": (
+        "gemini",
+        {"thinkingConfig": {"thinkingBudget": 2048}},
+        ("generationConfig", "thinkingConfig", "thinkingBudget"),
+        2048,
+    ),
+    "thinking_budget": (
+        "gemini",
+        {"thinking_config": {"thinking_budget": 2048}},
+        ("generationConfig", "thinking_config", "thinking_budget"),
+        2048,
+    ),
+    "thinkingLevel": (
+        "gemini",
+        {"thinkingConfig": {"thinkingLevel": "high"}},
+        ("generationConfig", "thinkingConfig", "thinkingLevel"),
+        "high",
+    ),
+    "thinking_level": (
+        "gemini",
+        {"thinking_config": {"thinking_level": "high"}},
+        ("generationConfig", "thinking_config", "thinking_level"),
+        "high",
+    ),
+    "enable_thinking": (
+        "fireworks_ai",
+        {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        ("reasoning_effort",),
+        "none",
+    ),
+    "reasoning_budget": (
+        "fireworks_ai",
+        {"extra_body": {"chat_template_kwargs": {"reasoning_budget": 1024}}},
+        ("reasoning_effort",),
+        1024,
+    ),
+    "low_effort": (
+        "fireworks_ai",
+        {"extra_body": {"chat_template_kwargs": {"low_effort": True}}},
+        ("reasoning_effort",),
+        "low",
+    ),
+    "reasoningConfig": (
+        "bedrock",
+        {"reasoningConfig": {"type": "enabled", "maxReasoningEffort": "high"}},
+        ("additionalModelRequestFields", "reasoningConfig", "maxReasoningEffort"),
+        "high",
+    ),
+    "maxReasoningEffort": (
+        "bedrock",
+        {"reasoningConfig": {"type": "enabled", "maxReasoningEffort": "high"}},
+        ("additionalModelRequestFields", "reasoningConfig", "maxReasoningEffort"),
+        "high",
+    ),
+    "effort": (
+        "anthropic",
+        {"output_config": {"effort": "high"}},
+        ("output_config", "effort"),
+        "high",
+    ),
+}
+
+
+@pytest.mark.parametrize("parameter", THINKING_PARAMETER_CASES)
+def test_provider_thinking_parameter_maps_to_thinking_field(parameter: str) -> None:
+    from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+    from litellm.llms.fireworks_ai.chat.transformation import FireworksAIConfig
+    from litellm.llms.vertex_ai.gemini.transformation import transform_request_body
+    from litellm.utils import get_optional_params
+
+    provider, request, path, expected = THINKING_PARAMETER_CASES[parameter]
+    models = {
+        "gemini": "gemini-2.5-flash",
+        "openrouter": "openai/gpt-5",
+        "bedrock": "amazon.nova-2-lite-v1:0",
+        "anthropic": "claude-opus-4-6",
+    }
+    if provider == "fireworks_ai":
+        body = FireworksAIConfig().map_extra_body_params(
+            request, model="accounts/fireworks/models/deepseek-v3p1"
+        )
+    else:
+        model = models[provider]
+        optional = get_optional_params(
+            model=model, custom_llm_provider=provider, max_tokens=8000, **request
+        )
+        if provider == "gemini":
+            body = transform_request_body(
+                messages=[{"role": "user", "content": "hi"}],
+                model=model,
+                optional_params=optional,
+                custom_llm_provider=provider,
+                litellm_params={},
+                cached_content=None,
+            )
+        elif provider in {"anthropic", "bedrock"}:
+            config = AnthropicConfig() if provider == "anthropic" else AmazonConverseConfig()
+            body = config.transform_request(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                optional_params=optional,
+                litellm_params={},
+                headers={},
+            )
+        else:
+            body = optional
+    value: Any = body
+    for field in path:
+        value = value[field]
+    assert value == expected
+
+
+def test_thinking_detector_matches_pinned_parameter_inventory() -> None:
+    from swarm_arena.llm._settings import _THINKING_CONTROLS
+
+    assert THINKING_PARAMETER_CASES.keys() == _THINKING_CONTROLS

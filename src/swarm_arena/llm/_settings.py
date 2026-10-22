@@ -23,6 +23,38 @@ _RESPONSE_CONTROLS = {
 }
 _PROMPT_CONTROLS = {"cache_control_injection_points", "enable_prompt_caching", "cache_control"}
 
+# The accepted spellings and provider mappings are pinned alongside the upstream facts.
+_THINKING_CONTROLS = frozenset(
+    {
+        "thinking",
+        "reasoning",
+        "reasoning_effort",
+        "thinkingConfig",
+        "thinking_config",
+        "budget_tokens",
+        "thinkingBudget",
+        "thinking_budget",
+        "thinkingLevel",
+        "thinking_level",
+        "enable_thinking",
+        "reasoning_budget",
+        "low_effort",
+        "reasoningConfig",
+        "maxReasoningEffort",
+        "effort",
+    }
+)
+_THINKING_CONTAINERS = (
+    "extra_body",
+    "generationConfig",
+    "generation_config",
+    "config",
+    "chat_template_kwargs",
+    "additionalModelRequestFields",
+    "additional_model_request_fields",
+    "output_config",
+)
+
 
 def injection_points(spec: ModelSpec) -> list[dict[str, Any]] | None:
     """
@@ -150,14 +182,14 @@ def _thinking(settings: ModelSettings) -> bool:
         return True
 
     def enabled(value: Mapping[str, Any]) -> bool:
-        for key in ("thinking", "reasoning", "reasoning_effort"):
-            option = value.get(key)
-            if option is not None and option is not False and option not in ("none", "disabled"):
-                if isinstance(option, Mapping) and option.get("type") == "disabled":
-                    continue
-                return True
-        body = value.get("extra_body")
-        return isinstance(body, Mapping) and enabled(body)
+        # An explicit thinking control bypasses caching even when requesting its
+        # disabled variant: native defaults and provider interpretation may differ.
+        if any(value.get(key) is not None for key in _THINKING_CONTROLS):
+            return True
+        return any(
+            isinstance(nested := value.get(key), Mapping) and enabled(nested)
+            for key in _THINKING_CONTAINERS
+        )
 
     body = settings.extra_body
     return enabled(settings.extra_args or {}) or (isinstance(body, Mapping) and enabled(body))
