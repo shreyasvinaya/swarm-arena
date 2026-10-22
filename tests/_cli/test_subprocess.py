@@ -423,19 +423,57 @@ def test_prompt_sigint_when_terminal_input_is_flushed(
     inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig, blocking: bool
 ) -> None:
     code = f"""
-import os, signal, termios
+import asyncio, os, signal, termios
 from swarm_arena._cli import run_cmds
 from swarm_arena._cli.main import main
 os.set_blocking(0, {blocking!r})
 original_wait = run_cmds.wait_readable
 async def wait(fd: int) -> None:
+    def interrupt() -> None:
+        # No parent input is queued: model Ctrl-C flushing the terminal input.
+        termios.tcflush(fd, termios.TCIFLUSH)
+        os.kill(os.getpid(), signal.SIGINT)
+    asyncio.get_running_loop().call_soon(interrupt)
     await original_wait(fd)
-    # Terminal Ctrl-C can discard the input that made the fd readable.
-    termios.tcflush(fd, termios.TCIFLUSH)
-    os.kill(os.getpid(), signal.SIGINT)
 from pytest import MonkeyPatch
 with MonkeyPatch.context() as patch:
     patch.setattr(run_cmds, "wait_readable", wait)
+    status = main()
+    assert os.get_blocking(0) is {blocking!r}
+    raise SystemExit(status)
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        output = _wait_prompt(process)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 130, (output + stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+def test_prompt_sigint_with_complete_line_queued(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig, blocking: bool
+) -> None:
+    code = f"""
+import os, select, signal
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+os.set_blocking(0, {blocking!r})
+original_print = print
+def prompt_print(*args: object, **kwargs: object) -> None:
+    original_print(*args, **kwargs)
+    if args and args[0] == "Start the run? [y/N] ":
+        # Canonical tty readiness proves the parent's complete line is queued.
+        # Hold prompt consumption until SIGINT has actually been delivered.
+        assert select.select([0], [], [], 5)[0] == [0]
+        os.kill(os.getpid(), signal.SIGINT)
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(run_cmds, "print", prompt_print, raising=False)
     status = main()
     assert os.get_blocking(0) is {blocking!r}
     raise SystemExit(status)
@@ -447,7 +485,7 @@ with MonkeyPatch.context() as patch:
         output = _wait_prompt(process)
         assert master is not None
         os.write(master, b"y\n")
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 130, (output + stdout, stderr)
         assert stderr == b"interrupted\n"
     assert not Path(run_config.run_root).exists()
