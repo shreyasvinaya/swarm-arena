@@ -189,3 +189,14 @@ async def finished_run(tmp_path: Path, anyio_backend: str) -> "FinishedRun":
     )
     await run_again(run, run_id=run.run_id)
     return run
+
+
+@pytest.fixture(autouse=True)
+def no_cwd_disk_cache() -> Iterator[None]:
+    """Reject LiteLLM's default disk directory without importing optional extras."""
+    working_dir = Path.cwd()
+    yield
+    for directory in {working_dir, Path.cwd()}:
+        assert not (directory / ".litellm_cache").exists(), (
+            "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
+        )

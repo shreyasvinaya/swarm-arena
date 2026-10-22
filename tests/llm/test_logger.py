@@ -520,10 +520,10 @@ def test_install_refuses_a_second_different_cache_policy(tmp_path: Path) -> None
     assert litellm.cache is cache
 
 
-def test_install_requires_cache_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_install_requires_cache_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     with pytest.raises(ImportError, match="cache"):
-        install(_config(cache=CachePolicy(backend="disk")))
+        install(_config(cache=CachePolicy(backend="disk", disk_dir=str(tmp_path / "cache"))))
     assert litellm.cache is None
     assert _logger._installed_policy is None
     assert not litellm.callbacks

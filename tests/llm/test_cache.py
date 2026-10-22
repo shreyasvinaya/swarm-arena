@@ -321,12 +321,14 @@ async def test_real_cache_identity_tracks_namespaces_keys_and_replacements(
         backend.disk_cache.close()
 
 
-def test_backend_construction_error_is_value_free(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_construction_error_is_value_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def fail(**kwargs: Any) -> Any:
         raise ValueError("CACHE_BACKEND_SECRET")
 
     monkeypatch.setattr("swarm_arena.llm._cache.Cache", fail)
     monkeypatch.setattr("swarm_arena.llm._cache.require_cache_extra", lambda policy: None)
     with pytest.raises(RuntimeError, match=r"response cache construction.*ValueError") as caught:
-        response_cache(CachePolicy(backend="disk"))
+        response_cache(CachePolicy(backend="disk", disk_dir=str(tmp_path / "cache")))
     assert_secret_absent(caught.value, "CACHE_BACKEND_SECRET")
