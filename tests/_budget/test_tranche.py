@@ -557,3 +557,46 @@ async def test_failed_overflow_report_can_be_committed_by_close(
     assert env.count("settle") == 1
     assert env.charged("g1/t/a") == Amount(tokens=7, usd=USD_LIMIT)
     assert _replay(env).run_exhausted()
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("retry", ["close", "report"])
+async def test_normalized_overflow_retries_without_invalid_amount(
+    direct: bool, retry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await _env(Limits())
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    rid = await tranche.reserve_call(Amount(usd=0.5 if direct else 0.1))
+    actual = Amount(tokens=7, usd=USD_LIMIT)
+    append = env.journal.append_durable
+    failed = False
+
+    async def fail_once(event: EventDraft) -> None:
+        nonlocal failed
+        if event.type == "settle" and not failed:
+            failed = True
+            raise RuntimeError("journal unavailable")
+        await append(event)
+
+    monkeypatch.setattr(env.journal, "append_durable", fail_once)
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        await tranche._settle_call(rid, actual, overflow=True)
+    assert env.ledger.run_exhausted()
+    if retry == "report":
+        assert (await tranche._settle_call(rid, actual, overflow=True)).overflow
+    assert (await tranche.close()).overflow
+    assert (await tranche.close()).overflow
+    assert env.charged("g1/t/a") == actual
+    assert env.count("settle") == 1
+    assert _replay(env).run_exhausted()
+
+
+async def test_overflow_marker_requires_normalized_limit(env: LedgerEnv) -> None:
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount())
+    rid = await tranche.reserve_call(Amount(usd=0.1))
+    with pytest.raises(ValueError, match="supported USD limit"):
+        await tranche._settle_call(rid, Amount(usd=0.01), overflow=True)
+    assert tranche.pending() == 1
+    assert env.count("settle") == 0
+    assert not (await tranche.settle_call(rid, Amount(usd=0.01))).overflow
+    assert env.charged("g1/t/a") == Amount(usd=0.01)

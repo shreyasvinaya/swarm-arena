@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `llm`, `cache`, and `langfuse` dependencies, an LLM import guard,
   bundled LiteLLM prices, and offline upstream compatibility checks.
 
+- Core LLM call recording with replayable deduplication and cache provenance,
+  exact reservation accounting, bounded missing-report cleanup, and supervised
+  fresh/resumed run bindings without optional provider dependencies.
 - Local `board serve` viewer with search, filters, pagination, evidence and lineage
   pages, and token-protected pin, hide and add curation.
 - Offline arena commands export/import human reviews, rank runs and namespaces,

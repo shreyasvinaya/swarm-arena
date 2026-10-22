@@ -619,6 +619,8 @@ class GoalRunner:
             models=deps.config.models,
             tracing=deps.config.tracing,
             cache=deps.config.cache,
+            limits=deps.config.limits,
+            settle_timeout_s=deps.config.settle_timeout_s,
             force_no_cache_read=final,
         )
 

@@ -9,6 +9,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.catalog import ModelCatalog
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.settings import CachePolicy, TracingConfig
 from swarm_arena._store.artifacts import ArtifactStore
 
@@ -46,6 +47,10 @@ class LLMScope:
         Human tracing configuration.
     cache : CachePolicy or None
         Response-cache policy.
+    limits : Limits
+        Run limits available to the component and its model adapter.
+    settle_timeout_s : float
+        Bound for pending usage reports and owned post-stop settlement.
     force_no_cache_read : bool, default=False
         Disable cache reads for anchors and final judging.
     call_ids : list[str], optional
@@ -61,7 +66,7 @@ class LLMScope:
     ...     agent="a", round=1, candidate_id=None, tranche=tranche,
     ...     journal=Mock(spec=JournalWriter),
     ...     artifacts=Mock(spec=ArtifactStore), models=ModelCatalog({}), tracing=TracingConfig(),
-    ...     cache=None)
+    ...     cache=None, limits=Limits(), settle_timeout_s=60)
     >>> with llm_scope(scope):
     ...     current_llm_scope() is scope
     True
@@ -82,6 +87,8 @@ class LLMScope:
     models: ModelCatalog
     tracing: TracingConfig
     cache: CachePolicy | None
+    limits: Limits
+    settle_timeout_s: float
     force_no_cache_read: bool = False
     call_ids: list[str] = field(default_factory=list)
 

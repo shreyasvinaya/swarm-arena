@@ -387,6 +387,15 @@ Rules [plan]:
 | `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b +M2 | `tests/testing/test_harness.py` |
 | `testing/_fake_model.py` | `FakeModel`, `FakeTurn` (imports `agents` lazily) | M3 | `tests/testing/test_fake_model.py` |
 
+M3 core recording additions to R3.1 (these extend the existing module rows):
+
+| Path | Added responsibility | M | Tests |
+|---|---|---|---|
+| `_journal/llm_record.py` | Owned callback supervision, drain/close/unbind, safe normalized records and cache provenance | M3 | `tests/_journal/test_llm_record.py` |
+| `_journal/replay.py` | Committed call, request digest and cache identity indexes | +M3 | `tests/_journal/test_replay.py` |
+| `_budget/llm_scope.py`, `_budget/tranche.py` | Required limits/settlement timeout; normalized overflow settlement seam | +M3 | `tests/_budget/test_llm_scope.py`, `tests/_budget/test_tranche.py` |
+| `_engine/run.py`, `_engine/resume.py` | Authorized registration bootstrap and bindings inside entered service owners | +M3 | `tests/_engine/test_run.py`, `tests/_engine/test_initialization_stop.py` |
+
 ### R3.2 Other test files (not 1:1 with a module)
 
 | Path | Responsibility | M |
@@ -401,6 +410,8 @@ Rules [plan]:
 | `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
 | `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
+| `tests/_fakes/llm_run.py` | `open_llm_run`, real owned writer/ledger fixture, committed calls/charges and held-worker readiness/release controls | M3 |
+| `tests/test_lease_io_boundary.py` | Includes core LLM recorder and future `llm/*.py` modules in the lease-held storage guard | +M3 |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
 | `tests/_fakes/tools.py` | Small module-level tool functions and scripts used across tests; refs name them `_fakes.tools:<name>` (importable through `pythonpath = ["tests"]`, R5.3) | M1a |
@@ -1814,6 +1825,14 @@ checkpoint; replay folds the maximum over all events and excludes downtime.
 produced it (derived from revision and `tool_end` order, no new stored field); part
 rankings, snapshots and join parents use only candidates of the current part key.
 
+M3 recording extension: `RunState.llm_calls: dict[str, LLMCall]` holds committed
+records by call ID. `llm_request_sha256: dict[str, str]` holds request digests;
+`llm_cache_identity: dict[str, str]` holds optional opaque cache provenance digests.
+The `llm_call` payload is `{call, request_sha256, cache_identity}`. Null digests
+are omitted from indexes; non-null digests must be lowercase SHA-256 hex.
+Request hashes alone never establish a cache origin. Duplicate call IDs and
+cross-run call identities are invalid replay input.
+
 #### R4.13.5 Ids — M1a (R2.7 item 7)
 
 ```python
@@ -1975,6 +1994,12 @@ def current_requesting_call() -> str | None: ...
 # around ctx.run_tool and ctx.post_learning, so parallel tool calls never mix. execute_tool_run reads it into
 # Candidate.requested_by_call, and post_learning reads it into Learning.posted_by_call. Outside it, both stay None.
 ```
+
+M3 scope extension: `limits: Limits` and `settle_timeout_s: float` are required
+fields immediately after `cache`, with no defaults. Every engine and standalone
+session constructor passes its `RunConfig` values. Report waiting and owned
+post-stop settlement/publication cleanup both use `settle_timeout_s`; it is not
+solely a grace period for receiving usage.
 
 #### R4.13.8 Process supervision — M1a
 
@@ -2351,6 +2376,18 @@ def mark_planning_session(plan: Plan, scope: LLMScope) -> Plan: ...
     # a copy with planning_session = scope.run_id and planner_call_ids = tuple(scope.call_ids) (R4.1)
 ```
 
+M3 run registration extension: `_engine/run.py` exposes
+`register_run_setup(fn: Callable[[RunConfig], None]) -> None`, idempotent by
+callable identity. `_setup_run(plans, config)` imports only admitted manager/judge
+modules and the human curator module, then invokes registered setups in supervised
+daemon workers. It does not construct managers. Fresh `_execute` binds inside the
+entered journal/initialization owner; `_ResumeServices._serve_owned` binds after
+authoritative acquired-head replay. Both pass the existing stop state and clock,
+preserve the prepared handoff, drain/close before unbinding, and clean up failed
+setup. A completed resume never constructs a manager merely for registration.
+The private `_bound_run` context is also the ownership seam for planning sessions;
+the standalone planning-session API remains a separate implementation.
+
 #### R4.13.14 Board internals — M1b (`RunBoard`, frontier, digest), M2 (rest)
 
 ```python
@@ -2506,6 +2543,51 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]: ...   # [plan] M3:
 def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3: marks the pending call of that reservation
     # abandoned; drain does not wait for an abandoned call
 ```
+
+M3 implemented recording contract (supersedes the earlier sketch where different):
+
+- `bind_run` additionally accepts `cache_identity: Mapping[str, str] | None`,
+  `stops: StopState | None`, `clock: RunClock | None`, `limits: Limits | None`
+  and `settle_timeout_s: float = 60`. Engine/session owners supply their live
+  services through `_bound_run(..., config, stops, clock, state)`; low-level
+  callers own equivalent cleanup. Binding validates indexes before installation.
+- `record_call` additionally accepts `cache_identity: str | None = None`: an
+  adapter-proven SHA-256 over namespace, effective cache key and generating
+  response identity. It is journaled independently of request payload storage.
+  Resume restores it; missing or ambiguous origins leave `cached_from_call_id`
+  unset. The core never guesses provenance from a request hash.
+- Complete model/JSON preparation precedes claiming. Request and response uploads
+  are separately supervised; an abandoned request cannot start a response upload.
+  Call IDs enter dedup indexes only after append. A claim without an appended
+  record remains recoverable while the writer is usable. Journaled and settled
+  states are separate; drain retries only outstanding accounting.
+- One normalized `Amount` supplies the journaled cost and ledger charge. Cache
+  hits cost zero; unknown spend charges the full estimate with fixed safe text.
+  Finite cost beyond `USD_LIMIT` records the supported maximum and explicitly
+  marks terminal usage overflow through `Tranche._settle_call(..., overflow=True)`.
+  This private seam requires a normalized maximum `Amount`, preserves admission
+  idempotency/close retries, and never constructs an invalid model. Non-finite
+  costs fail before append; raw provider diagnostics are never retained.
+- Callbacks outside the caller's scope still use the bound owner loop, live stop
+  state, active clock and writer terminal cause. Drain seals the scope and bounds
+  both report waiting and shielded accounting; unbind invalidates all workers.
+  Late callbacks with call/reservation/LiteLLM identity return `None`, while an
+  explicit unknown-run-only call raises `ValueError`. `pending_scope` returns
+  `None` once a scope is drained. Cleanup expiry is not ownership fencing;
+  uncommitted reservations remain conservative after terminal publication failure.
+- Gateway/unkeyed reports use `settle=False` without opening a pending call.
+  With a pending call, `settle=False` defers its recorded amount until drain.
+  Cancellation wakes waiters, and safe contained failures are reported only after
+  recoverable accounting. Fresh/resumed owners always drain/close/unbind inside
+  the entered writer lifetime. Category-aware control-registry migration remains
+  separate from this recorder contract.
+
+Example adapter sequence: reserve with `await scope.tranche.reserve_call(estimate)`,
+allocate with `open_call(scope, reservation_id=rid, estimate=estimate, ...)`, include
+the returned call ID and reservation ID in string metadata, then call
+`await record_call(..., settle=True, cache_identity=proven_identity_or_none)`.
+Before closing a component tranche, use `await drain(scope, wait=True)`; cancelled
+calls first use `abandon_call(scope, rid)` and drain without report waiting.
 
 ### R4.14 Journal event types — M1b (additions noted)
 

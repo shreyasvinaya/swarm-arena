@@ -1,6 +1,7 @@
 """Approve and execute one run with shared budgets and durable ownership."""
 
 import asyncio
+import importlib
 import os
 import socket
 import sys
@@ -40,6 +41,7 @@ from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
+from swarm_arena._journal.llm_record import _bound_run
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
@@ -54,7 +56,7 @@ from swarm_arena._model.tooling import Estimate, ToolRequest
 from swarm_arena._outcomes import _has_core_fenced as _has_fenced
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
-from swarm_arena._planning.provenance import _detach_plan, stamp
+from swarm_arena._planning.provenance import _detach_plan, ref_sites, stamp
 from swarm_arena._planning.validate import _goal_key_errors, admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store, _read_blob, open_store
@@ -64,6 +66,57 @@ from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 if TYPE_CHECKING:
     from swarm_arena._engine.resume import ResumeState
+
+
+_run_setups: list[Callable[[RunConfig], None]] = []
+
+
+def register_run_setup(fn: Callable[[RunConfig], None]) -> None:
+    """Register an optional integration's setup for each entered run lifetime.
+
+    Parameters
+    ----------
+    fn : Callable[[RunConfig], None]
+        Synchronous setup, invoked in supervised daemon preparation once per
+        start, resume or planning session. Repeated registration is idempotent.
+
+    Examples
+    --------
+    >>> def setup(config: RunConfig) -> None:
+    ...     pass
+    >>> register_run_setup(setup)
+    >>> register_run_setup(setup)
+    >>> sum(fn is setup for fn in _run_setups)
+    1
+    >>> _run_setups.remove(setup)
+    """
+    if not any(existing is fn for existing in _run_setups):
+        _run_setups.append(fn)
+
+
+def _bootstrap_registrations(plans: Sequence[Plan], config: RunConfig) -> None:
+    """Import authorized registration modules without rebuilding runtime objects."""
+    modules = dict.fromkeys(
+        site.ref.path.split(":", 1)[0]
+        for plan in plans
+        for site in ref_sites(plan)
+        if site.kind in {"manager", "judge"}
+    )
+    if config.curator is not None:
+        modules[config.curator.path.split(":", 1)[0]] = None
+    for module in modules:
+        importlib.import_module(module)
+
+
+async def _setup_run(plans: Sequence[Plan], config: RunConfig) -> None:
+    """Bootstrap admitted references, then invoke each setup under the live owner."""
+    outcome = _Outcome()
+    try:
+        await run_sync_daemon(_bootstrap_registrations, plans, config)
+        for setup in tuple(_run_setups):
+            await run_sync_daemon(setup, config)
+    except BaseException as error:
+        outcome.contain(error, RuntimeError, "run setup")
 
 
 async def _watch_fence(journal: JournalWriter, scope: anyio.CancelScope) -> None:
@@ -583,73 +636,94 @@ class RunRunner:
                             journal=journal,
                             ids=ids,
                         )
-                        journal.append(
-                            EventDraft(
-                                type=EventType.RUN_CONFIG,
-                                payload={"config": config.model_dump(mode="json")},
-                            )
-                        )
-                        journal.append(
-                            EventDraft(
-                                type=EventType.RUN_STARTED,
-                                payload={
-                                    "estimate": estimate.to_estimate().model_dump(mode="json"),
-                                    "warnings": warnings,
-                                    "manifest": manifest,
-                                    "final_slices": {g: a.model_dump() for g, a in slices.items()},
-                                },
-                            )
-                        )
-                        await ledger.hold_final_slices(slices)
-                        for plan in self.plans:
-                            journal.append(r0_revision_draft(plan, plan.base_dir))
+                        async with _bound_run(
+                            run_id,
+                            journal=journal,
+                            ids=ids,
+                            artifacts=artifacts,
+                            config=config,
+                            stops=stops,
+                            clock=clock,
+                            state=RunState(),
+                        ):
                             journal.append(
-                                EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id)
+                                EventDraft(
+                                    type=EventType.RUN_CONFIG,
+                                    payload={"config": config.model_dump(mode="json")},
+                                )
                             )
-                        head = await journal.commit()
-                        assert head is not None
-                        views = ViewWriter(store, journal)
-                        for plan in self.plans:
-                            await views.write(
-                                f"goals/{plan.goal.id}/plan.r0.toml",
-                                plan.dumps().encode(),
-                                source=head,
+                            journal.append(
+                                EventDraft(
+                                    type=EventType.RUN_STARTED,
+                                    payload={
+                                        "estimate": estimate.to_estimate().model_dump(mode="json"),
+                                        "warnings": warnings,
+                                        "manifest": manifest,
+                                        "final_slices": {
+                                            g: a.model_dump() for g, a in slices.items()
+                                        },
+                                    },
+                                )
                             )
-                        board = await _start_board(config)
-                        try:
-                            await _open_board(
-                                board,
-                                config,
-                                run_id,
-                                sorted(
-                                    {p.goal.namespace for p in self.plans}
-                                    | {part.goal.namespace for p in self.plans for part in p.parts}
-                                ),
-                            )
-                            deps = EngineDeps(
-                                run_id=run_id,
-                                config=config,
-                                store=store,
-                                journal=journal,
-                                ledger=ledger,
-                                board=board,
-                                executor=executor,
-                                artifacts=artifacts,
-                                ids=ids,
-                                views=views,
-                                stops=stops,
-                                clock=clock,
-                                admission=RunAdmission(config.limits.max_agents_total, self.plans),
-                                board_namespaces={
-                                    goal.namespace
-                                    for plan in self.plans
-                                    for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                                },
-                            )
-                            prepared()
-                            return await self._drive(deps, lease.doc.epoch)
-                        finally:
-                            await _close_board(board, config, failed=sys.exc_info()[0] is not None)
+                            await ledger.hold_final_slices(slices)
+                            for plan in self.plans:
+                                journal.append(r0_revision_draft(plan, plan.base_dir))
+                                journal.append(
+                                    EventDraft(type=EventType.GOAL_QUEUED, goal_id=plan.goal.id)
+                                )
+                            head = await journal.commit()
+                            assert head is not None
+                            views = ViewWriter(store, journal)
+                            for plan in self.plans:
+                                await views.write(
+                                    f"goals/{plan.goal.id}/plan.r0.toml",
+                                    plan.dumps().encode(),
+                                    source=head,
+                                )
+                            await _setup_run(self.plans, config)
+                            board = await _start_board(config)
+                            try:
+                                await _open_board(
+                                    board,
+                                    config,
+                                    run_id,
+                                    sorted(
+                                        {p.goal.namespace for p in self.plans}
+                                        | {
+                                            part.goal.namespace
+                                            for p in self.plans
+                                            for part in p.parts
+                                        }
+                                    ),
+                                )
+                                deps = EngineDeps(
+                                    run_id=run_id,
+                                    config=config,
+                                    store=store,
+                                    journal=journal,
+                                    ledger=ledger,
+                                    board=board,
+                                    executor=executor,
+                                    artifacts=artifacts,
+                                    ids=ids,
+                                    views=views,
+                                    stops=stops,
+                                    clock=clock,
+                                    admission=RunAdmission(
+                                        config.limits.max_agents_total, self.plans
+                                    ),
+                                    board_namespaces={
+                                        goal.namespace
+                                        for plan in self.plans
+                                        for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                                    },
+                                )
+                                prepared()
+                                return await self._drive(deps, lease.doc.epoch)
+                            finally:
+                                await _close_board(
+                                    board, config, failed=sys.exc_info()[0] is not None
+                                )
                     return await _finish_initialization_stop(store, journal, stops, config)
         finally:
             if not entered:

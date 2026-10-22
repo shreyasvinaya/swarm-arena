@@ -17,7 +17,7 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.planning_types import Decision
-from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
+from swarm_arena._model.results import AgentStatus, Candidate, Learning, LLMCall, Score
 from swarm_arena._model.run_config import RunConfig
 
 STOP_REASONS = frozenset(
@@ -181,7 +181,9 @@ class RunState:
     evidence is never relabeled by a later same-name part revision.
     Private event history retains the complete prefixes used by immutable round
     pages, including historical limits and revision activation.
-    ``llm_request_sha256`` is reserved for the later LLM event fold.
+    ``llm_calls`` retains recorded calls, ``llm_request_sha256`` their request
+    hashes, and ``llm_cache_identity`` the opaque generating-response identities
+    used for proven cache-origin links. Payload storage is not required.
 
     Examples
     --------
@@ -209,6 +211,8 @@ class RunState:
     id_counters: dict[str, int] = field(default_factory=dict)
     stop: Literal["none", "stop", "stop-now"] = "none"
     llm_request_sha256: dict[str, str] = field(default_factory=dict)
+    llm_calls: dict[str, LLMCall] = field(default_factory=dict)
+    llm_cache_identity: dict[str, str] = field(default_factory=dict)
     run_elapsed_s: float = 0.0
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
@@ -306,6 +310,20 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.LLM_CALL:
+                call = LLMCall.model_validate(payload["call"])
+                if call.id in self.llm_calls or call.run_id != event.run_id:
+                    raise ValueError("invalid LLM call identity")
+                self.llm_calls[call.id] = call
+                for key, index in (
+                    ("request_sha256", self.llm_request_sha256),
+                    ("cache_identity", self.llm_cache_identity),
+                ):
+                    digest = payload.get(key)
+                    if digest is not None:
+                        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                            raise ValueError("invalid LLM call digest")
+                        index[call.id] = digest
             case EventType.REVIEW_IMPORTED:
                 # Arena review objects own scores; the receipt only retains IDs for recovery.
                 pass

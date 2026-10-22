@@ -279,6 +279,14 @@ class Tranche:
         >>> anyio.run(example)
         (0, Amount(tokens=0, usd=0.01))
         """
+        return await self._settle_call(reservation_id, actual)
+
+    async def _settle_call(
+        self, reservation_id: str, actual: Amount, *, overflow: bool = False
+    ) -> TrancheOutcome:
+        """Accept a normalized provider range-overflow mark without invalid Amounts."""
+        if overflow and actual.usd != USD_LIMIT:
+            raise ValueError("overflow settlement requires the supported USD limit")
         async with self._lock:
             if self._closed:
                 return self._outcome
@@ -289,7 +297,7 @@ class Tranche:
                 elif call.batch.overflow and not call.batch.settled:
                     await self._settle_batch(call.batch)
                 return self._outcome
-            overflow = actual.usd > USD_LIMIT
+            overflow = overflow or actual.usd > USD_LIMIT
             actual = self._reported_amount(actual.tokens, actual._micro_usd, overflow=overflow)
             call.actual = actual
             call.overflow = overflow

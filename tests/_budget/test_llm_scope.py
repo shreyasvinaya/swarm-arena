@@ -16,6 +16,7 @@ from swarm_arena._budget.tranche import Tranche
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.base import CallRole
 from swarm_arena._model.catalog import ModelCatalog
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.settings import TracingConfig
 from swarm_arena._store.artifacts import ArtifactStore
 
@@ -35,6 +36,8 @@ def _scope(role: CallRole) -> LLMScope:
         models=ModelCatalog({}),
         tracing=TracingConfig(),
         cache=None,
+        limits=Limits(),
+        settle_timeout_s=60,
     )
 
 

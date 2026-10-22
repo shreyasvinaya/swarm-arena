@@ -191,6 +191,8 @@ def _worker_calls(source: str) -> list[tuple[str, str, int]]:
 def test_lease_owned_modules_use_abandonable_workers() -> None:
     paths = [
         *_ROOT.joinpath("_engine").glob("*.py"),
+        *_ROOT.joinpath("llm").glob("*.py"),
+        _ROOT / "_journal/llm_record.py",
         _ROOT / "_journal/writer.py",
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",

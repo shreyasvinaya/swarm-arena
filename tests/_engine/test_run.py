@@ -1,7 +1,8 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from unittest.mock import Mock
 
 import anyio
@@ -12,7 +13,7 @@ from _fakes.leases import force_take_over
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
-from swarm_arena import Ref, RunConfig
+from swarm_arena import Ref, RunConfig, ScriptedManager
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.run import RunRunner, _require_asyncio
 from swarm_arena._engine.swarm import Swarm
@@ -22,8 +23,265 @@ from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._model.ids import IdGen
+from swarm_arena._model.results import LLMCall
 from swarm_arena._model.tooling import Estimate
 from swarm_arena._store.local import LocalStore
+from swarm_arena.manager import AgentContext, RoundReport
+
+
+class RecordingManager(ScriptedManager):
+    results: ClassVar[list[LLMCall | None]] = []
+    pause_second: ClassVar[anyio.Event | None] = None
+    cache_second: ClassVar[bool] = False
+    order: ClassVar[list[str]] = []
+
+    async def run_round(self, ctx: AgentContext) -> RoundReport:
+        from _fakes.llm_run import record_kwargs
+
+        from swarm_arena._budget.llm_scope import current_llm_scope
+        from swarm_arena._journal.llm_record import record_call
+
+        if ctx.round == 2 and self.pause_second is not None:
+            self.pause_second.set()
+            await anyio.sleep_forever()
+        scope = current_llm_scope()
+        assert scope is not None
+        self.order.append(f"round-{ctx.round}")
+        meta = {
+            "run_id": scope.run_id,
+            "goal_id": scope.goal_id,
+            "team": scope.team,
+            "agent": scope.agent,
+            "round": str(scope.round),
+            "role": scope.role,
+        }
+        result = await record_call(
+            **record_kwargs(
+                meta,
+                settle=False,
+                litellm_call_id=f"lc-{ctx.round}" if self.cache_second else "lc-1",
+                cache_hit=self.cache_second and ctx.round == 2,
+                cache_identity="b" * 64,
+            )
+        )
+        self.results.append(result)
+        return await super().run_round(ctx)
+
+
+def _recording_plan(manager_path: str | None = None) -> Any:
+    current = plan(rounds=2)
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(
+                    path=manager_path or f"{__name__}:RecordingManager",
+                    config=current.teams[0].agents[0].manager.config,
+                ),
+            }
+        )
+    )
+    return current
+
+
+async def _pause_recording_run(config: RunConfig, current: Any) -> str:
+    paused = RecordingManager.pause_second
+    assert paused is not None
+    swarm = Swarm(config)
+    task = asyncio.create_task(swarm.run(current))
+    try:
+        with anyio.fail_after(15):
+            await paused.wait()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert swarm.run_id is not None
+    return swarm.run_id
+
+
+async def test_resume_binds_committed_llm_calls(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as run_module
+
+    calls: list[RunConfig] = []
+    monkeypatch.setattr(run_module, "_run_setups", [calls.append])
+    monkeypatch.setattr(RecordingManager, "results", [])
+    monkeypatch.setattr(RecordingManager, "order", [])
+    monkeypatch.setattr(RecordingManager, "pause_second", anyio.Event())
+    run_id = await _pause_recording_run(run_config, _recording_plan())
+    assert len(RecordingManager.results) == 1
+    assert RecordingManager.results[0] is not None
+    monkeypatch.setattr(RecordingManager, "pause_second", None)
+    await Swarm(run_config).resume(run_id, force=True)
+    assert RecordingManager.results[1] is None
+    assert len(RunState.from_events(all_events(run_config)).llm_calls) == 1
+    assert calls == [run_config, run_config]
+
+
+async def test_resume_points_cache_hits_to_originals_without_payloads(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._model.settings import TracingConfig
+
+    config = run_config.model_copy(update={"tracing": TracingConfig(store_payloads=False)})
+    monkeypatch.setattr(RecordingManager, "results", [])
+    monkeypatch.setattr(RecordingManager, "order", [])
+    monkeypatch.setattr(RecordingManager, "cache_second", True)
+    monkeypatch.setattr(RecordingManager, "pause_second", anyio.Event())
+    run_id = await _pause_recording_run(config, _recording_plan())
+    monkeypatch.setattr(RecordingManager, "pause_second", None)
+    await Swarm(config).resume(run_id, force=True)
+    first, hit = RecordingManager.results
+    assert first is not None
+    assert hit is not None
+    assert hit.cached_from_call_id == first.id
+    assert first.request_ref is None
+    assert hit.request_ref is None
+
+
+async def test_resume_imports_plan_refs_before_run_setups(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._model.plan import Plan
+
+    module = tmp_path / "setup_mod.py"
+    module.write_text(
+        "from swarm_arena._engine.run import register_run_setup\n"
+        f"from {__name__} import RecordingManager\n"
+        "def setup(config):\n"
+        "    RecordingManager.order.append('setup')\n"
+        "register_run_setup(setup)\n"
+        "class Manager(RecordingManager):\n"
+        "    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(run_module, "_run_setups", [])
+    monkeypatch.setattr(RecordingManager, "results", [])
+    monkeypatch.setattr(RecordingManager, "order", [])
+    monkeypatch.setattr(RecordingManager, "pause_second", anyio.Event())
+    current = _recording_plan("setup_mod:Manager")
+    current = Plan._from_data(current.model_dump(), base_dir=tmp_path)
+    try:
+        run_id = await _pause_recording_run(run_config, current)
+        assert RecordingManager.order == ["setup", "round-1"]
+        sys.modules.pop("setup_mod", None)
+        monkeypatch.setattr(run_module, "_run_setups", [])
+        monkeypatch.setattr(RecordingManager, "order", [])
+        monkeypatch.setattr(RecordingManager, "pause_second", None)
+        await Swarm(run_config).resume(run_id, force=True)
+        assert RecordingManager.order == ["setup", "round-2"]
+    finally:
+        sys.modules.pop("setup_mod", None)
+
+
+async def test_setup_failure_unbinds_and_releases_services(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._journal.llm_record import _bindings
+
+    def broken(_: RunConfig) -> None:
+        raise ValueError("SETUP_SECRET")
+
+    monkeypatch.setattr(run_module, "_run_setups", [broken])
+    with pytest.raises(RuntimeError, match="run setup failed: ValueError") as caught:
+        await Swarm(run_config).run(plan(rounds=1), run_id="setup-failure")
+    assert_secret_absent(caught.value, "SETUP_SECRET")
+    assert "setup-failure" not in _bindings
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "setup-failure"))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert not events(run_config, "round_started")
+
+
+async def test_completed_resume_bootstrap_does_not_construct_manager(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(RecordingManager, "results", [])
+    monkeypatch.setattr(RecordingManager, "order", [])
+    first = await Swarm(run_config).run(_recording_plan(), run_id="completed")
+
+    def forbidden(*_: Any, **__: Any) -> None:
+        pytest.fail("completed manager was constructed during registration bootstrap")
+
+    monkeypatch.setattr(RecordingManager, "__init__", forbidden)
+    assert await Swarm(run_config).resume("completed", force=True) == first
+
+
+async def test_resume_binding_keeps_the_rebased_acquired_head_clock(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import resume as resume_module
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._engine.stops import RunClock
+    from swarm_arena._journal.event import Event
+    from swarm_arena._journal.lease import Head, Lease
+    from swarm_arena._journal.llm_record import _bindings
+    from swarm_arena._journal.segment import encode_segment, segment_name
+    from swarm_arena._store.io import _storage_io
+
+    await Swarm(run_config).run(plan(rounds=1), run_id="rebase")
+    clocks: list[RunClock] = []
+    setup_clocks: list[RunClock] = []
+    starts: list[float] = []
+    acquire = resume_module._acquire_lease
+    advanced = False
+
+    class Clock(RunClock):
+        def __init__(self, elapsed_before: float) -> None:
+            super().__init__(elapsed_before)
+            clocks.append(self)
+            starts.append(self._start)
+
+    def advance() -> None:
+        store = LocalStore(Path(run_config.run_root) / "rebase")
+        owner = read_owner(store)
+        assert owner is not None
+        assert owner[0].head is not None
+        doc, etag = owner
+        old = doc.head
+        assert old is not None
+        event = Event(
+            type="run_config",
+            epoch=doc.epoch,
+            seq=old.seq + 1,
+            ts=utc_now(),
+            run_id="rebase",
+            context_id="rebase",
+            payload={"config": run_config.model_dump(), "run_elapsed_s": 20.0},
+        )
+        name = segment_name(doc.epoch, event.seq)
+        store.create(name, encode_segment(old.segment, [event]))
+        Lease(store, doc, etag, ttl_s=60).advance(
+            Head(epoch=doc.epoch, seq=event.seq, segment=name)
+        )
+
+    async def race(*args: Any, **kwargs: Any) -> Lease:
+        nonlocal advanced
+        if not advanced:
+            assert len(clocks) == 1
+            await _storage_io(advance)
+            advanced = True
+        return await acquire(*args, **kwargs)
+
+    def setup(_: RunConfig) -> None:
+        setup_clocks.append(_bindings["rebase"].clock)
+        assert _bindings["rebase"].clock._before == 20.0
+
+    monkeypatch.setattr(resume_module, "RunClock", Clock)
+    monkeypatch.setattr(resume_module, "_acquire_lease", race)
+    monkeypatch.setattr(run_module, "_run_setups", [setup])
+    await Swarm(run_config).resume("rebase", force=True)
+    assert len(clocks) == 1
+    assert setup_clocks == clocks
+    assert clocks[0]._start == starts[0]
+    assert "rebase" not in _bindings
 
 
 async def test_run_folder_layout(run_config: RunConfig) -> None:
@@ -70,6 +328,42 @@ async def test_llm_plan_with_noncatalog_ref_imports_nothing(run_config: RunConfi
         await Swarm(run_config).run(p)
     assert "_fakes.import_canary" not in sys.modules
     assert not await anyio.to_thread.run_sync(Path(run_config.run_root).exists)
+
+
+async def test_run_binds_record_and_calls_run_setups(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.llm_run import record_kwargs
+
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._journal.llm_record import record_call
+
+    calls: list[RunConfig] = []
+    monkeypatch.setattr(run_module, "_run_setups", [])
+    run_module.register_run_setup(calls.append)
+    await Swarm(run_config).run(plan(rounds=1))
+    assert calls == [run_config]
+    run_id = run_dir(run_config).name
+    # Explicit unbound misuse is distinct from a recognizably late callback.
+    with pytest.raises(ValueError, match="not bound"):
+        await record_call(**record_kwargs({"run_id": run_id}))
+
+
+async def test_prebuild_never_imports_a_rejected_r0_ref(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SWARM_ARENA_TEST_CANARY", str(tmp_path / "imported"))
+    sys.modules.pop("_fakes.import_canary", None)
+    proposed = plan().model_copy(update={"origin": "llm"})
+    proposed.teams[0].agents[0] = (
+        proposed.teams[0]
+        .agents[0]
+        .model_copy(update={"manager": Ref(path="_fakes.import_canary:Tool")})
+    )
+    with pytest.raises(ValueError, match="not in the planner catalog"):
+        await Swarm(run_config).run(proposed)
+    assert not (tmp_path / "imported").exists()
+    assert "_fakes.import_canary" not in sys.modules
 
 
 async def test_estimate_over_limit_refuses(run_config: RunConfig) -> None:

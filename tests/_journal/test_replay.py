@@ -139,6 +139,46 @@ def _learning() -> Learning:
     )
 
 
+def test_llm_call_events_fold_into_llm_calls() -> None:
+    from swarm_arena._model.results import LLMCall
+
+    call = LLMCall(id="llm-1", run_id="r", goal_id="g", role="manager", model="m", provider="p")
+    event = _ev(3, "llm_call", {"call": call.model_dump(mode="json"), "request_sha256": "a" * 64})
+    state = RunState.from_events([*_PRE, event])
+    assert state.llm_calls[call.id] == call
+    event.payload["call"]["tool_calls"].append({"id": "mutated", "name": "tool"})
+    assert state.llm_calls[call.id].tool_calls == []
+
+
+def test_llm_call_events_fold_request_sha256() -> None:
+    from swarm_arena._model.results import LLMCall
+
+    call = LLMCall(id="llm-1", run_id="r", goal_id="g", role="manager", model="m", provider="p")
+    event = _ev(
+        3,
+        "llm_call",
+        {
+            "call": call.model_dump(mode="json"),
+            "request_sha256": "a" * 64,
+            "cache_identity": "b" * 64,
+        },
+    )
+    state = RunState.from_events([*_PRE, event])
+    assert state.llm_request_sha256 == {call.id: "a" * 64}
+    assert state.llm_cache_identity == {call.id: "b" * 64}
+
+
+@pytest.mark.parametrize("field", ["request_sha256", "cache_identity"])
+def test_llm_call_hash_fields_reject_secret_payloads(field: str) -> None:
+    from swarm_arena._model.results import LLMCall
+
+    call = LLMCall(id="llm-1", run_id="r", goal_id="g", role="manager", model="m", provider="p")
+    event = _ev(3, "llm_call", {"call": call.model_dump(mode="json"), field: "HASH_SECRET"})
+    with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
+        RunState.from_events([*_PRE, event])
+    assert_secret_absent(caught.value, "HASH_SECRET")
+
+
 def test_origin_comes_from_journal_not_plan_body() -> None:
     plan = _plan().model_copy(update={"origin": "human"})
     state = RunState.from_events(

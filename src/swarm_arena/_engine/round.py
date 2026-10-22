@@ -919,6 +919,8 @@ class RoundRunner:
                             models=self.deps.config.models,
                             tracing=self.deps.config.tracing,
                             cache=self.deps.config.cache,
+                            limits=self.deps.config.limits,
+                            settle_timeout_s=self.deps.config.settle_timeout_s,
                         )
                     ):
                         report = await slot.manager.run_round(ctx)
