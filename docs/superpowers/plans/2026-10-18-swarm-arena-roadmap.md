@@ -2598,6 +2598,11 @@ ID. Missing or mismatched pairs fail value-free before payload upload or adoptio
 including against replayed identities. Drain refuses a duplicate placeholder for
 an already journaled ID even if pending bookkeeping is inconsistent.
 
+The binding counts undrained scopes per tranche. A scope drain handles only its
+own calls; it never closes the tranche. Owned exit drains every scope before
+closing each distinct tranche once, and closes only when that tranche's count
+reaches zero. Direct and batched reservations follow the same ownership rule.
+
 ### R4.14 Journal event types — M1b (additions noted)
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.

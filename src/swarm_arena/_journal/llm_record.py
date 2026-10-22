@@ -83,11 +83,26 @@ class _Binding:
     call_reservations: dict[str, str] = field(default_factory=dict)
     scopes: dict[int, LLMScope] = field(default_factory=dict)
     drained: set[int] = field(default_factory=set)
+    finished_scopes: set[int] = field(default_factory=set)
+    undrained_scopes: dict[int, int] = field(default_factory=dict)
     workers: set[anyio.CancelScope] = field(default_factory=set)
     active: bool = True
     closing: bool = False
     terminal: Exception | None = None
     overflow_notified: set[int] = field(default_factory=set)
+
+    def track_scope(self, scope: LLMScope) -> None:
+        """Count each funded scope once until all its accounting has drained."""
+        if id(scope) not in self.scopes:
+            self.scopes[id(scope)] = scope
+            tranche = id(scope.tranche)
+            self.undrained_scopes[tranche] = self.undrained_scopes.get(tranche, 0) + 1
+
+    def finish_scope(self, scope: LLMScope) -> None:
+        """Release one scope's ownership without closing its shared tranche."""
+        if id(scope) not in self.finished_scopes:
+            self.finished_scopes.add(id(scope))
+            self.undrained_scopes[id(scope.tranche)] -= 1
 
     def check(self) -> None:
         """Preserve the writer's actual terminal cause, including cleanup expiry."""
@@ -282,7 +297,7 @@ def open_call(
     cid = binding.ids.next("llm")
     binding.pending[rid] = _Pending(scope, cid, rid, estimate, alias, model, provider)
     binding.call_reservations[cid] = rid
-    binding.scopes[id(scope)] = scope
+    binding.track_scope(scope)
     return cid
 
 
@@ -908,9 +923,10 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     if binding is None:
         return []
     entries = [entry for entry in binding.pending.values() if entry.scope is scope]
+    binding.track_scope(scope)
     if not entries:
-        binding.scopes[id(scope)] = scope
         binding.drained.add(id(scope))
+        binding.finish_scope(scope)
         return []
     binding.check()
     if wait:
@@ -942,6 +958,8 @@ async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
     if cleanup.cancel_called:
         binding.terminal = _stop_cleanup_error()
     binding.check()
+    if all(entry.settled for entry in entries):
+        binding.finish_scope(scope)
     if failure is not None:
         raise failure from None
     return placeholders
@@ -992,17 +1010,23 @@ async def _bound_run(
                             await drain(scope, wait=False)
                         except BaseException as error:
                             failure = failure or error
+                    tranches = {
+                        id(scope.tranche): scope.tranche for scope in binding.scopes.values()
+                    }
+                    for key, tranche in tranches.items():
+                        if binding.undrained_scopes[key]:
+                            continue
                         try:
                             completed, result = await _owned(
-                                binding, scope.tranche.close, accounting=True
+                                binding, tranche.close, accounting=True
                             )
                             if (
                                 completed
                                 and result is not None
                                 and result.overflow
-                                and id(scope.tranche) not in binding.overflow_notified
+                                and key not in binding.overflow_notified
                             ):
-                                binding.overflow_notified.add(id(scope.tranche))
+                                binding.overflow_notified.add(key)
                                 raise _core_signal(
                                     LimitReached(
                                         "usage_overflow",

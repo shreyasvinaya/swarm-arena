@@ -474,6 +474,64 @@ async def test_drain_does_not_duplicate_an_already_journaled_id(tmp_path: Path) 
             pending.journaled = True
 
 
+@pytest.mark.parametrize("batched", [False, True])
+async def test_shared_tranche_closes_after_all_scopes_drain(
+    tmp_path: Path, batched: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.tranche import Tranche
+
+    async with open_llm_run(tmp_path) as run:
+        first = run.scope("judge", team="", agent="")
+        if batched:
+            first = replace(
+                first,
+                tranche=Tranche(run.ledger, ":run", "g", size=Amount(tokens=25_000, usd=0.25)),
+            )
+        second = replace(first, round=2, call_ids=[])
+        closed_pending: list[int] = []
+        close = first.tranche.close
+
+        async def tracked_close() -> Any:
+            closed_pending.append(first.tranche.pending())
+            return await close()
+
+        monkeypatch.setattr(first.tranche, "close", tracked_close)
+        for scope in (first, second):
+            _, meta = await _open(run, scope)
+            await record_call(**record_kwargs(meta, settle=False))
+        await run.journal.commit()
+        assert first.tranche.pending() == 2
+    assert run.charged(first) == Amount(tokens=240, usd=0.004)
+    assert sum(Amount(usd=call.cost_usd)._micro_usd for call in run.calls()) == 4000
+    assert first.tranche.pending() == 0
+    assert closed_pending == [0]
+
+
+@pytest.mark.parametrize("batched", [False, True])
+async def test_scope_drain_leaves_other_shared_scope_live(tmp_path: Path, batched: bool) -> None:
+    from swarm_arena._budget.tranche import Tranche
+
+    async with open_llm_run(tmp_path) as run:
+        first = run.scope("judge", team="", agent="")
+        if batched:
+            first = replace(
+                first,
+                tranche=Tranche(run.ledger, ":run", "g", size=Amount(tokens=25_000, usd=0.25)),
+            )
+        second = replace(first, round=2, call_ids=[])
+        _, first_meta = await _open(run, first)
+        _, second_meta = await _open(run, second)
+        await record_call(**record_kwargs(first_meta, settle=False))
+        assert await drain(first, wait=False) == []
+        assert first.tranche.pending() == 1
+        assert pending_scope(second_meta) is second
+        assert all(
+            event.payload["id"] != second_meta["reservation_id"] for event in run.events("settle")
+        )
+        assert await record_call(**record_kwargs(second_meta)) is not None
+    assert run.charged(first) == Amount(tokens=240, usd=0.004)
+
+
 async def test_money_is_normalized_once_in_record_and_settlement(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
         scope = run.scope("manager")
