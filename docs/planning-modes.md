@@ -188,9 +188,11 @@ are frozen before generation. A completed draft cannot change that identity.
 Draft snapshots spool immutable bytes to a temporary file and upload each unique
 digest once, one file at a time after validation. Resident staging memory scales
 with the largest file, while the temporary spool scales with the unique source
-bytes. The preparing worker closes the spool on completion. If preparation is
-abandoned while a synchronous source read is blocked, the spool is freed only
-when that read returns; cancellation does not interrupt the read.
+bytes. The preparing worker closes the spool when preparation finishes, fails,
+or observes abandonment. Cancellation cannot interrupt a synchronous step in
+progress: a source read, a component import or validator, or a registered model
+check. If such a step is blocked, the worker closes the spool on failure or
+abandonment only once that step returns.
 
 A direct initial Python call resolves relative goal and catalog files against
 its current working directory. With history, the original admitted plan's

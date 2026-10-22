@@ -518,32 +518,14 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
             replacement.release()
 
 
-@pytest.mark.parametrize("operation", ["plan", "run", "resume"])
 @pytest.mark.parametrize("handled", ["budget", "fenced"])
-async def test_public_lifecycles_ignore_callers_handled_exception(
+async def test_public_planning_ignores_callers_handled_exception(
     tmp_path: Path,
-    run_config: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    operation: str,
     handled: str,
 ) -> None:
-    from _fakes.run import plan as human_plan
-
-    from swarm_arena import Swarm
-    from swarm_arena._engine import run as run_module
     from swarm_arena._errors import Fenced, _core_error
     from swarm_arena.llm import BudgetExceeded
 
-    if operation == "resume":
-        await Swarm(run_config).run(human_plan(rounds=1), run_id="original")
-    flags: list[bool] = []
-    close_board = run_module._close_board
-
-    async def observe_close(board: Any, config: Any, *, failed: bool) -> None:
-        flags.append(failed)
-        await close_board(board, config, failed=failed)
-
-    monkeypatch.setattr(run_module, "_close_board", observe_close)
     try:
         if handled == "fenced":
             raise _core_error(Fenced, "unrelated owner")
@@ -553,19 +535,56 @@ async def test_public_lifecycles_ignore_callers_handled_exception(
         await LLMPlanner("planner").plan(GOAL, small, None)
         pytest.fail("expected budget refusal")
     except (BudgetExceeded, Fenced):
-        if operation == "plan":
-            config = planner_config(tmp_path / "success")
-            FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
-            result = await LLMPlanner("planner").plan(GOAL, config, None)
-            assert result.planning_session is not None
-            finished = [e for e in all_events(config) if e.type == "goal_finished"]
-            assert [e.payload["reason"] for e in finished] == ["planning complete"]
-        else:
-            swarm = Swarm(run_config)
-            results = (
-                await swarm.run(human_plan(rounds=1))
+        config = planner_config(tmp_path / "success")
+        FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+        result = await LLMPlanner("planner").plan(GOAL, config, None)
+        assert result.planning_session is not None
+        finished = [e for e in all_events(config) if e.type == "goal_finished"]
+        assert [e.payload["reason"] for e in finished] == ["planning complete"]
+
+
+@pytest.mark.parametrize("operation", ["run", "resume"])
+@pytest.mark.parametrize("handled", ["budget", "fenced"])
+def test_board_close_ignores_sync_callers_handled_exception(
+    run_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    handled: str,
+) -> None:
+    from _fakes.run import plan as human_plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._board.arena import ArenaBoard
+    from swarm_arena._engine import run as run_module
+    from swarm_arena._errors import Fenced, _core_error
+    from swarm_arena.llm import BudgetExceeded
+
+    if operation == "resume":
+        asyncio.run(Swarm(run_config).run(human_plan(rounds=1), run_id="original"))
+    flags: list[bool] = []
+    close_board = run_module._close_board
+    original_close = ArenaBoard.close
+
+    async def observe_close(board: Any, config: Any, *, failed: bool) -> None:
+        flags.append(failed)
+        await close_board(board, config, failed=failed)
+
+    def fail_close(board: ArenaBoard) -> None:
+        original_close(board)
+        raise OSError("unrelated close failure")
+
+    monkeypatch.setattr(run_module, "_close_board", observe_close)
+    monkeypatch.setattr(ArenaBoard, "close", fail_close)
+    try:
+        if handled == "fenced":
+            raise _core_error(Fenced, "unrelated owner")
+        raise BudgetExceeded("budget", "unrelated budget")
+    except (BudgetExceeded, Fenced):
+        swarm = Swarm(run_config)
+        with pytest.raises(RuntimeError, match="board close failed: OSError"):
+            asyncio.run(
+                swarm.run(human_plan(rounds=1))
                 if operation == "run"
-                else await swarm.resume("original", force=True)
+                else swarm.resume("original", force=True)
             )
-            assert results["g"]
-            assert flags == [False]
+        assert flags == [False]
