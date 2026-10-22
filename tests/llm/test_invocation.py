@@ -208,3 +208,34 @@ async def test_cleanup_process_controls_propagate(
     with pytest.raises(control):
         async with _invocation(parent_scope(), name="curator", error_type=ValueError):
             pass
+
+
+@pytest.mark.parametrize("timer_kind", ["fail_after", "move_on_after"])
+async def test_caller_timer_catches_cancellation_during_accounting(
+    monkeypatch: pytest.MonkeyPatch, timer_kind: str
+) -> None:
+    from swarm_arena.llm import _invocation as module
+
+    entered = False
+    timer: anyio.CancelScope
+
+    async def finish(scope: LLMScope, *, interrupted: bool) -> None:
+        nonlocal entered
+        assert not interrupted
+        entered = True
+        timer.deadline = anyio.current_time()
+        await anyio.sleep_forever()
+
+    async def invoke() -> None:
+        async with _invocation(parent_scope(), name="curator", error_type=ValueError):
+            pass
+
+    monkeypatch.setattr(module, "_finish_accounting", finish)
+    if timer_kind == "fail_after":
+        with pytest.raises(TimeoutError), anyio.fail_after(10) as timer:
+            await invoke()
+    else:
+        with anyio.move_on_after(10) as timer:
+            await invoke()
+        assert timer.cancelled_caught
+    assert entered

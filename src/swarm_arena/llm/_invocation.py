@@ -88,10 +88,17 @@ async def _invocation(
                 else cleanup_error
             )
     if failure is not None:
-        classified = boundary.classify(failure)
-        if _is_core_control(classified):
-            if type(failure) is BudgetExceeded or _core_category(failure) is _SignalCategory.LIMIT:
-                raise failure from None
-            raise classified from None
-        boundary.contain(classified, error_type, f"LLM {name}")
+        # Keep the captured cancellation active for AnyIO scope attribution.
+        try:
+            raise failure
+        except BaseException as error:
+            classified = boundary.classify(error)
+            if _is_core_control(classified):
+                if (
+                    type(failure) is BudgetExceeded
+                    or _core_category(failure) is _SignalCategory.LIMIT
+                ):
+                    raise failure from None
+                raise classified from None
+            boundary.contain(classified, error_type, f"LLM {name}")
     boundary.propagate_control(RuntimeError())
