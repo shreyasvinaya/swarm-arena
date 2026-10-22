@@ -1201,3 +1201,65 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
         e.payload["id"] for e in events if e.type == "settle"
     }
     assert next(e for e in events if e.type == "agent_status").payload["status"] == "stopped"
+
+
+async def test_provider_stop_collects_scripted_manager_partial_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena import Swarm
+    from swarm_arena._agent.runtime import AgentRuntime
+    from swarm_arena._engine.round import RoundRunner
+    from tests.llm.test_manager import config as manager_config
+
+    ready = tmp_path / "ready"
+    code = f"""
+import json, os, time
+from pathlib import Path
+json.dump({{'data': {{'y': 42.0}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+Path({str(ready)!r}).touch()
+time.sleep(60)
+"""
+    cfg = manager_config(
+        limits=Limits(max_usd=100, max_tokens=10_000_000),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    current = plan(rounds=1, tool=ProviderPyTool({"code": code, "grace_s": 0.1}))
+    runtimes: list[AgentRuntime] = []
+    original = RoundRunner._runtime
+
+    async def runtime(self: RoundRunner, *args: Any, **kwargs: Any) -> AgentRuntime:
+        rt = await original(self, *args, **kwargs)
+        runtimes.append(rt)
+        return rt
+
+    monkeypatch.setattr(RoundRunner, "_runtime", runtime)
+
+    async def fail_provider() -> None:
+        with anyio.fail_after(15):
+            while not await anyio.Path(ready).exists():  # noqa: ASYNC110 - subprocess readiness
+                await anyio.sleep(0.01)
+        await runtimes[0].stops.fail("fake", source="judge")
+
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as group:
+            group.start_soon(fail_provider)
+            await Swarm(cfg).run(current, run_id="provider-scripted")
+    events = all_events(cfg)
+    ends = [e for e in events if e.type == "tool_end"]
+    assert len(ends) == 1
+    output = ends[0].payload["candidate"]["output"]
+    assert output["status"] == "cancelled"
+    assert output["data"] == {"y": 42.0}
+    assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+        e.payload["id"] for e in events if e.type == "settle"
+    }
+    status = next(e for e in events if e.type == "agent_status")
+    assert (status.payload["status"], status.payload["reason"]) == (
+        "stopped",
+        "provider unavailable",
+    )

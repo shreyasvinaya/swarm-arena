@@ -452,7 +452,10 @@ succeeds without a model call.
 Recovery clears only the generation that was probed. A newer failure or another
 unresolved provider keeps the agent paused. Recovery does not revive a pruned or
 watchdog-stopped agent. An admitted SDK tool action finishes under core grace
-before the manager drains; further actions are refused. Caller cancellation,
+before the manager drains; further actions are refused. For custom and scripted
+managers, a provider stop closes tool admission and gracefully cancels running
+tools so their partial results and settlements are collected before the agent
+scope ends. The engine kill bound still limits unresponsive work. Caller cancellation,
 lost ownership and terminal budget controls retain their precedence.
 
 Provider generations and address causes are journaled and restored on resume,

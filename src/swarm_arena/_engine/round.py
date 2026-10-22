@@ -8,6 +8,7 @@ import anyio
 
 from swarm_arena._agent.context import (
     AgentContext,
+    _ActionInflight,
     _local_timer_scope,
     _prepare_metadata,
     _ToolMetadata,
@@ -1014,10 +1015,26 @@ class RoundRunner:
         inflight = Inflight()
         scopes = [anyio.CancelScope() for _ in agents]
         contexts: list[_RoundContext | None] = [None for _ in agents]
+        agent_inflight = [_ActionInflight(inflight) for _ in agents]
+        provider_cancelled = [anyio.Event() for _ in agents]
+        provider_kill_at = [float("inf") for _ in agents]
         reasons: dict[str, str] = {}
         summaries: dict[str, str] = {}
         done = anyio.Event()
         remaining = len(agents)
+
+        async def watch_provider(index: int) -> None:
+            await provider_cancelled[index].wait()
+            while True:
+                ctx = contexts[index]
+                if (
+                    ctx is None
+                    or not ctx._running_tools
+                    or anyio.current_time() >= provider_kill_at[index]
+                ):
+                    scopes[index].cancel()
+                    return
+                await anyio.sleep(0.05)
 
         async def manage(index: int, slot: AgentSlot) -> None:
             nonlocal remaining
@@ -1028,7 +1045,7 @@ class RoundRunner:
                 with (
                     _local_timer_scope(scopes[index]) as provider_timer,
                     scopes[index],
-                    track_inflight(inflight),
+                    track_inflight(agent_inflight[index]),
                 ):
                     await anyio.lowlevel.checkpoint()
                     if slot.manager is None:
@@ -1038,6 +1055,21 @@ class RoundRunner:
                     providers = await run_sync_daemon(
                         agent_providers, slot.manager, rt.tool, self.deps.config.models
                     )
+
+                    def cancel_after_tools() -> None:
+                        registry = agent_inflight[index]
+                        registry.close()
+                        if not provider_cancelled[index].is_set():
+                            provider_kill_at[index] = (
+                                anyio.current_time()
+                                + registry.max_grace_s()
+                                + 5.0
+                                + BEFORE_KILL_TIMEOUT_S
+                            )
+                            registry.cancel_all()
+                            provider_cancelled[index].set()
+
+                    provider_timer.provider_cancel = cancel_after_tools
 
                     def cancel_provider() -> None:
                         causes = self.deps.provider_stops.stopped().get(slot.address, frozenset())
@@ -1112,6 +1144,7 @@ class RoundRunner:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(self._watch, inflight, scopes, contexts, deadline)
                 for index, slot in enumerate(agents):
+                    tasks.start_soon(watch_provider, index)
                     tasks.start_soon(manage, index, slot)
                 await done.wait()
                 tasks.cancel_scope.cancel()

@@ -81,6 +81,7 @@ class _LocalTimer:
     failure: Exception | None = None
     provider_stopped: bool = False
     provider_child: "_LocalTimer | None" = None
+    provider_cancel: Callable[[], None] | None = None
 
     def stop_provider(self, error: Exception) -> None:
         """Route a provider stop through the live manager timer, when present."""
@@ -89,6 +90,8 @@ class _LocalTimer:
         child = self.provider_child
         if child is not None and child.live:
             child.stop_provider(error)
+        elif self.provider_cancel is not None:
+            self.provider_cancel()
         else:
             self.scope.cancel()
 
