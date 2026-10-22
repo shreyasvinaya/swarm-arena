@@ -41,6 +41,9 @@ class JournalWriter:
     group window and wait for the authority head to cover their sequence. A
     transient storage failure suspends renewals and retries only until the
     last confirmed expiry. Fatal failures disable publication and wake all waiters.
+    Native cancellation or another escaping base exception also wakes durable
+    waiters and disables admission before propagating out of the writer task.
+    Engine owners distinguish that stop from an earlier storage or lease failure.
     Settlement exhaustion raises ``RuntimeError('stop cleanup timed out')``;
     authority loss and other fatal publication failures raise ``Fenced``.
     After settlement exhaustion, a release attempt has its own
@@ -122,6 +125,7 @@ class JournalWriter:
         self._stopping = False
         self._entered = False
         self._failure: Exception | None = None
+        self._stopped = False
         self._settlement_expired = False
         self._tasks: TaskGroup | None = None
 
@@ -147,6 +151,8 @@ class JournalWriter:
         self._tasks = anyio.create_task_group()
         await self._tasks.__aenter__()
         self._entered = True
+        # Runner.close can cancel this task before its first step in the same loop
+        # iteration; an unstarted coroutine cannot execute the failure latch below.
         self._tasks.start_soon(self._run)
         return self
 
@@ -524,35 +530,43 @@ class JournalWriter:
 
     async def _run(self) -> None:
         """Own every commit, renewal, and release, including shielded shutdown."""
-        with anyio.CancelScope(shield=True):
-            try:
-                while not self.fenced.is_set():
-                    remaining = self._remaining()
-                    if remaining <= 0:
-                        raise _core_error(Fenced, "journal lease expired")
-                    now = anyio.current_time()
-                    deadlines = [
-                        value for value in (self._group_at, self._sync_at) if value is not None
-                    ]
-                    if self._queue and (
-                        self._closing or self._immediate or any(now >= value for value in deadlines)
-                    ):
-                        await self._publish()
-                        continue
-                    if self._closing:
-                        await self._update_owner("release")
-                        return
-                    renew_in = remaining - self._lease.ttl_s * 2 / 3
-                    if renew_in <= 0:
-                        await self._update_owner("renew")
-                        continue
-                    delay = min([renew_in, *(max(0, value - now) for value in deadlines)])
-                    with anyio.move_on_after(delay):
-                        await self._wake.wait()
-                    self._wake = anyio.Event()
-            except Exception as error:
-                self._fail(error)
-                if self._settlement_expired:
-                    await self._release_after_timeout()
-            finally:
-                self._done.set()
+        try:
+            with anyio.CancelScope(shield=True):
+                try:
+                    while not self.fenced.is_set():
+                        remaining = self._remaining()
+                        if remaining <= 0:
+                            raise _core_error(Fenced, "journal lease expired")
+                        now = anyio.current_time()
+                        deadlines = [
+                            value for value in (self._group_at, self._sync_at) if value is not None
+                        ]
+                        if self._queue and (
+                            self._closing
+                            or self._immediate
+                            or any(now >= value for value in deadlines)
+                        ):
+                            await self._publish()
+                            continue
+                        if self._closing:
+                            await self._update_owner("release")
+                            return
+                        renew_in = remaining - self._lease.ttl_s * 2 / 3
+                        if renew_in <= 0:
+                            await self._update_owner("renew")
+                            continue
+                        delay = min([renew_in, *(max(0, value - now) for value in deadlines)])
+                        with anyio.move_on_after(delay):
+                            await self._wake.wait()
+                        self._wake = anyio.Event()
+                except Exception as error:
+                    self._fail(error)
+                    if self._settlement_expired:
+                        await self._release_after_timeout()
+        except BaseException:
+            # Native task cancellation bypasses AnyIO shields, including during release.
+            self._stopped = not self.fenced.is_set()
+            self._fail(_core_error(Fenced, "journal writer stopped"))
+            raise
+        finally:
+            self._done.set()

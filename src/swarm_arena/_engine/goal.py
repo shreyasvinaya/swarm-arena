@@ -48,11 +48,10 @@ from swarm_arena._errors import (
     _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._journal import llm_record as _recorder
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head
-from swarm_arena._journal.llm_record import drain
+from swarm_arena._journal.llm_record import await_reports, drain
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
@@ -81,6 +80,11 @@ from swarm_arena._scoring.runner import (
 )
 
 _T = TypeVar("_T")
+
+
+def _report_timer(seconds: float) -> anyio.CancelScope:
+    """Give curator report arrival one allowance, separate from settlement."""
+    return anyio.move_on_after(seconds)
 
 
 @dataclass
@@ -1725,18 +1729,11 @@ class GoalRunner:
             if not interrupted:
                 try:
                     # Report arrival and durable settlement have separate budgets.
-                    with anyio.move_on_after(scope.settle_timeout_s) as report_timer:
-                        with _local_timer_scope(report_timer) as report_wait:
-                            binding = _recorder._bindings.get(scope.run_id)
-                            if binding is not None and binding.journal is scope.journal:
-                                entries = [
-                                    entry
-                                    for entry in binding.pending.values()
-                                    if any(owner is scope for owner in entry.scope.lineage())
-                                    and entry.state != "abandoned"
-                                ]
-                                for entry in entries:
-                                    await entry.event.wait()
+                    with (
+                        _report_timer(scope.settle_timeout_s) as report_timer,
+                        _local_timer_scope(report_timer) as report_wait,
+                    ):
+                        await await_reports(scope)
                     if report_wait.failure is not None:
                         raise report_wait.failure from None
                 except (KeyboardInterrupt, SystemExit):

@@ -629,3 +629,33 @@ def test_status_cli_exact_total_after_real_overflow_run(
     assert result.returncode == 0, result.stderr
     assert "$1000000000.000001" in result.stdout
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+@pytest.mark.parametrize("failure_kind", ["fence", "settlement"])
+def test_ordinary_core_failure_keeps_cli_diagnostic(
+    example: Example,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    failure_kind: str,
+) -> None:
+    from swarm_arena._errors import _core_error, _stop_cleanup_error
+
+    error = (
+        _core_error(Fenced, "run ownership lost")
+        if failure_kind == "fence"
+        else _stop_cleanup_error()
+    )
+
+    async def fail(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(run_cmds, f"_{command}_async", fail)
+    argv = (
+        [command, "--yes", str(example.run_toml), str(example.plan_toml)]
+        if command == "run"
+        else [command, str(example.run_root / "r")]
+    )
+    assert main(argv) == 1
+    assert capsys.readouterr().err == f"{error}\n"

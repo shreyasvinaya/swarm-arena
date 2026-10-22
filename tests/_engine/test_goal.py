@@ -3073,7 +3073,6 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     from contextlib import contextmanager
-    from types import SimpleNamespace
 
     import anyio
     from _fakes.curators import MergeAll
@@ -3086,8 +3085,8 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
     runner = await _curation_checkpoint(env)
     waiting = False
     allowances: list[float] = []
-    polls: list[float] = []
     waits: list[int] = []
+    report_scope: anyio.CancelScope | None = None
 
     async def curate(*args: Any, **kwargs: Any) -> Any:
         nonlocal waiting
@@ -3109,6 +3108,8 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
 
             async def wait() -> None:
                 waits.append(1)
+                assert report_scope is not None
+                report_scope.cancel()
                 await original_wait()
 
             class ObservedEvent:
@@ -3127,22 +3128,15 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
 
     @contextmanager
     def report_timer(seconds: float) -> Any:
-        if waiting:
-            allowances.append(seconds)
-        # Expire a report allowance at its first checkpoint, without a clock race.
-        with anyio.move_on_after(0 if waiting else seconds) as timer:
+        nonlocal report_scope
+        assert waiting
+        allowances.append(seconds)
+        # Cancel once the recorded report wait actually enters.
+        with anyio.CancelScope() as timer:
+            report_scope = timer
             yield timer
 
-    async def poll(seconds: float) -> None:
-        if waiting:
-            polls.append(seconds)
-            pytest.fail("report waiting must use recorder events, never tranche polling")
-        await anyio.lowlevel.checkpoint()
-
-    api = SimpleNamespace(**vars(anyio))
-    api.move_on_after = report_timer
-    api.sleep = poll
-    monkeypatch.setattr(goal_module, "anyio", api)
+    monkeypatch.setattr(goal_module, "_report_timer", report_timer)
     monkeypatch.setattr(MergeAll, "curate", curate)
     recorder.bind_run(
         env.deps.run_id,
@@ -3158,14 +3152,127 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
         settle_timeout_s=env.deps.config.settle_timeout_s,
     )
     try:
-        await runner._curate_round(1)
+        with anyio.fail_after(5):
+            await runner._curate_round(1)
     finally:
         recorder.unbind_run(env.deps.run_id)
     await env.deps.journal.commit()
     assert len(env.events("curated")) == 1
     assert waiting, env.events("curated")[0].payload
     assert allowances == [env.deps.config.settle_timeout_s]
-    assert polls == []
     assert waits == ([1] if mode == "recorded" else [])
     assert len(env.events("llm_call")) == int(mode != "direct")
     assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
+
+
+@pytest.mark.parametrize("interruption", ["stop_now", "deadline", "lease_loss", "writer_failure"])
+async def test_curator_report_wait_observes_owner_interruptions(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, interruption: str
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._errors import (
+        Fenced,
+        _core_category,
+        _core_error,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena._journal import llm_record as recorder
+
+    runner = await _curation_checkpoint(env)
+    entered = anyio.Event()
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        estimate = Amount(usd=0.01)
+        reservation = await scope.tranche.reserve_call(estimate)
+        recorder.open_call(
+            scope,
+            reservation_id=reservation,
+            estimate=estimate,
+            model_alias="model",
+            model="fake/model",
+            provider="fake",
+        )
+        entry = recorder._bindings[scope.run_id].pending[reservation]
+        original_event = entry.event
+
+        class ObservedEvent:
+            async def wait(self) -> None:
+                entered.set()
+                await original_event.wait()
+
+            def set(self) -> None:
+                original_event.set()
+
+        entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
+        raise KeyError("CURATOR_REPORT_SENTINEL")
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    recorder.bind_run(
+        env.deps.run_id,
+        journal=env.deps.journal,
+        ids=env.deps.ids,
+        artifacts=env.deps.artifacts,
+        tracing=env.deps.config.tracing,
+        committed=[],
+        request_sha256={},
+        stops=env.deps.stops,
+        clock=env.deps.clock,
+        limits=env.deps.config.limits,
+        settle_timeout_s=env.deps.config.settle_timeout_s,
+    )
+    binding = recorder._bindings[env.deps.run_id]
+    writer_check = env.deps.journal._raise_if_fenced
+    task = asyncio.create_task(runner._curate_round(1))
+    try:
+        with anyio.fail_after(5):
+            await entered.wait()
+        if interruption == "stop_now":
+            env.deps.stops.stop_now = env.deps.stops.stop = True
+        elif interruption == "deadline":
+            env.deps.clock._rebase(env.deps.config.limits.run_timeout_s)
+        elif interruption == "lease_loss":
+            binding.terminal = _core_error(Fenced, "run ownership lost")
+        else:
+
+            def failed_writer() -> None:
+                raise _stop_cleanup_error()
+
+            monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", failed_writer)
+        # A report is optional: interruption must shorten its 60 s allowance.
+        with anyio.fail_after(5):
+            if interruption in {"lease_loss", "writer_failure"}:
+                with pytest.raises(
+                    Fenced if interruption == "lease_loss" else RuntimeError
+                ) as caught:
+                    await asyncio.shield(task)
+                assert _core_category(caught.value) is (
+                    _SignalCategory.FENCED
+                    if interruption == "lease_loss"
+                    else _SignalCategory.TERMINAL
+                )
+            else:
+                await asyncio.shield(task)
+                assert binding.cleanup_at < float("inf")
+        if interruption in {"lease_loss", "writer_failure"}:
+            assert not env.events("curated")
+        else:
+            await env.deps.journal.commit()
+            assert runner.reason == (
+                "stop --now" if interruption == "stop_now" else "run_timeout_s"
+            )
+            assert len(env.events("curated")) == 1
+            assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        recorder.unbind_run(env.deps.run_id)
+        monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", writer_check)

@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import anyio
 
@@ -12,6 +13,13 @@ from swarm_arena.llm._hooks import BudgetExceeded
 from swarm_arena.llm._manager import _finish_accounting
 
 
+@dataclass
+class _InvocationAccounting:
+    """Carry accounting origin separately from the classified control outcome."""
+
+    failed: bool = False
+
+
 @asynccontextmanager
 async def _invocation(
     parent: LLMScope,
@@ -19,6 +27,7 @@ async def _invocation(
     name: str,
     error_type: type[Exception],
     accounting_name: str = "LLM accounting",
+    accounting: _InvocationAccounting | None = None,
 ) -> AsyncGenerator[LLMScope]:
     """
     Enter a child scope, contain failures and finish accounting before exit.
@@ -39,6 +48,10 @@ async def _invocation(
 
     accounting_name : str, default="LLM accounting"
         Diagnostic site for an ordinary accounting failure.
+
+    accounting : _InvocationAccounting or None, default=None
+        Optional private status marking a failed accounting step independently
+        of the control category propagated to the caller.
 
     Yields
     ------
@@ -90,6 +103,8 @@ async def _invocation(
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as cleanup_error:
+            if accounting is not None:
+                accounting.failed = True
             accounting_failure = cleanup_error
             failure = (
                 BaseExceptionGroup(f"{name} cleanup", [failure, cleanup_error])

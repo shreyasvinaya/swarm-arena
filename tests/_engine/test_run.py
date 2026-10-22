@@ -1893,3 +1893,107 @@ async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
     }
     assert any(e.type == "tool_end" and e.agent == "healthy" for e in ev)
     assert not any(e.type == "tool_start" and e.agent == "a0" for e in ev)
+
+
+def test_library_forced_interrupt_preserves_cancelled_shutdown(tmp_path: Path) -> None:
+    import os
+    import select
+    import signal
+    import subprocess
+    import time
+
+    code = """
+import asyncio
+import signal
+from pathlib import Path
+from typing import Any
+import anyio
+from _fakes.run import plan
+from swarm_arena import RunConfig, Swarm
+from swarm_arena._budget.ledger import Ledger
+
+root = Path.cwd()
+config = RunConfig(run_root=str(root / 'runs'), artifact_root=str(root / 'artifacts'),
+                   arena_root=str(root / 'arena'), settle_timeout_s=2)
+settle = Ledger._settle
+async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
+    first_interrupt = anyio.Event()
+    runner_handler = signal.getsignal(signal.SIGINT)
+    assert callable(runner_handler)
+    def observe(signum: int, frame: Any) -> None:
+        try:
+            runner_handler(signum, frame)
+        finally:
+            first_interrupt.set()
+    signal.signal(signal.SIGINT, observe)
+    try:
+        with anyio.CancelScope(shield=True):
+            print('settlement-ready', flush=True)
+            await first_interrupt.wait()
+    finally:
+        signal.signal(signal.SIGINT, runner_handler)
+        try:
+            with anyio.CancelScope(shield=True):
+                print('cleanup-ready', flush=True)
+                await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                print('settlement-resumed', flush=True)
+                await settle(self, *args, **kwargs)
+Ledger._settle = held_settle
+handler = signal.getsignal(signal.SIGINT)
+try:
+    asyncio.run(Swarm(config).run(plan(rounds=1)))
+except KeyboardInterrupt:
+    print('interrupted', flush=True)
+    print('handler-restored=' + str(signal.getsignal(signal.SIGINT) is handler), flush=True)
+    raise SystemExit(130)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-u", "-c", code],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        start_new_session=True,
+    )
+    stdout = process.stdout
+    assert stdout is not None
+    output = bytearray()
+
+    def until(marker: bytes) -> None:
+        deadline = time.monotonic() + 60
+        while marker not in output:
+            assert time.monotonic() < deadline, bytes(output)
+            if select.select([stdout], [], [], 0.05)[0]:
+                chunk = os.read(stdout.fileno(), 65536)
+                assert chunk, bytes(output)
+                output.extend(chunk)
+
+    try:
+        until(b"settlement-ready")
+        process.send_signal(signal.SIGINT)
+        until(b"cleanup-ready")
+        process.send_signal(signal.SIGINT)
+        try:
+            rest, _ = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"library forced interrupt did not exit: {bytes(output)!r}")
+        output.extend(rest)
+        assert process.returncode == 130, bytes(output)
+        assert b"settlement-resumed" in output
+        assert b"interrupted" in output
+        assert b"handler-restored=True" in output
+        assert b"Traceback" not in output
+        assert b"during asyncio.run() shutdown" not in output
+        assert b"unhandled exception" not in output
+        assert b"never retrieved" not in output
+    finally:
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        stdout.close()
