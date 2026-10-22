@@ -2672,6 +2672,23 @@ remaining accounting; cancelled-call retries retain their allowance until settle
 then retire it so later healthy work is unaffected. Pending-report waiting still
 uses its separate `settle_timeout_s` bound.
 
+`CallLogger` adapts successful and failed LiteLLM callbacks through the bound
+recorder's owner loop and supervised preparation boundary. `charge_reservation`
+keeps unknown spend charged, including success reports without usage, regardless
+of exception class; authoritative
+usage (including five-minute and one-hour cache writes) is priced by the pending
+run's catalog. Response-cache hits retain display usage and charge zero. Callback
+errors contain only operation/type identifiers, and terminal writer cleanup or
+usage-overflow failures remain observable through the owner's drain.
+
+The installed cache captures effective keys at LiteLLM's actual key-generation
+route. Together with the generating response ID, this feeds the replayable
+cache-origin index; missing or conflicting evidence leaves the origin unset.
+`install(config)` registers one stateless logger, requires the cache extra before
+constructing a backend, and rejects a second different non-null cache policy
+with `one response-cache policy per process`. A run without a cache policy leaves
+the process installation alone and relies on its per-call cache controls.
+
 ### R4.14 Journal event types — M1b (additions noted)
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.

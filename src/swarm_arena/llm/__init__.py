@@ -13,6 +13,7 @@ for _dist, _module in (("openai-agents", "agents"), ("litellm", "litellm")):
 
 try:
     from swarm_arena.llm import _catalog as _catalog  # noqa: I001
+    from swarm_arena.llm import _logger as _logger
 
     # isort: split
     import agents as _agents  # noqa: F401
