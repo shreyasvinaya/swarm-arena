@@ -2,6 +2,7 @@
 
 import ast
 import importlib
+import importlib.metadata
 import inspect
 import re
 import subprocess
@@ -146,6 +147,11 @@ class RenderedText(HTMLParser):
 
 
 def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
+    for distribution in ("openai-agents", "litellm"):
+        try:
+            importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip("Full Sphinx API docs require the 'llm' extra: swarm-arena[llm]")
     output = tmp_path / "html"
     done = subprocess.run(
         [sys.executable, "-m", "sphinx", "-W", "-q", str(ROOT / "docs"), str(output)],
