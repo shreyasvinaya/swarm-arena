@@ -2489,10 +2489,9 @@ async def test_conformance_rejects_reservation_admitted_during_close(
     from _fakes.tools import NoopManager
 
     from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.ledger import Ledger
     from swarm_arena._budget.llm_scope import current_llm_scope
     from swarm_arena._budget.tranche import Tranche
-
-    from swarm_arena._budget.ledger import Ledger
 
     entered, closing = anyio.Event(), anyio.Event()
     tasks: list[asyncio.Task[None]] = []
@@ -2592,3 +2591,40 @@ async def test_conformance_accepts_exact_closed_scope_accounting(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     assert await _run_conformance_kind(kind)
+
+
+async def test_later_round_stop_does_not_inherit_drain_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena.testing import _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    harness = OfflineHarness()
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+    failure = KeyError("first round")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if ctx._rt.round == 1:
+            await _reserve_conformance_call(opened=False)
+            raise failure
+        from swarm_arena._budget.llm_scope import current_llm_scope
+        from swarm_arena._journal import llm_record
+
+        scope = current_llm_scope()
+        assert scope is not None
+        llm_record._bindings[scope.run_id].stops.run_timeout = True
+        await anyio.sleep_forever()
+        raise AssertionError("stop must interrupt the round")
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    with (
+        anyio.fail_after(10),
+        pytest.raises(RuntimeError, match="offline harness stopped") as caught,
+    ):
+        await check_manager(
+            NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+        )
+    assert _has_drain_note(failure)
+    assert not _has_drain_note(caught.value)

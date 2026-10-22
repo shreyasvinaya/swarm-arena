@@ -94,9 +94,10 @@ class _DrainOutcome:
 
     def note(self, error: BaseException) -> None:
         """Attach the rule once to each propagated outcome object."""
-        if self.violated and self.noted is not error:
+        if (self.violated or self.noted is not None) and self.noted is not error:
             BaseException.add_note(error, _DRAIN_RULE)
             self.noted = error
+            self.violated = False
 
 
 @asynccontextmanager
@@ -694,6 +695,7 @@ class OfflineHarness:
                         rt.ledger._check_usage_overflow()
                     if manager_error is None:
                         await _assert_accounted(scope, self.store)
+                    self._drain_outcome.noted = None
             if any(
                 c.requested_by_call is not None and c.requested_by_call not in scope.call_ids
                 for c in rt.own
