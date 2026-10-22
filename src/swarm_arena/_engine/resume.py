@@ -4,7 +4,7 @@ import asyncio
 import sys
 import threading
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
@@ -493,6 +493,8 @@ async def _take_over(
     validate: Callable[[OwnerDoc], None] | None = None,
     before_acquire: Callable[[], Awaitable[None]] | None = None,
     review: bool = False,
+    clock: RunClock | None = None,
+    stops: StopState | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     while True:
@@ -508,19 +510,39 @@ async def _take_over(
             await _validated_io(validate, doc)
         if before_acquire is not None:
             await before_acquire()
+        lease: Lease | None = None
+        supervisor = (
+            run_module._supervise_initialization(store, doc.epoch + 1, stops, clock, config)
+            if stops is not None
+            else nullcontext()
+        )
         try:
-            return await _acquire_lease(
-                partial(
-                    Lease.take_over,
-                    store,
-                    owner_id=uuid4().hex,
-                    host=host_id(),
-                    ttl_s=config.lease_ttl_s,
-                    force=force,
-                    expect_epoch=doc.epoch,
-                ),
-                settle_timeout_s=config.settle_timeout_s,
-            )
+            try:
+                async with supervisor:
+                    lease = await _acquire_lease(
+                        partial(
+                            Lease.take_over,
+                            store,
+                            owner_id=uuid4().hex,
+                            host=host_id(),
+                            ttl_s=config.lease_ttl_s,
+                            force=force,
+                            expect_epoch=doc.epoch,
+                        ),
+                        settle_timeout_s=config.settle_timeout_s,
+                    )
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                if lease is None or (
+                    stops is not None and (stops.stop or stops.stop_now or stops.run_timeout)
+                ):
+                    raise _core_error(RuntimeError, "resume initialization stopped")
+                return lease
+            except BaseException:
+                if lease is not None:
+                    with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                        with suppress(BaseException):
+                            await _storage_io(lease.release)
+                raise
         except Fenced:
             current = await _lease_io(read_owner, store)
             if current is None or current[0].epoch != doc.epoch:
@@ -578,7 +600,7 @@ async def resume_run(
     run_module._require_asyncio()
     store = open_store(config.run_root).child(run_id)
 
-    clock: RunClock | None = None
+    clock, stops = RunClock(0), StopState()
     validated_head: Head | None = None
     model_warnings: list[str] = []
 
@@ -587,10 +609,7 @@ async def resume_run(
         _, state = _read(store, doc)
         _check(state, config)
         _restore_import_paths(state)
-        if clock is None:
-            clock = RunClock(state.run_elapsed_s)
-        else:
-            clock._rebase(state.run_elapsed_s)
+        clock._rebase(state.run_elapsed_s)
         validated_head = doc.head
 
     async def check_startup_models() -> None:
@@ -598,7 +617,14 @@ async def resume_run(
         model_warnings = await run_module._check_startup_models(config, replanner)
 
     lease = await _take_over(
-        config, run_id, store, force=force, validate=validate, before_acquire=check_startup_models
+        config,
+        run_id,
+        store,
+        force=force,
+        validate=validate,
+        before_acquire=check_startup_models,
+        clock=clock,
+        stops=stops,
     )
     assert clock is not None
     assert validated_head is not None

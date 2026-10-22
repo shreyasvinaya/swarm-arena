@@ -633,21 +633,25 @@ class RunRunner:
         assert self.run_id is not None
         config, run_id = self.config, self.run_id
         store = open_store(config.run_root).child(run_id)
-        lease = await _acquire_lease(
-            partial(
-                Lease.acquire_new,
-                store,
-                owner_id=uuid4().hex,
-                host=socket.gethostname(),
-                ttl_s=config.lease_ttl_s,
-            ),
-            settle_timeout_s=config.settle_timeout_s,
-        )
-        local_path = _local_journal_path(run_id, lease.doc.epoch)
-        clock = RunClock(0)
-        stops = StopState()
+        clock, stops = RunClock(0), StopState()
+        lease: Lease | None = None
         entered = False
         try:
+            async with _supervise_initialization(store, 1, stops, clock, config):
+                lease = await _acquire_lease(
+                    partial(
+                        Lease.acquire_new,
+                        store,
+                        owner_id=uuid4().hex,
+                        host=socket.gethostname(),
+                        ttl_s=config.lease_ttl_s,
+                    ),
+                    settle_timeout_s=config.settle_timeout_s,
+                )
+                await anyio.lowlevel.checkpoint_if_cancelled()
+            if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
+                raise _core_error(RuntimeError, "run initialization stopped before run_started")
+            local_path = _local_journal_path(run_id, lease.doc.epoch)
             async with _RunJournal(
                 store,
                 lease,
@@ -772,7 +776,7 @@ class RunRunner:
                                 await _close_board(board, config, failed=board_failed)
                     return await _finish_initialization_stop(store, journal, stops, config)
         finally:
-            if not entered:
+            if lease is not None and not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(BaseException):
                         await _storage_io(lease.release)
