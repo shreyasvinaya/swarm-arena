@@ -42,8 +42,10 @@ and `settle_timeout_s` each default to 60 s; the lease renews every
 `lease_ttl_s / 3`. `schedule_timeout_s` defaults to 600 s. `ConvergeSpec`
 defaults are `top_n=2`, `parents_per_part=1`, and `max_join_attempts=1`.
 Learning titles hold at most 120 characters and text at most 1,500 characters.
-Built-in model integrations and their model-cap checks arrive in M3; configuring
-a model catalog alone does not provide them.
+The `llm` extra provides built-in model integrations and checks used aliases,
+role permissions, manager function calling, output caps, and prices under a
+dollar cap; structured roles without response-schema support receive a warning
+and use the two-stage fallback.
 
 The optional `Limits.max_usd` run cap must be positive and no greater than
 1,000,000,000 USD. Leaving it unset means there is no configured dollar cap.
@@ -79,10 +81,13 @@ control meaning. The CLI likewise renders safe core diagnostics or a type name.
 The budget is allocated as follows:
 
 1. Hold `reserve_fraction` at run level for judging, replanning, convergence,
-   and final judging. Curator integrations are future work.
+   and final judging. The configured-curator seam and built-in `LLMCurator`
+   also use this reserve.
 2. Hold a protected **final slice for every goal**, including queued goals.
    It covers one convergence plus `max_join_attempts` additional attempts and
-   the complete final ranking batch. Converge tools are estimated at **every
+   the final ranking batch's output terms; serialized inputs are reserved at
+   dispatch and can still be refused (see [LLM-judge funding](scoring-and-review.md#llm-judges)).
+   Converge tools are estimated at **every
    reachable round from 1 through R + 1**, taking the maximum in each budget
    unit, because a stop can converge before all R ordinary rounds finish.
    Ordinary judging and replanning cannot consume these protected slices.

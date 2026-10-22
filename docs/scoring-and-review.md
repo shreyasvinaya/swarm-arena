@@ -193,8 +193,8 @@ judge remain separate evaluations.
 Team mode runs a converge team, seeded with leaders or `parents_per_part` ranked
 parents from each part. Assigned `AgentContext.seed_parents` are read-only and
 are prepended to explicit tool parents, removing duplicate IDs. A manager's
-`best(part=...)` is restricted to its own group; it does not grant arbitrary
-cross-part leaderboard access. Reads automatically populate later candidates'
+`best(part=...)` reads its own group or a declared sibling group, including
+`part=""` for the main group, and never an undeclared group. Reads automatically populate later candidates'
 `read_ids` provenance.
 
 Partial results require `converge.allow_partial=True`. `distinct=True` skips
