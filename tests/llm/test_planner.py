@@ -950,9 +950,11 @@ def test_board_close_ignores_sync_callers_handled_exception(
         assert flags == [False]
 
 
+@pytest.mark.parametrize("accounting_failure", [False, True])
 async def test_falsey_body_failure_is_retained_with_accounting_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accounting_failure: bool
 ) -> None:
+    from swarm_arena._errors import StorageError
     from swarm_arena.llm import _invocation, _planner
 
     class FalseyError(Exception):
@@ -963,22 +965,27 @@ async def test_falsey_body_failure_is_retained_with_accounting_failure(
         raise FalseyError(SECRET)
 
     async def finish(*args: Any, **kwargs: Any) -> None:
-        raise ValueError(SECRET)
+        if accounting_failure:
+            raise ValueError(SECRET)
 
     monkeypatch.setattr(_planner, "_prepare", prepare)
-    monkeypatch.setattr(_planner, "_finish_accounting", finish, raising=False)
     monkeypatch.setattr(_invocation, "_finish_accounting", finish)
     config = planner_config(tmp_path)
     async with open_llm_run(tmp_path, config=config) as run:
         parent = run.scope("planner")
-        with pytest.raises(RuntimeError) as shared:
+        expected = StorageError if accounting_failure else ValueError
+        with pytest.raises(expected) as shared:
             async with _invocation._invocation(parent, name="planner", error_type=ValueError):
                 raise FalseyError(SECRET)
-        with llm_scope(parent), pytest.raises(RuntimeError) as planner:
+        with llm_scope(parent), pytest.raises(expected) as planner:
             await LLMPlanner("planner")._draft_at(GOAL, config, None, base_dir=tmp_path)
         assert type(planner.value) is type(shared.value)
         assert str(planner.value) == str(shared.value)
-        assert "ExceptionGroup" in str(planner.value)
+        assert str(planner.value) == (
+            "LLM accounting failed: ValueError"
+            if accounting_failure
+            else "LLM planner failed: FalseyError"
+        )
         assert_secret_absent(planner.value, SECRET)
 
 
@@ -995,3 +1002,102 @@ async def test_custom_reviewer_cleanup_hook(tmp_path: Path) -> None:
         GOAL, planner_config(tmp_path), None
     )
     assert reviewer.cleared
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("hook_failure", ["lookup", "call"])
+async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
+    tmp_path: Path, cancelled: bool, hook_failure: str
+) -> None:
+    import traceback
+
+    from swarm_arena._errors import _is_core_signal
+
+    entered = anyio.Event()
+
+    class Reviews:
+        cleared = False
+
+        async def review(self, plan: Plan) -> Approve:
+            entered.set()
+            if cancelled:
+                await anyio.sleep_forever()
+            return Approve()
+
+        @property
+        def _clear_edit(self) -> Any:
+            if hook_failure == "lookup":
+                raise ValueError(SECRET)
+            return self.clear
+
+        def clear(self) -> None:
+            self.cleared = True
+            raise ValueError(SECRET)
+
+    reviewer = Reviews()
+    config = planner_config(tmp_path)
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    task = asyncio.create_task(
+        CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
+    )
+    try:
+        with anyio.fail_after(15):
+            await entered.wait()
+            if cancelled:
+                task.cancel()
+            expected = asyncio.CancelledError if cancelled else RuntimeError
+            with pytest.raises(
+                expected, match=None if cancelled else r"^review cleanup failed: ValueError$"
+            ) as caught:
+                await task
+        assert_secret_absent(caught.value, SECRET)
+        assert SECRET not in "".join(traceback.format_exception(caught.value))
+        if cancelled:
+            assert isinstance(caught.value, asyncio.CancelledError)
+        else:
+            assert isinstance(caught.value, RuntimeError)
+            assert _is_core_signal(caught.value)
+            assert str(caught.value) == "review cleanup failed: ValueError"
+        finished = [e.payload["reason"] for e in all_events(config) if e.type == "goal_finished"]
+        assert finished == ["stopped" if cancelled else "planning complete"]
+        assert reviewer.cleared is (hook_failure == "call")
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("primary", ["body", "control", "handled"])
+async def test_custom_cleanup_preserves_primary_and_ignores_handled_exception(
+    tmp_path: Path, primary: str
+) -> None:
+    from swarm_arena._errors import Fenced, _core_error
+
+    class Reviews:
+        async def review(self, plan: Plan) -> Approve:
+            if primary == "control":
+                raise _core_error(Fenced, "review ownership lost")
+            if primary == "body":
+                raise ValueError(SECRET)
+            return Approve()
+
+        def _clear_edit(self) -> None:
+            raise ValueError(SECRET)
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    config = planner_config(tmp_path)
+    planner = CollaborativePlanner(LLMPlanner("planner"), Reviews())
+    try:
+        raise _core_error(Fenced, "unrelated handled ownership loss")
+    except Fenced:
+        with pytest.raises(Fenced if primary == "control" else RuntimeError) as caught:
+            await planner.plan(GOAL, config, None)
+    assert (
+        str(caught.value)
+        == {
+            "control": "run ownership lost",
+            "body": "reviewer failed: ValueError",
+            "handled": "review cleanup failed: ValueError",
+        }[primary]
+    )
+    assert_secret_absent(caught.value, SECRET)

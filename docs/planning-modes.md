@@ -308,7 +308,9 @@ reviewers must retain their own edits. Each refused edit counts toward `max_iter
 The terminal adapter clears retained edits when the collaborative session ends.
 Approval cannot authorize a mutation of the offered draft: return
 `Edited(plan)` to propose changes explicitly. Custom async reviewers must
-cooperate with cancellation.
+cooperate with cancellation. Custom reviewer cleanup failures have type-only
+diagnostics. Cleanup cannot replace an already escaping error or cancellation;
+a cleanup failure after approval surfaces as an error.
 
 Standalone planning journals remain readable for accounting and provenance.
 They cannot be resumed: both `Swarm.resume` and `swarm-arena resume` refuse

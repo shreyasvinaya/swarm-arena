@@ -134,8 +134,13 @@ def _report_rejection(reviewer: Reviewer, diagnostic: str) -> None:
         report(diagnostic)
 
 
-def _clear_review(reviewer: Reviewer) -> None:
-    """Discard any session-local edits retained by the reviewer adapter."""
-    clear = getattr(reviewer, "_clear_edit", None)
-    if clear is not None:
-        clear()
+def _clear_review(reviewer: Reviewer, *, failure: BaseException | None) -> None:
+    """Contain adapter cleanup without replacing an explicitly captured failure."""
+    outcome = _Outcome()
+    try:
+        clear = getattr(reviewer, "_clear_edit", None)
+        if clear is not None:
+            clear()
+    except BaseException as error:
+        if failure is None:
+            outcome.contain(error, RuntimeError, "review cleanup")

@@ -562,7 +562,8 @@ class CollaborativePlanner(Planner):
         Raises
         ------
         RuntimeError
-            No approval within the configured review count.
+            No approval within the configured review count, or reviewer cleanup
+            failed after approval.
 
         Examples
         --------
@@ -579,6 +580,7 @@ class CollaborativePlanner(Planner):
         base_dir: Path,
     ) -> Plan:
         """Review with the explicit source root supplied by file-based callers."""
+        failure: BaseException | None = None
         try:
             if current_llm_scope() is None:
                 async with planning_session(config, goal, self) as scope:
@@ -587,8 +589,11 @@ class CollaborativePlanner(Planner):
                     )
                 return result
             return await self._review(goal, config, history, base_dir=base_dir)
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            _clear_review(self._reviewer)
+            _clear_review(self._reviewer, failure=failure)
 
     async def _review(
         self,
