@@ -603,3 +603,46 @@ The child's overlay retains the accepted parent's edits, with the child's new
 edits taking precedence at the same path. Passing that child as the next base
 parent preserves the chain. Checks and judges supplied with the same goal see
 the same effective files, without a manual overlay merge.
+
+
+### Testing an LLM judge offline
+
+The `llm` extra supplies `LLMJudge`; the conformance kit accepts its real model
+catalog through `config=`. Register a fresh `FakeModel` for each test. This
+example performs no provider request and verifies journaled call links:
+
+```python
+import asyncio
+import json
+
+from swarm_arena import Goal, RunConfig
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import LLMJudge
+from swarm_arena.testing import FakeModel, FakeTurn, check_judge, make_candidate
+from swarm_arena.tool import RunStatus, ToolOutput
+
+
+async def check_offline_judge() -> None:
+    goal = Goal(id="example", namespace="offline")
+    candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=goal)]
+    row = {"index": 0, "value": 7.5, "verdict": "good", "notes": "Meets the rubric"}
+    fake = FakeModel([FakeTurn(text=json.dumps({"scores": [row]}))])
+    fake.register("m")
+    config = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
+        settle_timeout_s=2,
+    )
+    scores = await check_judge(
+        LLMJudge("Correctness from 0 to 10", ["m"]), goal, candidates, config=config
+    )
+    assert scores[0].value == 7.5
+    assert scores[0].llm_call_ids
+
+
+asyncio.run(check_offline_judge())
+```
+
+The kit checks that the judge leaves no reservation pending and that closed
+charges equal journaled LLM costs. A contained terminal control fails the
+conformance check; propagated controls and ordinary judge errors retain their
+existing handling.

@@ -886,3 +886,12 @@ async def test_metadata_runs_off_loop_but_score_ids_stay_on_loop() -> None:
     assert len(out.scores) == 1
     assert len(observed) == 2
     assert all(t is not threading.main_thread() and t.daemon for t in observed)
+
+
+async def test_omitted_candidate_is_a_judge_error() -> None:
+    judge = _RecordingJudge(values={"c0": 1.0, "c1": None})
+    outcome = await judge_round(
+        "g", [(Ref.of(judge), judge)], [_cand("c0"), _cand("c1")], [], lambda _: _judge_ctx()
+    )
+    assert [s.candidate_id for s in outcome.scores] == ["c0"]
+    assert [(e.candidate_id, e.reason) for e in outcome.errors] == [("c1", "no score")]

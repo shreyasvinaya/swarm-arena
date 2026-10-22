@@ -1953,6 +1953,11 @@ def judge_amount(judge: Judge, n: int, config: RunConfig, price_of: Callable[[st
     # alias only when its input and output prices are each <= the member's (else the same alias formats) —; a judge with
     # non-empty providers() -> n x default_run_reservation (settled estimated at the barrier); any other judge -> Amount() (no
     # paid call, R5.4). The barrier's up-front batch reservation passes llm=False; estimates pass llm=True.
+    # Formatting calls retain the member's first output cap (also capped by the formatter's own spec).
+    # A different formatter has no higher input/output or effective cache-write tariff; otherwise the same
+    # alias formats with the schema in its prompt. This preserves the per-member output terms above.
+    # Final slices hold output terms only: MeteredModel separately reserves serialized inputs at call time.
+    # Refused input funding raises BudgetExceeded before provider dispatch; the formula is unchanged.
 def final_slice_estimate(plan: Plan, config: RunConfig, tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
                          price_of: Callable[[str], ModelSpec.Prices | None]) -> Amount: ...
     # [plan] _budget/estimate.py; M1b, +M3 for LLM terms. (1 + max_join_attempts) x sum over converge-team agents of

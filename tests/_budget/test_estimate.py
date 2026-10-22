@@ -367,3 +367,31 @@ def test_manager_tokens_priced_through_registered_source() -> None:
     price = price_of_model("anthropic/claude-sonnet-4-6")
     assert price is not None
     assert estimate.usd >= 3 * 20 * 8000 * price.output / 1e6
+
+
+class _RankingLLMJudge(Judge):
+    name = "llm"
+
+    def models(self) -> tuple[str, ...]:
+        return ("m",)
+
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        return []
+
+
+def test_final_slice_funds_an_llm_ranking_judge_without_tool_reservations() -> None:
+    config = _cfg(
+        alias="m",
+        max_tokens=4096,
+        input=1,
+        output=2,
+        limits=Limits(default_run_reservation={"tokens": 0, "usd": 0}),
+    )
+    plan = _plan(ranking_judge=_RankingLLMJudge(), top_n=2)
+    amount = final_slice_estimate(
+        plan, config, _tools(plan, _FreeTool()), make_price_of(config.models)
+    )
+    assert amount.tokens >= max(25_000, 2 * 2 * 4096)
+    assert amount.usd >= 0.25

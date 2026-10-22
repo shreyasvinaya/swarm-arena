@@ -79,6 +79,65 @@ so a judge can calibrate the batch against earlier evidence. Empty gated-in
 batches skip judging. Anchors remain in the same group and comparison domain;
 they do not authorize cross-part ranking.
 
+## LLM judges
+
+Install the `llm` extra and configure model aliases with the `judge` role.
+`LLMJudge` scores each candidate independently against a fixed rubric and a
+finite scale (0–10 by default). Include concrete score anchors in the rubric:
+
+```python
+from swarm_arena.llm import LLMJudge
+
+judge = LLMJudge(
+    "Correctness: 0 = unusable, 5 = partially correct, 10 = fully correct. "
+    "Explain the score using evidence from the candidate.",
+    ["opus", "gpt", "flash"],
+    "median",
+)
+```
+
+Aliases can refer to different providers. Every panel member scores every batch
+concurrently, at temperature zero. `mean` (the default), `median`, `min` and
+`max` aggregate votes. Repeated aliases retain separate votes and funding terms.
+A member that fails any batch is excluded from the entire invocation; all
+batches use the same surviving panel. A candidate is omitted unless every live
+member gives it a finite value inside the configured scale. If all members
+fail, no candidate receives a score. Budget refusals and core controls propagate;
+they never remove a panel member.
+
+Ordinary batches contain at most eight candidates, including up to two earlier
+leaders requested as anchors. Every batch re-scores the anchors, leaving room
+for `batch_size - len(anchors)` other candidates. Configure these with
+`LLMJudge.Config`; `anchors` must be smaller than `batch_size`. Each anchor gets
+one score from the first batch, with later aggregated anchor values appended to
+its notes so drift is visible. Its call links include every batch that held it.
+The final judge scores all finalists in one call per member, regardless of
+`batch_size`. Anchors and the final judge never read the response cache.
+
+The rubric identity includes the rubric, scale, aggregation and single-model
+alias. A panel identity hashes its sorted aliases, retaining repeats; a reduced
+panel records its surviving aliases, including a single survivor. Core stamping
+and recursive `Lexicographic` composition preserve that identity. Aliases are
+part of the identity: re-point a model under a **new alias** to avoid treating
+its scores as comparable to earlier results.
+
+Models without response-schema support use a free-text call followed by a
+formatting call. The formatter is the cheapest eligible schema-capable alias
+whose input, output and effective cache-write tariffs do not exceed the first
+model's terms. Otherwise the same alias formats with the schema in its prompt.
+The formatting output cap is no larger than either model's catalog cap. Each
+call reserves through `MeteredModel`; there is no second barrier hold for an
+LLM judge. Each returned score links the calls for its batch, including failed
+member attempts. The judge drains its scope before returning, so every link
+has a journaled call or an `estimated:` late-record placeholder.
+
+The final slice holds the **output terms only**; inputs are reserved at call
+time. A judge call whose serialized input (including schema) does not fit the
+remaining budget is refused before any provider call, so the judge never
+overspends through unfunded dispatch. `LLMJudge.judge` raises `BudgetExceeded`
+on that refusal, including a formatting-call refusal. Already incurred spend
+stays settled. Reported actual usage is never capped at the reservation.
+
 ## Pruning policies
 
 Policies consume `RoundState` after a round barrier and return a `Decision` with

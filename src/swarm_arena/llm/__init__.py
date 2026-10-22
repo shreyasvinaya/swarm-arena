@@ -24,8 +24,9 @@ except ModuleNotFoundError as _exc:
 
 from swarm_arena._facade import publish as _publish
 from swarm_arena.llm._hooks import BudgetExceeded
+from swarm_arena.llm._judge import LLMJudge
 from swarm_arena.llm._manager import AgentsSDKManager
 
-__all__: list[str] = ["AgentsSDKManager", "BudgetExceeded"]
+__all__: list[str] = ["AgentsSDKManager", "BudgetExceeded", "LLMJudge"]
 
 _publish(__name__, __all__)

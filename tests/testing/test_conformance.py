@@ -2791,3 +2791,34 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
         Amount(),
     )
     assert settled == Amount(usd=0.001 if mismatch else 0)
+
+
+async def test_check_judge_runs_an_llm_judge_offline(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    fake = FakeModel(
+        [
+            FakeTurn(
+                text=json.dumps(
+                    {
+                        "scores": [
+                            {"index": i, "value": 7.5, "verdict": "ok", "notes": "rubric"}
+                            for i in range(2)
+                        ]
+                    }
+                )
+            )
+        ]
+    )
+    fake.register("m")
+    config = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
+        settle_timeout_s=2,
+    )
+    candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=GOAL) for _ in range(2)]
+    scores = await check_judge(LLMJudge("r", ["m"]), GOAL, candidates, config=config)
+    assert [s.candidate_id for s in scores] == [c.id for c in candidates]
+    assert all(s.llm_call_ids for s in scores)
