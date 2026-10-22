@@ -628,26 +628,31 @@ class RunRunner:
         warnings: list[str],
         manifest: dict[str, Any],
     ) -> dict[str, list[Candidate]]:
-        from swarm_arena._engine.resume import _acquire_lease
+        from swarm_arena._engine.resume import _supervised_acquire
 
         assert self.run_id is not None
         config, run_id = self.config, self.run_id
         store = open_store(config.run_root).child(run_id)
-        lease = await _acquire_lease(
-            partial(
-                Lease.acquire_new,
-                store,
-                owner_id=uuid4().hex,
-                host=socket.gethostname(),
-                ttl_s=config.lease_ttl_s,
-            ),
-            settle_timeout_s=config.settle_timeout_s,
-        )
-        local_path = _local_journal_path(run_id, lease.doc.epoch)
-        clock = RunClock(0)
-        stops = StopState()
+        clock, stops = RunClock(0), StopState()
+        lease: Lease | None = None
         entered = False
         try:
+            lease = await _supervised_acquire(
+                store,
+                1,
+                stops,
+                clock,
+                config,
+                partial(
+                    Lease.acquire_new,
+                    store,
+                    owner_id=uuid4().hex,
+                    host=socket.gethostname(),
+                    ttl_s=config.lease_ttl_s,
+                ),
+                stopped="run initialization stopped before run_started",
+            )
+            local_path = _local_journal_path(run_id, lease.doc.epoch)
             async with _RunJournal(
                 store,
                 lease,
@@ -772,7 +777,7 @@ class RunRunner:
                                 await _close_board(board, config, failed=board_failed)
                     return await _finish_initialization_stop(store, journal, stops, config)
         finally:
-            if not entered:
+            if lease is not None and not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(BaseException):
                         await _storage_io(lease.release)
@@ -1139,7 +1144,7 @@ async def planning_session(
     >>> async with planning_session(config, goal, planner) as scope:  # doctest: +SKIP
     ...     result = await planner.plan(goal, config, None)
     """
-    from swarm_arena._engine.resume import _acquire_lease
+    from swarm_arena._engine.resume import _supervised_acquire
 
     _require_asyncio()
     boundary = _Outcome()
@@ -1154,19 +1159,24 @@ async def planning_session(
     lease: Lease | None = None
     entered = completed = False
     try:
-        async with _supervise_initialization(store, 1, stops, clock, config):
-            lease = await _acquire_lease(
-                partial(
-                    Lease.acquire_new,
-                    store,
-                    owner_id=uuid4().hex,
-                    host=socket.gethostname(),
-                    ttl_s=config.lease_ttl_s,
-                ),
-                settle_timeout_s=config.settle_timeout_s,
-            )
-            await anyio.lowlevel.checkpoint_if_cancelled()
-            async with _RunJournal(
+        lease = await _supervised_acquire(
+            store,
+            1,
+            stops,
+            clock,
+            config,
+            partial(
+                Lease.acquire_new,
+                store,
+                owner_id=uuid4().hex,
+                host=socket.gethostname(),
+                ttl_s=config.lease_ttl_s,
+            ),
+            stopped="planning session stopped",
+        )
+        async with (
+            _supervise_initialization(store, 1, stops, clock, config),
+            _RunJournal(
                 store,
                 lease,
                 run_id=run_id,
@@ -1174,133 +1184,132 @@ async def planning_session(
                 local_path=_local_journal_path(run_id, lease.doc.epoch),
                 sync_interval_s=config.sync_interval_s,
                 settle_timeout_s=config.settle_timeout_s,
-            ) as journal:
-                entered = True
-                journal.clock = clock
-                async with _supervise_writer(journal):
-                    ids = IdGen(run_id, lease.doc.epoch)
-                    ledger = Ledger(
-                        config.limits,
-                        reserve_fraction=config.reserve_fraction,
-                        goal_weights=config.goal_weights,
-                        journal=journal,
-                        ids=ids,
+            ) as journal,
+        ):
+            entered = True
+            journal.clock = clock
+            async with _supervise_writer(journal):
+                ids = IdGen(run_id, lease.doc.epoch)
+                ledger = Ledger(
+                    config.limits,
+                    reserve_fraction=config.reserve_fraction,
+                    goal_weights=config.goal_weights,
+                    journal=journal,
+                    ids=ids,
+                )
+                async with _bound_run(
+                    run_id,
+                    journal=journal,
+                    ids=ids,
+                    artifacts=artifacts,
+                    config=config,
+                    stops=stops,
+                    clock=clock,
+                    state=RunState(),
+                ):
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_CONFIG,
+                            payload={"config": config.model_dump(mode="json")},
+                        )
                     )
-                    async with _bound_run(
-                        run_id,
+                    journal.append(
+                        EventDraft(
+                            type=EventType.RUN_STARTED,
+                            payload={
+                                "planning": True,
+                                "warnings": warnings,
+                                "final_slices": {goal.id: Amount().model_dump()},
+                            },
+                        )
+                    )
+                    await ledger.hold_final_slices({goal.id: Amount()})
+                    ledger.open_goal(goal.id)
+                    journal.append(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
+                    tranche = Tranche(
+                        ledger,
+                        f"{goal.id}/:planner",
+                        goal.id,
+                        size=Amount(
+                            tokens=config.limits.llm_tranche_tokens,
+                            usd=config.limits.llm_tranche_usd,
+                        ),
+                    )
+                    scope = LLMScope(
+                        role="planner",
+                        run_id=run_id,
+                        goal_id=goal.id,
+                        team="",
+                        agent="",
+                        round=0,
+                        candidate_id=None,
+                        tranche=tranche,
                         journal=journal,
-                        ids=ids,
                         artifacts=artifacts,
-                        config=config,
-                        stops=stops,
-                        clock=clock,
-                        state=RunState(),
-                    ):
-                        journal.append(
-                            EventDraft(
-                                type=EventType.RUN_CONFIG,
-                                payload={"config": config.model_dump(mode="json")},
-                            )
-                        )
-                        journal.append(
-                            EventDraft(
-                                type=EventType.RUN_STARTED,
-                                payload={
-                                    "planning": True,
-                                    "warnings": warnings,
-                                    "final_slices": {goal.id: Amount().model_dump()},
-                                },
-                            )
-                        )
-                        await ledger.hold_final_slices({goal.id: Amount()})
-                        ledger.open_goal(goal.id)
-                        journal.append(EventDraft(type=EventType.GOAL_STARTED, goal_id=goal.id))
-                        tranche = Tranche(
-                            ledger,
-                            f"{goal.id}/:planner",
-                            goal.id,
-                            size=Amount(
-                                tokens=config.limits.llm_tranche_tokens,
-                                usd=config.limits.llm_tranche_usd,
-                            ),
-                        )
-                        scope = LLMScope(
-                            role="planner",
-                            run_id=run_id,
-                            goal_id=goal.id,
-                            team="",
-                            agent="",
-                            round=0,
-                            candidate_id=None,
-                            tranche=tranche,
-                            journal=journal,
-                            artifacts=artifacts,
-                            models=config.models,
-                            tracing=config.tracing,
-                            cache=config.cache,
-                            limits=config.limits,
-                            settle_timeout_s=config.settle_timeout_s,
-                        )
-                        failed = True
-                        failure: BaseException | None = None
+                        models=config.models,
+                        tracing=config.tracing,
+                        cache=config.cache,
+                        limits=config.limits,
+                        settle_timeout_s=config.settle_timeout_s,
+                    )
+                    failed = True
+                    failure: BaseException | None = None
+                    try:
+                        await journal.commit()
+                        await _storage_io(_create, store, "run.toml", config.dumps().encode())
+                        await _setup_run((), config)
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        with llm_scope(scope):
+                            yield scope
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        failed = False
+                    except BaseException as error:
+                        failure = error
+                        raise
+                    finally:
                         try:
-                            await journal.commit()
-                            await _storage_io(_create, store, "run.toml", config.dumps().encode())
-                            await _setup_run((), config)
-                            await anyio.lowlevel.checkpoint_if_cancelled()
-                            with llm_scope(scope):
-                                yield scope
-                            await anyio.lowlevel.checkpoint_if_cancelled()
-                            failed = False
+                            if not failed:
+                                await drain(scope, wait=True)
                         except BaseException as error:
                             failure = error
                             raise
                         finally:
-                            try:
-                                if not failed:
-                                    await drain(scope, wait=True)
-                            except BaseException as error:
-                                failure = error
-                                raise
-                            finally:
-                                with _stop_cleanup(config):
-                                    await drain(scope, wait=False)
-                                    outcome = await tranche.close()
-                                    reason = (
-                                        "planner failed"
-                                        if failure is not None
-                                        else "planning complete"
+                            with _stop_cleanup(config):
+                                await drain(scope, wait=False)
+                                outcome = await tranche.close()
+                                reason = (
+                                    "planner failed" if failure is not None else "planning complete"
+                                )
+                                if failure is not None:
+                                    try:
+                                        classified = boundary.classify(failure)
+                                    except anyio.get_cancelled_exc_class():
+                                        reason = "stopped"
+                                    else:
+                                        if _core_category(classified) in {
+                                            _SignalCategory.LIMIT,
+                                            _SignalCategory.TERMINAL,
+                                        }:
+                                            reason = "run budget"
+                                if outcome.overflow or stops.run_budget:
+                                    reason = "run budget"
+                                if stops.run_timeout:
+                                    reason = "run_timeout_s"
+                                if stops.stop or stops.stop_now:
+                                    reason = "stop --now" if stops.stop_now else "stop"
+                                await _record_stop(journal, stops)
+                                journal.append(
+                                    EventDraft(
+                                        type=EventType.GOAL_FINISHED,
+                                        goal_id=goal.id,
+                                        payload={"reason": reason},
                                     )
-                                    if failure is not None:
-                                        try:
-                                            classified = boundary.classify(failure)
-                                        except anyio.get_cancelled_exc_class():
-                                            reason = "stopped"
-                                        else:
-                                            if _core_category(classified) in {
-                                                _SignalCategory.LIMIT,
-                                                _SignalCategory.TERMINAL,
-                                            }:
-                                                reason = "run budget"
-                                    if outcome.overflow or stops.run_budget:
-                                        reason = "run budget"
-                                    if stops.run_timeout:
-                                        reason = "run_timeout_s"
-                                    if stops.stop or stops.stop_now:
-                                        reason = "stop --now" if stops.stop_now else "stop"
-                                    await _record_stop(journal, stops)
-                                    journal.append(
-                                        EventDraft(
-                                            type=EventType.GOAL_FINISHED,
-                                            goal_id=goal.id,
-                                            payload={"reason": reason},
-                                        )
-                                    )
-                                    await ledger.end_goal(goal.id)
-                                    await journal.commit()
-                                    if outcome.overflow:
-                                        ledger._check_usage_overflow()
-                        completed = True
+                                )
+                                await ledger.end_goal(goal.id)
+                                await journal.commit()
+                                if outcome.overflow:
+                                    ledger._check_usage_overflow()
+                    completed = True
         if not completed or stops.stop or stops.stop_now or stops.run_timeout:
             raise _core_error(RuntimeError, "planning session stopped") from None
     finally:

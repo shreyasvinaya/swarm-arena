@@ -598,9 +598,16 @@ class HumanReview:
             current = _read_state(store, run_id, doc)
             _review_keys(current, self._reviewer, config.arena_root, utc_now(), initial_scores)
 
+        stops = StopState()
         try:
             lease = await _take_over(
-                config, run_id, store, force=False, review=True, validate=validate_locations
+                config,
+                run_id,
+                store,
+                force=False,
+                review=True,
+                validate=validate_locations,
+                stops=stops,
             )
         except LeaseHeld:
             raise _core_error(
@@ -618,7 +625,7 @@ class HumanReview:
             )
             completed = False
             async with (
-                _supervise_initialization(store, lease.doc.epoch, StopState(), None, config),
+                _supervise_initialization(store, lease.doc.epoch, stops, None, config),
                 JournalWriter(
                     store,
                     lease,

@@ -245,7 +245,52 @@ invalid draft), `run budget`, `run_timeout_s`, `stop`, and `stop --now`; caller
 cancellation records `stopped`. A fenced owner cannot append a finish event.
 Trailing spaces and tabs after a saved planning-session comment are ignored.
 
-Interactive **together** planning remains a later M3 feature.
+## Together
+
+`CollaborativePlanner` combines an `LLMPlanner` with a `Reviewer`. Each review
+returns `Approve()`, `Feedback(text)`, or `Edited(plan)`. Feedback accumulates,
+and the next model request includes the previous draft. The default limit is
+five reviews; `max_iterations` must be a positive integer. Exhaustion raises
+`RuntimeError("plan not approved after N reviews")` with the configured count.
+Direct Python together planning resolves relative goal files against cwd;
+file-based callers retain the loaded goal file's directory through drafting
+and review.
+
+Using the same `goal` and catalog-backed `config` as LLM planning:
+
+```python
+from swarm_arena import Plan
+from swarm_arena.llm import Approve, CollaborativePlanner, LLMPlanner
+
+
+class ApprovingReviewer:
+    async def review(self, plan: Plan) -> Approve:
+        # Replace with your application's human review interface.
+        return Approve()
+
+
+planner = CollaborativePlanner(LLMPlanner("planner"), ApprovingReviewer())
+plan = await planner.plan(goal, config, None)
+```
+
+The private terminal adapter is provided for the plan CLI. It displays TOML
+and asks `Approve [a], feedback [f], edit [e]: `.
+Feedback is one line. Editing invokes the executable selected by `editor`,
+`VISUAL`, `EDITOR`, then `vi`, with one temporary-file argument and no shell.
+Specify an executable path rather than a command with flags. Invalid TOML and
+editor failures print safe diagnostics and retry; EOF ends review with
+`RuntimeError("terminal input ended")`. Edits load with the draft's `base_dir`.
+Cancellation restores stdin's descriptor state and stops and reaps the editor.
+
+One metered planning session spans every draft and human review. Its run-time
+allowance and stop/lease supervision remain active while awaiting input or the
+editor; review does not restart the allowance. Each draft drains its accounting.
+The result retains session provenance and is stamped `origin="together"`.
+Edited plans pass the same catalog admission as generated drafts, preserve
+their source directory, and cannot change the frozen human main goal's inputs
+or files. Approval cannot authorize a mutation of the offered draft: return
+`Edited(plan)` to propose changes explicitly. Custom async reviewers must
+cooperate with cancellation.
 
 Standalone planning journals remain readable for accounting and provenance.
 They cannot be resumed: both `Swarm.resume` and `swarm-arena resume` refuse

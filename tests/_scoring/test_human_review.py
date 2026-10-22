@@ -1434,3 +1434,35 @@ async def test_import_after_running_to_deadline(
         "timed-review", _file(tmp_path, _csv(*rows)), config=run_config
     )
     assert [score.key for score in scores] == [(1.0, 7.0)]
+
+
+@pytest.mark.parametrize("now", [False, True])
+async def test_import_stop_during_takeover_response(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    now: bool,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.lease_acquisition import HeldOwnerResponse
+
+    from swarm_arena._engine.control import request_stop
+
+    held = HeldOwnerResponse()
+    held.install(monkeypatch, takeover=True)
+    task = asyncio.create_task(
+        HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
+    )
+    try:
+        await held.ready()
+        assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
+        with anyio.fail_after(3), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+            await asyncio.shield(task)
+    finally:
+        await held.finish(task)
+    await held.assert_released()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))

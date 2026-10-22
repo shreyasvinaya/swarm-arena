@@ -28,6 +28,7 @@ from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal, check_models
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
 from swarm_arena.llm._manager import _finish_accounting
+from swarm_arena.llm._reviewer import Approve, Edited, Reviewer, _detach_decision
 from swarm_arena.llm._structured import DictOutputSchema, structured_call
 
 _ENTRY: Final[dict[str, Any]] = {
@@ -507,3 +508,141 @@ class LLMPlanner(Planner):
         boundary.propagate_control(RuntimeError())
         assert result is not None
         return result
+
+
+class CollaborativePlanner(Planner):
+    """Draft and review plans inside one bounded planning session.
+
+    Parameters
+    ----------
+    planner : LLMPlanner
+        Metered draft generator.
+    reviewer : Reviewer
+        Cooperatively cancellable human review adapter.
+    max_iterations : int, default=5
+        Positive maximum number of reviews.
+
+    Examples
+    --------
+    >>> from swarm_arena import Plan
+    >>> class Human:
+    ...     async def review(self, plan: Plan) -> Approve:
+    ...         return Approve()
+    >>> CollaborativePlanner(LLMPlanner("planner"), Human()).models()
+    ('planner',)
+    """
+
+    origin = "together"
+
+    def __init__(self, planner: LLMPlanner, reviewer: Reviewer, *, max_iterations: int = 5) -> None:
+        if type(max_iterations) is not int or max_iterations <= 0:
+            raise _core_error(ValueError, "max_iterations must be a positive integer")
+        self._planner = planner
+        self._reviewer = reviewer
+        self._max_iterations = max_iterations
+
+    def models(self) -> tuple[str, ...]:
+        """Return the underlying planner's model aliases.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Declared planning aliases.
+
+        Examples
+        --------
+        >>> from swarm_arena.llm import Approve
+        >>> from swarm_arena import Plan
+        >>> class Human:
+        ...     async def review(self, plan: Plan) -> Approve:
+        ...         return Approve()
+        >>> CollaborativePlanner(LLMPlanner("planner"), Human()).models()
+        ('planner',)
+        """
+        return self._planner.models()
+
+    async def plan(self, goal: Goal, config: RunConfig, history: History | None) -> Plan:
+        """Return a reviewed plan admitted with together provenance.
+
+        Parameters
+        ----------
+        goal : Goal
+            Human main goal frozen before the first draft.
+        config : RunConfig
+            Catalog, budget, storage and session allowance.
+        history : History or None
+            Previous admitted revisions and run evidence.
+
+        Returns
+        -------
+        Plan
+            Approved or edited admitted proposal.
+
+        Raises
+        ------
+        RuntimeError
+            No approval within the configured review count.
+
+        Examples
+        --------
+        >>> plan = await planner.plan(goal, config, None)  # doctest: +SKIP
+        """
+        return await self._plan_at(goal, config, history, base_dir=Path.cwd())
+
+    async def _plan_at(
+        self,
+        goal: Goal,
+        config: RunConfig,
+        history: History | None,
+        *,
+        base_dir: Path,
+    ) -> Plan:
+        """Review with the explicit source root supplied by file-based callers."""
+        if current_llm_scope() is None:
+            async with planning_session(config, goal, self) as scope:
+                result = mark_planning_session(
+                    await self._review(goal, config, history, base_dir=base_dir), scope
+                )
+            return result
+        return await self._review(goal, config, history, base_dir=base_dir)
+
+    async def _review(
+        self,
+        goal: Goal,
+        config: RunConfig,
+        history: History | None,
+        *,
+        base_dir: Path,
+    ) -> Plan:
+        scope = current_llm_scope()
+        assert scope is not None
+        boundary = _Outcome()
+        history = await _prepare(lambda: _history_copy(history))
+        revisions = history.revisions if history else []
+        frozen = await _freeze_draft_goal(goal, base_dir=base_dir, artifacts=scope.artifacts)
+        feedback: list[str] = []
+        previous = None
+        for _ in range(self._max_iterations):
+            draft = await self._planner._draft_at(
+                frozen, config, history, base_dir=base_dir, feedback=feedback, previous=previous
+            )
+            try:
+                offered = await _prepare(partial(_detach_plan, draft))
+                decision = await self._reviewer.review(offered)
+                decision = await _prepare(partial(_detach_decision, decision))
+                if isinstance(decision, Approve | Edited):
+                    proposed = draft if isinstance(decision, Approve) else decision.plan
+                    return await _admit_draft(
+                        proposed,
+                        config,
+                        scope.artifacts,
+                        frozen_goal=frozen,
+                        base_dir=proposed.base_dir,
+                        history=revisions,
+                        origin="together",
+                    )
+                feedback.append(decision.text)
+            except BaseException as error:
+                boundary.contain(error, RuntimeError, "reviewer")
+            previous = draft
+        raise _core_error(RuntimeError, f"plan not approved after {self._max_iterations} reviews")

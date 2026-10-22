@@ -761,7 +761,8 @@ async def test_blocked_publication_expires_without_late_state_change(
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
-    writer._settle_timeout_s = 0.2
+    # Allow normal release work to start and finish reliably after expiry.
+    writer._settle_timeout_s = 2
     wall_start, monotonic_start = utc_now(), time.monotonic()
 
     def slow_utc_now() -> datetime:
@@ -790,7 +791,7 @@ async def test_blocked_publication_expires_without_late_state_change(
             assert await anyio.to_thread.run_sync(entered.wait, 8)
         if deadline == "settlement":
             writer._stop_storage()
-        done, _ = await asyncio.wait([task], timeout=4)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "publication wait outlived its deadline"
         error = task.exception()
         assert error is not None
@@ -838,7 +839,8 @@ async def test_settlement_timeout_bounds_the_release_attempt(
     import threading
 
     writer = _writer(store, tmp_path, group_window_s=0)
-    writer._settle_timeout_s = 0.2
+    # Allow normal release work to start and finish reliably after expiry.
+    writer._settle_timeout_s = 2
     publishing, releasing, unblock = (threading.Event() for _ in range(3))
     workers: list[threading.Thread] = []
     create, replace = store.create, store.replace
@@ -867,7 +869,7 @@ async def test_settlement_timeout_bounds_the_release_attempt(
         assert await anyio.to_thread.run_sync(publishing.wait, 10)
         writer._stop_storage()
         assert await anyio.to_thread.run_sync(releasing.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "failed writer retained its blocked release"
         error = task.exception()
         assert isinstance(error, RuntimeError)

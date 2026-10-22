@@ -538,3 +538,38 @@ async def test_board_cleanup_uses_local_failure_inside_a_caller_exception_handle
                 )
     assert_secret_absent(caught.value, secret)
     assert not getattr(caller_error, "__notes__", ())
+
+
+async def test_manager_writer_entry_transfers_release_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import AsyncGenerator
+    from contextlib import asynccontextmanager
+
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena.testing import _harness
+
+    releases: list[Lease] = []
+    release = Lease.release
+
+    def released(lease: Lease) -> None:
+        releases.append(lease)
+        release(lease)
+
+    @asynccontextmanager
+    async def fail_binding(*args: object, **kwargs: object) -> AsyncGenerator[None]:
+        raise _core_error(RuntimeError, "binding entry failed")
+        yield
+
+    monkeypatch.setattr(Lease, "release", released)
+    monkeypatch.setattr(_harness, "_bound_run", fail_binding)
+    with pytest.raises(RuntimeError, match=r"^binding entry failed$"):
+        await OfflineHarness().run_rounds(
+            NoopManager(),
+            goal=GOAL,
+            tool=SQUARE,
+            rounds=1,
+            limits=Limits(),
+            config=RunConfig(),
+        )
+    assert len(releases) == 1

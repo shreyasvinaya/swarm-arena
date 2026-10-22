@@ -10,6 +10,7 @@ cancellation cleanup and prints ``interrupted`` without a traceback.
 
 import argparse
 import asyncio
+import io
 import signal
 import sys
 from collections.abc import Generator, Sequence
@@ -18,6 +19,7 @@ from functools import partial
 from os import get_blocking, read, set_blocking
 from pathlib import Path
 from threading import current_thread, main_thread
+from typing import TextIO
 
 import anyio
 from anyio import wait_readable
@@ -109,10 +111,12 @@ def _sigint_wakeup() -> Generator[None]:
             signal.signal(signal.SIGINT, current_handler)
 
 
-async def _prompt() -> bool:
+async def _readline(stdin: TextIO) -> str:
     """Await terminal readiness without a thread startup or buffered stdin lock."""
+    if isinstance(stdin, io.StringIO):
+        return stdin.readline()
     answer = bytearray()
-    fd = sys.stdin.fileno()
+    fd = stdin.fileno()
     blocking = get_blocking(fd)
     with _sigint_wakeup():
         try:
@@ -124,12 +128,21 @@ async def _prompt() -> bool:
                 except BlockingIOError:
                     # A terminal signal may flush input after readiness was reported.
                     continue
-                if not chunk or chunk == b"\n":
+                if not chunk:
                     break
                 answer.extend(chunk)
+                if chunk == b"\n":
+                    break
         finally:
             set_blocking(fd, blocking)
-    return bytes(answer).strip().lower() in {b"y", b"yes"}
+    return bytes(answer).decode(getattr(stdin, "encoding", None) or "utf-8", errors="replace")
+
+
+async def _prompt() -> bool:
+    """Read approval through the shared cancellable terminal reader."""
+    answer = await _readline(sys.stdin)
+    encoded = answer.encode(getattr(sys.stdin, "encoding", None) or "utf-8", errors="replace")
+    return encoded.strip().lower() in {b"y", b"yes"}
 
 
 def _summaries(run_root: str, run_id: str, goal_ids: Sequence[str]) -> list[str]:

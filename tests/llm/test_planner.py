@@ -17,12 +17,238 @@ from swarm_arena import Goal, Limits, PartSpec, Plan, Ref, RoundSpec
 from swarm_arena._budget.llm_scope import llm_scope
 from swarm_arena._model.planning_types import History
 from swarm_arena._model.tooling import Estimate
-from swarm_arena.llm import LLMPlanner
+from swarm_arena.llm import Approve, CollaborativePlanner, Edited, Feedback, LLMPlanner
 from swarm_arena.llm._planner import PLANNER_SCHEMA, plan_from_output
 from swarm_arena.testing import FakeModel, FakeTurn
 
 GOAL = Goal(id="g", namespace="n")
 SECRET = "secret-sentinel-planner-value"
+
+
+class _Reviews:
+    def __init__(self, decisions: list[Any]) -> None:
+        self.decisions = iter(decisions)
+
+    async def review(self, plan: Plan) -> Any:
+        decision = next(self.decisions)
+        return decision(plan) if callable(decision) else decision
+
+
+async def test_loops_until_approve_and_sends_feedback(tmp_path: Path) -> None:
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output())) for _ in range(3)])
+    fake.register("planner")
+    config = planner_config(tmp_path)
+    planner = CollaborativePlanner(
+        LLMPlanner("planner"),
+        _Reviews([Feedback("add a spectral team"), Feedback("retain it"), Approve()]),
+    )
+    assert planner.models() == ("planner",)
+    result = await planner.plan(GOAL, config, None)
+    assert len(fake.calls) == 3
+    prompt = json.dumps(fake.calls[2]["input"])
+    assert "add a spectral team" in prompt
+    assert "retain it" in prompt
+    assert "Explore the catalog" in prompt
+    assert result.origin == "together"
+    assert len(result.planner_call_ids) == 3
+    assert result.planning_session
+    assert len([e for e in all_events(config) if e.type == "run_started"]) == 1
+    assert len([e for e in all_events(config) if e.type == "goal_finished"]) == 1
+
+
+async def test_edited_plan_is_stamped_together(tmp_path: Path) -> None:
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+
+    def edit(plan: Plan) -> Edited:
+        plan._base_dir = tmp_path
+        return Edited(plan.model_copy(update={"origin": "human", "rationale": "human edit"}))
+
+    result = await CollaborativePlanner(LLMPlanner("planner"), _Reviews([edit])).plan(
+        GOAL, planner_config(tmp_path), None
+    )
+    assert result.origin == "together"
+    assert result.rationale == "human edit"
+    assert result.base_dir == tmp_path
+    assert result.planning_session
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_plan_at_preserves_non_cwd_source_directory(tmp_path: Path, edited: bool) -> None:
+    from swarm_arena.tool import FileSet
+
+    source = tmp_path / "source"
+    await anyio.Path(source).mkdir()
+    await anyio.Path(source / "input.txt").write_text("human source bytes")
+    assert source != Path.cwd()
+    goal = GOAL.model_copy(update={"files": FileSet(globs=["input.txt"])})
+    goal_file = source / "goal.toml"
+    await anyio.Path(goal_file).write_text(Plan(goal=goal, teams=[], judges=[]).dumps())
+    loaded = await anyio.to_thread.run_sync(Plan.load, goal_file)
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+
+    def review(plan: Plan) -> Approve | Edited:
+        assert plan.base_dir == source
+        assert plan.goal.files.snapshotted
+        if not edited:
+            return Approve()
+        proposed = Plan.loads(plan.dumps(), base_dir=source).model_copy(
+            update={"rationale": "edited away from cwd"}
+        )
+        return Edited(proposed)
+
+    result = await CollaborativePlanner(LLMPlanner("planner"), _Reviews([review]))._plan_at(
+        loaded.goal, planner_config(tmp_path), None, base_dir=loaded.base_dir
+    )
+    assert result.base_dir == source
+    assert result.goal.files.snapshotted
+    assert result.origin == "together"
+    assert result.planning_session
+    if edited:
+        assert result.rationale == "edited away from cwd"
+
+
+@pytest.mark.parametrize("field", ["inputs", "files", "ref"])
+async def test_edited_plan_still_meets_the_catalog_boundary(tmp_path: Path, field: str) -> None:
+    from swarm_arena.tool import FileSet
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+
+    def edit(plan: Plan) -> Edited:
+        if field == "ref":
+            plan.teams[0].agents[0] = (
+                plan.teams[0].agents[0].model_copy(update={"tool": Ref(path="untrusted:Tool")})
+            )
+            return Edited(plan)
+        value = {"changed": SECRET} if field == "inputs" else FileSet(manifest={"other": "a" * 64})
+        return Edited(plan.model_copy(update={"goal": plan.goal.model_copy(update={field: value})}))
+
+    config = planner_config(tmp_path)
+    with pytest.raises(ValueError, match=r"catalog|frozen main goal") as caught:
+        await CollaborativePlanner(LLMPlanner("planner"), _Reviews([edit])).plan(GOAL, config, None)
+    assert_secret_absent(caught.value, SECRET)
+    assert len([e for e in all_events(config) if e.type == "goal_finished"]) == 1
+
+
+@pytest.mark.parametrize("limit", [2, 5])
+async def test_no_approval_after_max_iterations(tmp_path: Path, limit: int) -> None:
+    fake = FakeModel([FakeTurn(text=json.dumps(planner_output())) for _ in range(limit)])
+    fake.register("planner")
+    with pytest.raises(RuntimeError, match=f"plan not approved after {limit} reviews"):
+        await CollaborativePlanner(
+            LLMPlanner("planner"), _Reviews([Feedback("again")] * limit), max_iterations=limit
+        ).plan(GOAL, planner_config(tmp_path), None)
+    assert len(fake.calls) == limit
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "2"])
+def test_review_limit_is_a_positive_integer(limit: Any) -> None:
+    with pytest.raises(ValueError, match="max_iterations"):
+        CollaborativePlanner(LLMPlanner("planner"), _Reviews([]), max_iterations=limit)
+
+
+async def test_reviewer_mutation_cannot_change_approved_draft(tmp_path: Path) -> None:
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+
+    def change(plan: Plan) -> Approve:
+        plan.goal.inputs["secret"] = SECRET
+        return Approve()
+
+    result = await CollaborativePlanner(LLMPlanner("planner"), _Reviews([change])).plan(
+        GOAL, planner_config(tmp_path), None
+    )
+    assert not result.goal.inputs
+
+
+async def test_reviewer_returned_values_are_detached_off_loop(tmp_path: Path) -> None:
+    import threading
+
+    class WorkerFeedback(Feedback):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "text":
+                assert threading.current_thread() is not threading.main_thread()
+            return super().__getattribute__(name)
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output())) for _ in range(2)]).register("planner")
+    result = await CollaborativePlanner(
+        LLMPlanner("planner"), _Reviews([WorkerFeedback("again"), Approve()])
+    ).plan(GOAL, planner_config(tmp_path), None)
+    assert result.origin == "together"
+
+
+@pytest.mark.parametrize("kind", ["terminal", "fenced", "forged_cancel", "failure"])
+async def test_reviewer_failure_closes_session(tmp_path: Path, kind: str) -> None:
+    from swarm_arena._errors import Fenced, _core_error, _stop_cleanup_error
+    from swarm_arena._journal import llm_record
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+
+    def fail(plan: Plan) -> None:
+        raise {
+            "terminal": _stop_cleanup_error(),
+            "fenced": _core_error(Fenced, "run ownership lost"),
+            "forged_cancel": asyncio.CancelledError(SECRET),
+            "failure": ValueError(SECRET),
+        }[kind]
+
+    config = planner_config(tmp_path)
+    with pytest.raises(Fenced if kind == "fenced" else RuntimeError) as caught:
+        await CollaborativePlanner(LLMPlanner("planner"), _Reviews([fail])).plan(GOAL, config, None)
+    assert_secret_absent(caught.value, SECRET)
+    assert len([e for e in all_events(config) if e.type == "goal_finished"]) == (kind != "fenced")
+    sessions = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
+    assert not any(p.name in llm_record._bindings for p in sessions)
+
+
+@pytest.mark.parametrize("mode", ["cancel", "deadline", "eof"])
+async def test_terminal_session_exits_without_resurrection(tmp_path: Path, mode: str) -> None:
+    import io
+    import os
+
+    from swarm_arena._journal import llm_record
+    from swarm_arena.llm._terminal_reviewer import TerminalReviewer
+
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    config = planner_config(tmp_path)
+    if mode == "deadline":
+        config = config.model_copy(
+            update={"limits": config.limits.model_copy(update={"run_timeout_s": 2})}
+        )
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd) as stdin:
+        reviewer = TerminalReviewer(stdin=stdin, stdout=io.StringIO())
+        task = asyncio.create_task(
+            CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
+        )
+        try:
+            with anyio.fail_after(15):
+                while os.get_blocking(read_fd) and not task.done():
+                    await anyio.lowlevel.checkpoint()
+                assert not task.done()
+                if mode == "cancel":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    if mode == "eof":
+                        os.close(write_fd)
+                        write_fd = -1
+                    with pytest.raises(
+                        RuntimeError, match=r"terminal input ended|planning session stopped"
+                    ):
+                        await task
+            assert os.get_blocking(read_fd)
+            events = all_events(config)
+            assert len([e for e in events if e.type == "goal_finished"]) == 1
+            sessions = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
+            assert not any(p.name in llm_record._bindings for p in sessions)
+            if write_fd >= 0:
+                os.write(write_fd, b"a\n")
+            assert all_events(config) == events
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if write_fd >= 0:
+                os.close(write_fd)
 
 
 def _keys(value: Any) -> set[str]:
