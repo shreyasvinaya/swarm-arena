@@ -398,3 +398,42 @@ the slowest slot to resolve or reach the effective round deadline. After this
 bounded preparation, the round has its own execution deadline, so a stuck slot
 can make preparation plus execution take about twice the effective round timeout.
 See [provider failures](limits-and-safety.md#provider-failures).
+
+
+## LLM call log and Langfuse
+
+The local journal always records every admitted LLM call and its accounting,
+including estimated charges when a provider report does not arrive. Calls link
+to their run, goal, component, reservation and model alias. Request/response
+payloads are stored as artifacts by default; `tracing.store_payloads = false`
+disables payload storage without disabling the call log. Langfuse is an optional
+view of these calls, not the source of truth for budgets or recovery.
+
+To enable export, install the `llm` and `langfuse` extras and set:
+
+```toml
+[tracing]
+langfuse = true
+```
+
+Configure the destination using Langfuse's own `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` (or `LANGFUSE_HOST`) environment
+variables. Keep credential values out of the plan and run configuration.
+With `langfuse = false` (the default), swarm-arena sends no tracing data to a
+vendor. Credentials alone do not enable export. This remains true after an
+enabled run and when enabled and disabled scopes run concurrently in one
+process. The Agents SDK's default OpenAI trace exporter is not installed by
+swarm-arena; enabled export uses an exclusive OpenInference processor.
+
+Each enabled run becomes a Langfuse session. Manager, judge, planner and curator
+calls carry the goal, team, agent, round and role; a call's `trace_url` links to
+the current trace when available. Both stages of a structured fallback call
+are traced and journaled. A missing trace URL does not remove the local record.
+
+The client and instrumentation are shared for the process. Components finish
+all owned actions and accounting before leaving their tracing context, without
+flushing on each run. At normal process exit, a daemon flushes and shuts down
+the client and exporter, with a maximum five-second wait. A failed or timed-out
+close logs only an exception type and never writes the journal. Buffered spans
+can be lost on a hard kill or when that wait expires; durable call accounting
+is independent of export.

@@ -27,6 +27,7 @@ from swarm_arena._model.tooling import Usage
 from swarm_arena._outcomes import _Outcome
 from swarm_arena.llm._cache import cache_identity, require_cache_extra, response_cache
 from swarm_arena.llm._catalog import _cost_micros, call_cost
+from swarm_arena.llm._langfuse import setup_langfuse
 
 _log = logging.getLogger("swarm_arena.llm")
 _install_lock = RLock()
@@ -461,6 +462,7 @@ def install(config: RunConfig) -> None:
     ...     sum(isinstance(callback, CallLogger) for callback in litellm.callbacks)
     1
     """
+    setup_langfuse(config.tracing)
     global _installed_policy
     with _install_lock:
         if config.cache is not None:

@@ -10,12 +10,14 @@ from agents import AgentOutputSchemaBase, ModelSettings
 from agents.models.interface import ModelTracing
 
 from swarm_arena._board.digest import untrusted
+from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._errors import _core_error
 from swarm_arena._model.base import LLMRole
 from swarm_arena._model.catalog import ModelCatalog, ModelSpec
 from swarm_arena._model.data import finite_json
 from swarm_arena.llm._catalog import build_model, prices_for, supports
 from swarm_arena.llm._hooks import MeteredModel, _prepare
+from swarm_arena.llm._langfuse import _call_trace, component_span
 
 _captured_call_ids: ContextVar[list[str] | None] = ContextVar("structured_call_ids", default=None)
 
@@ -282,18 +284,22 @@ async def structured_call(
             admission_check=admission_check,
         )
         try:
-            response = await model.get_response(
-                system,
-                prompt,
-                ModelSettings(),
-                [],
-                output,
-                [],
-                ModelTracing.DISABLED,
-                previous_response_id=None,
-                conversation_id=None,
-                prompt=None,
-            )
+            scope = current_llm_scope()
+            if scope is None:
+                raise _core_error(RuntimeError, "LLM call outside an LLM scope")
+            with component_span(scope), _call_trace(scope):
+                response = await model.get_response(
+                    system,
+                    prompt,
+                    ModelSettings(),
+                    [],
+                    output,
+                    [],
+                    ModelTracing.ENABLED if scope.tracing.langfuse else ModelTracing.DISABLED,
+                    previous_response_id=None,
+                    conversation_id=None,
+                    prompt=None,
+                )
         finally:
             ids.extend(model.call_ids)
             captured = _captured_call_ids.get()

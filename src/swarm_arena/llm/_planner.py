@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from contextlib import AsyncExitStack
 from functools import partial
 from pathlib import Path
 from typing import Any, Final
@@ -31,6 +32,7 @@ from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal, check_models
 from swarm_arena.llm._hooks import _prepare
 from swarm_arena.llm._invocation import _invocation
+from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._reviewer import (
     Approve,
     Edited,
@@ -393,7 +395,11 @@ class LLMPlanner(Planner):
         parent = current_llm_scope()
         if parent is None:
             raise _core_error(RuntimeError, "LLM planner outside an LLM scope")
-        async with _invocation(parent, name="planner", error_type=ValueError) as scope:
+        async with (
+            AsyncExitStack() as tracing,
+            _invocation(parent, name="planner", error_type=ValueError) as scope,
+        ):
+            tracing.enter_context(component_span(scope))
             errors, _ = await _prepare(lambda: check_models({"planner": self.models()}, config))
             if errors:
                 raise _core_error(ValueError, "\n".join(errors))

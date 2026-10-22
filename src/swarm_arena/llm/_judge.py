@@ -9,7 +9,7 @@ import anyio
 from pydantic import Field, JsonValue, model_validator
 
 from swarm_arena._board.digest import untrusted
-from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope, llm_scope
 from swarm_arena._engine.stops import report_provider_failure
 from swarm_arena._errors import (
     ProviderFailed,
@@ -25,6 +25,7 @@ from swarm_arena._model.results import Candidate, Score
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext, _panel_drops, _PanelDrop
 from swarm_arena.llm._hooks import BudgetExceeded, _prepare
+from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._manager import _finish_accounting
 from swarm_arena.llm._structured import _captured_call_ids, structured_call
 
@@ -241,6 +242,13 @@ class LLMJudge(Judge):
         if scope is None:
             raise RuntimeError("LLM judge outside an LLM scope")
         scope = scope.child()
+        with component_span(scope):
+            return await self._judge_owned(scope, goal, candidates, ctx)
+
+    async def _judge_owned(
+        self, scope: LLMScope, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        """Retain the invocation child through trace exit and accounting."""
         interrupted = False
         failure: BaseException | None = None
         accounting_failure: BaseException | None = None

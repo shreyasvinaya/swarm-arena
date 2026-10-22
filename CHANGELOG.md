@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pages report per-agent prompt-cache rates and response-cache hit counts from
   the same retained committed generation, without requiring LLM extras.
 
+- Opt-in Langfuse sessions and LLM trace links for managers, judges, planners and
+  curators, with per-scope consent, no default vendor tracing and bounded
+  process-exit exporter cleanup.
+
 - Provider failures outside agents preserve panel survivor identities, pause ranking
   policies, and skip replanning or curation with durable completion receipts;
   resume reuses failed batches and skipped phases without repeating paid work.

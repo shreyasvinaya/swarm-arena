@@ -55,6 +55,7 @@ from swarm_arena._model.data import finite_json
 from swarm_arena._outcomes import _classify_outcome, _Outcome
 from swarm_arena.llm._cache import bypass_response_cache, cache_namespace, cache_switches
 from swarm_arena.llm._catalog import build_model, call_estimate
+from swarm_arena.llm._langfuse import current_trace_url
 from swarm_arena.llm._linking import CallLinks, ManagerDeps
 from swarm_arena.llm._settings import merge_model_settings
 from swarm_arena.llm._settings import model_settings as per_call_settings
@@ -546,7 +547,13 @@ class MeteredModel(Model):
                 max_tokens=cap,
                 temperature=self.temperature,
             )
-            return _without_retries(merge_model_settings(caller, ours))
+            merged = _without_retries(merge_model_settings(caller, ours))
+            assert merged.metadata is not None
+            merged.metadata.pop("trace_url", None)
+            trace_url = current_trace_url()
+            if trace_url is not None:
+                merged.metadata["trace_url"] = trace_url
+            return merged
 
         request_outcome = _Outcome()
         try:
@@ -558,7 +565,7 @@ class MeteredModel(Model):
                 request.tools,
                 request.output_schema,
                 request.handoffs,
-                tracing,
+                tracing if scope.tracing.langfuse else ModelTracing.DISABLED,
                 previous_response_id=previous_response_id,
                 conversation_id=conversation_id,
                 prompt=request.prompt,

@@ -157,6 +157,9 @@ def isolated_llm_process_state(monkeypatch: pytest.MonkeyPatch) -> None:
     if litellm is not None:
         monkeypatch.setattr(litellm, "cache", None)
         monkeypatch.setattr(litellm, "callbacks", [])
+    tracing = sys.modules.get("swarm_arena.llm._langfuse")
+    if tracing is not None:
+        tracing._reset_langfuse(2)
     logger = sys.modules.get("swarm_arena.llm._logger")
     if logger is not None:
         monkeypatch.setattr(logger, "_installed_policy", None)

@@ -1574,3 +1574,36 @@ async def test_live_gate_stop_after_action_timeout_ends_round(
     assert observed == [False]
     assert stops.stop
     assert len(fake.calls) == 1
+
+
+async def test_component_span_stays_open_through_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Generator
+    from contextlib import contextmanager
+
+    from swarm_arena.llm import _manager
+
+    events: list[str] = []
+    original = _manager._finish_accounting
+
+    @contextmanager
+    def component(scope: Any) -> Generator[None]:
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    async def accounting(scope: Any, *, interrupted: bool) -> None:
+        assert events == ["enter"]
+        await original(scope, interrupted=interrupted)
+        events.append("accounted")
+
+    monkeypatch.setattr(_manager, "component_span", component)
+    monkeypatch.setattr(_manager, "_finish_accounting", accounting)
+    register([finish()])
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            await AgentsSDKManager(model="opus").run_round(context())
+    assert events == ["enter", "accounted", "exit"]

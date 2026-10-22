@@ -1,0 +1,322 @@
+"""Own optional process-wide export while keeping consent local to each scope."""
+
+import asyncio
+import atexit
+import logging
+import threading
+import time
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
+from typing import Any
+
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+from swarm_arena._errors import _core_error, _exception_type_name
+from swarm_arena._model.settings import TracingConfig
+from swarm_arena._outcomes import _Outcome
+
+_EXIT_TIMEOUT_S = 5.0
+_lock = threading.Lock()
+_log = logging.getLogger(__name__)
+
+
+@dataclass
+class _Resources:
+    client: Any
+    provider: Any
+    instrumentor: Any
+    requested: threading.Event = field(default_factory=threading.Event, init=False)
+    worker: threading.Thread = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Python 3.12+ cannot start threads in atexit. Start the idle daemon now.
+        self.worker = threading.Thread(
+            target=self._wait_and_close, name="swarm-arena-tracing-close", daemon=True
+        )
+        self.worker.start()
+
+    def _wait_and_close(self) -> None:
+        self.requested.wait()
+        _shutdown_resources(self)
+
+
+_resources: _Resources | None = None
+
+
+def _shutdown_resources(resources: _Resources) -> None:
+    """Close only owned resources, without recorder or journal callbacks."""
+    from agents import set_trace_processors
+
+    def forget() -> None:
+        owned = resources.client._resources
+        if owned is not None:
+            # The pinned SDK retains shutdown resources in its key cache.
+            with owned._lock:
+                if owned._instances.get(owned.public_key) is owned:
+                    del owned._instances[owned.public_key]
+
+    def uninstrument() -> None:
+        if resources.instrumentor.is_instrumented_by_opentelemetry:
+            resources.instrumentor.uninstrument()
+
+    def close_prompt_cache() -> None:
+        owned = resources.client._resources
+        if owned is not None:
+            owned.prompt_cache._task_manager.shutdown()
+
+    operations = (
+        forget,
+        lambda: set_trace_processors([]),
+        uninstrument,
+        close_prompt_cache,
+        lambda: resources.client.flush(),
+        lambda: resources.client.shutdown(),
+        lambda: resources.provider.shutdown(),
+    )
+    for operation in operations:
+        try:
+            operation()
+        except BaseException as error:
+            _log.warning("%s", _exception_type_name(error))
+
+
+def _close(resources: _Resources, timeout_s: float) -> None:
+    """Signal the already-running daemon and bound the wait for export cleanup."""
+    resources.requested.set()
+    resources.worker.join(timeout_s)
+    if resources.worker.is_alive():
+        _log.warning("TimeoutError")
+
+
+def _reset_langfuse(timeout_s: float) -> None:
+    """Release the process owner with a bounded wait; used only at exit/tests."""
+    global _resources
+    deadline = time.monotonic() + timeout_s
+    if not _lock.acquire(timeout=max(0, timeout_s)):
+        _log.warning("TimeoutError")
+        return
+    try:
+        resources, _resources = _resources, None
+        atexit.unregister(_close_at_exit)
+        if resources is not None:
+            _close(resources, max(0, deadline - time.monotonic()))
+    finally:
+        _lock.release()
+
+
+def _close_at_exit() -> None:
+    _reset_langfuse(_EXIT_TIMEOUT_S)
+
+
+def setup_langfuse(tracing: TracingConfig) -> None:
+    """Initialize the exclusive process exporter once, only after explicit opt-in.
+
+    Parameters
+    ----------
+    tracing : TracingConfig
+        Run configuration. Consent for individual calls remains on LLMScope.
+
+    Raises
+    ------
+    ImportError
+        If the optional Langfuse dependencies are absent.
+    RuntimeError
+        If tracing initialization fails; only the exception type is reported.
+
+    Examples
+    --------
+    Disabled setup imports no optional tracing dependencies:
+
+    >>> setup_langfuse(TracingConfig())
+    >>> current_trace_url() is None
+    True
+    """
+    global _resources
+    with _lock:
+        # Avoid the SDK's lazy default OpenAI exporter even on the first off run.
+        from agents.tracing import setup
+        from agents.tracing.provider import DefaultTraceProvider
+
+        if setup.GLOBAL_TRACE_PROVIDER is None:
+            setup.set_trace_provider(DefaultTraceProvider())
+        if not tracing.langfuse or _resources is not None:
+            return
+        try:
+            from langfuse import Langfuse
+            from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
+        except ImportError:
+            raise ImportError("Langfuse tracing requires swarm-arena[langfuse]") from None
+
+        class ConsentSampler(Sampler):
+            def should_sample(
+                self,
+                parent_context: Any,
+                trace_id: int,
+                name: str,
+                kind: Any = None,
+                attributes: Any = None,
+                links: Any = None,
+                trace_state: Any = None,
+            ) -> SamplingResult:
+                scope = current_llm_scope()
+                enabled = scope is not None and scope.tracing.langfuse
+                return SamplingResult(
+                    Decision.RECORD_AND_SAMPLE if enabled else Decision.DROP,
+                    attributes=attributes,
+                    trace_state=trace_state,
+                )
+
+            def get_description(self) -> str:
+                return "swarm-arena scope consent"
+
+        instrumentor = OpenAIAgentsInstrumentor()
+        if instrumentor.is_instrumented_by_opentelemetry:
+            raise _core_error(RuntimeError, "Langfuse instrumentor already owned")
+        provider = TracerProvider(sampler=ConsentSampler(), shutdown_on_exit=False)
+        client: Any = None
+        try:
+            client = Langfuse(tracer_provider=provider)
+            owned = client._resources
+            if owned is not None:
+                if owned.tracer_provider is not None and owned.tracer_provider is not provider:
+                    client = None  # A pre-existing client belongs to its original owner.
+                    raise _core_error(RuntimeError, "Langfuse provider already owned")
+                # The SDK's unbounded atexit callback must not outlive our bounded one.
+                atexit.unregister(owned.shutdown)
+                atexit.unregister(owned.prompt_cache._task_manager.shutdown)
+            instrumentor.instrument(tracer_provider=provider, exclusive_processor=True)
+        except BaseException as error:
+            if client is not None:
+                _close(_Resources(client, provider, instrumentor), _EXIT_TIMEOUT_S)
+            else:
+                provider.shutdown()
+            raise _core_error(
+                RuntimeError, f"Langfuse setup failed: {_exception_type_name(error)}"
+            ) from None
+        _resources = _Resources(client, provider, instrumentor)
+        atexit.register(_close_at_exit)
+
+
+@contextmanager
+def _guarded_context(factory: Callable[[], AbstractContextManager[Any]]) -> Generator[None]:
+    """Contain tracing failures without replacing a locally escaping outcome."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        outcome = _Outcome(capture_caller=False)
+    else:
+        outcome = _Outcome()
+    try:
+        manager = factory()
+        manager.__enter__()
+    except BaseException as error:
+        outcome.contain(error, RuntimeError, "Langfuse context")
+    failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            manager.__exit__(
+                type(failure) if failure is not None else None,
+                failure,
+                failure.__traceback__ if failure is not None else None,
+            )
+        except BaseException as error:
+            if failure is None:
+                outcome.contain(error, RuntimeError, "Langfuse context")
+            _log.warning("%s", _exception_type_name(error))
+
+
+@contextmanager
+def component_span(scope: LLMScope, *, candidate_id: str | None = None) -> Generator[None]:
+    """Propagate run/session attributes through a component's owned lifetime.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Active component consent and identifiers, inherited by child scopes.
+    candidate_id : str or None, optional
+        Candidate identifier associated with this component.
+
+    Yields
+    ------
+    None
+        Attributes are active until all owned actions and accounting finish.
+
+    Examples
+    --------
+    A disabled scope needs no Langfuse installation or initialized client:
+
+    >>> from unittest.mock import Mock
+    >>> scope = Mock(tracing=TracingConfig())
+    >>> with component_span(scope):
+    ...     assert current_trace_url() is None
+    """
+    if not scope.tracing.langfuse:
+        yield
+        return
+    from langfuse import propagate_attributes
+
+    with _guarded_context(
+        lambda: propagate_attributes(
+            session_id=scope.run_id,
+            metadata={
+                "goal": scope.goal_id,
+                "team": scope.team,
+                "agent": scope.agent,
+                "round": str(scope.round),
+                "candidate_id": candidate_id or "",
+            },
+            tags=[f"role:{scope.role}", f"goal:{scope.goal_id}"],
+        )
+    ):
+        yield
+
+
+@contextmanager
+def _call_trace(scope: LLMScope) -> Generator[None]:
+    """Give direct model calls both an SDK trace and a current export span."""
+    if not scope.tracing.langfuse:
+        yield
+        return
+    from agents import custom_span, trace
+
+    with (
+        _guarded_context(
+            lambda: trace(workflow_name=f"swarm-arena {scope.role}", group_id=scope.run_id)
+        ),
+        _guarded_context(lambda: custom_span(name=f"swarm-arena {scope.role} call")),
+    ):
+        yield
+
+
+def current_trace_url() -> str | None:
+    """Return the current consenting scope's Langfuse URL, without raising.
+
+    Returns
+    -------
+    str or None
+        Trace URL, or None when consent, a current trace, or the URL is absent.
+
+    Examples
+    --------
+    >>> current_trace_url() is None
+    True
+    """
+    scope = current_llm_scope()
+    resources = _resources
+    if scope is None or not scope.tracing.langfuse or resources is None:
+        return None
+    try:
+        trace_id = resources.client.get_current_trace_id()
+        if not trace_id:
+            return None
+        url = resources.client.get_trace_url(trace_id=trace_id)
+        return url if type(url) is str else None
+    except BaseException:
+        return None
