@@ -374,16 +374,27 @@ def _digest(value: str | None) -> str | None:
     return value
 
 
-async def _watch_owner(binding: _Binding, scope: anyio.CancelScope) -> None:
+async def _watch_owner(
+    binding: _Binding, scope: anyio.CancelScope, interrupt_reports: bool = False
+) -> None:
     """Bound foreign callback tasks by the same stop state and active clock."""
     cleanup_at = float("inf")
     while True:
         if not binding.active:
             scope.cancel()
             return
+        if interrupt_reports:
+            try:
+                binding.check()
+            except Exception:
+                scope.cancel()
+                return
         left = binding.clock.left(binding.limits.run_timeout_s)
         if binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
             binding.begin_cleanup()
+            if interrupt_reports:
+                scope.cancel()
+                return
         elif binding.stops.stop and math.isinf(cleanup_at):
             # Graceful judging retains its own limits. Bound this storage wait
             # without spending later invocations' or teardown's allowance.
@@ -433,6 +444,7 @@ async def _owned(
     *,
     entry: _Pending | None = None,
     accounting: bool = False,
+    interrupt_reports: bool = False,
 ) -> tuple[bool, _T | None]:
     """Await one operation with owner supervision and no adoption after abandonment."""
     if not binding.active:
@@ -448,7 +460,7 @@ async def _owned(
             entry.workers.add(scope)
         try:
             async with anyio.create_task_group() as watchers:
-                watchers.start_soon(_watch_owner, binding, scope)
+                watchers.start_soon(_watch_owner, binding, scope, interrupt_reports)
                 watchers.start_soon(_watch_writer, binding, scope)
                 try:
                     await anyio.lowlevel.checkpoint_if_cancelled()
@@ -1000,6 +1012,43 @@ def _placeholder(binding: _Binding, entry: _Pending) -> None:
     for owner in scope.lineage():
         if call.id not in owner.call_ids:
             owner.call_ids.append(call.id)
+
+
+async def await_reports(scope: LLMScope) -> None:
+    """Await descendant call reports under the recorder's live owner supervision.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Scope whose calls and descendant calls have finished dispatching.
+
+    Notes
+    -----
+    The caller supplies the single ``settle_timeout_s`` report timer, separate
+    from durable settlement. Abandoned entries never wait. Stop-now or the run
+    deadline ends this optional wait and starts the existing cleanup allowance;
+    ownership loss and writer failures propagate unchanged. A graceful stop
+    retains its normal report allowance.
+
+    Examples
+    --------
+    >>> from types import SimpleNamespace
+    >>> anyio.run(await_reports, SimpleNamespace(run_id="absent"))
+    """
+    binding = _bindings.get(_context_string(scope.run_id, "run_id"))
+    if binding is None or scope.journal is not binding.journal:
+        return
+    binding.check()
+    entries = [
+        entry
+        for entry in binding.pending.values()
+        if any(owner is scope for owner in entry.scope.lineage()) and entry.state != "abandoned"
+    ]
+    for entry in entries:
+        completed, _ = await _owned(binding, entry.event.wait, interrupt_reports=True)
+        binding.check()
+        if not completed:
+            return
 
 
 async def drain(scope: LLMScope, *, wait: bool) -> list[str]:

@@ -1592,3 +1592,44 @@ async def test_child_drain_keeps_sibling_open(tmp_path: Path) -> None:
         assert first.call_ids == [one["call_id"]]
         assert second.call_ids == [two["call_id"]]
         assert parent.tranche.pending() == 0
+
+
+async def test_await_reports_stops_on_real_takeover(tmp_path: Path) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._journal import llm_record
+
+    successor = None
+    try:
+        with pytest.raises(Fenced):  # noqa: PT012 - owned lifetime
+            async with open_llm_run(
+                tmp_path, config=RunConfig(lease_ttl_s=3, settle_timeout_s=60)
+            ) as run:
+                scope, meta = await _open(run, run.scope("curator"))
+                entry = llm_record._bindings[run.run_id].pending[meta["reservation_id"]]
+                original_event = entry.event
+                entered = anyio.Event()
+
+                class ObservedEvent:
+                    async def wait(self) -> None:
+                        entered.set()
+                        await original_event.wait()
+
+                    def set(self) -> None:
+                        original_event.set()
+
+                entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
+                task = asyncio.create_task(llm_record.await_reports(scope))
+                try:
+                    with anyio.fail_after(5):
+                        await entered.wait()
+                    successor = force_take_over(run.store, owner_id="next", host="local", ttl_s=60)
+                    with anyio.fail_after(5), pytest.raises(Fenced):
+                        await task
+                    assert not run.calls()
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+    finally:
+        if successor is not None:
+            successor.release()
