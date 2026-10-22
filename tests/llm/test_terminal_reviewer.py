@@ -33,6 +33,7 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
 ) -> None:
     marker = tmp_path / "editor-pid"
     result = tmp_path / "result.json"
+    terminated = tmp_path / "editor-terminated"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal, time\n"
@@ -42,11 +43,10 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
             if editor_kind == "slow_interrupt"
             else "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         )
-        + (
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            if editor_kind == "stubborn"
-            else "signal.signal(signal.SIGTERM, slow_exit)\n"
-        )
+        + "def terminate(*args):\n"
+        + f"    pathlib.Path({str(terminated)!r}).write_text('TERM')\n"
+        + ("    return\n" if editor_kind == "stubborn" else "    slow_exit()\n")
+        + "signal.signal(signal.SIGTERM, terminate)\n"
         + f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
         "while True: time.sleep(1)\n",
     )
@@ -107,8 +107,10 @@ Path({str(result)!r}).write_text(json.dumps({{
             pump()
         editor_pid = int(marker.read_text())
         os.write(master, b"\x03")
-        # Position the second terminal interrupt inside the one-second grace.
-        time.sleep(0.3)
+        deadline = time.monotonic() + 10
+        while not terminated.exists():
+            assert time.monotonic() < deadline, bytes(output)
+            pump()
         os.write(master, b"\x03")
         deadline = time.monotonic() + 10
         while True:
