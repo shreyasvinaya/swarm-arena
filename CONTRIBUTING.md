@@ -86,3 +86,43 @@ existing bytes.
 
 Score batch IDs include the barrier or final phase and their durable recovery key.
 This keeps ordinary and final judging of the same candidate distinct during replay.
+
+## CI timing and isolation
+
+CI uses separate pytest-xdist worker processes inside pytest-split shards. Keep
+filesystem writes under `tmp_path`, bind test servers to port 0, and reap children
+in fixture teardown or `finally`. Collection must produce identical node IDs in
+every worker; inventories built from weak subclass registries must discard
+unreachable classes and use stable ordering. Process-local monkeypatches do not
+require serial execution.
+
+The committed `.test_durations` balances shards with `least_duration`.
+Each CI shard refreshes its measured subset using `--store-durations
+--clean-durations --durations-path test-durations.json` and uploads a uniquely
+named `durations-*` artifact. Refresh after substantial test changes from a
+completed green CI run (do not run the full suite on the development laptop):
+
+```bash
+uv run gh run download RUN_ID -R shreyasvinaya/swarm-arena \
+  --pattern 'durations-*' --dir /tmp/swarm-ci-durations
+uv run python - <<'PYTHON'
+import json
+from collections import defaultdict
+from pathlib import Path
+from statistics import median
+
+samples = defaultdict(list)
+for artifact in Path("/tmp/swarm-ci-durations").glob("*/test-durations.json"):
+    for nodeid, seconds in json.loads(artifact.read_text()).items():
+        samples[nodeid].append(seconds)
+assert samples, "No duration artifacts found"
+Path(".test_durations").write_text(
+    json.dumps({key: round(median(values), 6) for key, values in samples.items()},
+               indent=2, sort_keys=True) + "\n"
+)
+PYTHON
+```
+
+Use an empty download directory for each refresh. Review and commit the resulting
+file. Durations are scheduling hints, never test timeouts or grounds for skipping
+a test. New tests without measurements receive pytest-split's mean estimate.
