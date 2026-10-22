@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from swarm_arena._agent.context import AgentContext, _prepare_metadata, _ToolMetadata
+from swarm_arena._agent.context import (
+    AgentContext,
+    _local_timer_scope,
+    _prepare_metadata,
+    _ToolMetadata,
+)
 from swarm_arena._agent.manager import LimitReached, Manager, RoundReport
 from swarm_arena._agent.repeats import COUNTED, RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
@@ -20,15 +25,32 @@ from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
+from swarm_arena._engine import stops as provider_module
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.parts import part_scoring, team_goal
-from swarm_arena._engine.stops import RunClock, StopState, round_deadline
-from swarm_arena._errors import Fenced, _core_error, _exception_type_name, _is_core_signal
+from swarm_arena._engine.stops import (
+    ProviderStops,
+    RunClock,
+    StopState,
+    agent_providers,
+    provider_stops,
+    round_deadline,
+)
+from swarm_arena._errors import (
+    Fenced,
+    ProviderFailed,
+    _core_category,
+    _core_error,
+    _exception_type_name,
+    _is_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
+from swarm_arena._journal.llm_record import drain
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.views import ViewWriter
@@ -89,6 +111,8 @@ class EngineDeps:
         Latched run and goal stops.
     clock : RunClock
         Accumulated active run time.
+    provider_stops : ProviderStops
+        Run-wide provider generations and unresolved address causes.
     admission : RunAdmission or None, default=None
         Shared scheduler capacity service; standalone goals initialize it.
     board_namespaces : set[str]
@@ -115,9 +139,14 @@ class EngineDeps:
     views: ViewWriter
     stops: StopState
     clock: RunClock
+    provider_stops: ProviderStops = field(init=False)
     admission: RunAdmission | None = None
     board_namespaces: set[str] = field(default_factory=set)
     board_attach_lock: anyio.Lock = field(default_factory=anyio.Lock)
+
+    def __post_init__(self) -> None:
+        """Use the provider latch already bound by new-run or resume setup."""
+        self.provider_stops = provider_stops(self.journal)
 
 
 @dataclass
@@ -636,7 +665,14 @@ class RoundRunner:
 
         return _RoundContext(
             rt,
-            gate=self._gate,
+            gate=lambda: (
+                self._gate()
+                or (
+                    _core_error(LimitReached, "stop", "provider unavailable")
+                    if self.deps.provider_stops.stopped().get(rt.address)
+                    else None
+                )
+            ),
             refresh=self._refresh_budget,
             metadata=metadata,
             feedback_for=feedback_for,
@@ -817,6 +853,96 @@ class RoundRunner:
             self._counters[key].setdefault("tool_runs", len(ids))
         self.started_runs = {**{key: len(ids) for key, ids in started.items()}, **self.started_runs}
 
+    async def _probe_stopped(self, round: int) -> None:
+        """Probe this goal's saved causes within the owner's preparation lifetime."""
+        service = self.deps.provider_stops
+        paused = service.stopped()
+        for slot in self.agents:
+            if slot.address in paused and slot.status not in _INACTIVE:
+                slot.status = AgentStatus.STOPPED
+        providers = sorted(
+            {
+                p
+                for slot in self.agents
+                if slot.status == AgentStatus.STOPPED
+                for p in paused.get(slot.address, ())
+            }
+        )
+        generations = service.generations()
+        for provider in providers:
+            generation = generations.get(provider)
+            if generation is None:
+                continue
+            deps = self.deps
+            tranche = Tranche(
+                deps.ledger,
+                f"{self.goal_id}/:judges",
+                self.goal_id,
+                size=Amount(
+                    tokens=deps.config.limits.llm_tranche_tokens,
+                    usd=deps.config.limits.llm_tranche_usd,
+                ),
+            )
+            scope = LLMScope(
+                role="manager",
+                run_id=deps.run_id,
+                goal_id=self.goal_id,
+                team="",
+                agent="",
+                round=round,
+                candidate_id=None,
+                tranche=tranche,
+                journal=deps.journal,
+                artifacts=deps.artifacts,
+                models=deps.config.models,
+                tracing=deps.config.tracing,
+                cache=deps.config.cache,
+                limits=deps.config.limits,
+                settle_timeout_s=deps.config.settle_timeout_s,
+                force_no_cache_read=True,
+            )
+            boundary, failure, interrupted, healthy = _Outcome(), None, False, False
+            try:
+                if provider_module._probe is None:
+                    healthy = True
+                else:
+                    with llm_scope(scope):
+                        operation = await run_sync_daemon(provider_module._probe, provider, scope)
+                        healthy = await operation
+                    if type(healthy) is not bool:
+                        raise _core_error(TypeError, "provider probe must return bool")
+            except BaseException as error:
+                failure = error
+                try:
+                    boundary.classify(error)
+                except anyio.get_cancelled_exc_class() as cancelled:
+                    interrupted, failure = True, cancelled
+                except BaseException as control:
+                    failure = control
+            finally:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await drain(scope, wait=not interrupted)
+                        await tranche.close()
+                except BaseException as error:
+                    failure = (
+                        BaseExceptionGroup("probe cleanup", [failure, error]) if failure else error
+                    )
+            if failure is not None:
+                boundary.contain(failure, RuntimeError, "provider probe")
+            boundary.propagate_control(RuntimeError())
+            if healthy:
+                await service.recover(provider, generation=generation)
+        paused = service.stopped()
+        for slot in self.agents:
+            if (
+                slot.status == AgentStatus.STOPPED
+                and slot.address in paused
+                and not paused[slot.address]
+            ):
+                service.activate(slot.address)
+                slot.status = AgentStatus.ACTIVE
+
     async def run(self, round: int) -> RoundOutcome:
         """
         Commit the frontier, run managers concurrently, and settle their tranches.
@@ -847,6 +973,9 @@ class RoundRunner:
 
         async def prepare() -> tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]]:
             await self._restore(round)
+            if self.frontier is None:
+                await self._probe_stopped(round)
+            agents[:] = [slot for slot in self.agents if slot.status not in _INACTIVE]
             frontier = await self._frontier(round, agents)
             parents = await self._parent_views(frontier)
             return frontier, parents, await self._feedback_policies()
@@ -896,12 +1025,29 @@ class RoundRunner:
             rt: AgentRuntime | None = None
             outcome = _Outcome()
             try:
-                with scopes[index], track_inflight(inflight):
+                with (
+                    _local_timer_scope(scopes[index]) as provider_timer,
+                    scopes[index],
+                    track_inflight(inflight),
+                ):
                     await anyio.lowlevel.checkpoint()
                     if slot.manager is None:
                         slot.manager = await run_sync_daemon(slot.spec.manager.build, Manager)
                     rt = await self._runtime(slot, round, frontier, private_paths, parents)
                     runtimes[index] = rt
+                    providers = await run_sync_daemon(
+                        agent_providers, slot.manager, rt.tool, self.deps.config.models
+                    )
+
+                    def cancel_provider() -> None:
+                        causes = self.deps.provider_stops.stopped().get(slot.address, frozenset())
+                        if causes:
+                            provider_timer.stop_provider(
+                                _core_error(ProviderFailed, sorted(causes)[0])
+                            )
+
+                    self.deps.provider_stops.register(slot.address, providers, cancel_provider)
+                    await anyio.lowlevel.checkpoint()
                     ctx = await self._context(rt, feedback_policies)
                     contexts[index] = ctx
                     with llm_scope(
@@ -926,11 +1072,23 @@ class RoundRunner:
                         report = await slot.manager.run_round(ctx)
                         report = await run_sync_daemon(_detach_model, RoundReport, report)
                         summaries[key] = finite_json(report.summary)
+                if provider_timer.failure is not None:
+                    outcome.propagate_control(provider_timer.failure)
             except BaseException as error:
                 error = outcome.classify(error)
                 if self.deps.journal.fenced.is_set():
                     raise _core_error(Fenced, "run ownership lost") from None
-                if contexts[index] is None:
+                if (
+                    provider_timer.provider_stopped
+                    and _core_category(error) is _SignalCategory.TERMINAL
+                ):
+                    raise error from None
+                if _core_category(error) is _SignalCategory.PROVIDER:
+                    assert isinstance(error, ProviderFailed)  # noqa: PT017 - core type narrowing
+                    if not provider_timer.provider_stopped:
+                        await self.deps.provider_stops.fail(error.provider, source="manager")
+                    reasons[key] = "provider unavailable"
+                elif contexts[index] is None:
                     reasons[key] = f"agent error: {_exception_type_name(error)}"
                 else:
                     reasons[key] = (
@@ -939,6 +1097,7 @@ class RoundRunner:
                         else f"manager error: {_exception_type_name(error)}"
                     )
             finally:
+                self.deps.provider_stops.unregister(slot.address)
                 if contexts[index] is None:
                     reasons.setdefault(key, "runtime preparation cancelled")
                 if rt is not None:
@@ -975,6 +1134,7 @@ class RoundRunner:
         for slot, rt, ctx in zip(agents, runtimes, contexts, strict=True):
             key = f"{slot.team.name}/{slot.spec.name}"
             own_learnings: list[Learning] = []
+            previous_status = slot.status
             slot.status = AgentStatus.FINISHED
             if rt is not None:
                 own_learnings = [item for item in rt.own if isinstance(item, Learning)]
@@ -998,6 +1158,20 @@ class RoundRunner:
                     self.deps.journal.append(
                         self._agent_draft(slot, EventType.WATCHDOG, round, reason=reason)
                     )
+            if previous_status in {
+                AgentStatus.PRUNED,
+                AgentStatus.WATCHDOG_STOPPED,
+                AgentStatus.STOPPED,
+            }:
+                slot.status = previous_status
+            if (
+                slot.status not in {AgentStatus.PRUNED, AgentStatus.WATCHDOG_STOPPED}
+                and slot.address in self.deps.provider_stops.stopped()
+            ):
+                slot.status = AgentStatus.STOPPED
+                reasons[key] = "provider unavailable"
+            elif slot.status in {AgentStatus.PRUNED, AgentStatus.WATCHDOG_STOPPED}:
+                self.deps.provider_stops.release(slot.address)
             statuses[key] = slot.status
             reasons.setdefault(key, "")
             a2a = agent_round_task(

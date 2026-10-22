@@ -352,8 +352,13 @@ class GoalRunner:
         """
         statuses = {f"{s.team.name}/{s.spec.name}": s.status for s in self.agents}
         statuses = {**self.state.agents, **statuses}
+        paused = self.deps.provider_stops.stopped()
         main = sum(
             statuses.get(f"{team.name}/{agent.name}") not in _INACTIVE
+            or (
+                statuses.get(f"{team.name}/{agent.name}") == AgentStatus.STOPPED
+                and f"{self.goal_id}/{team.name}/{agent.name}" in paused
+            )
             for team in self.plan.teams
             for agent in team.agents
         )
@@ -473,6 +478,7 @@ class GoalRunner:
         goal = self.recorded.goals[self.goal_id]
         reason = goal.pending_reason
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=reason))
             await self.deps.journal.commit()
             await self.deps.ledger.end_goal(self.goal_id)
@@ -1322,6 +1328,7 @@ class GoalRunner:
             reason = decision.prune.get(key, decision.prune.get(slot.team.name))
             if reason is not None:
                 slot.status = AgentStatus.PRUNED
+                self.deps.provider_stops.release(slot.address)
                 self.deps.journal.append(
                     EventDraft(
                         type=EventType.AGENT_STATUS,
@@ -1713,6 +1720,7 @@ class GoalRunner:
             )
         # Replay returns the pool at goal_finished; do not suspend before applying it live.
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             await self.deps.journal.append_durable(
                 self._draft(EventType.GOAL_FINISHED, reason=self.reason)
             )

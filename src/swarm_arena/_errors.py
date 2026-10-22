@@ -151,6 +151,30 @@ class LeaseHeld(RuntimeError):
     """
 
 
+class ProviderFailed(RuntimeError):
+    """
+    Identify an unavailable provider without retaining upstream diagnostics.
+
+    Parameters
+    ----------
+    provider : str
+        Provider identifier. Construction alone confers no control authority;
+        core producers register only validated catalog or tool identities.
+
+    Examples
+    --------
+    >>> error = ProviderFailed("anthropic")
+    >>> error.provider, str(error)
+    ('anthropic', 'provider unavailable')
+    """
+
+    def __init__(self, provider: str) -> None:
+        from swarm_arena._model.context_strings import _context_string
+
+        self.provider = _context_string(provider, "provider")
+        super().__init__("provider unavailable")
+
+
 class _CoreRuntimeError(RuntimeError):
     """Allow core runtime errors to be weakly registered."""
 
@@ -175,6 +199,7 @@ class _SignalCategory(Enum):
 
     DIAGNOSTIC = auto()
     LIMIT = auto()
+    PROVIDER = auto()
     TERMINAL = auto()
     FENCED = auto()
 
@@ -187,6 +212,7 @@ class _SignalSnapshot:
     errors: tuple[str, ...] | None
     name: str
     category: _SignalCategory
+    provider: str | None
 
 
 _CORE_SIGNALS: WeakKeyDictionary[Exception, _SignalSnapshot] = WeakKeyDictionary()
@@ -271,6 +297,7 @@ def _core_signal_kinds() -> tuple[type[Exception], ...]:
 
     return (
         SoftError,
+        ProviderFailed,
         LimitReached,
         PlanError,
         ConfigError,
@@ -302,6 +329,8 @@ def _core_signal(error: _SignalT, *, _category: _SignalCategory | None = None) -
                 if type(error) is Fenced
                 else _SignalCategory.LIMIT
                 if type(error) is LimitReached
+                else _SignalCategory.PROVIDER
+                if type(error) is ProviderFailed
                 else _SignalCategory.DIAGNOSTIC
             )
         _CORE_SIGNALS[error] = _SignalSnapshot(
@@ -315,6 +344,7 @@ def _core_signal(error: _SignalT, *, _category: _SignalCategory | None = None) -
             if type(error) is _CoreValueError
             else type(error).__name__,
             category,
+            error.provider if type(error) is ProviderFailed else None,
         )
     return error
 
@@ -379,6 +409,9 @@ def _rebuild_core_signal(error: BaseException) -> Exception | None:
     if kind is LimitReached:
         assert limit is not None
         rebuilt = _core_error(LimitReached, limit, args[0], _category=payload.category)
+    elif kind is ProviderFailed:
+        assert payload.provider is not None
+        rebuilt = _core_error(ProviderFailed, payload.provider, _category=payload.category)
     elif kind is PlanError:
         assert errors is not None
         rebuilt = _core_error(PlanError, errors, _category=payload.category)

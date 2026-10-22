@@ -30,7 +30,7 @@ from swarm_arena._engine.manifest import RunManifest, build_manifest_async
 from swarm_arena._engine.preflight import run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
-from swarm_arena._engine.stops import RunClock, StopState, _StopWatcher, watch_stop_files
+from swarm_arena._engine.stops import ProviderStops, RunClock, StopState, _StopWatcher, watch_stop_files
 from swarm_arena._errors import (
     AlreadyExists,
     Fenced,
@@ -783,6 +783,7 @@ class RunRunner:
                                         }
                                     ),
                                 )
+                                ProviderStops(journal)
                                 deps = EngineDeps(
                                     run_id=run_id,
                                     config=config,
@@ -1274,6 +1275,7 @@ async def planning_session(
                             usd=config.limits.llm_tranche_usd,
                         ),
                     )
+                    ProviderStops(journal, standalone=True)
                     scope = LLMScope(
                         role="planner",
                         run_id=run_id,

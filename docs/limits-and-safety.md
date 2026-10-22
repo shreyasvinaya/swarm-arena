@@ -423,3 +423,40 @@ A post-stop final-selection recovery read can exhaust its storage settlement
 allowance. That failure propagates as a core storage-settlement error; it does
 not publish judge errors or a terminal provider-failure result. Resume can
 continue the unfinished goal from the committed journal.
+
+
+## Provider failures
+
+A provider outage pauses every registered agent in the run that uses that
+provider, across goals. The provider set includes the manager's model catalog
+entries and the tool's declared providers. An explicit tool
+`failed_provider` identifies one provider; a provider-failed output without that
+field applies to all providers declared by the tool.
+
+For example, a tool can write
+`{"data": {}, "failed_provider": "anthropic"}` to its result file. Agents using
+Anthropic through either their manager or tool pause; unrelated agents continue.
+The optional LLM adapter recognizes authentication, permission, rate-limit,
+connection, timeout and service failures. Credit failures use structured error
+fields first, with a message fallback confined to the adapter. Provider messages
+are never copied into engine errors or provider events.
+
+Paused agents retain scheduler capacity. At the next fresh round, including
+convergence, the engine probes each failed provider needed by that goal before
+building its frontier or allocating shares. The probe uses the goal's judges
+budget, a manager scope, input `ping`, and `max_tokens=1`; both response-cache
+reads and writes are bypassed. Accounting drains before its tranche closes.
+With no probe adapter or no catalog alias for the saved provider, recovery
+succeeds without a model call.
+
+Recovery clears only the generation that was probed. A newer failure or another
+unresolved provider keeps the agent paused. Recovery does not revive a pruned or
+watchdog-stopped agent. An admitted SDK tool action finishes under core grace
+before the manager drains; further actions are refused. Caller cancellation,
+lost ownership and terminal budget controls retain their precedence.
+
+Provider generations and address causes are journaled and restored on resume,
+independently of the current model catalog. A restarted partial round does not
+probe or clear its saved causes. A fresh resumed round may recover its reserved
+slots without exceeding `max_agents_total`. Permanent disposition or goal
+completion releases the reservation.

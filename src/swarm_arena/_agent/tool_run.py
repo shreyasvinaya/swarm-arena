@@ -934,4 +934,11 @@ async def _run(
         rt.board.put_candidate(candidate, epoch=event.epoch, seq=event.seq)
         rt.own.append(candidate)
         rt.repeats.add(key, candidate)
+    if candidate.output.status == RunStatus.PROVIDER_FAILED:
+        from swarm_arena._engine.stops import failed_providers
+
+        failed = await _prepare_sync(lambda: failed_providers(candidate.output, rt.tool))
+        with anyio.CancelScope(shield=True):
+            for provider in sorted(failed):
+                await rt.stops.fail(provider, source="tool")
     return candidate

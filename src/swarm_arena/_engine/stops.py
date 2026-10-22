@@ -1,16 +1,29 @@
 """Latch admission stops and measure active run time."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import monotonic
+from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary, ref
 
 import anyio
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._engine.control import stop_key
-from swarm_arena._errors import StorageError
+from swarm_arena._errors import (
+    ProviderFailed,
+    StorageError,
+    _core_category,
+    _core_error,
+    _rebuild_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.event import EventDraft, EventType
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._outcomes import _Outcome
 from swarm_arena._store.base import Store
 
@@ -267,3 +280,394 @@ async def watch_stop_files(
                     state.stop_now = True
                 state.stop = True
         await anyio.sleep(interval_s)
+
+
+if TYPE_CHECKING:
+    from swarm_arena._agent.manager import Manager
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._journal.writer import JournalWriter
+    from swarm_arena._model.catalog import ModelCatalog
+    from swarm_arena._model.tooling import ToolOutput
+    from swarm_arena._tooling.tool import Tool
+
+
+_probe: Callable[[str, LLMScope], Awaitable[bool]] | None = None
+_services: WeakKeyDictionary[JournalWriter, ProviderStops] = WeakKeyDictionary()
+
+
+def register_probe(fn: Callable[[str, LLMScope], Awaitable[bool]] | None) -> None:
+    """Register the optional adapter's recovery probe.
+
+    Parameters
+    ----------
+    fn : Callable or None
+        Asynchronous provider probe, or None for unconditional recovery.
+
+    Examples
+    --------
+    >>> register_probe(None)
+    """
+    global _probe
+    _probe = fn
+
+
+def agent_providers(manager: Manager, tool: Tool, models: ModelCatalog) -> frozenset[str]:
+    """Resolve an agent's manager aliases and declared tool providers.
+
+    Parameters
+    ----------
+    manager : Manager
+        Built manager supplying model aliases.
+    tool : Tool
+        Built tool supplying provider identifiers.
+    models : ModelCatalog
+        Admitted model catalog.
+
+    Returns
+    -------
+    frozenset[str]
+        Detached provider identifiers. Call under supervised preparation.
+
+    Examples
+    --------
+    >>> from swarm_arena import ScriptedManager, FunctionTool
+    >>> from swarm_arena.config import ModelCatalog
+    >>> agent_providers(ScriptedManager([]), FunctionTool("math:sqrt"), ModelCatalog({}))
+    frozenset()
+    """
+    providers = {_context_string(p, "provider") for p in tool.providers()}
+    for alias in manager.models():
+        alias = _context_string(alias, "alias")
+        providers.add(_context_string(models.resolve(alias, "manager").provider, "provider"))
+    return frozenset(providers)
+
+
+def failed_providers(output: ToolOutput, tool: Tool) -> frozenset[str]:
+    """Resolve explicit or whole-tool provider failures under preparation.
+
+    Parameters
+    ----------
+    output : ToolOutput
+        Detached failed tool output.
+    tool : Tool
+        Tool whose declarations supply the fallback.
+
+    Returns
+    -------
+    frozenset[str]
+        Normalized identifiers; no upstream message is retained.
+
+    Examples
+    --------
+    >>> from swarm_arena import FunctionTool
+    >>> from swarm_arena._model.tooling import ToolOutput
+    >>> failed_providers(ToolOutput(status="provider_failed", failed_provider="openai"),
+    ...                  FunctionTool("math:sqrt")) == {"openai"}
+    True
+    """
+    if output.failed_provider is not None:
+        return frozenset({_context_string(output.failed_provider, "failed_provider")})
+    return frozenset(_context_string(p, "provider") for p in tool.providers())
+
+
+class ProviderStops:
+    """Own run-wide provider generations, causes and cancellation registrations.
+
+    Parameters
+    ----------
+    journal : JournalWriter
+        Entered owner writer. Its identity binds the reporter for child scopes.
+    state : RunState or None, optional
+        Committed state to restore, independent of today's model catalog.
+    standalone : bool, default=False
+        Use address-free standalone planning transition events.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> stops = ProviderStops(Mock())
+    >>> stops.stopped(), stops.generations()
+    ({}, {})
+    """
+
+    def __init__(
+        self, journal: JournalWriter, *, state: RunState | None = None, standalone: bool = False
+    ) -> None:
+        self._journal = ref(journal)
+        self._standalone = standalone
+        self._generations = dict(state.provider_generations) if state is not None else {}
+        self._failed = dict(state.provider_failed) if state is not None else {}
+        self._causes = (
+            {a: dict(c) for a, c in state.provider_causes.items()} if state is not None else {}
+        )
+        self._providers: dict[str, frozenset[str]] = {}
+        self._cancel: dict[str, Callable[[], None]] = {}
+        _services[journal] = self
+
+    def _writer(self) -> JournalWriter:
+        journal = self._journal()
+        if journal is None:
+            raise _core_error(RuntimeError, "provider owner is closed")
+        return journal
+
+    def _emit(self, transition: str, **payload: Any) -> None:
+        self._writer().append(
+            EventDraft(
+                type=EventType.PROVIDER_FAILED,
+                payload={
+                    "variant": "standalone" if self._standalone else "transition",
+                    "transition": transition,
+                    **payload,
+                },
+            )
+        )
+
+    def register(self, address: str, providers: frozenset[str], cancel: Callable[[], None]) -> None:
+        """Register active work and immediately observe outstanding failures.
+
+        Parameters
+        ----------
+        address : str
+            Full goal/team/agent identity.
+        providers : frozenset[str]
+            Validated provider identifiers from supervised preparation.
+        cancel : Callable[[], None]
+            Core callback carrying shared cancellation provenance.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> stops = ProviderStops(Mock())
+        >>> stops.register("g/t/a", frozenset({"openai"}), lambda: None)
+        >>> stops.stopped()
+        {}
+        """
+        address = _context_string(address, "address")
+        providers = frozenset(_context_string(p, "provider") for p in providers)
+        causes = {p: self._failed[p] for p in providers if p in self._failed}
+        if causes:
+            self._emit("observed", address=address, causes=causes)
+            self._causes.setdefault(address, {}).update(causes)
+        self._providers[address], self._cancel[address] = providers, cancel
+        if self._causes.get(address):
+            cancel()
+
+    def unregister(self, address: str) -> None:
+        """Remove the active callback while retaining between-round identity.
+
+        Parameters
+        ----------
+        address : str
+            Agent whose active round has ended.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> ProviderStops(Mock()).unregister("g/t/a")
+        """
+        self._cancel.pop(_context_string(address, "address"), None)
+
+    async def fail(self, provider: str, *, source: str) -> list[str]:
+        """Latch and durably report a failure before cancelling matching work.
+
+        Parameters
+        ----------
+        provider : str
+            Core-validated catalog or declared tool provider identifier.
+        source : str
+            Component identifier, never upstream diagnostic text.
+
+        Returns
+        -------
+        list[str]
+            Sorted affected addresses across all goals.
+
+        Examples
+        --------
+        >>> stopped = await service.fail("openai", source="manager")  # doctest: +SKIP
+        """
+        provider = _context_string(provider, "provider")
+        source = _context_string(source, "source")
+        if source not in {"manager", "tool", "judge", "planner", "curator"}:
+            raise _core_error(ValueError, "invalid provider source")
+        generation = self._generations.get(provider, 0) + 1
+        stopped = sorted(
+            {a for a, ps in self._providers.items() if provider in ps}
+            | {a for a, cs in self._causes.items() if provider in cs}
+        )
+        self._emit(
+            "failed", provider=provider, generation=generation, source=source, stopped=stopped
+        )
+        self._generations[provider] = self._failed[provider] = generation
+        for address in stopped:
+            self._causes.setdefault(address, {})[provider] = generation
+        # No await between event admission and the matching live state. Gate
+        # readers already refuse new work while durable publication is pending.
+        try:
+            await self._writer().commit()
+        finally:
+            for address in stopped:
+                if cancel := self._cancel.get(address):
+                    cancel()
+        return stopped
+
+    def stopped(self) -> dict[str, frozenset[str]]:
+        """Snapshot provider-paused addresses and their unresolved causes.
+
+        Returns
+        -------
+        dict[str, frozenset[str]]
+            Empty cause sets denote recovered slots awaiting a fresh round.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> ProviderStops(Mock()).stopped()
+        {}
+        """
+        return {a: frozenset(cs) for a, cs in self._causes.items()}
+
+    def generations(self) -> dict[str, int]:
+        """Snapshot currently failed providers' generations for probing.
+
+        Returns
+        -------
+        dict[str, int]
+            Generation that a successful probe must still match.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> ProviderStops(Mock()).generations()
+        {}
+        """
+        return dict(self._failed)
+
+    async def recover(self, provider: str, *, generation: int) -> list[str]:
+        """Clear only the generation whose probe succeeded.
+
+        Parameters
+        ----------
+        provider : str
+            Probed identifier, independent of the current catalog.
+        generation : int
+            Generation captured before starting that probe.
+
+        Returns
+        -------
+        list[str]
+            Addresses whose cause was cleared; other causes remain.
+
+        Examples
+        --------
+        >>> recovered = await service.recover("openai", generation=1)  # doctest: +SKIP
+        """
+        provider = _context_string(provider, "provider")
+        if self._failed.get(provider) != generation:
+            return []
+        recovered = sorted(a for a, cs in self._causes.items() if cs.get(provider) == generation)
+        self._emit("recovered", provider=provider, generation=generation, recovered=recovered)
+        self._failed.pop(provider)
+        for address in recovered:
+            self._causes[address].pop(provider)
+        await self._writer().commit()
+        return recovered
+
+    def activate(self, address: str) -> None:
+        """Admit a recovered provider-paused slot to its next fresh round.
+
+        Parameters
+        ----------
+        address : str
+            Recovered slot with no unresolved causes.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> ProviderStops(Mock()).activate("g/t/a")
+        """
+        address = _context_string(address, "address")
+        if address in self._causes and not self._causes[address]:
+            self._emit("activated", address=address)
+            del self._causes[address]
+
+    def release(self, address: str) -> None:
+        """Forget provider capacity only after a permanent disposition.
+
+        Parameters
+        ----------
+        address : str
+            Pruned, permanently stopped or completed agent.
+
+        Examples
+        --------
+        >>> from unittest.mock import Mock
+        >>> ProviderStops(Mock()).release("g/t/a")
+        """
+        address = _context_string(address, "address")
+        if address in self._causes:
+            self._emit("released", address=address)
+        self._causes.pop(address, None)
+        self._providers.pop(address, None)
+        self._cancel.pop(address, None)
+
+    def _release_goal(self, goal_id: str) -> None:
+        """Release all current and replayed address identities at goal completion."""
+        for address in sorted(self._providers.keys() | self._causes.keys()):
+            if address.split("/", 1)[0] == goal_id:
+                self.release(address)
+
+
+def provider_stops(journal: JournalWriter) -> ProviderStops:
+    """Find the shared service bound to this writer, including scope children.
+
+    Parameters
+    ----------
+    journal : JournalWriter
+        Current owner's writer.
+
+    Returns
+    -------
+    ProviderStops
+        Existing service, or a new service for a standalone harness owner.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> writer = Mock()
+    >>> provider_stops(writer) is provider_stops(writer)
+    True
+    """
+    return _services.get(journal) or ProviderStops(journal)
+
+
+async def report_provider_failure(
+    scope: LLMScope, error: BaseException, *, source: str
+) -> list[str]:
+    """Report only a validated provider signal through the owner's live latch.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Component or child scope sharing the entered journal owner.
+    error : BaseException
+        Registered provider signal, possibly transported through the SDK.
+    source : str
+        Manager, tool, judge, planner or curator.
+
+    Returns
+    -------
+    list[str]
+        Affected agent addresses, empty for standalone planning.
+
+    Examples
+    --------
+    >>> addresses = await report_provider_failure(scope, error, source="judge")  # doctest: +SKIP
+    """
+    classified = _Outcome().classify(error)
+    if _core_category(classified) is not _SignalCategory.PROVIDER:
+        raise classified from None
+    restored = _rebuild_core_signal(classified)
+    assert isinstance(restored, ProviderFailed)
+    return await provider_stops(scope.journal).fail(restored.provider, source=source)

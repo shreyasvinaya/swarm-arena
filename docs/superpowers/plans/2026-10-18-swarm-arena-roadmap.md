@@ -1622,6 +1622,9 @@ class ConditionalWritesUnsupported(StorageError): ...
 class ChainError(StorageError): ...                  # M1b: chain check failed
 class Fenced(RuntimeError): ...                      # M1b: this owner lost the run
 class LeaseHeld(RuntimeError): ...                   # M1b: a live owner holds the lease
+class ProviderFailed(RuntimeError):
+    def __init__(self, provider: str) -> None: ...   # safe identifier; core registration grants authority
+    provider: str
 ```
 
 #### R4.13.2 Store and artifacts — M1a (`replace` M1b, `S3Store` M2)
@@ -2356,6 +2359,7 @@ class RunAdmission:                                 # _engine/admission.py
     async def release(self, goal_id: str) -> None: ...
 class RoundRunner:                                   # _engine/round.py
     async def run(self, round: int) -> RoundOutcome: ...
+    # A new round probes providers before board.frontier(); the frontier publication window stays intact.
 async def converge(goal: GoalRunner, *, select_only: bool) -> list[Candidate]: ...   # _engine/converge.py
     # Converge outputs receive ordinary judges before the uncached final ranking. An unfunded barrier
     # records reserve_exhausted and selects previously judged survivors or unjoined parts, not its new outputs.
@@ -2911,3 +2915,35 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses only the allowlist that the driver can read before dispatch (a `ScriptTool` `Config.env`). A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
 
 19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.
+
+
+### Delivered provider-state interface additions
+
+These rows supplement R4.13.1, R4.13.4, R4.13.10, R4.13.13 and R4.13.17.
+
+| Registry | Delivered interface and semantics |
+|---|---|
+| R4.13.1 | `ProviderFailed(provider: str)`: fixed safe message and normalized identifier; constructor alone grants no authority. Shared registry snapshots and rebuilds the PROVIDER category; FENCED, caller cancellation and TERMINAL precede it. |
+| R4.13.4 | `RunState.provider_generations: dict[str, int]`, `provider_failed: dict[str, int]`, `provider_causes: dict[str, dict[str, int]]`. Empty address causes retain capacity until fresh-round activation or permanent release. |
+| R4.13.10 | `ProviderStops(journal, *, state: RunState \| None = None, standalone=False)` binds one service to an entered writer. `AgentRuntime.stops` and `EngineDeps.provider_stops` resolve this same service. |
+| R4.13.10 | `register(address, providers, cancel)` observes outstanding generations; `unregister(address)` drops only the active callback. `fail(provider, *, source) -> list[str]` journals and latches before cancelling with shared timer provenance. |
+| R4.13.10 | `stopped() -> dict[str, frozenset[str]]`; `generations() -> dict[str, int]`; `await recover(provider, *, generation) -> list[str]` clears only the matching generation. `activate(address)` removes a recovered cause entry; `release(address)` permanently drops address identity. |
+| R4.13.10 | `provider_stops(journal) -> ProviderStops`; `await report_provider_failure(scope, error, *, source) -> list[str]` accepts only a registered provider signal and reaches the service through the scope's inherited journal, including child scopes. |
+| R4.13.10 | `register_probe(fn \| None)`, `agent_providers(manager, tool, models) -> frozenset[str]`, `failed_providers(output, tool) -> frozenset[str]`; provider/build hooks use supervised preparation. |
+| R4.13.13 | New run and standalone planning bind a service; resume restores it from committed state. `GoalRunner.active_agents()` counts provider-paused slots before and after runtime reconstruction. |
+| R4.13.13 | `RoundRunner.run`: a new round runs provider probes first, before active selection and `board.frontier()`; the existing frontier publication window stays intact. Restarted rounds do not probe. |
+| R4.13.17 | `is_provider_failure(exc) -> bool` uses structured evidence before the permitted credit-message fallback. `await probe_provider(provider, scope) -> bool` uses the shared child-invocation helper, one token and complete cache bypass; only registered provider failure returns False. |
+
+The `provider_failed` event's `variant` distinguishes `transition`,
+address-free `standalone` transitions, and `receipt` operation records. Replay
+ignores receipts. Transition payloads contain only identifiers and generations:
+
+- `failed`: `provider`, `generation`, `source`, `stopped: list[str]`.
+- `recovered`: `provider`, `generation`, `recovered: list[str]`.
+- `observed`: `address`, `causes: dict[str, int]`.
+- `activated` or `released`: `address`.
+
+The transition name is stored in `transition`. Allowed failure sources are
+`manager`, `tool`, `judge`, `planner`, and `curator`. Goal completion clears
+its address causes. Recovery is run-wide; activation waits for each address's
+own fresh round.

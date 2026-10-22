@@ -32,6 +32,7 @@ from swarm_arena._budget.llm_scope import llm_scope
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._errors import (
     Fenced,
+    _core_category,
     _core_error,
     _is_core_control,
     _rebuild_core_signal,
@@ -921,3 +922,282 @@ async def test_admission_gate_refusal_releases_unused_reservation(
         assert scope.tranche.pending() == 0
         assert run.charged(scope) == Amount()
         assert len(run.events("reserve")) == stop_at - 1
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "RateLimitError",
+        "ServiceUnavailableError",
+        "InternalServerError",
+        "APIConnectionError",
+        "Timeout",
+        "BadRequestError",
+    ],
+)
+async def test_provider_failures_are_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import httpx
+    import litellm
+
+    from swarm_arena._errors import ProviderFailed, _core_category
+
+    error = getattr(litellm, kind)(
+        **(
+            {"response": httpx.Response(403, request=httpx.Request("GET", "https://test.invalid"))}
+            if kind == "PermissionDeniedError"
+            else {}
+        ),
+        message="private-sentinel credit balance",
+        model="private-model",
+        llm_provider="private-provider",
+    )
+    fake = FakeModel([])
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise error
+
+    monkeypatch.setattr(fake, "get_response", fail)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(ProviderFailed) as caught:
+            await invoke(metered(fake))
+        assert caught.value.provider == SPEC.provider
+        assert _core_category(caught.value) is _SignalCategory.PROVIDER
+        assert_secret_absent(caught.value, "private-sentinel")
+        assert_secret_absent(caught.value, "private-provider")
+        await drain(scope, wait=False)
+        assert "private-sentinel" not in repr(run.events("llm_call"))
+
+
+async def test_other_errors_are_not_provider_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import litellm
+
+    error = litellm.BadRequestError(message="invalid tools", model="m", llm_provider="fake")
+    fake = FakeModel([])
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise error
+
+    monkeypatch.setattr(fake, "get_response", fail)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(litellm.BadRequestError) as caught:
+            await invoke(metered(fake))
+        assert caught.value is error
+        await drain(scope, wait=False)
+
+
+async def test_probe_sends_max_tokens_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm_arena.llm import _hooks
+
+    fake = FakeModel([FakeTurn(text="ok")])
+    monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
+    async with open_llm_run(
+        tmp_path,
+        config=config(
+            cache=CachePolicy(backend="disk", roles={"manager": {"read": True, "write": True}})
+        ),
+    ) as run:
+        scope = run.scope("manager")
+        assert await _hooks.probe_provider(SPEC.provider, scope)
+        assert len(run.calls()) == 1
+        sent = fake.calls[0]["model_settings"]
+        assert sent.max_tokens == 1
+        assert "cache" not in (sent.extra_args or {})
+        assert run.charged(scope).usd == pytest.approx(sum(c.cost_usd for c in run.calls()))
+
+
+@pytest.mark.parametrize("record", [True, False])
+async def test_probe_drains_before_it_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: bool
+) -> None:
+    from _fakes.llm_components import LateFakeModel
+
+    from swarm_arena.llm import _hooks
+
+    release = anyio.Event()
+    fake = LateFakeModel([FakeTurn(text="pong")], delay_s=0 if record else None, release=release)
+    monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        finished = anyio.Event()
+
+        async def probe() -> None:
+            assert await _hooks.probe_provider("fake", scope)
+            finished.set()
+
+        try:
+            with anyio.fail_after(10):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(probe)
+                    await fake.ready.wait()
+                    assert not finished.is_set()
+                    release.set()
+                    await finished.wait()
+            assert set(scope.call_ids) == {c.id for c in run.calls()}
+            assert run.charged(scope).usd == pytest.approx(sum(c.cost_usd for c in run.calls()))
+            assert run.calls()[0].status == ("ok" if record else "error")
+            assert (run.calls()[0].error is not None) is (not record)
+        finally:
+            release.set()
+            await fake.aclose()
+
+
+@pytest.mark.parametrize("kind", ["missing", "judge", "failed", "terminal", "forged"])
+async def test_probe_catalog_roles_and_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import litellm
+
+    from swarm_arena._errors import ProviderFailed
+    from swarm_arena.llm import _hooks
+
+    fake = FakeModel([FakeTurn(text="pong")])
+    cfg = config()
+    if kind == "judge":
+        cfg = cfg.model_copy(
+            update={"models": ModelCatalog({"m": SPEC.model_copy(update={"roles": ["judge"]})})}
+        )
+    if kind in {"failed", "terminal", "forged"}:
+
+        async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+            if kind == "terminal":
+                raise _stop_cleanup_error()
+            if kind == "forged":
+                raise ProviderFailed("private-provider")
+            raise litellm.ServiceUnavailableError(
+                message="private-value", model="m", llm_provider="fake"
+            )
+
+        monkeypatch.setattr(fake, "get_response", fail)
+    monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
+    async with open_llm_run(tmp_path, config=cfg) as run:
+        scope = run.scope("manager")
+        if kind in {"terminal", "forged"}:
+            with pytest.raises(RuntimeError) as caught:
+                await _hooks.probe_provider("fake", scope)
+            assert _core_category(caught.value) is not _SignalCategory.PROVIDER
+            assert_secret_absent(caught.value, "private-provider")
+        else:
+            assert await _hooks.probe_provider(
+                "absent" if kind == "missing" else "fake", scope
+            ) is (kind != "failed")
+            if kind == "judge":
+                assert run.calls()[0].status == "ok"
+                assert run.calls()[0].error is None
+            if kind == "missing":
+                assert run.calls() == []
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"), [("insufficient_quota", True), ("invalid_tools", False)]
+)
+def test_provider_structured_code_precedes_message(code: str, expected: bool) -> None:
+    import litellm
+
+    from swarm_arena.llm._hooks import is_provider_failure
+
+    error = litellm.BadRequestError(
+        message="credit balance private-value", model="m", llm_provider="fake"
+    )
+    error.body = {"error": {"code": code}}
+    assert is_provider_failure(error) is expected
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_provider_stop_keeps_sdk_owned_siblings_until_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import PyTool
+
+    from swarm_arena import Ref, Swarm
+    from swarm_arena._agent.runtime import AgentRuntime
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine.round import RoundRunner
+    from swarm_arena.llm import AgentsSDKManager, _manager
+    from tests.llm.test_manager import NestedActionTool, finish, register
+    from tests.llm.test_manager import config as manager_config
+
+    release = tmp_path / "release"
+    ready = tmp_path / "ready"
+    code = f"""
+import json, os, time
+from pathlib import Path
+n = json.load(open('swarm/request.json'))['params']['n']
+Path({str(ready)!r} + str(n)).touch()
+while not Path({str(release)!r}).exists():
+    time.sleep(0.01)
+json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    cfg = manager_config(
+        limits=Limits(max_usd=100, max_tokens=10_000_000),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    current = plan(
+        rounds=1, tool=(NestedActionTool if nested else PyTool)({"code": code, "grace_s": 3})
+    )
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(update={"manager": Ref.of(AgentsSDKManager(model="opus"))})
+    )
+    calls = (
+        (("nested", {"x": 1}), ("nested", {"x": 2}))
+        if nested
+        else (("run_tool", {"inputs": {"n": 1}}), ("run_tool", {"inputs": {"n": 2}}))
+    )
+    fake = register([FakeTurn(tool_calls=calls), finish("must not run")])
+    runtimes: list[AgentRuntime] = []
+    original_runtime, original_drain = RoundRunner._runtime, _manager.drain
+
+    async def runtime(self: RoundRunner, *args: Any, **kwargs: Any) -> AgentRuntime:
+        rt = await original_runtime(self, *args, **kwargs)
+        runtimes.append(rt)
+        return rt
+
+    drained: list[bool] = []
+
+    async def drain_checked(scope: LLMScope, *, wait: bool) -> list[str]:
+        assert len([e for e in all_events(cfg) if e.type == "tool_end"]) == 2
+        drained.append(True)
+        return await original_drain(scope, wait=wait)
+
+    monkeypatch.setattr(RoundRunner, "_runtime", runtime)
+    monkeypatch.setattr(_manager, "drain", drain_checked)
+
+    async def fail_provider() -> None:
+        try:
+            with anyio.fail_after(15):
+                while not all([await anyio.Path(str(ready) + str(i)).exists() for i in (1, 2)]):
+                    await anyio.lowlevel.checkpoint()
+            assert runtimes
+            await runtimes[0].stops.fail("fake", source="judge")
+        finally:
+            release.touch()
+
+    try:
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as group:
+                group.start_soon(fail_provider)
+                await Swarm(cfg).run(current, run_id="provider-owned")
+    finally:
+        release.touch()
+    events = all_events(cfg)
+    ends = [e for e in events if e.type == "tool_end"]
+    assert len(ends) == 2
+    assert all(e.payload["candidate"]["output"]["status"] == "ok" for e in ends)
+    assert len(fake.calls) == 1
+    assert drained == [True]
+    assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+        e.payload["id"] for e in events if e.type == "settle"
+    }
+    assert next(e for e in events if e.type == "agent_status").payload["status"] == "stopped"

@@ -7,6 +7,7 @@ import anyio
 
 from swarm_arena._errors import (
     Fenced,
+    ProviderFailed,
     _carrier_name,
     _core_category,
     _core_error,
@@ -45,6 +46,7 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
     # diagnostic. Fencing above still wins over every other registered control.
     pending = [error]
     limit: Exception | None = None
+    provider: Exception | None = None
     while pending:
         current = pending.pop()
         category = _core_category(current)
@@ -52,10 +54,14 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
             rebuilt = _rebuild_core_signal(current)
             assert rebuilt is not None
             return rebuilt
+        if category is _SignalCategory.PROVIDER:
+            provider = _rebuild_core_signal(current)
         if category is _SignalCategory.LIMIT:
             limit = _rebuild_core_signal(current)
         if isinstance(current, BaseExceptionGroup):
             pending.extend(reversed(current.exceptions))
+    if provider is not None:
+        return provider
     if limit is not None:
         return limit
     rebuilt = _rebuild_core_signal(error)
@@ -64,7 +70,7 @@ def _classify_outcome(error: BaseException, *, cancelled: bool = False) -> Excep
     from swarm_arena._agent.manager import LimitReached
 
     if (
-        isinstance(error, (Fenced, LimitReached, BaseExceptionGroup))
+        isinstance(error, (Fenced, ProviderFailed, LimitReached, BaseExceptionGroup))
         or not isinstance(error, Exception)
         or _carrier_name(error) is not None
     ):

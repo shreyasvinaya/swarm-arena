@@ -13,7 +13,7 @@ def _values() -> dict[str, Any]:
     return {
         f.name: Mock(name=f.name)
         for f in fields(AgentRuntime)
-        if f.default is MISSING and f.default_factory is MISSING
+        if f.init and f.default is MISSING and f.default_factory is MISSING
     }
 
 
@@ -92,3 +92,14 @@ def test_registry_documents_tranche_outcomes_and_overflow_admission() -> None:
     assert "async def close(self) -> TrancheOutcome" in budget
     limits = roadmap.split("class LimitReached(RuntimeError):", 1)[1].split("class Manager", 1)[0]
     assert '"usage_overflow"' in limits
+
+
+def test_runtime_uses_writer_bound_provider_service() -> None:
+    from swarm_arena._engine.stops import ProviderStops
+
+    values = _values()
+    stops = ProviderStops(values["journal"])
+    first = AgentRuntime(**values)
+    second = AgentRuntime(**values)
+    assert first.stops is stops
+    assert second.stops is stops

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import anyio
 import pytest
+from _fakes.engine import EngineEnv
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._engine import stops as stops_module
@@ -167,3 +168,178 @@ async def test_poll_rebuilds_registered_outcomes(
     assert str(caught.value) == (
         "run ownership lost" if kind != "storage" else "safe stored diagnostic"
     )
+
+
+async def test_provider_failed_stops_matching_agents_in_every_goal(env: EngineEnv) -> None:
+    from swarm_arena._engine.stops import ProviderStops
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+
+    stops = ProviderStops(env.deps.journal)
+    cancelled: list[str] = []
+    for address, providers in [
+        ("g/t/A", {"anthropic"}),
+        ("h/t/B", {"anthropic", "openai"}),
+        ("h/t/C", {"openai"}),
+    ]:
+        stops.register(address, frozenset(providers), lambda a=address: cancelled.append(a))
+    assert await stops.fail("anthropic", source="manager") == ["g/t/A", "h/t/B"]
+    assert cancelled == ["g/t/A", "h/t/B"]
+    assert stops.stopped() == {"g/t/A": frozenset({"anthropic"}), "h/t/B": frozenset({"anthropic"})}
+    event = env.events("provider_failed")[-1]
+    assert event.payload == {
+        "variant": "transition",
+        "transition": "failed",
+        "provider": "anthropic",
+        "generation": 1,
+        "source": "manager",
+        "stopped": ["g/t/A", "h/t/B"],
+    }
+    committed = read_committed(env.deps.store)
+    assert committed is not None
+    state = RunState.from_events(committed[1])
+    rebuilt = ProviderStops(env.deps.journal, state=state)
+    assert rebuilt.stopped() == stops.stopped()
+    assert rebuilt.generations() == {"anthropic": 1}
+
+
+async def test_failure_before_registration_and_newer_failure_during_probe(env: EngineEnv) -> None:
+    from swarm_arena._engine.stops import ProviderStops
+
+    stops = ProviderStops(env.deps.journal)
+    assert await stops.fail("anthropic", source="judge") == []
+    cancelled: list[str] = []
+    stops.register("g/t/A", frozenset({"anthropic"}), lambda: cancelled.append("A"))
+    assert cancelled == ["A"]
+    generation = stops.generations()["anthropic"]
+    await stops.fail("anthropic", source="tool")
+    assert await stops.recover("anthropic", generation=generation) == []
+    assert stops.stopped()["g/t/A"] == {"anthropic"}
+    assert await stops.recover("anthropic", generation=2) == ["g/t/A"]
+    assert stops.stopped()["g/t/A"] == frozenset()
+    stops.activate("g/t/A")
+    assert stops.stopped() == {}
+
+
+async def test_provider_recovery_keeps_other_causes_and_permanent_release(env: EngineEnv) -> None:
+    from swarm_arena._engine.stops import ProviderStops
+
+    stops = ProviderStops(env.deps.journal)
+    stops.register("g/t/A", frozenset({"anthropic", "openai"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    await stops.fail("openai", source="tool")
+    await stops.recover("anthropic", generation=1)
+    assert stops.stopped() == {"g/t/A": frozenset({"openai"})}
+    stops.release("g/t/A")
+    await stops.recover("openai", generation=1)
+    assert stops.stopped() == {}
+
+
+def test_provider_signal_snapshot_and_forgery() -> None:
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _rebuild_core_signal,
+        _SignalCategory,
+    )
+    from swarm_arena._outcomes import _classify_outcome
+
+    error = _core_error(ProviderFailed, "anthropic")
+    error.provider = "private-value"
+    error.args = ("private-value",)
+    rebuilt = _rebuild_core_signal(error)
+    assert isinstance(rebuilt, ProviderFailed)
+    assert rebuilt.provider == "anthropic"
+    assert _core_category(rebuilt) is _SignalCategory.PROVIDER
+    assert_secret_absent(rebuilt, "private-value")
+    forged = ProviderFailed("private-value")
+    forged.args = ("private-value",)
+    safe = _classify_outcome(forged)
+    assert _core_category(safe) is not _SignalCategory.PROVIDER
+    assert_secret_absent(safe, "private-value")
+    with pytest.raises(asyncio.CancelledError):
+        _classify_outcome(error, cancelled=True)
+
+
+def test_tool_failed_provider_or_all_tool_providers() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.stops import failed_providers
+    from swarm_arena._model.tooling import ToolOutput
+
+    tool = Mock()
+    tool.providers.return_value = frozenset({"openai", "gemini"})
+    assert failed_providers(
+        ToolOutput(status="provider_failed", failed_provider="gemini"), tool
+    ) == {"gemini"}
+    assert failed_providers(ToolOutput(status="provider_failed"), tool) == {"openai", "gemini"}
+
+
+async def test_provider_receipts_do_not_replay_as_latch_transitions(env: EngineEnv) -> None:
+    from swarm_arena._journal.event import EventDraft
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+
+    await env.deps.journal.append_durable(
+        EventDraft(
+            type="provider_failed",
+            payload={
+                "variant": "receipt",
+                "provider": "openai",
+                "generation": 1,
+                "source": "judge",
+                "completed": True,
+            },
+        )
+    )
+    committed = read_committed(env.deps.store)
+    assert committed is not None
+    state = RunState.from_events(committed[1])
+    assert state.provider_generations == state.provider_failed == state.provider_causes == {}
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+async def test_provider_reporter_child_scope_and_safe_variant(
+    env: EngineEnv, standalone: bool
+) -> None:
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.stops import ProviderStops, report_provider_failure
+    from swarm_arena._errors import ProviderFailed
+
+    deps = env.deps
+    service = ProviderStops(deps.journal, standalone=standalone)
+    if not standalone:
+        service.register("g/t/a", frozenset({"openai"}), lambda: None)
+    scope = LLMScope(
+        role="planner",
+        run_id=deps.run_id,
+        goal_id="g",
+        team="",
+        agent="",
+        round=0,
+        candidate_id=None,
+        tranche=Tranche(deps.ledger, "g/:judges", "g", size=Amount()),
+        journal=deps.journal,
+        artifacts=deps.artifacts,
+        models=deps.config.models,
+        tracing=deps.config.tracing,
+        cache=deps.config.cache,
+        limits=deps.config.limits,
+        settle_timeout_s=deps.config.settle_timeout_s,
+    )
+    child = scope.child().child()
+    error = _core_error(ProviderFailed, "openai")
+    error.provider = "private-value"
+    assert await report_provider_failure(child, error, source="planner") == (
+        [] if standalone else ["g/t/a"]
+    )
+    event = env.events("provider_failed")[-1]
+    assert event.payload["variant"] == ("standalone" if standalone else "transition")
+    assert event.payload["provider"] == "openai"
+    assert "private-value" not in str(event.payload)
+    assert service.generations() == {"openai": 1}
+    with pytest.raises(RuntimeError):
+        await report_provider_failure(child, ProviderFailed("openai"), source="planner")
+    assert service.generations() == {"openai": 1}

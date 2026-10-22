@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Run-wide provider pauses retain agent capacity, recover through uncached probes
+  before fresh-round shares, and replay provider generations and causes on resume.
+
 - CollaborativePlanner supports bounded human approval, accumulated feedback and
   catalog-admitted edits in one planning session, with a cancellable terminal
   reviewer and supervised editor cleanup.

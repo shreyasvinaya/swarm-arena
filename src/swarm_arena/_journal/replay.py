@@ -213,6 +213,9 @@ class RunState:
     llm_request_sha256: dict[str, str] = field(default_factory=dict)
     llm_calls: dict[str, LLMCall] = field(default_factory=dict)
     llm_cache_identity: dict[str, str] = field(default_factory=dict)
+    provider_generations: dict[str, int] = field(default_factory=dict)
+    provider_failed: dict[str, int] = field(default_factory=dict)
+    provider_causes: dict[str, dict[str, int]] = field(default_factory=dict)
     run_elapsed_s: float = 0.0
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
@@ -310,6 +313,14 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.PROVIDER_FAILED:
+                self._provider_event(payload)
+            case EventType.GOAL_FINISHED:
+                self.provider_causes = {
+                    a: cs
+                    for a, cs in self.provider_causes.items()
+                    if a.split("/", 1)[0] != event.goal_id
+                }
             case EventType.LLM_CALL:
                 call = LLMCall.model_validate(payload["call"])
                 if call.id in self.llm_calls or call.run_id != event.run_id:
@@ -419,6 +430,77 @@ class RunState:
                     self.stop = "stop"
             case EventType.TAKEOVER:
                 self.stop = "none"
+
+    def _provider_event(self, payload: dict[str, Any]) -> None:
+        """Fold explicit latch transitions; operation receipts have no latch effect."""
+        variant = payload.get("variant")
+        if variant == "receipt":
+            return
+        if variant not in {"transition", "standalone"}:
+            raise _core_error(ValueError, "invalid provider event variant")
+        transition = payload.get("transition")
+        if transition in {"failed", "recovered"}:
+            provider, generation = payload.get("provider"), payload.get("generation")
+            addresses = payload.get("stopped" if transition == "failed" else "recovered")
+            if (
+                type(provider) is not str
+                or type(generation) is not int
+                or generation < 1
+                or type(addresses) is not list
+                or any(type(a) is not str for a in addresses)
+                or (variant == "standalone" and addresses)
+            ):
+                raise _core_error(ValueError, "invalid provider transition")
+            if transition == "failed":
+                if generation != self.provider_generations.get(provider, 0) + 1:
+                    raise _core_error(ValueError, "invalid provider generation")
+                self.provider_generations[provider] = self.provider_failed[provider] = generation
+                for address in addresses:
+                    self.provider_causes.setdefault(address, {})[provider] = generation
+                    self._provider_status(address, AgentStatus.STOPPED)
+            elif self.provider_failed.get(provider) == generation:
+                self.provider_failed.pop(provider)
+                for address in addresses:
+                    causes = self.provider_causes.get(address, {})
+                    if causes.get(provider) == generation:
+                        causes.pop(provider)
+        elif transition == "observed":
+            address, causes = payload.get("address"), payload.get("causes")
+            if (
+                type(address) is not str
+                or type(causes) is not dict
+                or any(
+                    type(p) is not str or type(g) is not int or self.provider_failed.get(p) != g
+                    for p, g in causes.items()
+                )
+            ):
+                raise _core_error(ValueError, "invalid provider observation")
+            self.provider_causes.setdefault(address, {}).update(causes)
+            self._provider_status(address, AgentStatus.STOPPED)
+        elif transition in {"activated", "released"}:
+            address = payload.get("address")
+            if type(address) is not str:
+                raise _core_error(ValueError, "invalid provider address")
+            if transition == "activated":
+                if address not in self.provider_causes or self.provider_causes[address]:
+                    raise _core_error(ValueError, "invalid provider activation")
+                self._provider_status(address, AgentStatus.ACTIVE)
+            self.provider_causes.pop(address, None)
+        else:
+            raise _core_error(ValueError, "invalid provider transition")
+
+    def _provider_status(self, address: str, status: AgentStatus) -> None:
+        """Preserve permanent slot outcomes while restoring provider dispositions."""
+        goal_id, _, key = address.partition("/")
+        goal = self.goals.get(goal_id)
+        if goal is None or goal.agents.get(key) in {
+            AgentStatus.PRUNED,
+            AgentStatus.WATCHDOG_STOPPED,
+        }:
+            return
+        agents = dict(goal.agents)
+        agents[key] = status
+        self.goals[goal_id] = goal.model_copy(update={"agents": agents})
 
     def _goal_event(self, event: Event) -> None:
         """Fold goal progress while keeping converge rounds distinct from main rounds."""

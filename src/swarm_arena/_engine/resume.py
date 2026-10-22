@@ -20,7 +20,7 @@ from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.goal import _repair_round_pages
 from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
-from swarm_arena._engine.stops import RunClock, StopState
+from swarm_arena._engine.stops import ProviderStops, RunClock, StopState
 from swarm_arena._errors import (
     Fenced,
     PlanError,
@@ -352,6 +352,7 @@ class _ResumeServices:
                                         }
                                     ),
                                 )
+                                ProviderStops(journal, state=state)
                                 self.deps = EngineDeps(
                                     run_id=self.run_id,
                                     config=config,

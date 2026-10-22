@@ -1577,3 +1577,78 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
     assert owner[0].expires_at <= utc_now()
     assert setups == []
     assert yielded == []
+
+
+async def test_provider_paused_goal_keeps_queued_goal_out_until_completion(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config,
+        max_agents_total=1,
+        max_concurrent_goals=2,
+        max_usd=10.0,
+        max_tool_runs_per_round=1,
+        default_run_reservation=Estimate(usd=0.1),
+    )
+    code = """
+import json, os
+n = json.load(open('swarm/request.json'))['params']['n']
+json.dump({'data': {}, 'failed_provider': 'fake'} if n == 1 else {'data': {'y': float(n)}},
+          open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=2, tool=ProviderPyTool({"code": code}))
+    g.teams[0].agents[0] = (
+        g.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref.of(
+                    ScriptedManager([{"inputs": {"n": n}, "round": n} for n in (1, 2)])
+                )
+            }
+        )
+    )
+    h = plan(goal_id="h", rounds=1)
+    entered, release = anyio.Event(), anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        assert (provider, scope.goal_id, scope.round) == ("fake", "g", 2)
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+
+    async def run() -> None:
+        try:
+            await Swarm(cfg).run([g, h], run_id="provider-capacity")
+        finally:
+            entered.set()
+
+    with anyio.fail_after(25):
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            try:
+                await entered.wait()
+                assert not any(e.goal_id == "h" for e in events(cfg, "goal_started")), [
+                    (e.type, e.payload)
+                    for e in all_events(cfg)
+                    if e.type in {"agent_status", "provider_failed", "tool_end", "decision"}
+                ]
+                assert events(cfg, "provider_failed")[0].payload["source"] == "tool"
+            finally:
+                release.set()
+    ev = all_events(cfg)
+    assert next(e.seq for e in ev if e.type == "goal_finished" and e.goal_id == "g") < next(
+        e.seq for e in ev if e.type == "goal_started" and e.goal_id == "h"
+    )
+    ends = [e for e in ev if e.type == "tool_end" and e.goal_id == "g"]
+    assert [(e.round, e.payload["candidate"]["output"]["status"]) for e in ends] == [
+        (1, "provider_failed"),
+        (2, "ok"),
+    ]

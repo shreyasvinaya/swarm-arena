@@ -2156,3 +2156,30 @@ async def test_r0_payload_links_the_planning_session(env: EngineEnv) -> None:
     await GoalRunner(env.deps, goal_id="g", plan=initial, replanner=None).run()
     r0 = env.events("plan_revision")[0].payload
     assert (r0["planning_session"], r0["planner_call_ids"]) == ("r-p", ["llm-1"])
+
+
+async def test_provider_paused_capacity_is_reserved_before_and_after_slot_rebuild(
+    env: EngineEnv,
+) -> None:
+    from swarm_arena._engine.round import AgentStatus
+    from swarm_arena._journal.replay import GoalState
+
+    plan = _plan(teams=1, rounds=2)
+    spec = plan.teams[0].agents[0]
+    key = f"{plan.teams[0].name}/{spec.name}"
+    address = f"g/{key}"
+    stops = env.deps.provider_stops
+    stops.register(address, frozenset({"anthropic"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        replanner=None,
+        state=GoalState(agents={key: AgentStatus.STOPPED}),
+    )
+    assert runner.active_agents() == 1
+    runner.agents = await runner._slots(plan.teams, reuse=True)
+    assert runner.active_agents() == 1
+    runner.agents[0].status = AgentStatus.PRUNED
+    assert runner.active_agents() == 0
