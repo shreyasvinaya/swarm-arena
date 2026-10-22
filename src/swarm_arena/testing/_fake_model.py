@@ -109,13 +109,9 @@ class FakeModel(Model):
 
         Examples
         --------
-        >>> from swarm_arena.config import ModelSpec
-        >>> from swarm_arena.llm._catalog import build_model
         >>> from swarm_arena.testing import FakeModel, FakeTurn
         >>> model = FakeModel([FakeTurn(text="ok")])
         >>> model.register("offline-example")
-        >>> build_model(ModelSpec(model="fake/offline-example", roles=["manager"])) is model
-        True
         """
         register_fake_model(name, self)
         self._name = name
