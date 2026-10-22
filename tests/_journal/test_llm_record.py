@@ -861,6 +861,36 @@ async def test_expired_teardown_deadline_is_cleanup_error(
     assert all(run_id not in _bindings for run_id in run_ids)
 
 
+async def test_teardown_deadline_preserves_captured_fencing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import _core_error
+    from swarm_arena._journal import llm_record
+
+    entered = anyio.Event()
+
+    async def held_close(self: Tranche) -> Any:
+        entered.set()
+        await anyio.sleep_forever()
+
+    async def fenced_drain(*args: Any, **kwargs: Any) -> list[str]:
+        raise _core_error(Fenced, "run ownership lost")
+
+    async def owner() -> None:
+        async with open_llm_run(tmp_path) as run:
+            scope, meta = await _open(run)
+            await record_call(**record_kwargs(meta))
+            await drain(scope, wait=False)
+            llm_record._bindings[run.run_id].cleanup_at = anyio.current_time() + 0.15
+            monkeypatch.setattr(llm_record, "drain", fenced_drain)
+            monkeypatch.setattr(Tranche, "close", held_close)
+
+    with pytest.raises(Fenced, match="run ownership lost"):
+        await owner()
+    assert entered.is_set()
+
+
 async def test_cancel_during_durable_settlement_retains_admitted_actual(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

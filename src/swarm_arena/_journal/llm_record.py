@@ -1173,7 +1173,11 @@ async def _bound_run(
         finally:
             # A terminal check can escape before the with-body completes,
             # after an inner handler captured this deadline's cancellation.
-            if cleanup is not None and cleanup.cancel_called:
+            if (
+                cleanup is not None
+                and cleanup.cancel_called
+                and (failure is None or not _has_core_fenced(failure))
+            ):
                 failure = _stop_cleanup_error()
             if _bindings.get(run_id) is binding:
                 unbind_run(run_id, journal=journal)
