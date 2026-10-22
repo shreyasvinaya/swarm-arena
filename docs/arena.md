@@ -490,7 +490,7 @@ commands continue to take a local `RUN_DIR`.
 | `learnings pin ID --namespace NS [--author NAME]` | Create one immutable curation object. Unknown namespace-local IDs fail without a write. |
 | `learnings hide ID --namespace NS [--author NAME]` | Create one immutable hide object. Hidden targets remain available to explicit curation actions. |
 | `learnings add --namespace NS --title TITLE --text TEXT [--goal ID] [--tag TAG] [--evidence ID ...] [--author NAME]` | Create one human learning, print its `L-h-` ID, and verify evidence against the refreshed frontier in that namespace. Author defaults to the login name. |
-| `trace CANDIDATE (--namespace NS \| --run ID)` | Print committed plan provenance, run details, checks, scores and learning citations. |
+| `trace CANDIDATE (--namespace NS \| --run ID)` | Print committed plan and LLM provenance, run details, checks, scores and learning citations. |
 | `reindex [--namespace NS ...]` | Rebuild selected disposable caches, print `NS: N runs`, and report cache warnings on stderr. Without namespaces, rebuild existing local caches. |
 
 Leaderboard headers show `namespace/goal[/part]`, judge, and eight-character
@@ -538,6 +538,30 @@ uv run swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN
 uv run swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
 ```
 
+Trace includes the executing revision's planner calls, the manager call recorded
+in `requested_by_call`, the tool run and its internal calls, checks, recorded
+judge calls and scores, then citing learnings and their posting calls. Each call
+appears once and shows its recorded role, model, total tokens and six-decimal USD
+cost. A response-cache hit shows `cache-hit-of=ID` only when an origin was recorded;
+an optional trace URL is printed as text. A recorded call link without a matching
+call record prints `llm ID: not found`. For example:
+
+```text
+llm planner-call planner local/model tokens=120 cost=$0.000140
+llm judge-hit judge local/model tokens=120 cost=$0.000000 cache-hit-of=judge-original
+```
+
+An initial or queued goal's `planning_session` is read from the producing run's
+recorded root, even when the viewer uses another `run_root`. Completed and
+interrupted planning journals are readable provenance; trace never resumes them
+or acquires their lease. The session's committed head is captured at publication,
+with its recorded completion reason when present. An absent or unreadable session
+prints `planning session ID: not found`; an unreadable session leaves other runs
+available. A session capture is reused while its producing run's committed mark
+is unchanged, and is checked again when that mark advances. Later autonomous
+revisions use their own `planner_call_ids` and have no standalone-session link. Recorded plan `base_dir`
+is preserved; viewing a plan does not resolve files or import producer plugins.
+
 ## Board viewer
 
 From the example setup above, serve its namespace locally:
@@ -566,6 +590,31 @@ example, `/?q=viscosity&verified=1&page=2` shows the second page of verified
 matches. Each request uses one published frontier; incoming requests refresh
 it in a background worker at most once every five seconds. Once a generation
 exists, GET requests keep reading it during storage refresh or mutation I/O.
+
+`/run/<run-id>/llm` shows one row per recorded `team/agent`, or `:<role>` for
+calls without an agent. It reports call count, ordinary input tokens, provider
+prompt-cache read/write tokens, prompt-cache hit rate with one decimal percent,
+and response-cache hit count. The rate is
+`cache_read_tokens / (input_tokens + cache_read_tokens + cache_write_tokens)`,
+or `0.0%` when the denominator is zero. Ordinary input tokens exclude cache
+tokens; output tokens do not enter this rate. Failed calls, probes and planning
+calls within the displayed run count even when no candidate links to them.
+Response-cache hits count in calls and response hits, but add no input, cache-read
+or cache-write tokens: the rate measures provider prompt caching, excluding
+replayed cached-response usage. Standalone-session planner calls appear in
+`trace` only; they are not added to the producing run's statistics, and a session
+without an arena pointer has no statistics page. The viewer's selected namespaces
+also restrict which source runs may have a statistics page.
+Calls repeated in several namespace caches count once per source root, run and
+call ID. Candidate pages link to this statistics page.
+
+Trace and statistics use the request's retained published generation, including
+while another thread refreshes the board or closes it. Committed call and plan
+projections are prepared before publication from the existing event cache;
+SQLite schema version 4 is unchanged. Cold reads, warm reads and `reindex` produce
+the same projections. The CLI and viewer need no LLM extra to read these records.
+Existing immutable round pages are never rewritten for late calls or a newer
+frontier.
 
 A learning page shows its text, author, markers, and linked evidence with
 formatted scores or an unknown-candidate error. Candidate pages show a summary,

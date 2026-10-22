@@ -214,8 +214,11 @@ Final judging uses the protected final slice. After an immediate stop or run
 deadline it is bounded by `settle_timeout_s`; if interrupted, only available
 committed ranking evidence can supply a fallback order and judge errors are
 recorded. If final judging fails and supplies no final order, the goal records
-`NO_RESULT` with reason `provider_failed`; judge-error events retain type-only
-diagnostics. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
+`NO_RESULT` with reason `provider_failed`: this reason means the final judges
+produced no order. Ordinary judge errors retain type-only diagnostics and do not
+claim a provider outage. Only a validated provider signal creates a provider
+transition or failed-provider receipt. A refused final reservation instead uses
+reason `reserve_exhausted`. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
 
 ## No result and solution records
 
@@ -318,3 +321,41 @@ otherwise they use `RunConfig.arena_root`.
 
 Human judge leaderboards compare all fidelities together and order verdict/score
 keys directly, without applying a program judge's `min_improvement` margin.
+
+
+## Provider failures during judging
+
+A validated provider failure produces no score or `judge_error` for the affected
+judge batch. Healthy judges still run, independently for each main-goal or part
+group. If a group's ranking judge fails, its candidates stay unjudged and the
+round skips policy pruning and curation. The engine records that skipped phase,
+closes the round, and publishes its page without inventing a policy decision.
+
+An `LLMJudge` panel drops a failed member across the entire logical call, even
+when the failure occurs in only one batch. Repeated aliases remain separate
+votes and paid members. Survivor scores carry the hash of the sorted remaining
+aliases, including when just one member survives; this is a new judge identity.
+Nested `Lexicographic` judges retain those identities. All-member provider failure
+propagates after accounting; a budget refusal is never a dropped panel member.
+
+For example, a configured panel `["a", "b", "c"]` that loses `"b"` produces
+scores under the identity of `["a", "c"]`, not its configured full-panel hash.
+The failed provider also pauses matching agents in other goals through the shared
+provider service.
+
+Completed failed batches have durable receipts despite producing no scores or
+judge errors. Resume reads those identities before preparing or funding another
+batch. A failed final batch retains its original input membership, lifecycle,
+revision and judge reference; resume completes `NO_RESULT(provider_failed)`
+without selecting again from final scores or repeating the call. A completed
+ranking-policy skip also prevents repeated manager or policy work.
+
+Before initial converge selection, the engine retries each paused ranking batch
+once through normal judge admission and the shared provider service. The judging
+reserve funds this retry under a graceful stop or a run-budget stop; an immediate
+stop or deadline skips it. Durable retry receipts and scores prevent repeat calls
+on resume. Only a validated provider failure in this retry can make an empty
+selection report `provider_failed`; otherwise it reports `no passing candidate`.
+Explicit no-result outcomes from final judging retain their own reasons.
+Batches paused in join-retry rounds are not retried and never determine the
+`provider_failed` selection reason.

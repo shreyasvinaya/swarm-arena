@@ -23,6 +23,7 @@ from swarm_arena.llm._actions import _own_actions, build_tools
 from swarm_arena.llm._cache import cache_namespace
 from swarm_arena.llm._catalog import build_model
 from swarm_arena.llm._hooks import BudgetExceeded, BudgetHooks, MeteredModel, _prepare, _sdk_control
+from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._linking import CallLinks, ManagerDeps
 from swarm_arena.llm._prompts import manager_instructions, reference_files, round_input
 
@@ -184,6 +185,11 @@ class AgentsSDKManager(Manager):
         scope = current_llm_scope()
         if scope is None or scope.role != "manager":
             raise _core_error(RuntimeError, "manager requires an active manager LLM scope")
+        with component_span(scope):
+            return await self._run_round(ctx, scope)
+
+    async def _run_round(self, ctx: AgentContext, scope: LLMScope) -> RoundReport:
+        """Keep tracing open through all owned actions and accounting."""
         outcome = _Outcome()
         failure: BaseException | None = None
         interrupted = False
@@ -237,7 +243,9 @@ class AgentsSDKManager(Manager):
                                     max_turns=scope.limits.max_turns_per_round,
                                     hooks=BudgetHooks(),
                                     run_config=SDKRunConfig(
-                                        tracing_disabled=not scope.tracing.langfuse
+                                        tracing_disabled=not scope.tracing.langfuse,
+                                        workflow_name="swarm-arena manager",
+                                        group_id=scope.run_id,
                                     ),
                                 )
                         except BaseException as error:

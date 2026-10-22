@@ -266,3 +266,21 @@ def test_run_store_construction_does_not_create_directories(
     store = run_store(str(root), "r1")
     assert store.url == str(root / "r1")
     assert not root.exists()
+
+
+def test_call_projection_keeps_committed_prefix(tmp_path: Path) -> None:
+    from _fakes.trace_calls import _call, _record
+
+    run = FakeRun(str(tmp_path / "runs"), "r")
+    first = run.commit(run.plan(), _record(_call(run, "first")))
+    cache = ArenaCache(tmp_path / "toy.sqlite")
+    try:
+        ingest_run(cache, run.store, "r", run.run_root, first)
+        before = cache._committed_state(mark(run, first))
+        second = run.commit(_record(_call(run, "second")))
+        ingest_run(cache, run.store, "r", run.run_root, second)
+        assert list(cache._committed_state(mark(run, first)).llm_calls) == ["first"]
+        assert list(cache._committed_state(mark(run, second)).llm_calls) == ["first", "second"]
+        assert list(before.llm_calls) == ["first"]
+    finally:
+        cache.close()

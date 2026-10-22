@@ -865,3 +865,365 @@ async def test_empty_draft_member_is_excluded(monkeypatch: pytest.MonkeyPatch) -
     assert scores[0].value == 6
     assert len(scores[0].llm_call_ids) == 2
     assert formatter.calls == []
+
+
+@pytest.mark.parametrize(
+    "aliases", [("a", "b", "c"), ("b",), ("b", "b"), ("a", "b", "b"), ("a", "b", "a")]
+)
+async def test_provider_panel_drop_reports_after_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...]
+) -> None:
+    import litellm
+
+    from swarm_arena._engine.stops import provider_stops
+    from swarm_arena._model.canonical import canonical_json, sha256_hex
+    from swarm_arena._model.ref import Ref
+    from swarm_arena._scoring.runner import judge_round
+
+    for alias in set(aliases):
+        fake = FakeModel([turn(2), turn(2)])
+        if alias == "b":
+
+            async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE", llm_provider="untrusted", model="wrong"
+                )
+
+            monkeypatch.setattr(fake, "get_response", fail)
+        fake.register(alias)
+    judge = LLMJudge("r", aliases)
+    ctx = JudgeContext(
+        goal=Goal(id="g", namespace="n"), executor=Mock(), artifact_root=str(tmp_path)
+    )
+    async with open_llm_run(tmp_path, config=configuration(tuple(set(aliases)))) as run:
+        scope = run.scope("judge")
+        service = provider_stops(scope.journal)
+        cancelled: list[str] = []
+        for address in ("g/a/one", "other/b/two"):
+            service.register(address, frozenset({"fake"}), lambda a=address: cancelled.append(a))
+        service.register(
+            "healthy/c/three", frozenset({"healthy"}), lambda: cancelled.append("healthy")
+        )
+        with llm_scope(scope):
+            outcome = await judge_round(
+                "g", [(Ref.of(judge), judge)], candidates(2), [], lambda _: ctx
+            )
+        assert scope.tranche.pending() == 0
+        assert provider_stops(scope.journal).generations() == {"fake": 1}
+        assert set(cancelled) == {"g/a/one", "other/b/two"}
+        service.register("late/d/four", frozenset({"fake"}), lambda: cancelled.append("late"))
+        assert cancelled[-1] == "late"
+        assert run.charged(scope).usd == pytest.approx(sum(c.cost_usd for c in run.calls()))
+        assert not [
+            e for e in run.events("provider_failed") if e.payload.get("disposition") == "panel_drop"
+        ]
+        if set(aliases) == {"b"}:
+            assert outcome.panel_drops == []
+            assert outcome.provider_failed
+            assert not outcome.errors
+            assert not outcome.scores
+        else:
+            remaining = sorted(a for a in aliases if a != "b")
+            assert {s.panel_hash for s in outcome.scores} == {
+                sha256_hex(canonical_json(list(remaining)))
+            }
+            assert not outcome.errors
+
+            assert [drop.dropped_member for drop in outcome.panel_drops] == ["b"] * aliases.count(
+                "b"
+            )
+            assert {drop.panel_hash for drop in outcome.panel_drops} == {
+                sha256_hex(canonical_json(list(remaining)))
+            }
+            assert {drop.provider for drop in outcome.panel_drops} == {"fake"}
+
+
+async def test_recursive_provider_survivors_across_batches_near_scale_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._errors import ProviderFailed, _core_error
+    from swarm_arena._model.canonical import canonical_json, sha256_hex
+    from swarm_arena.scoring import Lexicographic
+    from swarm_arena.testing import check_judge
+
+    for alias in ("a", "b", "c"):
+        fake = FakeModel([])
+
+        async def respond(*args: Any, _alias: str = alias, **kwargs: Any) -> ModelResponse:
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            ids = [row["candidate"]["id"] for row in rows]
+            if (_alias == "a" and "c0" in ids) or (_alias == "b" and "c8" in ids):
+                raise _core_error(ProviderFailed, "fake")
+            return await FakeModel([turn(len(rows), 1e308)]).get_response(*args, **kwargs)
+
+        monkeypatch.setattr(fake, "get_response", respond)
+        fake.register(alias)
+    panel = LLMJudge(
+        LLMJudge.Config(
+            rubric="r", models=["a", "b", "c", "c"], aggregate="median", scale_max=1e308, anchors=0
+        )
+    )
+    scores = await check_judge(
+        Lexicographic([Lexicographic([panel])]),
+        Goal(id="g", namespace="n"),
+        candidates(10),
+        config=configuration(("a", "b", "c")),
+    )
+    identity = sha256_hex(canonical_json(["c", "c"]))
+    for _ in range(2):
+        identity = sha256_hex(canonical_json([identity]))
+    assert len(scores) == 10
+    assert {s.panel_hash for s in scores} == {identity}
+    assert all(s.key == (1e308,) and s.llm_call_ids for s in scores)
+
+
+async def partial_panel_crash_driver(root: str) -> None:
+    """Leave a completed partial panel batch in a public-run journal."""
+    import os
+
+    from _engine.test_goal import Y_JUDGE, _plan
+    from _fakes.engine import with_executor
+
+    from swarm_arena import Limits, Ref, Swarm
+    from swarm_arena._errors import ProviderFailed, _core_error
+    from swarm_arena._exec.threads import run_sync_daemon
+    from swarm_arena._journal.writer import JournalWriter
+
+    path = Path(root)
+    config = with_executor(
+        configuration(("a", "b", "c")).model_copy(
+            update={
+                "run_root": str(path / "runs"),
+                "arena_root": str(path / "arena"),
+                "artifact_root": str(path / "artifacts"),
+                "limits": Limits(max_tokens=10_000_000, max_usd=1000, max_agents_per_fingerprint=8),
+            }
+        ),
+        workspace_root=str(path / "ws"),
+    )
+    counts: dict[str, int] = {}
+
+    async def respond(*args: Any, alias: str, **kwargs: Any) -> ModelResponse:
+        counts[alias] = counts.get(alias, 0) + 1
+        count = counts[alias]
+
+        def record() -> None:
+            with (path / "calls").open("a") as output:
+                output.write(f"{alias}:{count}\n")
+
+        await run_sync_daemon(record)
+        rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+        if (alias == "a" and count == 1) or (alias == "b" and count == 2):
+            raise _core_error(ProviderFailed, "fake")
+        return await FakeModel([turn(len(rows))]).get_response(*args, **kwargs)
+
+    from functools import partial
+
+    with pytest.MonkeyPatch.context() as patch:
+        for alias in ("a", "b", "c"):
+            fake = FakeModel([])
+            patch.setattr(fake, "get_response", partial(respond, alias=alias))
+            fake.register(alias)
+        original = JournalWriter._publish
+
+        async def publish(self: JournalWriter) -> None:
+            hit = any(
+                e.type == "provider_failed" and e.payload.get("disposition") == "panel_drop"
+                for e in self._queue
+            )
+            await original(self)
+            if hit:
+                os._exit(91)
+
+        patch.setattr(JournalWriter, "_publish", publish)
+        panel = Ref.of(
+            LLMJudge(
+                LLMJudge.Config(rubric="r", models=["a", "b", "c", "c"], batch_size=2, anchors=0)
+            )
+        ).model_copy(update={"name": "panel"})
+        await Swarm(config).run(
+            _plan(rounds=1, teams=2, agents_per_team=3, judges=[Y_JUDGE, panel]), run_id="panel"
+        )
+
+
+async def test_partial_panel_public_resume_makes_no_new_calls(tmp_path: Path) -> None:
+    import os
+
+    import anyio
+    from _fakes.run import all_events
+
+    from swarm_arena import Swarm
+    from swarm_arena._model.canonical import canonical_json, sha256_hex
+
+    repo = Path(__file__).parents[2]
+    environment = dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join([str(repo / "tests"), str(repo / "src"), str(repo)]),
+        XDG_CACHE_HOME=str(tmp_path / "cache"),
+    )
+    script = (
+        "import anyio,sys; from tests.llm.test_judge import partial_panel_crash_driver; "
+        "anyio.run(partial_panel_crash_driver,sys.argv[1])"
+    )
+    with anyio.fail_after(60):
+        process = await anyio.run_process(
+            ["uv", "run", "--project", str(repo), "python", "-c", script, str(tmp_path)],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    config = RunConfig.load(tmp_path / "runs" / "panel" / "run.toml")
+    calls = (tmp_path / "calls").read_text()
+    recorded = all_events(config)
+    scores = [
+        e.payload["score"]
+        for e in recorded
+        if e.type == "score" and e.payload["score"]["judge"] == "panel"
+    ]
+    drops = [e for e in recorded if e.payload.get("disposition") == "panel_drop"]
+    assert [e.payload["dropped_member"] for e in drops] == ["a", "b"]
+    assert {e.payload["panel_hash"] for e in drops} == {sha256_hex(canonical_json(["c", "c"]))}
+    assert all("complete" not in e.payload for e in drops)
+    assert len(scores) == 6
+    assert {s["panel_hash"] for s in scores} == {sha256_hex(canonical_json(["c", "c"]))}
+    spies = [FakeModel([]) for _ in range(3)]
+    for fake, alias in zip(spies, ("a", "b", "c"), strict=True):
+        fake.register(alias)
+    with anyio.fail_after(60):
+        result = await Swarm(config).resume("panel", force=True)
+        again = await Swarm(config).resume("panel", force=True)
+    assert result["g"] == again["g"]
+    assert (tmp_path / "calls").read_text() == calls
+    assert all(not fake.calls for fake in spies)
+
+
+async def test_llm_ranking_final_runs_with_zero_tool_reservation(tmp_path: Path) -> None:
+    from _engine.test_goal import _plan
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Ref, Swarm
+    from swarm_arena.tool import Estimate
+
+    fake = FakeModel([turn(2), turn(2)])
+    fake.register("a")
+    config = with_executor(
+        configuration().model_copy(
+            update={
+                "run_root": str(tmp_path / "runs"),
+                "arena_root": str(tmp_path / "arena"),
+                "artifact_root": str(tmp_path / "artifacts"),
+                "limits": Limits(
+                    max_tokens=2_000_000, max_usd=100, default_run_reservation=Estimate()
+                ),
+            }
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    judge = Ref.of(LLMJudge("r", ["a"])).model_copy(update={"name": "y"})
+    result = await Swarm(config).run(_plan(rounds=1, judges=[judge]), run_id="zero")
+    assert result["g"]
+    final_scores = [
+        e.payload["score"] for e in all_events(config) if e.type == "score" and e.round == 0
+    ]
+    assert len(final_scores) == 2
+    assert all(s["llm_call_ids"] for s in final_scores)
+    solution = json.loads(
+        (tmp_path / "runs" / "zero" / "goals" / "g" / "solution.json").read_text()
+    )
+    assert solution["status"] == "ok"
+
+
+@pytest.mark.parametrize("aliases", [("b",), ("a", "b")])
+async def test_panel_accounting_failure_prevents_provider_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliases: tuple[str, ...]
+) -> None:
+    from swarm_arena._engine.stops import provider_stops
+    from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
+    from swarm_arena.llm import _judge
+
+    async def fail_provider(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise _core_error(ProviderFailed, "fake")
+
+    async def fail_accounting(*args: Any, **kwargs: Any) -> None:
+        raise _core_error(StorageError, "LLM settlement failed: OSError")
+
+    for alias in aliases:
+        fake = FakeModel([turn(1)])
+        if alias == "b":
+            monkeypatch.setattr(fake, "get_response", fail_provider)
+        fake.register(alias)
+    monkeypatch.setattr(_judge, "_finish_accounting", fail_accounting)
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=configuration(aliases)) as run:
+        scope = run.scope("judge")
+        ctx = JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path))
+        with (
+            llm_scope(scope),
+            pytest.raises(StorageError, match="LLM settlement failed: OSError") as caught,
+        ):
+            await LLMJudge("r", aliases).judge(goal, candidates(1), ctx)
+        assert _is_core_signal(caught.value)
+        await scope.journal.commit()
+        assert provider_stops(scope.journal).generations() == {}
+        assert not run.events("provider_failed")
+
+
+async def test_provider_failure_is_reported_before_sibling_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+    import litellm
+
+    from swarm_arena import Limits
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.stops import provider_stops
+    from swarm_arena.llm import BudgetExceeded
+
+    failed = anyio.Event()
+    reserve = Tranche.reserve_call
+
+    async def ordered_reserve(self: Tranche, estimate: Amount) -> str:
+        if estimate.tokens > 1_000_000:
+            await failed.wait()
+        return await reserve(self, estimate)
+
+    monkeypatch.setattr(Tranche, "reserve_call", ordered_reserve)
+
+    class Down(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            failed.set()
+            raise litellm.ServiceUnavailableError(
+                message="PRIVATE", llm_provider="fake", model="fake/down"
+            )
+
+    Down([]).register("down")
+    huge = FakeModel([])
+    huge.register("huge")
+    config = configuration(("down", "huge"))
+    config.models.root["huge"] = config.models.root["huge"].model_copy(
+        update={"max_tokens": 5_000_000}
+    )
+    config = config.model_copy(update={"limits": Limits(max_tokens=1_000_000)})
+    goal = Goal(id="g", namespace="n")
+    async with open_llm_run(tmp_path, config=config) as run:
+        scope = run.scope("judge")
+        cancelled: list[bool] = []
+        provider_stops(scope.journal).register(
+            "other/t/a", frozenset({"fake"}), lambda: cancelled.append(True)
+        )
+        with llm_scope(scope), pytest.raises(BudgetExceeded):
+            await LLMJudge("r", ["down", "huge"]).judge(
+                goal,
+                candidates(1),
+                JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
+            )
+        assert provider_stops(scope.journal).generations() == {"fake": 1}
+        assert cancelled == [True]
+        assert huge.calls == []
+        assert scope.tranche.pending() == 0
+        assert not [
+            e for e in run.events("provider_failed") if e.payload.get("variant") == "receipt"
+        ]

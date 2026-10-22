@@ -1,6 +1,10 @@
 import asyncio
+import gc
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
+from weakref import ref
 
 import anyio
 import pytest
@@ -380,3 +384,34 @@ def test_agent_providers_resolves_manager_catalog_and_tool_union() -> None:
         }
     )
     assert agent_providers(manager, tool, catalog) == {"anthropic", "openai", "gemini"}
+
+
+@pytest.mark.parametrize("hashable", [False, True])
+def test_provider_services_use_writer_identity(hashable: bool) -> None:
+    @dataclass(unsafe_hash=hashable)
+    class Writer:
+        value: int = 1
+
+    first: Any = Writer()
+    second: Any = Writer()
+    assert first == second
+    service = stops_module.provider_stops(first)
+    assert stops_module.provider_stops(first) is service
+    assert stops_module.provider_stops(second) is not service
+
+
+def test_provider_service_registry_does_not_retain_writer() -> None:
+    @dataclass
+    class Writer:
+        value: int = 1
+
+    writer: Any = Writer()
+    identity = id(writer)
+    weak_writer = ref(writer)
+    service = stops_module.provider_stops(writer)
+    del writer
+    gc.collect()
+    assert weak_writer() is None
+    assert identity not in stops_module._services
+    with pytest.raises(RuntimeError, match="provider owner is closed"):
+        service._writer()

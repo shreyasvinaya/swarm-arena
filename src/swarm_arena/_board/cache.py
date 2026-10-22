@@ -1305,6 +1305,31 @@ class ArenaCache:
                 raise _core_error(ChainError, "head is not on the cached chain")
             return False
 
+    def _committed_state(self, mark: Frontier.Mark) -> RunState:
+        """Detach publication material from an exactly covered ingest checkpoint.
+
+        No SQL schema extension is needed: committed event envelopes already
+        retain calls and private revision provenance. Historical marks replay
+        only during publication; composite readers never invoke this seam.
+        """
+        with self._lock:
+            if not self._covered(
+                mark.run_id, Head(epoch=mark.epoch, seq=mark.seq, segment=mark.segment)
+            ):
+                raise _core_error(ChainError, "published run is not covered")
+            checkpoint = self._ingest_states.get(mark.run_id)
+            if checkpoint is not None and checkpoint[1] > mark.seq:
+                state = self._replay(mark.run_id, through_seq=mark.seq)
+            else:
+                state = self._ingest_state(mark.run_id, mark.seq)
+                self._ingest_states[mark.run_id] = (mark.segment, mark.seq, state)
+            return RunState(
+                plans=deepcopy(state.plans),
+                goals=deepcopy(state.goals),
+                plan_first_rounds=deepcopy(state.plan_first_rounds),
+                llm_calls=deepcopy(state.llm_calls),
+            )
+
     def _replay(self, run_id: str, *, through_seq: int | None = None) -> RunState:
         """Reconstruct an independent core state from a cached committed prefix."""
         with self._lock:

@@ -221,11 +221,12 @@ See the [exact pruning rules](scoring-and-review.md#pruning-policies) and
 ## Board
 
 `Board` is the indexing interface for candidates, scores, learnings, decisions,
-and lineage; `BoardView` is a fixed-frontier read view. The engine's in-memory
-run board indexes this run's committed journal and is reconstructed on resume.
-The journal is the durable authority. There is no cross-run arena in this
-release; that is M2. Managers access permitted views through `AgentContext`,
-with read caps and a UTF-8-byte-bounded digest. See the [board API](api/board.md).
+and lineage; `BoardView` is a fixed-frontier read view. The engine defaults to
+`ArenaBoard`, which combines this run's committed journal with permitted
+cross-run arena data. The journal remains the durable authority, and run state
+is reconstructed on resume. Managers access permitted views through
+`AgentContext`, with read caps and a UTF-8-byte-bounded digest. See the
+[arena guide](arena.md) and [board API](api/board.md).
 
 ## Swarm
 
@@ -388,3 +389,57 @@ effective cache key and the generating response, including replacements at the
 same key. When that evidence is unavailable or ambiguous, the origin stays unset.
 The recorder persists the opaque identity for replay even when payload storage
 is disabled.
+
+## Provider recovery preparation
+
+When a provider latch is outstanding, fresh-round preparation resolves slots
+concurrently before probing and selecting active agents. Healthy peers wait for
+the slowest slot to resolve or reach the effective round deadline. After this
+bounded preparation, the round has its own execution deadline, so a stuck slot
+can make preparation plus execution take about twice the effective round timeout.
+See [provider failures](limits-and-safety.md#provider-failures).
+
+
+## LLM call log and Langfuse
+
+The local journal always records every admitted LLM call and its accounting,
+including estimated charges when a provider report does not arrive. Calls link
+to their run, goal, component, reservation and model alias. Request/response
+payloads are stored as artifacts by default; `tracing.store_payloads = false`
+disables payload storage without disabling the call log. Langfuse is an optional
+view of these calls, not the source of truth for budgets or recovery.
+
+To enable export, install the `llm` and `langfuse` extras and set:
+
+```toml
+[tracing]
+langfuse = true
+```
+
+Configure the destination using Langfuse's own `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` (or `LANGFUSE_HOST`) environment
+variables. Keep credential values out of the plan and run configuration.
+With `langfuse = false` (the default), swarm-arena sends no tracing data to a
+vendor. Credentials alone do not enable export. This remains true after an
+enabled run and when enabled and disabled scopes run concurrently in one
+process. The Agents SDK's default OpenAI trace exporter is not installed by
+swarm-arena; enabled export uses an exclusive OpenInference processor.
+
+Each enabled run becomes a Langfuse session. Manager, judge, planner and curator
+calls carry the goal, team, agent, round and role; a call's `trace_url` links to
+the current trace when available. Both stages of a structured fallback call
+are traced and journaled. A missing trace URL does not remove the local record.
+The first enabled setup resolves the project identifier on a daemon using one
+request with a five-second timeout and no retries. Until resolution succeeds,
+and for the rest of the process after failure, trace URLs are absent. Looking up
+a call's trace URL performs no network I/O; pending or failed resolution never
+holds up a model call. Ordinary trace-context exit failures log only their type
+and preserve the completed result. Control signals still propagate.
+
+The client and instrumentation are shared for the process. Components finish
+all owned actions and accounting before leaving their tracing context, without
+flushing on each run. At normal process exit, a daemon flushes and shuts down
+the client and exporter, with a maximum five-second wait. A failed or timed-out
+close logs only an exception type and never writes the journal. Buffered spans
+can be lost on a hard kill or when that wait expires; durable call accounting
+is independent of export.

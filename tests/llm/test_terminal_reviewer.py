@@ -33,20 +33,27 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
 ) -> None:
     marker = tmp_path / "editor-pid"
     result = tmp_path / "result.json"
+    terminated = tmp_path / "editor-terminated"
+    second_sent = tmp_path / "second-sent"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal, time\n"
-        "def slow_exit(*args):\n    time.sleep(0.8); os._exit(0)\n"
+        f"second_sent = pathlib.Path({str(second_sent)!r})\n"
+        "def slow_exit(*args):\n"
+        "    deadline = time.monotonic() + 15\n"
+        "    while not second_sent.exists():\n"
+        "        if time.monotonic() >= deadline: os._exit(1)\n"
+        "        time.sleep(0.01)\n"
+        "    os._exit(0)\n"
         + (
             "signal.signal(signal.SIGINT, slow_exit)\n"
             if editor_kind == "slow_interrupt"
             else "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         )
-        + (
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            if editor_kind == "stubborn"
-            else "signal.signal(signal.SIGTERM, slow_exit)\n"
-        )
+        + "def terminate(*args):\n"
+        + f"    pathlib.Path({str(terminated)!r}).write_text('TERM')\n"
+        + ("    return\n" if editor_kind == "stubborn" else "    slow_exit()\n")
+        + "signal.signal(signal.SIGTERM, terminate)\n"
         + f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
         "while True: time.sleep(1)\n",
     )
@@ -107,9 +114,12 @@ Path({str(result)!r}).write_text(json.dumps({{
             pump()
         editor_pid = int(marker.read_text())
         os.write(master, b"\x03")
-        # Position the second terminal interrupt inside the one-second grace.
-        time.sleep(0.3)
+        deadline = time.monotonic() + 10
+        while not terminated.exists():
+            assert time.monotonic() < deadline, bytes(output)
+            pump()
         os.write(master, b"\x03")
+        second_sent.write_text("sent")
         deadline = time.monotonic() + 10
         while True:
             exited, status = os.waitpid(pid, os.WNOHANG)

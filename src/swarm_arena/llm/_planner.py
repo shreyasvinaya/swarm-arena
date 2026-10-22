@@ -2,22 +2,18 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from contextlib import AsyncExitStack
 from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
-import anyio
-
 from swarm_arena._board.digest import untrusted
-from swarm_arena._budget.llm_scope import current_llm_scope, llm_scope
+from swarm_arena._budget.llm_scope import current_llm_scope
 from swarm_arena._engine.run import mark_planning_session, planning_session
 from swarm_arena._errors import (
     ConfigError,
     PlanError,
-    _core_category,
     _core_error,
-    _is_core_control,
-    _SignalCategory,
 )
 from swarm_arena._model.base import CatalogKind
 from swarm_arena._model.canonical import canonical_json
@@ -34,18 +30,19 @@ from swarm_arena._outcomes import _Outcome
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.provenance import _detach_plan, stamp
 from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal, check_models
-from swarm_arena.llm._hooks import BudgetExceeded, _prepare
-from swarm_arena.llm._manager import _finish_accounting
+from swarm_arena.llm._hooks import _prepare
+from swarm_arena.llm._invocation import _invocation
+from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._reviewer import (
     Approve,
     Edited,
     Reviewer,
+    _clear_review,
     _detach_decision,
     _report_rejection,
     _review_work,
 )
 from swarm_arena.llm._structured import DictOutputSchema, structured_call
-from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 
 _ENTRY: Final[dict[str, Any]] = {
     "type": "object",
@@ -398,131 +395,95 @@ class LLMPlanner(Planner):
         parent = current_llm_scope()
         if parent is None:
             raise _core_error(RuntimeError, "LLM planner outside an LLM scope")
-        scope = parent.child()
-        boundary = _Outcome()
-        failure: BaseException | None = None
-        interrupted = False
-        result: Plan | None = None
-        try:
-            with llm_scope(scope):
-                errors, _ = await _prepare(lambda: check_models({"planner": self.models()}, config))
-                if errors:
-                    raise _core_error(ValueError, "\n".join(errors))
-                frozen = await _freeze_draft_goal(
-                    goal, base_dir=base_dir, artifacts=scope.artifacts
-                )
-                revisions = history.revisions if history else []
-                current = revisions[-1] if revisions else None
-                prompt = await _prepare(
-                    lambda: untrusted(
-                        json.dumps(
-                            {
-                                "goal": frozen.model_dump(mode="json"),
-                                "catalog": [
-                                    {
-                                        "name": e.name,
-                                        "kind": e.kind,
-                                        "description": e.description,
-                                        "settable": e.settable,
-                                    }
-                                    for e in config.planner_catalog.entries
+        async with (
+            AsyncExitStack() as tracing,
+            _invocation(parent, name="planner", error_type=ValueError) as scope,
+        ):
+            tracing.enter_context(component_span(scope))
+            errors, _ = await _prepare(lambda: check_models({"planner": self.models()}, config))
+            if errors:
+                raise _core_error(ValueError, "\n".join(errors))
+            frozen = await _freeze_draft_goal(goal, base_dir=base_dir, artifacts=scope.artifacts)
+            revisions = history.revisions if history else []
+            current = revisions[-1] if revisions else None
+            prompt = await _prepare(
+                lambda: untrusted(
+                    json.dumps(
+                        {
+                            "goal": frozen.model_dump(mode="json"),
+                            "catalog": [
+                                {
+                                    "name": e.name,
+                                    "kind": e.kind,
+                                    "description": e.description,
+                                    "settable": e.settable,
+                                }
+                                for e in config.planner_catalog.entries
+                            ],
+                            "models": {
+                                alias: {"roles": spec.roles}
+                                for alias, spec in config.models.root.items()
+                            },
+                            "limits": config.limits.model_dump(mode="json"),
+                            "current": None
+                            if current is None
+                            else {
+                                "teams": [t.name for t in current.teams],
+                                "parts": [p.name for p in current.parts],
+                            },
+                            "history": None
+                            if history is None
+                            else {
+                                "scores": [s.model_dump(mode="json") for s in history.scores],
+                                "learning_titles": [item.title for item in history.learnings],
+                                "prune_log": [
+                                    (r, d.model_dump(mode="json")) for r, d in history.decisions
                                 ],
-                                "models": {
-                                    alias: {"roles": spec.roles}
-                                    for alias, spec in config.models.root.items()
-                                },
-                                "limits": config.limits.model_dump(mode="json"),
-                                "current": None
-                                if current is None
-                                else {
-                                    "teams": [t.name for t in current.teams],
-                                    "parts": [p.name for p in current.parts],
-                                },
-                                "history": None
-                                if history is None
-                                else {
-                                    "scores": [s.model_dump(mode="json") for s in history.scores],
-                                    "learning_titles": [item.title for item in history.learnings],
-                                    "prune_log": [
-                                        (r, d.model_dump(mode="json")) for r, d in history.decisions
-                                    ],
-                                    "budget_left": history.budget_left.model_dump(mode="json"),
-                                    "rounds_done": history.rounds_done,
-                                    "join_failures": history.join_failures,
-                                },
-                                "feedback": list(feedback),
-                                "previous": previous.model_dump(mode="json") if previous else None,
-                            }
-                        )
+                                "budget_left": history.budget_left.model_dump(mode="json"),
+                                "rounds_done": history.rounds_done,
+                                "join_failures": history.join_failures,
+                            },
+                            "feedback": list(feedback),
+                            "previous": previous.model_dump(mode="json") if previous else None,
+                        }
                     )
                 )
-                output, _ = await structured_call(
-                    alias=self._model,
-                    role="planner",
-                    models=config.models,
-                    namespace=frozen.namespace,
-                    system=(
-                        "Select catalog entries and only their settable settings. "
-                        "Keep human components with keep_teams and keep_parts. "
-                        + self._instructions
-                    ),
-                    user=prompt,
-                    schema=PLANNER_SCHEMA,
-                    name="planner",
-                    no_cache_read=False,
-                    temperature=None,
+            )
+            output, _ = await structured_call(
+                alias=self._model,
+                role="planner",
+                models=config.models,
+                namespace=frozen.namespace,
+                system=(
+                    "Select catalog entries and only their settable settings. "
+                    "Keep human components with keep_teams and keep_parts. " + self._instructions
+                ),
+                user=prompt,
+                schema=PLANNER_SCHEMA,
+                name="planner",
+                no_cache_read=False,
+                temperature=None,
+            )
+            result = await _prepare(
+                partial(
+                    plan_from_output,
+                    output,
+                    goal=frozen,
+                    catalog=config.planner_catalog,
+                    current=current,
+                    rounds_done=history.rounds_done if history else 0,
+                    limits=config.limits,
                 )
-                result = await _prepare(
-                    partial(
-                        plan_from_output,
-                        output,
-                        goal=frozen,
-                        catalog=config.planner_catalog,
-                        current=current,
-                        rounds_done=history.rounds_done if history else 0,
-                        limits=config.limits,
-                    )
-                )
-                result = await _admit_draft(
-                    result,
-                    config,
-                    scope.artifacts,
-                    frozen_goal=frozen,
-                    base_dir=base_dir,
-                    history=revisions,
-                    origin=type(self).origin,
-                )
-        except BaseException as error:
-            failure = error
-            try:
-                boundary.classify(error)
-            except anyio.get_cancelled_exc_class() as cancelled:
-                interrupted, failure = True, cancelled
-            except BaseException as control:
-                failure = control
-        finally:
-            try:
-                await _finish_accounting(scope, interrupted=interrupted)
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as cleanup_error:
-                failure = (
-                    BaseExceptionGroup("planner cleanup", [failure, cleanup_error])
-                    if failure
-                    else cleanup_error
-                )
-        if failure is not None:
-            classified = boundary.classify(failure)
-            if _is_core_control(classified):
-                if (
-                    type(failure) is BudgetExceeded
-                    or _core_category(failure) is _SignalCategory.LIMIT
-                ):
-                    raise failure from None
-                raise classified from None
-            boundary.contain(classified, ValueError, "LLM planner")
-        boundary.propagate_control(RuntimeError())
-        assert result is not None
+            )
+            result = await _admit_draft(
+                result,
+                config,
+                scope.artifacts,
+                frozen_goal=frozen,
+                base_dir=base_dir,
+                history=revisions,
+                origin=type(self).origin,
+            )
         return result
 
 
@@ -607,7 +568,8 @@ class CollaborativePlanner(Planner):
         Raises
         ------
         RuntimeError
-            No approval within the configured review count.
+            No approval within the configured review count, or reviewer cleanup
+            failed after approval.
 
         Examples
         --------
@@ -624,6 +586,7 @@ class CollaborativePlanner(Planner):
         base_dir: Path,
     ) -> Plan:
         """Review with the explicit source root supplied by file-based callers."""
+        failure: BaseException | None = None
         try:
             if current_llm_scope() is None:
                 async with planning_session(config, goal, self) as scope:
@@ -632,9 +595,11 @@ class CollaborativePlanner(Planner):
                     )
                 return result
             return await self._review(goal, config, history, base_dir=base_dir)
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            if isinstance(self._reviewer, TerminalReviewer):
-                self._reviewer._clear_edit()
+            _clear_review(self._reviewer, failure=failure)
 
     async def _review(
         self,

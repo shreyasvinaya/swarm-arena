@@ -1997,6 +1997,9 @@ class LLMScope:
     cache: CachePolicy | None
     force_no_cache_read: bool = False                # anchors and the final judge
     call_ids: list[str] = field(default_factory=list)   # [plan] record_call appends the id of every LLMCall made in this scope
+    parent: LLMScope | None = field(default=None, repr=False, compare=False)
+    def child(self) -> LLMScope: ...
+    def lineage(self) -> Generator[LLMScope]: ...
 def current_llm_scope() -> LLMScope | None: ...
 @contextmanager
 def llm_scope(scope: LLMScope) -> Iterator[None]: ...
@@ -2019,6 +2022,12 @@ fields immediately after `cache`, with no defaults. Every engine and standalone
 session constructor passes its `RunConfig` values. Report waiting and owned
 post-stop settlement/publication cleanup both use `settle_timeout_s`; it is not
 solely a grace period for receiving usage.
+
+`child()` shares funding and services with its parent while allocating an
+independent call-id list and drain lifetime. `lineage()` yields the current
+scope followed by its ancestors. Recording propagates call links through that
+lineage; draining a child leaves its owner open, while an owner's drain includes
+its descendants.
 
 #### R4.13.8 Process supervision — M1a
 
@@ -2476,6 +2485,35 @@ class HumanObject(StoredModel):                      # reviews/ and curation/ ob
 def human_object_order(name: str) -> tuple[str, str]: ...   # (timestamp in the name, full name)
 def human_object_name(now: datetime) -> str: ...            # "<YYYYMMDDTHHMMSS.mmmZ>-<random 8 hex>.jsonl" [plan]
 ```
+
+LLM trace and viewer projections extend these internals without a public facade
+addition or SQL schema change (schema 4). The published generation retains calls,
+restored revision provenance and standalone session heads before any composite read.
+
+```python
+# _board/trace.py
+class CacheStats(FrozenModel):
+    calls: int; input_tokens: int; cache_read_tokens: int; cache_write_tokens: int; response_hits: int
+    @property
+    def hit_rate(self) -> float: ...  # reads / (ordinary input + reads + writes), or 0.0
+
+def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]: ...  # standalone: one authority read
+
+def format_llm_step(call: LLMCall) -> str: ...
+def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]: ...  # team/agent, else :role
+# ArenaCache publication seam; never called by a pinned composite reader:
+# _committed_state(mark: Frontier.Mark) -> RunState
+# _ArenaReader.llm_calls(run_id: str) -> list[LLMCall] returns detached committed calls.
+```
+
+Memo identity includes the normalized producing root, run ID and full committed
+head. Calls are counted once across namespace caches; candidate-less calls remain
+included. Standalone sessions resolve only beneath the producing root and keep
+recorded completion reasons. Trace preserves round-applicable plans, recorded
+base_dir, producing-run score links, parent-linked child IDs and recorded cache
+origins; it performs no reader-time refresh or replay. The viewer adds
+`/run/<run-id>/llm` under its existing Host and escaped-HTML rules. Round pages
+remain immutable.
 
 #### R4.13.15 Gateway — M4
 
@@ -2947,3 +2985,49 @@ The transition name is stored in `transition`. Allowed failure sources are
 `manager`, `tool`, `judge`, `planner`, and `curator`. Goal completion clears
 its address causes. Recovery is run-wide; activation waits for each address's
 own fresh round.
+
+
+### Delivered non-agent failure and receipt interfaces
+
+These additions supplement R3, R4.13.4, R4.13.11, R4.13.13 and the R4.14 event
+registry. They refine the earlier provider-state note: receipt variants do not
+change provider latch state, but their operation dispositions are now folded.
+
+| Registry | Delivered interface and semantics |
+|---|---|
+| R3 / R4.13.11 | `_scoring/runner.py`, `_scoring/lexicographic.py`: category-aware inner and recursive preparation boundaries preserve validated PROVIDER, LIMIT, TERMINAL and FENCED signals, with genuine caller cancellation precedence. |
+| R4.13.11 | `JudgeOutcome.provider_failed: dict[str, str] = {}` identifies judge names and providers within one main/part context. The engine aggregates separate batch receipts by part and ref; a failed ranking group skips policy, while a non-ranking failure does not. `final_judge` re-raises validated provider signals and registered limits. |
+| R4.13.4 | `GoalState.provider_batches: dict[str, dict[str, Any]]` folds completed failed barrier/final identities; `skipped_policies: dict[int, dict[str, Any]]` folds round policy skips. Failed curation adds its `decision_seq` to `curated_decisions`. |
+| R4.13.13 | Barrier identity adds lifecycle to goal/revision/round/part/ref/input membership. Completion carries that identity plus `key`, `members`, `anchors`, `ranking`, `managers_complete`. Recovery reads completed batches before judge preparation or funding and does not repeat managers once a barrier completion proves they finished. |
+| R4.13.13 | Final provider-failure receipts retain the existing pre-final `key`, goal/lifecycle/revision/ref/members/candidates, order, status and reason. Recovery restores `no_result/provider_failed` before convergence can reselect from final scores. |
+| R4.13.13 | A state-free registered manager TERMINAL propagates; it is never recorded as a manager error followed by another round. |
+
+`provider_failed` operation records use `variant="receipt"`, `source`,
+`disposition`, and `complete=true`:
+
+- `provider_failed` (source `judge`): `accounting="settled"`,
+  `provider_failed: {judge_name: provider}` and exactly one `barrier_batch` or
+  `final_batch` completion identity. There are zero SCORE/JUDGE_ERROR events for
+  that failed batch. Publication follows its accounting disposition.
+- `panel_drop` (source `judge`): `provider`, `dropped_member`, `member_index`,
+  survivor `panel_hash`, and invocation `batch_id`. This records a member drop,
+  not whole-batch completion; survivor SCORE events carry the batch receipt.
+  Repeated members and the whole-invocation survivor set are retained.
+- `policy_skipped` (source `judge`): `round`, `revision`, `lifecycle`, failed
+  ranking `batches`, `paused=true`, `managers_complete=true`,
+  `barrier_complete=true`, `policy="skipped"`, `curation="ineligible"`.
+  No DECISION is fabricated. Closure, replan boundaries and page repair continue.
+- `curator_skipped` (source `curator`): `provider`, `round`, `revision`,
+  `decision_seq`, `accounting="settled"`. No CURATED event is fabricated.
+
+A provider-failed planner uses a normal PLAN_REJECTED receipt with added
+`provider` and `disposition="provider_failed"`, beside its shared-service
+transition. `first_round`, optional `join_retry` and safe type-only errors retain
+their existing meanings. All source transitions use the shared ProviderStops
+service; receipts do not invent extra generations or agent stops.
+
+An ordinary final judge error may still produce reason `provider_failed`, meaning
+no final order, without any provider transition or provider receipt. Barrier
+LIMIT becomes `reserve_exhausted`; final LIMIT becomes `no_result` with that same
+reason. Replan/policy LIMIT containment is unchanged. Storage/accounting terminal
+failures, fencing and genuine caller cancellation never become provider receipts.

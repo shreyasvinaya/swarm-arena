@@ -221,9 +221,12 @@ Built-in provider probing and model-provider recovery are M3 work.
 | `swarm-arena stop --now RUN_DIR` | Cancel with grace and partial collection | Judge available candidates, select-only convergence; no converge team; retain best parts as `unjoined` |
 
 Run budget exhaustion drains work and finalizes from reserve; goal budget
-exhaustion affects that goal. Goals still queued at any early ending never
-start and report `NO_RESULT` with reason `stopped`. A stop arriving during
-convergence or final judging remains the lifecycle's termination reason.
+exhaustion affects that goal. Resume completes setup even when replayed usage
+has exhausted the work budget, then finishes interrupted convergence and final
+judging from the remaining reserve. Resuming a completed budget-stopped goal
+reuses its recorded result without repeating paid work. Goals still queued at
+any early ending never start and report `NO_RESULT` with reason `stopped`. A stop
+arriving during convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
 
 When budget exhaustion races with a new tool request, `LimitReached.limit` may
@@ -477,3 +480,45 @@ probe or clear its saved causes, and still writes the paused agent's STOPPED
 round status. A fresh resumed round may recover its reserved
 slots without exceeding `max_agents_total`. Permanent disposition or goal
 completion releases the reservation.
+
+
+### Failures outside agents
+
+Judges, panel members, replanners and curators use the same run-wide provider
+latch as managers and tools. A provider outage in one goal therefore pauses all
+matching agents, including later registrations, while their capacity remains
+reserved until recovery or permanent disposition.
+
+A failed non-ranking judge leaves its scores missing. A failed ranking judge
+skips the round's policy and makes curation ineligible; it never authorizes
+pruning on missing ranking evidence. At converge, paused ranking batches get
+one retry through normal admission and the shared provider service. A distinct
+batch identity makes a completed retry reusable on resume. Only a validated
+provider failure on that retry can produce `provider_failed` when no finalist
+passes; a recovered provider permits normal selection. A failed replanner keeps
+the current revision and records a safe `plan_rejected` completion, including the original
+`first_round` and any `join_retry`. A failed eligible curator records a completed
+skip without a `curated` event. These receipts survive takeover, so a missing
+decision or summary does not cause paid work to repeat.
+
+Each settled invocation reports a failed provider once, even when several panel
+members use it or a sibling is refused by the budget. A surviving panel carries
+its `panel_drop` metadata to the core, which commits it with the survivor scores.
+A drop describes a member loss, not whole-batch completion; single-member and
+all-member failures are failed batches instead.
+
+Failed judging and curation receipts are published only after accounting has a
+known disposition. Storage failures, settlement timeouts, fencing, terminal
+usage overflow and genuine caller cancellation are not provider failures and
+cannot manufacture these receipts. Error messages carry identifiers and type
+names, never prompts, outputs or provider diagnostic text.
+
+A registered judge budget refusal at the barrier records `reserve_exhausted`
+and ends ordinary rounds in select-only mode. At final judging it produces
+`no_result` with reason `reserve_exhausted`. Registered limits in replanning and
+policy retain their existing contained rejection/error-decision behavior.
+
+A registered usage overflow from a manager or judge takes the run-budget stop path:
+ordinary rounds end, and the free final selection can still run. A registered
+cleanup or storage terminal failure escapes the run even when no ledger or
+binding state accompanies it. Neither kind is recorded as a manager or judge error.

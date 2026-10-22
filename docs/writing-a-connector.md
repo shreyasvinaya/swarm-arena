@@ -122,8 +122,10 @@ The rules:
   interpreter when it is None. A tool is never started with `uv run`.
 - **`collect()` always runs**, also after a timeout or a cancel (after SIGTERM
   and `grace_s`). Return the data you have with `partial=True` then. If
-  `collect()` raises, the run gets status `error` and the traceback goes to the
-  run's stderr log.
+  `collect()` raises an ordinary exception or `SystemExit`, stderr records only
+  `swarm-arena: collect failed: <Type>`, without the exception message or
+  traceback. The run gets status `error`, preserving `timeout` or `cancelled`
+  when already stopped. See the [executor outcome contract](own-files.md).
 
 ### The workspace and `swarm/result.json`
 

@@ -840,7 +840,11 @@ async def test_goal_handlers_use_registered_categories(
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
     invocations: list[str] = []
 
+    supervised = runner._supervised_step
+
     async def fail(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("settle_on_stop"):
+            return await supervised(*args, **kwargs)
         invocations.append(site)
         raise error
 
@@ -852,7 +856,12 @@ async def test_goal_handlers_use_registered_categories(
         if site == "replan"
         else runner._round_decision(1)
     )
-    if kind in {"cleanup", "overflow", "fence"}:
+    if kind == "overflow" and site == "final":
+        assert await operation == []
+        assert env.deps.stops.run_budget
+        assert (runner.status, runner.reason) == ("no_result", "run budget")
+        assert not env.events("judge_error")
+    elif kind in {"cleanup", "overflow", "fence"}:
         with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
             await operation
         assert_secret_absent(caught.value, secret)
@@ -868,7 +877,7 @@ async def test_goal_handlers_use_registered_categories(
         assert not env.events("judge_error")
     elif kind in {"limit", "misleading_limit"} and site == "final":
         assert await operation == []
-        assert (runner.status, runner.reason) == ("no_result", "final slice used up")
+        assert (runner.status, runner.reason) == ("no_result", "reserve_exhausted")
         assert not env.events("judge_error")
     else:
         await operation
@@ -1016,6 +1025,8 @@ async def test_user_hook_interrupt_stays_contained_at_goal_handlers(
         raise interrupt(secret)
 
     async def invoke(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("settle_on_stop"):
+            return await supervised(*args, **kwargs)
         return await supervised(hook, **kwargs)
 
     monkeypatch.setattr(runner, "_supervised_step", invoke)

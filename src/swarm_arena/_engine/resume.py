@@ -494,6 +494,8 @@ async def _supervised_acquire(
     """Deliver acquisition under the owner's supervisor or release undelivered ownership."""
     lease: Lease | None = None
     try:
+        if stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, stopped)
         async with run_module._supervise_initialization(
             store, epoch, stops, clock, config, retain=retain
         ):

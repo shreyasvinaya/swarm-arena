@@ -170,8 +170,9 @@ revision cannot assign another goal a key that appeared only in an older revisio
 
 Install the `llm` extra and configure a model alias with the `planner` role,
 `limits.max_tokens`, and a human-maintained `planner_catalog`. If `max_usd` is
-set, all declared models need prices. `LLMPlanner` checks aliases before opening
-a standalone planning session or making a paid call.
+set, every used model alias needs a known price, from explicit catalog prices
+or the bundled price map. Unused catalog aliases need no price. `LLMPlanner`
+checks aliases before opening a standalone planning session or making a paid call.
 
 ```python
 from swarm_arena.llm import LLMPlanner
@@ -288,7 +289,9 @@ Cancellation restores stdin's descriptor state, first asks the editor to termina
 and reaps it, using a kill fallback after a one-second grace period. The terminal's
 saved mode, including echo and canonical input, is restored after every editor exit.
 Another Ctrl-C during the grace ends it immediately, kills and reaps the editor,
-and lets the planning session finish its journal cleanup.
+and lets the planning session finish its journal cleanup. The CLI also owns
+repeated Ctrl-C at the prompt and during shutdown: two interrupts allow journal
+cleanup to finish before exit 130; a third may force an immediate exit.
 
 One metered planning session spans every draft and human review. Its run-time
 allowance and stop/lease supervision remain active while awaiting input or the
@@ -299,13 +302,15 @@ their source directory, and cannot change the frozen human main goal. Its title,
 description, metadata, namespace, id, inputs and file declarations are all fixed;
 edited snapshots must still identify the original frozen files. A refused edit
 prints a safe admission diagnostic to stdout and returns the same draft to the
-reviewer for another review (including custom reviewers),
-retaining the edited text for repair without another paid model call. Each refused
-edit counts toward `max_iterations`; giving feedback requests a new draft instead.
+reviewer for another review (including custom reviewers) without another paid
+model call. The terminal adapter retains the edited text for repair; custom
+reviewers must retain their own edits. Each refused edit counts toward `max_iterations`; giving feedback requests a new draft instead.
 The terminal adapter clears retained edits when the collaborative session ends.
 Approval cannot authorize a mutation of the offered draft: return
 `Edited(plan)` to propose changes explicitly. Custom async reviewers must
-cooperate with cancellation.
+cooperate with cancellation. Custom reviewer cleanup failures have type-only
+diagnostics. Cleanup cannot replace an already escaping error or cancellation;
+a cleanup failure after approval surfaces as an error.
 
 Standalone planning journals remain readable for accounting and provenance.
 They cannot be resumed: both `Swarm.resume` and `swarm-arena resume` refuse

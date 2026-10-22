@@ -2,9 +2,11 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from typing import ClassVar
 
 from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
@@ -14,6 +16,19 @@ from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import Candidate, Score, _finite_key
 from swarm_arena._outcomes import _propagate_control
 from swarm_arena._scoring.check import CheckContext
+
+
+class _PanelDrop(FrozenModel):
+    """Settled member loss carried to the core's score publication boundary."""
+
+    provider: str
+    dropped_member: str
+    member_index: int
+    panel_hash: str
+    batch_id: str
+
+
+_panel_drops: ContextVar[list[_PanelDrop] | None] = ContextVar("judge_panel_drops", default=None)
 
 
 class JudgeContext(CheckContext):

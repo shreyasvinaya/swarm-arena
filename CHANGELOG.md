@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Candidate trace and board pages show recorded planner, manager, tool and judge
+  LLM calls, standalone planning provenance, cache origins and trace URLs; run
+  pages report per-agent prompt-cache rates and response-cache hit counts from
+  the same retained committed generation, without requiring LLM extras.
+
+- Opt-in Langfuse sessions and LLM trace links for managers, judges, planners and
+  curators, with per-scope consent, no default vendor tracing and bounded
+  process-exit exporter cleanup.
+
+- Provider failures outside agents preserve panel survivor identities, pause ranking
+  policies, and skip replanning or curation with durable completion receipts;
+  resume reuses failed batches and skipped phases without repeating paid work.
+
 - Run-wide provider pauses retain agent capacity, recover through uncached probes
   before fresh-round shares, and replay provider generations and causes on resume.
 
@@ -107,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Swarm.resume` continues committed runs with auditable lease takeover,
   conservative lost-run accounting, restored round state, and repaired result views.
+  Replayed budget exhaustion permits setup and reserve-funded completion;
+  completed budget-stopped goals reuse recorded results without new paid work.
 
 - CLI `run`, `status`, `stop`, and `resume` commands support terminal approval,
   sorted plan directories, committed status, epoch-scoped stops, and saved or

@@ -437,13 +437,17 @@ class AgentContext:
             payload=payload,
         )
 
-    def _charge(self, *, board_read: bool = False) -> None:
-        """Check gates and update counters atomically on the loop."""
-        rt = self._rt
+    def _check_admission(self) -> None:
+        """Check the live gate without charging a turn or appending counters."""
         blocked = self._gate()
         if blocked is not None:
             limit = _context_limit(blocked.limit)
             raise _core_signal(LimitReached(limit, str(blocked)), _category=_SignalCategory.LIMIT)
+
+    def _charge(self, *, board_read: bool = False) -> None:
+        """Check gates and update counters atomically on the loop."""
+        self._check_admission()
+        rt = self._rt
         if rt.watchdog.limit is not None:
             limit = _context_limit(rt.watchdog.limit)
             raise _core_signal(
@@ -621,20 +625,23 @@ class AgentContext:
         Candidate
             Result with manager-visible check feedback. New results record the
             ordered read identifiers at action entry. Linked or recovered results
-            retain their original read provenance.
+            retain their original read provenance. A live admission gate keeps its
+            budget or deadline reason when the in-flight registry has also closed.
+            Registry refusal does not consume a turn or append counter events.
 
         Examples
         --------
         >>> candidate = await ctx.run_tool({"x": 1.0})  # doctest: +SKIP
         """
+        parents = tuple(_context_string(value, "parents") for value in parents)
+        edits = (
+            None
+            if edits is None
+            else {_context_string(path, "edits path"): text for path, text in edits.items()}
+        )
+        self._check_admission()
         inflight = _inflight.get()
         with inflight.run() if isinstance(inflight, _ActionInflight) else nullcontext():
-            parents = tuple(_context_string(value, "parents") for value in parents)
-            edits = (
-                None
-                if edits is None
-                else {_context_string(path, "edits path"): text for path, text in edits.items()}
-            )
             self._charge()
             read_ids = tuple(self._read_ids)
             candidate = await execute_tool_run(

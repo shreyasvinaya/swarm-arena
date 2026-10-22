@@ -7,7 +7,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
-from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._errors import Fenced, ProviderFailed, _core_error, _SignalCategory
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft, EventType
@@ -481,6 +481,8 @@ def test_judge_outcome_and_error_are_frozen_models() -> None:
     outcome = JudgeOutcome(scores=[], errors=[error])
     assert outcome.model_dump() == {
         "scores": [],
+        "provider_failed": {},
+        "panel_drops": [],
         "errors": [{"candidate_id": "c-1", "judge": "quality", "reason": "no score"}],
     }
     with pytest.raises(ValueError, match="frozen"):
@@ -895,3 +897,85 @@ async def test_omitted_candidate_is_a_judge_error() -> None:
     )
     assert [s.candidate_id for s in outcome.scores] == ["c0"]
     assert [(e.candidate_id, e.reason) for e in outcome.errors] == [("c1", "no score")]
+
+
+class _ProviderJudge(_RecordingJudge):
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise _core_error(ProviderFailed, "anthropic")
+
+
+class _ProviderMetadataJudge(_RecordingJudge):
+    def panel_hash(self) -> str:
+        raise _core_error(ProviderFailed, "anthropic")
+
+
+class _TerminalMetadataJudge(_RecordingJudge):
+    def panel_hash(self) -> str:
+        raise _core_error(
+            RuntimeError, "stop cleanup timed out", _category=_SignalCategory.TERMINAL
+        )
+
+
+@pytest.mark.parametrize(
+    ("member", "error_type"),
+    [(_ProviderMetadataJudge, ProviderFailed), (_TerminalMetadataJudge, RuntimeError)],
+)
+async def test_recursive_metadata_preserves_registered_signal(
+    member: type[Judge], error_type: type[Exception]
+) -> None:
+    from swarm_arena.scoring import Lexicographic
+
+    judge = Lexicographic([Lexicographic([member()])])
+    # Preserve the actual instances; this test is about combination, not factories.
+    inner = Lexicographic([member()])
+    inner._members = [member()]
+    judge._members = [inner]
+    with pytest.raises(error_type):
+        await judge.judge(GOAL, [_cand()], _judge_ctx())
+
+
+async def test_judge_round_reports_provider_failed_without_judge_errors() -> None:
+    failed, healthy = _ProviderJudge(), _RecordingJudge()
+    outcome = await judge_round(
+        "g",
+        [
+            (Ref.of(failed).model_copy(update={"name": "A"}), failed),
+            (Ref.of(healthy).model_copy(update={"name": "B"}), healthy),
+        ],
+        [_cand("c-1"), _cand("c-2")],
+        [],
+        lambda _: _judge_ctx(),
+    )
+    assert outcome.provider_failed == {"A": "anthropic"}
+    assert outcome.errors == []
+    assert {s.judge for s in outcome.scores} == {"B"}
+
+
+async def test_final_judge_reraises_provider_failed() -> None:
+    judge = _ProviderJudge()
+    with pytest.raises(ProviderFailed):
+        await final_judge("g", (Ref.of(judge), judge), [_cand()], _judge_ctx())
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_judge_round_reraises_registered_limits(terminal: bool) -> None:
+    from swarm_arena.manager import LimitReached
+
+    class Limited(_RecordingJudge):
+        async def judge(
+            self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            raise _core_error(
+                LimitReached,
+                "budget",
+                "judge budget",
+                _category=(_SignalCategory.TERMINAL if terminal else _SignalCategory.LIMIT),
+            )
+
+    judge = Limited()
+    with pytest.raises(LimitReached):
+        await judge_round(
+            "g", [(Ref.of(_RecordingJudge()), judge)], [_cand()], [], lambda _: _judge_ctx()
+        )

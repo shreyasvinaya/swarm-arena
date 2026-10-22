@@ -594,7 +594,11 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
 
     capture = FakeModel([FakeTurn(tool_calls=(("stop", {}),)), FakeTurn(text="must not run")])
 
+    supervised = runner._supervised_step
+
     async def invoke_sdk(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("settle_on_stop"):
+            return await supervised(*args, **kwargs)
         try:
             await Runner.run(
                 Agent(name="test", model=capture, tools=[stop]),
@@ -619,7 +623,7 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
         await env.deps.journal.commit()
         if site == "final":
             assert result == []
-            assert (runner.status, runner.reason) == ("no_result", "final slice used up")
+            assert (runner.status, runner.reason) == ("no_result", "reserve_exhausted")
         elif site == "replan":
             assert result is False
             assert env.events("plan_rejected")[-1].payload["errors"] == [
@@ -630,6 +634,15 @@ async def test_carried_control_reaches_each_goal_handler_without_another_turn(
                 env.events("decision")[-1].payload["decision"]["policy"]
                 == "policy error: LimitReached"
             )
+    elif kind == "overflow" and site == "final":
+        assert await operation == []
+        assert env.deps.stops.run_budget
+        assert (runner.status, runner.reason) == ("no_result", "run budget")
+        outcome = await runner.run()
+        assert outcome.finalists == []
+        assert (outcome.status, outcome.reason) == ("no_result", "run budget")
+        assert env.events("no_result")[-1].payload["reason"] == "run budget"
+        assert env.events("goal_finished")
     else:
         with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
             await operation

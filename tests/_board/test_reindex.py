@@ -529,3 +529,29 @@ def test_reindex_logical_rows_exclude_only_local_surrogate_rowids(tmp_path: Path
         board.close()
         fresh.close()
         run._lease.release()
+
+
+def test_llm_projection_cold_warm_and_reindex_parity(run_config: RunConfig, tmp_path: Path) -> None:
+    from _fakes.trace_calls import _seed as seed_llm
+
+    from swarm_arena._board.trace import cache_stats, trace
+
+    run = FakeRun(run_config.run_root, "llm-run")
+    seed_llm(run)
+    add_pointer(run_config.arena_root, run)
+    directory = tmp_path / "llm-cache"
+    outputs = []
+    for phase in range(3):
+        if phase == 2:
+            reindex(run_config, ["toy"], cache_dir=directory)
+        board = ArenaBoard(arena_root=run_config.arena_root, cache_dir=str(directory))
+        board.open("", "", ["toy"])
+        try:
+            board.frontier()
+            with board._read_namespace() as reader:
+                outputs.append((trace(board, "c-llm"), cache_stats(reader.llm_calls("llm-run"))))
+        finally:
+            board.close()
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert outputs[0][1][":manager"].calls == 1
+    assert ArenaCache.SCHEMA_VERSION == 4

@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Sequence
+from contextlib import AsyncExitStack
 from typing import Any, Final, cast
 
 from pydantic import Field
@@ -18,6 +19,7 @@ from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.validate import check_models
 from swarm_arena.llm._hooks import _prepare
 from swarm_arena.llm._invocation import _invocation
+from swarm_arena.llm._langfuse import component_span
 from swarm_arena.llm._structured import structured_call
 
 CURATOR_SCHEMA: Final[dict[str, Any]] = {
@@ -200,7 +202,11 @@ class LLMCurator(Curator):
         parent = current_llm_scope()
         if parent is None:
             raise RuntimeError("LLM curator outside an LLM scope")
-        async with _invocation(parent, name="curator", error_type=ValueError) as scope:
+        async with (
+            AsyncExitStack() as tracing,
+            _invocation(parent, name="curator", error_type=ValueError) as scope,
+        ):
+            tracing.enter_context(component_span(scope))
             config = await _prepare(lambda: _detach_model(self.Config, self.config))
             alias = _context_string(config.model, "model")
             errors, _ = await _prepare(
