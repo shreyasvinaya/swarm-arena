@@ -170,6 +170,8 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
         rendered = RenderedText()
         rendered.feed(html)
         text = "".join(rendered.chunks)
+        assert ".. py:" not in text, path.name
+        assert ".. automodule::" not in text, path.name
         if "swarm_arena._" in html or "swarm_arena._" in text:
             leaks.append(f"{path.name}: private import path")
         names = sorted(set(re.findall(r"(?<![\w])_(?!_)[A-Za-z]\w*", text)))
