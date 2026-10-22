@@ -191,9 +191,12 @@ work, including `run_tool` calls nested inside extra actions. A round stop close
 each action's tool admission and lets admitted runs finish before cancelling the
 remaining handler work. An action timeout closes admission and starts graceful
 cancellation of its nested runs, waits for their completion and settlement, then
-cancels the rest of the handler. Registered terminal cleanup and ownership loss
-take precedence over the ordinary round-time limit. Overflow from an owned action ends this manager; an
-otherwise completed report is preserved when a peer overflows the shared budget.
+cancels the rest of the handler. If that action deadline prevents the handler
+from starting more work, the model receives the action-timeout message and can
+continue the round. A concurrent round or sibling stop still ends the round.
+Registered terminal cleanup and ownership loss take precedence over the ordinary
+round-time limit. Overflow from an owned action ends this manager; an otherwise
+completed report is preserved when a peer overflows the shared budget.
 Genuine caller cancellation retains highest precedence. See the [LLM API](api/llm.md).
 
 An agent sees the board at the round's recorded frontier plus its own new work.

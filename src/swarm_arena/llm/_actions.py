@@ -367,7 +367,7 @@ def _tool(
             if clock.cancel_called:
                 inflight.stop(scope, cancel=True)
 
-        with scope, _local_timer_scope(scope), track_inflight(inflight):
+        with scope, _local_timer_scope(scope) as timer, track_inflight(inflight):
             async with anyio.create_task_group() as timers:
                 if timeout is not None:
                     timers.start_soon(expire)
@@ -394,7 +394,9 @@ def _tool(
             classified = fenced
         if error is None and not scope.cancel_called:
             return result
-        carrier = _sdk_control(classified)
+        carrier = (
+            None if inflight.is_timeout_refusal(classified, timer) else _sdk_control(classified)
+        )
         if carrier is not None:
             raise carrier from None
         if scope.cancel_called:

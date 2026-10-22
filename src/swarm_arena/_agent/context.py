@@ -21,6 +21,7 @@ from swarm_arena._errors import (
     ConfigError,
     Fenced,
     SoftError,
+    _core_category,
     _core_error,
     _core_signal,
     _exception_type_name,
@@ -161,6 +162,24 @@ class _ActionInflight(Inflight):
             self.cancel_all()
         if not self._runs:
             scope.cancel()
+
+    def is_timeout_refusal(self, error: Exception, timer: _LocalTimer) -> bool:
+        """Recognize an ordinary stop caused solely by this action's timer."""
+        return (
+            _core_category(error) is _SignalCategory.LIMIT
+            and isinstance(error, LimitReached)
+            and error.limit == "stop"
+            and timer.scope.cancel_called
+            and self._local.closed
+            and self._stop_scopes == {timer.scope}
+            and not self._parent.closed
+            and not any(
+                other.live
+                and other is not timer
+                and (other.scope.cancel_called or other.failure is not None)
+                for other in _local_timers.get()
+            )
+        )
 
     @property
     def closed(self) -> bool:

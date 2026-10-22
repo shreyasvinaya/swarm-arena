@@ -1378,3 +1378,151 @@ async def test_peer_overflow_during_join_preserves_finished_report(
         with pytest.raises(LimitReached) as caught:
             await run.ledger.reserve(":run", Amount(usd=1), kind="tool", goal_id="g")
         assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+class ContinuingActionInputs(FrozenModel):
+    then: str
+
+
+class ContinuingActionTool(PyTool):
+    """Continue using the context after a nested run completes under cancellation."""
+
+    def extra_actions(self) -> list[Action[Any]]:
+        async def loop(ctx: AgentContext, args: ContinuingActionInputs) -> JsonValue:
+            first = await ctx.run_tool({"n": 1})
+            if args.then == "run2":
+                second = await ctx.run_tool({"n": 2})
+                return {"ids": [first.id, second.id]}
+            if args.then == "action":
+                await ctx.call_action("noop", {"x": 0})
+            elif args.then == "notes":
+                await ctx.save_notes("after the first run")
+            elif args.then == "none":
+                await anyio.sleep_forever()
+            return {"id": first.id}
+
+        async def noop(ctx: AgentContext, args: Inputs) -> JsonValue:
+            return {}
+
+        return [
+            Action(
+                name="loop",
+                description="Run tools in a loop.",
+                input_model=ContinuingActionInputs,
+                handler=loop,
+            ),
+            Action(name="noop", description="Do nothing.", input_model=Inputs, handler=noop),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("then", "round_stop"),
+    [
+        ("run2", False),
+        ("action", False),
+        ("ret_slowprep", False),
+        ("none", False),
+        ("notes", False),
+        ("run2", True),
+    ],
+)
+async def test_action_timeout_refusals_stay_local_unless_the_round_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, then: str, round_stop: bool
+) -> None:
+    from _fakes.run import all_events, plan
+    from _fakes.tools import WRITE_THEN_SLEEP
+    from agents.tool import default_tool_timeout_error_message
+
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import _inflight
+
+    held = HeldOperation()
+    if then == "ret_slowprep":
+
+        def estimate(self: ContinuingActionTool, request: Any) -> None:
+            if isinstance(_inflight.get(), _ActionInflight):
+                held.wait()
+
+        monkeypatch.setattr(ContinuingActionTool, "estimate", estimate)
+
+    stops: list[tuple[bool, bool]] = []
+    original_stop = _ActionInflight.stop
+
+    def observed_stop(self: _ActionInflight, scope: anyio.CancelScope, *, cancel: bool) -> None:
+        stops.append((cancel, self._parent.closed))
+        original_stop(self, scope, cancel=cancel)
+        if then == "ret_slowprep":
+            held.release.set()
+
+    monkeypatch.setattr(_ActionInflight, "stop", observed_stop)
+    reports: list[str] = []
+    controls: list[_SignalCategory | None] = []
+    original_round = AgentsSDKManager.run_round
+
+    async def observed_round(self: AgentsSDKManager, ctx: AgentContext) -> RoundReport:
+        try:
+            report = await original_round(self, ctx)
+        except BaseException as error:
+            controls.append(_core_category(error))
+            raise
+        reports.append(report.summary)
+        return report
+
+    monkeypatch.setattr(AgentsSDKManager, "run_round", observed_round)
+    cfg = config(
+        limits=Limits(max_tokens=10_000_000, max_usd=100, round_timeout_s=3 if round_stop else 60),
+        run_root=str(tmp_path / "runs"),
+        artifact_root=str(tmp_path / "artifacts"),
+        arena_root=str(tmp_path / "arena"),
+    )
+    code = WRITE_THEN_SLEEP
+    if round_stop:
+        # Keep core grace active across both real deadlines, without a test-side sleep.
+        code = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + code
+    current = plan(
+        rounds=1, tool=ContinuingActionTool({"code": code, "grace_s": 3 if round_stop else 0.3})
+    )
+    current.teams[0].agents[0] = (
+        current.teams[0]
+        .agents[0]
+        .model_copy(update={"manager": Ref.of(AgentsSDKManager(model="opus", action_timeout_s=2))})
+    )
+    summary = "model saw the timeout"
+    fake = register([FakeTurn(tool_calls=(("loop", {"then": then}),)), finish(summary)])
+    try:
+        with anyio.fail_after(20):
+            await Swarm(cfg).run(current, run_id="action-timeout")
+    finally:
+        if held.entered.is_set():
+            await held.finish()
+    events = all_events(cfg)
+    starts = [e for e in events if e.type == "tool_start"]
+    ends = [e for e in events if e.type == "tool_end"]
+    assert len(starts) == len(ends) == (0 if then == "ret_slowprep" else 1)
+    assert {e.task_id for e in starts} == {e.task_id for e in ends}
+    assert all(e.payload["candidate"]["output"]["status"] == "cancelled" for e in ends)
+    assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+        e.payload["id"] for e in events if e.type == "settle"
+    }
+    status = next(e for e in events if e.type == "agent_status")
+    assert stops[0] == (True, False)  # The action deadline closed only its own registry first.
+    if then == "ret_slowprep":
+        assert held.entered.is_set()
+        assert held.exited.is_set()
+    if round_stop:
+        assert any(parent_closed for _, parent_closed in stops)
+        assert reports == []
+        assert controls == [_SignalCategory.LIMIT]
+        assert len(fake.calls) == 1
+        assert status.payload["reason"] == "limit reached"
+    else:
+        assert reports == [summary]
+        assert controls == []
+        assert len(fake.calls) == 2
+        inputs = fake.calls[1]["input"]
+        assert isinstance(inputs, list)
+        assert inputs[-1]["type"] == "function_call_output"
+        assert inputs[-1]["output"] == default_tool_timeout_error_message(
+            tool_name="loop", timeout_seconds=2
+        )
+        assert status.payload["reason"] == ""
