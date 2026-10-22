@@ -86,3 +86,56 @@ existing bytes.
 
 Score batch IDs include the barrier or final phase and their durable recovery key.
 This keeps ordinary and final judging of the same candidate distinct during replay.
+
+## CI timing and isolation
+
+CI uses separate pytest-xdist worker processes inside pytest-split shards.
+Branch pushes use 20 jobs: core (two Python versions × two shards), extras
+(two versions × three shards), lowest-direct core (three shards), lowest-direct
+with all extras (two shards), macOS (four shards), and docs. Both lowest-direct
+configurations use Python 3.11 and preserve their resolved environment with
+`uv run --no-sync`. Main also tests core Python 3.12 and macOS Python 3.11;
+two shards per macOS version keep its total at four jobs. Keep
+filesystem writes under `tmp_path`, bind test servers to port 0, and reap children
+in fixture teardown or `finally`. Collection must produce identical node IDs in
+every worker; inventories built from weak subclass registries must discard
+unreachable classes and use stable ordering. Process-local monkeypatches do not
+require serial execution. Tests that assert authoritative LiteLLM accounting
+after `acompletion` must flush its background logging worker before draining
+the scope; completion itself does not await the callback. Tests of timeout
+accounting must establish call admission with an event before expiring the real
+round timer; short startup deadlines can expire before any call exists. Unknown-write
+renewal tests must observe takeover explicitly and leave enough lease lifetime
+for CI scheduling noise. The moto development
+floor includes conditional S3 `IfMatch` support, required by store CAS tests.
+
+The committed `.test_durations` balances shards with `least_duration`.
+Each CI shard refreshes its measured subset using `--store-durations
+--clean-durations --durations-path test-durations.json` and uploads a uniquely
+named `durations-*` artifact. Refresh after substantial test changes from a
+completed green CI run (do not run the full suite on the development laptop):
+
+```bash
+uv run gh run download RUN_ID -R shreyasvinaya/swarm-arena \
+  --pattern 'durations-*' --dir /tmp/swarm-ci-durations
+uv run python - <<'PYTHON'
+import json
+from collections import defaultdict
+from pathlib import Path
+from statistics import median
+
+samples = defaultdict(list)
+for artifact in Path("/tmp/swarm-ci-durations").glob("*/test-durations.json"):
+    for nodeid, seconds in json.loads(artifact.read_text()).items():
+        samples[nodeid].append(seconds)
+assert samples, "No duration artifacts found"
+Path(".test_durations").write_text(
+    json.dumps({key: round(median(values), 6) for key, values in samples.items()},
+               indent=2, sort_keys=True) + "\n"
+)
+PYTHON
+```
+
+Use an empty download directory for each refresh. Review and commit the resulting
+file. Durations are scheduling hints, never test timeouts or grounds for skipping
+a test. New tests without measurements receive pytest-split's mean estimate.
