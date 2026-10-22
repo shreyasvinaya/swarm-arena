@@ -12,6 +12,9 @@ from typing import Any, cast
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _agent.conftest import ctx_env as ctx_env
 from _agent.conftest import rt_env as rt_env
 from _fakes.agent_ctx import FakeAgentContext
@@ -217,9 +220,9 @@ async def test_round_timeout_charges_the_cut_call_without_waiting(
     timers: list[anyio.CancelScope] = []
     original_timer_scope = _manager._local_timer_scope
 
-    def observed_timer(timer: anyio.CancelScope) -> Any:
+    def observed_timer(timer: anyio.CancelScope, *, relay_provider_stop: bool = False) -> Any:
         timers.append(timer)
-        return original_timer_scope(timer)
+        return original_timer_scope(timer, relay_provider_stop=relay_provider_stop)
 
     monkeypatch.setattr(_manager, "_local_timer_scope", observed_timer)
     fake = HeldModel()
