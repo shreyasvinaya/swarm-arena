@@ -1789,3 +1789,45 @@ async def test_provider_probe_preserves_newer_failure_and_permanent_stops(
         assert service.stopped()[slot.address] == {"anthropic"}
     else:
         assert slot.address not in service.stopped()
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal", "caller"])
+async def test_provider_probe_preserves_owner_controls(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    from swarm_arena._engine import stops as stops_module
+    from swarm_arena._errors import _SignalCategory
+
+    slot = _runner("a")
+    stops = env.deps.provider_stops
+    stops.register(slot.address, frozenset({"anthropic"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    slot.status = AgentStatus.STOPPED
+    entered = anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        entered.set()
+        if control == "caller":
+            await anyio.sleep_forever()
+        if control == "fenced":
+            raise _core_error(Fenced, "run ownership lost")
+        raise _core_error(RuntimeError, "terminal probe", _category=_SignalCategory.TERMINAL)
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    runner = _round(env, [slot])
+    if control == "caller":
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel() -> None:
+                    await entered.wait()
+                    scope.cancel()
+
+                tasks.start_soon(cancel)
+                await runner._probe_stopped(2)
+                pytest.fail("probe swallowed caller cancellation")
+        assert scope.cancelled_caught
+    else:
+        with pytest.raises(Fenced if control == "fenced" else RuntimeError):
+            await runner._probe_stopped(2)
+    assert stops.stopped()[slot.address] == {"anthropic"}

@@ -1,5 +1,6 @@
 """Run parallel manager rounds against one durable, fixed frontier."""
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -76,6 +77,8 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from swarm_arena._engine.goal import GoalRunner
@@ -854,7 +857,7 @@ class RoundRunner:
             self._counters[key].setdefault("tool_runs", len(ids))
         self.started_runs = {**{key: len(ids) for key, ids in started.items()}, **self.started_runs}
 
-    async def _probe_stopped(self, round: int) -> None:
+    async def _probe_stopped(self, round: int) -> bool:
         """Probe this goal's saved causes within the owner's preparation lifetime."""
         service = self.deps.provider_stops
         paused = service.stopped()
@@ -930,7 +933,27 @@ class RoundRunner:
                         BaseExceptionGroup("probe cleanup", [failure, error]) if failure else error
                     )
             if failure is not None:
-                boundary.contain(failure, RuntimeError, "provider probe")
+                # Classify inside an except block so genuine cancellation stays
+                # attributable to the caller's AnyIO scope after cleanup.
+                try:
+                    raise failure
+                except BaseException as error:
+                    classified = boundary.classify(error)
+                    category = _core_category(classified)
+                    if category is _SignalCategory.TERMINAL:
+                        raise classified from None
+                    if (
+                        category is _SignalCategory.LIMIT
+                        and isinstance(classified, LimitReached)
+                        and classified.limit == "budget"
+                    ):
+                        deps.stops.goal_budget.add(self.goal_id)
+                        return False
+                    if category is not _SignalCategory.PROVIDER:
+                        _logger.warning(
+                            "provider probe failed: %s", _exception_type_name(classified)
+                        )
+                    healthy = False
             boundary.propagate_control(RuntimeError())
             if healthy:
                 await service.recover(provider, generation=generation)
@@ -943,6 +966,7 @@ class RoundRunner:
             ):
                 service.activate(slot.address)
                 slot.status = AgentStatus.ACTIVE
+        return True
 
     async def run(self, round: int) -> RoundOutcome:
         """
@@ -972,10 +996,13 @@ class RoundRunner:
         agents = [slot for slot in self.agents if slot.status not in _INACTIVE]
         private_paths = judge_private_paths(self.plan)
 
-        async def prepare() -> tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]]:
+        async def prepare() -> (
+            tuple[Frontier, dict[str, BoardView], dict[str, dict[str, str]]] | None
+        ):
             await self._restore(round)
-            if self.frontier is None:
-                await self._probe_stopped(round)
+            if self.frontier is None and not await self._probe_stopped(round):
+                supervisor._stop()
+                return None
             agents[:] = [slot for slot in self.agents if slot.status not in _INACTIVE]
             frontier = await self._frontier(round, agents)
             parents = await self._parent_views(frontier)

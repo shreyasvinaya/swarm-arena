@@ -2836,13 +2836,13 @@ async def test_public_resume_refuses_planning_session_without_mutation(
     assert read_owner(store) == owner
 
 
-@pytest.mark.parametrize("healthy", [True, False])
+@pytest.mark.parametrize("healthy", [True, False, "ordinary", "budget"])
 async def test_provider_causes_survive_takeover_and_only_fresh_round_probes(
     tmp_path: Path,
     run_config: RunConfig,
     recorders: dict[str, _Recorder],
     monkeypatch: pytest.MonkeyPatch,
-    healthy: bool,
+    healthy: bool | str,
 ) -> None:
     from swarm_arena._budget.llm_scope import LLMScope
     from swarm_arena._engine import stops as stops_module
@@ -2866,16 +2866,28 @@ async def test_provider_causes_survive_takeover_and_only_fresh_round_probes(
 
     async def probe(provider: str, scope: LLMScope) -> bool:
         seen.append((provider, scope.round))
-        return healthy
+        if healthy == "ordinary":
+            raise KeyError("private-probe-message")
+        if healthy == "budget":
+            from swarm_arena._budget.amount import Amount
+
+            await scope.tranche.reserve_call(Amount(usd=1_000_000))
+        return healthy is True
 
     monkeypatch.setattr(stops_module, "_probe", probe)
     await Swarm(c.config).resume(c.run_id, force=True)
     assert seen == [("retired-provider", 2)]
     starts = [e for e in _events(c, "tool_start") if e.agent == "a"]
-    assert [e.round for e in starts] == ([2] if healthy else [])
+    assert [e.round for e in starts] == ([2] if healthy is True else [])
     transitions = [e.payload for e in _events(c, "provider_failed")]
-    assert any(p.get("transition") == "recovered" for p in transitions) is healthy
+    assert any(p.get("transition") == "recovered" for p in transitions) is (healthy is True)
     assert not RunState.from_events(_events(c)).provider_causes
+    if healthy == "budget":
+        assert (
+            next(e for e in _events(c, "goal_finished") if e.goal_id == "g").payload["reason"]
+            == "goal budget"
+        )
+    assert "private-probe-message" not in str([e.payload for e in _events(c)])
 
 
 async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(

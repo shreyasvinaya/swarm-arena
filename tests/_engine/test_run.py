@@ -1652,3 +1652,57 @@ json.dump({'data': {}, 'failed_provider': 'fake'} if n == 1 else {'data': {'y': 
         (1, "provider_failed"),
         (2, "ok"),
     ]
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "budget"])
+async def test_provider_probe_failure_is_goal_local(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from _fakes.tools import ProviderPyTool
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    cfg = with_limits(
+        run_config, max_usd=10.0, max_concurrent_goals=2, default_run_reservation=Estimate(usd=0.1)
+    )
+    code = """
+import json, os
+json.dump({'data': {}, 'failed_provider': 'fake'}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
+"""
+    g = plan(goal_id="g", rounds=3, tool=ProviderPyTool({"code": code}))
+    peer = plan(goal_id="g", rounds=3).teams[0].agents[0].model_copy(update={"name": "peer"})
+    g.teams[0].agents.append(peer)
+    h = plan(goal_id="h", rounds=3)
+    calls: list[int] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        calls.append(scope.round)
+        if failure == "budget":
+            await scope.tranche.reserve_call(Amount(usd=1_000_000))
+        raise KeyError("private-probe-message")
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(cfg).run([g, h], run_id="probe-failure")
+    ev = all_events(cfg)
+    assert calls == ([2] if failure == "budget" else [2, 3])
+    assert {e.goal_id for e in ev if e.type == "goal_finished"} == {"g", "h"}
+    assert max(e.round for e in ev if e.type == "round_started" and e.goal_id == "h") == 3
+    assert not any(e.payload.get("transition") == "recovered" for e in ev)
+    if failure == "budget":
+        assert max(e.round for e in ev if e.type == "round_started" and e.goal_id == "g") == 1
+        assert (
+            next(e for e in ev if e.type == "goal_finished" and e.goal_id == "g").payload["reason"]
+            == "goal budget"
+        )
+    else:
+        assert any(
+            e.type == "agent_status" and e.goal_id == "g" and e.agent == "peer" and e.round == 3
+            for e in ev
+        )
+        assert "KeyError" in caplog.text
+    assert "private-probe-message" not in caplog.text + str([e.payload for e in ev])

@@ -447,7 +447,9 @@ building its frontier or allocating shares. The probe uses the goal's judges
 budget, a manager scope, input `ping`, and `max_tokens=1`; both response-cache
 reads and writes are bypassed. Accounting drains before its tranche closes.
 With no probe adapter or no catalog alias for the saved provider, recovery
-succeeds without a model call.
+succeeds without a model call. An ordinary probe error leaves the provider
+paused and logs only the error type. A refused probe reservation ends that goal's
+main rounds through the goal-budget stop path; other goals continue.
 
 Recovery clears only the generation that was probed. A newer failure or another
 unresolved provider keeps the agent paused. Recovery does not revive a pruned or
