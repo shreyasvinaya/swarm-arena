@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   # Each test job runs one of three disjoint groups of the suite (pytest-split).
-  # Tests still run one at a time inside each runner, so per-runner load does not change.
+  # Separate worker processes overlap I/O waits inside each shard.
   core:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     # No extras: proves that the core imports and passes with no optional dependency.
@@ -40,7 +40,12 @@ jobs:
         run: uv run ruff check .
       - if: matrix.shard == 1
         run: uv run ruff format --check .
-      - run: uv run pytest --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - run: uv run pytest -n 4 --dist worksteal --durations=25 --store-durations --durations-path test-durations.json --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durations-core-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
+          path: test-durations.json
 
   extras:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -58,7 +63,12 @@ jobs:
       - run: uv sync --all-extras --all-groups
       - if: matrix.shard == 1
         run: uv run ty check
-      - run: uv run pytest --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - run: uv run pytest -n 4 --dist worksteal --durations=25 --store-durations --durations-path test-durations.json --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durations-extras-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
+          path: test-durations.json
       - if: matrix.shard == 1
         run: uv run pytest -m s3 -v
 
@@ -86,7 +96,12 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv sync --all-groups --resolution lowest-direct --upgrade
-      - run: uv run --no-sync pytest -q --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - run: uv run --no-sync pytest -q -n 4 --dist worksteal --durations=25 --store-durations --durations-path test-durations.json --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durations-lowest-direct-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
+          path: test-durations.json
 
   macos:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -103,7 +118,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-groups
-      - run: uv run pytest -q --durations=25 --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - run: uv run pytest -q -n 3 --dist worksteal --durations=25 --store-durations --durations-path test-durations.json --splits 3 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durations-macos-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
+          path: test-durations.json
 
   pr-verify:
     # Same-repository PRs reuse the push run of their head commit instead of running
