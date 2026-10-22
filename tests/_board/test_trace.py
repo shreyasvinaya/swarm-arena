@@ -1007,8 +1007,11 @@ def test_llm_calls_of_run_without_committed_head(tmp_path: Path) -> None:
 def test_unreadable_planning_session_does_not_block_healthy_trace(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, damage: str
 ) -> None:
+    import logging
+
     from _fakes.trace_calls import _call, _record
 
+    caplog.set_level(logging.DEBUG, logger="swarm_arena.board")
     root = str(tmp_path / "runs")
     session = FakeRun(root, "damaged-session")
     call = _record(_call(session, "planner", "planner"))
@@ -1035,6 +1038,20 @@ def test_unreadable_planning_session_does_not_block_healthy_trace(
         assert any("c-healthy" in line for line in trace(board, "c-healthy"))
         assert "planning session damaged-session: not found" in trace(board, "c-linked")
         assert "damaged-session" in caplog.text
+        assert "session-secret-sentinel" not in caplog.text
+        for _ in range(2):
+            board.frontier()
+        messages = [r for r in caplog.records if "cannot read planning session" in r.message]
+        assert [r.levelno for r in messages] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+        # Moving only the producing run does not create a new session head.
+        linked.commit(EventDraft(type=EventType.WATCHDOG))
+        board.frontier()
+        assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+        if damage != "owner":
+            # A new unreadable session head gets its own warning.
+            session.commit(EventDraft(type=EventType.WATCHDOG))
+            board.frontier()
+            assert sum(r.levelno == logging.WARNING for r in caplog.records) == 2
         assert "session-secret-sentinel" not in caplog.text
     finally:
         board.close()

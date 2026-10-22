@@ -246,6 +246,7 @@ class ArenaBoard(Board):
         self._learnings: dict[str, Learning] = {}
         self._run_plans: dict[tuple[str, str], tuple[Frontier.Mark, _RunPlans]] = {}
         self._session_calls: dict[tuple[str, str], tuple[Head, _SessionCalls]] = {}
+        self._session_read_warnings: set[tuple[tuple[str, str], Head | None]] = set()
 
     @property
     def config(self) -> Config:
@@ -342,7 +343,7 @@ class ArenaBoard(Board):
     def _sessions_at(
         self, frontier: Frontier, plans: dict[str, _RunPlans]
     ) -> dict[tuple[str, str], "_SessionCalls | None"]:
-        """Capture each standalone session once, from its producing run's root."""
+        """Capture sessions from producing roots; warn once per unreadable head."""
         from swarm_arena._board.trace import _calls_at, _SessionCalls
 
         previous_state = self._read_state()
@@ -368,6 +369,7 @@ class ArenaBoard(Board):
             # Publication is synchronous worker preparation. Lease-owning
             # callers retain cancellation on their existing outer boundary.
             outcome = _Outcome(capture_caller=False)
+            head: Head | None = None
             try:
                 store = run_store(root, session_id)
                 owner = read_owner(store)
@@ -385,7 +387,10 @@ class ArenaBoard(Board):
                 sessions[key] = session
             except (StorageError, OSError, ValueError) as error:
                 outcome.propagate_control(error)
-                _LOG.warning("cannot read planning session %s", session_id)
+                warning = (key, head)
+                log = _LOG.debug if warning in self._session_read_warnings else _LOG.warning
+                log("cannot read planning session %s", session_id)
+                self._session_read_warnings.add(warning)
                 # An unreadable session is not a capture; retry next refresh.
         return sessions
 
@@ -495,6 +500,7 @@ class ArenaBoard(Board):
             self._caches.clear()
             self._run_plans.clear()
             self._session_calls.clear()
+            self._session_read_warnings.clear()
             self._published = _Published(Frontier(), {}, {}, (), None, lifetime)
         # Neither publication nor refresh locks may be held while readers drain.
         lifetime.wait()
