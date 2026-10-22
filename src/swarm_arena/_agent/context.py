@@ -41,7 +41,7 @@ from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import Estimate
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.runner import for_manager
 from swarm_arena._tooling.staging import effective_files
@@ -342,6 +342,7 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
     except KeyboardInterrupt:
         raise
     except BaseException as error:
+        _propagate_control(error)
         error = _classify_outcome(error)
         raise _core_signal(
             SoftError(f"invalid tool metadata: {_exception_type_name(error)}")

@@ -24,6 +24,22 @@ from swarm_arena.executor import Executor, Job
 from swarm_arena.manager import LimitReached
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_request_hook_preserves_terminal(nested: bool) -> None:
+    from swarm_arena._agent.tool_run import _request_hook
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    def fail() -> None:
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("request", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        _request_hook(fail)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 class _QueuedExecutor(Executor):
     def __init__(self, delegate: Executor) -> None:
         super().__init__()

@@ -96,7 +96,7 @@ async def run_checks(
 
     Each check receives its own shallow context copy, sharing the executor and
     id source. Invalid results fail closed after lax model revalidation. Check
-    exceptions expose only their types, while fencing always propagates.
+    exceptions expose only their types, while registered controls always propagate.
     Returned-model serializers and validation run in a cancellable daemon;
     callers retain control of the check's deadline and interruption result.
 
@@ -138,6 +138,7 @@ async def run_checks(
         try:
             result = await check.check(candidate, copy(ctx))
         except BaseException as error:
+            outcome.propagate_control(error)
             error = outcome.classify(error)
             results.append(
                 CheckResult(

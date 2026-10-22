@@ -35,6 +35,25 @@ from swarm_arena._model.ref import (
 )
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_validate_config_preserves_terminal(nested: bool) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena._model.ref import _validate_config
+
+    class Input(BaseModel):
+        @model_validator(mode="before")
+        @classmethod
+        def terminal(cls, value: Any) -> Any:
+            error = _stop_cleanup_error()
+            if nested:
+                raise BaseExceptionGroup("config", [BaseExceptionGroup("validator", [error])])
+            raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        _validate_config(Input, {}, where="component")
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 def test_path_format() -> None:
     assert Ref(path="a.b:C.D").path == "a.b:C.D"
     with pytest.raises(ValidationError):

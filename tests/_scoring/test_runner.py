@@ -33,6 +33,21 @@ from swarm_arena._scoring.script_judge import ScriptJudge
 SECRET = "runner-private-7e5cd74b"
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_run_checks_preserves_terminal(nested: bool) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import _core_category, _stop_cleanup_error
+
+    error: BaseException = _stop_cleanup_error()
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(side_effect=error))
+    with pytest.raises(RuntimeError) as caught:
+        await run_checks(_cand(), [("check", check)], _check_ctx())
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 def _cand(candidate_id: str = "c-1", *, failed: bool = False, **fields: Any) -> Candidate:
     checks = [CheckResult(check="gate", passed=False)] if failed else []
     defaults: dict[str, Any] = {"id": candidate_id, "checks": checks}

@@ -46,6 +46,22 @@ from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_plan, snapshot_ref
 from swarm_arena._tooling.tool import effective_tool_ref
 
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_safe_call_preserves_terminal(nested: bool) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    def fail() -> None:
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("admission", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        validation._safe_call("/refs", fail)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 J_A = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="a")
 J_B = Ref(path="_fakes.tools:FixedJudge", config={"value": 2}, name="b")
 MANAGER = Ref(path="_fakes.tools:NoopManager")

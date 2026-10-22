@@ -17,7 +17,7 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.results import Candidate, Score
 from swarm_arena._model.tooling import DEFAULT_GRACE_S, EnvName, GraceS, RunStatus, TimeoutS
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _Outcome
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.script_check import _preflight_files, _result_error
 from swarm_arena._tooling.script_tool import script_command
@@ -232,12 +232,14 @@ class ScriptJudge(Judge):
             except BaseException as error:
                 raise outcome.classify(error) from None
 
+        outcome = _Outcome()
         try:
             async with anyio.create_task_group() as group:
                 for index, candidate in enumerate(candidates):
                     group.start_soon(run, index, candidate)
         except BaseExceptionGroup as errors:
-            error = _classify_outcome(errors)
+            outcome.propagate_control(errors)
+            error = outcome.classify(errors)
             if len(errors.exceptions) == 1 and not isinstance(
                 errors.exceptions[0], BaseExceptionGroup
             ):

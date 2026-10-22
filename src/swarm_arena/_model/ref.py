@@ -241,6 +241,7 @@ def _validate_config(model_cls: type[BaseModel], data: object, *, where: str) ->
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                _propagate_control(error)
                 error = _classify_outcome(error)
                 safe = _sanitize_validation_error(model_cls, error)
             except RecursionError:

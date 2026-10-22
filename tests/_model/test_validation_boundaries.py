@@ -32,6 +32,25 @@ from swarm_arena._model.ref import _validate_config
 SECRET = "72637a4e-d59e-5316-bb5e-d65f326c5edf"
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_validation_wrapper_preserves_terminal(nested: bool) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena._model.base import FrozenModel
+
+    class Input(FrozenModel):
+        @model_validator(mode="before")
+        @classmethod
+        def terminal(cls, value: Any) -> Any:
+            error = _stop_cleanup_error()
+            if nested:
+                raise BaseExceptionGroup("model", [BaseExceptionGroup("validator", [error])])
+            raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        Input()
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 def validate(model: type[BaseModel], entry: str, data: dict[str, Any]) -> BaseModel:
     if entry == "constructor":
         return model(**data)

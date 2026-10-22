@@ -18,6 +18,23 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_script_judge_preserves_terminal(nested: bool) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    error: BaseException = _stop_cleanup_error()
+    if nested:
+        error = BaseExceptionGroup("command", [BaseExceptionGroup("executor", [error])])
+    ctx = JudgeContext(goal=GOAL, executor=RecordingExecutor(), artifact_root="/unused")
+    ctx.execute = AsyncMock(side_effect=error)
+    judge = ScriptJudge(command=["unused"])
+    with pytest.raises(RuntimeError) as caught:
+        await judge.judge(GOAL, [cand()], ctx)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 def sj(tmp_path: Path, artifacts: ArtifactStore, body: str, **cfg: Any) -> ScriptJudge:
     path = tmp_path / "judge/score.py"
     path.parent.mkdir(exist_ok=True)

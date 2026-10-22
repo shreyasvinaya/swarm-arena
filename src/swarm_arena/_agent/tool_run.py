@@ -38,7 +38,7 @@ from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
 from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
-from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _has_core_fenced, _Outcome, _propagate_control
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
 from swarm_arena._store.base import open_store
@@ -350,6 +350,7 @@ def _request_hook(hook: Callable[..., _T], *args: Any) -> _T:
     except KeyboardInterrupt:
         raise
     except BaseException as error:
+        _propagate_control(error)
         error = _classify_outcome(error)
         raise _core_signal(
             SoftError(f"invalid tool request: {_exception_type_name(error)}")

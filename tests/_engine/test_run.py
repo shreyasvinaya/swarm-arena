@@ -31,6 +31,34 @@ from swarm_arena._store.local import LocalStore
 from swarm_arena.manager import AgentContext, RoundReport
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["startup_models", "close_executor"])
+async def test_startup_and_shutdown_preserve_terminal(site: str, nested: bool) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine.run import _check_startup_models, _close_executor
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    def fail() -> None:
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("engine", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    operation = (
+        _check_startup_models(RunConfig(), Mock(models=fail))
+        if site == "startup_models"
+        else _close_executor(
+            Mock(aclose=AsyncMock(side_effect=fail)),
+            RunConfig(settle_timeout_s=2),
+            failed=False,
+        )
+    )
+    with pytest.raises(RuntimeError) as caught:
+        await operation
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
 class RecordingManager(ScriptedManager):
     results: ClassVar[list[LLMCall | None]] = []
     pause_second: ClassVar[anyio.Event | None] = None

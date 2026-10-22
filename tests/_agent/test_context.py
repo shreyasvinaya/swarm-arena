@@ -1405,3 +1405,21 @@ async def test_owned_action_inherits_engine_provider_deadline(expired: bool) -> 
         with pytest.raises(LimitReached) as caught:
             _check_provider_admission()
         assert caught.value.limit == ("round_timeout_s" if expired else "stop")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_prepare_metadata_preserves_terminal(nested: bool) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._agent.context import _prepare_metadata
+    from swarm_arena._errors import _stop_cleanup_error
+
+    def fail() -> None:
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("metadata", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        _prepare_metadata(Mock(get_description=fail), [])
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL

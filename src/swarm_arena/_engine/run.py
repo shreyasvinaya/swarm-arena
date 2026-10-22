@@ -292,10 +292,7 @@ async def _check_startup_models(config: RunConfig, replanner: Planner | None) ->
     try:
         errors, warnings = await run_sync_daemon(_startup_models, config, replanner)
     except BaseException as error:
-        error = outcome.classify(error)
-        raise _core_error(
-            ValueError, f"model checks failed: {_exception_type_name(error)}"
-        ) from None
+        outcome.contain(error, ValueError, "model checks")
     if errors:
         raise _core_error(ValueError, "\n".join(errors)) from None
     return warnings
@@ -448,10 +445,7 @@ async def _close_executor(executor: Executor, config: RunConfig, *, failed: bool
             await executor.aclose()
         except BaseException as exc:
             if not failed and not shutdown.cancel_called:
-                exc = outcome.classify(exc)
-                raise _core_error(
-                    RuntimeError, f"executor shutdown failed: {_exception_type_name(exc)}"
-                ) from None
+                outcome.contain(exc, RuntimeError, "executor shutdown")
 
 
 def _promote(stage: Path, artifacts: ArtifactStore) -> None:

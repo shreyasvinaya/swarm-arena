@@ -283,6 +283,7 @@ def _validation_wrapper(
             if isinstance(error, PydanticErrorMixin):
                 raise
             try:
+                _propagate_control(error)
                 error = _classify_outcome(error)
                 safe = _sanitize_validation_error(
                     model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
