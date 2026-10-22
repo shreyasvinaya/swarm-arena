@@ -2360,6 +2360,7 @@ async def test_state_free_reservation_terminal_escapes_manager(
 )
 async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) -> None:
     import os
+    import sys
 
     import anyio
     from _fakes.non_agent import FailingPlanner
@@ -2380,7 +2381,7 @@ async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) ->
     )
     with anyio.fail_after(60):
         process = await anyio.run_process(
-            ["uv", "run", "--project", str(repo), "python", "-c", script, str(tmp_path), boundary],
+            [sys.executable, "-c", script, str(tmp_path), boundary],
             cwd=tmp_path,
             env=environment,
             check=False,

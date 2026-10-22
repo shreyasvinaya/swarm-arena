@@ -31,6 +31,82 @@ plan. Relative storage roots follow the command's working directory.
 :language: toml
 ```
 
+## From the command line
+
+Validate a manual plan and print its worst-case estimate and admission warnings
+without starting a run or asking for approval:
+
+```sh
+uv run swarm-arena plan examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
+```
+
+Manual admission checks non-human catalog references before importing them and
+snapshots files against the plan's directory. The estimate uses the same effective
+round and convergence configurations as `run`; an uncapped unit prints `unlimited`.
+Every admission error is printed on stderr with exit 1.
+
+For model-generated planning, install the `llm` extra and supply a run configuration
+with a planner-role model alias, a human-approved `planner_catalog`, and enough
+token or USD budget for the planner. The catalog configuration in
+[LLM planning](#llm-planning) is also usable here after saving it with
+`config.dumps()` to `run.toml`. Create `goals/goal.toml` with just a `[goal]` table,
+for example:
+
+```toml
+[goal]
+id = "fit"
+namespace = "optimization"
+title = "Find a good solution using the approved catalog"
+```
+
+Then generate a plan, or review its TOML in the terminal before saving:
+
+```sh
+uv run swarm-arena plan --llm --model planner run.toml goals/goal.toml
+uv run swarm-arena plan --together --model planner run.toml goals/goal.toml
+```
+
+`--instructions TEXT` adds trusted planning instructions. `-o OUT` selects an
+output path; its resolved parent must be the goal file's directory, including
+when the goal file is outside the working directory. Relative `-o` paths follow
+the working directory. Defaults are `goals/plan.llm.toml` and
+`goals/plan.together.toml`. An existing output is refused with exit 1 unless
+`--force` is supplied; an output outside the goal directory is a usage error
+(exit 2). Publication replaces the complete file atomically and checks for an
+existing file again when publishing without `--force`. A directory or symlink
+at the output path is refused before the planning session starts, even with
+`--force`. New files use the process umask; replacement preserves the existing
+file's permission mode. The complete file and its directory are synced before
+publication. Cancellation during preparation of the output prevents publication;
+the abandoned worker removes its temporary file when the pending I/O returns,
+but the file may remain if the process exits first. This `.swarm-plan-*` file
+is hidden, uniquely named and never read.
+
+The goal and catalog files resolve against the goal file's directory, using the
+same parent-directory convention as `Plan.load` even for a symlinked goal file. Source
+files are frozen through the shared staging helper before the model call; its
+[spool lifecycle](#llm-planning) also applies to CLI planning. Both generated and
+edited drafts must pass catalog admission and preserve the frozen human goal.
+Together mode uses the [terminal reviewer](#together), including feedback,
+editing, safe retry diagnostics and EOF handling.
+
+One planning session covers generation and all reviews. The CLI saves only after
+validation and session cleanup succeed, then prints the output path and planning
+session ID. The file retains `origin = "llm"` or `origin = "together"` and its
+first-line session comment. Run it with, for example:
+
+```sh
+uv run swarm-arena run --yes run.toml goals/plan.llm.toml
+```
+
+The execution journal links to the planning session, so `trace` can show its
+planner calls. The printed planning session ID is for accounting and provenance;
+a planning session cannot be resumed. Initialization, settlement, EOF and invalid
+draft failures do not save a plan or print success. Ctrl-C uses the shared CLI
+interrupt owner: the first cancels, the second permits cleanup, and a third may
+force exit. Normal interruption exits 130. Help and manual planning need no LLM
+extra unless the human configuration itself references optional components.
+
 ## Manual Python plans
 
 The same public models accept component instances as well as `Ref` objects.

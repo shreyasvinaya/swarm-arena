@@ -52,6 +52,8 @@ uv sync --all-extras --all-groups
 uv run swarm-arena run --yes examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
 ```
 
+`uv run swarm-arena plan examples/rosenbrock/run.toml examples/rosenbrock/plan.toml` validates and estimates a plan; [LLM and together modes](docs/planning-modes.md#from-the-command-line) generate journal-linked plan files.
+
 Two teams compare gradient descent and random search over at most two rounds.
 The CLI prints an estimate, the run directory, and `done: rosenbrock 2 finalists`.
 Read `<run-dir>/goals/rosenbrock/solution.json` for the ordered results; run data

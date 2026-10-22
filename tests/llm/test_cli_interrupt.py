@@ -10,22 +10,25 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+import pytest
+
 
 def test_double_interrupt_at_prompt_finishes_session(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
     cleanup, release, received, result = (
         tmp_path / name for name in ("cleanup", "release", "received", "result")
     )
     code = f"""
 import json, os, signal, termios
+from contextlib import asynccontextmanager
 from pathlib import Path
 import anyio
 from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import all_events
 from swarm_arena import Goal
-from swarm_arena._budget.tranche import Tranche
 from swarm_arena._cli import run_cmds
 from swarm_arena._cli.main import main
-from swarm_arena.llm import CollaborativePlanner, LLMPlanner
+from swarm_arena.llm import CollaborativePlanner, LLMPlanner, _planner
 from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
 
@@ -33,22 +36,27 @@ config = planner_config(Path.cwd())
 FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
 before = termios.tcgetattr(0)
 handler = signal.getsignal(signal.SIGINT)
-original_close = Tranche.close
-async def close(self):
-    Path({str(cleanup)!r}).write_text('ready')
-    saved = signal.getsignal(signal.SIGINT)
-    def observe(*args):
-        Path({str(received)!r}).write_text('signal')
-        saved(*args)
-    signal.signal(signal.SIGINT, observe)
-    try:
-        with anyio.fail_after(10):
-            while not Path({str(release)!r}).exists():
-                await anyio.sleep(0.01)
-    finally:
-        signal.signal(signal.SIGINT, saved)
-    return await original_close(self)
-Tranche.close = close
+original_session = _planner.planning_session
+@asynccontextmanager
+async def held_session(*args):
+    async with original_session(*args) as scope:
+        try:
+            yield scope
+        finally:
+            # This handshake precedes the real session exit and its settlement bound.
+            with anyio.fail_after(120, shield=True):
+                saved = signal.getsignal(signal.SIGINT)
+                def observe(*args):
+                    Path({str(received)!r}).write_text('signal')
+                    saved(*args)
+                signal.signal(signal.SIGINT, observe)
+                Path({str(cleanup)!r}).write_text('ready')
+                try:
+                    while not Path({str(release)!r}).exists():
+                        await anyio.sleep(0.01)
+                finally:
+                    signal.signal(signal.SIGINT, saved)
+_planner.planning_session = held_session
 async def operation(args):
     await CollaborativePlanner(LLMPlanner('planner'), TerminalReviewer()).plan(
         Goal(id='g', namespace='n'), config, None)
@@ -113,7 +121,10 @@ raise SystemExit(status)
         }
         assert b"Traceback" not in output
     finally:
-        with suppress(ProcessLookupError):
+        if not reaped:
+            exited, _ = os.waitpid(pid, os.WNOHANG)
+            reaped = bool(exited)
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
         if not reaped:
             os.waitpid(pid, 0)

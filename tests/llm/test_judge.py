@@ -1067,7 +1067,7 @@ async def test_partial_panel_public_resume_makes_no_new_calls(tmp_path: Path) ->
     )
     with anyio.fail_after(60):
         process = await anyio.run_process(
-            ["uv", "run", "--project", str(repo), "python", "-c", script, str(tmp_path)],
+            [sys.executable, "-c", script, str(tmp_path)],
             cwd=tmp_path,
             env=environment,
             check=False,
