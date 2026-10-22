@@ -1031,9 +1031,9 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
     from swarm_arena._exec.threads import run_sync_daemon
     from swarm_arena._journal.lease import Lease
 
-    # The stalled phase keeps a short renewal interval (ttl / 3) so a successor's fence is seen
-    # within the bound; the setup run keeps the default lease so CI load cannot fence it early.
-    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 1.5})
+    # A whole run needs at least a three-second lease under parallel CI load. Its one-second
+    # renewal interval still detects the successor inside the unchanged three-second bound.
+    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 3.0})
     run_id = "export-cancel"
     if resumed:
         await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
