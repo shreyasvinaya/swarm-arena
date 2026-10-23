@@ -342,8 +342,14 @@ async def test_chain_error_fails_waiters_at_once(tmp_path: Path) -> None:
         with pytest.raises(Fenced) as err:
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert isinstance(err.value.__cause__, ChainError)
-        with anyio.fail_after(60), pytest.raises(Fenced):
-            await w.append_durable(EventDraft(type=EventType.SETTLE))
+        yielded: list[bool] = []
+        checkpoint = asyncio.get_running_loop().call_soon(yielded.append, True)
+        try:
+            with anyio.fail_after(30), pytest.raises(Fenced):
+                await w.append_durable(EventDraft(type=EventType.SETTLE))
+            assert not yielded, "a latched failure must reject before yielding to the loop"
+        finally:
+            checkpoint.cancel()
     owner = read_owner(flaky)
     assert owner is not None
     assert owner[0].version == 1
@@ -662,9 +668,9 @@ async def test_cancelled_exit_finishes_commit_and_release(
 
 
 async def test_write_through_append_wakes_writer(store: LocalStore, tmp_path: Path) -> None:
-    async with _writer(store, tmp_path, group_window_s=0.01) as w:
+    async with _writer(store, tmp_path, group_window_s=0.01, sync_interval_s=3600) as w:
         w.append(EventDraft(type=EventType.RESERVE))
-        with anyio.fail_after(60):
+        with anyio.fail_after(30):
             while w.head is None:  # noqa: ASYNC110 - observe publication without requesting a commit
                 await anyio.sleep(0.001)
         assert w.head.seq == 1
