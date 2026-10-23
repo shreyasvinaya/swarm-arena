@@ -6,6 +6,7 @@ import re
 import signal
 import subprocess
 import sys
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -128,16 +129,52 @@ def _is_zombie(pid: int) -> bool:
     return done.stdout.strip().startswith("Z")
 
 
-def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
-    require_visible_proc()
-    p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
+@contextlib.contextmanager
+def _held_child(tmp_path: Path) -> Generator[tuple[subprocess.Popen[bytes], Path]]:
+    """
+    Hold a ready child until explicit release, then let it exit naturally.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Directory for the readiness and release markers.
+
+    Yields
+    ------
+    tuple[subprocess.Popen[bytes], Path]
+        Child process and release marker, with bounded failure cleanup.
+    """
+    ready, release = tmp_path / "child-ready", tmp_path / "child-release"
+    code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "deadline = time.monotonic() + 300\n"
+        "Path('child-ready').touch()\n"
+        "while not Path('child-release').exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise TimeoutError('child release deadline')\n"
+        "    time.sleep(0.01)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
+        assert wait_until(ready.exists, 60)
+        yield p, release
+    finally:
+        release.touch()
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=60)
+
+
+def test_group_has_live_member_ignores_an_unreaped_zombie(tmp_path: Path) -> None:
+    require_visible_proc()
+    with _held_child(tmp_path) as (p, release):
         assert group_has_live_member(p.pid)
+        release.touch()
         assert wait_until(lambda: _is_zombie(p.pid), 60)  # exited, not reaped
         assert not group_has_live_member(p.pid)
         assert pid_alive(p.pid)  # the unreaped leader still anchors the group id
-    finally:
-        p.wait()
+    assert p.returncode == 0
     assert not group_has_live_member(p.pid)
 
 
@@ -262,7 +299,7 @@ def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
         assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def _spawn(argv: list[str]) -> "subprocess.Popen[bytes]":
@@ -333,14 +370,13 @@ async def test_exit_watch_polls_waitid_without_pidfd(monkeypatch: pytest.MonkeyP
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
-def test_ps_scan_ignores_zombies() -> None:
-    p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
-    try:
+def test_ps_scan_ignores_zombies(tmp_path: Path) -> None:
+    with _held_child(tmp_path) as (p, release):
         assert procinfo._live_in_ps(p.pid)
+        release.touch()
         assert wait_until(lambda: _is_zombie(p.pid), 60)
         assert not procinfo._live_in_ps(p.pid)
-    finally:
-        p.wait()
+    assert p.returncode == 0
 
 
 def test_liveness_reads_as_alive_when_it_cannot_tell(
