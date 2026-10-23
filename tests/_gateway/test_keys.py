@@ -350,7 +350,10 @@ async def test_run_mismatch_refuses_before_creation(tmp_path: Path) -> None:
         assert not gw.created
 
 
-async def test_restore_from_events_and_legacy_creation_time(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing", ["run_id", "owner_epoch", "created_at"])
+async def test_restore_refuses_missing_creation_fields(tmp_path: Path, missing: str) -> None:
+    from pydantic import ValidationError
+
     gw = MemoryGateway()
     async with open_llm_run(tmp_path) as run:
         manager = _manager(gw, run)
@@ -361,19 +364,23 @@ async def test_restore_from_events_and_legacy_creation_time(tmp_path: Path) -> N
         restored = _manager(gw, run)
         restored.restore(events)
         assert restored.records()[0].closed_at == closed.closed_at
-        legacy = events[0].model_copy(
+        incomplete = events[0].model_copy(
             update={
                 "payload": {
                     key: value
                     for key, value in events[0].payload.items()
-                    if key not in {"created_at", "run_id", "owner_epoch"}
+                    if key != missing
                 }
             }
         )
-        restored.restore([legacy])
-        assert restored.records()[0].created_at == legacy.ts
+        with pytest.raises(ValidationError) as caught:
+            restored.restore([incomplete])
+        assert caught.value.errors(include_input=False, include_url=False) == [
+            {"type": "missing", "loc": (missing,), "msg": "Field required"}
+        ]
+        assert restored.records()[0].closed_at == closed.closed_at
         with pytest.raises(ValueError, match="binding mismatch"):
-            restored.restore([legacy.model_copy(update={"run_id": "foreign"})])
+            restored.restore([incomplete.model_copy(update={"run_id": "foreign"})])
 
 
 @pytest.mark.parametrize("nested", [False, True])
