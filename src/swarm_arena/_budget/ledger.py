@@ -806,6 +806,8 @@ class Ledger:
                 payload={
                     "id": reservation_id,
                     "actual": actual.model_dump(),
+                    "charged": target.model_dump(),
+                    "keep_charged": entry.reservation.keep_charged,
                     "estimated": estimated,
                     "overspend": overspend.model_dump() if overspend != Amount() else None,
                 },

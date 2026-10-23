@@ -3306,3 +3306,54 @@ async def test_curator_report_wait_observes_owner_interruptions(
         await asyncio.gather(task, return_exceptions=True)
         recorder.unbind_run(env.deps.run_id)
         monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", writer_check)
+
+
+async def test_round_close_reads_late_rows(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import events
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._gateway.keys import KeyManager, gateway_call_id
+    from swarm_arena.config import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = KeyManager.read_with_status
+    first: list[str] = []
+
+    async def reveal_after_first(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        result = await original(self, records, wait_first=wait_first)
+        if wait_first:
+            first.extend(call.id for call in result[0])
+            fake_gateway.add_spend(
+                records[0].key_id,
+                model="openai/chat-model",
+                cost_usd=0.02,
+                tokens=(1, 1),
+                call_id="late",
+            )
+        return result
+
+    monkeypatch.setattr(KeyManager, "read_with_status", reveal_after_first)
+    await Swarm(config).run(gateway_plan())
+    calls = events(config, "llm_call")
+    assert len(first) == 1
+    assert len(calls) == 2
+    closed = events(config, "round_closed")[0]
+    assert calls[0].seq < closed.seq < calls[1].seq
+    (key_id,) = fake_gateway.keys
+    late = fake_gateway._spend[-1][1]
+    assert calls[1].payload["call"]["litellm_call_id"] == gateway_call_id(
+        key_id, late["request_id"]
+    )
+    assert calls[1].payload["call"]["cost_usd"] == 0.02

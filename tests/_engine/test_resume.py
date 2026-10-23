@@ -3379,3 +3379,251 @@ async def test_orphan_batch_uses_shorter_executor_or_settlement_allowance(
     assert len(deadlines) == 3
     assert len(set(deadlines)) == 1
     assert all(0 < value <= min(margin, settlement) for value in remaining)
+
+
+async def _crash_with_gateway(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Crashed:
+    from swarm_arena._gateway.keys import KeyRecord, key_alias, key_metadata
+    from swarm_arena.config import GatewayConfig
+
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+        }
+    )
+    append = JournalWriter.append
+    reserve = Ledger.reserve
+
+    async def keyed_reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("kind") == "tool":
+            kwargs["keep_charged"] = True
+        return await reserve(self, *args, **kwargs)
+
+    def with_key(self: JournalWriter, draft: EventDraft) -> Event:
+        if draft.type == "tool_start":
+            candidate_id = draft.payload["candidate_id"]
+            alias = key_alias(candidate_id)
+            metadata = key_metadata(
+                candidate_id=candidate_id,
+                run_id="resume-run",
+                goal_id="g",
+                team="t",
+                agent=draft.agent,
+            )
+            status, response, _ = fake_gateway._route(
+                "POST",
+                "/key/generate",
+                {
+                    "key_alias": alias,
+                    "max_budget": 1,
+                    "metadata": metadata,
+                    "duration": "86400s",
+                    "default_estimated_output_tokens": 4096,
+                },
+                f"Bearer {fake_gateway.master_key}",
+            )
+            assert status == 200
+            record = KeyRecord(
+                candidate_id=candidate_id,
+                key_id=response["token_id"],
+                alias=alias,
+                reservation_id=draft.payload["reservation_id"],
+                max_budget_usd=1,
+                cap="soft",
+                run_id="resume-run",
+                owner_epoch=self.epoch,
+                goal_id="g",
+                team="t",
+                agent=draft.agent,
+                round=1,
+                created_at=utc_now(),
+            )
+            append(
+                self,
+                EventDraft(
+                    type="gateway_key",
+                    goal_id="g",
+                    team="t",
+                    agent=draft.agent,
+                    task_id=candidate_id,
+                    round=1,
+                    payload={"action": "created", **record.model_dump(mode="json")},
+                ),
+            )
+        return append(self, draft)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(JournalWriter, "append", with_key)
+        patches.setattr(Ledger, "reserve", keyed_reserve)
+        return await _crash(tmp_path, config, recorders)
+
+
+@pytest.mark.parametrize("retry_acquire", [False, True])
+async def test_resume_reads_back_open_keys(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_acquire: bool,
+) -> None:
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.keys import gateway_call_id
+
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    key_id = next(
+        key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-lost-g-b"
+    )
+    fake_gateway.add_spend(
+        key_id, model="openai/chat-model", cost_usd=0.02, tokens=(2, 1), call_id="late-after-crash"
+    )
+    row = fake_gateway._spend[-1][1]
+    managers: list[Any] = []
+    adapters: list[Any] = []
+    bind, adapter_for = module._bind_gateway, module.adapter_for
+
+    def capture_bind(*args: Any, **kwargs: Any) -> Any:
+        manager = bind(*args, **kwargs)
+        managers.append(manager)
+        return manager
+
+    def capture_adapter(*args: Any, **kwargs: Any) -> Any:
+        adapter = adapter_for(*args, **kwargs)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(module, "_bind_gateway", capture_bind)
+    monkeypatch.setattr(module, "adapter_for", capture_adapter)
+    if retry_acquire:
+        take_over = Lease.take_over.__func__
+        attempts: list[bool] = []
+
+        def race(cls: type[Lease], store: Store, **kwargs: Any) -> Lease:
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise _core_error(Fenced, "same-epoch renewal race")
+            return take_over(cls, store, **kwargs)
+
+        monkeypatch.setattr(Lease, "take_over", classmethod(race))
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        assert len(managers) == len(adapters) == 1
+        resumed = runner.resumed
+        assert resumed is not None
+        deps = resumed._services.deps
+        assert deps is not None
+        assert deps.gateway is managers[0]
+        assert deps.gateway._adapter is adapters[0]
+        assert runner._key_manager is deps.gateway
+        assert runner._gateway is not None
+        assert runner._gateway.adapter is adapters[0]
+        calls = list(resumed.state.llm_calls.values())
+        assert len(calls) == 1
+        assert calls[0].litellm_call_id == gateway_call_id(key_id, row["request_id"])
+        assert calls[0].candidate_id == "lost-g-b"
+        assert calls[0].cost_usd == 0.02
+        assert _events(crashed, "llm_call")[0].epoch == 2
+        assert await deps.gateway.read(deps.gateway.records(), wait_first=False) == []
+        assert len(_events(crashed, "llm_call")) == 1
+        assert resumed.ledger._charges[
+            next(
+                e.payload["reservation_id"]
+                for e in _events(crashed, "tool_start")
+                if e.payload["candidate_id"] == "lost-g-b"
+            )
+        ] == Amount(usd=1)
+    finally:
+        await runner.aclose()
+
+
+async def test_resume_closes_keys_of_lost_runs(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        lost_key = next(
+            key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-lost-g-b"
+        )
+        completed_key = next(
+            key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-c1"
+        )
+        assert fake_gateway.keys[lost_key]["blocked"] is True
+        assert fake_gateway.keys[completed_key]["blocked"] is False
+        closed = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "closed"]
+        assert [event.payload["key_id"] for event in closed] == [lost_key]
+        assert [e.payload["candidate_id"] for e in _events(crashed, "run_lost")] == ["lost-g-b"]
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("path", ["/key/block", "/spend/logs/v2"])
+async def test_resume_gateway_failure_is_value_free_and_replayable(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    fake_gateway.fail[path] = 500
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    await runner.aclose()
+    failures = [
+        e for e in _events(crashed, "gateway_key") if e.payload["action"].endswith("failed")
+    ]
+    assert len(failures) == 1
+    assert failures[0].payload["action"] == (
+        "close_failed" if path == "/key/block" else "read_failed"
+    )
+    assert fake_gateway.master_key not in repr(failures)
+    fake_gateway.fail.pop(path)
+    again = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        assert again.resumed is not None
+        assert again.resumed.epoch == 3
+    finally:
+        await again.aclose()
+
+
+async def test_resume_rechecks_gateway_hard_cap_before_takeover(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena.config import GatewayConfig
+
+    crashed = await _crash(tmp_path, run_config, recorders)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    before = read_owner(crashed.store)
+    config = crashed.config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url),
+            "limits": crashed.config.limits.model_copy(update={"max_usd": 2000}),
+        }
+    )
+
+    async def attempt() -> None:
+        runner = await resume_run(config, crashed.run_id, force=False, replanner=None)
+        await runner.aclose()
+
+    with pytest.raises(ValueError, match="strict profile not verified"):
+        await attempt()
+    assert read_owner(crashed.store) == before
+    assert not fake_gateway.keys
+    assert not _events(crashed, "takeover")

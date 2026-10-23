@@ -445,6 +445,77 @@ async def test_failed_or_incomplete_read_keeps_charge_and_warns_safely(
         assert SECRET not in caplog.text
 
 
+@pytest.mark.parametrize("mode", ["empty", "rows", "duplicate", "failed", "timeout"])
+async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path, mode: str) -> None:
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run, settle_timeout_s=0.05)
+        record, _ = await _open(manager, run)
+        if mode in {"rows", "duplicate"}:
+            gw.rows = [_row()]
+        if mode == "duplicate":
+            assert len(await manager.read([record], wait_first=False)) == 1
+        if mode == "failed":
+            gw.read_error = GatewayError(SECRET)
+        if mode == "timeout":
+            gw.read_release = anyio.Event()
+        with anyio.fail_after(30):
+            calls, status = await manager.read_with_status([record], wait_first=mode == "timeout")
+        assert status == {"failed": "failed", "timeout": "incomplete"}.get(mode, "ok")
+        assert len(calls) == (1 if mode == "rows" else 0)
+        assert SECRET not in status
+        assert await manager.read_with_status([], wait_first=False) == ([], "ok")
+
+
+async def test_read_with_status_reports_partial_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._gateway import keys
+
+    gw = MemoryGateway()
+    gw.rows = [_row(request_id="bad"), _row(request_id="good")]
+    record_call = keys.record_call
+
+    async def sometimes_fail(**kwargs: Any) -> Any:
+        if kwargs["litellm_call_id"] == gateway_call_id("hash-1", "bad"):
+            raise ValueError(SECRET)
+        return await record_call(**kwargs)
+
+    monkeypatch.setattr(keys, "record_call", sometimes_fail)
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        calls, status = await manager.read_with_status([record], wait_first=False)
+        assert status == "incomplete"
+        assert [call.litellm_call_id for call in calls] == [gateway_call_id("hash-1", "good")]
+        # The existing method retains its list-only, best-effort contract.
+        assert await manager.read([record], wait_first=False) == []
+
+
+async def test_restore_accepts_shared_gateway_key_actions(tmp_path: Path) -> None:
+    from typing import get_args
+
+    from swarm_arena._gateway.reports import GatewayKeyAction
+
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(MemoryGateway(), run)
+        record, _ = await _open(manager, run)
+        await run.journal.commit()
+        created = run.events("gateway_key")[0]
+        observations = [
+            created.model_copy(update={"payload": {"action": action, "error": "gateway failed"}})
+            for action in get_args(GatewayKeyAction)
+            if action not in {"created", "closed"}
+        ]
+        assert {e.payload["action"] for e in observations} >= {"read_failed", "close_failed"}
+        manager.restore([created, *observations])
+        assert manager.records() == [record]
+        invalid = created.model_copy(update={"payload": {"action": "unknown"}})
+        with pytest.raises(ValueError, match="invalid gateway key action"):
+            manager.restore([created, invalid])
+        assert manager.records() == [record]
+
+
 async def test_caller_cancel_interrupts_read_without_recording(tmp_path: Path) -> None:
     import asyncio
 
@@ -962,3 +1033,18 @@ def test_fake_gateway_deleted_alias_can_be_reused() -> None:
     )
     assert status == 200
     assert gateway._route("POST", "/key/generate", body, authorization)[0] == 200
+
+
+async def test_restore_accepts_engine_elapsed_metadata(tmp_path: Path) -> None:
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(MemoryGateway(), run)
+        record, _ = await _open(manager, run)
+        await run.journal.commit()
+        created = run.events("gateway_key")[0]
+        stamped = created.model_copy(
+            update={
+                "payload": {**created.payload, "run_elapsed_s": 2.5},
+            }
+        )
+        manager.restore([stamped])
+        assert manager.records() == [record]

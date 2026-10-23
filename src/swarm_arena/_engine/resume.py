@@ -181,11 +181,13 @@ class _ResumeServices:
         validated_head: Head,
         model_warnings: list[str],
         stops: StopState,
+        gateway: run_module._GatewaySetup | None = None,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
         self.stops = stops
+        self.gateway = gateway
         self.validated_head = validated_head
         self.model_warnings = model_warnings
         self.ready, self.close = anyio.Event(), anyio.Event()
@@ -300,6 +302,11 @@ class _ResumeServices:
                                 clock=clock,
                                 state=state,
                             ):
+                                gateway = run_module._bind_gateway(
+                                    self.gateway, config, journal, self.run_id
+                                )
+                                if gateway is not None:
+                                    gateway.restore(events)
                                 executor = await run_module._start_executor(config)
                                 killed: list[str] = []
                                 starts = {
@@ -358,6 +365,29 @@ class _ResumeServices:
                                             payload=payload,
                                         )
                                     )
+                                if gateway is not None:
+                                    completed = {
+                                        e.payload["candidate"]["id"]
+                                        for e in events
+                                        if e.type == EventType.TOOL_END
+                                    }
+                                    for record in gateway.records():
+                                        if (
+                                            record.closed_at is None
+                                            and record.candidate_id not in completed
+                                        ):
+                                            closed = await gateway.close(record)
+                                            if closed.closed_at is None:
+                                                journal.append(
+                                                    EventDraft(
+                                                        type=EventType.GATEWAY_KEY,
+                                                        payload={
+                                                            "action": "close_failed",
+                                                            "error": "gateway closure unconfirmed",
+                                                        },
+                                                    )
+                                                )
+                                    await run_module._read_gateway(journal, gateway)
                                 shares = weighted_shares(
                                     ledger.free(),
                                     {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
@@ -424,6 +454,7 @@ class _ResumeServices:
                                     },
                                     stops=stops,
                                     clock=clock,
+                                    gateway=gateway,
                                     admission=RunAdmission(
                                         config.limits.max_agents_total,
                                         [
@@ -689,6 +720,7 @@ async def resume_run(
         stops = StopState()
         validated_head: Head | None = None
         model_warnings: list[str] = []
+        gateway: run_module._GatewaySetup | None = None
 
         def validate(doc: OwnerDoc) -> None:
             nonlocal clock, validated_head
@@ -702,8 +734,10 @@ async def resume_run(
             validated_head = doc.head
 
         async def check_startup_models() -> None:
-            nonlocal model_warnings
+            nonlocal model_warnings, gateway
             model_warnings = await run_module._check_startup_models(config, replanner)
+            if gateway is None:
+                gateway = await run_module._prepare_gateway(config)
 
         lease = await _take_over(
             config,
@@ -727,6 +761,7 @@ async def resume_run(
             validated_head=validated_head,
             model_warnings=model_warnings,
             stops=stops,
+            gateway=gateway,
         )
         services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
         try:
@@ -735,7 +770,7 @@ async def resume_run(
                 await services._aclose()
             assert services.resumed is not None
             state = services.resumed.state
-            return run_module.RunRunner(
+            runner = run_module.RunRunner(
                 config,
                 [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
                 run_id=run_id,
@@ -743,6 +778,10 @@ async def resume_run(
                 replanner=replanner,
                 resumed=services.resumed,
             )
+            assert services.deps is not None
+            runner._gateway = gateway
+            runner._key_manager = services.deps.gateway
+            return runner
         except BaseException:
             if not services.closed:
                 await services._aclose(failed=True)

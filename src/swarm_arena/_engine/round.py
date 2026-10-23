@@ -50,6 +50,7 @@ from swarm_arena._errors import (
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.keys import KeyManager
 from swarm_arena._journal.a2a import agent_round_task, agent_task_id, task_to_json
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.llm_record import drain
@@ -123,6 +124,8 @@ class EngineDeps:
         Successfully attached namespaces across all admitted revisions.
     board_attach_lock : anyio.Lock
         Serialize namespace attachment across concurrent goals.
+    gateway : KeyManager or None, default=None
+        Run-owned tool keys, shared by ordinary, restarted and converge rounds.
 
     Examples
     --------
@@ -147,6 +150,7 @@ class EngineDeps:
     admission: RunAdmission | None = None
     board_namespaces: set[str] = field(default_factory=set)
     board_attach_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    gateway: KeyManager | None = None
 
     def __post_init__(self) -> None:
         """Use the provider latch already bound by new-run or resume setup."""
@@ -605,6 +609,7 @@ class RoundRunner:
             sibling_views=siblings,
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),
+            gateway=deps.gateway,
         )
 
     def _rankings(self) -> dict[str, str]:
