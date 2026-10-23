@@ -150,7 +150,10 @@ async def test_failed_condition_is_estimated(tmp_path: Path, setup: str, reason:
         assert report.spend_usd() == 1
         assert adapter.deleted == []
         assert adapter.windows == []
-        cast(Any, probe.confirm_dead).assert_awaited_once_with(started)
+        if setup in {"alive", "unknown"}:
+            cast(Any, probe.confirm_dead).assert_awaited_once_with(started)
+        else:
+            cast(Any, probe.confirm_dead).assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1124,3 +1127,174 @@ async def test_reconcile_requires_writer_identity_even_with_live_manager(tmp_pat
                 _manager=manager,
             )
         assert not adapter.blocked
+
+
+async def test_unclosed_tail_keys_progress_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Awaitable, Callable
+
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}") for n in range(14)]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    clock = 0.0
+
+    def deadline(journal: Any, *, timeout_s: float | None = None) -> float:
+        return clock + min(journal._settle_timeout_s, timeout_s or float("inf"))
+
+    async def slow(operation: Callable[[], Awaitable[Any]], deadline: float) -> Any:
+        nonlocal clock
+        if clock + 0.1 > deadline:
+            clock = deadline
+            raise reconcile._AllowanceExpired("reconcile time allowance exhausted")
+        clock += 0.1
+        return await operation()
+
+    monkeypatch.setattr(reconcile, "_gateway_deadline", deadline)
+    monkeypatch.setattr(reconcile, "_external", slow)
+    adapter = CapableGateway()
+    adapter.errors["preflight"] = GatewayError("profile unverified")
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    progress = []
+    for _ in range(12):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        progress.append(len(set(adapter.blocked)))
+    assert [key.key_id for key in report.keys] == [record.key_id for record in records]
+    assert progress[-1] == 14, progress
+    assert progress[7] == 14, progress
+    assert {
+        event.payload["key_id"]
+        for event in committed(config)
+        if event.type == "gateway_key" and event.payload["action"] == "closed"
+    } == {record.key_id for record in records}
+    assert all(key.label == "estimated" and not key.deleted for key in report.keys)
+    assert not adapter.windows
+    assert not adapter.deleted
+    before = identity.await_count
+    await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+    assert identity.await_count == before
+
+
+async def test_closed_ineligible_key_skips_identity_and_death_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    worker = executor()
+    async with open_llm_run(tmp_path) as run:
+        record = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        run.journal.append(created(record))
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": record.candidate_id,
+                    "reservation_id": record.reservation_id,
+                    "started": Job.Started(
+                        kind="dispatch", job_id="c-1", task_name="c-1", ray_job_id="old"
+                    ).model_dump(),
+                },
+            )
+        )
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key") + run.events("tool_dispatch"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=worker,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=None,
+        )
+        assert report.keys[0].label == "estimated"
+        identity.assert_not_awaited()
+        cast(AsyncMock, worker.confirm_dead).assert_not_awaited()
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+
+
+async def test_death_confirmation_allowance_is_unknown_without_gateway_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    worker = executor()
+    cast(AsyncMock, worker.confirm_dead).side_effect = reconcile._AllowanceExpired(
+        "reconcile time allowance exhausted"
+    )
+    async with open_llm_run(tmp_path) as run:
+        record = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        started = Job.Started(kind="dispatch", job_id="c-1", task_name="c-1", ray_job_id="old")
+        run.journal.append(created(record))
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": "c-1",
+                    "reservation_id": "res-c-1",
+                    "started": started.model_dump(mode="json"),
+                },
+            )
+        )
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            [*run.events("gateway_key"), *run.events("tool_dispatch")],
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=worker,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
+        assert report.keys[0].label == "estimated"
+        assert not report.keys[0].deleted
+        cast(AsyncMock, worker.confirm_dead).assert_awaited_once_with(started)
+        identity.assert_not_awaited()
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+
+
+async def test_unclosed_key_precedes_eligible_closed_key_without_rechecking_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    async with open_llm_run(tmp_path) as run:
+        first = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        tail = key_record(run.run_id, key_id="hash-tail", candidate_id="c-tail")
+        run.journal.append(created(first))
+        run.journal.append(created(tail))
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        assert [call.args[0].key_id for call in identity.await_args_list] == [
+            tail.key_id,
+            first.key_id,
+        ]
+        assert adapter.blocked == [tail.key_id]
+        assert adapter.deleted == [tail.key_id, first.key_id]
+        assert [key.key_id for key in report.keys] == [first.key_id, tail.key_id]
+        assert all(key.deleted for key in report.keys)

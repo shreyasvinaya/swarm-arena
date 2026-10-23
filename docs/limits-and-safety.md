@@ -276,8 +276,12 @@ overall allowance is at most `settle_timeout_s`, capped before inherited
 cancellation and writer closing/I/O deadlines. Each key has a fresh allowance
 of at most `request_timeout_s` within that overall bound. An operation whose
 allowance expired before entry reports `reconcile time allowance exhausted`,
-without claiming a gateway failure. Repeated calls skip deleted keys so later
-keys can progress. Resume's closure loop also has one bounded overall allowance;
+without claiming a gateway failure. Reconciliation visits keys without confirmed
+closure first. It checks identity once, immediately before blocking an unclosed
+key or reading eligible spend; already-closed keys with no eligible spend need
+no identity or process-death lookup. Repeated calls can therefore close later
+keys even when the pinned profile never permits deletion. Deleted keys reuse
+committed observations. Resume's closure loop also has one bounded overall allowance;
 unclosed keys remain available for reconciliation. Run-end reads and
 reconciliation finish before the final completion allowance is armed. Failure
 events include the nonsecret key and candidate IDs for later recovery.
