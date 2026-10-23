@@ -36,6 +36,7 @@ langfuse = [
     "langfuse>=5,<6",
     "openinference-instrumentation-openai-agents>=1.0.0",
 ]
+ray = ["ray[default]>=2.59,<3"]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -83,6 +84,9 @@ pydocstyle.convention = "numpy"
 "tests/_store/test_s3.py" = ["TID251"]
 "tests/testing/test_fake_model.py" = ["TID251"]
 "tests/_fakes/llm_components.py" = ["TID251"]
+"tests/e2e/test_rosenbrock_ray.py" = ["TID251"]
+"tests/e2e/test_ray_cancel.py" = ["TID251"]
+"tests/e2e/test_ray_dispatch_crash.py" = ["TID251"]
 "tests/e2e/test_rosenbrock_llm.py" = ["TID251"]
 "tests/e2e/test_autonomous_replan.py" = ["TID251"]
 "tests/e2e/test_llm_plan_file.py" = ["TID251"]

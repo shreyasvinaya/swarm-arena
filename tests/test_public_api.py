@@ -136,6 +136,14 @@ else:
     ]
 
 
+try:
+    importlib.metadata.version("ray")
+except importlib.metadata.PackageNotFoundError:
+    pass
+else:
+    PUBLIC["swarm_arena.ray"] = []
+
+
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_all_snapshot(module: str) -> None:
     names = importlib.import_module(module).__all__
@@ -238,7 +246,9 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
     } <= found
 
 
-CORE = sorted(set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm"})
+CORE = sorted(
+    set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
+)
 
 
 @pytest.mark.parametrize("pydantic_model", [False, True])
