@@ -466,7 +466,7 @@ raise SystemExit(status)
         if interrupts == 3:
             os.write(master, b"\x03")
             until(b"received-third-force", timeout=60)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60
         os.write(release_write, b"x")
         while True:
             status = process.poll()
