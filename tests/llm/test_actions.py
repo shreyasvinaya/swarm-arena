@@ -34,7 +34,7 @@ from pydantic import Field
 from swarm_arena import AgentSpec, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
 from swarm_arena._agent.context import _prepare_metadata
 from swarm_arena._board.arena import ArenaBoard
-from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
+from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted
 from swarm_arena._board.pointers import RunPointer, write_pointer
 from swarm_arena._errors import (
     Fenced,
@@ -44,6 +44,7 @@ from swarm_arena._errors import (
     _stop_cleanup_error,
 )
 from swarm_arena._model.base import FrozenModel, JsonValue
+from swarm_arena._model.canonical import canonical_json
 from swarm_arena._store.base import open_store
 from swarm_arena.board import Row
 from swarm_arena.llm._actions import MAX_RESULT_CHARS, build_tools, candidate_view
@@ -520,21 +521,27 @@ async def test_read_learning_gives_each_evidence_score_or_error() -> None:
     ]
 
 
-@pytest.mark.parametrize("max_reads", [1, 2, 20])
+@pytest.mark.parametrize("max_reads", [1, 2, 10])
+@pytest.mark.parametrize("evidence_count", [1, 60])
 async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
-    tmp_path: Path, max_reads: int
+    tmp_path: Path, max_reads: int, evidence_count: int
 ) -> None:
     current = FakeRun(str(tmp_path / "runs"), "current", goal_id="new-goal")
     current.commit(current.plan())
     prior = FakeRun(current.run_root, "prior", goal_id="old-goal")
     text = "Use slow cooling for lower viscosity."
-    old = prior.candidate("old-candidate")
-    old.payload["candidate"]["output"]["data"] = {"private": "out-of-view-candidate-secret"}
+    evidence_ids = (
+        ["old-candidate"]
+        if evidence_count == 1
+        else [f"old-candidate-{i:02}" for i in range(evidence_count)]
+    )
+    old = [prior.candidate(id) for id in evidence_ids]
+    old[0].payload["candidate"]["output"]["data"] = {"private": "out-of-view-candidate-secret"}
     prior.commit(
         prior.plan(),
-        old,
-        prior.score("old-score", "old-candidate", 1),
-        prior.learning("L-shared", "viscosity", text=text, evidence=["old-candidate"]),
+        *old,
+        prior.score("old-score", evidence_ids[0], 1),
+        prior.learning("L-shared", "viscosity", text=text, evidence=evidence_ids),
     )
     arena_root = str(tmp_path / "arena")
     board = ArenaBoard(arena_root=arena_root, cache_dir=str(tmp_path / "cache"))
@@ -549,7 +556,7 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         assert view.search_learnings("toy", "viscosity", goal=current.goal.key()) == []
         assert view.get_learning("L-shared").text == text
         with pytest.raises(KeyError):
-            view.get_candidate("old-candidate")
+            view.get_candidate(evidence_ids[0])
 
         # Refreshing the board cannot widen the capability already given to the agent.
         prior.commit(prior.learning("L-later", "viscosity", text="later-learning-text"))
@@ -597,10 +604,30 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         if max_reads == 1:
             assert result == {"error": "max_board_reads_per_round reached"}
             return
+        assert isinstance(result, dict)
         assert result["text"] == text
+        retained = len(result["evidence"])
         assert result["evidence"] == [
-            {"id": "old-candidate", "scores": [], "error": "not in this view"}
+            {"id": id, "scores": [], "error": "not in this view"} for id in evidence_ids[:retained]
         ]
+        assert len(raw) <= MAX_RESULT_CHARS
+        assert raw == untrusted(canonical_json(result).decode("utf-8"))
+        if evidence_count == 60:
+            omitted = result["evidence_omitted"]
+            assert 0 < retained < evidence_count
+            assert omitted == evidence_count - retained
+            expanded: dict[str, Any] = {
+                **result,
+                "evidence": [
+                    *result["evidence"],
+                    {"id": evidence_ids[retained], "scores": [], "error": "not in this view"},
+                ],
+                "evidence_omitted": omitted - 1,
+            }
+            assert len(untrusted(canonical_json(expanded).decode("utf-8"))) > MAX_RESULT_CHARS
+        else:
+            assert retained == evidence_count
+            assert "evidence_omitted" not in result
         assert raw.startswith(UNTRUSTED_OPEN)
         assert raw.endswith(UNTRUSTED_CLOSE)
         assert "out-of-view-candidate-secret" not in raw
@@ -610,11 +637,36 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         assert decoded(await invoke(tools, deps, "read_learning", {"id": "L-later"})) == {
             "error": "unknown learning: L-later"
         }
-        assert decoded(await invoke(tools, deps, "get_candidate", {"id": "old-candidate"})) == {
-            "error": "unknown candidate: old-candidate"
+        assert decoded(await invoke(tools, deps, "get_candidate", {"id": evidence_ids[0]})) == {
+            "error": f"unknown candidate: {evidence_ids[0]}"
         }
     finally:
         board.close()
+
+
+@pytest.mark.parametrize("case", ["escaped_text", "oversized_evidence_id"])
+async def test_learning_text_takes_priority_over_evidence_at_result_cap(case: str) -> None:
+    fake = fake_context()
+    ids = (
+        [f"c-{i}" for i in range(60)] if case == "escaped_text" else ["c-" + "x" * MAX_RESULT_CHARS]
+    )
+    for id in ids:
+        fake.add_candidate(id)
+    text = '"\\\n🙂' * 300 if case == "escaped_text" else "Keep the learning text."
+    learning = await fake.post_learning("Hint", text, ids)
+    tools, deps = tool_set(fake)
+    raw = await invoke(tools, deps, "read_learning", {"id": learning.id})
+    result = decoded(raw)
+    assert isinstance(result, dict)
+    assert result["text"] == text
+    retained = len(result["evidence"])
+    assert result["evidence_omitted"] == len(ids) - retained
+    assert result["evidence_omitted"] > 0
+    assert [item["id"] for item in result["evidence"]] == ids[:retained]
+    assert len(raw) <= MAX_RESULT_CHARS
+    assert raw == untrusted(canonical_json(result).decode("utf-8"))
+    if case == "oversized_evidence_id":
+        assert result["evidence"] == []
 
 
 @pytest.mark.parametrize("visibility", ["visible", "foreign"])

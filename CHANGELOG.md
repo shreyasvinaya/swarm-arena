@@ -60,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Manager actions as SDK function tools, with validated schemas, per-call
   provenance, bounded feedback-redacted results, untrusted board content,
-  cross-goal learning text with value-free out-of-view and read-limit evidence markers,
+  cross-goal learning text with evidence trimming and value-free out-of-view
+  and read-limit evidence markers,
   recoverable soft errors, and terminal controls that stop further model turns.
 
 - Metered LLM calls reserve against committed tranche credit, protect per-call

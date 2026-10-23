@@ -193,6 +193,30 @@ def _candidate_result(ctx: AgentContext, candidate: Candidate) -> dict[str, Any]
     return candidate_view(candidate, ctx.scores_of(candidate.id))
 
 
+def _fit_learning_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the longest evidence prefix that fits alongside the learning text."""
+    evidence = result["evidence"]
+
+    def fits() -> bool:
+        text = canonical_json(finite_json(result)).decode("utf-8")
+        return len(untrusted(text)) <= MAX_RESULT_CHARS
+
+    if not evidence or fits():
+        return result
+    low, high = 0, len(evidence) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        result["evidence"] = evidence[:middle]
+        result["evidence_omitted"] = len(evidence) - middle
+        if fits():
+            low = middle
+        else:
+            high = middle - 1
+    result["evidence"] = evidence[:low]
+    result["evidence_omitted"] = len(evidence) - low
+    return result
+
+
 def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
     """Marshal real published reads through AgentContext's captured loop token."""
     if name == "my_candidates":
@@ -245,7 +269,7 @@ def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
         )
         evidence.append({"id": candidate_id, "scores": _score_view(scores), "error": error})
     result["evidence"] = evidence
-    return result
+    return _fit_learning_evidence(result)
 
 
 _READS: Final = {"my_candidates", "search_learnings", "read_learning", "get_candidate", "best"}

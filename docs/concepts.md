@@ -205,8 +205,10 @@ Genuine caller cancellation retains highest precedence. See the [LLM API](api/ll
 An agent sees the board at the round's recorded frontier plus its own new work.
 `best(part=...)` reads the agent's own group or an explicitly declared sibling
 group. `search_learnings(scope="namespace")` can find learnings from other goals
-and earlier runs. The SDK `read_learning` action retains their full text; evidence
-outside the fixed candidate view includes only its id, an empty scores list and
+and earlier runs. The SDK `read_learning` action prioritizes their text within its
+4,000-character result cap: it drops evidence entries from the end when needed
+and reports the count as `evidence_omitted`, preserving canonical JSON key order.
+Evidence outside the fixed candidate view includes only its id, an empty scores list and
 the value-free error marker `not in this view`. Visible evidence retains its
 scores or tool error. Once evidence reads reach the round's read limit, remaining
 evidence carries the value-free marker `read limit reached` and the learning text
