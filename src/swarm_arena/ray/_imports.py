@@ -2,7 +2,10 @@
 
 import importlib.metadata
 
-_MSG = "swarm_arena.ray needs the 'ray' extra: pip install 'swarm-arena[ray]'"
+_MSG = (
+    "swarm_arena.ray needs the 'ray' extra: uv add "
+    '"swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+)
 
 try:
     importlib.metadata.version("ray")
