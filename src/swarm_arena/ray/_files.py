@@ -1,22 +1,26 @@
 """Transport bounded, hash-verified artifacts and diagnostics without pickle."""
 
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
 from typing import Final, Literal, NamedTuple
 from uuid import uuid4
 
-from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed
+from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed, StorageError
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Blob, Store, _check_key
+from swarm_arena._tooling.result_file import _chunks, open_regular_file
 
 MIB: Final = 1024 * 1024
 _MAX_HEAD_BYTES: Final = 16 * MIB
-_MAX_BLOB_BYTES: Final = 1024 * MIB
+MAX_OBJECT_STORE_CAP_MIB: Final = 1024
+_MAX_BLOB_BYTES: Final = MAX_OBJECT_STORE_CAP_MIB * MIB
 _MAX_BLOBS: Final = 100_000
 _MAX_DIAGNOSTICS: Final = 32
 _MAX_DIAGNOSTIC_BYTES: Final = 4096
@@ -91,7 +95,7 @@ class MemoryStore(Store):
 
     def __init__(self, blobs: Mapping[str, bytes] | None = None) -> None:
         """Copy initial contents without marking them as worker outputs."""
-        self._blobs = {_check_key(key): data for key, data in (blobs or {}).items()}
+        self._blobs = {_check_key(key): bytes(data) for key, data in (blobs or {}).items()}
         self._created: dict[str, bytes] = {}
         self._prefix = ""
         self._url = f"memory://{uuid4().hex}"
@@ -193,6 +197,7 @@ class MemoryStore(Store):
         with self._lock:
             if key in self._blobs:
                 raise AlreadyExists("memory object already exists")
+            data = bytes(data)
             self._blobs[key] = self._created[key] = data
             return sha256_hex(data)
 
@@ -232,6 +237,7 @@ class MemoryStore(Store):
                 raise NotFound("memory object not found")
             if sha256_hex(self._blobs[key]) != if_match:
                 raise PreconditionFailed("memory object version mismatch")
+            data = bytes(data)
             self._blobs[key] = data
             if key in self._created:
                 self._created[key] = data
@@ -373,7 +379,9 @@ def inline_inputs(
     artifacts : ArtifactStore
         Driver artifact backend.
     cap_bytes : int
-        Maximum aggregate bytes of distinct artifacts.
+        Maximum aggregate bytes of distinct artifacts, in whole MiB from
+        1 through ``MAX_OBJECT_STORE_CAP_MIB`` (1024). All sizes are checked
+        before reading; local reads are bounded again against file growth.
 
     Returns
     -------
@@ -383,21 +391,65 @@ def inline_inputs(
     Raises
     ------
     ValueError
-        If the aggregate input cap is exceeded.
+        If the cap is outside the supported range or aggregate input size
+        exceeds it.
 
     Examples
     --------
     >>> inline_inputs(Job.Stage(), ArtifactStore(MemoryStore()), cap_bytes=MIB)
     {}
     """
+    _validate_cap(cap_bytes)
+    store = artifacts._store
+    digests = sorted(needed_hashes(stage))
+    sizes = {digest: _input_size(store, digest) for digest in digests}
+    _check_cap(sum(sizes.values()), cap_bytes=cap_bytes, what="inputs")
     blobs: dict[str, bytes] = {}
     total = 0
-    for digest in sorted(needed_hashes(stage)):
-        data = artifacts.get_bytes(digest)
+    for digest in digests:
+        if isinstance(store, MemoryStore):
+            data = store.read(digest).data
+            _check_cap(total + len(data), cap_bytes=cap_bytes, what="inputs")
+        else:
+            fd = open_regular_file(Path(store.url), digest)
+            try:
+                _check_cap(total + os.fstat(fd).st_size, cap_bytes=cap_bytes, what="inputs")
+                try:
+                    data = b"".join(_chunks(fd, digest, cap_bytes - total, step=MIB))
+                except ValueError:
+                    _check_cap(total + os.fstat(fd).st_size, cap_bytes=cap_bytes, what="inputs")
+                    raise StorageError("artifact input read failed") from None
+            finally:
+                os.close(fd)
+        if sha256_hex(data) != digest:
+            raise StorageError("artifact failed its hash check")
         total += len(data)
-        _check_cap(total, cap_bytes=cap_bytes, what="inputs")
         blobs[digest] = data
     return blobs
+
+
+def _input_size(store: Store, digest: str) -> int:
+    """Inspect an artifact's size without reading its contents."""
+    if isinstance(store, MemoryStore):
+        with store._lock:
+            key = store._prefix + _check_key(digest)
+            if key not in store._blobs:
+                raise NotFound("memory object not found")
+            return len(store._blobs[key])
+    fd = open_regular_file(Path(store.url), digest)
+    try:
+        return os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+
+
+def _validate_cap(cap_bytes: int) -> None:
+    if (
+        type(cap_bytes) is not int
+        or not MIB <= cap_bytes <= MAX_OBJECT_STORE_CAP_MIB * MIB
+        or cap_bytes % MIB
+    ):
+        raise ValueError("object_store_cap_mib must be an integer from 1 through 1024")
 
 
 def _check_cap(n: int, *, cap_bytes: int, what: Literal["inputs", "outputs"]) -> None:
@@ -419,19 +471,21 @@ def check_cap(
     blobs : Mapping[str, bytes]
         Distinct files, including output logs when checking outputs.
     cap_bytes : int
-        Maximum aggregate content bytes.
+        Maximum aggregate content bytes, in whole MiB from 1 through 1024.
     what : {"inputs", "outputs"}
         Direction named in the fixed cap diagnostic.
 
     Raises
     ------
     ValueError
-        If the aggregate content exceeds the cap.
+        If the cap is outside the supported range or aggregate content
+        exceeds it.
 
     Examples
     --------
-    >>> check_cap({"a": b"x"}, cap_bytes=1, what="inputs")
+    >>> check_cap({"a": b"x"}, cap_bytes=MIB, what="inputs")
     """
+    _validate_cap(cap_bytes)
     _check_cap(sum(map(len, blobs.values())), cap_bytes=cap_bytes, what=what)
 
 
