@@ -1706,3 +1706,64 @@ def gateway_plan(*, rounds: int = 1, converge_team: bool = False) -> Any:
             team=team("conv", final=True) if converge_team else None,
         ),
     )
+
+
+def llm_tool(prompt: str) -> dict[str, str]:
+    """
+    Send one chat request using only the injected gateway environment.
+
+    Parameters
+    ----------
+    prompt : str
+        User message sent to the loopback test model.
+
+    Returns
+    -------
+    dict of str to str
+        Assistant reply, without credentials or response identifiers.
+
+    Examples
+    --------
+    With a running fake gateway and an injected virtual key:
+
+    >>> llm_tool("hello")  # doctest: +SKIP
+    {'reply': 'ok'}
+    """
+    import urllib.request
+
+    request = urllib.request.Request(
+        os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+        data=json.dumps(
+            {"model": "chat-model", "messages": [{"role": "user", "content": prompt}]}
+        ).encode(),
+        headers={
+            "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+            "Content-Type": "application/json",
+        },
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=60) as response:
+        body = json.load(response)
+    return {"reply": body["choices"][0]["message"]["content"]}
+
+
+def plain_tool(x: float) -> dict[str, float]:
+    """
+    Square a number without using a provider or its environment.
+
+    Parameters
+    ----------
+    x : float
+        Number to square.
+
+    Returns
+    -------
+    dict of str to float
+        Squared value under ``y``.
+
+    Examples
+    --------
+    >>> plain_tool(3.0)
+    {'y': 9.0}
+    """
+    return {"y": x * x}

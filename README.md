@@ -92,6 +92,14 @@ uv run swarm-arena submit --address http://127.0.0.1:8265 --working-dir . --yes 
 Provision workers, module paths and authentication as described in
 [Running on Ray](docs/running-on-ray.md), including the dashboard requirement for recovery.
 
+An optional LiteLLM Proxy gateway gives each LLM-calling tool run its own virtual
+key and records tool-internal calls, while plain tools stay unkeyed. The pinned
+LiteLLM version supports **soft caps and estimated spend only**; keyed runs keep
+their full USD reservation charged. Declare the tool's providers, accept soft
+caps explicitly when using `max_usd`, and use `swarm-arena reconcile` for later
+reports. See [The LLM gateway on the cluster](docs/running-on-ray.md#the-llm-gateway-on-the-cluster)
+for setup, secret transport and worker network rules.
+
 ## Test one connector
 
 Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,

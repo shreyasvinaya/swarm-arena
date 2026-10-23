@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gateway end-to-end coverage for normal, converge and resumed tool runs, key
+  isolation and reconciliation, with cluster gateway and connector setup guidance.
+
 - `swarm-arena reconcile RUN_DIR` reports gateway spend under the run lease,
   with conservative death evidence, exact deduplicated totals and a bounded
   run-end attempt; the pinned LiteLLM profile retains estimated reservations.
