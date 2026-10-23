@@ -1,7 +1,9 @@
 """Check component prerequisites for admitted plan configurations."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 
@@ -10,9 +12,8 @@ from swarm_arena._board.arena import _effective_arena_root
 from swarm_arena._errors import ConfigError, StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport
+from swarm_arena._gateway.adapter import GatewayError, ProfileReport
 from swarm_arena._gateway.labels import _profile_failures
-from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.plan import Plan, RoundSpec
 from swarm_arena._model.ref import Ref
@@ -22,6 +23,9 @@ from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
+
+if TYPE_CHECKING:
+    from swarm_arena._gateway.adapter import GatewayAdapter
 
 _Component = Tool | Manager | Check | Judge
 _Site = tuple[Ref, type[_Component], Mapping[str, Any] | None]
@@ -61,6 +65,8 @@ async def gateway_preflight(
     """
     if config.llm_gateway is None:
         raise _core_error(ValueError, "llm_gateway is required")
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
+
     outcome = _Outcome()
     try:
         result = await adapter.preflight()
