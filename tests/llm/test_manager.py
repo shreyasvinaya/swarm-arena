@@ -671,12 +671,18 @@ print(any(isinstance(c, CallLogger) for c in litellm.callbacks))
 async def test_real_action_control_beats_round_timer(
     tmp_path: Path, ctx_env: CtxEnv, kind: str, timer_first: bool, nested: bool
 ) -> None:
+    from swarm_arena.llm import _actions
+
     entered, unwinding, release, finished = (anyio.Event() for _ in range(4))
 
     async def handler(context: AgentContext, args: Inputs) -> JsonValue:
         entered.set()
         try:
             if timer_first:
+                owner = _actions._owned_actions.get()
+                assert owner is not None
+                # SDK startup must finish before the round timer can interrupt the action.
+                owner.timer.scope.deadline = anyio.current_time()
                 await anyio.sleep_forever()
         finally:
             unwinding.set()
@@ -695,14 +701,14 @@ async def test_real_action_control_beats_round_timer(
     ctx = ctx_env.ctx()
     ctx.actions = (Action(name="held", description="Held", input_model=Inputs, handler=handler),)
     fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
-    timeout = 0.5 if timer_first else 60.0
-    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=timeout))) as run:
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=60))) as run:
         with llm_scope(run.scope("manager")):
             task = asyncio.create_task(AgentsSDKManager(model="opus").run_round(ctx))
         try:
             with anyio.fail_after(5):
                 await unwinding.wait()
                 assert entered.is_set()
+                assert not task.done(), "round returned while its action was unwinding"
                 release.set()
                 with pytest.raises(RuntimeError) as caught:
                     await task
@@ -727,11 +733,18 @@ async def test_real_action_control_beats_round_timer(
 async def test_real_caller_cancellation_beats_round_timer_and_action_control(
     tmp_path: Path, ctx_env: CtxEnv, kind: str, timer_first: bool, owner: str
 ) -> None:
+    from swarm_arena.llm import _actions
+
     entered, unwinding, release, finished = (anyio.Event() for _ in range(4))
 
     async def handler(context: AgentContext, args: Inputs) -> JsonValue:
         entered.set()
         try:
+            if timer_first:
+                actions = _actions._owned_actions.get()
+                assert actions is not None
+                # Expire the real timer after entry, before caller cancellation.
+                actions.timer.scope.deadline = anyio.current_time()
             await anyio.sleep_forever()
         finally:
             unwinding.set()
@@ -749,8 +762,7 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
     fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
     owner_scope = anyio.CancelScope()
     cancelled = anyio.Event()
-    timeout = 0.5 if timer_first else 60.0
-    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=timeout))) as run:
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=60))) as run:
 
         async def manage() -> None:
             with llm_scope(run.scope("manager")), owner_scope:
@@ -774,6 +786,7 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
                 else:
                     owner_scope.cancel()
                 await unwinding.wait()
+                assert not task.done(), "round returned while its action was unwinding"
                 release.set()
                 if owner == "task":
                     with pytest.raises(asyncio.CancelledError):
@@ -859,18 +872,30 @@ async def test_real_action_round_expiry_is_an_ordinary_limit(
 async def test_round_timer_preserves_fencing_across_parallel_action_unwind(
     tmp_path: Path, ctx_env: CtxEnv, reverse: bool
 ) -> None:
+    from swarm_arena.llm import _actions
+
+    entered: set[str] = set()
     raised: list[str] = []
+
+    async def wait_for_round_expiry(name: str) -> None:
+        entered.add(name)
+        if len(entered) == 2:
+            owner = _actions._owned_actions.get()
+            assert owner is not None
+            # Both handlers must participate in the cancellation/control race.
+            owner.timer.scope.deadline = anyio.current_time()
+        await anyio.sleep_forever()
 
     async def cleanup(context: AgentContext, args: Inputs) -> JsonValue:
         try:
-            await anyio.sleep_forever()
+            await wait_for_round_expiry("cleanup")
         finally:
             raised.append("cleanup")
             raise _stop_cleanup_error()
 
     async def fence(context: AgentContext, args: Inputs) -> JsonValue:
         try:
-            await anyio.sleep_forever()
+            await wait_for_round_expiry("fence")
         finally:
             raised.append("fence")
             raise _core_error(Fenced, "run ownership lost")
@@ -882,7 +907,7 @@ async def test_round_timer_preserves_fencing_across_parallel_action_unwind(
     )
     names = ("fence", "cleanup") if reverse else ("cleanup", "fence")
     fake = register([FakeTurn(tool_calls=tuple((name, {}) for name in names)), finish()])
-    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=0.5))) as run:
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=60))) as run:
         with llm_scope(run.scope("manager")), anyio.fail_after(5), pytest.raises(Fenced) as caught:
             await AgentsSDKManager(model="opus").run_round(ctx)
         assert sorted(raised) == ["cleanup", "fence"]
