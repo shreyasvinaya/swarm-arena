@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Annotated, Any, Final, Literal, TypeVar
+from typing import Annotated, Any, Final, Literal, TypeVar, get_args
 
 import anyio
 from pydantic import AwareDatetime, Field
@@ -16,6 +16,7 @@ from swarm_arena._budget.ledger import Reservation
 from swarm_arena._exec.executor import Job
 from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, VirtualKey
 from swarm_arena._gateway.labels import _observation_label
+from swarm_arena._gateway.reports import GatewayKeyAction, GatewayReadStatus
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.llm_record import record_call
 from swarm_arena._journal.writer import JournalWriter
@@ -537,10 +538,41 @@ class KeyManager:
         >>> inspect.signature(KeyManager.read).parameters["wait_first"].kind.name
         'KEYWORD_ONLY'
         """
+        calls, _ = await self.read_with_status(records, wait_first=wait_first)
+        return calls
+
+    async def read_with_status(
+        self, records: Sequence[KeyRecord], *, wait_first: bool
+    ) -> tuple[list[LLMCall], GatewayReadStatus]:
+        """Return informational observations and an operation-local read status.
+
+        Parameters
+        ----------
+        records : Sequence of KeyRecord
+            Trusted keys to read with the same ownership and polling rules as
+            :meth:`read`.
+        wait_first : bool
+            Whether to poll for the first visible spend rows.
+
+        Returns
+        -------
+        tuple of list of LLMCall and str
+            Newly recorded observations and a value-free status: ``ok`` for a
+            successful read (including empty or duplicate-only reads), ``failed``
+            for a failed gateway operation, or ``incomplete`` for polling expiry
+            or an ordinary per-row recording failure. Success does not certify
+            terminal accounting or final spend completeness. Controls propagate.
+
+        Examples
+        --------
+        >>> import inspect
+        >>> inspect.signature(KeyManager.read_with_status).parameters["wait_first"].kind.name
+        'KEYWORD_ONLY'
+        """
         for record in records:
             self._check_record(record)
         if not records:
-            return []
+            return [], "ok"
         deadline = anyio.current_time() + self._settle_timeout_s
         async with self._owned():
             while True:
@@ -570,14 +602,15 @@ class KeyManager:
                             observations.extend((record, row) for row in rows)
                     if poll.cancelled_caught:
                         _LOG.warning("gateway spend read timed out")
-                        return []
+                        return [], "incomplete"
                 except GatewayError:
                     _LOG.warning("gateway spend read failed")
-                    return []
+                    return [], "failed"
                 if observations or not wait_first or anyio.current_time() >= deadline:
                     break
                 await anyio.sleep(min(1.0, max(0, deadline - anyio.current_time())))
             calls: list[LLMCall] = []
+            status: GatewayReadStatus = "ok"
             for record, row in observations:
                 outcome = _Outcome()
                 try:
@@ -616,10 +649,11 @@ class KeyManager:
                 except Exception as error:
                     outcome.propagate_control(error)
                     _LOG.warning("gateway spend row recording failed")
+                    status = "incomplete"
                     continue
                 if call is not None:
                     calls.append(call)
-            return calls
+            return calls, status
 
     def restore(self, events: Iterable[Event]) -> None:
         """Rebuild key records from a trusted committed journal snapshot.
@@ -646,6 +680,8 @@ class KeyManager:
                 continue
             payload = dict(event.payload)
             action = payload.pop("action", None)
+            # The engine stamps every event with its run clock; it is not key state.
+            payload.pop("run_elapsed_s", None)
             if action == "created":
                 payload.setdefault("run_id", event.run_id)
                 payload.setdefault("owner_epoch", event.epoch)
@@ -661,7 +697,7 @@ class KeyManager:
                 restored[key_id] = KeyRecord.model_validate(
                     {**record.model_dump(), "closed_at": payload.get("closed_at")}
                 )
-            else:
+            elif action not in get_args(GatewayKeyAction):
                 raise ValueError("invalid gateway key action")
         self._records = restored
 

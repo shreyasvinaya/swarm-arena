@@ -51,7 +51,7 @@ from swarm_arena._errors import (
 )
 from swarm_arena._exec.executor import Executor, schedule_timeout_scope
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport
 from swarm_arena._gateway.keys import KeyManager
 from swarm_arena._gateway.litellm_proxy import adapter_for
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -890,6 +890,7 @@ class RunRunner:
                                     views=views,
                                     stops=stops,
                                     clock=clock,
+                                    gateway=self._key_manager,
                                     admission=RunAdmission(
                                         config.limits.max_agents_total, self.plans
                                     ),
@@ -962,6 +963,7 @@ class RunRunner:
                         deps.stops.on_change = stopping
                         if self._stopping(deps):
                             stopping()
+                        await _read_gateway(deps.journal, deps.gateway)
                         await _finish_run(deps.store, deps.journal)
                     if completion.cancel_called:
                         raise _core_error(RuntimeError, "run completion timed out")
@@ -1131,6 +1133,29 @@ async def _finish_queued_goal(
     await views.write(
         f"goals/{goal_id}/solution.json", solution_view(state, goal_id, head), source=head
     )
+
+
+async def _read_gateway(
+    journal: JournalWriter, gateway: KeyManager | None, *, goal_id: str | None = None
+) -> None:
+    """Record informational spend under the existing owner, reporting safe failures."""
+    if gateway is None:
+        return
+    outcome = _Outcome()
+    try:
+        _, status = await gateway.read_with_status(
+            gateway.records(goal_id=goal_id), wait_first=False
+        )
+    except GatewayError as error:
+        outcome.propagate_control(error)
+        status = "failed"
+    if status != "ok":
+        journal.append(
+            EventDraft(
+                type=EventType.GATEWAY_KEY,
+                payload={"action": "read_failed", "error": f"gateway read {status}"},
+            )
+        )
 
 
 async def _finish_run(store: Store, journal: JournalWriter) -> RunState:
