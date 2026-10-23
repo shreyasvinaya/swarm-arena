@@ -409,6 +409,85 @@ instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
 
+### Connector CI
+
+Keep the local conformance tests above and add a sequential Ray job. Install
+the `llm` extra too when tests use `FakeModel`; scripted model turns need no
+API key. In a source checkout, this GitHub Actions job runs the kit and the
+Ray integration tests:
+
+```yaml
+jobs:
+  connector-ray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      RAY_USAGE_STATS_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --extra ray --extra llm --all-groups
+      - run: uv run pytest -n 0 tests/testing/test_conformance.py tests/e2e/test_rosenbrock_ray.py -m "not s3" -v
+```
+
+The repository's shared `ray_cluster` fixture owns the head. It launches the
+equivalent of `uv run ray start --head --num-cpus=2 --include-dashboard=true
+--disable-usage-stats --block` using the current Python interpreter, with
+isolated ports and a short temporary directory. Readiness includes a successful
+State API query. Teardown stops only its process group. Do not start a second
+head in the job, use `ray stop`, or run cluster tests under xdist. The fixture
+disables token authentication only for its loopback test head; that does not
+test remote authentication. See [Running on Ray](running-on-ray.md) for token,
+worker-image and module-path setup.
+
+In a separate connector repository, provide an equivalent cluster fixture
+(the test fixtures are not a public installed API), or connect to a cluster
+your CI already owns. Put the connector in the uv project's dependencies;
+until the first release, add the package with
+`uv add "swarm-arena[ray,llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`.
+Use your connector test paths in the job. A Ray tool case takes this form,
+using the `RouteTool` from this guide:
+
+```python
+import pytest
+
+from my_connector.tools import RouteTool
+from swarm_arena.testing import check_tool, read_logs
+
+
+@pytest.mark.ray
+async def test_tool_on_ray(ray_cluster: str) -> None:
+    pytest.importorskip("swarm_arena.ray")
+    from swarm_arena.ray import RayExecutor
+
+    executor = RayExecutor()
+    try:
+        output = await check_tool(RouteTool(), {"target": "CCO"}, executor=executor)
+        assert output.data["target"] == "CCO"
+        stdout, stderr = read_logs(output)
+        assert isinstance(stdout, bytes) and isinstance(stderr, bytes)
+    finally:
+        await executor.aclose()
+```
+
+Keep tests for `check_check` and `check_judge` alongside this tool case, and
+use `check_manager` with the registered `FakeModel` catalog shown below for
+model-driven managers. `FakeModel` can also supply scripted turns to an
+`LLMJudge` (see the offline judge example below). These checks need no provider
+credentials. A caller-supplied executor belongs to the caller and remains open
+after a kit call; close it in `finally`.
+
+Include assertions on file bytes, overlays and edits, both logs and stopped
+results. `read_output_file` and `read_logs` read retained artifacts after the
+worker workspace is gone. For cancellation, `Job.on_partial` receives only
+data: file, log and report references are removed and no new artifacts are
+uploaded. Shared-host data-only success does not demonstrate remote file
+transport; use explicit filesystem-access denial or a real remote worker and
+record which environment was exercised.
+
 ### Testing managers and judges offline
 
 Install the optional SDK with

@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 import anyio
 import pytest
+from _fakes.ray_transport import isolated_ray_filesystem  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
     FAILING_COMMAND,
@@ -138,6 +139,101 @@ async def test_function_tool(local_executor: LocalExecutor) -> None:
     assert (await check_tool(ref, {"a": 1}, executor=local_executor)).data == {"sum": 2}
     with pytest.raises(ValidationError):
         await check_tool(FunctionTool(add), {"a": "x"}, executor=local_executor)
+
+
+@pytest.mark.ray
+@pytest.mark.usefixtures("isolated_ray_filesystem")
+async def test_check_tool_on_ray_matches_local(
+    ray_cluster: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("swarm_arena.ray")
+    from swarm_arena.ray import RayExecutor
+
+    examples = (await anyio.to_thread.run_sync(Path(__file__).resolve)).parents[2] / "examples"
+    monkeypatch.syspath_prepend(str(examples / "rosenbrock"))
+    tool = FunctionTool("rosen:gradient_descent")
+    inputs = {"lr": 0.001, "steps": 200, "x0": -1.0, "y0": 1.0}
+    executor = RayExecutor()
+    try:
+        remote = await check_tool(tool, inputs, executor=executor)
+        assert remote.status == RunStatus.OK
+        assert remote.data == (await check_tool(tool, inputs)).data
+        # A caller-owned executor remains usable after the kit returns.
+        assert (await check_tool(tool, inputs, executor=executor)).data == remote.data
+    finally:
+        await executor.aclose()
+
+
+@pytest.mark.ray
+@pytest.mark.usefixtures("isolated_ray_filesystem")
+async def test_check_tool_on_ray_transports_files_and_edits(ws: Path) -> None:
+    pytest.importorskip("swarm_arena.ray")
+    from swarm_arena.ray import RayExecutor
+    from swarm_arena.testing import read_logs, read_output_file
+
+    (ws / "tool").mkdir()
+    (ws / "tool/helper.txt").write_text("tool-root")
+    (ws / "problem/run.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "data = {name: Path(f'problem/{name}.txt').read_text() for name in ('a', 'b')}\n"
+        "data['helper'] = Path('tool/helper.txt').read_text()\n"
+        "request = json.loads(Path('swarm/request.json').read_text())\n"
+        "data['inputs'] = request['params']\n"
+        "data['parents'] = []\n"
+        "for root in sorted(Path('parents').glob('*')):\n"
+        "    data['parents'].append({'file': (root / 'answer.txt').read_text(),\n"
+        "        'data': json.loads((root / 'data.json').read_text())['inputs']})\n"
+        "data['workspace'] = str(Path.cwd())\n"
+        "Path('answer.txt').write_text(data['a'] + '/' + data['b'])\n"
+        "print('transport stdout'); print('transport stderr', file=sys.stderr)\n"
+        "Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(\n"
+        "    {'data': data, 'files': ['problem/a.txt', 'problem/b.txt', 'answer.txt']}))\n"
+    )
+    tool = ScriptTool(
+        command=[sys.executable, "problem/run.py"],
+        files=["tool/helper.txt"],
+        params={"turn": {"type": "integer"}},
+        editable=["problem/*.txt"],
+    )
+    goal = Goal(id="g", namespace="ns", files=PROBLEM)
+    executor = RayExecutor()
+    try:
+        first = await check_tool(
+            tool, {"turn": 1}, goal=goal, edits={"problem/a.txt": "parent"}, executor=executor
+        )
+        parent = make_candidate(
+            first, request=ToolRequest(edits={"problem/a.txt": "parent"}), tool=tool, goal=goal
+        )
+        second = await check_tool(
+            tool,
+            {"turn": 2},
+            goal=goal,
+            parents=[parent],
+            edits={"problem/b.txt": "live"},
+            executor=executor,
+        )
+    finally:
+        await executor.aclose()
+    assert first.status == second.status == RunStatus.OK
+    assert first.data["a"] == "parent"
+    assert first.data["b"] == "1"
+    assert second.data == {
+        "a": "parent",
+        "b": "live",
+        "helper": "tool-root",
+        "inputs": {"turn": 2},
+        "parents": [{"file": "parent/1", "data": {"turn": 1}}],
+        "workspace": second.data["workspace"],
+    }
+    assert Path(second.data["workspace"]).name.startswith("swarm-worker-")
+    with pytest.raises(PermissionError, match="test filesystem boundary"):
+        (Path(second.data["workspace"]) / "problem/a.txt").read_bytes()
+    assert read_output_file(second, "problem/a.txt") == b"parent"
+    assert read_output_file(second, "problem/b.txt") == b"live"
+    assert read_output_file(first, "answer.txt") == b"parent/1"
+    assert read_output_file(second, "answer.txt") == b"parent/live"
+    assert read_logs(second) == (b"transport stdout\n", b"transport stderr\n")
 
 
 async def test_script_tool_edit_and_same_identity_overlay(

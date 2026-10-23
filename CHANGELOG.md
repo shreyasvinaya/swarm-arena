@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ray conformance and Rosenbrock integration coverage for object-store file transport,
+  with worker setup, recovery limits and connector CI instructions.
+
 - Public `swarm_arena.ray.RayExecutor` with resource-aware scheduling, bounded cluster-bound recovery, hash-checked artifact transport and two-step cancellation with data-only partial results.
 
 - Rosenbrock examples with LLM managers and an advisory judge panel, plus offline
