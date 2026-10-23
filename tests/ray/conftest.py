@@ -3,6 +3,7 @@
 import os
 import signal
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -10,7 +11,7 @@ os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
 
 @pytest.fixture(scope="session")
-def ray_driver(ray_cluster: str) -> Iterator[None]:
+def ray_driver(ray_cluster: str) -> Iterator[Any]:
     """Bound initialization and release the driver before head teardown."""
     import ray
 
@@ -23,11 +24,11 @@ def ray_driver(ray_cluster: str) -> Iterator[None]:
         signal.signal(signal.SIGALRM, expired)
         signal.alarm(45)
         try:
-            ray.init(address=ray_cluster, ignore_reinit_error=True)
+            context = ray.init(address=ray_cluster, ignore_reinit_error=True)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous)
-        yield
+        yield context
     finally:
         signal.signal(signal.SIGALRM, expired)
         signal.alarm(30)

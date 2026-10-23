@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+from http.client import BadStatusLine, HTTPException
 from pathlib import Path
 from typing import Any
 
@@ -200,3 +201,14 @@ def test_state_readiness_requires_successful_state_response(
     monkeypatch.setattr(helper, "urlopen", open_url, raising=False)
     assert helper._state_ready(12345, 0.5) is ready
     assert calls == [("http://127.0.0.1:12345/api/v0/tasks?limit=1&timeout=1", 0.5)]
+
+
+@pytest.mark.parametrize("error", [HTTPException, BadStatusLine])
+def test_state_readiness_protocol_failure(
+    monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise error("bad response")
+
+    monkeypatch.setattr(helper, "urlopen", fail)
+    assert helper._state_ready(12345, 0.5) is False

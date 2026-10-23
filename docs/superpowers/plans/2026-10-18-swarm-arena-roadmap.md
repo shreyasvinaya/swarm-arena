@@ -373,7 +373,7 @@ Rules [plan]:
 | `ray/__init__.py` | Facade `swarm_arena.ray`; clear `ImportError` without the extra | M4 | `tests/test_public_api.py` |
 | `ray/_executor.py` | `RayExecutor` | M4 | `tests/ray/test_executor.py` (marker `ray`) |
 | `ray/_task.py` | Framed one-shot task; shared staged/collection/publication owner; worker-group supervisor | M4 | `tests/ray/test_task.py` (cluster cases marked `ray`) |
-| `ray/_state.py` | Bounded exact-attempt task lookup and identity-joined `worker_dead` evidence | M4 | `tests/ray/test_state_unit.py`, `tests/ray/test_state.py` (marker `ray`) |
+| `ray/_state.py` | Explicit-dashboard REST task/job lookup and identity-joined `worker_dead` evidence | M4 | `tests/ray/test_state_unit.py`, `tests/ray/test_state.py` (marker `ray`) |
 | `ray/_files.py` | Object-store file transport with the 256 MiB cap | M4 | `tests/ray/test_files.py` (marker `ray`) |
 | `ray/_submit.py` | `submit` through `JobSubmissionClient` | M4 | `tests/ray/test_submit.py` |
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
@@ -2733,29 +2733,38 @@ def run_job(payload: bytes) -> bytes: ...
 PENDING_STATES: Final[frozenset[str]]  # pending, submitted and getting/pinning-args states
 TERMINAL_STATES: Final[frozenset[str]] # FINISHED, FAILED; no CANCELLED state
 class TaskInfo(FrozenModel):
+    job_id: str
     task_id: str
     attempt_number: int              # nonnegative, never inferred from row order
     name: str
     state: str
     worker_id: str | None
     node_id: str | None
-def find_task(task_name: str, *, deadline: float | None = None,
+def find_task(task_name: str, *, dashboard_url: str | None = None,
+              expected_job_id: str | None = None, deadline: float | None = None,
               expected: TaskInfo | None = None) -> TaskInfo | None: ...
-def worker_dead(task_name: str, *, deadline: float | None = None,
+def worker_dead(task_name: str, *, dashboard_url: str | None = None,
+                expected_job_id: str | None = None, deadline: float | None = None,
                 expected: TaskInfo | None = None) -> bool | None: ...
-    # Blocking read-only helpers. deadline is absolute time.monotonic(); default is now + 5 s.
-    # Each SDK call uses the remaining allowance capped at 5 s; no call with < 1 s remaining
-    # (Ray's SDK timeout floor). No retries or sleeps here; late results are discarded.
-    # Exact-name, single-attempt dataclass normalization; duplicates/retries/name reuse,
-    # missing/malformed/truncated/stale/unavailable/timed-out evidence -> None (unknown).
-    # expected pins task/attempt plus any known worker/node and rejects state regression.
-    # worker_dead: nonterminal -> False; terminal + matched live worker -> False;
-    # terminal + matched dead worker + rechecked same terminal attempt -> True.
-    # Terminal with missing worker/node or worker row -> None, never proof of never-started work.
-    # list_tasks/list_workers use detail=True, limit=2, raise_on_missing_output=True.
-    # Names must be unique per dispatch; unseen reuse cannot be ruled out by an eventual snapshot.
-    # Caller supervises the entire operation through run_sync_daemon, including initialization,
-    # lock acquisition and SDK discovery, under the same allowance; no late result authorizes action.
+    # Task 7 stores dashboard_url from its ray.init RayContext and passes it on every lookup.
+    # Tasks 7/8 record the dispatching driver job_id with intent; recovery passes it as expected_job_id.
+    # No dashboard means unknown: recovery confirmation needs the dashboard/State API.
+    # Blocking read-only urllib GETs; deadline is absolute time.monotonic(), default now + 5 s.
+    # One caller deadline bounds the whole join. Each HTTP exchange is capped at 5 s with
+    # shrinking connect/read timeouts, a 1 MiB response cap, no redirects/proxies/retry sleeps,
+    # no SDK address discovery, no environment/local-cluster fallback or internal-KV changes.
+    # Timed-out sockets are closed. OS DNS may linger in a daemon but cannot start later I/O.
+    # Exact-name/job, single-attempt JSON normalization; missing/malformed/truncated/partial,
+    # ambiguous/stale/unavailable/timed-out evidence -> None. SDK-compatible limit=2/detail filters.
+    # expected pins job/task/attempt and known worker/node; state cannot regress.
+    # Nonterminal without worker -> False; known worker must be read: live -> False, dead/missing -> None.
+    # Terminal + matched live worker -> False; matched dead worker + fresh matching terminal -> True.
+    # Missing worker/node never proves never-started work. Names must be unique per dispatch.
+    # Tasks 8/16: dropped status events invalidate evidence. A job filter scopes the drop count;
+    # without it, unrelated job drops can prevent confirmation forever. Preserve unknown and
+    # orphan/reservation handling; never convert missing/degraded evidence into death permission.
+    # Async callers still use run_sync_daemon under their lifecycle supervision; an abandoned
+    # result never authorizes action. Polling and cancellation remain caller responsibilities.
 def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes -- and files
 def submit_runtime_env(*, working_dir: str | None, pip: Sequence[str]) -> dict[str, Any] | None: ...
     # ray/_submit.py; only nonempty working_dir/pip, never env_vars; None when both are empty
