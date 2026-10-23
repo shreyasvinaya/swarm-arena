@@ -767,6 +767,7 @@ async def resume_run(
             gateway=gateway,
         )
         services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
+        error: BaseException | None = None
         try:
             await services.ready.wait()
             if services.failure is not None:
@@ -785,11 +786,13 @@ async def resume_run(
             runner._gateway = gateway
             runner._key_manager = services.deps.gateway
             return runner
-        except BaseException as error:
-            try:
-                if not services.closed:
-                    await services._aclose(failed=True)
-            finally:
-                if run_module._has_driver_control(error):
-                    raise error
-            raise
+        except BaseException as caught:
+            error = caught
+        assert error is not None
+        try:
+            if not services.closed:
+                await services._aclose(failed=True)
+        except BaseException:
+            if not run_module._has_driver_control(error):
+                raise
+        raise error

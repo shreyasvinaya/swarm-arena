@@ -2786,6 +2786,8 @@ async def test_writer_supervision_preserves_driver_hard_control(
         error = BaseExceptionGroup(
             "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
         )
+    context = asyncio.CancelledError("original driver context")
+    error.__context__ = context
     journal = Mock(fenced=anyio.Event(), _stopped=False)
     entered = anyio.Event()
     order: list[str] = []
@@ -2813,6 +2815,7 @@ async def test_writer_supervision_preserves_driver_hard_control(
     with pytest.raises(type(error)) as caught:
         await invoke()
     assert caught.value is error
+    assert error.__context__ is context
     assert order == ["body failed", "watcher closed"]
     assert journal._raise_if_fenced.call_count == 1
 
@@ -2840,6 +2843,8 @@ async def test_run_preserves_driver_hard_control_through_cleanup(
         error = BaseExceptionGroup(
             "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
         )
+    context = asyncio.CancelledError("original driver context")
+    error.__context__ = context
     journal = Mock(_stopped=False)
     if fenced:
         journal._raise_if_fenced.side_effect = _core_error(Fenced)
@@ -2870,6 +2875,196 @@ async def test_run_preserves_driver_hard_control_through_cleanup(
     with pytest.raises(type(error)) as caught:
         await runner.run()
     assert caught.value is error
+    assert error.__context__ is context
     assert order == ["body failed", "closed"]
     assert cleanup.await_count == 1
     assert cleanup.call_args.kwargs["failed"] is True
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "cleanup_control", [PermissionError, KeyboardInterrupt, SystemExit, GeneratorExit]
+)
+async def test_preparation_control_survives_stage_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    cleanup_control: type[BaseException],
+) -> None:
+    from tempfile import TemporaryDirectory
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+
+    original: BaseException = control("driver control")
+    if nested:
+        original = BaseExceptionGroup("driver", [BaseExceptionGroup("nested", [original])])
+    context = asyncio.CancelledError("original driver context")
+    original.__context__ = context
+    order: list[str] = []
+
+    class FailingCleanupDirectory(TemporaryDirectory[str]):
+        def cleanup(self) -> None:
+            super().cleanup()
+            order.append("stage cleanup")
+            raise cleanup_control("stage removal failed")
+
+    async def preflight(*args: Any) -> None:
+        order.append("driver body")
+        raise original
+
+    async def close(*args: Any, **kwargs: Any) -> None:
+        order.append("executor cleanup")
+
+    config = module.RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    monkeypatch.setattr(module, "TemporaryDirectory", FailingCleanupDirectory)
+    monkeypatch.setattr(
+        module,
+        "_start_executor",
+        AsyncMock(return_value=Mock(capacity=AsyncMock(return_value=None))),
+    )
+    monkeypatch.setattr(module, "_prepare_gateway", AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "_check_startup_models", AsyncMock(return_value=[]))
+    monkeypatch.setattr(module, "run_preflight", preflight)
+    monkeypatch.setattr(module, "_close_executor", close)
+    runner = module.RunRunner(config, [], run_id="driver-control", approve=None, replanner=None)
+    caught: BaseException | None = None
+    try:
+        await runner.run()
+    except BaseException as error:
+        caught = error
+    assert order == ["driver body", "stage cleanup", "executor cleanup"]
+    assert caught is not None
+    assert caught is original, (type(caught).__name__, caught.__context__ is original)
+    assert original.__context__ is context
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("boundary", ["drive", "queue"])
+async def test_driver_control_survives_child_failure(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    boundary: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._engine.stops import StopState
+    from swarm_arena._errors import StorageError
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup("driver", [BaseExceptionGroup("nested", [error])])
+    waiting = anyio.Event()
+    cancellations: list[BaseException] = []
+    child_failed: list[bool] = []
+    runner = RunRunner(
+        run_config, [plan(rounds=1)], run_id="driver-control", approve=None, replanner=None
+    )
+
+    async def child() -> None:
+        await waiting.wait()
+        child_failed.append(True)
+        raise _core_error(StorageError, "stop poll failed")
+
+    async def wait_for_cancel() -> None:
+        waiting.set()
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class() as cancelled:
+            cancellations.append(cancelled)
+            raise error from cancelled
+
+    if boundary == "drive":
+        deps = Mock(stops=StopState(), journal=Mock(fenced=anyio.Event(), _stopped=False))
+        watcher = Mock(wait_error=child, close=AsyncMock())
+        monkeypatch.setattr(module, "_stop_watcher", lambda *args: watcher)
+        monkeypatch.setattr(module, "_close_stop_watcher", AsyncMock())
+
+        async def queue(*args: Any) -> Any:
+            await wait_for_cancel()
+
+        async def clock(*args: Any) -> None:
+            await anyio.sleep_forever()
+
+        monkeypatch.setattr(runner, "_queue", queue)
+        monkeypatch.setattr(runner, "_watch_clock", clock)
+        operation = runner._drive(deps, 1)
+    else:
+        goal = Mock(goal_id="g", active_agents=Mock(return_value=1), run=child)
+        deps = Mock(
+            config=run_config,
+            admission=Mock(update=AsyncMock()),
+            journal=Mock(append_durable=AsyncMock()),
+        )
+        monkeypatch.setattr(module, "GoalRunner", Mock(return_value=goal))
+        monkeypatch.setattr(runner, "_record_stops", AsyncMock())
+        monkeypatch.setattr(runner, "_stopping", Mock(return_value=False))
+
+        class DriverEvents:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(anyio, name)
+
+            def Event(self) -> Any:
+                return Mock(wait=wait_for_cancel)
+
+        monkeypatch.setattr(module, "anyio", DriverEvents())
+        operation = runner._queue(deps)
+    with anyio.fail_after(60), pytest.raises(type(error)) as caught:
+        await operation
+    assert child_failed == [True]
+    assert caught.value is error
+    assert error.__context__ is cancellations[0]
+
+
+async def test_driver_control_with_real_fenced_journal(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as module
+    from swarm_arena._journal.reader import read_committed
+
+    error = SystemExit("driver control")
+    local_path = tmp_path / "driver-journal.jsonl"
+    owner_before: list[Any] = []
+    journals: list[JournalWriter] = []
+
+    async def queue(self: RunRunner, deps: Any) -> Any:
+        assert isinstance(deps.journal, module._RunJournal)
+        await deps.journal.commit()
+        owner_before.append(read_owner(deps.store))
+        journals.append(deps.journal)
+        deps.journal.fenced.set()
+        raise error
+
+    monkeypatch.setattr(module, "_local_journal_path", lambda *args: local_path)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    runner = RunRunner(run_config, [], run_id="real-driver-control", approve=None, replanner=None)
+    with anyio.fail_after(60), pytest.raises(SystemExit) as caught:
+        await runner.run()
+    assert caught.value is error
+    assert error.__context__ is None
+    store = LocalStore(Path(run_config.run_root) / "real-driver-control")
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner_before == [owner]
+    assert owner[0].head is not None
+    assert owner[0].epoch == 1
+    # Fencing forbids release or publication under this still-live owner.
+    assert owner[0].expires_at > utc_now()
+    assert journals[0]._done.is_set()
+    assert not journals[0]._entered
+    committed = read_committed(store)
+    assert committed is not None
+    mirrored = [json.loads(line) for line in local_path.read_bytes().splitlines()]
+    assert mirrored
+    assert mirrored == [event.model_dump(mode="json") for event in committed[1]]
+    assert mirrored[-1]["seq"] == owner[0].head.seq

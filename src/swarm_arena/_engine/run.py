@@ -166,9 +166,11 @@ async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
                     error = caught
                 finally:
                     watchers.cancel_scope.cancel()
-    finally:
-        if error is not None and _has_driver_control(error):
-            raise error
+    except BaseException:
+        if error is None or not _has_driver_control(error):
+            raise
+    if error is not None and _has_driver_control(error):
+        raise error
     if journal._stopped and isinstance(error, anyio.get_cancelled_exc_class()):
         raise error
     journal._raise_if_fenced()
@@ -249,6 +251,8 @@ async def _supervise_initialization(
                 tasks.cancel_scope.cancel()
     if owned and not retain:
         await _close_stop_watcher(stops)
+    if error is not None and _has_driver_control(error):
+        raise error
     # The task group's own cancellation must not hide a concurrent caller cancel.
     outcome.propagate_control(asyncio.CancelledError())
     if poller.error is not None:
@@ -623,17 +627,20 @@ class RunRunner:
                     failed = True
                     if _has_driver_control(error):
                         hard = error
-                    elif _has_fenced(error):
-                        if services.deps.journal._stopped:
-                            raise anyio.get_cancelled_exc_class()() from None
-                        raise _core_error(Fenced) from None
-                    raise
+                    else:
+                        if _has_fenced(error):
+                            if services.deps.journal._stopped:
+                                raise anyio.get_cancelled_exc_class()() from None
+                            raise _core_error(Fenced) from None
+                        raise
                 finally:
                     try:
                         await services._aclose(failed=failed)
-                    finally:
-                        if hard is not None:
-                            raise hard
+                    except BaseException:
+                        if hard is None:
+                            raise
+                assert hard is not None
+                raise hard
             outcome = _Outcome()
             try:
                 self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
@@ -654,124 +661,140 @@ class RunRunner:
             hard = None
             try:
                 with TemporaryDirectory(prefix="swarm-arena-approval-") as directory:
-                    stage = Path(directory)
-                    staged = ArtifactStore(LocalStore(stage))
-                    admitted: list[Plan] = []
-                    warnings: list[str] = []
-                    for plan in self.plans:
-                        if str(plan.base_dir) not in sys.path:
-                            sys.path.append(str(plan.base_dir))
-                        outcome = _Outcome()
-                        try:
-                            frozen, notes = await run_sync_daemon(
-                                partial(
-                                    admit_revision,
-                                    stamp(plan, origin=plan.origin, parent=None),
-                                    self.config,
-                                    staged,
+                    try:
+                        stage = Path(directory)
+                        staged = ArtifactStore(LocalStore(stage))
+                        admitted: list[Plan] = []
+                        warnings: list[str] = []
+                        for plan in self.plans:
+                            if str(plan.base_dir) not in sys.path:
+                                sys.path.append(str(plan.base_dir))
+                            outcome = _Outcome()
+                            try:
+                                frozen, notes = await run_sync_daemon(
+                                    partial(
+                                        admit_revision,
+                                        stamp(plan, origin=plan.origin, parent=None),
+                                        self.config,
+                                        staged,
+                                    )
                                 )
-                            )
-                        except BaseException as error:
-                            classified = outcome.classify(error)
-                            _raise_terminal(classified)
-                            if isinstance(classified, PlanError):
-                                raise classified from None
-                            raise _core_error(
-                                PlanError, [f"admission failed: {_exception_type_name(classified)}"]
-                            ) from None
-                        admitted.append(frozen)
-                        warnings.extend(notes)
-                    if collisions := _goal_key_errors(admitted):
-                        raise _core_error(PlanError, collisions)
-                    self.plans = admitted
-                    warnings.extend(await _check_startup_models(self.config, self.replanner))
-                    outcome = _Outcome()
-                    try:
-                        estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
-                    except BaseException as exc:
-                        exc = outcome.classify(exc)
-                        _raise_terminal(exc)
-                        raise _core_error(
-                            RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
-                        ) from None
-                    if _exceeds_limit(estimate, self.config):
-                        raise _core_error(
-                            RuntimeError, "worst-case estimate exceeds the configured run limit"
-                        )
-                    total = sum(slices.values(), Amount())
-                    if _exceeds_limit(
-                        total, self.config, Fraction(str(self.config.reserve_fraction))
-                    ):
-                        raise _core_error(RuntimeError, "reserve cannot hold the final slices")
-                    executor = await _start_executor(self.config)
-                    outcome = _Outcome()
-                    try:
-                        capacity = await executor.capacity()
-                        invalid_capacity = capacity is not None and not isinstance(
-                            capacity, Resources
-                        )
-                        if not invalid_capacity:
-                            if capacity is not None:
-                                capacity = await run_sync_daemon(_detach_model, Resources, capacity)
-                            warnings.extend(_capacity_warning(admitted, capacity))
-                    except BaseException as exc:
-                        exc = outcome.classify(exc)
-                        _raise_terminal(exc)
-                        raise _core_error(
-                            RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
-                        ) from None
-                    if invalid_capacity:
-                        raise _core_error(
-                            RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
-                        ) from None
-                    self._gateway = await _prepare_gateway(self.config)
-                    if self._gateway is not None and self._gateway.cap == "soft":
-                        warnings.append("LLM gateway uses a soft cap.")
-                    if self.approve is not None:
+                            except BaseException as error:
+                                classified = outcome.classify(error)
+                                _raise_terminal(classified)
+                                if isinstance(classified, PlanError):
+                                    raise classified from None
+                                raise _core_error(
+                                    PlanError,
+                                    [f"admission failed: {_exception_type_name(classified)}"],
+                                ) from None
+                            admitted.append(frozen)
+                            warnings.extend(notes)
+                        if collisions := _goal_key_errors(admitted):
+                            raise _core_error(PlanError, collisions)
+                        self.plans = admitted
+                        warnings.extend(await _check_startup_models(self.config, self.replanner))
                         outcome = _Outcome()
                         try:
-                            approved = await self.approve(estimate.to_estimate(), warnings)
+                            estimate, slices = await run_sync_daemon(
+                                _estimates, admitted, self.config
+                            )
                         except BaseException as exc:
                             exc = outcome.classify(exc)
                             _raise_terminal(exc)
                             raise _core_error(
-                                RuntimeError, f"approval failed: {_exception_type_name(exc)}"
+                                RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
                             ) from None
-                        if type(approved) is not bool:
+                        if _exceeds_limit(estimate, self.config):
                             raise _core_error(
-                                RuntimeError, f"approval failed: {type(approved).__name__}"
+                                RuntimeError, "worst-case estimate exceeds the configured run limit"
+                            )
+                        total = sum(slices.values(), Amount())
+                        if _exceeds_limit(
+                            total, self.config, Fraction(str(self.config.reserve_fraction))
+                        ):
+                            raise _core_error(RuntimeError, "reserve cannot hold the final slices")
+                        executor = await _start_executor(self.config)
+                        outcome = _Outcome()
+                        try:
+                            capacity = await executor.capacity()
+                            invalid_capacity = capacity is not None and not isinstance(
+                                capacity, Resources
+                            )
+                            if not invalid_capacity:
+                                if capacity is not None:
+                                    capacity = await run_sync_daemon(
+                                        _detach_model, Resources, capacity
+                                    )
+                                warnings.extend(_capacity_warning(admitted, capacity))
+                        except BaseException as exc:
+                            exc = outcome.classify(exc)
+                            _raise_terminal(exc)
+                            raise _core_error(
+                                RuntimeError,
+                                f"executor capacity failed: {_exception_type_name(exc)}",
                             ) from None
-                        if not approved:
-                            raise _core_error(RuntimeError, "run not approved")
-                    await run_preflight(admitted, self.config, executor)
-                    self.run_id = self.run_id or new_run_id(utc_now())
-                    manifest = await build_manifest_async(
-                        run_id=self.run_id,
-                        config=self.config,
-                        plans=admitted,
-                        capacity=capacity,
-                        llm_gateway=self._gateway.manifest if self._gateway is not None else None,
-                    )
-                    await anyio.to_thread.run_sync(_promote, stage, artifacts)
+                        if invalid_capacity:
+                            raise _core_error(
+                                RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
+                            ) from None
+                        self._gateway = await _prepare_gateway(self.config)
+                        if self._gateway is not None and self._gateway.cap == "soft":
+                            warnings.append("LLM gateway uses a soft cap.")
+                        if self.approve is not None:
+                            outcome = _Outcome()
+                            try:
+                                approved = await self.approve(estimate.to_estimate(), warnings)
+                            except BaseException as exc:
+                                exc = outcome.classify(exc)
+                                _raise_terminal(exc)
+                                raise _core_error(
+                                    RuntimeError, f"approval failed: {_exception_type_name(exc)}"
+                                ) from None
+                            if type(approved) is not bool:
+                                raise _core_error(
+                                    RuntimeError, f"approval failed: {type(approved).__name__}"
+                                ) from None
+                            if not approved:
+                                raise _core_error(RuntimeError, "run not approved")
+                        await run_preflight(admitted, self.config, executor)
+                        self.run_id = self.run_id or new_run_id(utc_now())
+                        manifest = await build_manifest_async(
+                            run_id=self.run_id,
+                            config=self.config,
+                            plans=admitted,
+                            capacity=capacity,
+                            llm_gateway=self._gateway.manifest
+                            if self._gateway is not None
+                            else None,
+                        )
+                        await anyio.to_thread.run_sync(_promote, stage, artifacts)
+                    except BaseException as error:
+                        if _has_driver_control(error):
+                            hard = error
+                        raise
                 return await self._execute(
                     executor, artifacts, estimate, slices, warnings, manifest
                 )
             except BaseException as exc:
                 failed = True
-                if _has_driver_control(exc):
+                if hard is None and _has_driver_control(exc):
                     hard = exc
-                elif _has_fenced(exc):
-                    if self._journal is not None and self._journal._stopped:
-                        raise anyio.get_cancelled_exc_class()() from None
-                    raise _core_error(Fenced) from None
-                raise
+                if hard is None:
+                    if _has_fenced(exc):
+                        if self._journal is not None and self._journal._stopped:
+                            raise anyio.get_cancelled_exc_class()() from None
+                        raise _core_error(Fenced) from None
+                    raise
             finally:
                 try:
                     if executor is not None:
                         await _close_executor(executor, self.config, failed=failed)
-                finally:
-                    if hard is not None:
-                        raise hard
+                except BaseException:
+                    if hard is None:
+                        raise
+            if hard is not None:
+                raise hard
 
     async def _execute(
         self,
@@ -971,34 +994,38 @@ class RunRunner:
         result: dict[str, list[Candidate]] = {}
         error: BaseException | None = None
         async with _supervise_writer(deps.journal):
-            async with anyio.create_task_group() as watchers:
-                try:
-                    watchers.start_soon(_stop_watcher(deps.store, epoch, deps.stops).wait_error)
-                    watchers.start_soon(self._watch_clock, deps)
-                    result = await self._queue(deps)
-                    await self._record_stops(deps)
-                    await _read_gateway(deps.journal, deps.gateway)
-                    await self._reconcile_gateway(deps)
-                    with anyio.CancelScope() as completion:
+            try:
+                async with anyio.create_task_group() as watchers:
+                    try:
+                        watchers.start_soon(_stop_watcher(deps.store, epoch, deps.stops).wait_error)
+                        watchers.start_soon(self._watch_clock, deps)
+                        result = await self._queue(deps)
+                        await self._record_stops(deps)
+                        await _read_gateway(deps.journal, deps.gateway)
+                        await self._reconcile_gateway(deps)
+                        with anyio.CancelScope() as completion:
 
-                        def stopping() -> None:
-                            deps.journal._stop_storage()
-                            completion.deadline = min(
-                                completion.deadline,
-                                anyio.current_time() + deps.config.settle_timeout_s,
-                            )
+                            def stopping() -> None:
+                                deps.journal._stop_storage()
+                                completion.deadline = min(
+                                    completion.deadline,
+                                    anyio.current_time() + deps.config.settle_timeout_s,
+                                )
 
-                        deps.stops.on_change = stopping
-                        if self._stopping(deps):
-                            stopping()
-                        await _finish_run(deps.store, deps.journal)
-                    if completion.cancel_called:
-                        raise _core_error(RuntimeError, "run completion timed out")
-                except BaseException as caught:
-                    error = caught
-                finally:
-                    watchers.cancel_scope.cancel()
-                    await _close_stop_watcher(deps.stops)
+                            deps.stops.on_change = stopping
+                            if self._stopping(deps):
+                                stopping()
+                            await _finish_run(deps.store, deps.journal)
+                        if completion.cancel_called:
+                            raise _core_error(RuntimeError, "run completion timed out")
+                    except BaseException as caught:
+                        error = caught
+                    finally:
+                        watchers.cancel_scope.cancel()
+                        await _close_stop_watcher(deps.stops)
+            except BaseException:
+                if error is None or not _has_driver_control(error):
+                    raise
             if error is not None:
                 raise error
         return result
@@ -1113,50 +1140,58 @@ class RunRunner:
             self._wake_queue()
 
         error: BaseException | None = None
-        async with anyio.create_task_group() as goals:
-            try:
-                while queued or active:
-                    changed = self._queue_changed = anyio.Event()
-                    await self._record_stops(deps)
-                    if self._stopping(deps):
-                        for runner in list(queued):
-                            if state is not None and state.goals[runner.goal_id].status != "queued":
-                                continue
-                            await self._queued_result(deps, runner.goal_id)
-                            results[runner.goal_id] = []
-                            queued.remove(runner)
-                    while queued and len(active) < deps.config.limits.max_concurrent_goals:
-                        runner = queued[0]
-                        fresh = state is None or state.goals[runner.goal_id].status == "queued"
-                        if self._stopping(deps) and fresh:
-                            break
-                        if (
-                            sum(g.active_agents() for g in active.values()) + runner.active_agents()
-                            > deps.config.limits.max_agents_total
-                        ):
-                            break
-                        try:
-                            await deps.admission.update(runner.goal_id, runner.active_agents())
-                        except PlanError:
-                            # A revision may have reserved a larger peak during publication.
-                            break
-                        if self._stopping(deps) and fresh:
-                            await deps.admission.release(runner.goal_id)
-                            break
-                        queued.pop(0)
-                        if fresh:
-                            deps.ledger.open_goal(runner.goal_id)
-                            await deps.journal.append_durable(
-                                EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
-                            )
-                        active[runner.goal_id] = runner
-                        goals.start_soon(run_goal, runner)
-                    if queued or active:
-                        await changed.wait()
-            except BaseException as caught:
-                error = caught
-            finally:
-                goals.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as goals:
+                try:
+                    while queued or active:
+                        changed = self._queue_changed = anyio.Event()
+                        await self._record_stops(deps)
+                        if self._stopping(deps):
+                            for runner in list(queued):
+                                if (
+                                    state is not None
+                                    and state.goals[runner.goal_id].status != "queued"
+                                ):
+                                    continue
+                                await self._queued_result(deps, runner.goal_id)
+                                results[runner.goal_id] = []
+                                queued.remove(runner)
+                        while queued and len(active) < deps.config.limits.max_concurrent_goals:
+                            runner = queued[0]
+                            fresh = state is None or state.goals[runner.goal_id].status == "queued"
+                            if self._stopping(deps) and fresh:
+                                break
+                            if (
+                                sum(g.active_agents() for g in active.values())
+                                + runner.active_agents()
+                                > deps.config.limits.max_agents_total
+                            ):
+                                break
+                            try:
+                                await deps.admission.update(runner.goal_id, runner.active_agents())
+                            except PlanError:
+                                # A revision may have reserved a larger peak during publication.
+                                break
+                            if self._stopping(deps) and fresh:
+                                await deps.admission.release(runner.goal_id)
+                                break
+                            queued.pop(0)
+                            if fresh:
+                                deps.ledger.open_goal(runner.goal_id)
+                                await deps.journal.append_durable(
+                                    EventDraft(type=EventType.GOAL_STARTED, goal_id=runner.goal_id)
+                                )
+                            active[runner.goal_id] = runner
+                            goals.start_soon(run_goal, runner)
+                        if queued or active:
+                            await changed.wait()
+                except BaseException as caught:
+                    error = caught
+                finally:
+                    goals.cancel_scope.cancel()
+        except BaseException:
+            if error is None or not _has_driver_control(error):
+                raise
         if error is not None:
             raise error
         return {p.goal.id: results[p.goal.id] for p in self.plans}
