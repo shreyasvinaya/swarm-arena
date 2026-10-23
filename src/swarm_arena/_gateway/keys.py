@@ -707,8 +707,8 @@ class KeyManager:
         Parameters
         ----------
         events : Iterable of Event
-            Committed events for this run. Legacy creation events use their event
-            timestamp and epoch; reads include a one-second lower-bound overlap
+            Committed events for this run. Creation payloads must carry their
+            run identity, owner epoch and timestamp; reads include a one-second lower-bound overlap
             and 15 minutes of clock skew on both sides.
             Restore recorder dedup indexes separately before calling ``read``.
 
@@ -729,9 +729,6 @@ class KeyManager:
             # The engine stamps every event with its run clock; it is not key state.
             payload.pop("run_elapsed_s", None)
             if action == "created":
-                payload.setdefault("run_id", event.run_id)
-                payload.setdefault("owner_epoch", event.epoch)
-                payload.setdefault("created_at", event.ts)
                 record = KeyRecord.model_validate(payload)
                 self._check_record(record)
                 restored[record.key_id] = record
