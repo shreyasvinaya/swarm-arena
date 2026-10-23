@@ -456,12 +456,83 @@ async def test_failed_or_incomplete_read_keeps_charge_and_warns_safely(
         assert SECRET not in caplog.text
 
 
-@pytest.mark.parametrize("mode", ["empty", "no_rows", "rows", "duplicate", "failed", "timeout"])
-async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path, mode: str) -> None:
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "empty",
+        "no_rows",
+        "rows",
+        "duplicate",
+        "failed",
+        "timeout",
+        "latency_no_rows",
+        "latency_read_deadline",
+        "latency_equal_deadline",
+        "latency_first_timeout",
+        "latency_failed",
+    ],
+)
+async def test_read_with_status_distinguishes_failure_from_empty(
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Generator
+    from contextlib import contextmanager
+
+    from swarm_arena._gateway import keys
+
     gw = MemoryGateway()
     async with open_llm_run(tmp_path) as run:
         manager = _manager(gw, run, settle_timeout_s=0.05 if mode in {"timeout", "no_rows"} else 60)
         record, _ = await _open(manager, run)
+        poll_starts: list[float] = []
+
+        class PollClock:
+            now = 0.0
+            deadline = float("inf")
+            scope: anyio.CancelScope
+
+            def current_time(self) -> float:
+                return self.now
+
+            async def sleep(self, seconds: float) -> None:
+                self.now += seconds
+                await anyio.lowlevel.checkpoint()
+
+            @contextmanager
+            def move_on_at(self, deadline: float) -> Generator[anyio.CancelScope]:
+                self.deadline = deadline
+                with anyio.CancelScope() as self.scope:
+                    yield self.scope
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(anyio, name)
+
+        clock = PollClock()
+        spend_rows = gw.spend_rows
+
+        async def delayed_rows(
+            key: VirtualKey, *, start: datetime, end: datetime
+        ) -> list[SpendRow]:
+            poll_starts.append(clock.now)
+            if mode == "latency_failed" and len(poll_starts) == 3:
+                raise GatewayError(SECRET)
+            # Advance a virtual 0.4 s per poll; expire the actual cancellation
+            # scope at the modeled deadline, independent of host scheduling.
+            clock.now += 0.4
+            if clock.now >= clock.deadline:
+                clock.now = clock.deadline
+                clock.scope.cancel()
+                await anyio.lowlevel.checkpoint()
+            return await spend_rows(key, start=start, end=end)
+
+        read_deadline = float("inf")
+        if mode.startswith("latency_"):
+            manager._settle_timeout_s = 0.2 if mode == "latency_first_timeout" else 3.0
+            read_deadline = {"latency_read_deadline": 2.9, "latency_equal_deadline": 3.0}.get(
+                mode, float("inf")
+            )
+            monkeypatch.setattr(keys, "anyio", clock)
+            monkeypatch.setattr(gw, "spend_rows", delayed_rows)
         if mode in {"rows", "duplicate"}:
             gw.rows = [_row()]
         if mode == "duplicate":
@@ -470,13 +541,29 @@ async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path,
             gw.read_error = GatewayError(SECRET)
         if mode == "timeout":
             gw.read_release = anyio.Event()
-        with anyio.fail_after(30):
-            calls, status = await manager.read_with_status(
-                [record], wait_first=mode in {"timeout", "no_rows"}
+        token = keys._read_deadline.set(read_deadline)
+        try:
+            with anyio.fail_after(30):
+                calls, status = await manager.read_with_status(
+                    [record],
+                    wait_first=mode in {"timeout", "no_rows"} or mode.startswith("latency_"),
+                )
+        finally:
+            keys._read_deadline.reset(token)
+        assert status == {
+            "failed": "failed",
+            "timeout": "incomplete",
+            "no_rows": "no_rows",
+            "latency_no_rows": "no_rows",
+            "latency_read_deadline": "incomplete",
+            "latency_equal_deadline": "incomplete",
+            "latency_first_timeout": "incomplete",
+            "latency_failed": "failed",
+        }.get(mode, "ok")
+        if mode.startswith("latency_"):
+            assert poll_starts == pytest.approx(
+                [0.0] if mode == "latency_first_timeout" else [0.0, 1.4, 2.8]
             )
-        assert status == {"failed": "failed", "timeout": "incomplete", "no_rows": "no_rows"}.get(
-            mode, "ok"
-        )
         assert len(calls) == (1 if mode == "rows" else 0)
         assert SECRET not in status
         assert await manager.read_with_status([], wait_first=False) == ([], "ok")
