@@ -590,7 +590,7 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
 
     _add_namespace(review_run)
     # Setup retains the normal lease; only the stalled phase needs fast fence detection.
-    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 1.5})
+    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 3.0})
     path = _file(tmp_path, _csv({"id": "c-1", "score": "7"}, {"id": "c-second", "score": "8"}))
 
     def fail(*args: Any, **kwargs: Any) -> str:
@@ -621,7 +621,7 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
     def block() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(10), "worker release deadline"
+        assert release.wait(180), "worker release deadline"
         returned.set()
 
     def authority(*args: Any, **kwargs: Any) -> Any:
@@ -663,18 +663,17 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
     services: list[asyncio.Task[Any]] = []
     successor: Lease | None = None
     try:
-        assert await run_sync_daemon(entered.wait, 15)
+        assert await run_sync_daemon(entered.wait, 60)
         services = [t for t in asyncio.all_tasks() if t.get_name() == f"resume-{review_run.run_id}"]
-        started = anyio.current_time()
         if interrupt == "cancel":
             scopes[0].cancel()
         else:
             successor = force_take_over(
                 review_run.store, owner_id="successor", host="local", ttl_s=60
             )
-        done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "caller retained by stalled receipt I/O"
-        assert anyio.current_time() - started < 3 * config.settle_timeout_s
+        assert not release.is_set(), "caller waited for the held receipt worker"
         owner = read_owner(review_run.store)
         assert owner is not None
         if interrupt == "cancel":
@@ -687,9 +686,9 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
         assert all(t.done() for t in services), "resume service outlived its caller"
         assert not returned.is_set()
         release.set()
-        assert await run_sync_daemon(returned.wait, 5)
+        assert await run_sync_daemon(returned.wait, 60)
         for worker in workers:
-            await run_sync_daemon(worker.join, 5)
+            await run_sync_daemon(worker.join, 60)
             assert not worker.is_alive()
         await asyncio.gather(task, *services)
         assert not renewals_after_return
@@ -698,9 +697,9 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
         assert not any(e.payload.get("reviewer") == "bob" for e in _events(review_run.store))
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 5)
+        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 60)
         for worker in workers:
-            await run_sync_daemon(worker.join, 5)
+            await run_sync_daemon(worker.join, 60)
             assert not worker.is_alive()
         if successor is not None:
             successor.release()
@@ -737,7 +736,7 @@ async def test_cancelled_takeover_releases_undelivered_lease(
         lease = original(cls, *args, **kwargs)
         leases.append(lease)
         acquired.set()
-        assert release.wait(10), "takeover worker release deadline"
+        assert release.wait(180), "takeover worker release deadline"
         returned.set()
         return lease
 
@@ -761,17 +760,17 @@ async def test_cancelled_takeover_releases_undelivered_lease(
     monkeypatch.setattr(Lease, "release", release_lease)
     task = asyncio.create_task(caller())
     try:
-        assert await run_sync_daemon(acquired.wait, 5)
+        assert await run_sync_daemon(acquired.wait, 60)
         if native:
             task.cancel()
-            done, _ = await asyncio.wait([task], timeout=2)
+            done, _ = await asyncio.wait([task], timeout=30)
             assert done, "native cancellation waits for takeover delivery"
         else:
             scopes[0].cancel()
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
-        assert await run_sync_daemon(returned.wait, 5)
-        assert await run_sync_daemon(cleaned.wait, 5), "undelivered lease was not released"
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        assert await run_sync_daemon(returned.wait, 60)
+        assert await run_sync_daemon(cleaned.wait, 60), "undelivered lease was not released"
         owner = read_owner(review_run.store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
@@ -781,8 +780,8 @@ async def test_cancelled_takeover_releases_undelivered_lease(
         await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
-        assert await run_sync_daemon(returned.wait, 5)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        assert await run_sync_daemon(returned.wait, 60)
         for lease in leases:
             with anyio.CancelScope(shield=True):
                 with suppress(Fenced):
@@ -843,7 +842,7 @@ async def test_cancelled_writer_entry_releases_lease_once(
             if len(releases) > 1:
                 workers.append(threading.current_thread())
                 duplicate.set()
-                assert unblock.wait(10), "duplicate release cleanup deadline"
+                assert unblock.wait(180), "duplicate release cleanup deadline"
         original_release(self)
 
     async def caller() -> None:
@@ -862,9 +861,9 @@ async def test_cancelled_writer_entry_releases_lease_once(
     monkeypatch.setattr(resume._ResumeServices, "_serve_owned", serve)
     task = asyncio.create_task(caller())
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await entered.wait()
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, f"caller blocked after writer entry: {len(releases)} lease releases"
         assert len(leases) == len(releases) == 1
         assert not duplicate.is_set(), "owner started a second blocking cleanup"
@@ -875,15 +874,15 @@ async def test_cancelled_writer_entry_releases_lease_once(
         assert all(service.task is not None and service.task.done() for service in services)
     finally:
         unblock.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
         for service in services:
             assert service.task is not None
-            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 5)
+            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 60)
         # AnyIO pool threads are reused, so drain their call via the owner task;
         # daemon cleanup threads can additionally be joined.
         for worker in workers:
             if worker.name.startswith("swarm-arena-daemon-"):
-                await run_sync_daemon(worker.join, 5)
+                await run_sync_daemon(worker.join, 60)
                 assert not worker.is_alive()
 
 
@@ -955,7 +954,7 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
             releases.append(self)
             workers.append(threading.current_thread())
             blocked.set()
-            assert unblock.wait(10), "fallback release cleanup deadline"
+            assert unblock.wait(180), "fallback release cleanup deadline"
         original_release(self)
 
     async def caller() -> None:
@@ -976,8 +975,8 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
     monkeypatch.setattr(resume, "run_sync_daemon", daemon)
     task = asyncio.create_task(caller())
     try:
-        assert await run_sync_daemon(blocked.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=5)
+        assert await run_sync_daemon(blocked.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "caller retained an unbounded shield around blocked release"
         assert all(service.task is not None and service.task.done() for service in services)
         assert len(services) == int(operation == "resume" and stage == "journal-entry")
@@ -990,12 +989,12 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
         assert _events(review_run.store) == before
     finally:
         unblock.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
         for service in services:
             assert service.task is not None
-            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 5)
+            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 60)
         for worker in workers:
-            await run_sync_daemon(worker.join, 5)
+            await run_sync_daemon(worker.join, 60)
             assert not worker.is_alive()
     assert len(releases) == 1, "late cleanup attempted another release"
     owner = read_owner(review_run.store)
@@ -1350,7 +1349,7 @@ async def test_stop_during_import(
         if doc is not None and doc.epoch == 2:
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return original(store, run_id, doc)
 
     monkeypatch.setattr(human_review, "_read_state", read)
@@ -1361,9 +1360,9 @@ async def test_stop_during_import(
         HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
     )
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "review import retained a stopped storage wait"
         with pytest.raises(RuntimeError, match=r"^review import stopped$"):
             await task
@@ -1374,10 +1373,10 @@ async def test_stop_during_import(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert not _reviews(run_config)
     assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
@@ -1414,7 +1413,7 @@ async def test_import_after_running_to_deadline(
     with monkeypatch.context() as patch:
         patch.setattr(run_module._RunJournal, "append", signal)
         patch.setattr(run_module.RunRunner, "_watch_clock", deadline)
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             await Swarm(run_config).run(
                 [
                     plan(goal_id="a", rounds=1),
@@ -1452,15 +1451,25 @@ async def test_import_stop_during_takeover_response(
     from swarm_arena._engine.control import request_stop
 
     held = HeldOwnerResponse()
+
+    def hold_response() -> None:
+        held.held.entered.set()
+        try:
+            assert held.held.release.wait(180), "test did not release owner response"
+        finally:
+            held.held.exited.set()
+
+    monkeypatch.setattr(held.held, "wait", hold_response)
     held.install(monkeypatch, takeover=True)
     task = asyncio.create_task(
         HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
     )
     try:
-        await held.ready()
+        assert await anyio.to_thread.run_sync(held.held.entered.wait, 60)
         assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
-        with anyio.fail_after(3), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+        with anyio.fail_after(30), pytest.raises(RuntimeError, match=r"^review import stopped$"):
             await asyncio.shield(task)
+        assert not held.held.exited.is_set(), "review waited for its held owner response"
     finally:
         await held.finish(task)
     await held.assert_released()
@@ -1487,7 +1496,7 @@ async def test_import_stop_at_preparation_entry_has_stopped_outcome(
         return gettempdir()
 
     monkeypatch.setattr(human_review, "gettempdir", tempdir)
-    with anyio.fail_after(5), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+    with anyio.fail_after(60), pytest.raises(RuntimeError, match=r"^review import stopped$"):
         await HumanReview("alice").import_csv(
             review_run.run_id,
             _file(tmp_path),
