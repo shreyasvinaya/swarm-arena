@@ -5,8 +5,10 @@ import importlib.metadata
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,7 +25,7 @@ from swarm_arena._store.base import open_store
 from swarm_arena._tooling.result_file import request_json
 from swarm_arena._tooling.staging import edit_hashes, put_edits
 from swarm_arena.executor import Job, LocalExecutor
-from swarm_arena.tool import Command, RunStatus, ToolOutput, ToolRequest
+from swarm_arena.tool import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
 
 try:
     importlib.metadata.version("ray")
@@ -36,6 +38,7 @@ import ray
 from swarm_arena.ray._files import MIB, MemoryStore, frame, inline_inputs, unframe
 from swarm_arena.ray._task import (
     TaskSettings,
+    _WorkerSupervisor,
     driver_import_roots,
     job_payload,
     read_payload,
@@ -50,6 +53,7 @@ def _job(script: str = "report_env.py", *, args: list[str] | None = None, **kw: 
 
 
 def _tool_job(code: str, *, tool: str = "PyTool", **kw: Any) -> Job:
+    kw.setdefault("timeout_s", 60)
     return make_job(
         kind="tool",
         command=None,
@@ -66,6 +70,7 @@ def _function_job(path: str, *, inputs: dict[str, Any] | None = None) -> Job:
         tool=Ref(path="swarm_arena:FunctionTool", config={"function": path}),
         request=ToolRequest(inputs=inputs or {}),
         stage=Job.Stage(request_json=request_json(ToolRequest(inputs=inputs or {}))),
+        timeout_s=60,
     )
 
 
@@ -79,22 +84,52 @@ def _remote(job: Job, *, cap: int = 256 * MIB, blobs: dict[str, bytes] | None = 
     )
 
 
+def _pid_written(path: Path) -> bool:
+    """Check pid contents, not just file creation before write_text flushes."""
+    return path.exists() and path.read_text().isdigit()
+
+
+def _timeout_after_ready(monkeypatch: pytest.MonkeyPatch, ready: Callable[[], bool]) -> None:
+    """Inject execution timeout only after readiness; keep the real grace wait."""
+    original = _WorkerSupervisor._wait
+    timed_out = False
+
+    async def wait(
+        self: _WorkerSupervisor, process: subprocess.Popen[bytes], deadline: float | None
+    ) -> bool:
+        nonlocal timed_out
+        if not timed_out:
+            assert deadline is not None
+            assert await anyio.to_thread.run_sync(wait_until, ready, 30)
+            assert process.poll() is None
+            timed_out = True
+            return False
+        return await original(self, process, deadline)
+
+    monkeypatch.setattr(_WorkerSupervisor, "_wait", wait)
+
+
 def test_run_in_worker_ok(tmp_path: Path) -> None:
     assert _run(_job(), tmp_path).status == RunStatus.OK
 
 
-def test_timeout_keeps_partial_output(tmp_path: Path) -> None:
-    out = _run(_job("partial_on_sigterm.py", timeout_s=1.0, grace_s=2.0), tmp_path)
+def test_timeout_keeps_partial_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = tmp_path / "ready"
+    _timeout_after_ready(monkeypatch, ready.exists)
+    out = _run(
+        _job("partial_on_sigterm.py", args=["--ready-file", str(ready)], grace_s=2), tmp_path
+    )
     assert out.status == RunStatus.TIMEOUT
     assert out.partial
     assert out.data["step"] >= 1
 
 
-def test_tool_ignoring_sigterm_killed_after_grace(tmp_path: Path) -> None:
+def test_tool_ignoring_sigterm_killed_after_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid = tmp_path / "pid"
-    out = _run(
-        _job("ignore_sigterm.py", args=["--pid-file", str(pid)], timeout_s=1, grace_s=0.2), tmp_path
-    )
+    _timeout_after_ready(monkeypatch, lambda: _pid_written(pid))
+    out = _run(_job("ignore_sigterm.py", args=["--pid-file", str(pid)], grace_s=0.2), tmp_path)
     assert out.status == RunStatus.TIMEOUT
     assert not pid_alive(int(pid.read_text()))
 
@@ -105,10 +140,11 @@ def test_blocked_collect_cannot_stop_kill(tmp_path: Path, monkeypatch: pytest.Mo
 
     RELEASE.clear()
     pid = tmp_path / "pid"
+    _timeout_after_ready(monkeypatch, lambda: _pid_written(pid))
     code = WORKER_SCRIPTS["ignore_sigterm.py"]
     code = f"import sys; sys.argv = ['tool', '--pid-file', {str(pid)!r}]\n" + code
     worker = _Worker(
-        _tool_job(code, tool="BlockingCollectTool", timeout_s=1, grace_s=0.2),
+        _tool_job(code, tool="BlockingCollectTool", grace_s=0.2),
         tmp_path,
         ArtifactStore(MemoryStore()),
         TaskSettings(),
@@ -123,13 +159,13 @@ def test_blocked_collect_cannot_stop_kill(tmp_path: Path, monkeypatch: pytest.Mo
             assert worker.job_run.collect_finished.wait(5)
 
 
-def test_fifo_stderr_cannot_block_kill(tmp_path: Path) -> None:
+def test_fifo_stderr_cannot_block_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid = tmp_path / "pid"
+    _timeout_after_ready(monkeypatch, lambda: _pid_written(pid))
     out = _run(
         _job(
             "ignore_sigterm.py",
             args=["--pid-file", str(pid), "--fifo-stderr"],
-            timeout_s=1,
             grace_s=0.2,
         ),
         tmp_path,
@@ -346,14 +382,24 @@ def test_payload_errors_are_value_free() -> None:
     assert_secret_absent(caught.value, secret)
 
 
-def test_effective_command_bounds(tmp_path: Path) -> None:
+def test_effective_command_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = tmp_path / "ready"
+    _timeout_after_ready(monkeypatch, ready.exists)
+    original = _WorkerSupervisor.run
+
+    async def run(self: _WorkerSupervisor, *args: Any, **kwargs: Any) -> CompletedRun:
+        assert kwargs["timeout_s"] == 1
+        assert kwargs["grace_s"] == 0.2
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(_WorkerSupervisor, "run", run)
     job = _tool_job(WORKER_SCRIPTS["partial_on_sigterm.py"], timeout_s=60, grace_s=60)
     job = dataclasses.replace(
         job,
         tool=Ref(
             path="_fakes.tools:PyTool",
             config={
-                "code": "import sys; sys.argv = ['tool']\n"
+                "code": f"import sys; sys.argv = ['tool', '--ready-file', {str(ready)!r}]\n"
                 + WORKER_SCRIPTS["partial_on_sigterm.py"],
                 "timeout_s": 1,
                 "grace_s": 0.2,
@@ -463,6 +509,7 @@ def test_stop_collect_control_survives_kill(
     from swarm_arena._errors import _core_error, _SignalCategory
 
     pid = tmp_path / "pid"
+    _timeout_after_ready(monkeypatch, lambda: _pid_written(pid))
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         terminal = _core_error(RuntimeError, "cleanup failed", _category=_SignalCategory.TERMINAL)
@@ -471,7 +518,7 @@ def test_stop_collect_control_survives_kill(
     monkeypatch.setattr(PyTool, "collect", fail)
     with pytest.raises(RuntimeError, match="cleanup failed"):
         _run(
-            _job("ignore_sigterm.py", args=["--pid-file", str(pid)], timeout_s=1, grace_s=0),
+            _job("ignore_sigterm.py", args=["--pid-file", str(pid)], grace_s=0),
             tmp_path,
         )
     assert not pid_alive(int(pid.read_text()))
@@ -760,6 +807,7 @@ def test_process_options_and_oom_status(tmp_path: Path, monkeypatch: pytest.Monk
                 ]
             ),
             resources=Resources(memory_gib=1),
+            timeout_s=60,
         ),
         tmp_path,
     )
@@ -1068,6 +1116,7 @@ def test_drop_env_payload_roundtrip_and_worker(
         artifact_root=str(tmp_path / "artifacts"),
         drop_env=("GEMINI_API_KEY", "OPENAI_API_KEY"),
         secret_values={"OPENAI_API_KEY": "sk-v"},
+        timeout_s=60,
     )
     restored, _, _ = read_payload(job_payload(job, TaskSettings()))
     assert restored.drop_env == job.drop_env

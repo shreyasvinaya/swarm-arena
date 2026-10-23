@@ -1289,3 +1289,115 @@ def test_session_read_error_is_retried_at_unchanged_producing_mark(
         assert reads == [1, 1]
     finally:
         board.close()
+
+
+@pytest.mark.parametrize(
+    ("observed", "label", "expected"),
+    [
+        (None, "estimated", "1.00 USD (estimated)"),
+        (
+            0.012345,
+            "observed (completeness unverified)",
+            "0.0123 USD (observed (completeness unverified))",
+        ),
+        (0.012345, "observed", "0.0123 USD (observed)"),
+    ],
+)
+def test_trace_shows_gateway_cap(
+    tmp_path: Path,
+    observed: float | None,
+    label: str,
+    expected: str,
+) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key())
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        with board._read_namespace() as old:
+            before = old.trace(["toy"], "c-1")
+            assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in before
+            assert not any(line.startswith("gateway spend") for line in before)
+            run.commit(reconcile(observed=observed, label=label))
+            assert trace(board, "c-1") == before
+            board.frontier()
+            assert old.trace(["toy"], "c-1") == before
+            after = trace(board, "c-1")
+            assert f"gateway spend {expected}" in after
+    finally:
+        board.close()
+
+
+def test_gateway_trace_filters_candidate_key_and_producing_run(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key(), reconcile(key_id="foreign-hash", observed=99, label="observed"))
+    other = FakeRun(str(tmp_path / "runs"), "r2")
+    key = gateway_key(cap="hard")
+    key.payload["run_id"] = "r2"
+    other.commit(
+        _plan(other), _candidate(other), key, reconcile(observed=99, label="observed", run_id="r2")
+    )
+    add_pointer(str(tmp_path / "arena"), other)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        lines = trace(board, "c-1")
+        assert lines[0].startswith("plan     r1 ")
+        assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in lines
+        assert not any(line.startswith("gateway spend") for line in lines)
+    finally:
+        board.close()
+
+
+def test_gateway_trace_uses_only_published_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key(), reconcile())
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+
+        def forbidden(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("gateway trace performed preparation")
+
+        monkeypatch.setattr(board, "frontier", forbidden)
+        monkeypatch.setattr(ArenaCache, "_committed_state", forbidden)
+        monkeypatch.setattr(RunState, "from_events", forbidden)
+        monkeypatch.setattr("swarm_arena._board.arena.read_owner", forbidden)
+        assert "gateway spend 1.00 USD (estimated)" in trace(board, "c-1")
+    finally:
+        board.close()
+
+
+def test_gateway_trace_does_not_merge_equal_run_ids_across_namespaces(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    for namespace, cap in (("public", "hard"), ("private", "soft")):
+        run = FakeRun(str(tmp_path / namespace), "same-run", namespace=namespace)
+        created = gateway_key(cap=cap)
+        created.payload["run_id"] = "same-run"
+        run.commit(run.plan(), run.candidate("c-1"), created, reconcile(run_id="same-run"))
+        add_pointer(str(tmp_path / "arena"), run)
+    board.open("", "", ["public", "private"])
+    try:
+        board.frontier()
+        with board._read_namespace() as reader:
+            with pytest.raises(KeyError):
+                reader.trace(["public"], "c-1")
+            assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in reader.trace(
+                ["private"], "c-1"
+            )
+    finally:
+        board.close()

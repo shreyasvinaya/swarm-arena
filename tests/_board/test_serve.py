@@ -336,6 +336,7 @@ def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.Mon
 
     from swarm_arena._board.cache import ArenaCache
     from swarm_arena._board.trace import _lines, _SessionCalls
+    from swarm_arena._journal.replay import _GatewayKey, _GatewaySpend
     from swarm_arena._model.board_types import Frontier
     from swarm_arena._model.plan import Plan
     from swarm_arena._model.results import Candidate, LLMCall
@@ -348,10 +349,22 @@ def test_request_keeps_captured_frontier(server: Server, monkeypatch: pytest.Mon
         revisions: Sequence[Plan],
         calls: Mapping[str, Mapping[str, LLMCall]],
         sessions: Mapping[str, _SessionCalls | None],
+        gateway_keys: Mapping[tuple[str, str], _GatewayKey],
+        gateway_reconcile: Mapping[tuple[str, str], _GatewaySpend],
     ) -> list[str]:
         server.run.commit(server.run.score("s-later", "c-child", 99, judge="late-score"))
         server.board.frontier()
-        return _lines(cache, frontier, candidate, seq, revisions, calls, sessions)
+        return _lines(
+            cache,
+            frontier,
+            candidate,
+            seq,
+            revisions,
+            calls,
+            sessions,
+            gateway_keys,
+            gateway_reconcile,
+        )
 
     monkeypatch.setattr("swarm_arena._board.trace._lines", lines)
     assert "late-score" not in get(server, "/candidate/c-child")
@@ -767,3 +780,13 @@ def test_llm_route_enforces_served_namespace_selection(tmp_path: Path, records: 
         thread.join(timeout=5)
         assert not thread.is_alive()
         board.close()
+
+
+def test_candidate_page_shows_committed_gateway_cap(server: Server) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    server.run.commit(gateway_key("c-child"), reconcile("c-child"))
+    server.board.frontier()
+    text = get(server, "/candidate/c-child")
+    assert "gateway key cand-c-child: max_budget 1.00 USD, cap soft" in text
+    assert "gateway spend 1.00 USD (estimated)" in text

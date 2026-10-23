@@ -132,10 +132,78 @@ conservatively, without a lost marker. Thus a crash's
 additional accounting loss is bounded by unsettled reservations: in-flight tool
 runs and open per-holder tranches. The accounting cap cannot be enlarged by a
 crash or forced takeover. A tool's **actual external spend** still depends on
-correct estimates, reported usage, and its own provider caps; this release has no gateway
-that enforces tool-internal provider spending. Reported overspend is recorded
+correct estimates, reported usage, and its own provider caps. The optional
+gateway on the pinned LiteLLM range provides only a soft cap, as described below. Reported overspend is recorded
 and can exhaust the budget. Usage beyond the supported accounting range
 terminally exhausts the whole run, even with unset caps.
+
+## LLM gateway: hard and soft caps
+
+The optional `llm_gateway` checks its strict profile before run ownership,
+manifest publication, approval, or any virtual key creation. Approval warnings
+include `LLM gateway uses a soft cap.` when soft-cap policy is accepted. **The pinned LiteLLM range
+`>=1.107.0rc2,<1.108` cannot provide a hard cap.** Its profile is always
+unverified. `require_hard_cap` defaults to true when `limits.max_usd` is set;
+that configuration therefore fails preflight. Set it explicitly to false to
+accept a soft cap:
+
+```toml
+[limits]
+max_usd = 5.0
+
+[llm_gateway]
+url = "http://127.0.0.1:4000"
+master_key_env = "LITELLM_MASTER_KEY"
+require_hard_cap = false
+```
+
+Keep the master key in the named environment variable. Neither it nor a virtual
+key belongs in configuration files, manifests or journal events. Gateway URLs
+must have no userinfo, query or fragment. A run retains one adapter, its checked
+profile and one key manager bound to the existing journal owner. Preflight
+retains fixed method, route and status diagnostics from the built-in transport;
+foreign adapter errors expose only their type. Gateway model identifiers must
+be printable, nonblank and at most 256 characters, otherwise they display as
+`<unknown>`. Errors and manifest evidence retain the first ten failures followed
+by `and N more` when necessary.
+
+A verified strict profile requires all of the following:
+
+- Budget reservations enabled, with enforcement that fails closed when spend
+  counters are stale.
+- Known input/output prices and an output-token bound for every model, plus an
+  enforced per-key bound on the request's `max_tokens`.
+- Only routes that participate in budget reservations; pass-through endpoints
+  disabled.
+- An enforced maximum total request duration, no longer than the configured
+  `request_timeout_s`.
+- Virtual keys required for model access.
+
+LiteLLM on the pinned range lacks three required guarantees: **request
+`max_tokens` is not bounded per key**, **no maximum request duration is
+enforced**, and **virtual keys are not required**. It also lacks the needed
+settings introspection endpoint. The adapter checks liveliness and model
+metadata, and reports `gateway settings introspection unavailable`; it never
+assumes unreadable settings pass. `default_estimated_output_tokens` is an
+estimate, not an enforced ceiling, and an HTTP timeout does not establish a
+total request-duration guarantee. A batch-write interval is not proof that
+spend logs are complete.
+
+The manifest's `llm_gateway` block records the URL, `cap`, `verified`, `failures`
+and `terminal_accounting`; it is identical in `manifest.json` and `run_started`.
+Without a gateway the block is null. The pinned adapter records `cap = "soft"`,
+`verified = false` and `terminal_accounting = false`. Candidate `trace` and the
+board viewer display the key alias, reserved `max_budget` in USD and cap label.
+They use the committed state captured with the board frontier, so a refresh
+reveals later reconciliation while an already captured reader stays unchanged.
+
+Gateway budgets cap **USD only**, not tokens. Pin the gateway's cost map to the
+model prices used when reserving budgets; changing prices undermines estimates.
+A soft cap does not guarantee that concurrent external requests stay within the
+reservation. Keyed tool reservations stay fully charged for the run. With this
+LiteLLM range, reconciliation keeps the full reservation labelled `estimated`:
+without a verified duration bound, waiting longer cannot prove completeness.
+Observed rows can still inform provenance without lowering the ledger charge.
 
 ## Tokens, USD, and tranches
 

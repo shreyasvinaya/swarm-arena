@@ -7,11 +7,12 @@ import socket
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
+from dataclasses import dataclass
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 import anyio
@@ -26,8 +27,8 @@ from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.goal import GoalRunner, r0_revision_draft
-from swarm_arena._engine.manifest import RunManifest, build_manifest_async
-from swarm_arena._engine.preflight import run_preflight
+from swarm_arena._engine.manifest import RunManifest, _GatewayManifest, build_manifest_async
+from swarm_arena._engine.preflight import gateway_preflight, run_preflight
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.solution import solution_view
 from swarm_arena._engine.stops import (
@@ -50,6 +51,9 @@ from swarm_arena._errors import (
 )
 from swarm_arena._exec.executor import Executor, schedule_timeout_scope
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+from swarm_arena._gateway.keys import KeyManager
+from swarm_arena._gateway.litellm_proxy import adapter_for
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._journal.llm_record import _bound_run, drain
@@ -462,6 +466,57 @@ def _local_journal_path(run_id: str, epoch: int) -> Path:
     )
 
 
+@dataclass(frozen=True)
+class _GatewaySetup:
+    """Keep the one adapter and its preownership evidence for the run lifetime."""
+
+    adapter: GatewayAdapter
+    profile: ProfileReport
+    manifest: _GatewayManifest
+
+    @property
+    def cap(self) -> Literal["hard", "soft"]:
+        return self.manifest.cap
+
+
+async def _prepare_gateway(config: RunConfig) -> _GatewaySetup | None:
+    """Resolve credentials and verify policy before ownership or publication."""
+    if config.llm_gateway is None:
+        return None
+    adapter = adapter_for(config.llm_gateway, os.environ)
+    cap, profile = await gateway_preflight(config, adapter)
+    manifest = _GatewayManifest(
+        url=config.llm_gateway.url,
+        cap=cap,
+        verified=profile.verified,
+        failures=profile.failures,
+        terminal_accounting=adapter.terminal_accounting,
+    )
+    return _GatewaySetup(adapter, profile, manifest)
+
+
+def _bind_gateway(
+    setup: _GatewaySetup | None, config: RunConfig, journal: JournalWriter, run_id: str
+) -> KeyManager | None:
+    """Construct the sole key owner under the existing entered writer.
+
+    Resume uses the same preparation and binding seams, then restores committed
+    records before reads or dispatch. The pipeline owns returned keys' cleanup;
+    this constructor installs no writer, recorder, watcher or cleanup timer.
+    """
+    if setup is None:
+        return None
+    assert config.llm_gateway is not None
+    return KeyManager(
+        setup.adapter,
+        config.llm_gateway,
+        cap=setup.cap,
+        journal=journal,
+        settle_timeout_s=config.settle_timeout_s,
+        run_id=run_id,
+    )
+
+
 class RunRunner:
     """
     Coordinate approval, startup, queued goals and run-wide cancellation.
@@ -505,6 +560,8 @@ class RunRunner:
         self._used = False
         self._queue_changed = anyio.Event()
         self._journal: JournalWriter | None = None
+        self._gateway: _GatewaySetup | None = None
+        self._key_manager: KeyManager | None = None
 
     async def run(self) -> dict[str, list[Candidate]]:
         """
@@ -647,6 +704,9 @@ class RunRunner:
                         raise _core_error(
                             RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
                         ) from None
+                    self._gateway = await _prepare_gateway(self.config)
+                    if self._gateway is not None and self._gateway.cap == "soft":
+                        warnings.append("LLM gateway uses a soft cap.")
                     if self.approve is not None:
                         outcome = _Outcome()
                         try:
@@ -666,7 +726,11 @@ class RunRunner:
                     await run_preflight(admitted, self.config, executor)
                     self.run_id = self.run_id or new_run_id(utc_now())
                     manifest = await build_manifest_async(
-                        run_id=self.run_id, config=self.config, plans=admitted, capacity=capacity
+                        run_id=self.run_id,
+                        config=self.config,
+                        plans=admitted,
+                        capacity=capacity,
+                        llm_gateway=self._gateway.manifest if self._gateway is not None else None,
                     )
                     await anyio.to_thread.run_sync(_promote, stage, artifacts)
                 return await self._execute(
@@ -733,6 +797,7 @@ class RunRunner:
                         store, lease.doc.epoch, stops, clock, config
                     ) as prepared:
                         journal.clock = clock
+                        self._key_manager = _bind_gateway(self._gateway, config, journal, run_id)
                         await _storage_io(_create, store, "run.toml", config.dumps().encode())
                         await _storage_io(
                             _create,
