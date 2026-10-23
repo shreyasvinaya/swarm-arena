@@ -393,6 +393,10 @@ def inline_inputs(
     ValueError
         If the cap is outside the supported range or aggregate input size
         exceeds it.
+    NotFound
+        If a referenced artifact is missing, including after size preflight.
+    StorageError
+        If an artifact is not a readable regular file or fails its hash check.
 
     Examples
     --------
@@ -411,7 +415,7 @@ def inline_inputs(
             data = store.read(digest).data
             _check_cap(total + len(data), cap_bytes=cap_bytes, what="inputs")
         else:
-            fd = open_regular_file(Path(store.url), digest)
+            fd = _open_local_input(Path(store.url), digest)
             try:
                 _check_cap(total + os.fstat(fd).st_size, cap_bytes=cap_bytes, what="inputs")
                 try:
@@ -428,6 +432,20 @@ def inline_inputs(
     return blobs
 
 
+def _open_local_input(root: Path, digest: str) -> int:
+    """Keep missing and damaged artifacts on the storage error path."""
+    try:
+        return open_regular_file(root, digest)
+    except ValueError:
+        try:
+            os.lstat(root / digest)
+        except FileNotFoundError:
+            raise NotFound("store key not found") from None
+        except OSError:
+            raise StorageError("artifact input read failed") from None
+        raise StorageError("artifact input read failed") from None
+
+
 def _input_size(store: Store, digest: str) -> int:
     """Inspect an artifact's size without reading its contents."""
     if isinstance(store, MemoryStore):
@@ -436,7 +454,7 @@ def _input_size(store: Store, digest: str) -> int:
             if key not in store._blobs:
                 raise NotFound("memory object not found")
             return len(store._blobs[key])
-    fd = open_regular_file(Path(store.url), digest)
+    fd = _open_local_input(Path(store.url), digest)
     try:
         return os.fstat(fd).st_size
     finally:
