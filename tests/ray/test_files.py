@@ -32,8 +32,6 @@ from swarm_arena.ray._files import (
     uses_object_store,
 )
 
-pytestmark = pytest.mark.ray
-
 
 def test_needed_hashes_cover_root_parents_and_candidate() -> None:
     hashes = [sha256_hex(bytes([i])) for i in range(4)]
@@ -64,7 +62,7 @@ def test_inline_inputs_over_cap_raises(tmp_path: Path) -> None:
 def test_inline_inputs_deduplicates(artifacts: ArtifactStore) -> None:
     sha = artifacts.put_bytes(b"ab")
     stage = Job.Stage(root={"a": sha, "b": sha})
-    assert inline_inputs(stage, artifacts, cap_bytes=2) == {sha: b"ab"}
+    assert inline_inputs(stage, artifacts, cap_bytes=MIB) == {sha: b"ab"}
 
 
 @pytest.mark.parametrize("what", ["inputs", "outputs"])
@@ -241,6 +239,7 @@ def test_uses_object_store() -> None:
     assert uses_object_store("/tmp/artifacts")
 
 
+@pytest.mark.ray
 def test_frame_roundtrips_through_ray_object_store(ray_driver: None) -> None:
     import ray
 
@@ -312,3 +311,123 @@ def test_frame_rejects_invalid_digest_identifier() -> None:
     with pytest.raises(ValueError, match="invalid frame sha256") as caught:
         frame(b"", {"secret-sentinel": b"x"})
     assert_secret_absent(caught.value, "secret-sentinel", sanitized=True)
+
+
+@pytest.mark.parametrize("operation", ["init", "create", "replace"])
+@pytest.mark.parametrize("view", [False, True])
+def test_memory_store_detaches_mutable_buffers(operation: str, view: bool) -> None:
+    buffer = bytearray(b"aaaa")
+    data: Any = memoryview(buffer) if view else buffer
+    store = MemoryStore({"out": data} if operation == "init" else {})
+    if operation == "create":
+        store.create("out", data)
+    elif operation == "replace":
+        etag = store.create("out", b"old")
+        store.replace("out", data, if_match=etag)
+    buffer[:] = b"bbbb"
+    blob = store.read("out")
+    assert blob.data == b"aaaa"
+    assert type(blob.data) is bytes
+    assert blob.etag == sha256_hex(b"aaaa")
+    if operation != "init":
+        assert store.created() == {"out": b"aaaa"}
+    store.replace("out", b"next", if_match=blob.etag)
+
+
+def test_inline_inputs_refuses_aggregate_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._store.base import Blob
+
+    class CountingStore(LocalStore):
+        bytes_read = 0
+
+        def read(self, key: str) -> Blob:
+            blob = super().read(key)
+            self.bytes_read += len(blob.data)
+            return blob
+
+    store = CountingStore(tmp_path)
+    artifacts = ArtifactStore(store)
+    first = artifacts.put_bytes(b"x" * (MIB // 2 + 1))
+    second = artifacts.put_bytes(b"y" * (MIB // 2 + 1))
+    from swarm_arena.ray import _files
+
+    byte_reads: list[int] = []
+    original_read = _files.os.read
+
+    def counting_read(fd: int, size: int) -> bytes:
+        data = original_read(fd, size)
+        byte_reads.append(len(data))
+        return data
+
+    monkeypatch.setattr(_files.os, "read", counting_read)
+    with pytest.raises(ValueError, match="over the Ray") as caught:
+        inline_inputs(Job.Stage(root={"a": first, "b": second}), artifacts, cap_bytes=MIB)
+    assert str(caught.value) == (
+        f"inputs of this tool run are {MIB + 2} bytes, over the Ray "
+        "object_store_cap_mib cap of 1 MiB; use an s3:// artifact_root"
+    )
+    assert store.bytes_read == 0
+    assert byte_reads == []
+
+
+@pytest.mark.parametrize("cap_bytes", [0, 1, MIB - 1, 1024 * MIB + 1, 2048 * MIB])
+def test_transport_rejects_invalid_object_store_caps(cap_bytes: int) -> None:
+    for operation in (
+        lambda: inline_inputs(Job.Stage(), ArtifactStore(MemoryStore()), cap_bytes=cap_bytes),
+        lambda: check_cap({}, cap_bytes=cap_bytes, what="outputs"),
+    ):
+        with pytest.raises(ValueError, match="object_store_cap_mib"):
+            operation()
+
+
+def test_transport_cap_endpoints_and_exported_maximum() -> None:
+    from swarm_arena.ray._files import MAX_OBJECT_STORE_CAP_MIB
+
+    assert MAX_OBJECT_STORE_CAP_MIB == 1024
+    for cap_bytes in (MIB, MAX_OBJECT_STORE_CAP_MIB * MIB):
+        check_cap({}, cap_bytes=cap_bytes, what="inputs")
+        assert inline_inputs(Job.Stage(), ArtifactStore(MemoryStore()), cap_bytes=cap_bytes) == {}
+
+
+def test_inline_inputs_rechecks_file_growth_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena.ray import _files
+
+    artifacts = ArtifactStore(LocalStore(tmp_path))
+    digest = artifacts.put_bytes(b"x")
+    original = _files._input_size
+    reads: list[int] = []
+
+    def size_then_grow(store: Any, key: str) -> int:
+        size = original(store, key)
+        (tmp_path / key).write_bytes(b"x" * (MIB + 1))
+        return size
+
+    def read(fd: int, count: int) -> bytes:
+        reads.append(count)
+        raise AssertionError("over-cap file was read")
+
+    monkeypatch.setattr(_files, "_input_size", size_then_grow)
+    monkeypatch.setattr(_files.os, "read", read)
+    with pytest.raises(ValueError, match="over the Ray object_store_cap_mib cap of 1 MiB"):
+        inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB)
+    assert reads == []
+
+
+def test_inline_inputs_verifies_local_hash(tmp_path: Path) -> None:
+    from swarm_arena._errors import StorageError
+
+    artifacts = ArtifactStore(LocalStore(tmp_path))
+    digest = artifacts.put_bytes(b"x")
+    (tmp_path / digest).write_bytes(b"changed")
+    with pytest.raises(StorageError, match="artifact failed its hash check"):
+        inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB)
+
+
+def test_inline_inputs_supports_immutable_memory_store() -> None:
+    artifacts = ArtifactStore(MemoryStore())
+    digest = artifacts.put_bytes(b"x")
+    assert inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB) == {digest: b"x"}
