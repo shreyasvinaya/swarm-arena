@@ -311,3 +311,28 @@ async def test_local_executor_applies_drop_env(
         assert output.data == {"data": {"dropped": True, "virtual": True}}
     finally:
         await executor.aclose()
+
+
+@pytest.mark.parametrize("source", ["missing", "malformed"])
+def test_dropped_names_do_not_read_secrets_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    path = tmp_path / "secret.env"
+    if source == "malformed":
+        path.write_text("not-an-env-line")
+
+    def refuse_read(path: str) -> dict[str, str]:
+        pytest.fail("dropped name caused a secrets-file read")
+
+    monkeypatch.setattr(exec_env, "read_secrets_file", refuse_read)
+    job = make_job(
+        secret_env=("GEMINI_API_KEY",),
+        secrets_file=str(path),
+        drop_env=("OPENAI_API_KEY", "GEMINI_API_KEY"),
+        secret_values={"OPENAI_API_KEY": "virtual"},
+    )
+    env = build_env(
+        job, Command(argv=["x"], env=["OPENAI_API_KEY"]), workspace=tmp_path, node_env={}
+    )
+    assert env["OPENAI_API_KEY"] == "virtual"
+    assert "GEMINI_API_KEY" not in env

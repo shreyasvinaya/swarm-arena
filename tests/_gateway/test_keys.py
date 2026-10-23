@@ -233,7 +233,7 @@ async def test_rows_recorded_once_and_never_fund_ambient_scope(tmp_path: Path) -
         assert run.charged(scope) == Amount()
         assert not run.events("settle")
         start, end = gw.windows[0]
-        assert start == record.created_at.replace(microsecond=0) - timedelta(seconds=1)
+        assert start == record.created_at.replace(microsecond=0) - timedelta(minutes=15, seconds=1)
         assert end >= record.created_at
 
 
@@ -725,3 +725,205 @@ async def test_read_timer_does_not_bound_healthy_recording(
 def test_gateway_job_preserves_existing_drops() -> None:
     job = gateway_job(make_job(drop_env=("CUSTOM",)), url="http://gw", secret="sk-v")
     assert job.drop_env == tuple(sorted(PROVIDER_KEYS | {"CUSTOM"}))
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_model", "expected_provider"),
+    [
+        ("openai/" + "x" * 300, "unknown", "unknown"),
+        ("openai/gpt\n6", "unknown", "unknown"),
+        ("x" * 65 + "/model", "x" * 65 + "/model", "unknown"),
+        ("", "unknown", "unknown"),
+        ("   ", "unknown", "unknown"),
+        (None, "unknown", "unknown"),
+    ],
+)
+async def test_poison_model_does_not_starve_later_rows(
+    tmp_path: Path, model: Any, expected_model: str, expected_provider: str
+) -> None:
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [
+            _row(request_id="good"),
+            _row(request_id="poison").model_copy(update={"model": model}),
+            _row(request_id="late"),
+        ]
+        calls = await manager.read([record], wait_first=False)
+        assert [call.litellm_call_id for call in calls] == [
+            gateway_call_id(record.key_id, name) for name in ("good", "poison", "late")
+        ]
+        assert (calls[1].model, calls[1].provider) == (expected_model, expected_provider)
+        gw.rows.append(_row(request_id="next"))
+        following = await manager.read([record], wait_first=False)
+        assert [call.litellm_call_id for call in following] == [
+            gateway_call_id(record.key_id, "next")
+        ]
+
+
+async def test_row_recording_error_warns_once_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from swarm_arena._gateway import keys
+
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [_row(request_id=name) for name in ("good", "poison", "late")]
+        original = keys.record_call
+
+        async def reject_poison(**kwargs: Any) -> Any:
+            if kwargs["litellm_call_id"] == gateway_call_id(record.key_id, "poison"):
+                raise ValueError(SECRET * 10000)
+            return await original(**kwargs)
+
+        monkeypatch.setattr(keys, "record_call", reject_poison)
+        calls = await manager.read([record], wait_first=False)
+        assert [call.litellm_call_id for call in calls] == [
+            gateway_call_id(record.key_id, name) for name in ("good", "late")
+        ]
+        assert [entry.getMessage() for entry in caplog.records] == [
+            "gateway spend row recording failed"
+        ]
+        caplog.clear()
+        gw.rows.append(_row(request_id="next"))
+        following = await manager.read([record], wait_first=False)
+        assert [call.litellm_call_id for call in following] == [
+            gateway_call_id(record.key_id, "next")
+        ]
+        assert [entry.getMessage() for entry in caplog.records] == [
+            "gateway spend row recording failed"
+        ]
+        assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("skew_s", [-3, 3])
+async def test_spend_window_includes_gateway_clock_skew(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skew_s: int
+) -> None:
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [_row().model_copy(update={"ts": record.created_at + timedelta(seconds=skew_s)})]
+        original = gw.spend_rows
+
+        async def dated(key: VirtualKey, *, start: datetime, end: datetime) -> list[SpendRow]:
+            rows = await original(key, start=start, end=end)
+            return [row for row in rows if start <= row.ts <= end]
+
+        monkeypatch.setattr(gw, "spend_rows", dated)
+        before = datetime.now(UTC)
+        assert len(await manager.read([record], wait_first=False)) == 1
+        start, end = gw.windows[0]
+        assert start == record.created_at.replace(microsecond=0) - timedelta(minutes=15, seconds=1)
+        assert end >= before + timedelta(minutes=15)
+
+
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("restored", [False, True])
+async def test_open_refuses_owned_candidate_before_create(
+    tmp_path: Path, closed: bool, restored: bool
+) -> None:
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run, candidate_id=SECRET)
+        if closed:
+            await manager.close(record)
+        if restored:
+            await run.journal.commit()
+            manager = _manager(gw, run)
+            manager.restore(run.events("gateway_key"))
+        with pytest.raises(ValueError, match="candidate already has a gateway key") as caught:
+            await _open(manager, run, candidate_id=SECRET)
+        assert_secret_absent(caught.value, SECRET)
+        assert len(gw.created) == 1
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_fake_gateway_refuses_duplicate_alias(blocked: bool) -> None:
+    from _fakes.gateway import FakeGateway
+
+    gateway = FakeGateway()
+    body = {"key_alias": "cand-one", "metadata": {}, "default_estimated_output_tokens": 4096}
+    authorization = f"Bearer {gateway.master_key}"
+    status, created, _ = gateway._route("POST", "/key/generate", body, authorization)
+    assert status == 200
+    if blocked:
+        assert (
+            gateway._route("POST", "/key/block", {"key": created["token_id"]}, authorization)[0]
+            == 200
+        )
+    status, error, _ = gateway._route("POST", "/key/generate", body, authorization)
+    assert status == 400
+    assert error == {"error": "key_alias already exists"}
+    assert len(gateway.keys) == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("signal", ["fenced", "terminal"])
+async def test_row_recording_preserves_registered_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signal: str, nested: bool
+) -> None:
+    from swarm_arena._errors import Fenced, _core_error, _is_core_control, _SignalCategory
+    from swarm_arena._gateway import keys
+
+    error = (
+        _core_error(Fenced, "safe")
+        if signal == "fenced"
+        else _core_error(RuntimeError, "safe", _category=_SignalCategory.TERMINAL)
+    )
+    raised = BaseExceptionGroup(SECRET, [error]) if nested else error
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [_row()]
+
+        async def fail(**kwargs: Any) -> Any:
+            raise raised
+
+        monkeypatch.setattr(keys, "record_call", fail)
+        with pytest.raises(Exception, match=r"safe|ownership") as caught:
+            await manager.read([record], wait_first=False)
+        assert _is_core_control(caught.value)
+        assert_secret_absent(caught.value, SECRET)
+
+
+async def test_row_recording_preserves_caller_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._gateway import keys
+
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [_row()]
+        with anyio.CancelScope() as cancelled:
+
+            async def fail(**kwargs: Any) -> Any:
+                cancelled.cancel()
+                raise ValueError(SECRET)
+
+            monkeypatch.setattr(keys, "record_call", fail)
+            await manager.read([record], wait_first=False)
+            pytest.fail("row error swallowed caller cancellation")
+        assert cancelled.cancelled_caught
+
+
+def test_fake_gateway_deleted_alias_can_be_reused() -> None:
+    from _fakes.gateway import FakeGateway
+
+    gateway = FakeGateway()
+    body = {"key_alias": "cand-one", "metadata": {}, "default_estimated_output_tokens": 4096}
+    authorization = f"Bearer {gateway.master_key}"
+    _, created, _ = gateway._route("POST", "/key/generate", body, authorization)
+    status, _, _ = gateway._route(
+        "POST", "/key/delete", {"keys": [created["token_id"]]}, authorization
+    )
+    assert status == 200
+    assert gateway._route("POST", "/key/generate", body, authorization)[0] == 200

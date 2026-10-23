@@ -27,6 +27,7 @@ from swarm_arena._tooling.llm_calls import PROVIDER_KEYS
 
 REPLACED_KEYS: Final = frozenset({"OPENAI_API_KEY", "ANTHROPIC_API_KEY"})
 _CLEANUP_TIMEOUT_S: Final = 30.0
+_CLOCK_SKEW: Final = timedelta(minutes=15)
 _LOG = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -235,6 +236,13 @@ class KeyRecord(FrozenModel):
     closed_at: AwareDatetime | None = None
 
 
+def _observation_label(value: object, limit: int) -> str:
+    """Normalize untrusted labels to the recorder's bounded printable domain."""
+    if type(value) is str and 0 < len(value) <= limit and value.isprintable() and value.strip():
+        return value
+    return "unknown"
+
+
 def _virtual(record: KeyRecord) -> VirtualKey:
     return VirtualKey(key_id=record.key_id, alias=record.alias)
 
@@ -343,6 +351,8 @@ class KeyManager:
         ----------
         candidate_id, run_id, goal_id, team, agent : str
             Trusted invocation attribution; run_id must match this manager.
+            Use one create attempt per candidate_id; already held candidates
+            are refused even when their key is closed.
         reservation : Reservation
             Existing full tool charge, never settled by this manager.
         round : int
@@ -361,6 +371,8 @@ class KeyManager:
         """
         if run_id != self._run_id:
             raise ValueError("gateway run binding mismatch")
+        if any(record.candidate_id == candidate_id for record in self._records.values()):
+            raise ValueError("candidate already has a gateway key")
         deadline = min(
             anyio.current_effective_deadline(), anyio.current_time() + _CLEANUP_TIMEOUT_S
         )
@@ -514,7 +526,15 @@ class KeyManager:
         -------
         list of LLMCall
             Newly recorded calls. Failed/incomplete reads warn and return no
-            observations; no estimate or ledger balance is changed.
+            observations; no estimate or ledger balance is changed. Invalid model
+            and provider labels become "unknown". An ordinary recording failure
+            warns once for that row and does not prevent later rows from recording.
+
+        Notes
+        -----
+        Query bounds include 15 minutes of clock skew on both sides, in addition
+        to second rounding and the one-second lower overlap. The key filter
+        selects observations and canonical identities deduplicate this overlap.
 
         Examples
         --------
@@ -537,11 +557,13 @@ class KeyManager:
                         deadline if wait_first and self._settle_timeout_s else math.inf
                     ) as poll:
                         end = datetime.now(UTC)
-                        end = end.replace(microsecond=0) + timedelta(seconds=1)
+                        end = end.replace(microsecond=0) + timedelta(seconds=1) + _CLOCK_SKEW
                         for record in records:
-                            start = record.created_at.astimezone(UTC).replace(
-                                microsecond=0
-                            ) - timedelta(seconds=1)
+                            start = (
+                                record.created_at.astimezone(UTC).replace(microsecond=0)
+                                - timedelta(seconds=1)
+                                - _CLOCK_SKEW
+                            )
                             rows = await self._call(
                                 partial(
                                     self._adapter.spend_rows, _virtual(record), start=start, end=end
@@ -562,32 +584,44 @@ class KeyManager:
                 await anyio.sleep(min(1.0, max(0, deadline - anyio.current_time())))
             calls: list[LLMCall] = []
             for record, row in observations:
-                call = await record_call(
-                    metadata={
-                        "run_id": self._run_id,
-                        "owner_epoch": str(self._journal.epoch),
-                        "goal_id": record.goal_id,
-                        "team": record.team,
-                        "agent": record.agent,
-                        "round": str(record.round),
-                        "role": "tool",
-                        "candidate_id": record.candidate_id,
-                    },
-                    model=row.model,
-                    provider=row.model.split("/", 1)[0] if "/" in row.model else "unknown",
-                    usage=row.usage,
-                    cost_usd=row.cost_usd,
-                    cache_hit=False,
-                    latency_ms=None,
-                    status="ok",
-                    error=None,
-                    request=None,
-                    response=None,
-                    litellm_call_id=gateway_call_id(row.key_id, row.request_id),
-                    tool_call_ids=(),
-                    settle=False,
-                    _external_observation=True,
-                )
+                outcome = _Outcome()
+                try:
+                    model = _observation_label(row.model, 256)
+                    provider = (
+                        _observation_label(model.split("/", 1)[0], 64)
+                        if "/" in model
+                        else "unknown"
+                    )
+                    call = await record_call(
+                        metadata={
+                            "run_id": self._run_id,
+                            "owner_epoch": str(self._journal.epoch),
+                            "goal_id": record.goal_id,
+                            "team": record.team,
+                            "agent": record.agent,
+                            "round": str(record.round),
+                            "role": "tool",
+                            "candidate_id": record.candidate_id,
+                        },
+                        model=model,
+                        provider=provider,
+                        usage=row.usage,
+                        cost_usd=row.cost_usd,
+                        cache_hit=False,
+                        latency_ms=None,
+                        status="ok",
+                        error=None,
+                        request=None,
+                        response=None,
+                        litellm_call_id=gateway_call_id(row.key_id, row.request_id),
+                        tool_call_ids=(),
+                        settle=False,
+                        _external_observation=True,
+                    )
+                except BaseException as error:
+                    outcome.propagate_control(error)
+                    _LOG.warning("gateway spend row recording failed")
+                    continue
                 if call is not None:
                     calls.append(call)
             return calls
@@ -599,7 +633,8 @@ class KeyManager:
         ----------
         events : Iterable of Event
             Committed events for this run. Legacy creation events use their event
-            timestamp and epoch; reads include a one-second lower-bound overlap.
+            timestamp and epoch; reads include a one-second lower-bound overlap
+            and 15 minutes of clock skew on both sides.
             Restore recorder dedup indexes separately before calling ``read``.
 
         Examples

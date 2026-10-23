@@ -102,6 +102,7 @@ class FakeGateway:
         Method, query-free path and decoded JSON/query, in arrival order.
     keys : dict
         Hash-indexed key state, including secret, alias, blocked and deleted.
+        Active and blocked aliases are unique; deleted aliases may be reused.
         Deleted keys remain archived for key-info. A missing block route/key
         returns 404; only the separate key-info reply establishes absence.
     fail, delay, malformed : dict, dict, set
@@ -364,6 +365,11 @@ class FakeGateway:
                 models[0]["model_info"]["input_cost_per_token"] = None
             return 200, {"data": models}, {}
         if path == "/key/generate" and method == "POST":
+            if any(
+                row["alias"] == body["key_alias"] and not row["deleted"]
+                for row in self.keys.values()
+            ):
+                return 400, {"error": "key_alias already exists"}, {}
             secret = "sk-" + uuid4().hex
             key_id = hashlib.sha256(secret.encode()).hexdigest()
             metadata = dict(body["metadata"])

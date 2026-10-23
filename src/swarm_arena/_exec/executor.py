@@ -63,7 +63,7 @@ class Job:
     secret_values : Mapping[str, str], optional
         Driver-supplied secrets overriding other environment sources.
     drop_env : tuple[str, ...], optional
-        Names removed after node/file resolution, before explicit env and secrets.
+        Tuple of names excluded from node/file resolution before explicit overlays.
     on_started : Callable[[Job.Started], Awaitable[None]] or None, default=None
         Await before releasing the job to run; None starts without a callback.
     on_partial : Callable[[ToolOutput], Awaitable[None]] or None, default=None
@@ -218,6 +218,8 @@ class Job:
 
     def __post_init__(self) -> None:
         """Require finite execution limits and a consistent payload for the job kind."""
+        if type(self.drop_env) is not tuple or any(type(name) is not str for name in self.drop_env):
+            raise ValueError("Job.drop_env: expected a tuple of strings")
         for name, value, positive in (
             ("timeout_s", self.timeout_s, True),
             ("grace_s", self.grace_s, False),
