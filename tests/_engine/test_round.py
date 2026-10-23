@@ -2005,3 +2005,56 @@ async def test_budget_close_during_reserve_durability(
     settles = [e for e in env.events("settle") if e.payload["id"] == reserves[0]["id"]]
     assert len(settles) == 1
     assert Amount.model_validate(settles[0].payload["actual"]) == Amount()
+
+
+@pytest.mark.parametrize("retired", [False, True])
+@pytest.mark.parametrize("durable", [False, True])
+async def test_dispatch_restore_deduplicates_progress_and_preserves_admissions(
+    env: EngineEnv, durable: bool, retired: bool
+) -> None:
+    slot = _scripted("a", [])
+    runner = _round(env, [slot], frontier=Frontier())
+    journal = env.deps.journal
+    journal.append(EventDraft(type="round_started", goal_id="g", round=1, payload={"round": 1}))
+    for kind in ["tool_dispatch", "tool_dispatch", *(["run_lost"] if retired else [])]:
+        journal.append(
+            EventDraft(
+                type=kind,
+                goal_id="g",
+                team="t",
+                agent="a",
+                round=1,
+                payload={
+                    "candidate_id": "c-a",
+                    "reservation_id": "r-a",
+                    "started": Job.Started(
+                        kind="dispatch", job_id="c-a", task_name="c-a", ray_job_id="driver-1"
+                    ).model_dump(mode="json"),
+                },
+            )
+        )
+    if durable:
+        journal.append(
+            EventDraft(
+                type="agent_counters",
+                goal_id="g",
+                team="t",
+                agent="a",
+                round=1,
+                payload={"turns": 3, "board_reads": 0, "tool_runs": 3},
+            )
+        )
+        journal.append(
+            EventDraft(
+                type="agent_counters",
+                goal_id="g",
+                team="t",
+                agent="a",
+                round=1,
+                payload={"turns": 4, "board_reads": 1},
+            )
+        )
+    await journal.commit()
+    await runner._restore(1)
+    assert runner.started_runs == {"t/a": 1}
+    assert runner._counters["t/a"]["tool_runs"] == (3 if durable else 1)

@@ -1060,3 +1060,41 @@ def test_replay_refuses_invalid_planner_provenance(key: str, value: Any) -> None
     with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
         RunState.from_events([_ev(1, "plan_revision", payload, goal_id="g")])
     assert_secret_absent(caught.value, "secret-sentinel")
+
+
+DISPATCH = {
+    "candidate_id": "c-a-e1-0001",
+    "reservation_id": "r-1",
+    "started": {
+        "kind": "dispatch",
+        "job_id": "c-a-e1-0001",
+        "task_name": "c-a-e1-0001",
+        "ray_job_id": "driver-1",
+    },
+}
+
+
+def test_replay_dispatch_without_end_is_started() -> None:
+    state = RunState.from_events([*_PRE, _reserve(3, "r-1"), _ev(4, "tool_dispatch", DISPATCH)])
+    started = state.started["c-a-e1-0001"]
+    assert started.kind == "dispatch"
+    assert started.task_name == "c-a-e1-0001"
+    assert started.ray_job_id == "driver-1"
+    assert state.reservations["r-1"].state == "open"
+
+
+@pytest.mark.parametrize("end", ["tool_end", "run_lost"])
+def test_replay_dispatch_with_end_is_not_started(end: str) -> None:
+    terminal = (
+        _end(5, "c-a-e1-0001")
+        if end == "tool_end"
+        else _ev(5, "run_lost", {"candidate_id": "c-a-e1-0001", "reservation_id": "r-1"})
+    )
+    state = RunState.from_events(
+        [*_PRE, _reserve(3, "r-1"), _ev(4, "tool_dispatch", DISPATCH), terminal]
+    )
+    assert "c-a-e1-0001" not in state.started
+    if end == "run_lost":
+        assert "c-a-e1-0001" in state.lost
+        assert "c-a-e1-0001" not in state.candidates
+        assert state.reservations["r-1"].state == "open"

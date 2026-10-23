@@ -264,7 +264,7 @@ class _ResumeServices:
                                 starts = {
                                     e.payload["candidate_id"]: e
                                     for e in events
-                                    if e.type == EventType.TOOL_START
+                                    if e.type in {EventType.TOOL_START, EventType.TOOL_DISPATCH}
                                 }
                                 commands = {
                                     e.payload["job_id"]: e
@@ -277,10 +277,14 @@ class _ResumeServices:
                                 ):
                                     for id, started in jobs.items():
                                         outcome = _Outcome()
+                                        confirmed = False
                                         try:
-                                            with anyio.move_on_after(config.settle_timeout_s):
-                                                if await executor.kill_orphan(started):
-                                                    killed.append(id)
+                                            with anyio.move_on_after(
+                                                config.settle_timeout_s
+                                            ) as orphan_scope:
+                                                confirmed = (
+                                                    await executor.kill_orphan(started) is True
+                                                )
                                         except BaseException as error:
                                             error = outcome.classify(error)
                                             _raise_terminal(error)
@@ -289,8 +293,11 @@ class _ResumeServices:
                                                 RuntimeError,
                                                 f"orphan recovery failed: {name}",
                                             ) from None
+                                        confirmed = confirmed and not orphan_scope.cancel_called
+                                        if confirmed:
+                                            killed.append(id)
                                         source = index[id]
-                                        payload = (
+                                        payload: dict[str, Any] = (
                                             {
                                                 "candidate_id": id,
                                                 "reservation_id": source.payload["reservation_id"],
@@ -298,6 +305,15 @@ class _ResumeServices:
                                             if event_type == EventType.RUN_LOST
                                             else {"job_id": id, "status": "lost"}
                                         )
+                                        if (
+                                            event_type == EventType.RUN_LOST
+                                            and started.kind == "dispatch"
+                                        ):
+                                            payload.update(
+                                                kind="dispatch",
+                                                task_name=started.task_name,
+                                                confirmed_dead=confirmed,
+                                            )
                                         journal.append(
                                             EventDraft(
                                                 type=event_type,

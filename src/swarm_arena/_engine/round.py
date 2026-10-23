@@ -397,7 +397,8 @@ class RoundRunner:
         Ordered converge parent identifiers, prepended to every tool request.
     started_runs : Mapping[str, int], optional
         Restored durable starts by team/agent, including lost runs. Without an
-        explicit count, a restarted round counts its committed tool_start events.
+        explicit count, a restarted round counts its committed tool_start and
+        tool_dispatch events.
     supervisor : GoalRunner or None, default=None
         Existing goal owner for stop and fence supervision. Standalone rounds
         create a local supervisor.
@@ -857,14 +858,19 @@ class RoundRunner:
                     and learning.author == key
                 ):
                     self._own_learnings.setdefault(key, []).append(learning)
-            elif event.type in {EventType.TOOL_START, EventType.RUN_LOST, EventType.TOOL_END}:
+            elif event.type in {
+                EventType.TOOL_START,
+                EventType.TOOL_DISPATCH,
+                EventType.RUN_LOST,
+                EventType.TOOL_END,
+            }:
                 id = (
                     event.payload["candidate"]["id"]
                     if event.type == EventType.TOOL_END
                     else event.payload["candidate_id"]
                 )
                 admitted.setdefault(key, set()).add(id)
-                if event.type == EventType.TOOL_START:
+                if event.type in {EventType.TOOL_START, EventType.TOOL_DISPATCH}:
                     started.setdefault(key, set()).add(id)
         for key, ids in admitted.items():
             self._counters[key].setdefault("tool_runs", len(ids))
