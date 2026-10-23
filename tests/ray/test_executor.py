@@ -2,6 +2,9 @@
 
 import asyncio
 import os
+import subprocess
+import sys
+import textwrap
 import threading
 from collections.abc import Generator
 from pathlib import Path
@@ -85,8 +88,16 @@ def _frame(output: ToolOutput | None = None, blobs: dict[str, bytes] | None = No
 @pytest.fixture
 def fake_ray(monkeypatch: pytest.MonkeyPatch) -> _RunJob:
     run_job = _RunJob(_Ref(_frame()))
+    connected = [False]
+
+    def init(**kw: Any) -> Any:
+        connected[0] = True
+        return SimpleNamespace(dashboard_url="head:8265")
+
+    monkeypatch.setattr(module, "_connection_address", None, raising=False)
+    monkeypatch.setattr(ray, "is_initialized", lambda: connected[0])
     monkeypatch.setattr(module, "run_job", run_job)
-    monkeypatch.setattr(ray, "init", Mock(return_value=SimpleNamespace(dashboard_url="head:8265")))
+    monkeypatch.setattr(ray, "init", Mock(side_effect=init))
     monkeypatch.setattr(
         ray,
         "get_runtime_context",
@@ -793,7 +804,7 @@ async def test_secret_values_never_in_task_metadata(ray_driver: Any, tmp_path: P
 
 @pytest.mark.ray
 async def test_capacity_reports_cluster(ray_driver: Any) -> None:
-    cap = await RayExecutor(address=ray.get_runtime_context().gcs_address).capacity()
+    cap = await RayExecutor().capacity()
     assert cap is not None
     assert cap.cpus == 2.0
     assert cap.custom == {"llm_keys": 1.0}
@@ -1471,20 +1482,146 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
             assert await anyio.to_thread.run_sync(done.wait, 2)
 
 
-@pytest.mark.parametrize("address", ["auto", "configured-head", "private-other-head"])
-async def test_explicit_address_must_match_connected_gcs(
+@pytest.mark.parametrize("address", ["localhost:6379", "127.0.0.1:6379", "auto"])
+async def test_owned_connection_reuses_configured_address(
     fake_ray: _RunJob, tmp_path: Path, address: str
 ) -> None:
-    executor = RayExecutor(address=address)
     job = make_job(artifact_root=str(tmp_path))
-    if address == "private-other-head":
-        with pytest.raises(RuntimeError) as caught:
-            await executor.submit(job)
-        assert_secret_absent(caught.value, address)
-        assert_secret_absent(caught.value, "configured-head")
-        assert not fake_ray.arguments
-    else:
-        assert (await executor.submit(job)).status == RunStatus.OK
+    # The fake runtime stores a different GCS spelling from either explicit input.
+    for requested in (address, address, "auto"):
+        assert (await RayExecutor(address=requested).submit(job)).status == RunStatus.OK
+    assert len(fake_ray.arguments) == 3
+    with pytest.raises(RuntimeError) as caught:
+        await RayExecutor(address="private-other-head").submit(job)
+    assert_secret_absent(caught.value, "private-other-head")
+    assert_secret_absent(caught.value, address)
+    assert len(fake_ray.arguments) == 3
+
+
+async def test_foreign_connection_refuses_explicit_address_but_auto_reuses(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    job = make_job(artifact_root=str(tmp_path))
+    for address in ("configured-head", "auto", "configured-head"):
+        if address == "auto":
+            assert (await RayExecutor().submit(job)).status == RunStatus.OK
+        else:
+            with pytest.raises(RuntimeError, match="Ray is already initialized in this process"):
+                await RayExecutor(address=address).submit(job)
+    assert len(fake_ray.arguments) == 1
+
+
+async def test_disconnected_process_can_claim_a_new_address(
+    fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = await RayExecutor(address="first-private-head").capacity()
+    assert first is not None
+    assert first.cpus == 2
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    second = await RayExecutor(address="second-private-head").capacity()
+    assert second is not None
+    assert second.cpus == 2
+
+
+async def test_concurrent_executors_serialize_connection_ownership(
+    fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, second_entered, release = threading.Event(), threading.Event(), threading.Event()
+    connected = [False]
+    calls: list[str] = []
+    errors: list[Exception] = []
+    connect = RayExecutor._connect
+
+    def init(*, address: str, **kw: Any) -> Any:
+        calls.append(address)
+        entered.set()
+        assert release.wait(60)
+        connected[0] = True
+        return SimpleNamespace(dashboard_url="head:8265")
+
+    def connect_started(self: RayExecutor) -> tuple[str | None, str | None]:
+        if self.config.address == "second-private-head":
+            second_entered.set()
+        return connect(self)
+
+    async def capacity(address: str) -> None:
+        try:
+            result = await RayExecutor(address=address).capacity()
+            assert result is not None
+            assert result.cpus == 2
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(ray, "init", init)
+    monkeypatch.setattr(ray, "is_initialized", lambda: connected[0])
+    monkeypatch.setattr(RayExecutor, "_connect", connect_started)
+    try:
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(capacity, "configured-head")
+                assert await anyio.to_thread.run_sync(entered.wait, 30)
+                tasks.start_soon(capacity, "second-private-head")
+                assert await anyio.to_thread.run_sync(second_entered.wait, 30)
+                release.set()
+        assert calls == ["configured-head"]
+        assert len(errors) == 1
+        assert_secret_absent(errors[0], "second-private-head")
+    finally:
+        release.set()
+
+
+@pytest.mark.ray
+@pytest.mark.parametrize("foreign", [False, True])
+def test_live_process_connection_ownership(ray_cluster: str, foreign: bool) -> None:
+    # A separate driver avoids changing the shared ray_driver fixture's connection.
+    script = textwrap.dedent("""\
+        import os
+        import sys
+        import anyio
+        import ray
+        from swarm_arena.ray import RayExecutor
+
+        async def main() -> None:
+            # Exercise the typed spelling without the fixture's address override.
+            os.environ.pop("RAY_ADDRESS", None)
+            cluster, mode = sys.argv[1:]
+            address = "localhost:" + cluster.rsplit(":", 1)[1]
+            if mode == "foreign":
+                ray.init(address=cluster)
+                try:
+                    await RayExecutor(address=cluster).capacity()
+                except RuntimeError as error:
+                    assert str(error) == "Ray is already initialized in this process"
+                else:
+                    raise AssertionError("foreign connection was claimed")
+            else:
+                for _ in range(2):
+                    assert (await RayExecutor(address=address).capacity()).cpus == 2
+                try:
+                    await RayExecutor(address="other-private-head:1234").capacity()
+                except RuntimeError as error:
+                    assert "other-private-head" not in str(error)
+                    assert address not in str(error)
+                else:
+                    raise AssertionError("a different address was silently ignored")
+            assert (await RayExecutor().capacity()).cpus == 2
+            print("ownership verified", flush=True)
+
+        try:
+            anyio.run(main)
+        finally:
+            ray.shutdown()
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, ray_cluster, "foreign" if foreign else "owned"],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ownership verified" in result.stdout
 
 
 async def test_schedule_cleanup_does_not_restart_after_a_force_control(
