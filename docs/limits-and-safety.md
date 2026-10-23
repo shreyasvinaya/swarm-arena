@@ -133,7 +133,11 @@ and retrying them needs new budget. Reservations with neither event remain
 charged conservatively, without a lost marker. A Ray dispatch intent can be
 committed before submission, so a missing task does not prove that it never ran.
 See [Ray recovery](running-on-ray.md#recovery) for the dashboard requirements and
-unknown death evidence. Thus a crash's
+unknown death evidence. Token-authenticated clusters use Ray's own token loader
+under the recovery deadline and can confirm lost runs with matching evidence;
+tokens are never persisted or included in errors. Unavailable authentication
+remains unknown, and HTTPS, proxied or overridden dashboards retain the documented
+confirmation limits. Thus a crash's
 additional accounting loss is bounded by unsettled reservations: in-flight tool
 runs and open per-holder tranches. The accounting cap cannot be enlarged by a
 crash or forced takeover. A tool's **actual external spend** still depends on

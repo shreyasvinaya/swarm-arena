@@ -227,8 +227,20 @@ def _request(url: str, deadline: float) -> Any:
 
     def read() -> None:
         try:
+            try:
+                from ray._private.authentication.http_token_authentication import (
+                    get_auth_headers_if_auth_enabled,
+                )
+            except ImportError:
+                headers = {}
+            else:
+                headers = get_auth_headers_if_auth_enabled({})
+            # Token loading can involve file I/O; it shares the caller's deadline.
+            # A late loader must never start an HTTP exchange after abandonment.
+            transport.remaining()
+            request = Request(url, headers=headers)
             opener = build_opener(ProxyHandler({}), _Handler(transport), _NoRedirect())
-            with opener.open(url, timeout=transport.remaining()) as response:
+            with opener.open(request, timeout=transport.remaining()) as response:
                 body = bytearray()
                 while True:
                     transport.refresh()

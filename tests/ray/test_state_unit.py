@@ -819,3 +819,186 @@ def test_dns_deadline_prevents_late_connect(monkeypatch: pytest.MonkeyPatch) -> 
             worker.join(60)
             assert not worker.is_alive()
     assert not connections
+
+
+@pytest.mark.parametrize("helper_available", [False, True])
+async def test_token_auth_uses_real_ray_middleware(
+    helper_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import builtins
+    import io
+    import os
+    import subprocess
+    import sys
+
+    # Ray caches authentication mode in C++; initialize it in an isolated process.
+    if os.environ.get("SWARM_STATE_AUTH_PROBE") != "1":
+        result = await anyio.to_thread.run_sync(
+            lambda: subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-n",
+                    "0",
+                    f"{__file__}::test_token_auth_uses_real_ray_middleware[{helper_available}]",
+                ],
+                env={
+                    **os.environ,
+                    "SWARM_STATE_AUTH_PROBE": "1",
+                    "RAY_AUTH_MODE": "token",
+                    "RAY_AUTH_TOKEN": "state-auth-SENTINEL-secret",
+                },
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "state-auth-SENTINEL-secret" not in result.stdout + result.stderr
+        return
+    from email.message import Message
+    from types import SimpleNamespace
+    from urllib.error import HTTPError
+    from urllib.request import Request
+
+    import aiohttp
+    from aiohttp import web
+    from multidict import CIMultiDict
+    from ray._private.authentication.http_token_authentication import get_token_auth_middleware
+
+    from swarm_arena._journal.event import EventDraft, EventType
+    from swarm_arena.executor import Job
+    from swarm_arena.ray import RayExecutor
+
+    secret = "state-auth-SENTINEL-secret"
+    monkeypatch.setenv("RAY_AUTH_MODE", "token")
+    monkeypatch.setenv("RAY_AUTH_TOKEN", secret)
+    middleware = get_token_auth_middleware(aiohttp)
+    seen: list[int] = []
+    representations: list[str] = []
+    original_import = builtins.__import__
+
+    def import_module(name: str, *args: Any, **kwargs: Any) -> Any:
+        if not helper_available and name == "ray._private.authentication.http_token_authentication":
+            raise ImportError(secret)
+        return original_import(name, *args, **kwargs)
+
+    class Reply(io.BytesIO):
+        def read1(self, size: int | None = -1) -> bytes:
+            return self.read(size)
+
+    class Opener:
+        def open(self, request: Request | str, timeout: float) -> Reply:
+            url = request if isinstance(request, str) else request.full_url
+            headers = {} if isinstance(request, str) else dict(request.header_items())
+            path = urlsplit(url).path
+            representations.append(repr(request))
+
+            async def handler(request: Any) -> web.Response:
+                row = TaskRow() if path.endswith("/tasks") else WorkerRow()
+                return web.json_response(
+                    {
+                        "result": True,
+                        "data": {
+                            "result": {
+                                "total": 1,
+                                "num_after_truncation": 1,
+                                "num_filtered": 1,
+                                "result": [dataclasses.asdict(row)],
+                            }
+                        },
+                    }
+                )
+
+            response = asyncio.run(
+                middleware(
+                    SimpleNamespace(path=path, headers=CIMultiDict(headers), cookies={}), handler
+                )
+            )
+            seen.append(response.status)
+            if response.status != 200:
+                error = HTTPError(
+                    url, response.status, response.reason, Message(), Reply(response.body)
+                )
+                assert_secret_absent(error, secret)
+                raise error
+            return Reply(response.body)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    monkeypatch.setattr(_state, "build_opener", lambda *args: Opener())
+    executor = RayExecutor(cancel_margin_s=30)
+    executor._initialized = True
+    executor._dashboard_url = "127.0.0.1:8265"
+    started = Job.Started(
+        kind="dispatch", job_id="candidate", task_name="dispatch", ray_job_id="job"
+    )
+    try:
+        assert worker_dead("dispatch", expected_job_id="job") is (
+            True if helper_available else None
+        )
+        assert await executor.confirm_dead(started) is (True if helper_available else None)
+        assert set(seen) == ({200} if helper_available else {401})
+        assert secret not in repr((started, executor, representations))
+        assert secret not in repr(capsys.readouterr()) + caplog.text
+        event = EventDraft(
+            type=EventType.TOOL_DISPATCH, payload={"started": started.model_dump(mode="json")}
+        )
+        assert secret not in event.model_dump_json() + repr(event)
+        assert secret not in started.model_dump_json()
+    finally:
+        await executor.aclose()
+
+
+def test_token_lookup_shares_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ray._private.authentication import http_token_authentication
+
+    entered = threading.Event()
+    release = threading.Event()
+    opened: list[object] = []
+
+    def headers(user_headers: dict[str, str]) -> dict[str, str]:
+        entered.set()
+        assert release.wait(300)
+        return {"Authorization": "Bearer state-auth-SENTINEL-secret"}
+
+    monkeypatch.setattr(http_token_authentication, "get_auth_headers_if_auth_enabled", headers)
+    monkeypatch.setattr(_state, "build_opener", lambda *args: opened.append(args))
+    allowances, expired, workers = _expire_after_entry(monkeypatch, entered, 0.2)
+    try:
+        assert find_task("dispatch", deadline=100.2) is None
+        assert entered.is_set()
+        assert allowances == [pytest.approx(0.2)]
+        assert len(expired) == 1
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(60)
+            assert not worker.is_alive()
+    assert not opened
+
+
+def test_token_loader_failure_is_value_free(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from ray._private.authentication import http_token_authentication
+
+    secret = "loader-SENTINEL-secret"
+    opened: list[object] = []
+
+    def fail(headers: dict[str, str]) -> dict[str, str]:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(http_token_authentication, "get_auth_headers_if_auth_enabled", fail)
+    monkeypatch.setattr(_state, "build_opener", lambda *args: opened.append(args))
+    assert find_task("dispatch") is None
+    assert worker_dead("dispatch") is None
+    assert not opened
+    assert secret not in repr(capsys.readouterr()) + caplog.text

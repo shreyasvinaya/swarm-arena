@@ -286,7 +286,12 @@ unavailable or late state stays unknown. **Recovery confirmation needs a
 plain-HTTP dashboard reachable at `RayContext.dashboard_url`. HTTPS, proxied or
 `RAY_OVERRIDE_DASHBOARD_URL` dashboards make lost runs stay unconfirmed; their
 spend stays estimated.** No environment discovery fallback is used for state
-lookups.
+lookups. State requests use the same Ray token-header loader as the Jobs SDK,
+within the existing recovery deadline. Token-authenticated clusters can confirm
+lost runs when the driver has the matching token and identity-matched evidence
+is available. Tokens stay in request headers and are never recorded in events
+or errors. If the authentication helper or token is unavailable, rejected State
+requests leave recovery unknown; this does not relax the dashboard limits above.
 
 On resume, the committed `tool_dispatch` event supplies the task name and the
 original driver's Ray job ID. The resumed driver queries the connected
