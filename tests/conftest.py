@@ -13,6 +13,7 @@ from uuid import uuid4
 import anyio
 import pytest
 from _fakes.finished import FinishedRun, run_again
+from _fakes.gateway import FakeGateway
 
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._model.run_config import RunConfig
@@ -212,3 +213,10 @@ def no_cwd_disk_cache() -> Iterator[None]:
     assert existed or not cache.exists(), (
         "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
     )
+
+
+@pytest.fixture
+def fake_gateway() -> Iterator[FakeGateway]:
+    """Serve the pinned gateway wire protocol without external access."""
+    with FakeGateway() as gateway:
+        yield gateway
