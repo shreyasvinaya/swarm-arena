@@ -619,13 +619,38 @@ async def test_shared_cli_prompt_keeps_ascii_approval(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize("collaborative", [False, True])
-async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: bool) -> None:
+async def test_editor_cancellation_reaps_process(
+    tmp_path: Path, collaborative: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker = tmp_path / "pid"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal\n"
+        "signal.alarm(600)\n"
         f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\nsignal.pause()\n",
     )
+    processes: list[asyncio.subprocess.Process | anyio.abc.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+    original_open = anyio.open_process
+
+    def record(process: asyncio.subprocess.Process | anyio.abc.Process) -> None:
+        if process.pid not in {owned.pid for owned in processes}:
+            processes.append(process)
+
+    async def spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await original_spawn(*args, **kwargs)
+        if args[0] == editor:
+            record(process)
+        return process
+
+    async def open_process(command: Any, **kwargs: Any) -> anyio.abc.Process:
+        process = await original_open(command, **kwargs)
+        if command[0] == editor:
+            record(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(anyio, "open_process", open_process)
     reviewer = TerminalReviewer(stdin=io.StringIO("e\n"), stdout=io.StringIO(), editor=editor)
     config = planner_config(tmp_path)
     FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
@@ -635,11 +660,14 @@ async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: 
         else reviewer.review(PLAN)
     )
     task = asyncio.create_task(operation)
+    failure: BaseException | None = None
     try:
         with anyio.fail_after(60):
-            while not marker.exists() or not marker.read_text():
+            while not processes or not marker.exists() or not marker.read_text():
                 await anyio.lowlevel.checkpoint()
             pid = int(marker.read_text())
+            assert len(processes) == 1
+            assert processes[0].pid == pid
             task.cancel()
         with anyio.fail_after(60):
             await asyncio.wait({task})
@@ -655,6 +683,52 @@ async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: 
             sessions = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
             assert not any(p.name in llm_record._bindings for p in sessions)
             assert all_events(config) == events
+    except (Exception, asyncio.CancelledError, pytest.fail.Exception) as error:
+        failure = error
+        raise
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        cleanup_errors: list[Exception] = []
+        if not task.done():
+            task.cancel()
+        for process in processes:
+            try:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                with anyio.fail_after(60, shield=True):
+                    await process.wait()
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            if marker.exists() and marker.read_text().isdigit():
+                pid = int(marker.read_text())
+                if pid not in {process.pid for process in processes}:
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+                    with anyio.fail_after(60, shield=True):
+                        while True:
+                            try:
+                                reaped, _ = await anyio.to_thread.run_sync(
+                                    os.waitpid, pid, os.WNOHANG
+                                )
+                            except ChildProcessError:
+                                try:
+                                    os.kill(pid, 0)
+                                except ProcessLookupError:
+                                    break
+                            else:
+                                if reaped:
+                                    break
+                            await anyio.sleep(0.01)
+            with anyio.fail_after(60, shield=True):
+                await asyncio.wait({task})
+        except Exception as error:
+            cleanup_errors.append(error)
+        finally:
+            if task.done() and not task.cancelled():
+                task.exception()
+        if cleanup_errors:
+            if failure is None:
+                raise ExceptionGroup("editor test cleanup failed", cleanup_errors)
+            for error in cleanup_errors:
+                failure.add_note(f"editor test cleanup failed: {type(error).__name__}")

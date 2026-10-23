@@ -420,6 +420,7 @@ async def test_harness_cancellation_abandons_board_storage(
         cancelled.set()
 
     task = asyncio.create_task(run())
+    failure: BaseException | None = None
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         scope.cancel()
@@ -427,14 +428,36 @@ async def test_harness_cancellation_abandons_board_storage(
             await cancelled.wait()
         assert cancelled.is_set(), "harness retained its board storage worker"
         assert not release.is_set()
+        assert len(workers) == 1
         assert all(worker.is_alive() for worker in workers)
+    except (Exception, asyncio.CancelledError, pytest.fail.Exception) as error:
+        failure = error
+        raise
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 60)
-                assert not worker.is_alive()
+        cleanup_errors: list[Exception] = []
+        try:
+            if not task.done():
+                task.cancel()
+            with anyio.fail_after(60, shield=True):
+                await asyncio.wait({task})
+        except Exception as error:
+            cleanup_errors.append(error)
+        finally:
+            for worker in workers:
+                try:
+                    with anyio.fail_after(60, shield=True):
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if task.done() and not task.cancelled():
+                task.exception()
+        if cleanup_errors:
+            if failure is None:
+                raise ExceptionGroup("harness test cleanup failed", cleanup_errors)
+            for error in cleanup_errors:
+                failure.add_note(f"harness test cleanup failed: {type(error).__name__}")
 
 
 async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
