@@ -1000,10 +1000,12 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
 
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     daemon: list[bool] = []
+    workers: list[threading.Thread] = []
 
     def collect(
         self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
     ) -> ToolOutput:
+        workers.append(threading.current_thread())
         daemon.append(threading.current_thread().daemon)
         entered.set()
         try:
@@ -1043,7 +1045,14 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
     finally:
         release.set()
         watchdog.cancel()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        try:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
+            assert finished.is_set()
+        finally:
+            await anyio.to_thread.run_sync(watchdog.join, 60)
+            assert not watchdog.is_alive()
 
 
 @pytest.mark.parametrize("exception", [SystemExit, KeyboardInterrupt])
@@ -2861,25 +2870,43 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(_run_conformance_kind(kind))
+    failure: BaseException | None = None
     try:
         with anyio.fail_after(60):
             await entered.wait()
             # Expire the actual owner's allowance only once the accounting read is held.
             llm_record._bindings[scopes[0].run_id].stops.run_timeout = True
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "conformance stop did not finish while accounting was held"
             with pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
-                await task
+                task.result()
         assert not release.is_set()
         assert scopes[0].tranche._closed
         assert llm_record._bindings == baseline
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+        raise
     finally:
         release.set()
         task.cancel()
         for straggler in stragglers:
             straggler.cancel()
-        await asyncio.gather(task, *stragglers, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        cleanup_errors: list[str] = []
+        try:
+            done, pending = await asyncio.wait({task, *stragglers}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                cleanup_errors.append("task cleanup did not finish")
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                if worker.is_alive():
+                    cleanup_errors.append("accounting worker cleanup did not finish")
+            if cleanup_errors:
+                if failure is not None:
+                    failure.add_note("; ".join(cleanup_errors))
+                else:
+                    raise AssertionError("; ".join(cleanup_errors))
     accounting_store.clear()
     committed = read_committed(scopes[0].journal._store)
     assert committed is not None
