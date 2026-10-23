@@ -285,6 +285,10 @@ committed observations. Resume's closure loop also has one bounded overall allow
 unclosed keys remain available for reconciliation. Run-end reads and
 reconciliation finish before the final completion allowance is armed. Failure
 events include the nonsecret key and candidate IDs for later recovery.
+Gateway key operations propagate `KeyboardInterrupt`, `SystemExit`,
+`GeneratorExit`, and exception groups containing them without converting them
+to gateway failures or starting compensating cleanup. Caller cancellation and
+registered ownership/terminal controls retain their existing handling.
 
 A key created just before the open deadline but never journaled is unusable
 (its bearer never left the driver), expires after `key_duration_s`, and is not
