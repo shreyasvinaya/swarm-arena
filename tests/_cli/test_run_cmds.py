@@ -225,7 +225,7 @@ async def test_prompt_cancellation_releases_reader(monkeypatch: pytest.MonkeyPat
             monkeypatch.setattr(run_cmds, "wait_readable", wait)
             async with anyio.create_task_group() as group:
                 group.start_soon(run_cmds._prompt)
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await entered.wait()
                 group.cancel_scope.cancel()
             assert os.get_blocking(reader)

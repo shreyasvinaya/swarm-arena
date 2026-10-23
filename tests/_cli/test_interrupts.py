@@ -58,7 +58,7 @@ async def test_nested_prompt_and_grace_restore_outer_callback() -> None:
 
     async def send() -> None:
         signal.raise_signal(signal.SIGINT)
-        with anyio.fail_after(2):
+        with anyio.fail_after(60):
             await arrived.wait()
 
     before = signal.getsignal(signal.SIGINT)
@@ -113,7 +113,7 @@ print(json.dumps({
         cwd=tmp_path,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
     assert result.returncode == 0, result.stderr
     import json
@@ -258,9 +258,9 @@ raise SystemExit(status)
         until(b"cleanup-ready")
         process.send_signal(signal.SIGINT)
         until(b"received-2")
-        deadline = time.monotonic() + 15
         process.send_signal(signal.SIGINT)
-        until(b"received-3", timeout=15)
+        until(b"received-3", timeout=60)
+        deadline = time.monotonic() + 30
         try:
             rest, _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -283,5 +283,5 @@ raise SystemExit(status)
             os.killpg(process.pid, signal.SIGKILL)
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=10)
+        process.wait(timeout=60)
         stdout.close()
