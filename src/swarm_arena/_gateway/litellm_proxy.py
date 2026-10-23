@@ -9,7 +9,6 @@ cleanup owner.
 
 import contextlib
 import contextvars
-import hashlib
 import json
 import math
 import socket
@@ -35,7 +34,7 @@ from urllib.request import (
 )
 
 import anyio
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 
 from swarm_arena._errors import ConfigError, _exception_type_name, _is_core_control
 from swarm_arena._exec.threads import run_sync_daemon
@@ -163,7 +162,7 @@ class _Cache(FrozenModel):
 
 
 class _Attribution(FrozenModel):
-    """Keep only the bounded candidate identity needed by reconciliation."""
+    """Keep a bounded client-supplied label, never authoritative attribution."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -183,21 +182,53 @@ class _Spend(FrozenModel):
     completion_tokens: _Count
     spend: Annotated[float, Field(strict=True, ge=0)]
     startTime: str
-    metadata: FiniteJsonObject
+    metadata: FiniteJsonObject = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _informational_metadata(cls, value: Any, info: ValidationInfo) -> dict[str, Any]:
+        """Drop invalid optional fields independently before validating the row.
+
+        The verified api_key owns attribution. Client-supplied metadata cannot
+        make its spend unreadable. Cache reads consume the prompt allowance
+        first; a write count exceeding the remainder is omitted as inconsistent.
+        """
+        result: dict[str, Any] = {}
+        if not isinstance(value, dict):
+            return result
+        attribution = value.get("spend_logs_metadata")
+        if isinstance(attribution, dict):
+            try:
+                label = _Attribution.model_validate(
+                    {"candidate_id": attribution.get("candidate_id")}
+                ).candidate_id
+            except ValidationError:
+                pass
+            else:
+                if label is not None:
+                    result["spend_logs_metadata"] = {"candidate_id": label}
+        raw_cache = value.get("additional_usage_values")
+        if isinstance(raw_cache, dict):
+            cache: dict[str, int | None] = {}
+            remaining = info.data.get("prompt_tokens", 0)
+            for name in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                if name not in raw_cache:
+                    continue
+                try:
+                    count = getattr(_Cache.model_validate({name: raw_cache[name]}), name)
+                except ValidationError:
+                    continue
+                if count is None or count <= remaining:
+                    cache[name] = count
+                    remaining -= count or 0
+            if cache:
+                result["additional_usage_values"] = cache
+        return result
 
     def normalized(self) -> SpendRow:
         """Produce a fully validated core-owned record."""
         raw_cache = self.metadata.get("additional_usage_values")
         cache = _Cache.model_validate({} if raw_cache is None else raw_cache)
-        raw_attribution = self.metadata.get("spend_logs_metadata")
-        attribution = _Attribution.model_validate(
-            {} if raw_attribution is None else raw_attribution
-        )
-        metadata: dict[str, Any] = {}
-        if raw_cache is not None:
-            metadata["additional_usage_values"] = cache.model_dump(exclude_unset=True)
-        if attribution.candidate_id is not None:
-            metadata["spend_logs_metadata"] = {"candidate_id": attribution.candidate_id}
         read = cache.cache_read_input_tokens or 0
         write = cache.cache_creation_input_tokens or 0
         # LiteLLM's normalized prompt count includes cached input. Usage splits it.
@@ -208,7 +239,7 @@ class _Spend(FrozenModel):
             model=self.model,
             cost_usd=self.spend,
             ts=self.startTime,
-            metadata=metadata,
+            metadata=self.metadata,
             usage=Usage(
                 input_tokens=self.prompt_tokens - read - write,
                 output_tokens=self.completion_tokens,
@@ -884,8 +915,11 @@ class LiteLLMProxy:
             Only timezone-aware ISO timestamps are accepted from the wire.
             Metadata retains only spend_logs_metadata.candidate_id (at most 256
             characters) and the two cache counters in additional_usage_values.
-            Identical request_id observations collapse within this read;
-            conflicts reject the entire read. No dedup state survives a read.
+            Invalid optional metadata fields are omitted independently; they
+            cannot reject a row. Attribution uses key_id, never this metadata.
+            Identical normalized request_id observations may collapse within a
+            page. Any repeat across pages rejects the read as incomplete through
+            GatewayError, without retry. No dedup state survives a read.
 
         Raises
         ------
@@ -919,7 +953,6 @@ class LiteLLMProxy:
                 "end_date": upper.strftime("%Y-%m-%d %H:%M:%S"),
             }
             rows: dict[str, SpendRow] = {}
-            fingerprints: dict[str, bytes] = {}
             seen = 0
             expected: tuple[int, int] | None = None
             for number in range(1, _MAX_PAGES + 1):
@@ -951,18 +984,16 @@ class LiteLLMProxy:
                 expected = counts
                 if any(row.api_key != key.key_id for row in page.data):
                     raise ValueError
+                if any(row.request_id in rows for row in page.data):
+                    # A repeated primary key across offset pages can hide a
+                    # skipped row even when totals and the duplicate agree.
+                    raise ValueError
                 seen += len(page.data)
                 for raw_row in page.data:
                     row = raw_row.normalized()
-                    # Compare validated wire observations before dropping metadata;
-                    # keep only their digest, never the upstream request payloads.
-                    fingerprint = hashlib.sha256(
-                        json.dumps(raw_row.model_dump(), sort_keys=True, allow_nan=False).encode()
-                    ).digest()
-                    previous = fingerprints.get(row.request_id)
-                    if previous is not None and previous != fingerprint:
+                    previous = rows.get(row.request_id)
+                    if previous is not None and previous != row:
                         raise ValueError
-                    fingerprints[row.request_id] = fingerprint
                     rows[row.request_id] = row
                 if number >= page.total_pages:
                     if seen != page.total:
