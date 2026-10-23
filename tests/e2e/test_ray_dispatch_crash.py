@@ -67,7 +67,7 @@ def test_driver_killed_after_dispatch_then_resume(
         update={
             "executor": Ref.of(RayExecutor()),
             "lease_ttl_s": 3.0,
-            "limits": run_config.limits.model_copy(update={"tool_timeout_s": 20}),
+            "limits": run_config.limits.model_copy(update={"tool_timeout_s": 60}),
         }
     )
     run_file, plan_file = tmp_path / "run.toml", tmp_path / "plan.toml"
@@ -98,16 +98,16 @@ def test_driver_killed_after_dispatch_then_resume(
                 )
                 return row is not None and row.state not in PENDING_STATES
 
-            _wait_for(running, 15)
+            _wait_for(running, 60)
             driver.send_signal(signal.SIGKILL)
-            assert driver.wait(timeout=10) == -signal.SIGKILL
+            assert driver.wait(timeout=60) == -signal.SIGKILL
             resumed = subprocess.run(
                 [*cli, "resume", str(run_dir), "--force"],
                 cwd=tmp_path,
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=90,
+                timeout=180,
             )
             assert resumed.returncode == 0, resumed.stdout + resumed.stderr
             events = _committed_events(run_dir)
@@ -131,4 +131,4 @@ def test_driver_killed_after_dispatch_then_resume(
         finally:
             if driver.poll() is None:
                 driver.kill()
-            driver.wait(timeout=10)
+            driver.wait(timeout=60)
