@@ -596,7 +596,9 @@ class MeteredModel(Model):
                 request.tools,
                 request.output_schema,
                 request.handoffs,
-                tracing if scope.tracing.langfuse else ModelTracing.DISABLED,
+                ModelTracing.ENABLED_WITHOUT_DATA
+                if scope.tracing.langfuse and not tracing.is_disabled()
+                else ModelTracing.DISABLED,
                 previous_response_id=previous_response_id,
                 conversation_id=conversation_id,
                 prompt=request.prompt,

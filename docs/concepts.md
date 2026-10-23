@@ -437,6 +437,12 @@ Each enabled run becomes a Langfuse session. Manager, judge, planner and curator
 calls carry the goal, team, agent, round and role; a call's `trace_url` links to
 the current trace when available. Both stages of a structured fallback call
 are traced and journaled. A missing trace URL does not remove the local record.
+SDK tracing omits sensitive request and response data; payloads remain in the
+local journal/artifacts according to `tracing.store_payloads`. Before Langfuse
+processes a span, error status descriptions and exception events/attributes are
+reduced to exception type names, without messages or stack traces. If the SDK
+has redacted the original type or the type is unrecognized, the exported type
+is `Exception`. Run, goal, component and accounting metadata remain available.
 The first enabled setup resolves the project identifier on a daemon using one
 request with a five-second timeout and no retries. Until resolution succeeds,
 and for the rest of the process after failure, trace URLs are absent. Looking up

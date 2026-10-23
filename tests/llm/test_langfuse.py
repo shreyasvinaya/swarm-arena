@@ -6,7 +6,7 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -285,7 +285,7 @@ async def test_judge_call_opens_an_sdk_trace_and_sets_trace_url(
         exported[1][0].flush()
         spans = exported[0].get_finished_spans()
         assert [t.name for t in spy.traces] == ["swarm-arena judge"]
-        assert fake.calls[0]["tracing"] is ModelTracing.ENABLED
+        assert fake.calls[0]["tracing"] is ModelTracing.ENABLED_WITHOUT_DATA
         assert (
             calls[0].trace_url
             == f"https://langfuse.example/project/test/traces/{spans[0].context.trace_id:032x}"
@@ -1030,3 +1030,147 @@ async def test_trace_exit_control_still_wins_after_success(
             _langfuse.component_span(run.scopes[-1]),
         ):
             pass
+
+
+@pytest.mark.parametrize("role", ["manager", "judge"])
+async def test_provider_error_spans_are_value_free(
+    tmp_path: Path,
+    exported: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    role: Literal["manager", "judge"],
+) -> None:
+    import json
+    from unittest.mock import AsyncMock
+
+    import litellm
+    from _fakes.run import all_events, plan
+    from agents.extensions.models.litellm_model import LitellmModel
+    from langfuse._client.span_processor import LangfuseSpanProcessor
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+
+    from swarm_arena import Limits, Ref, RunConfig, Swarm
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    secret = "PROVIDER_ERROR_SECRET_8c031"
+    received: list[str] = []
+    original_start = LangfuseSpanProcessor.on_start
+    original_end = LangfuseSpanProcessor.on_end
+
+    def on_start(self: Any, span: Any, parent_context: Any = None) -> None:
+        received.append(json.dumps(dict(span.attributes or {})))
+        original_start(self, span, parent_context)
+
+    def on_end(self: Any, span: Any) -> None:
+        received.append(
+            json.dumps(
+                {
+                    "status": span.status.description,
+                    "attributes": dict(span.attributes or {}),
+                    "events": [
+                        {"name": event.name, "attributes": dict(event.attributes or {})}
+                        for event in span.events
+                    ],
+                }
+            )
+        )
+        original_end(self, span)
+
+    monkeypatch.setattr(LangfuseSpanProcessor, "on_start", on_start)
+    monkeypatch.setattr(LangfuseSpanProcessor, "on_end", on_end)
+    modes: list[ModelTracing] = []
+    runner_sensitive: list[bool] = []
+    original_response = LitellmModel.get_response
+    original_run = agents.Runner.run
+
+    async def response(self: Any, *args: Any, **kwargs: Any) -> Any:
+        modes.append(args[6])
+        return await original_response(self, *args, **kwargs)
+
+    async def runner(*args: Any, **kwargs: Any) -> Any:
+        runner_sensitive.append(kwargs["run_config"].trace_include_sensitive_data)
+        return await original_run(*args, **kwargs)
+
+    monkeypatch.setattr(LitellmModel, "get_response", response)
+    monkeypatch.setattr(agents.Runner, "run", runner)
+
+    async def fail_provider(**kwargs: Any) -> Any:
+        error = RuntimeError(secret)
+        span = trace.get_current_span()
+        span.set_status(Status(StatusCode.ERROR, secret))
+        span.set_attribute("error.message", secret)
+        span.set_attribute("exception.stacktrace", secret)
+        span.record_exception(error, attributes={"provider.detail": secret})
+        resources = _langfuse._resources
+        assert resources is not None
+        tracer = resources.provider.get_tracer("openinference.instrumentation.openai_agents")
+        with tracer.start_as_current_span(
+            "provider failure",
+            attributes={"error.message": secret, "openinference.span.kind": "LLM"},
+        ):
+            raise error
+
+    dispatch = AsyncMock(side_effect=fail_provider)
+    monkeypatch.setattr(litellm, "acompletion", dispatch)
+    proposed = plan(rounds=1)
+    if role == "manager":
+        proposed.teams[0].agents[0] = (
+            proposed.teams[0]
+            .agents[0]
+            .model_copy(update={"manager": Ref.of(AgentsSDKManager(model="m"))})
+        )
+    else:
+        proposed.judges.append(Ref.of(LLMJudge("rubric", ["m"])))
+    cfg = RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+        settle_timeout_s=2,
+        limits=Limits(max_tokens=1000000),
+        tracing=TracingConfig(langfuse=True),
+        models=ModelCatalog(
+            {
+                "m": ModelSpec(
+                    model="openai/gpt-4o-mini",
+                    roles=[role],
+                    max_tokens=100,
+                    prices=ModelSpec.Prices(input=1, output=1),
+                )
+            }
+        ),
+    )
+    with anyio.fail_after(30):
+        await Swarm(cfg).run(proposed)
+    assert dispatch.await_count == 1
+    assert modes == [ModelTracing.ENABLED_WITHOUT_DATA]
+    assert runner_sensitive == ([False] if role == "manager" else [])
+    exported[1][0].flush()
+    spans = exported[0].get_finished_spans()
+    assert spans
+    errors = [span for span in spans if span.status.status_code == StatusCode.ERROR]
+    assert errors
+    assert all(span.status.description in {"Exception", "RuntimeError"} for span in errors), [
+        (span.name, span.status.description) for span in errors
+    ]
+    events = [event for span in spans for event in span.events if event.name == "exception"]
+    assert events
+    assert all(
+        dict(event.attributes or {}) == {"exception.type": "RuntimeError"} for event in events
+    )
+    serialized = json.dumps(
+        [
+            {
+                "status": span.status.description,
+                "attributes": dict(span.attributes or {}),
+                "events": [
+                    {"name": event.name, "attributes": dict(event.attributes or {})}
+                    for event in span.events
+                ],
+            }
+            for span in spans
+        ]
+    )
+    assert secret not in serialized
+    assert received
+    assert all(secret not in snapshot for snapshot in received)
+    assert all(secret not in event.model_dump_json() for event in all_events(cfg))

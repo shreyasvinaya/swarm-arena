@@ -247,6 +247,7 @@ class AgentsSDKManager(Manager):
                                     hooks=BudgetHooks(),
                                     run_config=SDKRunConfig(
                                         tracing_disabled=not scope.tracing.langfuse,
+                                        trace_include_sensitive_data=False,
                                         workflow_name="swarm-arena manager",
                                         group_id=scope.run_id,
                                     ),

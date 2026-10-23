@@ -295,7 +295,9 @@ async def structured_call(
                     [],
                     output,
                     [],
-                    ModelTracing.ENABLED if scope.tracing.langfuse else ModelTracing.DISABLED,
+                    ModelTracing.ENABLED_WITHOUT_DATA
+                    if scope.tracing.langfuse
+                    else ModelTracing.DISABLED,
                     previous_response_id=None,
                     conversation_id=None,
                     prompt=None,

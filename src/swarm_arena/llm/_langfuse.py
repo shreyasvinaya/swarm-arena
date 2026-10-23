@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import builtins
 import logging
 import threading
 import time
@@ -136,6 +137,90 @@ def _close_at_exit() -> None:
     _reset_langfuse(_EXIT_TIMEOUT_S)
 
 
+def _trace_error_kind(value: Any) -> str:
+    """Accept known exception identifiers, never infer a type from error prose."""
+    if type(value) is str:
+        name = value.rsplit(".", 1)[-1]
+        kind = vars(builtins).get(name)
+        if isinstance(kind, type) and issubclass(kind, BaseException):
+            return name
+        if name == "CancelledError":
+            return name
+    return "Exception"
+
+
+def _trace_error_key(name: str) -> bool:
+    lowered = name.lower()
+    return "error" in lowered or "exception" in lowered or "status_message" in lowered
+
+
+def _trace_attributes(attributes: Any) -> dict[str, Any]:
+    values = dict(attributes or {})
+    clean = {key: value for key, value in values.items() if not _trace_error_key(key)}
+    if len(clean) != len(values):
+        clean["exception.type"] = _trace_error_kind(
+            values.get("exception.type", values.get("error.type"))
+        )
+    return clean
+
+
+def _error_boundary() -> Any:
+    """Place error normalization ahead of every owned OTel processor."""
+    from opentelemetry.sdk.trace import Event, ReadableSpan, SynchronousMultiSpanProcessor
+    from opentelemetry.trace import Status, StatusCode
+
+    class ErrorBoundary(SynchronousMultiSpanProcessor):
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            attributes = _trace_attributes(span.attributes)
+            # OTel has no public attribute-removal API. This is the owned SDK
+            # span's still-mutable attribute store, before downstream on_start.
+            for key in tuple(span.attributes or {}):
+                if _trace_error_key(key):
+                    del span._attributes[key]
+            span.set_attributes(attributes)
+            super().on_start(span, parent_context=parent_context)
+
+        def _on_ending(self, span: Any) -> None:
+            # Owned Langfuse processing uses on_start/on_end. Do not expose the
+            # unsanitized mutable ending span to an intermediate callback.
+            pass
+
+        def on_end(self, span: Any) -> None:
+            events = []
+            for event in span.events:
+                if _trace_error_key(event.name):
+                    attributes = {
+                        "exception.type": _trace_error_kind(
+                            (event.attributes or {}).get("exception.type")
+                        )
+                    }
+                    events.append(Event("exception", attributes, event.timestamp))
+                else:
+                    events.append(
+                        Event(event.name, _trace_attributes(event.attributes), event.timestamp)
+                    )
+            status = span.status
+            if status.status_code is StatusCode.ERROR or status.description:
+                status = Status(status.status_code, _trace_error_kind(status.description))
+            clean = ReadableSpan(
+                name=span.name,
+                context=span.context,
+                parent=span.parent,
+                resource=span.resource,
+                attributes=_trace_attributes(span.attributes),
+                events=events,
+                links=span.links,
+                kind=span.kind,
+                status=status,
+                start_time=span.start_time,
+                end_time=span.end_time,
+                instrumentation_scope=span.instrumentation_scope,
+            )
+            super().on_end(clean)
+
+    return ErrorBoundary()
+
+
 def setup_langfuse(tracing: TracingConfig) -> None:
     """Initialize the exclusive process exporter once, only after explicit opt-in.
 
@@ -177,6 +262,7 @@ def setup_langfuse(tracing: TracingConfig) -> None:
             return
         try:
             from langfuse import Langfuse
+            from openinference.instrumentation import TraceConfig
             from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
@@ -212,7 +298,11 @@ def setup_langfuse(tracing: TracingConfig) -> None:
         instrumentor = OpenAIAgentsInstrumentor()
         if instrumentor.is_instrumented_by_opentelemetry:
             raise _core_error(RuntimeError, "Langfuse instrumentor already owned")
-        provider = TracerProvider(sampler=ConsentSampler(), shutdown_on_exit=False)
+        provider = TracerProvider(
+            sampler=ConsentSampler(),
+            shutdown_on_exit=False,
+            active_span_processor=_error_boundary(),
+        )
         client: Any = None
         resources: _Resources | None = None
         try:
@@ -225,7 +315,16 @@ def setup_langfuse(tracing: TracingConfig) -> None:
                 # The SDK's unbounded atexit callback must not outlive our bounded one.
                 atexit.unregister(owned.shutdown)
                 atexit.unregister(owned.prompt_cache._task_manager.shutdown)
-            instrumentor.instrument(tracer_provider=provider, exclusive_processor=True)
+            instrumentor.instrument(
+                tracer_provider=provider,
+                exclusive_processor=True,
+                config=TraceConfig(
+                    hide_inputs=True,
+                    hide_outputs=True,
+                    hide_llm_invocation_parameters=True,
+                    hide_llm_tools=True,
+                ),
+            )
             resources = _Resources(client, provider, instrumentor)
             resources.project_worker = threading.Thread(
                 target=_resolve_project,
