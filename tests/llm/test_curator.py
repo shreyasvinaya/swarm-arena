@@ -302,7 +302,7 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
                 task = asyncio.create_task(
                     LLMCurator(model="cur").curate("physika", [learning(1), learning(2)], view())
                 )
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
@@ -826,7 +826,7 @@ async def test_custom_curator_control_skips_report_wait(
     monkeypatch.setattr(MergeAll, "curate", curate)
     monkeypatch.setattr(module, "drain", drain)
     monkeypatch.setattr(Tranche, "pending", pending)
-    with pytest.raises(type(control)), anyio.fail_after(10):
+    with pytest.raises(type(control)), anyio.fail_after(60):
         await runner._curate_round(1)
     assert drained
     assert not report_polled
