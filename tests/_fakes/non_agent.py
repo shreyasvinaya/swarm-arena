@@ -116,7 +116,6 @@ async def crash_driver(root: str, boundary: str) -> None:
             run_root=str(path / "runs"),
             arena_root=str(path / "arena"),
             artifact_root=str(path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_agents_per_fingerprint=4),
             planner_catalog=PlannerCatalog(entries=[]),
         ),

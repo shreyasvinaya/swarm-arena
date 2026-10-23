@@ -84,7 +84,6 @@ def _config(multiplier: int = 1, **kwargs: Any) -> RunConfig:
             }
         ),
         limits=Limits(max_tokens=None, max_usd=None),
-        settle_timeout_s=2,
         **kwargs,
     )
 

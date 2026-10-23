@@ -12,7 +12,6 @@ def planner_config(root: Path) -> RunConfig:
         run_root=str(root / "runs"),
         artifact_root=str(root / "artifacts"),
         arena_root=str(root / "arena"),
-        settle_timeout_s=2,
         limits=Limits(max_tokens=1_000_000),
         models=ModelCatalog(
             {

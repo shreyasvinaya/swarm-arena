@@ -41,7 +41,8 @@ async def test_graceful_report_timeout_survives_delayed_loop(
     release: Timer | None = None
     try:
         async with open_llm_run(tmp_path) as run:
-            scope, meta = await _open(run)
+            # Only the deliberately missing report gets a short deadline.
+            scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
             watch_owner = llm_record._watch_owner
             report_watchers: set[asyncio.Task[Any]] = set()
 
@@ -244,7 +245,7 @@ async def test_payloads_stored_by_sha256(tmp_path: Path) -> None:
 
 
 async def test_store_payloads_false_keeps_refs_none(tmp_path: Path) -> None:
-    config = RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+    config = RunConfig(tracing=TracingConfig(store_payloads=False))
     async with open_llm_run(tmp_path, config=config) as run:
         _, meta = await _open(run)
         call = await record_call(**record_kwargs(meta))
@@ -292,7 +293,8 @@ async def test_known_litellm_call_id_writes_nothing(
 
 async def test_drain_charges_unrecorded_call_in_full(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
-        scope, meta = await _open(run)
+        # Only the deliberately missing report gets a short deadline.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
         assert await drain(scope, wait=True) == [meta["call_id"]]
         await run.journal.commit()
         (placeholder,) = run.calls()
@@ -334,7 +336,8 @@ async def test_drain_overtaking_a_suspended_record_writes_one_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with open_llm_run(tmp_path) as run:
-        scope, meta = await _open(run)
+        # Only the deliberately missing report gets a short deadline.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
         held = HeldOperation()
         original = run.artifacts.put_bytes
         uploads: list[bytes] = []
@@ -534,7 +537,7 @@ async def test_pending_scope_finds_the_scope_by_reservation_id(tmp_path: Path) -
 
 async def test_journals_request_sha256_without_payloads(tmp_path: Path) -> None:
     async with open_llm_run(
-        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False))
     ) as run:
         _, meta = await _open(run)
         kwargs = record_kwargs(meta)
@@ -724,7 +727,7 @@ async def test_overflow_is_terminal_even_with_unlimited_budget(tmp_path: Path) -
 
 async def test_cache_identity_is_replayed_and_never_guessed_from_request(tmp_path: Path) -> None:
     async with open_llm_run(
-        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False))
     ) as run:
         scope = run.scope("manager")
         originals: list[LLMCall] = []
@@ -1208,7 +1211,8 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
 async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with open_llm_run(tmp_path) as run:
+    # The event-held write must outlive the stale cancellation deadline.
+    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=2)) as run:
         scope, meta = await _open(run)
         entered = anyio.Event()
 
@@ -1268,9 +1272,7 @@ async def test_held_payload_stops_on_real_takeover(
     successor = None
     try:
         with pytest.raises(Fenced):  # noqa: PT012 - owned lifetime
-            async with open_llm_run(
-                tmp_path, config=RunConfig(lease_ttl_s=3, settle_timeout_s=2)
-            ) as run:
+            async with open_llm_run(tmp_path, config=RunConfig(lease_ttl_s=3)) as run:
                 _, meta = await _open(run)
                 put = run.artifacts.put_bytes
 
@@ -1452,7 +1454,6 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
             deps.clock,
         )
 
-    run_config = run_config.model_copy(update={"settle_timeout_s": 2})
     await Swarm(run_config).run(plan(rounds=1), run_id="takeover")
     old = await resume_run(run_config, "takeover", force=True, replanner=None)
     new = None
@@ -1588,7 +1589,7 @@ async def test_resumed_detached_reservation_only_report(
             )
         return await _open(run, scope)
 
-    config = run_config.model_copy(update={"settle_timeout_s": 2})
+    config = run_config
     await Swarm(config).run(plan(rounds=1), run_id="reservation-only")
     old = await resume_run(config, "reservation-only", force=True, replanner=None)
     new = None

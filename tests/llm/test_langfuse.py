@@ -1043,6 +1043,7 @@ async def test_provider_error_spans_are_value_free(
     from unittest.mock import AsyncMock
 
     import litellm
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events, plan
     from agents.extensions.models.litellm_model import LitellmModel
     from langfuse._client.span_processor import LangfuseSpanProcessor
@@ -1052,6 +1053,7 @@ async def test_provider_error_spans_are_value_free(
     from swarm_arena import Limits, Ref, RunConfig, Swarm
     from swarm_arena.config import ModelCatalog, ModelSpec
 
+    missing_callback_timeout(monkeypatch)
     secret = "PROVIDER_ERROR_SECRET_8c031"
     received: list[str] = []
     original_start = LangfuseSpanProcessor.on_start
@@ -1125,7 +1127,6 @@ async def test_provider_error_spans_are_value_free(
         run_root=str(tmp_path / "runs"),
         arena_root=str(tmp_path / "arena"),
         artifact_root=str(tmp_path / "artifacts"),
-        settle_timeout_s=2,
         limits=Limits(max_tokens=1000000),
         tracing=TracingConfig(langfuse=True),
         models=ModelCatalog(

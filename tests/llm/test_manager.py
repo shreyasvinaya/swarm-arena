@@ -61,7 +61,7 @@ def config(*, limits: Limits | None = None, **fields: Any) -> RunConfig:
     return RunConfig(
         models=ModelCatalog({"opus": SPEC}),
         limits=limits or Limits(),
-        settle_timeout_s=fields.pop("settle_timeout_s", 2),
+        settle_timeout_s=fields.pop("settle_timeout_s", RunConfig().settle_timeout_s),
         **fields,
     )
 

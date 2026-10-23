@@ -70,9 +70,7 @@ SPEC = ModelSpec(
 
 
 def config(**kwargs: Any) -> RunConfig:
-    return RunConfig(
-        models=ModelCatalog({"m": SPEC}), limits=Limits(), settle_timeout_s=2, **kwargs
-    )
+    return RunConfig(models=ModelCatalog({"m": SPEC}), limits=Limits(), **kwargs)
 
 
 def metered(capture: Model, **kwargs: Any) -> MeteredModel:
@@ -1118,6 +1116,9 @@ async def test_probe_drains_before_it_returns(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=config()) as run:
         scope = run.scope("manager")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if not record:
+            scope = replace(scope, settle_timeout_s=2)
         finished = anyio.Event()
 
         async def probe() -> None:
@@ -1171,6 +1172,9 @@ async def test_probe_catalog_roles_and_controls(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=cfg) as run:
         scope = run.scope("manager")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if kind in {"failed", "terminal", "forged"}:
+            scope = replace(scope, settle_timeout_s=2)
         if kind in {"terminal", "forged"}:
             with pytest.raises(RuntimeError) as caught:
                 await _hooks.probe_provider("fake", scope)
@@ -1399,7 +1403,7 @@ async def test_probe_preserves_upstream_type_without_message(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=config()) as run:
         with pytest.raises(RuntimeError) as caught:
-            await _hooks.probe_provider("fake", run.scope("manager"))
+            await _hooks.probe_provider("fake", replace(run.scope("manager"), settle_timeout_s=2))
         assert _exception_type_name(caught.value) == "BadRequestError"
         assert_secret_absent(caught.value, "private-probe-sentinel")
         assert "private-probe-sentinel" not in repr(run.events("llm_call"))

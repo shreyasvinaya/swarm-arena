@@ -1365,7 +1365,6 @@ def _llm_config(*, role: Literal["manager", "judge"] = "manager") -> RunConfig:
                 )
             }
         ),
-        settle_timeout_s=2,
     )
 
 
@@ -1405,7 +1404,7 @@ async def test_check_manager_runs_the_run_setups(
 
     monkeypatch.setattr(run, "_run_setups", [])
     run.register_run_setup(spy)
-    config = RunConfig(settle_timeout_s=2)
+    config = RunConfig()
     await check_manager(
         ScriptedManager([]),
         goal=GOAL,
@@ -2916,7 +2915,6 @@ async def test_check_judge_runs_an_llm_judge_offline(tmp_path: Path) -> None:
     fake.register("m")
     config = RunConfig(
         models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
-        settle_timeout_s=2,
     )
     candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=GOAL) for _ in range(2)]
     scores = await check_judge(LLMJudge("r", ["m"]), GOAL, candidates, config=config)

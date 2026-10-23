@@ -222,7 +222,7 @@ async def test_stop_poll_failure_reaches_owner(
 async def test_one_stop_watcher_spans_acquisition_setup_and_driver(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
+    config = run_config
     swarm = Swarm(config)
     if mode != "run":
         await swarm.run(plan(rounds=1), run_id="r")

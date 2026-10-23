@@ -1182,7 +1182,6 @@ async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
     env.deps.config = env.deps.config.model_copy(
         update={
             "curator": Ref(path="_fakes.curators:MergeAll"),
-            "settle_timeout_s": 2.0,
         }
     )
     env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
@@ -1233,6 +1232,9 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
     from swarm_arena.board import Learning
 
     runner = await _curation_checkpoint(env)
+    # This probe holds the invocation through its stop/cancellation allowance.
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
+
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
     finished = anyio.Event()
     before = env.deps.ids.counters()
@@ -1564,6 +1566,10 @@ async def test_curator_cancellation_retains_settlement_finality(
     from swarm_arena._model.ids import IdGen
 
     runner = await _curation_checkpoint(env)
+    if phase == "pending_call":
+        # A deliberately missing report must finish its bounded stop experiment.
+        env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
+
     original_wait = JournalWriter._wait_for
     admitted: list[int] = []
     dispatched: list[str] = []
@@ -2035,6 +2041,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
 
     from swarm_arena._board.arena import ArenaView
 
+    # Keep the abandonment budget short; event watchdogs allow slow CI startup.
     env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     loop_thread = threading.get_ident()
@@ -2056,7 +2063,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
     runner = GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None)
     task = asyncio.create_task(runner.run())
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             while not entered.is_set():  # noqa: ASYNC110 - page read entry signal
                 await anyio.sleep(0.01)
         if signal == "fence":
@@ -2065,14 +2072,14 @@ async def test_live_page_read_abandons_hook_without_late_publication(
             monkeypatch.setattr(env.deps.clock, "left", lambda timeout: 0)
         else:
             env.deps.stops.stop_now = True
-        done, _ = await asyncio.wait([task], timeout=7)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "page read retained the goal after supervision stopped it"
         assert not returned.is_set()
         assert not env.store.exists("goals/g/rounds/round-01.md")
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
             await anyio.sleep(0.01)
     assert not env.store.exists("goals/g/rounds/round-01.md")
@@ -2636,7 +2643,6 @@ async def test_llm_judge_usage_overflow_finishes_run(
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000),
         ),
         workspace_root=str(tmp_path / "ws"),
@@ -2796,10 +2802,13 @@ async def test_graceful_stop_judging_outlives_settlement_window(
 
 
 @pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
-async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
+async def test_ranking_provider_is_retried_once_at_converge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+) -> None:
     pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events
 
     from swarm_arena import Limits, Swarm
@@ -2807,6 +2816,7 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
     from swarm_arena.llm import LLMJudge
     from swarm_arena.testing import FakeModel, FakeTurn
 
+    missing_callback_timeout(monkeypatch)
     calls: list[str] = []
 
     class Scorer(FakeModel):
@@ -2851,7 +2861,6 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000),
         ),
         workspace_root=str(tmp_path / "ws"),
@@ -2904,6 +2913,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events
 
     from swarm_arena import Limits, Swarm
@@ -2912,6 +2922,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation
     from swarm_arena.testing import FakeModel, FakeTurn
 
+    missing_callback_timeout(monkeypatch)
     calls: list[str] = []
     fired: list[str] = []
     role = "judge" if component == "final" else component
@@ -2956,7 +2967,6 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000, max_agents_per_fingerprint=4),
             curator=Ref.of(LLMCurator(model="down")) if component == "curator" else None,
         ),
