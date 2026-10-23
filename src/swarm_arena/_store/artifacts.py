@@ -3,16 +3,18 @@
 import contextlib
 import os
 from collections.abc import Iterable, Iterator
+from io import BytesIO
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from pydantic import ValidationError
 
 from swarm_arena._errors import AlreadyExists, StorageError
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.tooling import FileRef
-from swarm_arena._store.base import Store, _read_blob
+from swarm_arena._store.base import Store
 from swarm_arena._store.local import LocalStore
+from swarm_arena._store.s3 import S3Store
 
 _MAX_ARTIFACT_BYTES: Final = 2**30
 
@@ -121,7 +123,15 @@ class ArtifactStore:
     def _put_chunks(
         self, chunks: Iterable[bytes], *, max_bytes: int = _MAX_ARTIFACT_BYTES
     ) -> tuple[str, int]:
-        """Publish capped chunks, streaming locally or buffering one remote object."""
+        """Publish chunks with one remote buffer plus the current input chunk.
+
+        Nonlocal buffering uses at most min(max_bytes, 1 GiB) payload bytes
+        (plus allocator overhead). BytesIO hands its immutable buffer to the
+        byte API without a second whole-object copy on CPython. Backend-owned
+        copies are outside this bound. Local storage retains streaming.
+        """
+        if not isinstance(self._store, LocalStore):
+            max_bytes = min(max_bytes, _MAX_ARTIFACT_BYTES)
 
         def bounded() -> Iterator[bytes]:
             size = 0
@@ -133,13 +143,18 @@ class ArtifactStore:
 
         if isinstance(self._store, LocalStore):
             return self._store._create_artifact(bounded())
-        data = bytearray()
-        for chunk in bounded():
-            data.extend(chunk)
-        return self.put_bytes(bytes(data)), len(data)
+        with BytesIO() as buffer:
+            for chunk in bounded():
+                buffer.write(chunk)
+            data = buffer.getvalue()
+        return self.put_bytes(data), len(data)
 
     def get_bytes(self, sha256: str) -> bytes:
-        """Read artifact contents and verify their digest.
+        """Read artifact contents and verify their digest and 1 GiB cap.
+
+        S3 checks metadata before reading and bounds the GET to cover growth.
+        Other byte-only backends can enforce the cap only after their read.
+        Immutable byte results are reused without another full-object copy.
 
         Parameters
         ----------
@@ -163,17 +178,54 @@ class ArtifactStore:
         >>> artifacts.get_bytes(digest)  # doctest: +SKIP
         b'hello'
         """
-        data = _read_blob(self._store, sha256).data
+        data = self._read_bytes(sha256)
         if sha256_hex(data) != sha256:
             raise StorageError("artifact failed its hash check")
         return data
+
+    def _read_bytes(self, key: str) -> bytes:
+        """Read bounded S3 contents or check a byte-only backend's returned object."""
+        store = self._store
+        if isinstance(store, S3Store):
+            from fsspec.asyn import sync
+
+            full_key = store._key(key)
+            with store._reading("head_object"):
+                head = store._call("head_object", Bucket=store._bucket, Key=full_key)
+            if head["ContentLength"] > _MAX_ARTIFACT_BYTES:
+                raise StorageError("artifact crosses the size cap")
+            with store._reading("get_object"):
+                response = store._call(
+                    "get_object",
+                    Bucket=store._bucket,
+                    Key=full_key,
+                    **(
+                        {"Range": f"bytes=0-{_MAX_ARTIFACT_BYTES}"} if head["ContentLength"] else {}
+                    ),
+                )
+
+                async def consume() -> bytes:
+                    async with response["Body"] as body:
+                        return cast(bytes, await body.read(_MAX_ARTIFACT_BYTES + 1))
+
+                data = cast(bytes, sync(store._filesystem().loop, consume))
+        else:
+            data = store.read(key).data
+        if not isinstance(data, bytes):
+            raise TypeError("invalid storage blob")
+        if memoryview(data).nbytes > _MAX_ARTIFACT_BYTES:
+            raise StorageError("artifact crosses the size cap")
+        # Exact bytes are already immutable; detach only an untrusted subclass.
+        return data if type(data) is bytes else memoryview(data).tobytes()
 
     def fetch(self, sha256: str, dest: Path, *, read_only: bool = True) -> None:
         """Write verified contents to a destination with explicit permissions.
 
         Sources over 1 GiB are refused. Local reads check size before reading
-        and refuse symlinks or special files. Other backends return a complete
-        byte object, checked before writing. A destination is published
+        and refuse symlinks or special files. S3 checks metadata before a
+        bounded GET, including a growth check. Other byte-only backends return
+        a complete object; their cap is necessarily checked after the read.
+        A destination is published
         atomically through pinned directories; no
         symlinked directory or leaf is followed and hardlinks are replaced.
 
@@ -212,9 +264,7 @@ class ArtifactStore:
                     Path(self._store.url), sha256, max_bytes=_MAX_ARTIFACT_BYTES
                 )
             else:
-                data = _read_blob(self._store, sha256).data
-                if len(data) > _MAX_ARTIFACT_BYTES:
-                    raise StorageError("artifact crosses the size cap")
+                data = self._read_bytes(sha256)
             if sha256_hex(data) != sha256:
                 raise StorageError("artifact failed its hash check")
             absolute = dest.absolute()

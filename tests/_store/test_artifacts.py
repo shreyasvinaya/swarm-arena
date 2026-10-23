@@ -279,3 +279,112 @@ async def test_nonlocal_fetch_checks_digest_cap_and_destination(
         remote.fetch(digest, tmp_path / "corrupt")
     assert_secret_absent(caught.value, SECRET)
     assert not (tmp_path / "corrupt").exists()
+
+
+def test_remote_publication_has_one_buffer_and_hard_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tracemalloc
+    from unittest.mock import Mock
+
+    from swarm_arena._store.base import Store
+
+    backend = Mock(spec=Store)
+    remote = ArtifactStore(backend)
+    cap = 8 * 2**20
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", cap)
+    tracemalloc.start()
+    try:
+        remote._put_chunks((b"x" * 65536 for _ in range(128)), max_bytes=cap)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < cap * 1.5, f"publication retained two full buffers: {peak}"
+    backend.reset_mock()
+    with pytest.raises(StorageError, match="size cap"):
+        remote._put_chunks([b"x" * (cap + 1)], max_bytes=cap * 2)
+    backend.create.assert_not_called()
+
+
+def test_remote_read_reuses_immutable_bytes_and_caps_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._exec.job_steps import live_request
+    from swarm_arena._store.base import Blob, Store
+    from swarm_arena.tool import ToolRequest
+
+    data = b"restored edit"
+    digest = sha256_hex(data)
+    backend = Mock(spec=Store)
+    backend.read.return_value = Blob(data, "etag")
+    remote = ArtifactStore(backend)
+    assert remote.get_bytes(digest) is data
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", 4)
+    with pytest.raises(StorageError, match="size cap"):
+        remote.get_bytes(digest)
+    with pytest.raises(ValueError, match="could not be restored"):
+        live_request(ToolRequest(edits={"edit.txt": "sha256:" + digest}), remote)
+
+
+@pytest.mark.s3
+async def test_s3_fetch_refuses_before_read(
+    s3_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._store.base import open_store
+    from swarm_arena._store.s3 import S3Store
+
+    backend = open_store(s3_url)
+    assert isinstance(backend, S3Store)
+    remote = ArtifactStore(backend)
+    digest = remote.put_bytes(b"oversized")
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", 4)
+    calls: list[str] = []
+    original = backend._call
+
+    def call(method: str, **kwargs: object) -> dict:
+        calls.append(method)
+        return original(method, **kwargs)
+
+    monkeypatch.setattr(backend, "_call", call)
+    with pytest.raises(StorageError, match="size cap"):
+        remote.fetch(digest, tmp_path / "refused")
+    assert calls == ["head_object"]
+    assert not (tmp_path / "refused").exists()
+
+
+@pytest.mark.s3
+async def test_s3_bounded_read_handles_empty_missing_and_growth(
+    s3_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._store.base import open_store
+    from swarm_arena._store.s3 import S3Store
+
+    backend = open_store(s3_url)
+    assert isinstance(backend, S3Store)
+    remote = ArtifactStore(backend)
+    empty = remote.put_bytes(b"")
+    assert remote.get_bytes(empty) == b""
+    remote.fetch(empty, tmp_path / "empty")
+    assert (tmp_path / "empty").read_bytes() == b""
+    with pytest.raises(NotFound):
+        remote.get_bytes("0" * 64)
+    digest = remote.put_bytes(b"grew after metadata")
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", 4)
+    original = backend._call
+    ranges: list[object] = []
+
+    def call(method: str, **kwargs: object) -> dict:
+        response = original(method, **kwargs)
+        if method == "head_object":
+            response["ContentLength"] = 2
+        elif method == "get_object":
+            ranges.append(kwargs.get("Range"))
+        return response
+
+    monkeypatch.setattr(backend, "_call", call)
+    with pytest.raises(StorageError, match="size cap"):
+        remote.fetch(digest, tmp_path / "grew")
+    assert ranges == ["bytes=0-4"]
+    assert not (tmp_path / "grew").exists()

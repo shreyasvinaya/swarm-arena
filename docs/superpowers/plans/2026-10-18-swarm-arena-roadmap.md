@@ -2110,6 +2110,9 @@ class _JobRun:
     async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput: ...
     async def fault_output(self, reason: str) -> ToolOutput: ...
     collect_finished: threading.Event  # workspace release only when the worker finishes
+    @property
+    def publication_finished(self) -> bool: ...  # includes validation/diagnostic workers
+    def _start_collect(self, run: CompletedRun) -> _DaemonCall[ToolOutput | None]: ...
     def _collect_owned(self, run: CompletedRun) -> ToolOutput | None: ...
     def _collect(self, run: CompletedRun) -> ToolOutput | None: ...
     async def _before_kill(self, provisional: CompletedRun) -> None: ...
@@ -2119,22 +2122,28 @@ class _JobRun:
 ```
 
 Preparation runs in `run_sync_daemon` under the owner, followed by a cancellation
-checkpoint before launch. An unfinished `_Preparation` or collection worker retains
-its workspace, including after its original collection deadline expires.
+checkpoint before launch. An unfinished preparation, collection or publication worker
+retains its workspace, including after its original deadline expires. Queued publication
+work is revoked on abandonment; failed collector thread creation releases ownership.
 The existing `_JobRun` owns collection once: normal completion has the original
 `BEFORE_KILL_TIMEOUT_S` deadline; cancellation rejoins that same collect;
 stop collection runs before kill and is never retried. `_collect` sets and resets
 `_OUTPUT_BYTE_LIMIT` in the collecting worker. Valid stop results are partial
 iff `partial or data or files`. Direct LocalExecutor nonstandard propagation is preserved; registered terminal
-collection errors are retained through process cleanup and re-raised before publication. Worker callers reuse this state and these operations with their
+collection errors received by the awaiting owner are retained through process cleanup
+and re-raised before publication; abandoned worker outcomes are discarded. Cancellation
+during normal collection wins over every rejoin error and still delivers one partial. Worker callers reuse this state and these operations with their
 own launch/termination mechanics; no worker uses the local process-group launcher.
 
 `_finish` validates the declaration and aggregate output sizes before publication,
 then awaits each file and log separately through the abandonable storage boundary.
 A cancelled local run delivers data-only partial output without new publication.
 Local artifact chunks stream; other backends accumulate one object within the
-remaining byte cap before using the existing Store byte API. Retrieval verifies
-hashes and fetch keeps pinned, atomic destination writes on every backend.
+remaining byte cap, with a 1 GiB ceiling and one buffer plus the input chunk (and
+allocator overhead on CPython), before using the existing Store byte API. Retrieval
+verifies hashes and the 1 GiB cap without copying immutable byte results. S3 checks
+metadata before a bounded read; byte-only stores can check only after their read.
+Fetch keeps pinned, atomic destination writes on every backend.
 `live_request` is worker-only; it restores only the exact reserved edit reference
 form and reports failed restoration using path/type diagnostics without values.
 

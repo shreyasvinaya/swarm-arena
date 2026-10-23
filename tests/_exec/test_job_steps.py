@@ -560,3 +560,257 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
         await executor.aclose()
     assert collected == [True]
     assert list((tmp_path / "ws").iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["terminal", "fenced", "group", "ordinary"])
+@pytest.mark.parametrize("cancellation", ["native", "scope"])
+async def test_cancel_during_normal_collect_delivers_partial_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, cancellation: str
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena._exec import job_steps
+    from swarm_arena.executor import LocalExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    rejoining = anyio.Event()
+    workers: list[threading.Thread] = []
+    partials: list[ToolOutput] = []
+    error: BaseException = _core_error(
+        RuntimeError, "terminal test", _category=_SignalCategory.TERMINAL
+    )
+    if kind == "fenced":
+        error = _core_error(Fenced, "run ownership lost")
+    elif kind == "group":
+        error = ExceptionGroup("outer", [ExceptionGroup("inner", [error])])
+    elif kind == "ordinary":
+        error = RuntimeError(SECRET)
+
+    def collect(*args: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        raise error
+
+    deliver = _JobRun._deliver_partial
+
+    async def partial(self: _JobRun) -> None:
+        rejoining.set()
+        await deliver(self)
+
+    async def received(output: ToolOutput) -> None:
+        partials.append(output)
+
+    if kind == "ordinary":
+        monkeypatch.setattr(_JobRun, "_collect", collect)
+    else:
+        monkeypatch.setattr(job_steps, "command_output_from_result", collect)
+    monkeypatch.setattr(_JobRun, "_deliver_partial", partial)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
+    scope = anyio.CancelScope()
+
+    async def submit() -> ToolOutput:
+        with scope:
+            return await executor.submit(
+                _job(tmp_path, command=Command(argv=["true"]), on_partial=received)
+            )
+        raise asyncio.CancelledError()  # expose a scope-owned cancel to this test's awaiter
+
+    task = asyncio.create_task(submit())
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        if cancellation == "native":
+            task.cancel()
+        else:
+            scope.cancel()
+        with anyio.fail_after(5):
+            await rejoining.wait()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert len(partials) == 1
+        assert partials[0].status is RunStatus.CANCELLED
+        assert partials[0].files == []
+        assert partials[0].logs_ref is None
+        assert len(workers) == 1
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+        await executor.aclose()
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_collect_thread_start_failure_releases_workspace(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, stop: bool
+) -> None:
+    from swarm_arena._exec import threads
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    completed = _completed(ws)
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=10, max_output_bytes=10)
+
+    async def run(*args: Any, **kwargs: Any) -> CompletedRun:
+        return completed
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("cannot start thread")
+
+    from unittest.mock import Mock
+
+    sup = Mock(run=run)
+    monkeypatch.setattr(threads.threading.Thread, "start", fail)
+    invocation = runner._before_kill(completed) if stop else runner.run(sup, None)
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        await invocation
+    assert runner.collect_finished.is_set()
+
+
+async def test_abandoned_stop_collector_cannot_latch_late_terminal(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from unittest.mock import Mock
+
+    import anyio
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    completed = _completed(ws).model_copy(update={"status": RunStatus.TIMEOUT})
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=10, max_output_bytes=10)
+
+    def collect(self: _JobRun, run: CompletedRun) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        raise _core_error(RuntimeError, "late terminal", _category=_SignalCategory.TERMINAL)
+
+    async def run(*args: Any, **kwargs: Any) -> CompletedRun:
+        callback = asyncio.create_task(kwargs["before_kill"](completed))
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        callback.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await callback
+        release.set()
+        # Model the supervisor's reap window: collector ends after abandonment,
+        # but before run hands back TIMEOUT to the owner.
+        assert await anyio.to_thread.run_sync(runner.collect_finished.wait, 5)
+        return completed
+
+    monkeypatch.setattr(_JobRun, "_collect", collect)
+    try:
+        with anyio.fail_after(10):
+            output = await runner.run(Mock(run=run), None)
+        assert output.status is RunStatus.TIMEOUT
+        assert not output.data
+        assert not output.partial
+    finally:
+        release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+
+
+async def test_abandoned_publication_retains_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena.executor import LocalExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    workspaces: list[Path] = []
+    read = _JobRun._read_log
+
+    def held(self: _JobRun, rel: str) -> bytes:
+        workers.append(threading.current_thread())
+        workspaces.append(self._workspace)
+        entered.set()
+        assert release.wait(30)
+        (self._workspace / "late-publication").write_text("retained")
+        return read(self, rel)
+
+    monkeypatch.setattr(_JobRun, "_read_log", held)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
+    task = asyncio.create_task(executor.submit(_job(tmp_path, command=Command(argv=["true"]))))
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        task.cancel()
+        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            await task
+        assert workspaces[0].is_dir(), "workspace removed while publication still owns it"
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+        await executor.aclose()
+    assert len(workers) == 1
+    assert (workspaces[0] / "late-publication").read_text() == "retained"
+
+
+async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena._exec.job_steps import _WorkspaceCall
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    writes: list[bool] = []
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    runner = _JobRun(
+        job, prepare_job(job, ws, artifacts), ws, artifacts, max_log_bytes=10, max_output_bytes=10
+    )
+    original = _WorkspaceCall.run
+
+    def delayed(self: _WorkspaceCall[Any]) -> Any:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        return original(self)
+
+    def write() -> None:
+        writes.append(True)
+
+    monkeypatch.setattr(_WorkspaceCall, "run", delayed)
+    task = asyncio.create_task(runner._workspace_io(write))
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        task.cancel()
+        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            await task
+        assert runner.publication_finished
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert writes == []

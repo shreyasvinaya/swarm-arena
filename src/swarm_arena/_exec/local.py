@@ -328,6 +328,8 @@ class LocalExecutor(Executor):
                     _LOG.warning("retaining workspace %s: preparation is still running", workspace)
                 elif job_run is not None and not job_run.collect_finished.is_set():
                     _LOG.warning("retaining workspace %s: collection is still running", workspace)
+                elif job_run is not None and not job_run.publication_finished:
+                    _LOG.warning("retaining workspace %s: publication is still running", workspace)
                 elif not self.config.keep_workspaces:
                     with anyio.CancelScope(shield=True):
                         await anyio.to_thread.run_sync(_remove_workspace, workspace)
