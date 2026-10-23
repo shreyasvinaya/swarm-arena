@@ -31,7 +31,7 @@ swarm-arena submit --address http://<head>:8265 --working-dir . --yes run.toml p
 ```
 
 Replace `<head>` with your head node's hostname. With `--address`, any
-different value in `RAY_ADDRESS` or `RAY_API_SERVER_ADDRESS` is refused before
+different nonempty value in `RAY_ADDRESS` or `RAY_API_SERVER_ADDRESS` is refused before
 contacting Ray; unset the conflicting variable. Without `--address`, Ray's
 environment fallback applies (`RAY_API_SERVER_ADDRESS` before `RAY_ADDRESS`).
 Success prints the submission ID and exits zero;
