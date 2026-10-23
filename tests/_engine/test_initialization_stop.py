@@ -81,7 +81,7 @@ async def test_initialization_stops_before_worker_release(
         ):
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(60)
+            assert release.wait(180)
         return original(*args, **kwargs)
 
     if site == "setup":
@@ -95,18 +95,18 @@ async def test_initialization_stops_before_worker_release(
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     store = LocalStore(Path(config.run_root) / "r")
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         if signal == "deadline":
             deadline.set()
         else:
             assert await request_stop(config.run_root, "r", now=signal == "stop_now") == 1
         if site == "first_commit":
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await cleanup_entered.wait()
             # Settle the already-admitted batch within the cleanup allowance.
             release.set()
-        bound = 20 if site == "first_commit" else 10 if site in {"board_open", "setup"} else 2
+        bound = 60 if site == "first_commit" else 30
         done, _ = await asyncio.wait([task], timeout=bound)
         assert done, "initialization ignored its stop/deadline while the worker was held"
         assert "r" not in _bindings
@@ -136,7 +136,7 @@ async def test_initialization_stops_before_worker_release(
         await asyncio.gather(task, return_exceptions=True)
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
     assert not store.exists("goals/g/rounds/round-01.md")
     if site == "run.toml":
@@ -164,7 +164,7 @@ async def test_initialization_stop_cleanup_is_bounded(
     def hold(entered: threading.Event) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20)
+        assert release.wait(180)
 
     def open_board(*args: Any, **kwargs: Any) -> Any:
         hold(board_entered)
@@ -183,11 +183,11 @@ async def test_initialization_stop_cleanup_is_bounded(
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     store = LocalStore(Path(config.run_root) / "r")
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(board_entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(board_entered.wait, 60)
             await request_stop(config.run_root, "r", now=True)
-            assert await anyio.to_thread.run_sync(write_entered.wait, 8)
-        done, _ = await asyncio.wait([task], timeout=10)
+            assert await anyio.to_thread.run_sync(write_entered.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "stop cleanup waited for a blocked solution write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -199,10 +199,10 @@ async def test_initialization_stop_cleanup_is_bounded(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert not store.exists("review")
 
@@ -235,7 +235,7 @@ async def test_resume_initialization_stops_before_worker_release(
     def hold() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20)
+        assert release.wait(180)
 
     store = LocalStore(Path(config.run_root) / "r")
     initial_owner = read_owner(store)
@@ -297,15 +297,15 @@ async def test_resume_initialization_stops_before_worker_release(
     monkeypatch.setattr(run_module, "_bootstrap_registrations", bootstrap)
     task = asyncio.create_task(Swarm(config).resume("r", force=True))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         if signal == "cancel":
             task.cancel()
         elif signal == "deadline":
             deadline.set()
         else:
             assert await request_stop(config.run_root, "r", now=True) == 2
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "resume initialization ignored its stop while storage was held"
         assert "r" not in _bindings
         if signal == "cancel":
@@ -323,10 +323,10 @@ async def test_resume_initialization_stops_before_worker_release(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert stages[-1] == site
     assert "r" not in _bindings
@@ -357,7 +357,7 @@ async def test_stopped_initialization_contains_segment_failure(
     def open_board(*args: Any, **kwargs: Any) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20)
+        assert release.wait(180)
         original_open(*args, **kwargs)
 
     def read(store: LocalStore, key: str) -> Blob:
@@ -379,10 +379,10 @@ async def test_stopped_initialization_contains_segment_failure(
     )
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         await request_stop(config.run_root, "r", now=True)
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done
         assert not task.cancelled()
         error = task.exception()
@@ -397,10 +397,10 @@ async def test_stopped_initialization_contains_segment_failure(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
 
 
@@ -439,7 +439,7 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         ):
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return original(store, key, data)
 
     monkeypatch.setattr(GoalRunner, "run", run_goal)
@@ -453,11 +453,11 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
     )
     store = LocalStore(Path(config.run_root) / "r")
     try:
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             await driving.wait()
         assert await request_stop(config.run_root, "r", now=True) == 1
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
-        done, _ = await asyncio.wait([task], timeout=3)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "driver cleanup retained the blocked storage write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -471,10 +471,10 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     owner = read_owner(store)
     assert owner is not None

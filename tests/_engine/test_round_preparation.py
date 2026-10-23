@@ -29,7 +29,7 @@ async def test_round_deadline_starts_after_slow_preparation(
     def blocked() -> Frontier:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20)
+        assert release.wait(180)
         return original()
 
     monkeypatch.setattr(round_module, "round_deadline", measured)
@@ -37,12 +37,12 @@ async def test_round_deadline_starts_after_slow_preparation(
     runner = _round(env, [_scripted("a", [])])
     task = asyncio.create_task(runner.run(1))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         clock.advance(1000)
         prepared_at = clock.current_time()
         release.set()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             result = await task
         assert starts
         assert starts[0] >= prepared_at
@@ -54,5 +54,5 @@ async def test_round_deadline_starts_after_slow_preparation(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()

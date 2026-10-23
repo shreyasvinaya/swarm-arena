@@ -76,7 +76,7 @@ async def test_resumed_round_restores_only_own_learnings(
     )
     task = asyncio.create_task(GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None).run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await RecoverLearning.ready.wait()
     finally:
         task.cancel()

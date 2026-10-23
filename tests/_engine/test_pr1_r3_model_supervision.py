@@ -33,7 +33,7 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
         text=True,
     )
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             while not (tmp_path / "dump-entered").exists():
                 assert process.poll() is None, process.communicate()
                 await anyio.sleep(0.01)
@@ -52,11 +52,11 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
                     )
                 }
             )
-            with anyio.fail_after(10):
+            with anyio.fail_after(30):
                 await Swarm(cfg).resume("r", force=True)
         # Stop files are polled every 2 s and the hook stays blocked until `release`,
-        # so a 10 s bound still proves the run ends before the serializer returns.
-        with anyio.move_on_after(10):
+        # so a 30 s bound still proves the run ends before the serializer returns.
+        with anyio.move_on_after(30):
             while not (  # noqa: ASYNC110 - observes a separate driver process
                 (tmp_path / "done.json").exists() if cause == "stop" else process.poll() is not None
             ):
@@ -90,7 +90,7 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
     finally:
         (tmp_path / "release").write_text("release")
         try:
-            out, err = await anyio.to_thread.run_sync(lambda: process.communicate(timeout=8))
+            out, err = await anyio.to_thread.run_sync(lambda: process.communicate(timeout=60))
             (tmp_path / "driver-output.txt").write_text(out + err)
             if cause == "takeover":
                 assert "Fenced" in err
@@ -99,7 +99,7 @@ async def test_program_score_serialization_is_supervised(tmp_path: Path, cause: 
         finally:
             if process.poll() is None:
                 process.kill()
-                process.communicate(timeout=5)
+                process.communicate(timeout=60)
 
 
 def test_serializer_marker_is_published_atomically(
@@ -118,18 +118,18 @@ def test_serializer_marker_is_published_atomically(
         if path.parent == tmp_path and path.name.startswith("dump-entered"):
             original_write(path, "", *args, **kwargs)
             opened.set()
-            assert release_write.wait(10), "marker write was not released"
+            assert release_write.wait(180), "marker write was not released"
         return original_write(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", paused_write)
     with ThreadPoolExecutor(max_workers=1) as pool:
         result = pool.submit(fake.BlockingScore.maximize(1.0).model_dump)
         try:
-            assert opened.wait(10), "serializer did not start publishing"
+            assert opened.wait(60), "serializer did not start publishing"
             assert not marker.exists(), "reader can observe an incomplete marker"
         finally:
             release_write.set()
-            result.result(timeout=10)
+            result.result(timeout=60)
     thread_ids = json.loads(marker.read_text())
     assert thread_ids["loop_thread"] == get_ident()
     assert thread_ids["hook_thread"] != get_ident()

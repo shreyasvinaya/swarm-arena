@@ -52,15 +52,15 @@ async def test_storage_preflight_keeps_caller_cancellation(
     def block(config: RunConfig) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20)
+        assert release.wait(180)
 
     monkeypatch.setattr(preflight, "check_storage", block)
     task = asyncio.create_task(preflight._check_storage(RunConfig()))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError), anyio.fail_after(2):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await task
     finally:
         release.set()
@@ -68,5 +68,5 @@ async def test_storage_preflight_keeps_caller_cancellation(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()

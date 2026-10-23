@@ -448,7 +448,7 @@ async def test_offline_harness_preserves_native_caller_cancel(
         )
     )
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:

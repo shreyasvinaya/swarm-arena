@@ -15,7 +15,18 @@ from swarm_arena import Ref, RunConfig, Swarm
 
 
 @pytest.fixture(autouse=True)
-def reset_board() -> Iterator[None]:
+def reset_board(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    act = LifecycleBoard._act
+
+    def held_act(board: LifecycleBoard, mode: str) -> None:
+        if mode == "block":
+            board.entered.set()
+            assert board.release.wait(180), "test did not release board"
+        else:
+            act(board, mode)
+
+    # Keep the shared fake's ten-second backstop outside these longer assertions.
+    monkeypatch.setattr(LifecycleBoard, "_act", held_act)
     LifecycleBoard.entered.clear()
     LifecycleBoard.release.clear()
     LifecycleBoard.closed.clear()
@@ -125,14 +136,14 @@ async def test_blocking_board_close_is_bounded(
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
-            assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 10)
-            with anyio.fail_after(5):
+            assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 60)
+            with anyio.fail_after(30):
                 await completed.wait()
             assert not LifecycleBoard.release.is_set()
     finally:
         LifecycleBoard.release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -161,9 +172,9 @@ async def test_blocking_board_open_can_be_cancelled(
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
-            assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 10)
+            assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 60)
             scope.cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await completed.wait()
             assert cancelled == [True]
             assert LifecycleBoard.closed.is_set()

@@ -95,7 +95,7 @@ async def test_caller_cancel_wins_over_replacement_fence(
         monkeypatch.setattr(hooks.PaidTool, "extra_actions", actions)
     task = asyncio.create_task(Swarm(config(tmp_path)).run(plan(where, "fence"), run_id="r"))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:

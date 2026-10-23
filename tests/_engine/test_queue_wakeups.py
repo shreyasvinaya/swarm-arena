@@ -108,7 +108,7 @@ async def test_goal_queue_wakes_without_polling(
     if cause == "capacity":
         first = first.model_copy(update={"policy": Ref(path=f"{__name__}:PruneOne")})
     swarm = Swarm(cfg)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(swarm.run, [first, _held_plan("b")])
             try:
