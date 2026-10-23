@@ -564,8 +564,13 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
 
 @pytest.mark.parametrize("kind", ["terminal", "fenced", "group", "ordinary"])
 @pytest.mark.parametrize("cancellation", ["native", "scope", "move_on_after", "fail_after"])
-async def test_cancel_during_normal_collect_delivers_partial_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, cancellation: str
+@pytest.mark.parametrize("collection", ["normal", "timeout"])
+async def test_caller_cancellation_owns_collector_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    cancellation: str,
+    collection: str,
 ) -> None:
     import threading
 
@@ -575,7 +580,6 @@ async def test_cancel_during_normal_collect_delivers_partial_once(
     from swarm_arena.executor import LocalExecutor
 
     entered, release = threading.Event(), threading.Event()
-    rejoining = anyio.Event()
     workers: list[threading.Thread] = []
     partials: list[ToolOutput] = []
     error: BaseException = _core_error(
@@ -594,20 +598,10 @@ async def test_cancel_during_normal_collect_delivers_partial_once(
         assert release.wait(30)
         raise error
 
-    deliver = _JobRun._deliver_partial
-
-    async def partial(self: _JobRun) -> None:
-        rejoining.set()
-        await deliver(self)
-
     async def received(output: ToolOutput) -> None:
         partials.append(output)
 
-    if kind == "ordinary":
-        monkeypatch.setattr(_JobRun, "_collect", collect)
-    else:
-        monkeypatch.setattr(job_steps, "command_output_from_result", collect)
-    monkeypatch.setattr(_JobRun, "_deliver_partial", partial)
+    monkeypatch.setattr(job_steps, "command_output_from_result", collect)
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
     scopes: list[anyio.CancelScope] = []
     after_scope: list[bool] = []
@@ -623,7 +617,17 @@ async def test_cancel_during_normal_collect_delivers_partial_once(
         with owner as scope:
             scopes.append(scope)
             await executor.submit(
-                _job(tmp_path, command=Command(argv=["true"]), on_partial=received)
+                _job(
+                    tmp_path,
+                    command=Command(
+                        argv=["true"]
+                        if collection == "normal"
+                        else [sys.executable, "-c", "import time; time.sleep(60)"]
+                    ),
+                    timeout_s=None if collection == "normal" else 0.2,
+                    grace_s=0,
+                    on_partial=received,
+                )
             )
             pytest.fail("caller cancellation became a normal result")
         after_scope.append(True)
@@ -639,7 +643,6 @@ async def test_cancel_during_normal_collect_delivers_partial_once(
         else:
             scope.deadline = anyio.current_time()
         with anyio.fail_after(5):
-            await rejoining.wait()
             release.set()
             if cancellation == "native":
                 with pytest.raises(asyncio.CancelledError):
@@ -861,12 +864,14 @@ async def test_pending_scope_cancel_wins_collector_handback(
 
     call = Mock(result=handback)
     monkeypatch.setattr(runner, "_start_collect", lambda run: call)
-    runner._post_collect = call
-    runner._collect_deadline = anyio.current_time() + 10
+
+    async def run(*args: Any, **kwargs: Any) -> CompletedRun:
+        if site == "stop":
+            with anyio.CancelScope(shield=True):
+                await kwargs["before_kill"](completed)
+        return completed
+
     with scope:
-        if site == "normal":
-            await runner._wait_post_collect()
-        else:
-            await runner._before_kill(completed)
+        await runner.run(Mock(run=run), None)
         pytest.fail("pending cancellation became a collector outcome")
     assert scope.cancelled_caught
