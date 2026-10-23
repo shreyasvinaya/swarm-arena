@@ -16,6 +16,12 @@ except importlib.metadata.PackageNotFoundError:
 from swarm_arena.ray._submit import driver_entrypoint, submit_driver, submit_runtime_env
 
 
+@pytest.fixture(autouse=True)
+def _clear_address_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_API_SERVER_ADDRESS", raising=False)
+
+
 class _FakeClient:
     def __init__(self, *, returns: str) -> None:
         self.returns = returns
@@ -131,3 +137,18 @@ def test_environment_fallback_or_matching_explicit_address(
     monkeypatch.setattr("swarm_arena.ray._submit.JobSubmissionClient", fake)
     assert submit_driver(address, "command", runtime_env=None) == "id"
     assert fake.address == address
+
+
+@pytest.mark.parametrize(
+    "empty_variables",
+    [("RAY_ADDRESS",), ("RAY_API_SERVER_ADDRESS",), ("RAY_ADDRESS", "RAY_API_SERVER_ADDRESS")],
+)
+def test_explicit_address_accepts_empty_environment(
+    empty_variables: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for variable in empty_variables:
+        monkeypatch.setenv(variable, "")
+    fake = _FakeClient(returns="id")
+    monkeypatch.setattr("swarm_arena.ray._submit.JobSubmissionClient", fake)
+    assert submit_driver("http://head:8265", "command", runtime_env=None) == "id"
+    assert fake.address == "http://head:8265"

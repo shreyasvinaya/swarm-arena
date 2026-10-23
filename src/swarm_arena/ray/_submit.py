@@ -75,8 +75,9 @@ def submit_driver(
     Parameters
     ----------
     address : str or None
-        Jobs server address. Conflicting RAY_ADDRESS or RAY_API_SERVER_ADDRESS
-        values are refused. None lets Ray resolve its environment fallback.
+        Jobs server address. Conflicting nonempty RAY_ADDRESS or
+        RAY_API_SERVER_ADDRESS values are refused. None lets Ray resolve its
+        environment fallback.
     entrypoint : str
         Shell command to execute as the driver.
     runtime_env : Mapping[str, Any] or None
@@ -102,7 +103,7 @@ def submit_driver(
     'swarm-arena-...'
     """
     if address is not None and any(
-        os.environ.get(name) not in (None, address)
+        os.environ.get(name) not in (None, "", address)
         for name in ("RAY_ADDRESS", "RAY_API_SERVER_ADDRESS")
     ):
         raise _core_error(
