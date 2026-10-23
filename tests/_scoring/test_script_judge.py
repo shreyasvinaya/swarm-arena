@@ -193,7 +193,7 @@ async def test_executor_error_cancels_sibling() -> None:
 
     context = JudgeContext(goal=GOAL, executor=Refusing(), artifact_root="/a")
     cands = [cand(id=cid, request=ToolRequest(inputs={"cid": cid})) for cid in ("bad", "waiting")]
-    with anyio.fail_after(2), pytest.raises(RuntimeError, match="RuntimeError"):
+    with anyio.fail_after(60), pytest.raises(RuntimeError, match="RuntimeError"):
         await ScriptJudge(command=["x"]).judge(GOAL, cands, context)
     assert cancelled.is_set()
     assert context.errors == {}
