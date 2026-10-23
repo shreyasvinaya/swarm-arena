@@ -462,6 +462,7 @@ async def test_gateway_preflight_preserves_terminal(nested: bool, fenced: bool) 
         RuntimeError("GATEWAY_SENTINEL"),
         Fenced("GATEWAY_SENTINEL"),
         LimitReached("stop", "GATEWAY_SENTINEL"),
+        ExceptionGroup("GATEWAY_SENTINEL", [ValueError("GATEWAY_SENTINEL")]),
     ],
 )
 async def test_gateway_preflight_contains_untrusted_errors(error: Exception) -> None:
@@ -476,6 +477,7 @@ async def test_gateway_preflight_contains_untrusted_errors(error: Exception) -> 
         await gateway_preflight(
             RunConfig(llm_gateway=GatewayConfig(url="http://example.test")), adapter
         )
+    assert str(caught.value) == f"gateway preflight failed: {type(error).__name__}"
     assert_secret_absent(caught.value, "GATEWAY_SENTINEL")
 
 

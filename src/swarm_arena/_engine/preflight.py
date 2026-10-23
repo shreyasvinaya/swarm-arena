@@ -72,7 +72,7 @@ async def gateway_preflight(
         # A foreign adapter may raise the same exception class with arbitrary text.
         if type(adapter) is LiteLLMProxy and type(classified) is GatewayError:
             raise _core_error(RuntimeError, f"gateway preflight failed: {classified}") from None
-        outcome.contain(classified, RuntimeError, "gateway preflight")
+        outcome.contain(error, RuntimeError, "gateway preflight")
     if report.verified:
         return "hard", report
     if config.llm_gateway.hard_cap_required(config.limits):
