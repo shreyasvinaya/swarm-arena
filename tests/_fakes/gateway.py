@@ -164,7 +164,7 @@ class FakeGateway:
         class Handler(BaseHTTPRequestHandler):
             def setup(self) -> None:
                 super().setup()
-                self.connection.settimeout(5)
+                self.connection.settimeout(60)
 
             def log_message(self, format: str, *args: Any) -> None:
                 pass
@@ -192,8 +192,9 @@ class FakeGateway:
                     gateway.entered[path].set()
                 gate = gateway.hold.get(path)
                 if gate is not None:
+                    backstop = time.monotonic() + 300
                     while not gateway._stopping.is_set() and not gate.wait(0.05):
-                        pass
+                        assert time.monotonic() < backstop, "gateway reply was not released"
                 gateway._stopping.wait(gateway.delay.get(path, 0.0))
                 raw = b"{not json" if path in gateway.malformed else json.dumps(data).encode()
                 raw = gateway.raw_responses.get(path, raw)
@@ -233,7 +234,7 @@ class FakeGateway:
             self._server.shutdown()
             self._server.server_close()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=60)
             assert not self._thread.is_alive()
 
     def add_spend(

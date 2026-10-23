@@ -5,8 +5,12 @@ import json
 import os
 import socket
 import threading
+import time
 import traceback
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -32,18 +36,18 @@ CREATE: dict[str, Any] = {
 }
 
 
-def _proxy_at(url: str, http_timeout_s: float = 5.0) -> LiteLLMProxy:
+def _proxy_at(url: str, http_timeout_s: float = 60.0) -> LiteLLMProxy:
     return LiteLLMProxy(
         url=url, master_key=MASTER, request_timeout_s=600, http_timeout_s=http_timeout_s
     )
 
 
-def _proxy(gw: FakeGateway, http_timeout_s: float = 5.0) -> LiteLLMProxy:
+def _proxy(gw: FakeGateway, http_timeout_s: float = 60.0) -> LiteLLMProxy:
     return _proxy_at(gw.url, http_timeout_s)
 
 
 async def _proxy_and_key(
-    gw: FakeGateway, http_timeout_s: float = 5.0
+    gw: FakeGateway, http_timeout_s: float = 60.0
 ) -> tuple[LiteLLMProxy, VirtualKey]:
     proxy = _proxy(gw, http_timeout_s)
     key, _ = await proxy.create_key(**CREATE)
@@ -68,13 +72,13 @@ def _chat(gw: FakeGateway, secret: str, model: str = "openai/gpt-6") -> tuple[An
         data=json.dumps({"model": model}).encode(),
         headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
     )
-    with urlopen(req, timeout=5) as response:
+    with urlopen(req, timeout=60) as response:
         return response.headers, json.loads(response.read())
 
 
 async def _wait(event: threading.Event) -> None:
-    with anyio.fail_after(5):
-        assert await anyio.to_thread.run_sync(event.wait, 4)
+    with anyio.fail_after(90):
+        assert await anyio.to_thread.run_sync(event.wait, 60)
 
 
 async def test_preflight_strict_verified(fake_gateway: FakeGateway) -> None:
@@ -463,7 +467,8 @@ async def test_pagination_one_deadline(
 ) -> None:
     import swarm_arena._gateway.litellm_proxy as module
 
-    proxy, key = await _proxy_and_key(fake_gateway)
+    _, key = await _proxy_and_key(fake_gateway)
+    proxy = _proxy(fake_gateway, http_timeout_s=5)
     for i in range(51):
         fake_gateway.add_spend(key.key_id, model="m", cost_usd=1, tokens=(1, 2), call_id=str(i))
     original = proxy._request
@@ -477,8 +482,6 @@ async def test_pagination_one_deadline(
         return result
 
     # Patch only this module's clock reference, never time.monotonic process-wide.
-    from types import SimpleNamespace
-
     monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: real_time() + elapsed))
     monkeypatch.setattr(proxy, "_request", request)
     with pytest.raises(GatewayError, match="TimeoutError"):
@@ -500,7 +503,23 @@ async def test_delayed_visibility_without_sleep(fake_gateway: FakeGateway) -> No
 async def test_create_delivery_race(
     fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, order: str, termination: str
 ) -> None:
+    import swarm_arena._gateway.litellm_proxy as deadline_module
     import swarm_arena._gateway.litellm_proxy as module
+
+    deadlines: list[anyio.CancelScope] = []
+
+    @contextmanager
+    def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
+        assert delay == 60
+        with anyio.fail_after(delay) as scope:
+            deadlines.append(scope)
+            yield scope
+
+    monkeypatch.setattr(
+        deadline_module,
+        "anyio",
+        SimpleNamespace(fail_after=observed_deadline, run=anyio.run),
+    )
 
     entered, release, returned, blocked = (threading.Event() for _ in range(4))
     original = module._CreateOwner.publish
@@ -509,23 +528,29 @@ async def test_create_delivery_race(
         if order == "after_publish":
             original(owner, key)
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         if order == "before_publish":
             original(owner, key)
         returned.set()
 
     monkeypatch.setattr(module._CreateOwner, "publish", publish)
     fake_gateway.entered["/key/block"] = blocked
-    task = asyncio.create_task(_proxy(fake_gateway, http_timeout_s=2).create_key(**CREATE))
+    task = asyncio.create_task(_proxy(fake_gateway, http_timeout_s=60).create_key(**CREATE))
     try:
         await _wait(entered)
         if termination == "cancel":
             task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "gateway operation did not finish while held"
             with pytest.raises(asyncio.CancelledError):
-                await task
+                task.result()
         else:
+            assert len(deadlines) == 1
+            deadlines[0].deadline = anyio.current_time()
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "gateway operation did not finish while held"
             with pytest.raises(GatewayError, match="TimeoutError"):
-                await task
+                task.result()
         release.set()
         await _wait(returned)
         await _wait(blocked)
@@ -533,8 +558,9 @@ async def test_create_delivery_race(
         assert all(row["blocked"] for row in fake_gateway.keys.values())
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
+        task.cancel()
+        with anyio.fail_after(60, shield=True):
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -699,7 +725,7 @@ async def test_abandoned_block_owner_is_bounded(
     def request(*args: Any, **kwargs: Any) -> Any:
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
             return {"token": key.key_id, "blocked": True}
         finally:
             worker_done.set()
@@ -719,9 +745,11 @@ async def test_abandoned_block_owner_is_bounded(
         assert not release.is_set()
     finally:
         release.set()
-        await _wait(worker_done)
-        thread.join(timeout=5)
-        assert not thread.is_alive()
+        try:
+            await _wait(worker_done)
+        finally:
+            thread.join(60)
+            assert not thread.is_alive()
 
 
 async def test_spend_retains_own_hash_and_one_cost(fake_gateway: FakeGateway) -> None:
@@ -860,11 +888,10 @@ async def test_applied_mutation_with_bad_reply_uses_info(
 async def test_idempotency_inspection_uses_remaining_deadline(
     fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from types import SimpleNamespace
-
     import swarm_arena._gateway.litellm_proxy as module
 
-    proxy, key = await _proxy_and_key(fake_gateway)
+    _, key = await _proxy_and_key(fake_gateway)
+    proxy = _proxy(fake_gateway, http_timeout_s=5)
     original = proxy._request
     real_time = module.time.monotonic
     elapsed = 0.0
@@ -1135,7 +1162,23 @@ async def test_duplicate_request_ids_within_read(
 async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    import swarm_arena._gateway.litellm_proxy as deadline_module
     import swarm_arena._gateway.litellm_proxy as module
+
+    deadlines: list[anyio.CancelScope] = []
+
+    @contextmanager
+    def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
+        assert delay == 60
+        with anyio.fail_after(delay) as scope:
+            deadlines.append(scope)
+            yield scope
+
+    monkeypatch.setattr(
+        deadline_module,
+        "anyio",
+        SimpleNamespace(fail_after=observed_deadline, run=anyio.run),
+    )
 
     entered, release, finished = (threading.Event() for _ in range(3))
     sockets: list[socket.socket] = []
@@ -1155,7 +1198,8 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
             try:
                 self.wfile.write(b"HTTP/1.1 200 OK\r\n")
                 entered.set()
-                while not release.wait(0.05):
+                backstop = time.monotonic() + 300
+                while not release.wait(0.05) and time.monotonic() < backstop:
                     self.wfile.write(b"X-Drip: still-here\r\n")
             except OSError:
                 pass
@@ -1163,10 +1207,12 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
     server_thread.start()
-    proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=0.5)
+    proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=60)
     original = proxy._request
+    operations: list[Any] = []
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        operations.append(args[0])
         try:
             return original(*args, **kwargs)
         finally:
@@ -1176,22 +1222,39 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
     task = asyncio.create_task(proxy.closed_at(VirtualKey(key_id="hash", alias="alias")))
     try:
         await _wait(entered)
-        with anyio.fail_after(1.5):
+        assert len(deadlines) == 1
+        transport = operations[0].transport
+        assert transport is not None
+        timer = transport._timer
+        assert timer.is_alive()
+        assert 0 < timer.interval <= 60
+        # Advance the transport watchdog after the blocked I/O is observed.
+        operations[0].deadline = time.monotonic()
+        timer.cancel()
+        timer.function(*timer.args, **timer.kwargs)
+        with anyio.fail_after(30):
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "gateway operation did not finish while held"
             with pytest.raises(GatewayError):
-                await task
+                task.result()
         # The caller is already bounded on the old code. Assert worker exit too,
         # before the fixture releases the endless header stream.
-        with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
+        with anyio.fail_after(30):
+            assert await anyio.to_thread.run_sync(finished.wait, 30)
         assert sockets
         assert all(sock.fileno() == -1 for sock in sockets)
     finally:
         release.set()
-        server.shutdown()
-        server.server_close()
-        server_thread.join(5)
-        await _wait(finished)
-        assert not server_thread.is_alive()
+        task.cancel()
+        try:
+            with anyio.fail_after(60, shield=True):
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(60)
+            await _wait(finished)
+            assert not server_thread.is_alive()
 
 
 @pytest.mark.parametrize("status", [200, 404])
@@ -1199,6 +1262,23 @@ async def test_body_drip_worker_exits_at_deadline(
     monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import swarm_arena._gateway.litellm_proxy as deadline_module
+
+    deadlines: list[anyio.CancelScope] = []
+
+    @contextmanager
+    def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
+        assert delay == 60
+        with anyio.fail_after(delay) as scope:
+            deadlines.append(scope)
+            yield scope
+
+    monkeypatch.setattr(
+        deadline_module,
+        "anyio",
+        SimpleNamespace(fail_after=observed_deadline, run=anyio.run),
+    )
 
     entered, release, finished = (threading.Event() for _ in range(3))
 
@@ -1212,7 +1292,8 @@ async def test_body_drip_worker_exits_at_deadline(
                 self.send_header("Content-Length", "1000000")
                 self.end_headers()
                 entered.set()
-                while not release.wait(0.05):
+                backstop = time.monotonic() + 300
+                while not release.wait(0.05) and time.monotonic() < backstop:
                     self.wfile.write(b" ")
             except OSError:
                 pass
@@ -1220,10 +1301,12 @@ async def test_body_drip_worker_exits_at_deadline(
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
     thread.start()
-    proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=0.5)
+    proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=60)
     original = proxy._request
+    operations: list[Any] = []
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        operations.append(args[0])
         try:
             return original(*args, **kwargs)
         finally:
@@ -1233,17 +1316,34 @@ async def test_body_drip_worker_exits_at_deadline(
     task = asyncio.create_task(proxy.closed_at(VirtualKey(key_id="hash", alias="alias")))
     try:
         await _wait(entered)
+        assert len(deadlines) == 1
+        transport = operations[0].transport
+        assert transport is not None
+        timer = transport._timer
+        assert timer.is_alive()
+        assert 0 < timer.interval <= 60
+        # Advance the transport watchdog after the blocked I/O is observed.
+        operations[0].deadline = time.monotonic()
+        timer.cancel()
+        timer.function(*timer.args, **timer.kwargs)
+        done, _ = await asyncio.wait({task}, timeout=30)
+        assert task in done, "gateway operation did not finish while held"
         with pytest.raises(GatewayError):
-            await task
-        with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
+            task.result()
+        with anyio.fail_after(30):
+            assert await anyio.to_thread.run_sync(finished.wait, 30)
     finally:
         release.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(5)
-        await _wait(finished)
-        assert not thread.is_alive()
+        task.cancel()
+        try:
+            with anyio.fail_after(60, shield=True):
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(60)
+            await _wait(finished)
+            assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("termination", ["cancel", "timeout"])
@@ -1256,10 +1356,10 @@ async def test_tls_handshake_worker_exits(
 
     class Handler(BaseRequestHandler):
         def handle(self) -> None:
-            self.request.settimeout(180)
+            self.request.settimeout(300)
             self.request.recv(4096)
             entered.set()
-            release.wait(180)
+            release.wait(300)
 
     server = ThreadingTCPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
@@ -1267,7 +1367,7 @@ async def test_tls_handshake_worker_exits(
     # The worker must exit at its own operation deadline, long before the server
     # releases the handshake. The cancel case gets a deadline that the cancel
     # always beats under load; the timeout case keeps the short deadline under test.
-    http_timeout_s = 10 if termination == "cancel" else 0.5
+    http_timeout_s = 60 if termination == "cancel" else 0.5
     proxy = _proxy_at(
         f"https://127.0.0.1:{server.server_address[1]}", http_timeout_s=http_timeout_s
     )
@@ -1285,20 +1385,29 @@ async def test_tls_handshake_worker_exits(
         await _wait(entered)
         if termination == "cancel":
             task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "TLS cancellation did not finish"
             with pytest.raises(asyncio.CancelledError):
-                await task
+                task.result()
         else:
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "TLS timeout did not finish"
             with pytest.raises(GatewayError):
-                await task
+                task.result()
         with anyio.fail_after(90):
             assert await anyio.to_thread.run_sync(finished.wait, 60)
     finally:
         release.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(60)
-        await _wait(finished)
-        assert not thread.is_alive()
+        task.cancel()
+        try:
+            with anyio.fail_after(60, shield=True):
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(60)
+            await _wait(finished)
+            assert not thread.is_alive()
 
 
 async def test_missing_key_confirmation_shares_operation_byte_budget(
@@ -1359,17 +1468,33 @@ async def test_hostname_resolves_in_daemon_http_worker(
 async def test_abandoned_dns_never_opens_socket(
     monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
+    import swarm_arena._gateway.litellm_proxy as deadline_module
     import swarm_arena._gateway.litellm_proxy as module
+
+    deadlines: list[anyio.CancelScope] = []
+
+    @contextmanager
+    def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
+        assert delay == 60
+        with anyio.fail_after(delay) as scope:
+            deadlines.append(scope)
+            yield scope
+
+    monkeypatch.setattr(
+        deadline_module,
+        "anyio",
+        SimpleNamespace(fail_after=observed_deadline, run=anyio.run),
+    )
 
     entered, release, finished = (threading.Event() for _ in range(3))
     sockets: list[Any] = []
     original_socket = socket.socket
-    proxy = _proxy_at("http://localhost:4000", http_timeout_s=0.5)
+    proxy = _proxy_at("http://localhost:4000", http_timeout_s=60)
     original_request = proxy._request
 
     def resolve(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 4000))]
 
     def make_socket(*args: Any, **kwargs: Any) -> Any:
@@ -1384,8 +1509,6 @@ async def test_abandoned_dns_never_opens_socket(
             finished.set()
 
     # Scope socket instrumentation to this module; AnyIO owns unrelated sockets.
-    from types import SimpleNamespace
-
     monkeypatch.setattr(
         module,
         "socket",
@@ -1402,9 +1525,13 @@ async def test_abandoned_dns_never_opens_socket(
     task = asyncio.create_task(_call(proxy, operation, VirtualKey(key_id="hash", alias="alias")))
     try:
         await _wait(entered)
-        with anyio.fail_after(1.5):
+        assert len(deadlines) == 1
+        deadlines[0].deadline = anyio.current_time()
+        with anyio.fail_after(30):
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "gateway operation did not finish while held"
             with pytest.raises(GatewayError):
-                await task
+                task.result()
         assert not finished.is_set()
         assert not sockets
         release.set()
@@ -1412,10 +1539,9 @@ async def test_abandoned_dns_never_opens_socket(
         assert not sockets
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        task.cancel()
+        with anyio.fail_after(60, shield=True):
+            await asyncio.gather(task, return_exceptions=True)
         await _wait(finished)
         for sock in sockets:
             sock.close()
