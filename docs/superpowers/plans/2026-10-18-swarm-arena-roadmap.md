@@ -2723,7 +2723,10 @@ def run_in_worker(job: Job, workspace: Path, artifacts: ArtifactStore, *, poll_s
     # Sync entry with a private asyncio loop. Shared _Staged/_JobRun preserve effective Command limits,
     # daemon preparation, bounded once-only collection and per-object publication. The direct child stays
     # in the Ray worker group; Ray owns descendants when its max_calls=1 worker exits.
-    # The caller retains workspace ownership; run_job removes only a fully released workspace.
+    # Main-thread SIGINT is owned through loop shutdown and its previous handler is restored.
+    # Timeout and cancel stop sequences are shielded; soft cancel returns data only, with no new uploads.
+    # A completed result survives a late interrupt. The caller retains workspace ownership;
+    # run_job removes a fully released workspace immediately, or a retained workspace at worker exit.
 @ray.remote(max_retries=0, max_calls=1)
 def run_job(payload: bytes) -> bytes: ...
     # Frame(ToolOutput JSON, newly-created blobs, registered FrameDiagnostic entries); incremental output

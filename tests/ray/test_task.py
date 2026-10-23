@@ -196,22 +196,22 @@ def test_soft_cancel_returns_partial_through_ray(ray_driver: None, tmp_path: Pat
     ready = tmp_path / "ready"
     ref = run_job.remote(
         job_payload(
-            _job(
-                "partial_on_sigterm.py",
-                args=["--ready-file", str(ready)],
-                timeout_s=None,
-                grace_s=2,
-            ),
+            _cancel_job(ready),
             TaskSettings(cap_bytes=256 * MIB),
         )
     )
     try:
         assert wait_until(ready.exists, 30)
         ray.cancel(ref)
-        out = ToolOutput.model_validate_json(unframe(ray.get(ref, timeout=40)).head)
+        decoded = unframe(ray.get(ref, timeout=40))
+        out = ToolOutput.model_validate_json(decoded.head)
         assert out.status == RunStatus.CANCELLED
         assert out.partial
         assert out.data["step"] >= 1
+        assert out.files == []
+        assert out.logs_ref is None
+        assert out.llm_calls_file is None
+        assert decoded.blobs == {}
     finally:
         ray.cancel(ref, force=True)
 
@@ -670,8 +670,17 @@ def test_run_job_retains_abandoned_collector_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import atexit
+
     from swarm_arena.ray import _task
 
+    hooks: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def register(callback: Any, *args: Any, **kwargs: Any) -> Any:
+        hooks.append((callback, args, kwargs))
+        return callback
+
+    monkeypatch.setattr(atexit, "register", register)
     workspace = tmp_path / "worker"
     workspace.mkdir()
     release, finished = threading.Event(), threading.Event()
@@ -700,6 +709,12 @@ def test_run_job_retains_abandoned_collector_workspace(
         release.set()
         assert finished.wait(5)
     assert (workspace / "late-write").exists()
+    assert len(hooks) == 1
+    callback, args, kwargs = hooks[0]
+    assert kwargs == {"ignore_errors": True}
+    callback(*args, **kwargs)
+    assert not workspace.exists()
+    callback(*args, **kwargs)  # already removed at exit is harmless
 
 
 def test_worker_report_bytes_and_registered_diagnostics(tmp_path: Path) -> None:
@@ -815,3 +830,220 @@ def test_remote_boundary_keeps_control_authority(
         ) as caught:
             cast(Any, run_job)._function(payload)
         assert_secret_absent(caught.value, "SENTINEL")
+
+
+def _cancel_job(ready: Path) -> Job:
+    code = WORKER_SCRIPTS["partial_on_sigterm.py"].replace(
+        "{'data': {'step': n}}", "{'data': {'step': n}, 'files': ['out.txt']}"
+    )
+    prefix = (
+        "import sys; from pathlib import Path; "
+        f"sys.argv = ['tool', '--ready-file', {str(ready)!r}]; "
+        "Path('out.txt').write_text('artifact'); "
+        "Path('swarm/llm_calls.jsonl').write_text('{}\\n'); print('tool log', flush=True)\n"
+    )
+    return _tool_job(prefix + code, timeout_s=None, grace_s=2)
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_interrupt_main_owns_handler_and_returns_data_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign: bool
+) -> None:
+    import _thread
+
+    from swarm_arena.ray import _task
+
+    foreign_calls: list[int] = []
+
+    def foreign_handler(signum: int, frame: Any) -> None:
+        foreign_calls.append(signum)
+        raise KeyboardInterrupt
+
+    previous = signal.getsignal(signal.SIGINT)
+    installed = foreign_handler if foreign else signal.default_int_handler
+    signal.signal(signal.SIGINT, installed)
+    ready = tmp_path / "ready"
+    original_wait = _task._WorkerSupervisor._wait
+    original_run = anyio.run
+    owned_before_loop: list[bool] = []
+    interrupted = False
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        owned_before_loop.append(signal.getsignal(signal.SIGINT) is not installed)
+        return original_run(*args, **kwargs)
+
+    async def wait(self: Any, process: Any, deadline: Any) -> bool:
+        nonlocal interrupted
+        if not interrupted:
+            assert await anyio.to_thread.run_sync(wait_until, ready.exists, 10)
+            interrupted = True
+            _thread.interrupt_main()
+        return await original_wait(self, process, deadline)
+
+    monkeypatch.setattr(_task._WorkerSupervisor, "_wait", wait)
+    monkeypatch.setattr(anyio, "run", run)
+    store = MemoryStore()
+    try:
+        out = _run(_cancel_job(ready), tmp_path, ArtifactStore(store))
+        assert signal.getsignal(signal.SIGINT) is installed
+        assert owned_before_loop == [True]
+        assert foreign_calls == []
+        assert out.status == RunStatus.CANCELLED
+        assert out.partial
+        assert out.data["step"] >= 1
+        assert out.files == []
+        assert out.logs_ref is None
+        assert out.llm_calls_file is None
+        assert store.created() == {}
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@pytest.mark.parametrize("cancel_kind", ["scope", "interrupt"])
+def test_cancel_during_timeout_grace_keeps_one_collect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_kind: str
+) -> None:
+    import _thread
+
+    from _fakes.tools import PyTool
+
+    from swarm_arena.ray import _task
+
+    ready, term, release = (tmp_path / name for name in ("ready", "term", "release"))
+    code = f"""import json, os, signal, time
+from pathlib import Path
+stopped = False
+def stop(signum, frame):
+    global stopped
+    stopped = True
+signal.signal(signal.SIGTERM, stop)
+Path('out.txt').write_text('artifact')
+Path('swarm/llm_calls.jsonl').write_text('{{}}\\n')
+print('tool log', flush=True)
+Path({str(ready)!r}).touch()
+while not stopped:
+    time.sleep(0.01)
+Path({str(term)!r}).touch()
+while not Path({str(release)!r}).exists():
+    time.sleep(0.01)
+result = {{'data': {{'step': 4}}, 'files': ['out.txt']}}
+Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(result))
+"""
+    store = MemoryStore()
+    worker = _task._Worker(
+        _tool_job(code, timeout_s=60, grace_s=20), tmp_path, ArtifactStore(store), TaskSettings()
+    )
+    original_wait = _task._WorkerSupervisor._wait
+    original_collect = PyTool.collect
+    waits: list[str] = []
+    collects: list[RunStatus] = []
+    processes: list[Any] = []
+    scope: anyio.CancelScope | None = None
+
+    def collect(self: Any, request: Any, workspace: Path, run: Any) -> ToolOutput:
+        collects.append(run.status)
+        assert release.exists()
+        return original_collect(self, request, workspace, run)
+
+    async def wait(self: Any, process: Any, deadline: Any) -> bool:
+        processes.append(process)
+        marker = ready if not waits else term
+        assert await anyio.to_thread.run_sync(wait_until, marker.exists, 10)
+        if not waits:
+            waits.append("execution")
+            return False  # enter timeout cleanup after the child's readiness event
+        waits.append("grace")
+        if cancel_kind == "scope":
+            assert scope is not None
+            scope.cancel()
+        else:
+            _thread.interrupt_main()
+        # The child cannot produce a result until this grace wait survives cancel.
+        await anyio.lowlevel.checkpoint()
+        await anyio.lowlevel.checkpoint()
+        assert process.poll() is None
+        assert collects == []
+        release.touch()
+        return await original_wait(self, process, deadline)
+
+    async def run_scoped() -> ToolOutput:
+        nonlocal scope
+        with anyio.CancelScope() as scope:
+            await worker.run()
+        assert scope.cancelled_caught
+        return worker.partial
+
+    monkeypatch.setattr(_task._WorkerSupervisor, "_wait", wait)
+    monkeypatch.setattr(PyTool, "collect", collect)
+    out = anyio.run(run_scoped) if cancel_kind == "scope" else _task._execute(worker)
+    assert waits == ["execution", "grace"]
+    assert out.status == RunStatus.CANCELLED
+    assert out.partial
+    assert out.data == {"step": 4}
+    assert out.files == []
+    assert out.logs_ref is None
+    assert out.llm_calls_file is None
+    assert collects == [RunStatus.TIMEOUT]
+    assert store.created() == {}
+    assert all(process.poll() is not None for process in processes)
+
+
+def test_interrupt_after_loop_completion_keeps_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _thread
+
+    from swarm_arena.ray import _task
+
+    expected = ToolOutput(status=RunStatus.OK, data={"finished": True})
+    original = anyio.run
+
+    async def completed(self: Any) -> ToolOutput:
+        return expected
+
+    def late_interrupt(*args: Any, **kwargs: Any) -> Any:
+        output = original(*args, **kwargs)
+        _thread.interrupt_main()
+        return output
+
+    monkeypatch.setattr(_task._Worker, "run", completed)
+    monkeypatch.setattr(anyio, "run", late_interrupt)
+    assert _run(_job(), tmp_path) is expected
+
+
+def test_soft_cancel_during_publication_omits_completed_blobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import _thread
+
+    from swarm_arena.ray import _task
+
+    original = _task._WorkerRun._workspace_io
+    uploads: list[str] = []
+
+    async def interrupt_after_file(self: Any, operation: Any, *args: Any, **kw: Any) -> Any:
+        result = await original(self, operation, *args, **kw)
+        if operation.__name__ == "_upload_file":
+            uploads.append(args[0])
+            _thread.interrupt_main()
+            await anyio.lowlevel.checkpoint()
+            await anyio.lowlevel.checkpoint()
+        return result
+
+    monkeypatch.setattr(_task._WorkerRun, "_workspace_io", interrupt_after_file)
+    code = (
+        "import json, os; open('out.txt', 'w').write('artifact'); "
+        "print('tool log', flush=True); "
+        "json.dump({'data': {'step': 7}, 'files': ['out.txt']}, "
+        "open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
+    )
+    decoded = unframe(_task._run_frame(job_payload(_tool_job(code), TaskSettings(cap_bytes=MIB))))
+    output = ToolOutput.model_validate_json(decoded.head)
+    assert uploads == ["out.txt"]
+    assert output.status == RunStatus.CANCELLED
+    assert output.partial
+    assert output.data == {"step": 7}
+    assert output.files == []
+    assert output.logs_ref is None
+    assert output.llm_calls_file is None
+    assert decoded.blobs == {}

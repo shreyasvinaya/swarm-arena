@@ -1,5 +1,7 @@
 """Run one framed job in a one-shot Ray worker, retaining the shared job owner."""
 
+import asyncio
+import atexit
 import contextlib
 import dataclasses
 import os
@@ -12,6 +14,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
+from types import FrameType
 from typing import Annotated
 
 import anyio
@@ -271,8 +274,6 @@ class _WorkerSupervisor(ProcessSupervisor):
                         status = RunStatus.OOM
                 else:
                     status = RunStatus.TIMEOUT
-            except KeyboardInterrupt:
-                status = RunStatus.CANCELLED
             except anyio.get_cancelled_exc_class():
                 with anyio.CancelScope(shield=True):
                     await self._stop_child(
@@ -289,20 +290,23 @@ class _WorkerSupervisor(ProcessSupervisor):
                         ),
                     )
                 raise
-            if status in {RunStatus.TIMEOUT, RunStatus.CANCELLED}:
-                await self._stop_child(
-                    process,
-                    grace_s,
-                    before_kill,
-                    CompletedRun(
-                        returncode=None,
-                        status=status,
-                        stdout_path=stdout,
-                        stderr_path=stderr,
-                        started_at=started_at,
-                        ended_at=utc_now(),
-                    ),
-                )
+            if status == RunStatus.TIMEOUT:
+                with anyio.CancelScope(shield=True):
+                    await self._stop_child(
+                        process,
+                        grace_s,
+                        before_kill,
+                        CompletedRun(
+                            returncode=None,
+                            status=status,
+                            stdout_path=stdout,
+                            stderr_path=stderr,
+                            started_at=started_at,
+                            ended_at=utc_now(),
+                        ),
+                    )
+                # Deliver a cancel held by the stop shield before any publication.
+                await anyio.lowlevel.checkpoint()
             return CompletedRun(
                 returncode=process.returncode,
                 status=status,
@@ -444,13 +448,36 @@ def _error(message: str) -> ToolOutput:
 
 
 def _execute(worker: _Worker) -> ToolOutput:
+    """Own main-thread SIGINT through loop shutdown, independent of asyncio's handler."""
+    interrupted = False
+    active: tuple[asyncio.AbstractEventLoop, anyio.CancelScope] | None = None
+    result: ToolOutput | None = None
+
+    def interrupt(signum: int, frame: FrameType | None) -> None:
+        nonlocal interrupted
+        interrupted = True
+        owner = active
+        if owner is not None:
+            owner[0].call_soon_threadsafe(owner[1].cancel)
+
+    async def run() -> ToolOutput:
+        nonlocal active, result
+        with anyio.CancelScope() as scope:
+            active = (asyncio.get_running_loop(), scope)
+            try:
+                if interrupted:
+                    scope.cancel()
+                result = await worker.run()
+            finally:
+                active = None
+        # An interrupt after completion cannot replace the accepted result.
+        return worker.partial if result is None else result
+
+    previous = signal.signal(signal.SIGINT, interrupt)
     try:
-        return anyio.run(worker.run)
-    except KeyboardInterrupt:
-        # Interrupts outside the subprocess poll (preparation, collect, upload)
-        # unwind the event loop first. Shared cancellation cleanup retains only
-        # data and never begins another upload after abandonment.
-        return worker.partial
+        return anyio.run(run)
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def run_in_worker(
@@ -483,11 +510,15 @@ def run_in_worker(
 
     Notes
     -----
-    Uses its own asyncio loop; call from synchronous code. Subprocesses stay
+    Uses its own asyncio loop and temporarily owns SIGINT; call from synchronous
+    main-thread code. Soft cancellation returns only collected data, without
+    file, log or report references or new uploads. Both cancellation and timeout
+    preserve the shielded grace and once-only collection. Subprocesses stay
     in the worker's process group. Ray owns descendant cleanup when its
     one-shot worker exits; this function only terminates/reaps the direct child.
     The caller owns the workspace. ``run_job`` removes it only after all
-    preparation, collection and publication workers have released it.
+    preparation, collection and publication workers have released it, or at
+    one-shot worker exit if an abandoned daemon still owns it.
 
     Examples
     --------
@@ -583,8 +614,9 @@ def _run_frame(payload: bytes) -> bytes:
     raised: BaseException | None = None
     try:
         output = detach_tool_output(_execute(worker))
-        created = {} if memory is None else memory.created()
-        if memory is not None:
+        created: dict[str, bytes] = {}
+        if memory is not None and output.status != RunStatus.CANCELLED:
+            created = memory.created()
             if memory.exceeded:
                 output, created = _error(_CAP_ERROR), {}
             else:
@@ -608,3 +640,5 @@ def _run_frame(payload: bytes) -> bytes:
                 if raised is None:
                     raise
                 # Cleanup must not replace an escaping ownership/control failure.
+        else:
+            atexit.register(shutil.rmtree, workspace, ignore_errors=True)
