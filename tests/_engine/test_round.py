@@ -1842,21 +1842,56 @@ async def test_provider_probe_preserves_owner_controls(
 async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
     env: EngineEnv, monkeypatch: pytest.MonkeyPatch, component: type[Tool] | type[Manager]
 ) -> None:
+    from collections.abc import Generator
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+
     from swarm_arena._engine import stops as stops_module
 
     release = threading.Event()
-    entered: set[str] = set()
+    entered = {name: anyio.Event() for name in ("stuck-a", "stuck-b")}
+    resolved = {name: anyio.Event() for name in entered}
+    scopes: dict[str, anyio.CancelScope] = {}
     workers: list[threading.Thread] = []
+    current: ContextVar[anyio.CancelScope] = ContextVar("resolution_scope")
+    loop = asyncio.get_running_loop()
     original = Ref.build
+    original_daemon = round_module.run_sync_daemon
     peer_calls: list[str] = []
     probes: list[str] = []
 
+    class ResolutionClock:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        @contextmanager
+        def move_on_at(self, deadline: float) -> Generator[anyio.CancelScope]:
+            with anyio.move_on_at(deadline) as scope:
+                token = current.set(scope)
+                try:
+                    yield scope
+                finally:
+                    current.reset(token)
+
+    def started(name: str, scope: anyio.CancelScope, worker: threading.Thread) -> None:
+        scopes[name] = scope
+        workers.append(worker)
+        entered[name].set()
+
     def blocked(self: Ref, base: type[Any]) -> Any:
-        if self.name in {"stuck-a", "stuck-b"} and base is component:
-            workers.append(threading.current_thread())
-            entered.add(self.name)
-            assert release.wait(5), "constructor release deadline"
+        if self.name in entered and base is component:
+            loop.call_soon_threadsafe(started, self.name, current.get(), threading.current_thread())
+            assert release.wait(30), "constructor release deadline"
         return original(self, base)
+
+    async def observe_resolution(fn: Any, *args: Any) -> Any:
+        ref = getattr(fn, "__self__", None)
+        watched = isinstance(ref, Ref) and ref.name in entered and args == (component,)
+        try:
+            return await original_daemon(fn, *args)
+        finally:
+            if watched:
+                resolved[ref.name].set()
 
     class Peer(Manager):
         async def run_round(self, ctx: AgentContext) -> RoundReport:
@@ -1876,7 +1911,7 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
                     )
                 }
             )
-    e = env.with_limits(round_timeout_s=0.2, run_timeout_s=30.0)
+    e = env.with_limits(round_timeout_s=60.0, run_timeout_s=120.0)
     service = e.deps.provider_stops
     service.register(slots[2].address, frozenset({"fake"}), lambda: None)
     await service.fail("fake", source="manager")
@@ -1887,18 +1922,34 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
 
     monkeypatch.setattr(Ref, "build", blocked)
     monkeypatch.setattr(stops_module, "_probe", probe)
-    start = anyio.current_time()
+    monkeypatch.setattr(round_module, "anyio", ResolutionClock())
+    monkeypatch.setattr(round_module, "run_sync_daemon", observe_resolution)
+    task = asyncio.create_task(_round(e, slots).run(1))
     try:
-        with anyio.fail_after(2):
-            out = await _round(e, slots).run(1)
-        assert anyio.current_time() - start < 1.5
-        assert entered == {"stuck-a", "stuck-b"}
+        with anyio.fail_after(15):
+            # Neither constructor is released: serial resolution cannot reach both gates.
+            await entered["stuck-a"].wait()
+            await entered["stuck-b"].wait()
+            assert not any(event.is_set() for event in resolved.values())
+            assert scopes["stuck-a"] is not scopes["stuck-b"]
+            scopes["stuck-a"].deadline = anyio.current_time()
+            await resolved["stuck-a"].wait()
+            assert not resolved["stuck-b"].is_set(), "slot expiry cancelled its peer"
+            assert not task.done()
+            scopes["stuck-b"].deadline = anyio.current_time()
+            out = await task
+        assert resolved["stuck-b"].is_set()
+        assert not release.is_set()
+        assert all(worker.is_alive() for worker in workers)
         assert probes == ["fake"]
         assert peer_calls == ["ran"]
         assert out.reasons["t/a"] == out.reasons["t/b"] == "runtime preparation cancelled"
         assert out.statuses["t/peer"] == AgentStatus.FINISHED
     finally:
         release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         for worker in workers:
             await anyio.to_thread.run_sync(worker.join, 5)
             assert not worker.is_alive()
