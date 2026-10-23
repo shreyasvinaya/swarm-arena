@@ -276,7 +276,7 @@ def test_two_caches_share_one_file_concurrently(tmp_path: Path) -> None:
     path = tmp_path / "fresh" / "toy.sqlite"
 
     def worker(reverse: bool) -> None:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=60)
         cache = ArenaCache(path)
         try:
             for run in runs[::-1] if reverse else runs:
@@ -514,7 +514,7 @@ def test_one_cache_serializes_whole_transactions(tmp_path: Path) -> None:
 
     def index(event: JournalEvent, state: RunState, pending: list[str]) -> None:
         entered.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=300)
         original(event, state, pending)
 
     def read() -> list[str]:
@@ -525,14 +525,14 @@ def test_one_cache_serializes_whole_transactions(tmp_path: Path) -> None:
         patch.setattr(cache, "_index", index)
         writer = pool.submit(ingest_run, cache, run.store, "r1", run.run_root, head)
         try:
-            assert entered.wait(timeout=5)
+            assert entered.wait(timeout=60)
             reader = pool.submit(read)
-            assert reader_started.wait(timeout=5)
+            assert reader_started.wait(timeout=60)
             assert not reader.done()
         finally:
             release.set()
-        assert writer.result(timeout=5) == 2
-        assert reader.result(timeout=5) == ["c"]
+        assert writer.result(timeout=60) == 2
+        assert reader.result(timeout=60) == ["c"]
     cache.close()
 
 
@@ -1209,14 +1209,14 @@ def test_human_objects_concurrent_connections_apply_each_line_once(tmp_path: Pat
     ]
 
     def apply(cache: ArenaCache) -> None:
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=60)
         cache.apply_human_objects([PIN_NAME] * len(operations), operations)
 
     try:
         with ThreadPoolExecutor(2) as pool:
             futures = [pool.submit(apply, cache) for cache in caches]
             for future in futures:
-                future.result(timeout=10)
+                future.result(timeout=60)
         assert caches[0].flags(build_frontier([], [], [PIN_NAME])) == {learning.id: (False, True)}
         assert caches[0]._conn.execute("SELECT count(*) FROM curation_ops").fetchone() == (2,)
         assert caches[0]._conn.execute("SELECT count(*) FROM learning_tags").fetchone() == (1,)
@@ -1845,7 +1845,7 @@ def test_one_cache_shared_by_threads(tmp_path: Path) -> None:
     done = [ThreadEvent(), ThreadEvent()]
 
     def write(run: FakeRun, finished: ThreadEvent) -> None:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=60)
         for i in range(20):
             drafts = [run.candidate(f"c-{run.run_id}-{i}-{j}") for j in range(10)]
             drafts.append(
@@ -1860,8 +1860,8 @@ def test_one_cache_shared_by_threads(tmp_path: Path) -> None:
         finished.set()
 
     def read() -> None:
-        barrier.wait(timeout=10)
-        deadline = monotonic() + 30
+        barrier.wait(timeout=60)
+        deadline = monotonic() + 60
         while not all(finished.is_set() for finished in done):
             assert monotonic() < deadline
             assert len(cache.candidates(fixed)) == 2

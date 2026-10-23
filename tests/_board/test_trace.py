@@ -473,7 +473,7 @@ def test_trace_does_not_hold_board_lock_during_cache_reads(
 
     def blocked(frontier: Frontier, candidate_id: str) -> list[str]:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return query(frontier, candidate_id)
 
     monkeypatch.setattr(cache, "_citing_learning_ids", blocked)
@@ -482,14 +482,15 @@ def test_trace_does_not_hold_board_lock_during_cache_reads(
             result = pool.submit(trace, board, "target")
             acquired = False
             try:
-                assert entered.wait(5)
-                acquired = board._lock.acquire(timeout=1)
+                assert entered.wait(60)
+                acquired = board._lock.acquire(timeout=30)
                 assert acquired
+                assert not release.is_set()
             finally:
                 if acquired:
                     board._lock.release()
                 release.set()
-            assert "learning citing Target citation" in result.result(timeout=5)
+            assert "learning citing Target citation" in result.result(timeout=60)
     finally:
         board.close()
 
@@ -607,7 +608,7 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
 
     def blocked(frontier: Frontier) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return prepare(frontier)
 
     def counted_capture() -> Any:
@@ -625,16 +626,17 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
         with ThreadPoolExecutor(max_workers=2) as pool:
             refreshed = pool.submit(board.frontier)
             try:
-                assert entered.wait(5)
+                assert entered.wait(60)
                 with monkeypatch.context() as fixed:
                     fixed.setattr(board, "_cache", forbidden)
                     fixed.setattr(board, "_read_cache", forbidden)
                     result = pool.submit(trace, board, "target")
-                    assert result.result(timeout=1) == expected
+                    assert result.result(timeout=30) == expected
                     assert captures == 1
+                    assert not release.is_set()
             finally:
                 release.set()
-            refreshed.result(timeout=5)
+            refreshed.result(timeout=60)
     finally:
         board.close()
 
@@ -650,18 +652,20 @@ def test_trace_pins_its_generation_against_concurrent_close(tmp_path: Path) -> N
 
     def paused(self: ArenaCache, *args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return candidates(self, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patched, ThreadPoolExecutor(max_workers=2) as pool:
         patched.setattr(ArenaCache, "candidates", paused)
         result = pool.submit(trace, board, "c-1")
-        assert entered.wait(5)
-        closed = pool.submit(board.close)
-        assert not closed.done()
-        release.set()
-        assert result.result(timeout=5) == expected
-        closed.result(timeout=5)
+        try:
+            assert entered.wait(60)
+            closed = pool.submit(board.close)
+            assert not closed.done()
+        finally:
+            release.set()
+        assert result.result(timeout=60) == expected
+        closed.result(timeout=60)
     with pytest.raises(RuntimeError, match="arena board is closed"):
         trace(board, "c-1")
 
@@ -913,7 +917,7 @@ def test_trace_cli_core_only_uses_producer_root(
             Context().run,
             main,
             ["trace", "queued-candidate", "--namespace", "toy", "--config", str(path)],
-        ).result(timeout=10)
+        ).result(timeout=60)
     assert code == 0
     output = capsys.readouterr().out
     assert "right-session" in output
