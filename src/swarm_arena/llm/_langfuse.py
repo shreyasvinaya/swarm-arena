@@ -154,10 +154,12 @@ def _trace_error_key(name: str) -> bool:
     return "error" in lowered or "exception" in lowered or "status_message" in lowered
 
 
-def _trace_attributes(attributes: Any) -> dict[str, Any]:
+def _trace_attributes(attributes: Any, *, is_error: bool = False) -> dict[str, Any]:
     values = dict(attributes or {})
     clean = {key: value for key, value in values.items() if not _trace_error_key(key)}
-    if len(clean) != len(values):
+    if is_error or any(
+        key.lower().startswith("exception.") or key.lower() == "error.type" for key in values
+    ):
         clean["exception.type"] = _trace_error_kind(
             values.get("exception.type", values.get("error.type"))
         )
@@ -169,9 +171,34 @@ def _error_boundary() -> Any:
     from opentelemetry.sdk.trace import Event, ReadableSpan, SynchronousMultiSpanProcessor
     from opentelemetry.trace import Status, StatusCode
 
+    class DetachedSpan(ReadableSpan):
+        # ReadableSpan derives these counters from its bounded containers, which
+        # are replaced by the sanitized attribute/event copies below.
+        def __init__(self, source: Any, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._dropped_counts = (
+                source.dropped_attributes,
+                source.dropped_events,
+                source.dropped_links,
+            )
+
+        @property
+        def dropped_attributes(self) -> int:
+            return self._dropped_counts[0]
+
+        @property
+        def dropped_events(self) -> int:
+            return self._dropped_counts[1]
+
+        @property
+        def dropped_links(self) -> int:
+            return self._dropped_counts[2]
+
     class ErrorBoundary(SynchronousMultiSpanProcessor):
         def on_start(self, span: Any, parent_context: Any = None) -> None:
-            attributes = _trace_attributes(span.attributes)
+            attributes = _trace_attributes(
+                span.attributes, is_error=span.status.status_code is StatusCode.ERROR
+            )
             # OTel has no public attribute-removal API. This is the owned SDK
             # span's still-mutable attribute store, before downstream on_start.
             for key in tuple(span.attributes or {}):
@@ -202,12 +229,15 @@ def _error_boundary() -> Any:
             status = span.status
             if status.status_code is StatusCode.ERROR or status.description:
                 status = Status(status.status_code, _trace_error_kind(status.description))
-            clean = ReadableSpan(
+            clean = DetachedSpan(
+                span,
                 name=span.name,
                 context=span.context,
                 parent=span.parent,
                 resource=span.resource,
-                attributes=_trace_attributes(span.attributes),
+                attributes=_trace_attributes(
+                    span.attributes, is_error=status.status_code is StatusCode.ERROR
+                ),
                 events=events,
                 links=span.links,
                 kind=span.kind,

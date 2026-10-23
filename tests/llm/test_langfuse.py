@@ -1174,3 +1174,122 @@ async def test_provider_error_spans_are_value_free(
     assert received
     assert all(secret not in snapshot for snapshot in received)
     assert all(secret not in event.model_dump_json() for event in all_events(cfg))
+
+
+@pytest.mark.parametrize(
+    ("status_error", "event_name", "removed", "expected_type"),
+    [
+        (False, "plain", {}, None),
+        (False, "plain", {"app.error_budget": 3}, None),
+        (False, "plain", {"error.detail": "SECRET"}, None),
+        (False, "plain", {"exception.message": "SECRET"}, "Exception"),
+        (False, "plain", {"error.type": "ValueError"}, "ValueError"),
+        (True, "plain", {}, "Exception"),
+        (False, "exception", {}, None),
+    ],
+)
+def test_error_boundary_preserves_non_error_attributes(
+    status_error: bool, event_name: str, removed: dict[str, Any], expected_type: str | None
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter = InMemorySpanExporter()
+    boundary = _langfuse._error_boundary()
+    boundary.add_span_processor(SimpleSpanProcessor(exporter))
+    provider = TracerProvider(active_span_processor=boundary, shutdown_on_exit=False)
+    safe = {"keep": "ok", "count": 3, "enabled": True}
+    try:
+        with provider.get_tracer("regression").start_as_current_span(
+            "ordinary", attributes=safe | removed
+        ) as span:
+            span.add_event(event_name, safe | removed)
+            if status_error:
+                span.set_status(Status(StatusCode.ERROR, "SECRET"))
+        (result,) = exporter.get_finished_spans()
+        expected = safe | ({"exception.type": expected_type} if expected_type else {})
+        assert dict(result.attributes or {}) == expected
+        event_expected = (
+            {"exception.type": "Exception"}
+            if event_name == "exception"
+            else safe | ({"exception.type": expected_type} if removed and expected_type else {})
+        )
+        assert dict(result.events[0].attributes or {}) == event_expected
+        assert result.status.status_code is (StatusCode.ERROR if status_error else StatusCode.UNSET)
+        assert result.status.description == ("Exception" if status_error else None)
+    finally:
+        provider.shutdown()
+
+
+def test_error_boundary_preserves_dropped_counts() -> None:
+    from opentelemetry.sdk.trace import Span, SpanLimits, TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import Link, SpanContext, TraceFlags
+
+    exporter = InMemorySpanExporter()
+    boundary = _langfuse._error_boundary()
+    boundary.add_span_processor(SimpleSpanProcessor(exporter))
+    provider = TracerProvider(
+        active_span_processor=boundary,
+        shutdown_on_exit=False,
+        span_limits=SpanLimits(max_span_attributes=2, max_events=2, max_links=1),
+    )
+    parent = SpanContext(1, 2, False, TraceFlags(1))
+    try:
+        span = provider.get_tracer("regression", "1").start_span(
+            "limited", links=[Link(parent), Link(parent)]
+        )
+        assert isinstance(span, Span)
+        for i in range(4):
+            span.set_attribute(f"keep.{i}", i)
+            span.add_event(f"event.{i}")
+        expected = (span.dropped_attributes, span.dropped_events, span.dropped_links)
+        assert expected == (2, 2, 1)
+        span.end()
+        (result,) = exporter.get_finished_spans()
+        assert (result.dropped_attributes, result.dropped_events, result.dropped_links) == expected
+        assert dict(result.attributes or {}) == dict(span.attributes or {})
+        assert [event.name for event in result.events] == [event.name for event in span.events]
+        assert result.links == span.links
+        assert result.context == span.context
+        assert result.instrumentation_scope == span.instrumentation_scope
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["function", "custom"])
+async def test_tool_and_custom_span_errors_are_value_free(
+    tmp_path: Path, exported: Any, kind: str
+) -> None:
+    import json
+
+    from opentelemetry.trace import StatusCode
+
+    secret = "TOOL_CUSTOM_ERROR_SECRET_b26f"
+    async with open_llm_run(
+        tmp_path, config=manager_config(tracing=TracingConfig(langfuse=True))
+    ) as run:
+        scope = run.scope("manager")
+        with (
+            llm_scope(scope),
+            _langfuse.component_span(scope),
+            agents.trace("component errors"),
+        ):
+            child = (
+                agents.function_span("tool failure")
+                if kind == "function"
+                else agents.custom_span("component failure")
+            )
+            with child:
+                child.set_error({"message": secret, "data": {"detail": secret}})
+    exported[1][0].flush()
+    spans = exported[0].get_finished_spans()
+    errors = [span for span in spans if span.status.status_code is StatusCode.ERROR]
+    assert len(errors) == 1
+    assert errors[0].name == ("tool failure" if kind == "function" else "component failure")
+    assert errors[0].status.description == "Exception"
+    assert errors[0].attributes["exception.type"] == "Exception"
+    assert secret not in json.dumps([span.to_json() for span in spans])
