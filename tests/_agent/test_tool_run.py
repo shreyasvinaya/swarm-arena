@@ -2764,15 +2764,40 @@ async def test_gateway_failures_never_stop_the_run(
     dispatched: bool,
     status: RunStatus,
     fault: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import copy
+
     from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
 
     if fault == "http_500":
         fake_gateway.fail[path] = 500
     else:
-        fake_gateway.delay[path] = 1.0
-    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool(), http_timeout_s=0.2) as rt:
+        # Held until the gateway stops: only the adapter's own deadline ends the call.
+        fake_gateway.delay[path] = 600
+        method = {
+            "/key/generate": "create_key",
+            "/key/block": "block_key",
+            "/spend/logs/v2": "spend_rows",
+        }[path]
+        original = getattr(LiteLLMProxy, method)
+        short = {"on": True}
+
+        async def short_deadline(self: LiteLLMProxy, *args: Any, **kwargs: Any) -> Any:
+            # Only the slow route gets the short deadline; other gateway calls keep a
+            # generous one, so CI load cannot turn a healthy call into this fault.
+            if short["on"]:
+                self = copy.copy(self)
+                self._http_timeout_s = 0.2
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(LiteLLMProxy, method, short_deadline)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool(), http_timeout_s=30) as rt:
         first = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        if fault == "slow":
+            short["on"] = False
         assert first.output.status == status
         assert bool(rt_env.events("tool_start")) is dispatched
         assert first.warnings
