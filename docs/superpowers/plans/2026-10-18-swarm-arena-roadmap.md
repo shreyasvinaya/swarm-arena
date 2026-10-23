@@ -2557,12 +2557,13 @@ def job_payload(job: Job) -> bytes: ...              # Job without on_started; R
 def run_job(payload: bytes) -> bytes: ...            # materialize, command(), Popen in the worker's group, poll, collect; → ToolOutput JSON
 def find_task(task_name: str) -> TaskInfo | None: ...    # ray.util.state
 def worker_dead(task_name: str) -> bool | None: ...
-def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes and files
+def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes -- and files
 def submit_runtime_env(*, working_dir: str | None, pip: Sequence[str]) -> dict[str, Any] | None: ...
     # ray/_submit.py; only nonempty working_dir/pip, never env_vars; None when both are empty
 def submit_driver(address: str | None, entrypoint: str, *, runtime_env: Mapping[str, Any] | None) -> str: ...
-    # ray/_submit.py; JobSubmissionClient(address).submit_job → submission id
-    # address None → Ray reads RAY_ADDRESS, as `swarm-arena submit` does without --address
+    # ray/_submit.py; JobSubmissionClient(address).submit_job with client-generated swarm-arena-<uuid4 hex> id
+    # address None → Ray's RAY_API_SERVER_ADDRESS/RAY_ADDRESS fallback; explicit conflicts are refused
+    # one abandonable 300-second wait covers construction and submission; timeout/interrupt reports id + status command
 ```
 
 #### R4.13.17 LLM internals — M3
