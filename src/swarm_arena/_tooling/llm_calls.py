@@ -18,7 +18,7 @@ from swarm_arena._model.data import finite_json
 from swarm_arena._model.results import LLMCall
 from swarm_arena._model.tooling import FileRef, Usage
 from swarm_arena._outcomes import _propagate_control
-from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.artifacts import ArtifactStore, _read_bounded_body
 from swarm_arena._store.local import LocalStore
 from swarm_arena._store.s3 import S3Store
 from swarm_arena._tooling.result_file import (
@@ -338,7 +338,8 @@ def _read_report_artifact(artifacts: ArtifactStore, ref: FileRef) -> bytes:
     """Read and verify one report under its declared size and the 16 MiB ceiling.
 
     Local reads are pinned and bounded before allocation; S3 checks HEAD and a
-    bounded GET (one excess byte detects growth). Generic byte-only stores have
+    bounded GET consumed through EOF or one excess byte to detect growth.
+    Generic byte-only stores have
     no pre-read bound in their API, so their returned object is checked before
     copying, hashing or parsing. Call only from the owner's storage worker.
     """
@@ -365,7 +366,7 @@ def _read_report_artifact(artifacts: ArtifactStore, ref: FileRef) -> bytes:
 
             async def consume() -> bytes:
                 async with response["Body"] as body:
-                    return cast(bytes, await body.read(ref.size + 1))
+                    return await _read_bounded_body(body, ref.size)
 
             data = cast(bytes, sync(store._filesystem().loop, consume))
     else:

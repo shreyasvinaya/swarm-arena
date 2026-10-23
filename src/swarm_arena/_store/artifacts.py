@@ -5,7 +5,7 @@ import os
 from collections.abc import Iterable, Iterator
 from io import BytesIO
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from pydantic import ValidationError
 
@@ -17,6 +17,24 @@ from swarm_arena._store.local import LocalStore
 from swarm_arena._store.s3 import S3Store
 
 _MAX_ARTIFACT_BYTES: Final = 2**30
+
+
+async def _read_bounded_body(body: Any, limit: int) -> bytes:
+    """Consume short async reads until EOF or the limit-plus-one sentinel.
+
+    Keep one buffer and request at most 1 MiB at a time. Callers own the
+    response context and validate the final size and digest. No read may
+    request an unbounded amount, including the read used to observe EOF.
+    """
+    remaining = limit + 1
+    with BytesIO() as buffer:
+        while remaining:
+            chunk = await body.read(min(remaining, 2**20))
+            if not chunk:
+                break
+            buffer.write(chunk)
+            remaining -= len(chunk)
+        return buffer.getvalue()
 
 
 class ArtifactStore:
@@ -152,7 +170,8 @@ class ArtifactStore:
     def get_bytes(self, sha256: str) -> bytes:
         """Read artifact contents and verify their digest and 1 GiB cap.
 
-        S3 checks metadata before reading and bounds the GET to cover growth.
+        S3 checks metadata before reading and consumes short response chunks
+        through EOF or the cap plus one byte to detect growth.
         Other byte-only backends can enforce the cap only after their read.
         Immutable byte results are reused without another full-object copy.
 
@@ -206,7 +225,7 @@ class ArtifactStore:
 
                 async def consume() -> bytes:
                     async with response["Body"] as body:
-                        return cast(bytes, await body.read(_MAX_ARTIFACT_BYTES + 1))
+                        return await _read_bounded_body(body, _MAX_ARTIFACT_BYTES)
 
                 data = cast(bytes, sync(store._filesystem().loop, consume))
         else:
