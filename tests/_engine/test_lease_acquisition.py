@@ -59,7 +59,7 @@ async def test_engine_acquisition_supervision(
             return getattr(anyio, name)
 
         async def sleep(self, seconds: float) -> None:
-            assert 0 < seconds <= config.limits.run_timeout_s
+            assert seconds == pytest.approx(config.limits.run_timeout_s - elapsed, abs=1)
             await deadline.wait()
 
     if stop == "deadline":
