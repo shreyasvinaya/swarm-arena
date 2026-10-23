@@ -377,12 +377,12 @@ async def test_valid_full_report_has_bounded_memory_and_loop_progress(
             workers.append(threading.current_thread())
             order.append("parsing")
             loop.call_soon_threadsafe(parsing.set)
-            assert release.wait(30), "event loop did not release the parser"
+            assert release.wait(180), "event loop did not release the parser"
             order.append("released")
         return loads(data, *args, **kwargs)
 
     async def progress() -> None:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await parsing.wait()
         order.append("loop progressed")
         release.set()

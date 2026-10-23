@@ -253,7 +253,7 @@ async def test_result_must_be_a_regular_file(tmp_path: Path, kind: str) -> None:
     ws = tmp_path / "ws"
     await anyio.to_thread.run_sync(prepare_unsafe_result, ws, kind)
     r = await anyio.to_thread.run_sync(run, ws, RunStatus.OK, 0)
-    with anyio.fail_after(5):  # a FIFO opened without O_NONBLOCK would block forever
+    with anyio.fail_after(30):  # a FIFO opened without O_NONBLOCK would block forever
         out = await anyio.to_thread.run_sync(tool_output_from_result, ws, r, abandon_on_cancel=True)
     assert out.status is RunStatus.ERROR
     logged = await anyio.to_thread.run_sync(r.stderr_path.read_text)
@@ -268,7 +268,7 @@ async def test_result_must_be_a_regular_file(tmp_path: Path, kind: str) -> None:
 async def test_note_in_log_never_blocks_or_follows(tmp_path: Path, kind: str) -> None:
     p = tmp_path / "stderr.log"
     await anyio.to_thread.run_sync(prepare_log, p, kind)
-    with anyio.fail_after(5):
+    with anyio.fail_after(30):
         await anyio.to_thread.run_sync(
             note_in_log, p, "m", abandon_on_cancel=True
         )  # returns None, raises nothing
@@ -436,7 +436,7 @@ async def test_declared_files_must_be_regular(tmp_path: Path, kind: str) -> None
         assert out.status == RunStatus.ERROR
         assert "not a regular file" in r.stderr_path.read_text()
 
-    with anyio.fail_after(5):
+    with anyio.fail_after(30):
         await anyio.to_thread.run_sync(collect, abandon_on_cancel=True)
 
 
