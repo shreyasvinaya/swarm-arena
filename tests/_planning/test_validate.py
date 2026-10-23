@@ -2802,6 +2802,30 @@ def test_provider_warning_absent_with_gateway() -> None:
     assert validate_plan(plan, config) == []
 
 
+@pytest.mark.parametrize("tool_type", ["function", "script"])
+def test_unreplaced_provider_key_warns(tool_type: str) -> None:
+    from swarm_arena import ScriptTool
+    from swarm_arena._model.settings import GatewayConfig
+
+    names = ["OPENAI_API_KEY", "GEMINI_API_KEY", "UNRELATED_TOKEN"]
+    tool = (
+        FunctionTool("_fakes.tools:add", env=names)
+        if tool_type == "function"
+        else ScriptTool(command=["python", "run.py"], env=names)
+    )
+    warnings = validate_plan(
+        _plan(tool=tool),
+        RunConfig(
+            llm_gateway=GatewayConfig(url="http://gw:4000"),
+            secrets=SecretsPolicy(allow=names),
+        ),
+    )
+    assert warnings == [
+        "agent g/t0/a0: tool allowlists GEMINI_API_KEY, which the LLM gateway does not "
+        "replace; keyed tool runs do not get it"
+    ]
+
+
 def test_effective_secret_names_detach_string_subclasses() -> None:
     from swarm_arena._tooling.env_names import effective_secret_env
     from swarm_arena.tool import Command

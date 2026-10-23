@@ -29,6 +29,8 @@ from swarm_arena._errors import (
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.adapter import GatewayError
+from swarm_arena._gateway.keys import REPLACED_KEYS, KeyRecord, gateway_job, needs_key
 from swarm_arena._journal.a2a import agent_task_id, task_to_json, tool_run_task
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
@@ -561,7 +563,12 @@ class _ToolReservation:
 
 async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> None:
     """Book zero once before dispatch, bounding even the ledger's inner shield."""
-    if owner.admitted is None or owner.started or rt.journal.fenced.is_set():
+    if (
+        owner.admitted is None
+        or owner.admitted.keep_charged
+        or owner.started
+        or rt.journal.fenced.is_set()
+    ):
         return
     with anyio.CancelScope(shield=True):
         try:
@@ -571,6 +578,65 @@ async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> Non
                 await rt.ledger.settle(owner.admitted.id, Amount())
         except TimeoutError:
             pass
+
+
+def _gateway_cleanup_deadline(rt: AgentRuntime, inherited: float) -> float:
+    """Cap external cleanup by the remaining caller and writer allowances."""
+    deadline = min(
+        inherited,
+        rt.journal._closing_at,
+        anyio.current_time() + min(30.0, rt.config.settle_timeout_s),
+    )
+    if rt.journal._io_scope is not None:
+        deadline = min(deadline, rt.journal._io_scope.deadline)
+    return deadline
+
+
+async def _revoke_gateway_key(rt: AgentRuntime, record: KeyRecord, deadline: float) -> None:
+    """Attempt bounded no-journal revocation without replacing an escaping error."""
+    assert rt.gateway is not None
+    deadline = _gateway_cleanup_deadline(rt, deadline)
+    if deadline <= anyio.current_time():
+        return
+    with anyio.CancelScope(shield=True, deadline=deadline):
+        try:
+            await rt.gateway.revoke(record)
+        except anyio.get_cancelled_exc_class():
+            # The primary caller cancellation still escapes the submit boundary.
+            pass
+        except Exception:
+            # Revocation is best effort; the original outcome retains authority.
+            pass
+
+
+async def _read_tool_gateway(
+    rt: AgentRuntime,
+    record: KeyRecord,
+    inflight: Inflight,
+    generation: int,
+    warnings: list[str],
+) -> list[str]:
+    """Keep readback cancellable without imposing a timer on healthy recording."""
+    assert rt.gateway is not None
+    with anyio.CancelScope() as scope:
+        if not inflight._add_completion(scope, grace_s=0, generation=generation):
+            return []
+        try:
+            calls, status = await rt.gateway.read_with_status([record], wait_first=True)
+        finally:
+            inflight.discard(scope)
+    if scope.cancelled_caught:
+        warnings.append(
+            "LLM gateway spend read-back failed: gateway read interrupted; "
+            "later reads and reconcile retry"
+        )
+        return []
+    if status != "ok":
+        warnings.append(
+            f"LLM gateway spend read-back failed: gateway read {status}; "
+            "later reads and reconcile retry"
+        )
+    return [call.id for call in calls]
 
 
 async def execute_tool_run(
@@ -705,7 +771,7 @@ async def execute_tool_run(
                     if inflight is not None:
                         inflight.discard(admission_scope)
             raise _core_signal(LimitReached("stop", "the round is stopping"))
-        except BaseException as error:
+        except (Exception, anyio.get_cancelled_exc_class()) as error:
             if not _has_core_fenced(error):
                 await _refund_undispatched(rt, owner)
             raise
@@ -741,17 +807,20 @@ async def _run(
     secret_env: tuple[str, ...] = ()
     failed = False
     submitted = False
+    call_ids: list[str] = []
+    gateway_record: KeyRecord | None = None
 
-    def estimate() -> tuple[Amount, bool, tuple[str, ...]]:
+    def estimate() -> tuple[Amount, frozenset[str], tuple[str, ...]]:
         value = rt.tool.estimate(request)
         return (
             amount if value is None else Amount.from_estimate(value),
-            bool(rt.tool.providers()),
+            frozenset(rt.tool.providers()),
             effective_secret_env(rt.tool),
         )
 
     try:
-        amount, providers, secret_env = await _prepare_sync(estimate)
+        amount, declared_providers, secret_env = await _prepare_sync(estimate)
+        providers = bool(declared_providers)
     except BaseException as error:
         error = outcome.classify(error)
         _raise_terminal(error)
@@ -759,6 +828,7 @@ async def _run(
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
         failed = True
+        declared_providers = frozenset()
     if inflight.closed or generation != inflight._cancel_generation:
         raise _core_signal(LimitReached("stop", "the round is stopping"))
 
@@ -770,10 +840,24 @@ async def _run(
             inflight.add(admission_scope, grace_s=grace_s, admitted_generation=generation)
         owner.admitted = reservation
 
+    keyed = rt.gateway is not None and needs_key(declared_providers, secret_env)
     res = await rt.ledger.reserve(
-        rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
+        rt.holder,
+        amount,
+        kind="tool",
+        goal_id=rt.goal_id,
+        on_admit=on_admit,
+        keep_charged=keyed,
     )
     await anyio.lowlevel.checkpoint()
+    if keyed and amount.usd <= 0:
+        warnings.append(
+            "LLM gateway key needs a USD reservation above 0; give Tool.estimate() a usd value "
+            "or set limits.default_run_reservation.usd"
+        )
+        failed = True
+    if failed:
+        inflight.discard(admission_scope)
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
@@ -835,22 +919,71 @@ async def _run(
                 artifact_root=rt.config.artifact_root,
                 on_started=on_started,
                 on_partial=on_partial,
+                drop_env=tuple(sorted(REPLACED_KEYS)) if rt.gateway is not None else (),
             )
-            with anyio.CancelScope() as run_scope:
+            inherited_deadline = anyio.current_effective_deadline()
+            secret: str | None = None
+            if keyed:
+                assert rt.gateway is not None
                 try:
-                    inflight.add(run_scope, grace_s=job.grace_s, admitted_generation=generation)
+                    gateway_record, secret = await rt.gateway.open(
+                        candidate_id=id,
+                        reservation=res,
+                        run_id=rt.repeats.run_id,
+                        goal_id=rt.goal_id,
+                        team=rt.team.name,
+                        agent=rt.spec.name,
+                        round=rt.round,
+                    )
+                except GatewayError:
+                    warnings.append("LLM gateway key creation failed: gateway open failed")
+                    failed = True
                     inflight.discard(admission_scope)
-                except LimitReached as error:
-                    admission_refusal = error
-                    raise
-                try:
-                    submitted = True
-                    output = await rt.executor.submit(job)
-                finally:
-                    inflight.discard(run_scope)
-            if run_scope.cancelled_caught:
-                output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
-    except BaseException as error:
+            try:
+                if not failed:
+                    if gateway_record is not None:
+                        assert secret is not None
+                        assert rt.config.llm_gateway is not None
+                        job = gateway_job(job, url=rt.config.llm_gateway.url, secret=secret)
+                        secret = None
+                    with anyio.CancelScope() as run_scope:
+                        try:
+                            inflight.add(
+                                run_scope, grace_s=job.grace_s, admitted_generation=generation
+                            )
+                            inflight.discard(admission_scope)
+                        except LimitReached as error:
+                            admission_refusal = error
+                            raise
+                        try:
+                            submitted = True
+                            output = await rt.executor.submit(job)
+                        finally:
+                            inflight.discard(run_scope)
+                    if run_scope.cancelled_caught:
+                        output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
+                    if gateway_record is not None:
+                        assert rt.gateway is not None
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        close_deadline = _gateway_cleanup_deadline(rt, inherited_deadline)
+                        with anyio.CancelScope(shield=True, deadline=close_deadline):
+                            gateway_record = await rt.gateway.close(gateway_record)
+                        if gateway_record.closed_at is None:
+                            warnings.append(
+                                "LLM gateway spend read-back failed: gateway closure unconfirmed; "
+                                "later reads and reconcile retry"
+                            )
+                        if not run_scope.cancelled_caught:
+                            call_ids.extend(
+                                await _read_tool_gateway(
+                                    rt, gateway_record, inflight, generation, warnings
+                                )
+                            )
+            except (Exception, anyio.get_cancelled_exc_class()):
+                if gateway_record is not None:
+                    await _revoke_gateway_key(rt, gateway_record, inherited_deadline)
+                raise
+    except (Exception, anyio.get_cancelled_exc_class()) as error:
         inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
@@ -885,7 +1018,6 @@ async def _run(
 
     warnings.extend(collection_warnings(output))
     reported_rows = 0
-    call_ids: list[str] = []
     ref = output.llm_calls_file
     if ref is not None:
         if ref.size > MAX_LLM_CALLS_BYTES:
@@ -911,7 +1043,8 @@ async def _run(
                     try:
                         while (row := await run_sync_daemon(next, rows, None)) is not None:
                             reported_rows += 1
-                            await record_reported([row], metadata=metadata, call_ids=call_ids)
+                            if not keyed:
+                                await record_reported([row], metadata=metadata, call_ids=call_ids)
                     finally:
                         warnings.extend(report_warnings)
                 finally:
@@ -926,8 +1059,13 @@ async def _run(
     actual = Amount()
     estimated = False
     usage = output.usage
-    overflow = usage.usd is not None and usage.usd > USD_LIMIT
-    if overflow:
+    overflow = not keyed and usage.usd is not None and usage.usd > USD_LIMIT
+    if keyed:
+        # Gateway observations are the only actual-spend source. A tool's
+        # unsupported usage remains informational and never trips the run fuse.
+        estimated = usage.usd is None or usage.usd > USD_LIMIT
+        actual = Amount(tokens=usage.total_tokens, usd=0 if estimated else usage.usd)
+    elif overflow:
         warnings.append("tool error: usage exceeds supported range")
         output = output.model_copy(update={"status": RunStatus.ERROR})
         actual = Amount(tokens=max(0, usage.total_tokens), usd=USD_LIMIT)
@@ -1002,7 +1140,7 @@ async def _run(
         requested_by_call=current_requesting_call(),
         llm_call_ids=call_ids,
         llm_calls_source=llm_calls_source(
-            keyed=False,
+            keyed=keyed,
             reported_rows=reported_rows,
             may_call=providers or may_call_llm(frozenset(), secret_env),
         ),

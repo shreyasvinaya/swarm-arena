@@ -1572,3 +1572,137 @@ class StallCollectTool(PyTool):
     def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
         time.sleep(60)
         return super().collect(request, workspace, run)
+
+
+GATEWAY_ENV_SCRIPT = """
+import json, os
+names = ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
+         'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL')
+with open(os.environ['SWARM_ARENA_RESULT'], 'w') as handle:
+    json.dump({'data': {'env': {k: os.environ[k] for k in names if k in os.environ}}}, handle)
+"""
+
+
+class EnvCommandTool(PyTool):
+    """Request a provider credential only in the worker's command hook."""
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        code: str = ""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        (workspace / "report_env.py").write_text(GATEWAY_ENV_SCRIPT)
+        return Command(argv=[sys.executable, "report_env.py"], env=["OPENAI_API_KEY"])
+
+
+class GatewayChatTool(PyTool):
+    """Make loopback chat calls without printing or writing the virtual key."""
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        code: str = ""
+        calls: int = 1
+        also_report_jsonl: bool = False
+        reported_cost_usd: float = 9.0
+        extra_reported_rows: int = 0
+        malformed_report: bool = False
+        sleep_s: float = 0
+        ready_file: str = ""
+        reservation: Estimate | None = None
+        usage_usd: float | None = None
+
+    @property
+    def config(self) -> Config:
+        return cast(GatewayChatTool.Config, super().config)
+
+    def providers(self) -> frozenset[str]:
+        return frozenset({"openai"})
+
+    def estimate(self, request: ToolRequest) -> Estimate | None:
+        return self.config.reservation
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        code = (
+            f"settings = {self.config.model_dump()!r}\n"
+            + """
+import json, os, time, urllib.request
+from pathlib import Path
+rows = []
+for index in range(settings['calls']):
+    req = urllib.request.Request(os.environ['OPENAI_BASE_URL'] + '/chat/completions',
+        data=json.dumps({'model': 'chat-model', 'messages': []}).encode(),
+        headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
+                 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        rows.append({'model': 'openai/chat-model',
+                     'cost_usd': settings['reported_cost_usd'],
+                     'litellm_call_id': response.headers['x-litellm-call-id']})
+if settings['also_report_jsonl']:
+    rows.extend({'model': 'openai/chat-model', 'cost_usd': settings['reported_cost_usd']}
+                for _ in range(settings['extra_reported_rows']))
+    report = ''.join(json.dumps(row) + '\\n' for row in rows)
+    if settings['malformed_report']:
+        report += 'not-json\\n'
+    Path('swarm/llm_calls.jsonl').write_text(report)
+Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(
+    {'data': {'chats': settings['calls'], 'y': 1}, 'usage': {'usd': settings['usage_usd']}}))
+if settings['ready_file']:
+    Path(settings['ready_file']).touch()
+time.sleep(settings['sleep_s'])
+"""
+        )
+        return Command(argv=[sys.executable, "-c", code], grace_s=self.config.grace_s)
+
+
+def gateway_env() -> dict[str, Any]:
+    """Report credential routing for the env-only FunctionTool regression."""
+    names = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL")
+    return {"env": {name: os.environ[name] for name in names if name in os.environ}}
+
+
+def gateway_plan(*, rounds: int = 1, converge_team: bool = False) -> Any:
+    """Build a deterministic chat-tool plan for assembled gateway checks."""
+    from swarm_arena import (
+        AgentSpec,
+        ConvergeSpec,
+        Plan,
+        ProgramJudge,
+        Ref,
+        RoundSpec,
+        ScriptedManager,
+        TeamSpec,
+    )
+
+    def team(name: str, *, final: bool = False) -> TeamSpec:
+        return TeamSpec(
+            name=name,
+            rationale="Exercise gateway routing",
+            agents=[
+                AgentSpec(
+                    name="a",
+                    rationale="Run a keyed tool",
+                    tool=Ref.of(GatewayChatTool()),
+                    manager=Ref.of(
+                        ScriptedManager(
+                            [
+                                {
+                                    "inputs": {"n": 1000 if final else r},
+                                    **({} if final else {"round": r}),
+                                }
+                                for r in range(1, (1 if final else rounds) + 1)
+                            ]
+                        )
+                    ),
+                )
+            ],
+        )
+
+    return Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[team("t")],
+        judges=[Ref.of(ProgramJudge("_fakes.tools:score_min_y")).model_copy(update={"name": "y"})],
+        ranking="y",
+        rounds=[RoundSpec() for _ in range(rounds)],
+        converge=ConvergeSpec(
+            mode="team" if converge_team else "select",
+            team=team("conv", final=True) if converge_team else None,
+        ),
+    )

@@ -1869,6 +1869,8 @@ class GoalRunner:
 
     async def _close_round(self, round: int, *, replan: bool) -> None:
         """Commit a completed round with its replan boundary and lifecycle reason."""
+        from swarm_arena._engine.run import _read_gateway
+
         await self.deps.journal.append_durable(
             self._draft(
                 EventType.ROUND_CLOSED,
@@ -1881,6 +1883,7 @@ class GoalRunner:
             )
         )
 
+        await _read_gateway(self.deps.journal, self.deps.gateway, goal_id=self.goal_id)
         await self._refresh()
         await _repair_round_pages(
             self.deps, self.recorded, goal_id=self.goal_id, closed_round=round, supervisor=self

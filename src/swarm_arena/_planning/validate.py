@@ -23,6 +23,7 @@ from swarm_arena._errors import (
     _rebuild_core_signal,
 )
 from swarm_arena._exec.threads import _DaemonCall
+from swarm_arena._gateway.keys import unreplaced_provider_keys
 from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
 from swarm_arena._model.catalog import CatalogEntry, ModelSpec, _human_only_inputs
@@ -43,7 +44,7 @@ from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.io import _storage_io
-from swarm_arena._tooling.env_names import _env_names
+from swarm_arena._tooling.env_names import _env_names, effective_secret_env
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
 from swarm_arena._tooling.paths import fold_key, matches
 from swarm_arena._tooling.staging import tool_root
@@ -452,14 +453,13 @@ def _rule_configs(
 def _provider_warnings(
     plan: Plan, config: RunConfig, built: Mapping[str, Configurable]
 ) -> list[str]:
-    """Warn once per agent about providers from any effective tool configuration."""
-    if config.llm_gateway is not None:
-        return []
+    """Warn about provider routing across every effective tool configuration."""
     warnings: list[str] = []
     for team_pointer, team in _teams(plan):
         for index, agent in enumerate(team.agents):
             pointer = f"{team_pointer}/agents/{index}/tool"
             providers: set[str] = set()
+            unreplaced: set[str] = set()
             for site, component in built.items():
                 if (site == pointer or site.endswith("@" + pointer)) and isinstance(
                     component, Tool
@@ -468,9 +468,18 @@ def _provider_warnings(
                     def declared(component: Tool = component) -> set[str]:
                         return {_context_string(name, "provider") for name in component.providers()}
 
-                    providers.update(_safe_call(pointer, declared))
+                    if config.llm_gateway is None:
+                        providers.update(_safe_call(pointer, declared))
+                    else:
+                        names = _safe_call(pointer, partial(effective_secret_env, component))
+                        unreplaced.update(unreplaced_provider_keys(names))
+            address = f"{plan.goal.id}/{team.name}/{agent.name}"
+            warnings.extend(
+                f"agent {address}: tool allowlists {name}, which the LLM gateway does not "
+                "replace; keyed tool runs do not get it"
+                for name in sorted(unreplaced)
+            )
             if providers:
-                address = f"{plan.goal.id}/{team.name}/{agent.name}"
                 warnings.append(
                     f"agent {address}: tool declares providers {sorted(providers)} "
                     "but there is no llm_gateway; "

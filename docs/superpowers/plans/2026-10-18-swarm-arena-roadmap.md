@@ -296,7 +296,7 @@ Rules [plan]:
 | `_budget/llm_scope.py` | `LLMScope` context variable seam with `call_ids`, and the call-id seam `requesting_call` (R4.13.7) | M1b | `tests/_budget/test_llm_scope.py` |
 | `_agent/__init__.py` | Empty | M1b | — |
 | `_agent/manager.py` | `Manager` ABC, `LimitReached` | M1b | `tests/_agent/test_manager.py` |
-| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items | M1b +M2 | `tests/_agent/test_runtime.py` |
+| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items; shared run-owned gateway (+M4) | M1b +M2 +M4 | `tests/_agent/test_runtime.py` |
 | `_agent/context.py` | `AgentContext` (public actions) | M1b +M2 | `tests/_agent/test_context.py` |
 | `_agent/tool_run.py` | The `run_tool` pipeline | M1b +M2 +M4 | `tests/_agent/test_tool_run.py` |
 | `_agent/repeats.py` | Repeat key and rules (§6.2) | M1b | `tests/_agent/test_repeats.py` |
@@ -330,9 +330,9 @@ Rules [plan]:
 | `_engine/__init__.py` | Empty | M1b | — |
 | `_engine/swarm.py` | `Swarm` facade | M1b | `tests/_engine/test_swarm.py` |
 | `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3); inherited schedule-timeout scope and run-owned gateway construction (+M4) | M1b +M2 +M3 +M4 | `tests/_engine/test_run.py` |
-| `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
+| `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call; informational gateway reads after round close (+M4) | M1b +M2 +M4 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
-| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
+| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout; gateway propagation (+M4) | M1b +M2 +M4 | `tests/_engine/test_round.py` |
 | `_engine/stops.py` | Mid-round stop rules (§6.4); `ProviderStops`, the run's one provider-failure registry (M3, R4.13.10) | M1b +M3 | `tests/_engine/test_stops.py` |
 | `_engine/parts.py` | Part assignment, kept best of a part, join, re-join attempts (groups come from `_scoring/ranking.py`) | M1b | `tests/_engine/test_parts.py` |
 | `_engine/converge.py` | Select and team converge, final judge call | M1b | `tests/_engine/test_converge.py` |
@@ -352,6 +352,7 @@ Rules [plan]:
 | `_gateway/litellm_proxy.py` | LiteLLM Proxy adapter (stdlib `urllib`), `terminal_accounting = False` | M4 | `tests/_gateway/test_litellm_proxy.py` |
 | `_gateway/profile.py` | Pure pinned strict-profile check; unavailable settings remain unverified | M4 | `tests/_gateway/test_profile.py` |
 | `_gateway/keys.py` | Key per tool run; the gateway values for the `Job` (base URLs for `Job.env`, the key for `Job.secret_values`, the provider key names to drop from `Job.secret_env` and to set as `Job.drop_env`); spend read-back | M4 | `tests/_gateway/test_keys.py` |
+| `_gateway/reports.py` | Shared reconciliation payloads, gateway key action vocabulary and read-status labels | M4 | `tests/_gateway/test_reports.py` |
 | `_gateway/reconcile.py` | Post-run reconcile | M4 | `tests/_gateway/test_reconcile.py` |
 | `llm/__init__.py` | Facade `swarm_arena.llm`; clear `ImportError` without the extra | M3 | `tests/test_public_api.py` |
 | `llm/_catalog.py` | Capability checks, prices, `build_model` | M3 | `tests/llm/test_catalog.py` |
@@ -2253,7 +2254,7 @@ def collect_output_files(workspace: Path, declared: Sequence[str], artifacts: Ar
     # or uploading it, including sparse files, and bound the read if it grows. Validate all declarations before reads.
 ```
 
-#### R4.13.10 Agent runtime and the `run_tool` pipeline — M1b
+#### R4.13.10 Agent runtime and the `run_tool` pipeline — M1b (+M4 gateway)
 
 ```python
 @dataclass
@@ -2290,6 +2291,7 @@ class AgentRuntime:
     private_paths: frozenset[str] = frozenset()      # [plan] every check and judge file path of the revision (R4.13.9)
     stops: ProviderStops                             # [plan] M3: the run's one ProviderStops, shared by every goal round
                                                      # (EngineDeps.provider_stops, R4.13.13)
+    gateway: KeyManager | None = None               # +M4: last field; the run-owned manager from EngineDeps.gateway
 
 class ProviderStops:                                 # _engine/stops.py — M3 [plan]: one per run, shared by every goal round
     def register(self, address: str, providers: frozenset[str], cancel: Callable[[], None]) -> None: ...
@@ -2309,16 +2311,30 @@ async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, paren
     # validate inputs, edits (validate_edits), and visible parents (including root/protection)
     # → repeat rules and replicate allocation → plan the stage → count the tool run → reserve (durable) → put_edits
     # → Job(on_started = durable start event) → executor.submit (refused when the round's admission is closed:
-    # at Inflight.add and again in on_started; a refused run settles Amount() and raises LimitReached('stop'))
+    # at Inflight.add and again in on_started; an unkeyed refusal settles Amount() and raises LimitReached('stop'))
     # → logs → checks → durable completion event → settle (or keep charged) → board.put_candidate
     # The final request (including the allocated replicate) supplies key, stage.request_json, Job, and Candidate.
     # Pure stage planning completes before count/reserve; artifact writes follow reserve.
     # Logs use goals/<goal-id>/logs/<candidate-id>.{out,err}; board publication uses the completion event's position.
-    # Cancelled preparation with no committed tool_start settles zero and launches no check commands.
-    # Usage above USD_LIMIT retains an ERROR candidate and reported tokens, then settles via settle_overflow
+    # Cancelled unkeyed preparation with no committed tool_start settles zero and launches no check commands.
+    # Unkeyed usage above USD_LIMIT retains an ERROR candidate and reported tokens, then settles via settle_overflow
     # after durable tool_end; live and replayed admission become terminal in all limits modes.
     # Replicate allocation hooks have type-only diagnostics; release uses retained allocation data without hooks.
     # AgentContext.run_tool applies the gate and counts the turn, then calls execute_tool_run, which owns every other check.
+    # With a gateway, needs_key(tool.providers(), effective_secret_env(tool)) controls keying (R5.4 item 18).
+    # Reserve with keep_charged=keyed. Keyed zero-USD reservations fail without key creation or dispatch;
+    # all keyed reservations stay fully charged, including failed creation, cancellation and dispatch refusal.
+    # Gateway URLs use Job.env; the virtual key uses Job.secret_values. Unkeyed jobs drop REPLACED_KEYS (R4.7).
+    # Open before submit; close after collection. Outer cancellation/fencing uses bounded no-journal revoke.
+    # Cleanup inherits caller/writer limits; no new shield extends an expired owner. Hard process controls pass through.
+    # Keyed spend readback stays registered with round completion, under the existing recorder owner.
+    # read_with_status returns (observations, 'ok' | 'failed' | 'incomplete'); read remains a list-only wrapper.
+    # Failed/unconfirmed closure and failed/incomplete readback retain the result with value-free warnings.
+    # Only gateway rows become keyed LLMCall events; reported JSONL is retained with parse warnings for information.
+    # Candidate source is 'gateway'; its call IDs contain only observations available at that completion.
+    # Later reads after durable round close, before run completion, and at resume are informational and deduplicated.
+    # Resume preflights final limits before takeover, binds/restores once, and closes keys lacking committed tool_end.
+    # The shared GatewayKeyAction vocabulary is created/closed/read_failed/close_failed; only created/closed restore state.
 
 class Inflight:
     closed: bool

@@ -2355,3 +2355,106 @@ async def test_run_without_gateway_constructs_no_services(
     assert runner._gateway is runner._key_manager is None
     assert events(run_config, "run_started")[0].payload["manifest"]["llm_gateway"] is None
     factory.assert_not_called()
+
+
+async def test_run_end_reads_late_rows_and_shares_gateway_across_rounds(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.keys import KeyManager, gateway_call_id
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    managers: list[KeyManager] = []
+    original_bind = module._bind_gateway
+    original_read = KeyManager.read_with_status
+    boundary_reads: list[int] = []
+
+    def bind(*args: Any, **kwargs: Any) -> KeyManager | None:
+        manager = original_bind(*args, **kwargs)
+        assert manager is not None
+        managers.append(manager)
+        return manager
+
+    async def late_after_round(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        result = await original_read(self, records, wait_first=wait_first)
+        assert self is managers[0]
+        if not wait_first and records:
+            boundary_reads.append(len(records))
+            if len(boundary_reads) == 2:
+                fake_gateway.add_spend(
+                    records[0].key_id,
+                    model="openai/chat-model",
+                    cost_usd=0.03,
+                    tokens=(1, 1),
+                    call_id="late-run-end",
+                )
+        return result
+
+    monkeypatch.setattr(module, "_bind_gateway", bind)
+    monkeypatch.setattr(KeyManager, "read_with_status", late_after_round)
+    await Swarm(config).run(gateway_plan(rounds=2, converge_team=True))
+    assert len(managers) == 1
+    assert len(fake_gateway.keys) == 3
+    assert len(boundary_reads) >= 3
+    calls = events(config, "llm_call")
+    late = next(row for _, row in fake_gateway._spend if row["litellm_call_id"] == "late-run-end")
+    late_id = gateway_call_id(late["api_key"], late["request_id"])
+    observed = [event for event in calls if event.payload["call"]["litellm_call_id"] == late_id]
+    assert len(observed) == 1
+    assert observed[0].seq > events(config, "round_closed")[-1].seq
+    assert all(key["blocked"] for key in fake_gateway.keys.values())
+
+
+@pytest.mark.parametrize("boundary", ["round", "end"])
+async def test_gateway_boundary_read_failure_is_journaled_and_run_continues(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = KeyManager.read_with_status
+    count = 0
+
+    async def failing_read(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        nonlocal count
+        if not wait_first:
+            count += 1
+        if not wait_first and count == (1 if boundary == "round" else 2):
+            fake_gateway.fail["/spend/logs/v2"] = 500
+        try:
+            return await original(self, records, wait_first=wait_first)
+        finally:
+            fake_gateway.fail.pop("/spend/logs/v2", None)
+
+    monkeypatch.setattr(KeyManager, "read_with_status", failing_read)
+    result = await Swarm(config).run(gateway_plan())
+    assert result["g"]
+    failures = [e for e in events(config, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 1
+    assert {k: v for k, v in failures[0].payload.items() if k != "run_elapsed_s"} == {
+        "action": "read_failed",
+        "error": "gateway read failed",
+    }
+    assert fake_gateway.master_key not in repr(failures)

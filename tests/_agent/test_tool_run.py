@@ -1,12 +1,16 @@
 import asyncio
 import dataclasses
 import os
+import sys
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
 from _fakes.engine import RtEnv
+from _fakes.gateway import FakeGateway
 from _fakes.tools import WRITE, CommandRaisesTool, PyTool, write_then_sleep
 
 from swarm_arena import FunctionTool, RoundSpec, ScriptCheck
@@ -20,7 +24,7 @@ from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.tooling import RunStatus, ToolOutput
-from swarm_arena._tooling.tool import effective_tool_timeout, tool_grace
+from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
 from swarm_arena.executor import Executor, Job
 from swarm_arena.manager import LimitReached
 
@@ -2519,3 +2523,622 @@ async def test_closed_admission_refuses_dispatch_before_intent(rt_env: RtEnv) ->
     assert "tool_dispatch" not in rt_env.committed_types()
     assert rt_env.charged(reservation) == Amount()
     assert rt.started_runs == 0
+
+
+@asynccontextmanager
+async def _gateway_runtime(
+    env: RtEnv,
+    gateway: FakeGateway,
+    tool: Tool,
+    *,
+    allow: tuple[str, ...] = (),
+    http_timeout_s: float = 30,
+    settle_timeout_s: float = 0,
+) -> AsyncGenerator[AgentRuntime]:
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.run_config import SecretsPolicy
+    from swarm_arena._model.settings import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    rt = env.with_tool(tool)
+    config = rt.config.model_copy(
+        update={
+            "secrets": SecretsPolicy(allow=list(allow)),
+            "llm_gateway": GatewayConfig(url=gateway.url, require_hard_cap=False),
+            "limits": rt.limits.model_copy(update={"default_run_reservation": Estimate(usd=1)}),
+        }
+    )
+    assert config.llm_gateway is not None
+    manager = KeyManager(
+        LiteLLMProxy(
+            url=gateway.url,
+            master_key=gateway.master_key,
+            request_timeout_s=600,
+            http_timeout_s=http_timeout_s,
+        ),
+        config.llm_gateway,
+        cap="soft",
+        journal=rt.journal,
+        settle_timeout_s=settle_timeout_s,
+        run_id=rt.repeats.run_id,
+    )
+    rt = dataclasses.replace(rt, gateway=manager, config=config, limits=config.limits)
+    committed = read_committed(env.run_store)
+    assert committed is not None
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState.from_events(committed[1]),
+    ):
+        yield rt
+
+
+def _report_env_tool(*, providers: list[str], env: list[str]) -> Tool:
+    from _fakes.tools import GATEWAY_ENV_SCRIPT
+
+    from swarm_arena import ScriptTool
+
+    return ScriptTool(
+        command=[sys.executable, "-c", GATEWAY_ENV_SCRIPT], providers=providers, env=env
+    )
+
+
+def _gateway_requests(gateway: FakeGateway, path: str) -> list[dict[str, Any]]:
+    return [body for _, route, body in gateway.requests if route == path]
+
+
+async def test_keyed_run_gets_gateway_env(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "real-provider-sentinel")
+    tool = _report_env_tool(providers=["openai"], env=["OPENAI_API_KEY"])
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=("OPENAI_API_KEY",)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    env = candidate.output.data["env"]
+    assert env["OPENAI_BASE_URL"] == f"{fake_gateway.url}/v1"
+    assert env["ANTHROPIC_BASE_URL"] == fake_gateway.url
+    assert env["OPENAI_API_KEY"].startswith("sk-")
+    assert env["OPENAI_API_KEY"] != "real-provider-sentinel"
+    assert env["ANTHROPIC_API_KEY"] == env["OPENAI_API_KEY"]
+    assert candidate.llm_calls_source == "gateway"
+    assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+async def test_keyed_run_never_gets_real_provider_keys(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "real-openai-sentinel")
+    monkeypatch.setenv("GEMINI_API_KEY", "real-gemini-sentinel")
+    names = ["OPENAI_API_KEY", "GEMINI_API_KEY"]
+    tool = _report_env_tool(providers=["openai"], env=names)
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=tuple(names)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    env = candidate.output.data["env"]
+    assert "GEMINI_API_KEY" not in env
+    assert env["OPENAI_API_KEY"].startswith("sk-")
+    assert "real-openai-sentinel" not in env.values()
+
+
+async def test_unkeyed_run_has_no_gateway_env(rt_env: RtEnv, fake_gateway: FakeGateway) -> None:
+    tool = _report_env_tool(providers=[], env=[])
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert "OPENAI_BASE_URL" not in candidate.output.data["env"]
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert candidate.llm_calls_source == "none"
+
+
+async def test_function_env_only_tool_gets_gateway_key(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    tool = FunctionTool("_fakes.tools:gateway_env", env=["OPENAI_API_KEY"])
+    assert not tool.providers()
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=("OPENAI_API_KEY",)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.data["env"]["OPENAI_API_KEY"].startswith("sk-")
+    assert candidate.llm_calls_source == "gateway"
+    assert len(_gateway_requests(fake_gateway, "/key/generate")) == 1
+
+
+async def test_unkeyed_tool_command_env_never_gets_real_replaced_key(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import EnvCommandTool
+
+    monkeypatch.setenv("OPENAI_API_KEY", "real-o-sentinel")
+    async with _gateway_runtime(
+        rt_env, fake_gateway, EnvCommandTool(), allow=("OPENAI_API_KEY",)
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert "OPENAI_API_KEY" not in candidate.output.data["env"]
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert candidate.llm_calls_source == "none"
+
+
+async def test_keyed_run_records_gateway_rows_and_keeps_reservation(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.keys import gateway_call_id
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool({"calls": 2})) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert len(candidate.llm_call_ids) == 2
+    calls = [e.payload["call"] for e in rt_env.events("llm_call")]
+    assert {c["id"] for c in calls} == set(candidate.llm_call_ids)
+    (key_id,) = fake_gateway.keys
+    assert {c["litellm_call_id"] for c in calls} == {
+        gateway_call_id(key_id, row["request_id"]) for _, row in fake_gateway._spend
+    }
+    assert all(c["cost_usd"] == 0.01 for c in calls)
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    settle = rt_env.events("settle")[-1].payload
+    assert settle["charged"] == {"tokens": 0, "usd": 1.0}
+    assert settle["keep_charged"] is True
+    assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+async def test_keyed_run_reported_rows_are_information_only(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    tool = GatewayChatTool(
+        {"also_report_jsonl": True, "extra_reported_rows": 1, "malformed_report": True}
+    )
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    calls = [e.payload["call"] for e in rt_env.events("llm_call")]
+    assert len(calls) == 1
+    assert calls[0]["cost_usd"] == 0.01
+    assert candidate.output.llm_calls_file is not None
+    assert len(candidate.llm_call_ids) == 1
+    assert any("swarm/llm_calls.jsonl" in warning for warning in candidate.warnings)
+
+
+async def test_keyed_run_without_usd_reservation_not_dispatched(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena.tool import Estimate
+
+    async with _gateway_runtime(
+        rt_env, fake_gateway, GatewayChatTool({"reservation": Estimate(tokens=1000)})
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert candidate.warnings[-1] == (
+        "LLM gateway key needs a USD reservation above 0; give Tool.estimate() a usd value or set "
+        "limits.default_run_reservation.usd"
+    )
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert not rt_env.events("tool_start")
+    assert rt_env.charged(candidate) == Amount(tokens=1000)
+
+
+async def test_keyed_usage_overflow_is_information_only(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._budget.amount import USD_LIMIT
+
+    async with _gateway_runtime(
+        rt_env, fake_gateway, GatewayChatTool({"usage_usd": USD_LIMIT + 1})
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert candidate.output.status == RunStatus.OK
+        assert not rt.ledger.run_exhausted()
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not rt_env.events("settle")[-1].payload.get("usage_overflow")
+
+
+@pytest.mark.parametrize("fault", ["http_500", "slow"])
+@pytest.mark.parametrize(
+    ("path", "dispatched", "status"),
+    [
+        ("/key/generate", False, RunStatus.ERROR),
+        ("/key/block", True, RunStatus.OK),
+        ("/spend/logs/v2", True, RunStatus.OK),
+    ],
+)
+async def test_gateway_failures_never_stop_the_run(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    path: str,
+    dispatched: bool,
+    status: RunStatus,
+    fault: str,
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    if fault == "http_500":
+        fake_gateway.fail[path] = 500
+    else:
+        fake_gateway.delay[path] = 1.0
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool(), http_timeout_s=0.2) as rt:
+        first = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert first.output.status == status
+        assert bool(rt_env.events("tool_start")) is dispatched
+        assert first.warnings
+        assert "LLM gateway" in first.warnings[-1]
+        assert rt_env.charged(first) == Amount(usd=1)
+        fake_gateway.fail.pop(path, None)
+        fake_gateway.delay.pop(path, None)
+        second = await execute_tool_run(rt, {"n": 1}, parents=(), replicate=None, edits=None)
+        assert second.output.status == RunStatus.OK
+        assert rt_env.charged(second) == Amount(usd=1)
+        assert fake_gateway.master_key not in repr(first)
+
+
+async def _gateway_tool_ready(path: Path) -> None:
+    from _fakes.proc import wait_for_file
+
+    await wait_for_file(path, 60)
+
+
+async def test_key_revoked_when_outer_scope_cancelled(
+    rt_env: RtEnv, fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    ready = tmp_path / "keyed-ready"
+    tool = GatewayChatTool({"sleep_s": 60, "ready_file": str(ready), "grace_s": 0.1})
+    appended: list[Any] = []
+    original = rt_env.rt.journal.append
+
+    def append(draft: Any) -> Any:
+        appended.append(draft)
+        return original(draft)
+
+    monkeypatch.setattr(rt_env.rt.journal, "append", append)
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        with anyio.CancelScope() as outer:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel_ready() -> None:
+                    await _gateway_tool_ready(ready)
+                    outer.cancel()
+
+                tasks.start_soon(cancel_ready)
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert outer.cancelled_caught
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not [e for e in appended if e.type == "gateway_key" and e.payload["action"] == "closed"]
+    assert not rt_env.events("tool_end")
+    assert not rt_env.events("settle")
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert rt_env.charged(reservation) == Amount(usd=1)
+
+
+async def test_key_revoked_when_dispatch_commit_fenced(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    rt_env.fence_on_append(EventType.TOOL_DISPATCH)
+
+    async def fenced_run() -> None:
+        async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+            rt = dataclasses.replace(rt, executor=_DispatchSpy(rt_env))
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+
+    with pytest.raises(Fenced):
+        await fenced_run()
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not _gateway_requests(fake_gateway, "/v1/chat/completions")
+
+
+async def test_key_creation_cancellation_has_late_cleanup_owner(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    entered, released, blocked = threading.Event(), threading.Event(), threading.Event()
+    fake_gateway.entered["/key/generate"] = entered
+    fake_gateway.entered["/key/block"] = blocked
+    fake_gateway.hold["/key/generate"] = released
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with anyio.CancelScope() as outer:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel_create() -> None:
+                    assert await anyio.to_thread.run_sync(entered.wait, 30)
+                    outer.cancel()
+
+                tasks.start_soon(cancel_create)
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert outer.cancelled_caught
+        released.set()
+        assert await anyio.to_thread.run_sync(blocked.wait, 30)
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not rt_env.events("tool_start")
+    assert not rt_env.events("gateway_key")
+    assert not rt_env.events("tool_end")
+    assert rt_env.charged(rt_env.events("reserve")[-1].payload["reservation"]["id"]) == Amount(
+        usd=1
+    )
+
+
+async def test_round_cancel_closes_key_without_reading_spend(
+    rt_env: RtEnv, fake_gateway: FakeGateway, tmp_path: Path
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    ready = tmp_path / "round-keyed-ready"
+    tool = GatewayChatTool({"sleep_s": 60, "ready_file": str(ready), "grace_s": 0.1})
+    async with (
+        _gateway_runtime(rt_env, fake_gateway, tool) as rt,
+        anyio.create_task_group() as tasks,
+    ):
+
+        async def cancel_ready() -> None:
+            await _gateway_tool_ready(ready)
+            rt_env.inflight.cancel_all()
+
+        tasks.start_soon(cancel_ready)
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.CANCELLED
+    assert candidate.llm_call_ids == []
+    assert candidate.llm_calls_source == "gateway"
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not _gateway_requests(fake_gateway, "/spend/logs/v2")
+    assert [e.payload["action"] for e in rt_env.events("gateway_key")] == ["created", "closed"]
+
+
+@pytest.mark.parametrize("closure", ["budget", "hard"])
+async def test_keyed_admission_preserves_full_charge(
+    rt_env: RtEnv, fake_gateway: FakeGateway, closure: str
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        executor = _DispatchSpy(rt_env, close_first=closure)
+        rt = dataclasses.replace(rt, executor=executor)
+        if closure == "hard":
+            with pytest.raises(LimitReached, match="stopping"):
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert not rt_env.events("tool_dispatch")
+        else:
+            candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert candidate.output.status == RunStatus.OK
+            assert rt.started_runs == 1
+        reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+        assert rt_env.charged(reservation) == Amount(usd=1)
+        assert not rt_env.inflight._scopes
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is True
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal", "ordinary"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_keyed_dispatch_preserves_control_and_revokes(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+    nested: bool,
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    error = (
+        _core_error(Fenced, "safe")
+        if control == "fenced"
+        else _stop_cleanup_error()
+        if control == "terminal"
+        else ValueError("unsafe-value")
+    )
+    raised = ExceptionGroup("unsafe-value", [error]) if nested else error
+
+    async def fail(job: Job) -> ToolOutput:
+        raise raised
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        if control == "ordinary":
+            candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert candidate.output.status == RunStatus.ERROR
+            assert "unsafe-value" not in repr(candidate)
+        else:
+            with pytest.raises(Exception, match=r"safe|ownership|cleanup") as caught:
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert _core_category(caught.value) is (
+                _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+            )
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is True
+        assert not [e for e in rt_env.events("gateway_key") if e.payload["action"] == "closed"]
+
+
+async def test_virtual_key_never_written(
+    fake_gateway: FakeGateway, tmp_path: Path, run_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    from _fakes.run import all_events
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine.run import _local_journal_path
+    from swarm_arena._exec.local import LocalExecutor
+    from swarm_arena.config import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = LocalExecutor.submit
+    jobs: list[Job] = []
+
+    async def capture(self: LocalExecutor, job: Job) -> ToolOutput:
+        jobs.append(job)
+        return await original(self, job)
+
+    monkeypatch.setattr(LocalExecutor, "submit", capture)
+    result = await Swarm(config).run(gateway_plan())
+    candidate = result["g"][0]
+    key = next(
+        value for value in fake_gateway.keys.values() if value["alias"] == f"cand-{candidate.id}"
+    )
+    secret = key["secret"]
+    local = _local_journal_path(candidate.run_id, 1)
+    assert local.is_relative_to(temp)
+    assert local.is_file()
+    assert any(event.type == "gateway_key" for event in all_events(config))
+    assert "gateway_key" in local.read_text()
+    for path in await anyio.to_thread.run_sync(lambda: list(tmp_path.rglob("*"))):
+        if path.is_file():
+            content = path.read_bytes()
+            assert secret.encode() not in content, path
+            assert fake_gateway.master_key.encode() not in content, path
+    assert secret not in repr(jobs)
+    assert secret not in repr(candidate)
+    # Real engine-created key events include the clock stamp and must restore.
+    await Swarm(config).resume(candidate.run_id)
+    assert _local_journal_path(candidate.run_id, 2).is_file()
+    for path in await anyio.to_thread.run_sync(lambda: list(tmp_path.rglob("*"))):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes(), path
+
+
+async def test_round_cancel_during_gateway_read_keeps_completed_result(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.keys import KeyManager
+
+    entered = anyio.Event()
+
+    async def read(self: KeyManager, *args: Any, **kwargs: Any) -> Any:
+        assert rt_env.inflight._scopes, "gateway read has no round completion owner"
+        entered.set()
+        rt_env.inflight.cancel_all()
+        await anyio.lowlevel.checkpoint()
+        pytest.fail("round cancellation did not interrupt read")
+
+    monkeypatch.setattr(KeyManager, "read_with_status", read)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert entered.is_set()
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert candidate.llm_call_ids == []
+    assert any("gateway read interrupted" in warning for warning in candidate.warnings)
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not rt_env.inflight._scopes
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+async def test_keyed_hard_process_control_never_awaits_cleanup(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+    from swarm_arena._gateway.keys import KeyManager
+
+    error = control("process control")
+    cleanup: list[str] = []
+
+    async def fail(job: Job) -> ToolOutput:
+        raise error
+
+    async def forbidden(*args: Any, **kwargs: Any) -> None:
+        cleanup.append("awaited")
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    monkeypatch.setattr(tool_run, "_refund_undispatched", forbidden)
+    monkeypatch.setattr(KeyManager, "revoke", forbidden)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with pytest.raises(control) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caught.value is error
+        assert cleanup == []
+        assert not rt_env.events("tool_end")
+
+
+@pytest.mark.parametrize("expired", ["caller", "writer"])
+async def test_gateway_revocation_respects_expired_owner(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, expired: str
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.keys import KeyManager
+
+    attempts: list[str] = []
+
+    async def revoke(*args: Any, **kwargs: Any) -> None:
+        attempts.append("revoke")
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        record = rt.gateway.records()[0]
+        monkeypatch.setattr(KeyManager, "revoke", revoke)
+        if expired == "writer":
+            with monkeypatch.context() as patch:
+                patch.setattr(rt.journal, "_closing_at", anyio.current_time() - 1)
+                await _revoke_gateway_key(rt, record, float("inf"))
+        else:
+            await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
+    assert attempts == []
+
+
+async def test_late_gateway_row_recorded_after_report(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    fake_gateway.chat_visible_after_s = 3600
+    tool = GatewayChatTool({"also_report_jsonl": True, "reported_cost_usd": 9})
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert candidate.llm_call_ids == []
+        assert candidate.output.llm_calls_file is not None
+        assert rt_env.events("llm_call") == []
+        assert rt.gateway is not None
+        fake_gateway.reveal_spend()
+        calls = await rt.gateway.read(rt.gateway.records(), wait_first=False)
+        assert len(calls) == 1
+        assert calls[0].cost_usd == 0.01
+        assert calls[0].candidate_id == candidate.id
+        assert await rt.gateway.read(rt.gateway.records(), wait_first=False) == []
+        await rt.journal.commit()
+        assert len(rt_env.events("llm_call")) == 1
+        assert rt_env.charged(candidate) == Amount(usd=1)

@@ -1,4 +1,4 @@
-"""Share the gateway reconciliation payload between producers and replay."""
+"""Share gateway lifecycle vocabulary and reconciliation payloads with replay."""
 
 from typing import Annotated, Literal, Self
 
@@ -9,6 +9,8 @@ from swarm_arena._model.base import FrozenModel
 GatewayId = Annotated[str, Field(strict=True, min_length=1, max_length=256)]
 GatewayUsd = Annotated[float, Field(strict=True, ge=0)]
 ReportLabel = Literal["observed", "observed (completeness unverified)", "estimated"]
+GatewayKeyAction = Literal["created", "closed", "read_failed", "close_failed"]
+GatewayReadStatus = Literal["ok", "failed", "incomplete"]
 
 
 class KeyReport(FrozenModel):
