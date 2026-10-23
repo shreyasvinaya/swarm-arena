@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
@@ -55,6 +57,115 @@ from swarm_arena._model.tooling import (
 )
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
+
+
+def _reap_owned_children(
+    children: list[subprocess.Popen[bytes]], starts: dict[int, Job.Started]
+) -> list[str]:
+    """Kill only recorded children, then boundedly reap every child despite earlier errors."""
+    errors: list[str] = []
+    for child in children:
+        try:
+            if child.returncode is None:
+                started = starts.get(child.pid)
+                if (
+                    started is not None
+                    and started.start_time is not None
+                    and process_start_time(child.pid) != started.start_time
+                ):
+                    if pid_alive(child.pid):
+                        errors.append("child identity changed before emergency cleanup")
+                    continue
+                # The unreaped Popen leader anchors the group until wait() below.
+                try:
+                    # macOS may deny signalling a group containing only zombies.
+                    with suppress(ProcessLookupError, PermissionError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                finally:
+                    child.wait(timeout=60)
+            else:
+                child.wait(timeout=60)
+        except Exception as error:
+            errors.append(f"child cleanup failed: {type(error).__name__}")
+    return errors
+
+
+@pytest.fixture(autouse=True)
+def owned_children(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Provide emergency OS cleanup independently of the supervisor under test."""
+    children: list[subprocess.Popen[bytes]] = []
+    starts: dict[int, Job.Started] = {}
+    spawn, run = supervisor._spawn, ProcessSupervisor.run
+
+    def capture_spawn(*args: Any, **kwargs: Any) -> None:
+        procs = kwargs["procs"]
+        before = len(procs)
+        try:
+            spawn(*args, **kwargs)
+        finally:
+            children.extend(procs[before:])
+
+    async def capture_run(self: ProcessSupervisor, *args: Any, **kwargs: Any) -> CompletedRun:
+        original = kwargs.get("on_started")
+
+        async def on_started(started: Job.Started) -> None:
+            assert started.pid is not None
+            starts[started.pid] = started
+            if original is not None:
+                await original(started)
+
+        kwargs["on_started"] = on_started
+        return await run(self, *args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_spawn", capture_spawn)
+    monkeypatch.setattr(ProcessSupervisor, "run", capture_run)
+    try:
+        yield
+    finally:
+        # Observe product cleanup before the emergency reaper can make it pass.
+        leaked = [child for child in children if child.returncode is None and pid_alive(child.pid)]
+        errors = _reap_owned_children(children, starts)
+        assert not leaked, "supervisor left an owned child unreaped; emergency cleanup ran"
+        assert not errors, "; ".join(errors)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_child_guard_reaps_after_failed_observation(count: int) -> None:
+    children: list[subprocess.Popen[bytes]] = []
+    starts: dict[int, Job.Started] = {}
+    errors: list[str] = []
+
+    def fail_observation() -> None:
+        nonlocal errors
+        try:
+            for _ in range(count):
+                child = spawn_group(
+                    [sys.executable, "-c", "import threading; threading.Event().wait(300)"]
+                )
+                children.append(child)
+                starts[child.pid] = Job.Started(
+                    kind="process",
+                    job_id="guard",
+                    host_id=host_id(),
+                    pid=child.pid,
+                    pgid=child.pid,
+                    start_time=process_start_time(child.pid),
+                )
+            raise TimeoutError("observation failed")
+        finally:
+            errors = _reap_owned_children(children, starts)
+
+    try:
+        with pytest.raises(TimeoutError, match="observation failed"):
+            fail_observation()
+        assert not errors
+        assert all(child.returncode is not None and not pid_alive(child.pid) for child in children)
+    finally:
+        # Independent fallback keeps this regression test safe if the guard itself breaks.
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+            child.wait(timeout=60)
 
 
 def tool_job(
@@ -244,11 +355,11 @@ async def test_cancel_delivers_partial_through_on_partial(
                 raise TimeoutError("ready did not appear")
             await anyio.sleep(0.05)
 
-    with anyio.fail_after(60):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(local_executor.submit, job)
-            await ready()
-            tg.cancel_scope.cancel()
+    async def is_ready() -> bool:
+        await ready()
+        return True
+
+    await cancel_when(lambda: local_executor.submit(job), is_ready)
     assert [(o.status, o.partial, o.data) for o in got] == [
         (RunStatus.CANCELLED, True, {"step": 2})
     ]
@@ -439,11 +550,13 @@ async def test_blocked_collect_cannot_stop_kill(
         RELEASE.set()
         if not task.done():
             task.cancel()
-        _, pending_cleanup = await asyncio.wait([task], timeout=60)
-        if task.done() and not task.cancelled():
-            task.exception()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
+        try:
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            if task.done() and not task.cancelled():
+                task.exception()
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
     assert not pending_cleanup, "collector owner did not finish cleanup"
     assert all(not worker.is_alive() for worker in workers)
 
@@ -631,13 +744,24 @@ async def cancel_when(
     submit: Callable[[], Coroutine[Any, Any, object]], ready: Callable[[], Awaitable[bool]]
 ) -> None:
     """Start ``submit``, wait (asynchronously) until ``ready()``, then cancel it."""
-    with anyio.fail_after(60):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(submit)
+    task = asyncio.create_task(submit())
+    try:
+        with anyio.fail_after(60):
             # The conditions are files and threading.Events, which have no anyio event: poll.
             while not await ready():  # noqa: ASYNC110
                 await anyio.sleep(0.02)
-            tg.cancel_scope.cancel()
+        task.cancel()
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "cancelled job retained its owner"
+        if not task.cancelled():
+            task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "cancelled job did not finish cleanup"
 
 
 def ready_file(ws: Path) -> Callable[[], Awaitable[bool]]:
@@ -1051,11 +1175,13 @@ async def test_failed_cleanup_never_replaces_output_or_cancel(
 
 _EXIT_SCRIPT = """
 import sys
+from pathlib import Path
 from typing import Any
 import anyio
 from _fakes.tools import BlockingCollectTool, RELEASE, make_job
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._exec.executor import Job
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.tooling import ToolOutput, ToolRequest
 
@@ -1071,9 +1197,15 @@ BlockingCollectTool.collect = held_collect
 
 
 async def main() -> None:
+    async def started(record: Job.Started) -> None:
+        path = Path(sys.argv[3])
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(record.model_dump_json())
+        temporary.replace(path)
+
     tool = Ref.of(BlockingCollectTool({"code": "import threading; threading.Event().wait(300)"}))
     job = make_job(kind="tool", command=None, tool=tool, request=ToolRequest(),
-                   timeout_s=0.5, grace_s=0.1, artifact_root=sys.argv[2])
+                   timeout_s=0.5, grace_s=0.1, artifact_root=sys.argv[2], on_started=started)
     out = await LocalExecutor(workspace_root=sys.argv[1]).submit(job)
     print(out.status.value, flush=True)
 
@@ -1085,15 +1217,42 @@ anyio.run(main)
 def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> None:
     tests_dir = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(tests_dir)}
-    done = subprocess.run(
-        [sys.executable, "-c", _EXIT_SCRIPT, str(tmp_path / "ws"), str(tmp_path / "artifacts")],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=60,
-        check=False,
-    )
-    assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
+    child_record = tmp_path / "child.json"
+    try:
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _EXIT_SCRIPT,
+                str(tmp_path / "ws"),
+                str(tmp_path / "artifacts"),
+                str(child_record),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
+        started = Job.Started.model_validate_json(child_record.read_text())
+        assert started.pid is not None
+        assert not pid_alive(started.pid), "interpreter left its held tool alive"
+    finally:
+        # subprocess.run owns the interpreter; this record owns its separate tool group.
+        if child_record.exists():
+            started = Job.Started.model_validate_json(child_record.read_text())
+            pid = started.pid
+            assert pid is not None
+            assert pid == started.pgid
+            assert pid > 1
+            if pid_alive(pid):
+                assert started.start_time is not None
+                assert process_start_time(pid) == started.start_time, "child identity changed"
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                # The interpreter may already have exited; observe the OS reaping its orphan.
+                assert wait_until(lambda: not pid_alive(pid), 60), "tool child was not reaped"
 
 
 @pytest.fixture

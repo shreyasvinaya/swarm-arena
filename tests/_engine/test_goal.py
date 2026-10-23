@@ -2822,7 +2822,10 @@ async def test_graceful_stop_judging_outlives_settlement_window(
             event.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "judging owner did not finish cleanup"
     events = all_events(config)
     assert calls == (["1", "0", "0"] if retry else ["1", "0"])
     assert result["g"]

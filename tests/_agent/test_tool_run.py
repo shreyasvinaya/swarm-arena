@@ -2456,8 +2456,12 @@ async def test_interrupted_recording_preserves_candidate_links(
             assert candidate.llm_call_ids == [calls[0]["id"]]
             assert candidate.llm_calls_source == "reported"
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if not task.done():
+                task.cancel()
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            if task.done() and not task.cancelled():
+                task.exception()
+        assert not pending_cleanup, "recording owner did not finish cleanup"
 
 
 @pytest.mark.parametrize("claimed_size", [1, 3])
