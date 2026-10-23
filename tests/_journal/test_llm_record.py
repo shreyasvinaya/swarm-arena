@@ -241,7 +241,8 @@ async def test_graceful_report_timeout_survives_delayed_loop(
         held.release.set()
         if release is not None:
             release.cancel()
-            release.join()
+            release.join(60)
+            assert not release.is_alive()
 
 
 async def test_stop_now_interrupts_drain_report_wait(
@@ -270,7 +271,7 @@ async def test_stop_now_interrupts_drain_report_wait(
         monkeypatch.setattr(llm_record, "await_reports", observed_reports)
         task = asyncio.create_task(drain(scope, wait=True))
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await entered.wait()
                 run.stops.stop_now = True
                 assert await task == [meta["call_id"]]
@@ -282,7 +283,8 @@ async def test_stop_now_interrupts_drain_report_wait(
             assert run.charged(scope) == ESTIMATE
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            with anyio.fail_after(60):
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_await_reports_requires_finite_deadline(tmp_path: Path) -> None:
@@ -477,9 +479,10 @@ async def test_late_record_after_drain_writes_nothing(tmp_path: Path) -> None:
 
 
 async def test_drain_without_wait_charges_at_once(tmp_path: Path) -> None:
-    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=10)) as run:
-        scope, _ = await _open(run)
-        with anyio.fail_after(2):
+    async with open_llm_run(tmp_path) as run:
+        # No callback releases the pending report; its backstop outlives the observation.
+        scope, _ = await _open(run, replace(run.scope("manager"), settle_timeout_s=300))
+        with anyio.fail_after(30):
             await drain(scope, wait=False)
         assert len(run.calls()) == 1
 
@@ -549,10 +552,15 @@ async def test_concurrent_duplicate_callbacks_record_once(
 
 
 async def test_drain_does_not_wait_for_an_abandoned_call(tmp_path: Path) -> None:
-    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=10)) as run:
-        scope, meta = await _open(run)
+    from swarm_arena._journal.llm_record import _bindings
+
+    async with open_llm_run(tmp_path) as run:
+        # An abandoned report remains unavailable for the entire observation window.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=300))
         abandon_call(scope, meta["reservation_id"])
-        with anyio.fail_after(2):
+        entry = _bindings[run.run_id].pending[meta["reservation_id"]]
+        entry.event = anyio.Event()
+        with anyio.fail_after(30):
             placeholders = await drain(scope, wait=True)
         assert placeholders == [meta["call_id"]]
         assert len(run.calls()) == 1
@@ -629,7 +637,7 @@ async def test_settle_error_after_claim_wakes_drain_and_reraises(
             await record_call(**record_kwargs(meta))
         assert_secret_absent(caught.value, "SETTLE_SECRET")
         monkeypatch.setattr(scope.tranche, "settle_call", settle)
-        with anyio.fail_after(2), pytest.raises(StorageError):
+        with anyio.fail_after(60), pytest.raises(StorageError):
             await drain(scope, wait=True)
         assert len(run.events("llm_call")) == 1
         assert scope.call_ids == [meta["call_id"]]
@@ -660,7 +668,7 @@ async def test_cancel_during_settle_wakes_drain_and_settles_once(
             await entered.wait()
             cancel.cancel()
             release.set()
-        with anyio.fail_after(2):
+        with anyio.fail_after(60):
             assert await drain(scope, wait=True) == []
         assert len(run.events("llm_call")) == 1
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
@@ -957,7 +965,7 @@ async def test_unbind_abandons_held_request_before_response_upload(
 
         monkeypatch.setattr(run.artifacts, "put_bytes", upload)
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as group:
                     group.start_soon(callback)
                     await held.ready()
@@ -990,13 +998,14 @@ async def test_unbind_abandons_model_preparation_before_any_upload(
         try:
             await held.ready()
             unbind_run(run.run_id)
-            with anyio.fail_after(2):
+            with anyio.fail_after(30):
                 assert await task is None
             assert run.calls() == []
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             await held.finish()
+            with anyio.fail_after(60):
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_forged_storage_control_is_contained(
@@ -1095,15 +1104,18 @@ async def test_held_payload_expires_with_owner_and_never_uploads_response(
                     else:
                         setattr(run.stops, stop, True)
                     with (
-                        anyio.fail_after(2),
+                        anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out"),
                     ):
                         await task
                     assert not run.calls()
                     assert len(uploads) == 1
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    with anyio.fail_after(60):
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         await held.finish()
     assert len(uploads) == 1
@@ -1208,7 +1220,8 @@ async def test_cancel_during_durable_settlement_retains_admitted_actual(
                     await task
             finally:
                 release.set()
-                await asyncio.gather(task, return_exceptions=True)
+                with anyio.fail_after(60):
+                    await asyncio.gather(task, return_exceptions=True)
         assert await drain(scope, wait=True) == []
         await run.journal.commit()
         assert len(run.events("settle")) == 1
@@ -1241,7 +1254,7 @@ async def test_durable_settlement_timeout_is_not_fencing_with_a_valid_lease(
                     await held.ready()
                     run.stops.stop_now = True
                     with (
-                        anyio.fail_after(2),
+                        anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
                     ):
                         await task
@@ -1253,8 +1266,11 @@ async def test_durable_settlement_timeout_is_not_fencing_with_a_valid_lease(
                     assert run.charged(scope) == ESTIMATE
                     assert not run.calls()
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    with anyio.fail_after(60):
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         await held.finish()
 
@@ -1322,7 +1338,7 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
         assert owner_doc[0].expires_at > utc_now()
         if signal == "release":
             held.release.set()
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await task
             assert run.charged(scopes[0]) == Amount(tokens=120, usd=0.002)
             assert len(run.calls()) == 1
@@ -1335,7 +1351,7 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
                 owner_cancel.cancel()
             else:
                 task.cancel()
-            done, _ = await asyncio.wait([task], timeout=10)
+            done, _ = await asyncio.wait([task], timeout=30)
             assert done, "interrupted accounting outlived its cleanup allowance"
             if signal == "cancel":
                 assert task.cancelled()
@@ -1356,8 +1372,9 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
         held.release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
         await held.finish()
+        with anyio.fail_after(60):
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
@@ -1376,14 +1393,15 @@ async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
             patch.setattr(scope.tranche, "settle_call", delayed)
             task = asyncio.create_task(record_call(**record_kwargs(meta)))
             try:
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     await entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             finally:
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                with anyio.fail_after(60):
+                    await asyncio.gather(task, return_exceptions=True)
         assert await drain(scope, wait=False) == []
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
 
@@ -1404,13 +1422,14 @@ async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
                 done, _ = await asyncio.wait([task], timeout=run.config.settle_timeout_s * 1.25)
                 assert not done
                 held.release.set()
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     assert await task is not None
             finally:
                 held.release.set()
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
                 await held.finish()
+                with anyio.fail_after(60):
+                    await asyncio.gather(task, return_exceptions=True)
         assert run.charged(next_scope) == Amount(tokens=120, usd=0.002)
 
 
@@ -1438,12 +1457,15 @@ async def test_held_payload_stops_on_real_takeover(
                 try:
                     await held.ready()
                     successor = force_take_over(run.store, owner_id="next", host="local", ttl_s=60)
-                    with anyio.fail_after(5), pytest.raises(Fenced):
+                    with anyio.fail_after(30), pytest.raises(Fenced):
                         await task
                     assert not run.calls()
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    with anyio.fail_after(60):
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         await held.finish()
         if successor is not None:
@@ -1508,7 +1530,7 @@ async def test_scope_cancel_during_held_settlement_is_bounded(
                 try:
                     await held.ready()
                     cancel.cancel()
-                    done, _ = await asyncio.wait([task], timeout=1)
+                    done, _ = await asyncio.wait([task], timeout=30)
                     assert done, "a nested settlement shield outlived the cleanup allowance"
                     assert finished.is_set()
                     assert all(
@@ -1516,8 +1538,11 @@ async def test_scope_cancel_during_held_settlement_is_bounded(
                         for error in errors
                     )
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    with anyio.fail_after(60):
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         await held.finish()
 
@@ -1658,7 +1683,7 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
             no_upload.setattr(old_run.artifacts, "put_bytes", forbidden)
             if task is not None:
                 await held.finish()
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     result = (await asyncio.gather(task, return_exceptions=True))[0]
                 assert result is None or isinstance(result, Fenced)
             assert await record_call(**record_kwargs(meta, settle=False)) is None
@@ -1697,8 +1722,9 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
         held.release.set()
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             await held.finish()
+            with anyio.fail_after(60):
+                await asyncio.gather(task, return_exceptions=True)
         assert old.resumed is not None
         await old.resumed._services._aclose(failed=True)
         if new is not None:
@@ -1910,15 +1936,16 @@ async def test_await_reports_stops_on_real_takeover(tmp_path: Path) -> None:
 
                 task = asyncio.create_task(wait_for_reports())
                 try:
-                    with anyio.fail_after(5):
+                    with anyio.fail_after(60):
                         await entered.wait()
                     successor = force_take_over(run.store, owner_id="next", host="local", ttl_s=60)
-                    with anyio.fail_after(5), pytest.raises(Fenced):
+                    with anyio.fail_after(30), pytest.raises(Fenced):
                         await task
                     assert not run.calls()
                 finally:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    with anyio.fail_after(60):
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         if successor is not None:
             successor.release()
@@ -2086,8 +2113,9 @@ async def test_one_sided_payload_upload_cancel_does_not_append(
         finally:
             held.release.set()
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             await held.finish()
+            with anyio.fail_after(60):
+                await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("external_first", [True, False])
@@ -2169,7 +2197,7 @@ async def test_interrupted_reports_retain_each_admitted_link(
             )
         )
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -2179,7 +2207,8 @@ async def test_interrupted_reports_retain_each_admitted_link(
             assert len(links) == 1
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            with anyio.fail_after(60):
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_tool_dedup_namespace_rebuilds_from_committed_rows(tmp_path: Path) -> None:

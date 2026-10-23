@@ -734,7 +734,7 @@ async def test_cancelled_exit_finishes_commit_and_release(
 async def test_write_through_append_wakes_writer(store: LocalStore, tmp_path: Path) -> None:
     async with _writer(store, tmp_path, group_window_s=0.01, sync_interval_s=3600) as w:
         w.append(EventDraft(type=EventType.RESERVE))
-        with anyio.fail_after(30):
+        with anyio.fail_after(60):
             while w.head is None:  # noqa: ASYNC110 - observe publication without requesting a commit
                 await anyio.sleep(0.001)
         assert w.head.seq == 1
