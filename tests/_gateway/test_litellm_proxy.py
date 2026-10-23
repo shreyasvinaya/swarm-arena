@@ -310,9 +310,6 @@ async def test_incomplete_pages_rejected(
         {"completion_tokens": True},
         {"startTime": "sentinel-secret"},
         {"startTime": "2026-10-23T00:00:00"},
-        {"metadata": {"secret": float("inf")}},
-        {"metadata": {"additional_usage_values": {"cache_read_input_tokens": -1}}},
-        {"metadata": {"additional_usage_values": {"cache_read_input_tokens": 99}}},
     ],
 )
 async def test_malformed_spend_is_safe(fake_gateway: FakeGateway, changes: dict[str, Any]) -> None:
@@ -1091,7 +1088,9 @@ async def test_spend_metadata_allowlist(fake_gateway: FakeGateway) -> None:
 
 
 @pytest.mark.parametrize("candidate", [7, ["candidate"], "c" * 257])
-async def test_spend_attribution_is_bounded(fake_gateway: FakeGateway, candidate: Any) -> None:
+async def test_invalid_spend_attribution_keeps_row(
+    fake_gateway: FakeGateway, candidate: Any
+) -> None:
     proxy, key = await _proxy_and_key(fake_gateway)
     fake_gateway.add_spend(
         key.key_id,
@@ -1101,8 +1100,10 @@ async def test_spend_attribution_is_bounded(fake_gateway: FakeGateway, candidate
         call_id=None,
         metadata={"spend_logs_metadata": {"candidate_id": candidate}},
     )
-    with pytest.raises(GatewayError):
-        await _rows(proxy, key)
+    (row,) = await _rows(proxy, key)
+    assert row.key_id == key.key_id
+    assert row.cost_usd == 0.1
+    assert row.metadata == {}
 
 
 @pytest.mark.parametrize("across_pages", [False, True])
@@ -1119,7 +1120,7 @@ async def test_duplicate_request_ids_within_read(
     if conflict:
         first["spend"] = 5.0
     fake_gateway._spend[-1] = (0.0, first)
-    if conflict:
+    if conflict or across_pages:
         with pytest.raises(GatewayError) as caught:
             await _rows(proxy, key)
         assert first["request_id"] not in str(caught.value)
@@ -1316,16 +1317,17 @@ async def test_delete_foreign_echo_is_unknown(fake_gateway: FakeGateway) -> None
         await proxy.delete_key(key)
 
 
-async def test_duplicate_conflict_in_discarded_metadata_is_unknown(
+async def test_discarded_metadata_cannot_conflict_with_same_page_row(
     fake_gateway: FakeGateway,
 ) -> None:
     proxy, key = await _proxy_and_key(fake_gateway)
     fake_gateway.add_spend(key.key_id, model="m", cost_usd=1, tokens=(1, 2), call_id=None)
     original = dict(fake_gateway._spend[0][1])
     fake_gateway._spend.append((0.0, {**original, "metadata": {"proxy_server_request": MASTER}}))
-    with pytest.raises(GatewayError) as caught:
-        await _rows(proxy, key)
-    assert MASTER not in str(caught.value)
+    (row,) = await _rows(proxy, key)
+    assert row.cost_usd == 1
+    assert row.metadata == {}
+    assert MASTER not in row.model_dump_json()
 
 
 async def test_hostname_resolves_in_daemon_http_worker(
@@ -1411,3 +1413,134 @@ async def test_abandoned_dns_never_opens_socket(
         await _wait(finished)
         for sock in sockets:
             sock.close()
+
+
+async def test_51_row_shifted_listing_is_incomplete(fake_gateway: FakeGateway) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    for i in range(1, 52):
+        fake_gateway.add_spend(key.key_id, model="m", cost_usd=0.1, tokens=(1, 2), call_id=f"r{i}")
+        fake_gateway._spend[-1][1]["request_id"] = f"r{i}"
+    # Total stays 51, but page 2 repeats r50 instead of returning r51.
+    # Even an identical repeat means the offset listing lost a row.
+    fake_gateway.page_overrides[2] = {"data": [dict(fake_gateway._spend[49][1])]}
+    with pytest.raises(GatewayError) as caught:
+        await _rows(proxy, key)
+    assert str(caught.value) == "GET /spend/logs/v2: ValueError"
+    assert [q["page"] for _, p, q in fake_gateway.requests if p == "/spend/logs/v2"] == ["1", "2"]
+    fake_gateway.page_overrides.clear()
+    rows = await _rows(proxy, key)
+    assert len(rows) == 51
+    assert rows[-1].request_id == "r51"
+
+
+@pytest.mark.parametrize(
+    "bad", [None, 7, "bad", [], {"candidate_id": "c" * 300}, {"candidate_id": "\ud800"}]
+)
+async def test_invalid_attribution_section_preserves_other_metadata(
+    fake_gateway: FakeGateway, bad: Any
+) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    fake_gateway.add_spend(
+        key.key_id,
+        model="m",
+        cost_usd=0.1,
+        tokens=(10, 2),
+        call_id=None,
+        metadata={
+            "spend_logs_metadata": bad,
+            "additional_usage_values": {"cache_read_input_tokens": 3},
+        },
+    )
+    (row,) = await _rows(proxy, key)
+    assert row.cost_usd == 0.1
+    assert row.key_id == key.key_id
+    assert row.metadata == {"additional_usage_values": {"cache_read_input_tokens": 3}}
+    assert row.usage.input_tokens == 7
+
+
+@pytest.mark.parametrize("field", ["cache_read_input_tokens", "cache_creation_input_tokens"])
+@pytest.mark.parametrize("bad", [-1, True, "3", 99, float("nan"), [3]])
+async def test_invalid_cache_field_drops_only_that_field(
+    fake_gateway: FakeGateway, field: str, bad: Any
+) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    other = (
+        "cache_creation_input_tokens"
+        if field == "cache_read_input_tokens"
+        else "cache_read_input_tokens"
+    )
+    fake_gateway.add_spend(
+        key.key_id,
+        model="m",
+        cost_usd=0.1,
+        tokens=(10, 2),
+        call_id=None,
+        metadata={
+            "spend_logs_metadata": {"candidate_id": "untrusted-candidate"},
+            "additional_usage_values": {field: bad, other: 2},
+        },
+    )
+    (row,) = await _rows(proxy, key)
+    assert row.metadata == {
+        "spend_logs_metadata": {"candidate_id": "untrusted-candidate"},
+        "additional_usage_values": {other: 2},
+    }
+    assert row.key_id == key.key_id
+    assert row.cost_usd == 0.1
+    assert row.usage.input_tokens == 8
+
+
+@pytest.mark.parametrize("bad", [None, 7, "bad", [], {"secret": float("inf")}])
+async def test_invalid_metadata_container_keeps_spend(fake_gateway: FakeGateway, bad: Any) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    fake_gateway.add_spend(key.key_id, model="m", cost_usd=0.1, tokens=(10, 2), call_id=None)
+    fake_gateway.row_overrides = {"metadata": bad}
+    (row,) = await _rows(proxy, key)
+    assert row.metadata == {}
+    assert row.cost_usd == 0.1
+    assert row.usage.input_tokens == 10
+
+
+async def test_cache_sum_drops_field_exceeding_remaining_prompt(fake_gateway: FakeGateway) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    fake_gateway.add_spend(
+        key.key_id,
+        model="m",
+        cost_usd=0.1,
+        tokens=(10, 2),
+        call_id=None,
+        metadata={
+            "additional_usage_values": {
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 8,
+            }
+        },
+    )
+    (row,) = await _rows(proxy, key)
+    assert row.metadata == {"additional_usage_values": {"cache_read_input_tokens": 3}}
+    assert row.usage.input_tokens == 7
+    assert row.usage.cache_write_tokens == 0
+
+
+@pytest.mark.parametrize("bad", [None, 7, "bad", [], {"cache_read_input_tokens": "x" * 300}])
+async def test_invalid_cache_section_preserves_label_and_other_rows(
+    fake_gateway: FakeGateway, bad: Any
+) -> None:
+    proxy, key = await _proxy_and_key(fake_gateway)
+    for metadata in (
+        {
+            "spend_logs_metadata": {"candidate_id": "untrusted-label"},
+            "additional_usage_values": bad,
+        },
+        {"additional_usage_values": {"cache_read_input_tokens": 2}},
+    ):
+        fake_gateway.add_spend(
+            key.key_id, model="m", cost_usd=0.1, tokens=(10, 2), call_id=None, metadata=metadata
+        )
+    first, second = await _rows(proxy, key)
+    assert first.metadata == {"spend_logs_metadata": {"candidate_id": "untrusted-label"}}
+    assert first.usage.input_tokens == 10
+    assert second.metadata == {"additional_usage_values": {"cache_read_input_tokens": 2}}
+    assert second.usage.input_tokens == 8
+    assert first.key_id == second.key_id == key.key_id
+    assert first.cost_usd == second.cost_usd == 0.1
