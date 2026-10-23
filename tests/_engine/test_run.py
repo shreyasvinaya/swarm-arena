@@ -1981,16 +1981,28 @@ async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
     assert not any(e.type == "tool_start" and e.agent == "a0" for e in ev)
 
 
-def test_library_forced_interrupt_preserves_cancelled_shutdown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "window", ["ready", "waiter-registration", "cleanup-callback", "first-worker", "second-worker"]
+)
+def test_library_forced_interrupt_preserves_cancelled_shutdown(tmp_path: Path, window: str) -> None:
     import os
     import select
     import signal
     import subprocess
     import time
 
-    code = """
+    if window.endswith("-worker") and not getattr(sys, "_is_gil_enabled", lambda: True)():
+        pytest.skip("requires GIL selector ordering")
+
+    code = f"""
 import asyncio
+import os
+import select
 import signal
+import sys
+import threading
+from collections import deque
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 import anyio
@@ -2002,8 +2014,63 @@ root = Path.cwd()
 config = RunConfig(run_root=str(root / 'runs'), artifact_root=str(root / 'artifacts'),
                    arena_root=str(root / 'arena'), settle_timeout_s=2)
 settle = Ledger._settle
+stage = 0
+selecting = threading.Event()
+worker = None
+async def operation() -> None:
+    global worker, stage
+    loop = asyncio.get_running_loop()
+    if {window.endswith("-worker")!r}:
+        def send() -> None:
+            assert sys.stdin.buffer.read(1) == b'i'
+            assert selecting.wait(60)
+            signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+        worker = threading.Thread(target=send, daemon=True)
+        worker.start()
+        # The sender runs only once the native selector releases the GIL.
+        sys.setswitchinterval(60)
+    # Keep Runner's native handler, but wake the selector for signals on any thread.
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    os.set_blocking(write_fd, False)
+    def drain() -> None:
+        with suppress(BlockingIOError):
+            os.read(read_fd, 65536)
+    loop.add_reader(read_fd, drain)
+    wakeup_fd = signal.set_wakeup_fd(write_fd)
+    original_select = loop._selector.select
+    def select_at_interrupt(timeout: float | None = None) -> Any:
+        global stage
+        if stage and not loop._ready:
+            ready_stage, stage = stage, 0
+            # A raw KeyboardInterrupt must land outside task/done callbacks.
+            print('settlement-ready' if ready_stage == 1 else 'cleanup-ready', flush=True)
+            if ready_stage == {1 if window == "first-worker" else 2}:
+                selecting.set()
+            # Hold this idle boundary until SIGINT, even if other I/O becomes ready.
+            assert select.select([read_fd], [], [], 120)[0]
+            return original_select(0)
+        return original_select(timeout)
+    loop._selector.select = select_at_interrupt
+    try:
+        await Swarm(config).run(plan(rounds=1))
+    finally:
+        loop._selector.select = original_select
+        signal.set_wakeup_fd(wakeup_fd)
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
 async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
+    global stage
     first_interrupt = anyio.Event()
+    if {window == "waiter-registration"!r}:
+        class HeldWaiters(deque[asyncio.Future[bool]]):
+            def append(self, future: asyncio.Future[bool]) -> None:
+                # Hold the Event.wait check/register gap before publishing readiness.
+                print('waiter-registering', flush=True)
+                assert sys.stdin.buffer.read(1) == b'x'
+                super().append(future)
+        first_interrupt._event._waiters = HeldWaiters()
     runner_handler = signal.getsignal(signal.SIGINT)
     assert callable(runner_handler)
     def observe(signum: int, frame: Any) -> None:
@@ -2014,13 +2081,18 @@ async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
     signal.signal(signal.SIGINT, observe)
     try:
         with anyio.CancelScope(shield=True):
-            print('settlement-ready', flush=True)
+            stage = 1
             await first_interrupt.wait()
     finally:
         signal.signal(signal.SIGINT, runner_handler)
         try:
             with anyio.CancelScope(shield=True):
-                print('cleanup-ready', flush=True)
+                stage = 2
+                if {window == "cleanup-callback"!r}:
+                    def held_callback() -> None:
+                        print('callback-running', flush=True)
+                        assert sys.stdin.buffer.read(1) == b'c'
+                    asyncio.get_running_loop().call_soon(held_callback)
                 await anyio.sleep_forever()
         finally:
             with anyio.CancelScope(shield=True):
@@ -2028,16 +2100,23 @@ async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
                 await settle(self, *args, **kwargs)
 Ledger._settle = held_settle
 handler = signal.getsignal(signal.SIGINT)
+interval = sys.getswitchinterval()
 try:
-    asyncio.run(Swarm(config).run(plan(rounds=1)))
+    asyncio.run(operation())
 except KeyboardInterrupt:
     print('interrupted', flush=True)
     print('handler-restored=' + str(signal.getsignal(signal.SIGINT) is handler), flush=True)
     raise SystemExit(130)
+finally:
+    sys.setswitchinterval(interval)
+    if worker is not None:
+        worker.join(10)
+        assert not worker.is_alive()
 """
     process = subprocess.Popen(
         [sys.executable, "-B", "-u", "-c", code],
         cwd=tmp_path,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
@@ -2057,10 +2136,32 @@ except KeyboardInterrupt:
                 output.extend(chunk)
 
     try:
+        if window == "waiter-registration":
+            until(b"waiter-registering")
+            assert b"settlement-ready" not in output, bytes(output)
+            assert process.stdin is not None
+            process.stdin.write(b"x")
+            process.stdin.flush()
         until(b"settlement-ready")
-        process.send_signal(signal.SIGINT)
+        if window == "first-worker":
+            assert process.stdin is not None
+            process.stdin.write(b"i")
+            process.stdin.flush()
+        else:
+            process.send_signal(signal.SIGINT)
+        if window == "cleanup-callback":
+            until(b"callback-running")
+            assert b"cleanup-ready" not in output, bytes(output)
+            assert process.stdin is not None
+            process.stdin.write(b"c")
+            process.stdin.flush()
         until(b"cleanup-ready")
-        process.send_signal(signal.SIGINT)
+        if window == "second-worker":
+            assert process.stdin is not None
+            process.stdin.write(b"i")
+            process.stdin.flush()
+        else:
+            process.send_signal(signal.SIGINT)
         try:
             rest, _ = process.communicate(timeout=15)
         except subprocess.TimeoutExpired:
@@ -2082,4 +2183,6 @@ except KeyboardInterrupt:
         if process.poll() is None:
             process.kill()
         process.wait(timeout=10)
+        if process.stdin is not None:
+            process.stdin.close()
         stdout.close()
