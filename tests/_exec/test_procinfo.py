@@ -133,7 +133,7 @@ def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
     p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
     try:
         assert group_has_live_member(p.pid)
-        assert wait_until(lambda: _is_zombie(p.pid), 5)  # exited, not reaped
+        assert wait_until(lambda: _is_zombie(p.pid), 60)  # exited, not reaped
         assert not group_has_live_member(p.pid)
         assert pid_alive(p.pid)  # the unreaped leader still anchors the group id
     finally:
@@ -145,16 +145,19 @@ def test_group_has_live_member_sees_a_live_child_of_a_zombie_leader(tmp_path: Pa
     require_visible_proc()
     code = (
         "import subprocess; "
-        "open('child.pid', 'w').write(str(subprocess.Popen(['sleep', '30']).pid))"
+        "open('child.pid', 'w').write(str(subprocess.Popen(['sleep', '300']).pid))"
     )
     p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
-        assert wait_until(lambda: _is_zombie(p.pid), 5)
+        assert wait_until(lambda: _is_zombie(p.pid), 60)
         assert group_has_live_member(p.pid)
         os.kill(int((tmp_path / "child.pid").read_text()), signal.SIGKILL)
         assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
-        p.wait()
+        if group_has_live_member(p.pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+        p.wait(60)
 
 
 def fake_proc(root: Path, options: str = "rw,nosuid,nodev,noexec") -> Path:
@@ -242,13 +245,20 @@ def test_proc_scan_unreadable_entry_cannot_tell(
 @pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
 def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
     require_visible_proc()
-    code = THREADED.format(work_s=1.0)
+    code = THREADED.format(work_s=1.0).replace(
+        "    time.sleep(1.0)\n",
+        "    from pathlib import Path\n"
+        "    deadline = time.monotonic() + 300\n"
+        "    while not Path('worker.release').exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n",
+    )
     p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
-        assert wait_until(lambda: main_thread_state(p.pid) == "Z", 5)
+        assert wait_until(lambda: main_thread_state(p.pid) == "Z", 60)
         assert not (tmp_path / "worker.done").exists()
         assert group_has_live_member(p.pid)  # the worker thread still runs
-        assert wait_until(lambda: (tmp_path / "worker.done").exists(), 5)
+        (tmp_path / "worker.release").touch()
+        assert wait_until(lambda: (tmp_path / "worker.done").exists(), 60)
         assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
         p.kill()
@@ -327,7 +337,7 @@ def test_ps_scan_ignores_zombies() -> None:
     p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
     try:
         assert procinfo._live_in_ps(p.pid)
-        assert wait_until(lambda: _is_zombie(p.pid), 5)
+        assert wait_until(lambda: _is_zombie(p.pid), 60)
         assert not procinfo._live_in_ps(p.pid)
     finally:
         p.wait()

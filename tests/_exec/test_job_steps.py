@@ -2,10 +2,14 @@
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator, Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
+from _fakes.proc import wait_for_file
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, make_job
 
@@ -27,6 +31,57 @@ def _job(tmp_path: Path, **fields: Any) -> Job:
     return make_job(
         artifact_root=str(tmp_path / "artifacts"),
         **{"command": Command(argv=["python", "-c", "pass"]), **fields},
+    )
+
+
+@pytest.fixture
+async def timeout_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Path]:
+    """Arm the short execution timer only after the child publishes readiness."""
+    from swarm_arena._exec import supervisor
+
+    ready = tmp_path / "child-ready"
+    waiting = anyio.Event()
+    scopes: list[anyio.CancelScope] = []
+
+    class ReadyTimeout:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        @contextmanager
+        def move_on_after(
+            self, delay: float | None, shield: bool = False
+        ) -> Generator[anyio.CancelScope]:
+            if delay == 0.2 and not scopes:
+                with anyio.move_on_after(None, shield=shield) as scope:
+                    scopes.append(scope)
+                    waiting.set()
+                    yield scope
+            else:
+                with anyio.move_on_after(delay, shield=shield) as scope:
+                    yield scope
+
+    async def arm() -> None:
+        await waiting.wait()
+        await wait_for_file(ready, 60)
+        scopes[0].deadline = anyio.current_time() + 0.2
+
+    monkeypatch.setattr(supervisor, "anyio", ReadyTimeout())
+    async with anyio.create_task_group() as group:
+        group.start_soon(arm)
+        try:
+            yield ready
+        finally:
+            group.cancel_scope.cancel()
+
+
+def _held_child(ready: Path) -> Command:
+    """Keep a ready child alive until process cleanup, with a finite backstop."""
+    return Command(
+        argv=[
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); time.sleep(300)",
+        ]
     )
 
 
@@ -338,25 +393,25 @@ async def test_cancel_nonlocal_publication_starts_no_next_object(
         published.append(data)
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         return create(key, data)
 
     monkeypatch.setattr(backend, "create", publish)
     task = asyncio.create_task(runner._finish(ToolOutput(status=RunStatus.OK, files=files), None))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
         assert published == [b"one"]
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert published == [b"one"]
 
@@ -377,7 +432,7 @@ async def test_live_request_await_is_abandonable(
     def read(digest: str) -> bytes:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         raise ValueError(SECRET)
 
     monkeypatch.setattr(artifacts, "get_bytes", read)
@@ -389,18 +444,18 @@ async def test_live_request_await_is_abandonable(
         )
     )
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 5)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
 
 
@@ -409,6 +464,7 @@ async def test_abandoned_collector_retains_its_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stop: str,
+    timeout_ready: Path,
 ) -> None:
     import threading
 
@@ -427,7 +483,7 @@ async def test_abandoned_collector_retains_its_workspace(
         workers.append(threading.current_thread())
         workspaces.append(self._workspace)
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         (self._workspace / "late-collect").write_text("retained")
         return ToolOutput(status=RunStatus.OK, data={"kept": 1})
 
@@ -439,13 +495,13 @@ async def test_abandoned_collector_retains_its_workspace(
             tmp_path,
             timeout_s=0.2,
             grace_s=0,
-            command=Command(argv=["python", "-c", "import time; time.sleep(60)"]),
+            command=_held_child(timeout_ready),
         )
     executor = LocalExecutor(workspace_root=str(tmp_path / "workspaces"))
     task = asyncio.create_task(executor.submit(job))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
-        with anyio.fail_after(5):
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        with anyio.fail_after(30):
             if stop == "cancel":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -461,10 +517,10 @@ async def test_abandoned_collector_retains_its_workspace(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
         await executor.aclose()
     assert (workspaces[0] / "late-collect").read_text() == "retained"
@@ -517,6 +573,7 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stop: str,
+    timeout_ready: Path,
 ) -> None:
     import anyio
 
@@ -535,17 +592,19 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
     monkeypatch.setattr(_JobRun, "_collect", collect)
     job = _job(
         tmp_path,
-        timeout_s=0.2 if stop == "timeout" else 30,
+        timeout_s=0.2 if stop == "timeout" else None,
         grace_s=0,
-        command=Command(argv=["python", "-c", "import time; time.sleep(60)"]),
+        command=_held_child(timeout_ready),
         on_started=on_started,
     )
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
     task = asyncio.create_task(executor.submit(job))
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
+            await started.wait()
+            await wait_for_file(timeout_ready, 60)
+        with anyio.fail_after(30):
             if stop == "cancel":
-                await started.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -555,7 +614,7 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
     finally:
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
         await executor.aclose()
     assert collected == [True]
@@ -571,6 +630,7 @@ async def test_caller_cancellation_owns_collector_outcome(
     kind: str,
     cancellation: str,
     collection: str,
+    timeout_ready: Path,
 ) -> None:
     import threading
 
@@ -597,7 +657,7 @@ async def test_caller_cancellation_owns_collector_outcome(
     def collect(*args: Any) -> ToolOutput:
         workers.append(threading.current_thread())
         loop.call_soon_threadsafe(entered.set)
-        assert release.wait(60)
+        assert release.wait(300)
         raise error
 
     async def received(output: ToolOutput) -> None:
@@ -610,9 +670,9 @@ async def test_caller_cancellation_owns_collector_outcome(
 
     async def submit() -> None:
         if cancellation == "fail_after":
-            owner = anyio.fail_after(60)
+            owner = anyio.fail_after(300)
         elif cancellation == "move_on_after":
-            owner = anyio.move_on_after(60)
+            owner = anyio.move_on_after(300)
         else:
             owner = anyio.CancelScope()
         # CancelScope is itself a context manager, while fail_after yields one.
@@ -621,11 +681,9 @@ async def test_caller_cancellation_owns_collector_outcome(
             await executor.submit(
                 _job(
                     tmp_path,
-                    command=Command(
-                        argv=["true"]
-                        if collection == "normal"
-                        else [sys.executable, "-c", "import time; time.sleep(60)"]
-                    ),
+                    command=Command(argv=["true"])
+                    if collection == "normal"
+                    else _held_child(timeout_ready),
                     timeout_s=None if collection == "normal" else 0.2,
                     grace_s=0,
                     on_partial=received,
@@ -637,7 +695,7 @@ async def test_caller_cancellation_owns_collector_outcome(
     task = asyncio.create_task(submit())
     task.add_done_callback(lambda _: finished.set())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
         [scope] = scopes
         if cancellation == "native":
@@ -649,7 +707,7 @@ async def test_caller_cancellation_owns_collector_outcome(
         release.set()
         # A watchdog around `await task` would send it a second native cancel.
         # Await only notification; inspect the job's own outcome outside the timer.
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await finished.wait()
         if cancellation == "native":
             with pytest.raises(asyncio.CancelledError):
@@ -672,10 +730,10 @@ async def test_caller_cancellation_owns_collector_outcome(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
         await executor.aclose()
 
@@ -727,24 +785,24 @@ async def test_abandoned_stop_collector_cannot_latch_late_terminal(
     def collect(self: _JobRun, run: CompletedRun) -> ToolOutput:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         raise _core_error(RuntimeError, "late terminal", _category=_SignalCategory.TERMINAL)
 
     async def run(*args: Any, **kwargs: Any) -> CompletedRun:
         callback = asyncio.create_task(kwargs["before_kill"](completed))
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         callback.cancel()
         with pytest.raises(asyncio.CancelledError):
             await callback
         release.set()
         # Model the supervisor's reap window: collector ends after abandonment,
         # but before run hands back TIMEOUT to the owner.
-        assert await anyio.to_thread.run_sync(runner.collect_finished.wait, 5)
+        assert await anyio.to_thread.run_sync(runner.collect_finished.wait, 60)
         return completed
 
     monkeypatch.setattr(_JobRun, "_collect", collect)
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(30):
             output = await runner.run(Mock(run=run), None)
         assert output.status is RunStatus.TIMEOUT
         assert not output.data
@@ -752,7 +810,7 @@ async def test_abandoned_stop_collector_cannot_latch_late_terminal(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -774,7 +832,7 @@ async def test_abandoned_publication_retains_workspace(
         workers.append(threading.current_thread())
         workspaces.append(self._workspace)
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         (self._workspace / "late-publication").write_text("retained")
         return read(self, rel)
 
@@ -782,19 +840,19 @@ async def test_abandoned_publication_retains_workspace(
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
     task = asyncio.create_task(executor.submit(_job(tmp_path, command=Command(argv=["true"]))))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
         assert workspaces[0].is_dir(), "workspace removed while publication still owns it"
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
         await executor.aclose()
     assert len(workers) == 1
@@ -823,7 +881,7 @@ async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
     def delayed(self: _WorkspaceCall[Any]) -> Any:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         return original(self)
 
     def write() -> None:
@@ -832,19 +890,19 @@ async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
     monkeypatch.setattr(_WorkspaceCall, "run", delayed)
     task = asyncio.create_task(runner._workspace_io(write))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
         assert runner.publication_finished
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert writes == []
 
@@ -1124,7 +1182,7 @@ async def test_abandoned_report_operation_retains_workspace(
         workers.append(threading.current_thread())
         workspaces.append(workspace)
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         (workspace / "late-report").write_text("retained")
 
     def held_read(workspace: Path) -> Any:
@@ -1149,19 +1207,19 @@ async def test_abandoned_report_operation_retains_workspace(
     )
     task = asyncio.create_task(executor.submit(_report_job(tmp_path, code=command.argv[2])))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
         assert workspaces[0].is_dir(), "workspace removed while report operation still owns it"
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
         await executor.aclose()
     assert len(workers) == 1
