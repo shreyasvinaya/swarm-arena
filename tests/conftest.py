@@ -13,6 +13,7 @@ from uuid import uuid4
 import anyio
 import pytest
 from _fakes.finished import FinishedRun, run_again
+from _fakes.gateway import FakeGateway
 
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._model.run_config import RunConfig
@@ -223,3 +224,10 @@ def ray_cluster() -> Iterator[str]:
 
     with local_ray_cluster() as address:
         yield address
+
+
+@pytest.fixture
+def fake_gateway() -> Iterator[FakeGateway]:
+    """Serve the pinned gateway wire protocol without external access."""
+    with FakeGateway() as gateway:
+        yield gateway
