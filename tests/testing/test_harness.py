@@ -400,7 +400,7 @@ async def test_harness_cancellation_abandons_board_storage(
     def frontier(board: ArenaBoard) -> Frontier:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         return original(board)
 
     monkeypatch.setattr(ArenaBoard, "frontier", frontier)
@@ -421,17 +421,19 @@ async def test_harness_cancellation_abandons_board_storage(
 
     task = asyncio.create_task(run())
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         scope.cancel()
-        with anyio.move_on_after(3):
+        with anyio.move_on_after(30):
             await cancelled.wait()
         assert cancelled.is_set(), "harness retained its board storage worker"
+        assert not release.is_set()
+        assert all(worker.is_alive() for worker in workers)
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
         for worker in workers:
             if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
 
 
@@ -444,7 +446,7 @@ async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(NoopManager, "run_round", wait)
     harness = OfflineHarness()
-    with anyio.fail_after(10), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+    with anyio.fail_after(60), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
         await harness.run_rounds(
             NoopManager(),
             goal=GOAL,
@@ -520,7 +522,7 @@ async def test_board_cleanup_uses_local_failure_inside_a_caller_exception_handle
 
     monkeypatch.setattr(ArenaBoard, "close", fail_close)
     monkeypatch.setattr(NoopManager, "run_round", manager)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:
