@@ -351,6 +351,9 @@ async def reconcile_keys(
             if reasons:
                 _key_event(journal, record, "read_failed", error="gateway read incomplete")
             elif record.key_id not in deleted:
+                # Publication must cover both closure and observations before
+                # deleting their upstream recovery source. This is storage work.
+                await journal.commit()
                 try:
                     await _external(partial(adapter.delete_key, key), deadline)
                 except GatewayError:
@@ -533,12 +536,14 @@ async def reconcile_run(
     except LeaseHeld:
         raise _core_error(
             RuntimeError,
-            f"run {run_id} has a live owner; its own reconcile at run end covers the work",
+            f"run {run_id} has a live owner; retry after its lease expires",
         ) from None
     entered = False
     hard = False
     report: ReconcileReport | None = None
     try:
+        if lease.doc.head is None:
+            return ReconcileReport(run_id=run_id, keys=[])
         store = lease._store
         async with (
             _supervise_initialization(store, lease.doc.epoch, stops, None, config, retain=True),

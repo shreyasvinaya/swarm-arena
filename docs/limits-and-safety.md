@@ -217,6 +217,8 @@ is ignored); a missing or changed binding is refused before takeover and
 rechecked after acquisition. The driver also attempts reconciliation before its final commit,
 using its existing owner and gateway profile. Gateway failures are recorded
 without failing completion; storage failures and ownership loss still propagate.
+A run with no committed head returns an empty report and releases its lease
+without publishing history; it remains ineligible for resume.
 
 A key's report becomes an observation only when all these conditions hold:
 
@@ -238,6 +240,8 @@ completeness. An adapter that can demonstrate these capabilities reports
 accounting, in which case it reports **observed**. Unverified observed spend
 is not proof that every charge has arrived: late log batches may add rows.
 Deletion is attempted only after a successful eligible read and durable recording.
+The committed head must cover the observations and closure before deletion,
+so a takeover after deletion can recover spend even after upstream log retention.
 
 Reports deduplicate gateway requests by key and request identity, retain earlier
 committed observations even when logs age out, and sum integer micro-dollars

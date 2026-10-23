@@ -26,7 +26,6 @@ from swarm_arena._gateway.adapter import GatewayError, ProfileReport
 from swarm_arena._gateway.keys import gateway_call_id
 from swarm_arena._journal.event import EventDraft
 from swarm_arena._journal.lease import OWNER_KEY, Lease, read_owner
-from swarm_arena._journal.replay import RunState
 from swarm_arena._model.canonical import canonical_json, utc_now
 from swarm_arena._model.settings import GatewayConfig
 from swarm_arena._store.base import Store
@@ -203,7 +202,10 @@ async def test_reconcile_run_fails_with_live_owner_writes_nothing(tmp_path: Path
     lease = Lease.acquire_new(store, owner_id="live", host="h", ttl_s=60)
     before = store.read(OWNER_KEY)
     try:
-        with pytest.raises(RuntimeError, match="has a live owner"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"^run r-reconcile has a live owner; retry after its lease expires$",
+        ):
             await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
         assert store.read(OWNER_KEY) == before
         assert store.list("journal/") == []
@@ -230,6 +232,8 @@ async def test_reconcile_checks_storage_before_takeover(
 
 
 async def test_reconcile_run_without_head_reports_no_keys(tmp_path: Path) -> None:
+    from swarm_arena._engine.resume import resume_run
+
     config = config_at(tmp_path)
     store = LocalStore(Path(config.run_root) / "r-reconcile")
     lease = Lease.acquire_new(store, owner_id="old", host="h", ttl_s=60)
@@ -241,8 +245,12 @@ async def test_reconcile_run_without_head_reports_no_keys(tmp_path: Path) -> Non
     assert owner is not None
     assert owner[0].epoch == 2
     assert owner[0].expires_at < utc_now()
-    assert [e.payload for e in committed(config) if e.type == "takeover"] == [{"force": False}]
-    assert RunState.from_events(committed(config)).run_id == "r-reconcile"
+    assert owner[0].head is None
+    assert store.list("journal/") == []
+    before = store.read(OWNER_KEY)
+    with pytest.raises(ValueError, match="has no committed events"):
+        await resume_run(config, "r-reconcile", force=False, replanner=None)
+    assert store.read(OWNER_KEY) == before
 
 
 @pytest.mark.parametrize("race", ["renew", "other_fenced", "other_first"])
@@ -742,3 +750,62 @@ async def test_reconcile_http_expiry_does_not_cancel_durable_recording(
         assert len(run.calls()) == 1
         assert run.calls()[0].cost_usd == 0.03
         assert not run.events("settle")
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+async def test_delete_requires_durable_observations_and_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, takeover: bool
+) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._gateway.adapter import VirtualKey
+    from swarm_arena._journal.writer import JournalWriter
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.03)]
+    real_delete = adapter.delete_key
+    successors: list[Lease] = []
+    durable: list[tuple[float, bool]] = []
+
+    async def delete(key: VirtualKey) -> None:
+        events = committed(config)
+        durable.append(
+            (
+                sum(e.payload["call"]["cost_usd"] for e in events if e.type == "llm_call"),
+                any(e.type == "gateway_key" and e.payload["action"] == "closed" for e in events),
+            )
+        )
+        await real_delete(key)
+        if takeover:
+            successors.append(
+                force_take_over(
+                    LocalStore(Path(config.run_root) / "r-reconcile"),
+                    owner_id="successor",
+                    host="h",
+                    ttl_s=60,
+                )
+            )
+
+    def writer(*args: Any, **kwargs: Any) -> JournalWriter:
+        return JournalWriter(*args, **kwargs, group_window_s=30)
+
+    monkeypatch.setattr(reconcile, "JournalWriter", writer)
+    monkeypatch.setattr(adapter, "delete_key", delete)
+    try:
+        if takeover:
+            with pytest.raises(Fenced):
+                await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+        else:
+            report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+            assert report.keys[0].deleted
+    finally:
+        for lease in successors:
+            lease.release()
+    if takeover:
+        adapter.rows = []
+        monkeypatch.setattr(adapter, "delete_key", real_delete)
+        later = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+        assert later.keys[0].observed_usd == 0.03
+    assert durable == [(0.03, True)]
