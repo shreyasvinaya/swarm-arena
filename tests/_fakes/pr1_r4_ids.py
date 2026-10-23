@@ -31,15 +31,16 @@ def block() -> None:
     released = threading.Event()
 
     def release() -> None:
-        deadline = time.monotonic() + 60  # backstop only; the test writes `release`
+        deadline = time.monotonic() + 300  # backstop only; the test writes `release`
         while not (root / "release").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         released.set()
 
     watcher = threading.Thread(target=release, daemon=True)
     watcher.start()
-    released.wait()
-    watcher.join()
+    assert released.wait(360), "release watcher did not finish"
+    watcher.join(60)
+    assert not watcher.is_alive()
 
 
 class Identifier(str):
