@@ -2016,7 +2016,7 @@ git commit -m "Export LLM calls to Langfuse when configured, and to no vendor ot
 - Produces (core):
   ```python
   # _board/trace.py
-  def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]: ...      # one authority read, then the committed chain
+  def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]: ...      # one authority read, then the committed chain; removed at the M3 PR gate (Ruling PR-3)
   def format_llm_step(call: LLMCall) -> str: ...
       # f"llm {id} {role} {model} tokens={usage.total_tokens} cost=${cost_usd:.6f}"
       # + f" cache-hit-of={cached_from_call_id}" when cache_hit + f" {trace_url}" when set

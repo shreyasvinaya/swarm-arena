@@ -2511,8 +2511,6 @@ class CacheStats(FrozenModel):
     @property
     def hit_rate(self) -> float: ...  # reads / (ordinary input + reads + writes), or 0.0
 
-def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]: ...  # standalone: one authority read
-
 def format_llm_step(call: LLMCall) -> str: ...
 def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]: ...  # team/agent, else :role
 # ArenaCache publication seam; never called by a pinned composite reader:
