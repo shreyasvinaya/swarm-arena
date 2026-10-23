@@ -259,7 +259,7 @@ Rules [plan]:
 | `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started`; `Job.drop_env` excludes node/file values before driver overlays | M1a +M4 | `tests/_exec/test_executor.py` |
 | `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (shared isolated launcher argv; local group ownership unchanged) | M1a +M4 | `tests/_exec/test_supervisor.py` |
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
-| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are removed after node/file allowlists, before explicit environment, result-path and secret-value overlays (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
+| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are skipped before reading node/file sources; explicit environment, result-path and secret-value overlays still apply (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/threads.py` | `run_sync_daemon` and the daemon-call holder: run blocking user code on a daemon thread that never blocks interpreter exit | M1a | `tests/_exec/test_threads.py` |
 | `_exec/job_steps.py` | Shared staged carrier, preparation, one-shot daemon collection, bounded per-object publication and transported edit restoration | M4 | `tests/_exec/test_job_steps.py`, `tests/_exec/test_local_run.py`, `tests/_exec/test_output_bounds.py` |
@@ -1369,7 +1369,10 @@ retains the entered writer and explicit run binding. `KeyRecord` stores `run_id`
 `owner_epoch`, and `created_at` before create; resumed reads use the live journal epoch.
 `gateway_call_id(key_id, request_id)` is `"gw:" + sha256_hex(canonical_json([key_id, request_id]))`.
 Gateway rows use the recorder's external-observation path with `settle=False`, never funded scope
-lineage. First-row polling is separately bounded; it never puts a report timer around durable
+lineage. Query bounds include 15 minutes of clock skew on both sides plus second rounding and
+a one-second lower overlap; canonical identities deduplicate overlapping reads. Invalid model/provider
+labels become `unknown`; ordinary per-row recording errors warn and later rows continue.
+Use one create attempt per candidate_id; open refuses a candidate whose record is already held. First-row polling is separately bounded; it never puts a report timer around durable
 recording. Unknown closure/read outcomes retain estimates. The caller owns stop/deadline
 supervision and post-open cleanup; pre-return compensation is bounded by the original
 open allowance and remaining inherited/writer deadline, with no compensating journal write.
@@ -1412,7 +1415,7 @@ class Job:
         # (gateway virtual keys as OPENAI_API_KEY and ANTHROPIC_API_KEY, M4); they win over env and secret_env. Never
         # journaled, logged, or put in Ray runtime_env; sent to Ray only inside the task payload (R4.13.16). On Ray the
         # payload can sit in the object store, which can spill to worker-local disk (documented in M4 item 9).
-    drop_env: tuple[str, ...] = ()              # [plan] +M4: remove names after node/file allowlist resolution.
+    drop_env: tuple[str, ...] = ()              # [plan] +M4: validated tuple of str; skip these node/file names.
         # job.env, SWARM_ARENA_RESULT, then job.secret_values still override. The Job dataclass payload carries
         # this tuple to the Ray worker; LocalExecutor uses the same build_env precedence.
         # gateway_job sets every PROVIDER_KEYS name on a keyed run. With a gateway, every unkeyed tool job gets

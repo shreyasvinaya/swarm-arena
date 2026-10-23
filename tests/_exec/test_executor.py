@@ -370,3 +370,15 @@ def test_job_timeout_is_positive_and_grace_can_be_zero() -> None:
     with pytest.raises(ValueError, match="timeout_s"):
         make_job(timeout_s=0)
     assert make_job(timeout_s=None, grace_s=0).grace_s == 0
+
+
+@pytest.mark.parametrize("drop_env", ["GEMINI_API_KEY", ["GEMINI_API_KEY"], ("SECRET", 1), None])
+def test_job_drop_env_requires_tuple_of_strings(drop_env: object) -> None:
+    with pytest.raises(ValueError, match=r"Job\.drop_env") as caught:
+        make_job(drop_env=drop_env)
+    assert_secret_absent(caught.value, "GEMINI_API_KEY")
+    assert_secret_absent(caught.value, "SECRET")
+
+
+def test_job_drop_env_accepts_tuple_of_strings() -> None:
+    assert make_job(drop_env=("GEMINI_API_KEY",)).drop_env == ("GEMINI_API_KEY",)
