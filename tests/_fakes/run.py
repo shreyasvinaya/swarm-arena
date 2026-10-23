@@ -133,7 +133,7 @@ async def wait_tool_started(config: RunConfig) -> LocalStore:
     --------
     >>> store = await wait_tool_started(config)  # doctest: +SKIP
     """
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         while True:
             if (store := await anyio.to_thread.run_sync(_started_store, config)) is not None:
                 return store

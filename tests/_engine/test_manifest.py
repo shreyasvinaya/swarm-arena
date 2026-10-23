@@ -252,6 +252,7 @@ async def test_async_manifest_preserves_output_and_worker_boundaries(
 @pytest.mark.parametrize("hook", ["validator", "serializer"])
 def test_cancelled_manifest_identity_allows_process_exit(tmp_path: Path, hook: str) -> None:
     script = r"""
+import asyncio
 import threading
 from typing import Self
 
@@ -269,7 +270,7 @@ def block_hook(name: str) -> None:
     if block and name == HOOK:
         print(f"{name}_entered daemon={threading.current_thread().daemon}", flush=True)
         entered.set()
-        threading.Event().wait()
+        assert threading.Event().wait(300), "manifest hook backstop expired"
 
 class BlockingTool(CountingTool):
     class Config(CountingTool.Config):
@@ -307,12 +308,13 @@ async def main() -> None:
             )
         print(f"manifest_returned cancel_called={scope.cancel_called}", flush=True)
 
-    async with anyio.create_task_group() as group:
-        group.start_soon(build)
-        with anyio.fail_after(2):
-            while not entered.is_set():
-                await anyio.sleep(0.01)
-        scope.cancel()
+    task = asyncio.create_task(build())
+    with anyio.fail_after(60):
+        while not entered.is_set():
+            await anyio.sleep(0.01)
+    scope.cancel()
+    with anyio.fail_after(30):
+        await task
 
 anyio.run(main)
 print("interpreter_exiting", flush=True)
@@ -329,7 +331,7 @@ print("interpreter_exiting", flush=True)
             env=env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=120,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:

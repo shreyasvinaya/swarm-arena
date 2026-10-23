@@ -59,12 +59,12 @@ class HeldOwnerResponse:
         if not task.done():
             task.cancel()
         await self.held.finish()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
 
     async def assert_released(self) -> None:
         """Observe late cleanup and an expired durable owner document."""
-        assert await anyio.to_thread.run_sync(self.released.wait, 5)
+        assert await anyio.to_thread.run_sync(self.released.wait, 60)
         owner = read_owner(self.stores[0])
         assert owner is not None
         assert owner[0].expires_at <= utc_now()

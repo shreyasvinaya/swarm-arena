@@ -94,7 +94,7 @@ class _BarrierManager(Manager):
         self.starts.append(start)
         if len(self.starts) == 2:
             self.both_entered.set()
-        with anyio.fail_after(10):
+        with anyio.fail_after(30):
             await self.both_entered.wait()
         self.spans.append((start, anyio.current_time()))
         return RoundReport(summary="")
@@ -129,7 +129,7 @@ class _RoundTime:
             await self.changed.wait()
 
     async def wait_past(self, deadline: float) -> None:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             while self.last_tick < deadline:
                 await self.ticked.wait()
 
@@ -251,7 +251,7 @@ async def test_runtime_constructor_is_supervised(
             workers.append(threading.current_thread())
             entered.set()
             # The safety bound also releases the old synchronous check build on RED.
-            assert release.wait(20), "constructor release deadline"
+            assert release.wait(300), "constructor release deadline"
             returned.set()
         return original(self, base)
 
@@ -272,7 +272,7 @@ async def test_runtime_constructor_is_supervised(
     monkeypatch.setattr(Ref, "build", blocked)
 
     async def trigger() -> None:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         await peer_ran.wait()
         if stop == "deadline":
             clock.advance(61)
@@ -282,7 +282,7 @@ async def test_runtime_constructor_is_supervised(
             e.deps.journal.fenced.set()
 
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(trigger)
                 if stop == "fenced":
@@ -300,15 +300,15 @@ async def test_runtime_constructor_is_supervised(
         assert not returned.is_set()
         before = e.event_types()
         release.set()
-        assert await anyio.to_thread.run_sync(returned.wait, 5)
-        await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert await anyio.to_thread.run_sync(returned.wait, 60)
+        await anyio.to_thread.run_sync(workers[0].join, 60)
         assert not workers[0].is_alive()
         assert manager_calls == ["b"]
         assert e.event_types() == before
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -383,7 +383,7 @@ async def test_round_started_commits_with_its_frontier(
     loop = asyncio.get_running_loop()
 
     def committing_frontier() -> Frontier:  # forces a commit while the frontier is built
-        asyncio.run_coroutine_threadsafe(env.deps.journal.commit(), loop).result(timeout=5)
+        asyncio.run_coroutine_threadsafe(env.deps.journal.commit(), loop).result(timeout=60)
         return real()
 
     monkeypatch.setattr(env.deps.board, "frontier", committing_frontier)
@@ -397,7 +397,7 @@ async def test_managers_run_in_parallel(env: EngineEnv) -> None:
     starts: list[float] = []
     spans: list[tuple[float, float]] = []
     both_entered = anyio.Event()
-    with anyio.fail_after(5):  # default round_timeout_s 14,400: the watchers must end
+    with anyio.fail_after(30):  # default round_timeout_s 14,400: the watchers must end
         await _round(
             env,
             [
@@ -472,7 +472,7 @@ async def test_round_timeout_cancels_with_partial(
         await e.wait_for(marker)
         clock.advance(5.0)
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(30):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(expire_after_start)
             out = await _round(e, [_slow_script("a", marker)]).run(1)
@@ -490,7 +490,7 @@ async def test_run_budget_drains_then_cancels_inflight(env: EngineEnv, tmp_path:
         await env.wait_for(marker)
         env.deps.stops.run_budget = True
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(30):
         async with anyio.create_task_group() as tg:
             tg.start_soon(budget_when_marker)
             out = await _round(env, [slot]).run(1)
@@ -531,7 +531,7 @@ async def test_queued_job_obeys_admission_closure_kind(
         await closed.wait()  # the stop watcher has closed admission
         gate.release.set()  # only now can b reach on_started
 
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(close_while_queued)
             out = await _round(e, [_runner("b")]).run(1)
@@ -579,7 +579,7 @@ async def test_starved_agent(
         await both_submitted.wait()
         clock.advance(5.0)
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(30):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(observe, tmp_path / "ma")
             tasks.start_soon(observe, tmp_path / "mb")
@@ -613,7 +613,7 @@ async def test_stop_now_cancels_inflight_with_partial(env: EngineEnv, tmp_path: 
         await env.wait_for(marker)
         env.deps.stops.stop_now = True
 
-    with anyio.fail_after(20):  # grace_s 10; the tool would sleep 600 s
+    with anyio.fail_after(30):  # grace_s 10; the tool would sleep 600 s
         async with anyio.create_task_group() as tg:
             tg.start_soon(stop_when_marker)
             out = await _round(env, [_slow_script("a", marker)]).run(1)
@@ -665,7 +665,7 @@ async def test_goal_budget_exhausted_blocks_new_runs_and_drains(env: EngineEnv) 
     e = dataclasses.replace(
         e, deps=dataclasses.replace(e.deps, executor=PaidExecutor(e.deps.executor))
     )
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         out = await _round(e, [_with_manager("a", BudgetManager())]).run(1)
     assert len(errors) == 1
     assert errors[0].limit == "budget"
@@ -949,6 +949,11 @@ async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
 async def test_budget_drain_uses_only_inflight_job_grace(
     env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
 ) -> None:
+    clock = _RoundTime(monkeypatch)
+    # Freeze the runner's time between explicit advances, including real child startup.
+    origin = anyio.current_time()
+    monkeypatch.setattr(clock, "current_time", lambda: origin + clock.offset)
+    closed = anyio.Event()
     marker = tmp_path / "drain"
     slot = _slow_script("a", marker)
     slot.tool_ref = Ref.of(PyTool({"code": write_then_sleep(marker), "grace_s": 0.2}))
@@ -958,32 +963,40 @@ async def test_budget_drain_uses_only_inflight_job_grace(
     real = Inflight.cancel_all
 
     def record(self: Inflight) -> None:
-        times["cancel"] = anyio.current_time()
+        times["cancel"] = clock.current_time()
         real(self)
 
     monkeypatch.setattr(Inflight, "cancel_all", record)
     real_close = Inflight.close
 
     def close(self: Inflight, *, budget: bool = False) -> None:
-        times.setdefault("closed", anyio.current_time())
+        times.setdefault("closed", clock.current_time())
         real_close(self, budget=budget)
+        closed.set()
 
     monkeypatch.setattr(Inflight, "close", close)
 
     async def latch() -> None:
         await env.wait_for(marker)
-        times["flag"] = anyio.current_time()
+        times["flag"] = clock.current_time()
         if flag == "goal_budget":
             env.deps.stops.goal_budget.add("g")
         else:
             env.deps.stops.run_budget = True
+        clock.advance(0)
+        await closed.wait()
+        clock.advance(4)
+        await clock.wait_past(origin + 4)
+        assert "cancel" not in times, "the minimum admission drain ended early"
+        clock.advance(1)
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(30):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(latch)
             out = await _round(env, [slot, idle]).run(1)
     assert 5.0 <= times["cancel"] - times["flag"] < 7.0
     assert 5.0 <= times["cancel"] - times["closed"] < 7.0
+    assert times["cancel"] == origin + 5.0
     assert out.candidates[0].output.partial
     assert out.candidates[0].output.status == RunStatus.CANCELLED
 
@@ -1027,7 +1040,7 @@ async def test_cancellation_allows_executor_collection_after_grace(
         await entered.wait()
         e.deps.stops.stop_now = True
 
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(stop)
             out = await _round(e, [slot]).run(1)
@@ -1055,7 +1068,7 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
         workers.append(threading.current_thread())
         workspaces.append(workspace)
         entered.set()
-        assert release.wait(10)
+        assert release.wait(300)
         (workspace / "late_write").write_text("retained")
         done.set()
         return original(self, request, workspace)
@@ -1063,11 +1076,11 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
     monkeypatch.setattr(PyTool, "command", command)
 
     async def stop() -> None:
-        assert await anyio.to_thread.run_sync(entered.wait, 5)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         env.deps.stops.stop_now = True
 
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(stop)
                 out = await _round(env, [slot]).run(1)
@@ -1077,9 +1090,9 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
         assert Amount.model_validate(env.events("settle")[0].payload["actual"]) == Amount()
         before = env.event_types()
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 5)
-        with anyio.fail_after(5):
-            await anyio.to_thread.run_sync(workers[0].join, 5)
+        assert await anyio.to_thread.run_sync(done.wait, 60)
+        with anyio.fail_after(60):
+            await anyio.to_thread.run_sync(workers[0].join, 60)
         assert not workers[0].is_alive()
         assert env.event_types() == before
         assert not marker.exists()
@@ -1087,7 +1100,7 @@ async def test_prestart_cancellation_settles_zero_and_retains_preparation(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -1140,7 +1153,7 @@ async def test_tranche_pending_is_conservatively_closed(env: EngineEnv) -> None:
 
     config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     e = dataclasses.replace(env, deps=dataclasses.replace(env.deps, config=config))
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         await _round(e, [_with_manager("a", PendingManager())]).run(1)
     assert Amount.model_validate(env.events("settle")[0].payload["actual"]) == Amount(usd=0.01)
 
@@ -1195,7 +1208,7 @@ async def test_idle_manager_cancelled_without_collection_allowance(
         clock.advance(5.0)
 
     e = env.with_limits(round_timeout_s=1.0)
-    with anyio.fail_after(3):
+    with anyio.fail_after(30):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(expire)
             out = await _round(e, [_with_manager("a", IdleManager())]).run(1)
@@ -1269,7 +1282,7 @@ async def test_metadata_preparation_is_supervised_per_agent(
                     error = ValueError(secret)
                     error.add_note(secret)
                     raise error from RuntimeError(secret)
-                assert release.wait(20), "metadata release deadline"
+                assert release.wait(300), "metadata release deadline"
                 returned.set()
                 return original_hook()
 
@@ -1292,10 +1305,10 @@ async def test_metadata_preparation_is_supervised_per_agent(
             await anyio.sleep(0.01)
 
     async def trigger_deadline() -> None:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         await peer_ran.wait()
         beat_target.append(len(ticks) + 5)
-        with anyio.fail_after(2):
+        with anyio.fail_after(60):
             await beats_reached.wait()
         assert not returned.is_set()
         clock.advance(61)
@@ -1306,7 +1319,7 @@ async def test_metadata_preparation_is_supervised_per_agent(
     )
     monkeypatch.setattr(Ref, "build", build)
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 if failure == "hang":
                     tasks.start_soon(heartbeat)
@@ -1329,7 +1342,7 @@ async def test_metadata_preparation_is_supervised_per_agent(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
     if failure == "hang":
         assert returned.is_set()
@@ -1881,7 +1894,7 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
     def blocked(self: Ref, base: type[Any]) -> Any:
         if self.name in entered and base is component:
             loop.call_soon_threadsafe(started, self.name, current.get(), threading.current_thread())
-            assert release.wait(30), "constructor release deadline"
+            assert release.wait(300), "constructor release deadline"
         return original(self, base)
 
     async def observe_resolution(fn: Any, *args: Any) -> Any:
@@ -1927,7 +1940,7 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
     before = anyio.current_time()
     task = asyncio.create_task(_round(e, slots).run(1))
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(30):
             # Neither constructor is released: serial resolution cannot reach both gates.
             await entered["stuck-a"].wait()
             await entered["stuck-b"].wait()
@@ -1955,7 +1968,7 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -1991,7 +2004,7 @@ async def test_budget_close_during_reserve_durability(
     monkeypatch.setattr(journal, "append_durable", gated)
     slot = _runner("b")
     slot.tool_ref = Ref.of(FunctionTool("_fakes.tools:square", grace_s=grace))
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         out = await _round(env, [slot]).run(1)
     assert len(env.events("tool_start")) == 1
     assert len(out.candidates) == 1

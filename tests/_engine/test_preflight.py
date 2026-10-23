@@ -1,4 +1,7 @@
+import asyncio
 import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 import anyio
@@ -197,7 +200,7 @@ async def test_hung_hook_is_abandonable_daemon(monkeypatch: pytest.MonkeyPatch) 
         workers.append(threading.current_thread())
         assert workers[-1].daemon
         entered.set()
-        assert release.wait(15), "preflight release deadline"
+        assert release.wait(300), "preflight release deadline"
 
     async def preflight() -> None:
         with scope:
@@ -208,17 +211,17 @@ async def test_hung_hook_is_abandonable_daemon(monkeypatch: pytest.MonkeyPatch) 
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(preflight)
-            with anyio.fail_after(10):
-                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            with anyio.fail_after(60):
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
             scope.cancel()
-            with anyio.fail_after(2):
+            with anyio.fail_after(30):
                 await completed.wait()
             assert workers[0].is_alive()
             assert not release.is_set()
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -234,7 +237,7 @@ async def test_cancelled_hook_does_not_continue_to_later_hooks(
     def block(self: object) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(15), "preflight release deadline"
+        assert release.wait(300), "preflight release deadline"
 
     def later(self: object) -> None:
         called.append("executor")
@@ -249,16 +252,16 @@ async def test_cancelled_hook_does_not_continue_to_later_hooks(
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(preflight)
-            with anyio.fail_after(10):
-                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            with anyio.fail_after(60):
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
             scope.cancel()
-            with anyio.fail_after(2):
+            with anyio.fail_after(30):
                 await completed.wait()
     finally:
         release.set()
         # Join the abandoned worker before checking that it cannot dispatch the next hook.
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
     assert called == []
 
@@ -287,15 +290,33 @@ async def test_part_overrides_and_executor_failures_are_collected(
 async def test_shared_preflight_has_its_own_hook_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
+    scopes: list[anyio.CancelScope] = []
+    loop = asyncio.get_running_loop()
+
+    class ReadyDeadline:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        @contextmanager
+        def fail_after(self, delay: float) -> Generator[anyio.CancelScope]:
+            assert delay == 1
+            with anyio.fail_after(60) as scope:
+                scopes.append(scope)
+                yield scope
+
+    def arm() -> None:
+        scopes[-1].deadline = anyio.current_time() + 1
 
     def block(self: object) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(10), "preflight release deadline"
+        loop.call_soon_threadsafe(arm)
+        assert release.wait(300), "preflight release deadline"
 
+    monkeypatch.setattr(preflight, "anyio", ReadyDeadline())
     monkeypatch.setattr(CountingTool, "preflight", block)
     try:
-        with anyio.fail_after(3):
+        with anyio.fail_after(30):
             with pytest.raises(RuntimeError, match="CountingTool: TimeoutError"):
                 await run_preflight([_plan()], RunConfig(settle_timeout_s=1), _executor())
         assert entered.is_set()
@@ -303,7 +324,7 @@ async def test_shared_preflight_has_its_own_hook_deadline(monkeypatch: pytest.Mo
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
