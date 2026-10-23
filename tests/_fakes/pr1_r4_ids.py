@@ -93,6 +93,8 @@ async def main() -> None:
     cfg = config(root)
     cfg = cfg.model_copy(
         update={
+            # This experiment deliberately holds the judge/scalar through stop.
+            "settle_timeout_s": 2.0,
             # Keep the owner live while entry/exit events supervise the public
             # stop request; whole-run CI leases must be at least three seconds.
             "lease_ttl_s": 3.0,

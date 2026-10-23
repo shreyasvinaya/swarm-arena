@@ -1,7 +1,10 @@
+import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import pytest
 from _fakes.engine import EngineEnv
 
@@ -1215,6 +1218,28 @@ async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
     return GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None, journal_r0=False)
 
 
+async def _finish_held_hook_probe(
+    task: asyncio.Task[Any], release: threading.Event, workers: list[threading.Thread]
+) -> list[str]:
+    issues: list[str] = []
+    with anyio.CancelScope(shield=True):
+        release.set()
+        if not task.done():
+            task.cancel()
+        done, _ = await asyncio.wait([task], timeout=60)
+        if not done:
+            issues.append("hook owner did not join within cleanup watchdog")
+        elif not task.cancelled():
+            task.exception()
+        for worker in workers:
+            with anyio.move_on_after(60) as joining:
+                await anyio.to_thread.run_sync(worker.join, 60, abandon_on_cancel=True)
+            if joining.cancel_called or worker.is_alive():
+                issues.append("hook worker did not join within cleanup watchdog")
+    # Callers assert these only after finally, preserving an escaping test failure.
+    return issues
+
+
 @pytest.mark.parametrize("stage", ["constructor", "models", "invoke", "serialize", "traverse"])
 @pytest.mark.parametrize("stop", ["stop", "deadline"])
 async def test_curator_blocking_hooks_are_abandoned_before_ids(
@@ -1236,15 +1261,17 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
     env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
 
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     finished = anyio.Event()
     before = env.deps.ids.counters()
     original_init = MergeAll.__init__
     original_curate = MergeAll.curate
 
     def block() -> None:
+        workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(120)
         finally:
             exited.set()
 
@@ -1296,33 +1323,37 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
         finally:
             finished.set()
 
+    task = asyncio.create_task(work())
     try:
-        with anyio.fail_after(4):
-            async with anyio.create_task_group() as group:
-                group.start_soon(work)
-                assert await anyio.to_thread.run_sync(entered.wait, 2)
-                if stop == "stop":
-                    env.deps.stops.stop = True
-                else:
-                    env.deps.config = env.deps.config.model_copy(
-                        update={
-                            "limits": env.deps.config.limits.model_copy(
-                                update={"run_timeout_s": 0.001}
-                            )
-                        }
-                    )
-                await finished.wait()
-                assert env.deps.ids.counters() == before
-                assert env.events("curated") == []
-                release.set()
-                assert await anyio.to_thread.run_sync(exited.wait, 1)
-                # A subsequent healthy core operation proves the abandoned daemon
-                # cannot publish into its former goal after returning.
-                await runner._refresh()
-                assert len(env.events("learning")) == 1
-                assert env.deps.ids.counters() == before
+        with anyio.fail_after(60):
+            while not entered.is_set():  # noqa: ASYNC110 - curator hook entry signal
+                await anyio.sleep(0.01)
+        if stop == "stop":
+            env.deps.stops.stop = True
+        else:
+            env.deps.config = env.deps.config.model_copy(
+                update={
+                    "limits": env.deps.config.limits.model_copy(update={"run_timeout_s": 0.001})
+                }
+            )
+        with anyio.fail_after(30):
+            await finished.wait()
+            await task
+        assert env.deps.ids.counters() == before
+        assert env.events("curated") == []
+        if stage != "invoke":
+            assert not exited.is_set()
+            assert workers
+            assert all(worker.is_alive() for worker in workers)
     finally:
-        release.set()
+        cleanup_issues = await _finish_held_hook_probe(task, release, workers)
+    assert not cleanup_issues, "; ".join(cleanup_issues)
+    assert exited.is_set()
+    # Healthy work has its own watchdog after the held worker has joined.
+    with anyio.fail_after(60):
+        await runner._refresh()
+    assert len(env.events("learning")) == 1
+    assert env.deps.ids.counters() == before
 
 
 @pytest.mark.parametrize("stage", ["constructor", "models", "curate", "empty", "malformed"])
@@ -2044,6 +2075,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
     # Keep the abandonment budget short; event watchdogs allow slow CI startup.
     env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     loop_thread = threading.get_ident()
     target = env.deps.board if site == "snapshot" else ArenaView
     method = "snapshot" if site == "snapshot" else "count_learnings"
@@ -2053,10 +2085,13 @@ async def test_live_page_read_abandons_hook_without_late_publication(
         result = original(*args, **kwargs)
         if not env.events("round_closed"):
             return result
+        workers.append(threading.current_thread())
         entered.set()
         assert threading.get_ident() != loop_thread
-        release.wait()
-        returned.set()
+        try:
+            assert release.wait(120)
+        finally:
+            returned.set()
         return result
 
     monkeypatch.setattr(target, method, blocked)
@@ -2077,11 +2112,9 @@ async def test_live_page_read_abandons_hook_without_late_publication(
         assert not returned.is_set()
         assert not env.store.exists("goals/g/rounds/round-01.md")
     finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-    with anyio.fail_after(60):
-        while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
-            await anyio.sleep(0.01)
+        cleanup_issues = await _finish_held_hook_probe(task, release, workers)
+    assert not cleanup_issues, "; ".join(cleanup_issues)
+    assert returned.is_set()
     assert not env.store.exists("goals/g/rounds/round-01.md")
 
 
