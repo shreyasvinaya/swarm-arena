@@ -34,8 +34,10 @@ async def test_cancel_stops_waiting_and_drops_the_thread() -> None:
 
     def blocked() -> None:
         entered.set()
-        release.wait()
-        finished.set()
+        try:
+            assert release.wait(180), "test did not release the held thread"
+        finally:
+            finished.set()
 
     async def cancel_when_entered(scope: anyio.CancelScope) -> None:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
@@ -64,7 +66,7 @@ def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPa
     def blocked() -> int:
         threads.append(threading.current_thread())
         entered.set()
-        release.wait()
+        assert release.wait(180), "test did not release the held thread"
         return 1
 
     async def main() -> None:

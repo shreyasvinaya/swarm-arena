@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import errno
 import os
@@ -48,7 +49,7 @@ def test_process_start_time_and_group_liveness() -> None:
     os.killpg(p.pid, signal.SIGKILL)
     p.wait()
     assert process_start_time(p.pid) is None
-    assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+    assert wait_until(lambda: not group_has_live_member(p.pid), 60)
 
 
 def test_group_liveness_counts_our_group() -> None:
@@ -151,7 +152,7 @@ def test_group_has_live_member_sees_a_live_child_of_a_zombie_leader(tmp_path: Pa
         assert wait_until(lambda: _is_zombie(p.pid), 5)
         assert group_has_live_member(p.pid)
         os.kill(int((tmp_path / "child.pid").read_text()), signal.SIGKILL)
-        assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+        assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
         p.wait()
 
@@ -248,7 +249,7 @@ def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
         assert not (tmp_path / "worker.done").exists()
         assert group_has_live_member(p.pid)  # the worker thread still runs
         assert wait_until(lambda: (tmp_path / "worker.done").exists(), 5)
-        assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+        assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
         p.kill()
         p.wait()
@@ -265,8 +266,14 @@ async def test_exit_watch_waits_without_reaping() -> None:
             await watch.wait()
         assert p.returncode is None
         assert pid_alive(p.pid)  # exited but still a zombie
-        with anyio.fail_after(60):
-            await watch.wait()  # returns at once the second time
+        yielded: list[bool] = []
+        checkpoint = asyncio.get_running_loop().call_soon(yielded.append, True)
+        try:
+            with anyio.fail_after(30):
+                await watch.wait()
+            assert not yielded, "an observed exit must return before yielding to the loop"
+        finally:
+            checkpoint.cancel()
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 

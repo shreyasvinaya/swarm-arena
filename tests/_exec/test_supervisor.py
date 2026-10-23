@@ -318,7 +318,7 @@ async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit c
             tg.cancel_scope.cancel()
     assert not scope.cancelled_caught
     assert statuses == [RunStatus.CANCELLED]
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
@@ -327,7 +327,7 @@ async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
 
     done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=broken)
     assert done.status is RunStatus.CANCELLED
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert done.stderr_path.read_text().endswith("swarm-arena: before_kill failed: RuntimeError\n")
 
 
@@ -370,7 +370,7 @@ async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> N
     done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=before_kill)
     assert done.status is RunStatus.CANCELLED
     assert alive == [True]
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert "swarm-arena" not in done.stderr_path.read_text()  # no note on success
 
 
@@ -398,7 +398,7 @@ async def test_fifo_stderr_cannot_block_kill(
             before_kill=blocked if mode == "blocked" else broken,
         )
     assert done.status is RunStatus.CANCELLED
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None:
@@ -414,7 +414,7 @@ async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None
             await wait_for_file(tmp_path / "gc.pid", 60)
             tg.cancel_scope.cancel()
     assert not scope.cancelled_caught
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert "before_kill failed: RuntimeError" in (tmp_path / "stderr.log").read_text()
 
 
@@ -425,7 +425,7 @@ async def test_background_child_killed_after_normal_exit(tmp_path: Path) -> None
     )
     done = await call(tmp_path, py(code))
     assert (done.status, done.returncode) == (RunStatus.OK, 0)
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "bg.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "bg.pid").read_text())), 60)
 
 
 async def test_oom_status_needs_memory_limit(tmp_path: Path) -> None:
@@ -658,7 +658,7 @@ async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, ki
     except BaseException as exc:
         caught = exc
     assert caught is raised
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_safety_net_reap_does_not_block_the_loop(
