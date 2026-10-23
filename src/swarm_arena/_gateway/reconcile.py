@@ -291,16 +291,26 @@ async def reconcile_keys(
     reports: list[KeyReport] = []
     for record in records:
         if record.key_id in deleted:
-            units, _ = _observations(record, list(state.llm_calls.values()), [])
+            retained: float | None = None
+            retained_reasons: list[str] = []
+            try:
+                units, _ = _observations(record, list(state.llm_calls.values()), [])
+                retained = _report_usd(units)
+            except (GatewayError, ValueError):
+                retained_reasons.append("unsupported gateway observation")
             reports.append(
                 KeyReport(
                     candidate_id=record.candidate_id,
                     key_id=record.key_id,
                     alias=record.alias,
                     reserved_usd=record.max_budget_usd,
-                    observed_usd=_report_usd(units),
-                    label=OBSERVED if adapter.terminal_accounting else UNVERIFIED,
-                    reasons=[],
+                    observed_usd=retained,
+                    label=ESTIMATED
+                    if retained is None
+                    else OBSERVED
+                    if adapter.terminal_accounting
+                    else UNVERIFIED,
+                    reasons=retained_reasons,
                     deleted=True,
                 )
             )
@@ -375,11 +385,13 @@ async def reconcile_keys(
             else:
                 try:
                     units, fresh = _observations(record, list(state.llm_calls.values()), rows)
+                    observed = _report_usd(units)
                 except GatewayError as error:
                     # These messages are constructed locally, never adapter data.
                     reasons.append(str(error))
+                except ValueError:
+                    reasons.append("unsupported gateway observation")
                 else:
-                    observed = _report_usd(units)
                     for row in fresh:
                         if await _record_row(record, row, journal) is None:
                             reasons.append("gateway observation recording incomplete")
@@ -417,7 +429,6 @@ async def reconcile_keys(
             )
         )
     report = ReconcileReport(run_id=run_id, keys=reports)
-    report.spend_usd()
     journal.append(EventDraft(type=EventType.RECONCILE, payload=report.model_dump(mode="json")))
     return report
 

@@ -967,3 +967,44 @@ async def test_expired_allowance_does_not_blame_or_call_gateway(tmp_path: Path) 
         assert not adapter.windows
         assert not adapter.deleted
         assert not [e for e in run.events("gateway_key") if e.payload["action"].endswith("failed")]
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+async def test_unrepresentable_spend_commits_an_estimated_report(
+    tmp_path: Path, aggregate: bool
+) -> None:
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [
+        key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}")
+        for n in range(11 if aggregate else 1)
+    ]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    adapter = CapableGateway()
+    costs = [1_000_000_000.0] * 10 + [0.000001]
+    adapter.rows = [
+        spend(str(n), cost, key_id=records[n if aggregate else 0].key_id)
+        for n, cost in enumerate(costs)
+    ]
+    for _ in range(2):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        assert report.spend_usd() == (11 if aggregate else 1)
+        assert report.total_label == "estimated"
+        if aggregate:
+            assert report.total_reasons == ["unsupported gateway observation"]
+            assert [key.observed_usd for key in report.keys] == costs
+            assert all(key.deleted for key in report.keys)
+        else:
+            assert report.keys[0].observed_usd is None
+            assert report.keys[0].reasons == ["unsupported gateway observation"]
+            assert not adapter.deleted
+        snapshots = [event for event in committed(config) if event.type == "reconcile"]
+        assert snapshots[-1].payload == report.model_dump(mode="json")
+        assert not [event for event in committed(config) if event.type == "settle"]
+    assert len(snapshots) == 2

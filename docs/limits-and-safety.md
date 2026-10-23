@@ -245,8 +245,13 @@ so a takeover after deletion can recover spend even after upstream log retention
 
 Reports deduplicate gateway requests by key and request identity, retain earlier
 committed observations even when logs age out, and sum integer micro-dollars
-before displaying USD. Totals that cannot be represented without losing a
-micro-dollar are refused. A later reconcile can add late rows for retained keys;
+before displaying USD. A key total that cannot be represented without losing a
+micro-dollar stays estimated with `unsupported gateway observation` and is not
+deleted. An unsupported run aggregate preserves all per-key results and reports
+the exact full-reservation total as estimated with the same fixed reason. If
+even that estimate cannot be represented, the aggregate is unavailable (`null`),
+never rounded or clamped. These display limits do not prevent run completion or
+its final review export. A later reconcile can add late rows for retained keys;
 deleted keys reuse their committed observations without repeating gateway reads.
 Readers retain their captured committed snapshot until refreshed.
 Reconciliation never refunds reservations, changes a live run's budget, or

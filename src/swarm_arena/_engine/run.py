@@ -981,7 +981,7 @@ class RunRunner:
         """Reconcile under this owner; bound gateway work separately from storage."""
         if self._gateway is None or deps.gateway is None:
             return
-        from swarm_arena._gateway.reconcile import reconcile_keys
+        from swarm_arena._gateway.reconcile import _key_event, reconcile_keys
 
         assert deps.config.llm_gateway is not None
         head = await deps.journal.commit()
@@ -989,17 +989,33 @@ class RunRunner:
         chain = await _read_chain(deps.store, head)
         events = [event for _, batch in chain for event in batch]
         deadline = _gateway_deadline(deps.journal)
-        await reconcile_keys(
-            events,
-            run_id=deps.run_id,
-            journal=deps.journal,
-            adapter=self._gateway.adapter,
-            executor=deps.executor,
-            gateway=deps.config.llm_gateway,
-            profile=self._gateway.profile,
-            _deadline=deadline,
-            _manager=deps.gateway,
-        )
+        outcome = _Outcome()
+        try:
+            await reconcile_keys(
+                events,
+                run_id=deps.run_id,
+                journal=deps.journal,
+                adapter=self._gateway.adapter,
+                executor=deps.executor,
+                gateway=deps.config.llm_gateway,
+                profile=self._gateway.profile,
+                _deadline=deadline,
+                _manager=deps.gateway,
+            )
+        except BaseExceptionGroup as error:
+            if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
+                raise
+            outcome.propagate_control(error)
+            if error.subgroup(StorageError) is not None:
+                raise
+        except (Exception, anyio.get_cancelled_exc_class()) as error:
+            outcome.propagate_control(error)
+            if isinstance(error, StorageError):
+                raise
+        else:
+            return
+        for record in deps.gateway.records():
+            _key_event(deps.journal, record, "read_failed", error="gateway read failed")
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
         await anyio.sleep(deps.clock.left(deps.config.limits.run_timeout_s))
