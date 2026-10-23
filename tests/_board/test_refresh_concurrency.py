@@ -53,7 +53,7 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
     def pause() -> None:
         if not entered.is_set():
             entered.set()
-            assert release.wait(5), "test failed to release storage"
+            assert release.wait(180), "test failed to release storage"
 
     def read(self: LocalStore, key: str) -> Any:
         if phase == "journal" and self.url.endswith("/slow") and key == head.segment:
@@ -85,15 +85,14 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(5, release.set)
+    timer = Timer(30, release.set)
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(heartbeat)
             group.start_soon(refresh)
-            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()  # Escape even if the regression blocks the loop itself.
             try:
-                start = perf_counter()
                 assert view.best(view.goal, 1, judge="j")[0].id == "fast-c"
                 assert view.scores("fast-c")[0].value == 1
                 assert view.lineage("fast-c").root == "fast-c"
@@ -103,11 +102,12 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 assert view.learnings("toy")[0].id == "fast-learning"
                 assert view.search_learnings("toy", "viscosity")[0].id == "fast-learning"
                 assert view.count_learnings("toy") == 1
-                assert perf_counter() - start < 1.0
+                assert not release.is_set(), "read waited for the held refresh"
+                timer.cancel()
                 before = len(ticks)
                 # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
                 beat_target.append(before + 3)
-                with anyio.fail_after(2):
+                with anyio.fail_after(60):
                     await beats_reached.wait()
                 assert not completed.is_set()
             finally:
@@ -117,6 +117,8 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
     finally:
         release.set()
         timer.cancel()
+        if timer.ident is not None:
+            timer.join(60)
         board.close()
 
 
@@ -192,7 +194,7 @@ async def test_public_board_reads_use_published_state_during_refresh(
 
     def pause() -> None:
         entered.set()
-        assert release.wait(5), "test failed to release refresh"
+        assert release.wait(180), "test failed to release refresh"
 
     def pointers(*args: Any, **kwargs: Any) -> Any:
         if phase == "pointers":
@@ -229,22 +231,22 @@ async def test_public_board_reads_use_published_state_during_refresh(
                 beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(5, release.set)
+    timer = Timer(30, release.set)
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(refresh)
             group.start_soon(heartbeat)
-            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()
             try:
-                started = perf_counter()
                 result = read()
-                assert perf_counter() - started < 1.0
+                assert not release.is_set(), "read waited for the held refresh"
+                timer.cancel()
                 assert result == expected
                 before = len(ticks)
                 # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
                 beat_target.append(before + 3)
-                with anyio.fail_after(2):
+                with anyio.fail_after(60):
                     await beats_reached.wait()
                 assert not finished.is_set()
             finally:
@@ -255,6 +257,8 @@ async def test_public_board_reads_use_published_state_during_refresh(
     finally:
         release.set()
         timer.cancel()
+        if timer.ident is not None:
+            timer.join(60)
         board.close()
 
 

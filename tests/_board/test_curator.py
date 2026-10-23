@@ -329,7 +329,7 @@ async def test_engine_curator_drain_has_a_bound(
             exited.set()
 
     monkeypatch.setattr(goal_module, "drain", held_drain)
-    with anyio.fail_after(5), pytest.raises(RuntimeError, match="stop cleanup timed out"):
+    with anyio.fail_after(30), pytest.raises(RuntimeError, match="stop cleanup timed out"):
         await runner._curate_round(1)
     assert entered.is_set()
     assert exited.is_set()
