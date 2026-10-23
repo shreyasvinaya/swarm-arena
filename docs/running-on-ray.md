@@ -367,7 +367,10 @@ A keyed run needs a USD reservation **above zero**, supplied by
 `max_budget` equals that reservation. The engine keeps the **entire reservation
 charged**, including failed or cancelled key-open attempts; gateway observations
 and reconciliation never refund it or create a second charge. Failures before
-key open retain ordinary undispatched-refund behavior. Tighter, realistic
+the reservation is promoted to `keep_charged` retain ordinary undispatched-refund
+behavior. Once promoted, the full reservation remains charged, including
+cancellation while that promotion becomes durable, even if key creation has not
+started. Tighter, realistic
 `Tool.estimate()` values and accurate `Tool.providers()` declarations avoid
 reserving unnecessarily large amounts or keying tools that do not use an LLM.
 A soft proxy cap does not make `max_usd` a hard bound on actual provider spend.
@@ -390,12 +393,13 @@ tool with a hard-coded provider URL can go around it. The proxy needs its own
 provider egress.
 
 Run completion makes a bounded reconciliation attempt. To retry later, use
-the addressed run directory and its original gateway configuration:
+the addressed run directory and its original gateway configuration. Replace
+`example-id` with your run's ID:
 
 ```sh
-swarm-arena reconcile runs/<run-id>
+swarm-arena reconcile runs/example-id
 # Optional explicit configuration, retaining the original gateway URL:
-swarm-arena reconcile runs/<run-id> --config run.toml
+swarm-arena reconcile runs/example-id --config run.toml
 ```
 
 Run directories and run roots are **trusted operator data**: anyone who can

@@ -42,7 +42,7 @@ def _config(
         run_root=str(root / "runs"),
         arena_root=str(root / "arena"),
         artifact_root=str(root / "artifacts"),
-        settle_timeout_s=1.0,
+        settle_timeout_s=60.0,
         secrets=SecretsPolicy(allow=["OPENAI_API_KEY"]),
         llm_gateway=GatewayConfig(
             url=gateway.url,
@@ -206,17 +206,100 @@ async def test_full_reservation_held(
 async def test_reconcile_labels(
     fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from datetime import datetime, timedelta
+
+    from swarm_arena._gateway import litellm_proxy, reconcile
+    from swarm_arena._gateway.adapter import ProfileReport
+    from swarm_arena._model.canonical import utc_now
+
     await _run_swarm(fake_gateway, tmp_path, monkeypatch)
     assert {k["label"] for k in _last_reconcile(tmp_path)["keys"]} == {"estimated"}
-    # Visibility is explicit; reducing a configured timeout cannot invent a capability.
-    fake_gateway.reveal_spend()
-    await _reconcile_cli(_config(fake_gateway, tmp_path, request_timeout_s=0.2), tmp_path)
+    original_preflight = litellm_proxy.LiteLLMProxy.preflight
+    profiles: list[ProfileReport] = []
+
+    async def observed_preflight(self: Any) -> ProfileReport:
+        profile = await original_preflight(self)
+        profiles.append(profile)
+        return profile
+
+    real_reconcile = reconcile.reconcile_keys
+    now = utc_now() + timedelta(days=1)
+    closures = [
+        datetime.fromisoformat(e["payload"]["closed_at"])
+        for e in _events(tmp_path, "gateway_key")
+        if e["payload"]["action"] == "closed"
+    ]
+    assert len(closures) == 2
+    assert all((now - closure).total_seconds() > 600 for closure in closures)
+
+    async def controlled(*args: Any, **kwargs: Any) -> Any:
+        return await real_reconcile(*args, **kwargs, now=lambda: now)
+
+    monkeypatch.setattr(litellm_proxy.LiteLLMProxy, "preflight", observed_preflight)
+    monkeypatch.setattr(reconcile, "reconcile_keys", controlled)
+    before = len(_calls(fake_gateway, "/model/info"))
+    await _reconcile_cli(_config(fake_gateway, tmp_path), tmp_path)
+    assert len(_calls(fake_gateway, "/model/info")) == before + 1
+    assert len(profiles) == 1
+    assert profiles[0].verified is False
+    assert profiles[0].failures
+    assert profiles[0].request_timeout_s is None
+    assert profiles[0].batch_write_interval_s is None
     keys = _last_reconcile(tmp_path)["keys"]
     assert len(keys) == 2
     assert {k["label"] for k in keys} == {"estimated"}
     assert all(k["observed_usd"] is None and not k["deleted"] for k in keys)
     assert not _calls(fake_gateway, "/key/delete")
     _assert_full_charge(tmp_path)
+
+
+async def test_reconcile_preflight_timeout_stays_estimated(
+    fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from swarm_arena._gateway import reconcile
+    from swarm_arena._gateway.adapter import GatewayError
+
+    await _run_swarm(fake_gateway, tmp_path, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    fake_gateway.entered["/health/liveliness"] = entered
+    fake_gateway.hold["/health/liveliness"] = release
+    original = reconcile._external
+    expired = []
+
+    async def bounded(operation: Any, deadline: float) -> Any:
+        if getattr(operation, "__name__", None) != "preflight":
+            return await original(operation, deadline)
+
+        async def expire(scope: anyio.CancelScope) -> None:
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+            scope.cancel()
+
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(expire, scope)
+                return await original(operation, deadline)
+        expired.append(True)
+        raise GatewayError("reconcile time allowance exhausted")
+
+    monkeypatch.setattr(reconcile, "_external", bounded)
+    before = len(fake_gateway.requests)
+    try:
+        await _reconcile_cli(_config(fake_gateway, tmp_path), tmp_path)
+        assert expired == [True]
+        routes = [route for _, route, _ in fake_gateway.requests[before:]]
+        assert "/health/liveliness" in routes
+        assert "/model/info" not in routes
+        assert "/spend/logs/v2" not in routes
+        keys = _last_reconcile(tmp_path)["keys"]
+        assert len(keys) == 2
+        assert {k["label"] for k in keys} == {"estimated"}
+        assert all(k["observed_usd"] is None and not k["deleted"] for k in keys)
+        assert not _calls(fake_gateway, "/key/delete")
+        _assert_full_charge(tmp_path)
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -353,13 +436,20 @@ async def test_resume_late_rows_exact_totals_and_old_reader_isolation(
         board.close()
 
 
+@pytest.mark.parametrize("failed_closure", [False, True])
 async def test_resume_runs_remaining_round_with_new_keys(
-    fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_gateway: FakeGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_closure: bool,
 ) -> None:
     from swarm_arena._engine.goal import GoalRunner
+    from swarm_arena._gateway.keys import gateway_call_id
 
     monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
     config = _config(fake_gateway, tmp_path)
+    if failed_closure:
+        fake_gateway.fail["/key/block"] = 500
     swarm = Swarm(config)
     plan = _plan()
     teams = []
@@ -413,6 +503,26 @@ async def test_resume_runs_remaining_round_with_new_keys(
     assert stopped.is_set()
     assert len(_candidates(tmp_path)) == 4
     assert len(fake_gateway.keys) == 2
+    old_keys = set(fake_gateway.keys)
+    if failed_closure:
+        assert not [
+            e for e in _events(tmp_path, "gateway_key") if e["payload"]["action"] == "closed"
+        ]
+        assert all(not key["blocked"] for key in fake_gateway.keys.values())
+    fake_gateway.fail.clear()
+    late_ids = set()
+    for key_id in old_keys:
+        fake_gateway.add_spend(
+            key_id,
+            model="chat-model",
+            cost_usd=0.2,
+            tokens=(10, 2),
+            call_id=None,
+            visible_after_s=float("inf"),
+        )
+        late_ids.add(gateway_call_id(key_id, fake_gateway._spend[-1][1]["request_id"]))
+    assert not late_ids.intersection(c["litellm_call_id"] for c in _observed_calls(tmp_path))
+    fake_gateway.reveal_spend()
     assert swarm.run_id is not None
     with anyio.fail_after(120):
         assert await Swarm(config).resume(swarm.run_id)
@@ -427,6 +537,29 @@ async def test_resume_runs_remaining_round_with_new_keys(
     assert all(
         c.llm_calls_source == "gateway" and c.llm_call_ids for c in candidates if c.team == "llm"
     )
+    events = _events(tmp_path)
+    first_work = next(
+        index
+        for index, event in enumerate(events)
+        if event["epoch"] == 2 and event["type"] == "tool_start"
+    )
+    late_reads = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event["type"] == "llm_call" and event["payload"]["call"]["litellm_call_id"] in late_ids
+    ]
+    assert len(late_reads) == len(old_keys) == 2
+    assert all(event["epoch"] == 2 and index < first_work for index, event in late_reads)
+    if failed_closure:
+        closed = [
+            (index, event)
+            for index, event in enumerate(events)
+            if event["type"] == "gateway_key"
+            and event["payload"]["action"] == "closed"
+            and event["payload"]["key_id"] in old_keys
+        ]
+        assert {event["payload"]["key_id"] for _, event in closed} == old_keys
+        assert all(event["epoch"] == 2 and index < first_work for index, event in closed)
     _assert_full_charge(tmp_path)
 
 
@@ -434,7 +567,7 @@ async def test_resume_runs_remaining_round_with_new_keys(
 async def test_capability_stub_observed_labels_and_repeated_totals(
     fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: bool
 ) -> None:
-    from datetime import timedelta
+    from datetime import datetime, timedelta
 
     from _fakes.reconcile import CapableGateway
 
@@ -453,6 +586,24 @@ async def test_capability_stub_observed_labels_and_repeated_totals(
     )
     assert cap == "hard"
     assert profile.verified
+    # Re-deliver identities already committed by the initial tool read, before
+    # deletion can suppress subsequent reads. These rows must count only once.
+    for _, row in fake_gateway._spend:
+        adapter.rows.append(
+            SpendRow(
+                key_id=row["api_key"],
+                request_id=row["request_id"],
+                litellm_call_id=row["litellm_call_id"],
+                model=row["model"],
+                usage=Usage(
+                    input_tokens=row["prompt_tokens"], output_tokens=row["completion_tokens"]
+                ),
+                cost_usd=row["spend"],
+                ts=datetime.fromisoformat(row["startTime"]),
+                metadata={},
+            )
+        )
+    assert len(adapter.rows) == len(_observed_calls(tmp_path)) == 2
     for key_id in fake_gateway.keys:
         for index, cost in enumerate((0.1, 0.2)):
             adapter.rows.append(
@@ -634,6 +785,18 @@ async def test_virtual_key_never_written(
     import tempfile
 
     from swarm_arena._engine.run import _local_journal_path
+    from swarm_arena._exec.executor import Job
+    from swarm_arena.executor import LocalExecutor
+    from swarm_arena.tool import ToolOutput
+
+    submitted: list[Job] = []
+    original_submit = LocalExecutor.submit
+
+    async def inspect_job(self: LocalExecutor, job: Job) -> ToolOutput:
+        submitted.append(job)
+        return await original_submit(self, job)
+
+    monkeypatch.setattr(LocalExecutor, "submit", inspect_job)
 
     temp = tmp_path / "temp"
     temp.mkdir()
@@ -651,7 +814,19 @@ async def test_virtual_key_never_written(
     captured = capsys.readouterr()
     values = [fake_gateway.master_key, *(k["secret"] for k in fake_gateway.keys.values())]
     assert len(values) == 3
+    assert len(submitted) == 4
+    keyed = [job for job in submitted if job.secret_values]
+    assert len(keyed) == 2
+    assert {job.secret_values["OPENAI_API_KEY"] for job in keyed} == set(values[1:])
+    assert all(
+        job.secret_values
+        == dict.fromkeys(
+            ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"), job.secret_values["OPENAI_API_KEY"]
+        )
+        for job in keyed
+    )
     for secret in values:
+        assert all(secret not in repr(job) and secret not in repr(job.env) for job in submitted)
         assert secret not in caplog.text + captured.out + captured.err + repr(candidates)
         for path in files:
             assert secret.encode() not in path.read_bytes(), path
