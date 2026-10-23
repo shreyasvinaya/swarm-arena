@@ -785,7 +785,11 @@ async def resume_run(
             runner._gateway = gateway
             runner._key_manager = services.deps.gateway
             return runner
-        except BaseException:
-            if not services.closed:
-                await services._aclose(failed=True)
+        except BaseException as error:
+            try:
+                if not services.closed:
+                    await services._aclose(failed=True)
+            finally:
+                if run_module._has_driver_control(error):
+                    raise error
             raise

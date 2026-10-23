@@ -3754,3 +3754,69 @@ async def test_resume_gateway_closure_has_one_overall_allowance(
             assert [event.payload["key_id"] for event in failures] == [attempted[0][0]]
         finally:
             await runner.aclose()
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_resume_preserves_driver_hard_control_through_cleanup(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import resume as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    journal = Mock(_stopped=False)
+    if fenced:
+        journal._raise_if_fenced.side_effect = _core_error(Fenced)
+    order: list[str] = []
+
+    async def fail() -> None:
+        order.append("body failed")
+        raise error
+
+    async def close(*, failed: bool = False) -> None:
+        assert failed
+        order.append("closed")
+        if cleanup_fails:
+            raise _core_error(Fenced) if fenced else OSError("cleanup failed")
+
+    services = Mock(
+        closed=False,
+        ready=Mock(wait=AsyncMock(side_effect=fail)),
+        _serve=AsyncMock(),
+        _aclose=AsyncMock(side_effect=close),
+        deps=Mock(journal=journal),
+    )
+    lease = Mock()
+
+    async def take_over(*args: Any, **kwargs: Any) -> Any:
+        kwargs["validate"](lease.doc)
+        return lease
+
+    monkeypatch.setattr(module, "_check_storage", AsyncMock())
+    monkeypatch.setattr(module, "_take_over", take_over)
+    monkeypatch.setattr(module, "_read", Mock(return_value=([], Mock(run_elapsed_s=0))))
+    monkeypatch.setattr(module, "_check", Mock())
+    monkeypatch.setattr(module, "_restore_import_paths", Mock())
+    monkeypatch.setattr(module, "_ResumeServices", Mock(return_value=services))
+    try:
+        with pytest.raises(type(error)) as caught:
+            await module.resume_run(run_config, "driver-control", force=False, replanner=None)
+        assert caught.value is error
+        assert order == ["body failed", "closed"]
+        services._aclose.assert_awaited_once_with(failed=True)
+    finally:
+        with anyio.fail_after(60):
+            await services.task
