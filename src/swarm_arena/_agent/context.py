@@ -5,7 +5,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import get_ident
-from typing import Any, Literal, TypeVar
+from typing import Any, Final, Literal, TypeVar
 
 import anyio
 from pydantic import BaseModel, ValidationError
@@ -49,6 +49,8 @@ from swarm_arena._tooling.tool import Action, Tool
 
 _T = TypeVar("_T")
 _CONTEXT_LIMITS = frozenset(Limits.model_fields) | {"budget", "stop"}
+_BOARD_READ_LIMIT_MESSAGE: Final = "max_board_reads_per_round reached"
+_UNKNOWN_CANDIDATE_MESSAGE: Final = "unknown candidate: {id}"
 
 
 def _context_limit(value: object) -> str:
@@ -492,8 +494,8 @@ class AgentContext:
             limit = _context_limit(blocked.limit)
             raise _core_signal(LimitReached(limit, str(blocked)), _category=_SignalCategory.LIMIT)
 
-    def _charge(self, *, board_read: bool = False) -> None:
-        """Check gates and update counters atomically on the loop."""
+    def _check_charge(self) -> bool:
+        """Check action limits without mutation; return whether a charge is due."""
         self._check_admission()
         rt = self._rt
         if rt.watchdog.limit is not None:
@@ -504,9 +506,16 @@ class AgentContext:
             )
         lifetime = next((item for item in reversed(_nested.get()) if item.owner is self), None)
         if lifetime is not None and lifetime.live:
-            return
+            return False
         if rt.counters.turns >= rt.limits.max_turns_per_round:
             raise _core_signal(LimitReached("max_turns_per_round", "turns used up for this round"))
+        return True
+
+    def _charge(self, *, board_read: bool = False) -> None:
+        """Check gates and update counters atomically on the loop."""
+        if not self._check_charge():
+            return
+        rt = self._rt
         rt.counters.turns += 1
         exhausted = board_read and rt.counters.board_reads >= rt.limits.max_board_reads_per_round
         if board_read and not exhausted:
@@ -518,7 +527,7 @@ class AgentContext:
             )
         )
         if exhausted:
-            raise _core_signal(SoftError("max_board_reads_per_round reached"))
+            raise _core_signal(SoftError(_BOARD_READ_LIMIT_MESSAGE))
 
     def _manager(self, candidate: Candidate) -> Candidate:
         """Filter feedback without exposing mutable runtime-owned containers."""
@@ -544,7 +553,7 @@ class AgentContext:
             try:
                 candidate = self._rt.view.get_candidate(id)
             except (KeyError, ValueError):
-                raise _core_signal(SoftError(f"unknown candidate: {id}")) from None
+                raise _core_signal(SoftError(_UNKNOWN_CANDIDATE_MESSAGE.format(id=id))) from None
         return candidate
 
     def _learning(self, id: str) -> Learning:
@@ -984,7 +993,7 @@ class AgentContext:
         id = _context_string(id, "id")
 
         def read() -> Candidate:
-            self._check_admission()
+            self._check_charge()
             candidate = self._candidate(id)
             self._charge(board_read=True)
             self._read_ids[id] = None

@@ -15,6 +15,8 @@ from agents.tool_context import ToolContext
 from pydantic import ConfigDict, ValidationError, create_model
 
 from swarm_arena._agent.context import (
+    _BOARD_READ_LIMIT_MESSAGE,
+    _UNKNOWN_CANDIDATE_MESSAGE,
     AgentContext,
     _ActionInflight,
     _defer_timer_error,
@@ -225,10 +227,10 @@ def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
             known = _rebuild_core_signal(error)
             if not isinstance(known, SoftError):
                 raise
-            if str(known) == "max_board_reads_per_round reached":
+            if str(known) == _BOARD_READ_LIMIT_MESSAGE:
                 read_limited = True
                 marker = "read limit reached"
-            elif str(known) == f"unknown candidate: {candidate_id}":
+            elif str(known) == _UNKNOWN_CANDIDATE_MESSAGE.format(id=candidate_id):
                 marker = "not in this view"
             else:
                 raise

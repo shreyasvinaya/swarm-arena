@@ -3,6 +3,7 @@ from dataclasses import replace
 from doctest import SKIP, DocTestParser, DocTestRunner
 from threading import get_ident
 from typing import Any, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
@@ -33,7 +34,7 @@ from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena.board import Candidate, Learning, Row
 from swarm_arena.executor import Job
 from swarm_arena.manager import LimitReached
-from swarm_arena.tool import Action, Estimate, ToolOutput, ToolRequest
+from swarm_arena.tool import Action, Estimate, RunStatus, ToolOutput, ToolRequest
 
 SECRET = "secret-context-value-9x"
 
@@ -134,6 +135,32 @@ async def test_missing_candidate_still_checks_live_admission(ctx_env: CtxEnv) ->
         ctx.get_candidate("missing")
     assert caught.value.limit == "stop"
     assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (0, 0)
+
+
+@pytest.mark.parametrize("kind", ["turn", "watchdog", "both"])
+async def test_missing_candidate_still_checks_latched_limits(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    ctx = ctx_env.ctx()
+    rt = ctx_env.rt
+    if kind in {"turn", "both"}:
+        rt.counters.turns = rt.limits.max_turns_per_round
+    if kind in {"watchdog", "both"}:
+        for _ in range(rt.limits.max_consecutive_failures):
+            rt.watchdog.record_run(RunStatus.ERROR, passed=False)
+        assert rt.watchdog.limit == "max_consecutive_failures"
+    lookup = Mock(wraps=rt.view.get_candidate)
+    monkeypatch.setattr(rt.view, "get_candidate", lookup)
+    turns = rt.counters.turns
+    with pytest.raises(LimitReached) as caught:
+        ctx.get_candidate("missing")
+    assert caught.value.limit == (
+        "max_turns_per_round" if kind == "turn" else "max_consecutive_failures"
+    )
+    assert _is_core_control(caught.value)
+    assert (rt.counters.turns, rt.counters.board_reads) == (turns, 0)
+    assert ctx_env.events("agent_counters") == []
+    lookup.assert_not_called()
 
 
 async def test_learning_rules(ctx_env: CtxEnv) -> None:
@@ -672,8 +699,9 @@ async def test_all_actions_obey_gate_and_watchdog(ctx_env: CtxEnv) -> None:
     assert error.value.limit == "max_consecutive_failures"
 
 
+@pytest.mark.parametrize("max_turns", [1, 20])
 async def test_worker_nested_reads_use_loop_and_charge_once(
-    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, max_turns: int
 ) -> None:
     view = await _snapshot(ctx_env, candidates=(_candidate(),))
     owner = get_ident()
@@ -685,7 +713,7 @@ async def test_worker_nested_reads_use_loop_and_charge_once(
         return get(id)
 
     monkeypatch.setattr(view, "get_candidate", lookup)
-    ctx = ctx_env.ctx(view=view)
+    ctx = ctx_env.ctx(view=view, limits=Limits(max_turns_per_round=max_turns))
 
     def worker(context: AgentContext) -> JsonValue:
         assert get_ident() != owner
@@ -710,8 +738,14 @@ async def test_worker_nested_reads_use_loop_and_charge_once(
     assert threads == [owner, owner]
     assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
     assert len(ctx_env.events("agent_counters")) == 1
-    ctx.get_candidate("c-old")
-    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 2)
+    if max_turns == 1:
+        with pytest.raises(LimitReached) as caught:
+            ctx.get_candidate("c-old")
+        assert caught.value.limit == "max_turns_per_round"
+        assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
+    else:
+        ctx.get_candidate("c-old")
+        assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 2)
 
 
 async def test_simultaneous_contexts_and_cancellation_keep_charges_independent(
