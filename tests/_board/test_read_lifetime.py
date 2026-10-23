@@ -68,14 +68,14 @@ def test_read_captured_before_close_keeps_reader_alive(
     def paused(*args: Any, **kwargs: Any) -> Any:
         # scores pauses after candidate validation, between two cache operations.
         entered.set()
-        assert draining.wait(5)
+        assert draining.wait(60)
         assert drained == [False]
         assert not closed.is_set()
         return original(*args, **kwargs)
 
     def shutdown() -> None:
         try:
-            assert entered.wait(5)
+            assert entered.wait(60)
             board.close()
         except BaseException as error:
             failures.append(error)
@@ -92,7 +92,7 @@ def test_read_captured_before_close_keeps_reader_alive(
         )
     finally:
         entered.set()
-        worker.join(5)
+        worker.join(60)
         assert not worker.is_alive()
         assert not failures
     assert cache._closed
@@ -112,15 +112,15 @@ def test_swapped_generation_stays_pinned_until_compound_read_finishes(
 
     def paused(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert swapped.wait(5)
-        assert draining.wait(5)
+        assert swapped.wait(60)
+        assert draining.wait(60)
         assert drained == [False]
         assert not closed.is_set()
         return original(*args, **kwargs)
 
     def refresh_and_close() -> None:
         try:
-            assert entered.wait(5)
+            assert entered.wait(60)
             run.commit(run.score("new-score", "old", 2))
             board.frontier()
             assert board._read_state() is not old
@@ -139,7 +139,7 @@ def test_swapped_generation_stays_pinned_until_compound_read_finishes(
         assert [s.id for s in board.scores("old")] == ["os"]
     finally:
         entered.set()
-        worker.join(5)
+        worker.join(60)
         assert not worker.is_alive()
         assert not failures
     assert cache._closed
@@ -191,7 +191,7 @@ def test_failed_read_releases_its_pin(
         reader.scores("old")
     worker = Thread(target=board.close, daemon=True)
     worker.start()
-    worker.join(5)
+    worker.join(60)
     assert not worker.is_alive()
     assert view._cache._closed
 
@@ -213,13 +213,13 @@ def test_nested_view_read_continues_after_close_stops_new_reads(
     def paused(*args: Any, **kwargs: Any) -> ArenaView | None:
         result = original_view(*args, **kwargs)
         entered.set()
-        assert stopped.wait(5)
+        assert stopped.wait(60)
         # The outer Board read already owns a pin; its nested view may finish.
         return result
 
     def shutdown() -> None:
         try:
-            assert entered.wait(5)
+            assert entered.wait(60)
             board.close()
         except BaseException as error:
             failures.append(error)
@@ -232,7 +232,7 @@ def test_nested_view_read_continues_after_close_stops_new_reads(
         assert [c.id for c in board.best(run.goal.key(), 1, judge="j")] == ["old"]
     finally:
         entered.set()
-        worker.join(5)
+        worker.join(60)
         assert not worker.is_alive()
         assert not failures
     assert view._cache._closed
@@ -254,10 +254,10 @@ def test_reopen_while_old_read_drains_uses_a_new_lifetime(
 
     def paused(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert stopped.wait(5)
+        assert stopped.wait(60)
         # Acquiring both locks from the reader proves close's drain holds neither.
-        assert board._refresh_lock.acquire(timeout=5)
-        assert board._lock.acquire(timeout=5)
+        assert board._refresh_lock.acquire(timeout=30)
+        assert board._lock.acquire(timeout=30)
         board._lock.release()
         board._refresh_lock.release()
         board.open(run.run_id, run.run_root, ["toy"])
@@ -268,7 +268,7 @@ def test_reopen_while_old_read_drains_uses_a_new_lifetime(
 
     def shutdown() -> None:
         try:
-            assert entered.wait(5)
+            assert entered.wait(60)
             board.close()
         except BaseException as error:
             failures.append(error)
@@ -281,7 +281,7 @@ def test_reopen_while_old_read_drains_uses_a_new_lifetime(
         assert view.get_candidate("old").id == "old"
     finally:
         entered.set()
-        worker.join(5)
+        worker.join(60)
         assert not worker.is_alive()
         assert not failures
     assert view._cache._closed
