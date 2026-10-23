@@ -544,12 +544,17 @@ async def test_caller_cancel_interrupts_read_without_recording(tmp_path: Path) -
             with anyio.fail_after(60):
                 await gw.read_entered.wait()
                 task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=60)
+                assert task in done, "gateway read did not finish cancellation"
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    task.result()
             assert not run.calls()
         finally:
+            gw.read_release.set()
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            done, pending_cleanup = await asyncio.wait({task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+        assert not pending_cleanup, "gateway read cleanup did not finish"
 
 
 async def test_expired_open_cleanup_budget_never_restarts(
