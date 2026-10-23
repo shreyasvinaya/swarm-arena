@@ -7,10 +7,15 @@ from pathlib import Path
 from typing import Any, cast
 
 import anyio
+import pytest
+
+pytest.importorskip("agents")
+
+# isort: split
 import httpx
 import litellm
-import pytest
 from _fakes.llm_run import HeldOperation, LLMRun, open_llm_run
+from _fakes.secrecy import assert_secret_absent
 from litellm.exceptions import ModifyResponseException
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
@@ -20,6 +25,8 @@ from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_c
 from swarm_arena import Limits, RunConfig
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import LLMScope
+from swarm_arena._engine.run import _setup_run
+from swarm_arena._errors import ConfigError
 from swarm_arena._journal.llm_record import drain, open_call, unbind_run
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena.config import CachePolicy, ModelCatalog, ModelSpec, TracingConfig
@@ -546,16 +553,42 @@ def test_install_is_idempotent() -> None:
     assert sentinel in litellm.callbacks
 
 
-def test_install_refuses_a_second_different_cache_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["roles", "namespace"])
+async def test_setup_accepts_scope_cache_policy_changes(tmp_path: Path, field: str) -> None:
+    pytest.importorskip("diskcache")
+    policy = CachePolicy(backend="disk", disk_dir=str(tmp_path / "cache"))
+    await _setup_run((), _config(cache=policy))
+    cache = litellm.cache
+    await _setup_run(
+        (),
+        _config(cache=policy.model_copy(update={field: {} if field == "roles" else "another"})),
+    )
+    assert litellm.cache is cache
+
+
+@pytest.mark.parametrize("field", ["backend", "disk_dir", "ttl_s"])
+async def test_setup_refuses_a_different_cache_backend(tmp_path: Path, field: str) -> None:
     pytest.importorskip("diskcache")
     pytest.importorskip("fastapi")
-    cfg = _config(cache=CachePolicy(backend="disk", disk_dir=str(tmp_path / "first")))
+    cfg = _config(
+        cache=CachePolicy(
+            backend="disk", disk_dir=str(tmp_path / "first"), redis_url_env="CACHE_URL"
+        )
+    )
     install(cfg)
     cache = litellm.cache
     install(cfg)
     assert litellm.cache is cache
-    with pytest.raises(ValueError, match="one response-cache policy per process"):
-        install(_config(cache=CachePolicy(backend="disk", disk_dir="SECRET_PATH")))
+    replacement: dict[str, Any] = {
+        "backend": "redis",
+        "disk_dir": "cache-secret-sentinel",
+        "ttl_s": 1,
+    }
+    assert cfg.cache is not None
+    changed = cfg.cache.model_copy(update={field: replacement[field]})
+    with pytest.raises(ConfigError, match=r"response-cache backend.*per process") as caught:
+        await _setup_run((), _config(cache=changed))
+    assert_secret_absent(caught.value, replacement["disk_dir"], sanitized=True)
     assert litellm.cache is cache
 
 

@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from swarm_arena._budget.amount import _MICROS_PER_USD, USD_LIMIT, _usd_from_micro_units
 from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._engine.run import register_run_setup
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import ConfigError, _core_error, _exception_type_name
 from swarm_arena._journal import llm_record as _recorder
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.context_strings import _context_string
@@ -447,8 +447,8 @@ def install(config: RunConfig) -> None:
 
     Raises
     ------
-    ValueError
-        If a different response-cache policy has already been installed.
+    ConfigError
+        If a different response-cache backend, location or TTL is already installed.
     ImportError
         If the selected response cache requires missing optional dependencies.
 
@@ -465,8 +465,23 @@ def install(config: RunConfig) -> None:
     global _installed_policy
     with _install_lock:
         if config.cache is not None:
-            if _installed_policy is not None and config.cache != _installed_policy:
-                raise ValueError("one response-cache policy per process")
+            if _installed_policy is not None:
+                location = {"disk": "disk_dir", "s3": "s3_path", "redis": "redis_url_env"}
+                installed = _installed_policy
+                if (
+                    config.cache.backend,
+                    getattr(config.cache, location[config.cache.backend]),
+                    config.cache.ttl_s,
+                ) != (
+                    installed.backend,
+                    getattr(installed, location[installed.backend]),
+                    installed.ttl_s,
+                ):
+                    raise _core_error(
+                        ConfigError,
+                        "one response-cache backend, location and ttl_s per process; "
+                        "use the installed settings or start a new process",
+                    ) from None
             if _installed_policy is None:
                 require_cache_extra(config.cache)
                 cache = response_cache(config.cache)

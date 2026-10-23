@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - LiteLLM call logging with per-run catalog prices, exact cache-lifetime usage,
   conservative failed-call charging, proven response-cache origins, and idempotent
-  logger/cache installation under the owning run lifetime.
+  logger/cache installation under the owning run lifetime. Cache backend settings
+  are process-wide, with clear configuration refusals; role switches and namespaces
+  remain per scope.
 
 - Lazy `FakeModel` and `FakeTurn` helpers replay isolated offline LLM
   conversations, capture SDK inputs, and record exact catalog-priced usage

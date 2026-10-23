@@ -336,6 +336,11 @@ prompt-cache points. Provider minimum prompt lengths still apply. Prompt-cache
 reads and writes retain their separate usage and pricing, including the 5m/1h
 write split described above.
 
+One response-cache backend, location (`disk_dir`, `s3_path`, or `redis_url_env`)
+and `ttl_s` can be installed per process. A conflicting setup raises a clear
+configuration error; use the installed settings or start a new process.
+Role read/write switches and namespaces remain per scope and may differ between runs.
+
 Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
 extra (`uv add "swarm-arena[llm,cache]"`). Configure `RunConfig.cache` in TOML:
 
