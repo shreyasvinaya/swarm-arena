@@ -8,7 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Generic, TypeVar
+from typing import Any, Final, Generic, NoReturn, TypeVar
 
 import anyio
 
@@ -272,7 +272,7 @@ class _JobRun:
             if self._collect_error is not None:
                 # The process supervisor may log an ordinary callback exception.
                 # Registered terminal collection failures still belong to the owner.
-                _raise_terminal(outcome.classify(self._collect_error))
+                _raise_terminal(_classify_outcome(self._collect_error))
             if run.status in _STOPPED:  # collect ran (or was given up) in before_kill
                 output = await anyio.to_thread.run_sync(self._stopped_output, run.status)
             else:
@@ -281,18 +281,27 @@ class _JobRun:
                 await self._wait_post_collect()
                 output = self._output or ToolOutput(status=RunStatus.ERROR)
             return await self._finish(output, (run.started_at, run.ended_at))
+        except BaseException as error:
+            await self._raise_failure(error, outcome)
+
+    async def _raise_failure(self, error: BaseException, outcome: _Outcome) -> NoReturn:
+        """Give the caller its own cancellation before propagating a job failure."""
+        try:
+            # Supervisor cleanup can hide scope cancellation behind a shield.
+            # Outside that shield, obtain the caller's cancellation itself rather
+            # than letting classification manufacture one from a collector error.
+            await anyio.lowlevel.checkpoint()
+            raise error
         except anyio.get_cancelled_exc_class():
-            if self._started:  # a cancel before the start handshake has no output to give
+            if self._started:
                 with anyio.CancelScope(shield=True):
                     try:
                         await self._deliver_partial()
-                    except BaseException as error:
-                        # A pending caller cancellation owns the final outcome,
-                        # including failures from the shielded collector rejoin.
-                        # Keep the original scope-tagged cancellation: the shared
-                        # classifier's fresh cancellation may be chained to error.
+                    except BaseException as late_error:
+                        # Classify cleanup against the original awaiting snapshot,
+                        # then re-raise the captured, scope-attributable cancellation.
                         with contextlib.suppress(anyio.get_cancelled_exc_class()):
-                            outcome.classify(error)
+                            outcome.classify(late_error)
             raise
 
     async def fault_output(self, reason: str) -> ToolOutput:
@@ -316,7 +325,6 @@ class _JobRun:
     async def _before_kill(self, provisional: CompletedRun) -> None:
         """Collect the partial output in a daemon thread the supervisor can stop waiting on."""
         self._provisional = provisional
-        outcome = _Outcome()
         try:
             call = self._start_collect(provisional)
             self._output = await call.result()
@@ -326,16 +334,6 @@ class _JobRun:
             # Only a hand-back actually received by this owner can survive
             # supervisor cleanup. Abandoned workers cannot set this latch.
             self._collect_error = error
-            # Classify cancellation first, then re-raise the original direct-call
-            # error below instead of replacing its identity with a rebuilt Fenced.
-            with contextlib.suppress(Fenced):
-                try:
-                    outcome.classify(error)
-                except anyio.get_cancelled_exc_class():
-                    # A non-cancel hand-back can race a pending owner scope.
-                    # Let that scope supply its own attributable cancellation.
-                    await anyio.lowlevel.checkpoint_if_cancelled()
-                    raise
             raise
 
     def _start_collect(self, run: CompletedRun) -> _DaemonCall[ToolOutput | None]:
@@ -372,19 +370,8 @@ class _JobRun:
         """Wait for the one post-exit collect until its original deadline."""
         assert self._post_collect is not None
         with anyio.move_on_after(max(0.0, self._collect_deadline - anyio.current_time())) as scope:
-            outcome = _Outcome()
-            try:
-                self._output = await self._post_collect.result()
-                self._collected = True
-            except BaseException as error:
-                # Preserve direct-call identity after giving cancellation precedence.
-                with contextlib.suppress(Fenced):
-                    try:
-                        outcome.classify(error)
-                    except anyio.get_cancelled_exc_class():
-                        await anyio.lowlevel.checkpoint_if_cancelled()
-                        raise
-                raise
+            self._output = await self._post_collect.result()
+            self._collected = True
         if scope.cancelled_caught:
             await anyio.to_thread.run_sync(note_in_log, self._stderr, "collect timed out")
 
