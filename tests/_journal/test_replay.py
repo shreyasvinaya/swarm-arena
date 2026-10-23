@@ -1137,3 +1137,21 @@ def test_gateway_projection_rejects_invalid_report_safely(patch: dict[str, Any])
     with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
         RunState.from_events([_ev(1, draft.type.value, draft.payload)])
     assert_secret_absent(caught.value, "SECRET")
+
+
+@pytest.mark.parametrize("label", ["estimated", "observed", "observed (completeness unverified)"])
+def test_gateway_shared_report_round_trips_every_label(label: str) -> None:
+    from _fakes.gateway_events import reconcile
+
+    from swarm_arena._gateway.reports import KeyReport, ReconcileReport
+
+    draft = reconcile(run_id="r", label=label, observed=None if label == "estimated" else 0.25)
+    report = ReconcileReport.model_validate(draft.payload)
+    assert isinstance(report.keys[0], KeyReport)
+    payload = report.model_dump(mode="json")
+    state = RunState.from_events([_ev(1, "reconcile", payload)])
+    projection = state.gateway_reconcile[("c-1", "hash-1")]
+    assert projection.label == label
+    assert projection.observed_usd == report.keys[0].observed_usd
+    assert projection == report.keys[0]
+    assert report.spend_usd() == (1.0 if label == "estimated" else 0.25)

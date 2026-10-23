@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from swarm_arena._gateway.adapter import ProfileReport
+from swarm_arena._gateway.labels import _observation_label
 
 BUDGET_RESERVATIONS: Final[str | None] = "disable_budget_reservation"
 FAIL_CLOSED: Final[str | None] = "fail_closed_budget_enforcement"
@@ -52,7 +53,7 @@ def _model_info(model: object) -> Mapping[str, Any]:
 def _model_name(model: object) -> str:
     """Keep model identifiers, never representations of malformed values."""
     name = model.get("model_name") if isinstance(model, Mapping) else None
-    return name if isinstance(name, str) and name else "<unknown>"
+    return _observation_label(name, 256, fallback="<unknown>")
 
 
 def _reserved_routes(value: Any, models: Sequence[object]) -> bool:

@@ -15,6 +15,7 @@ from pydantic import AwareDatetime, Field
 from swarm_arena._budget.ledger import Reservation
 from swarm_arena._exec.executor import Job
 from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, VirtualKey
+from swarm_arena._gateway.labels import _observation_label
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.llm_record import record_call
 from swarm_arena._journal.writer import JournalWriter
@@ -234,13 +235,6 @@ class KeyRecord(FrozenModel):
     round: int
     created_at: AwareDatetime
     closed_at: AwareDatetime | None = None
-
-
-def _observation_label(value: object, limit: int) -> str:
-    """Normalize untrusted labels to the recorder's bounded printable domain."""
-    if type(value) is str and 0 < len(value) <= limit and value.isprintable() and value.strip():
-        return value
-    return "unknown"
 
 
 def _virtual(record: KeyRecord) -> VirtualKey:

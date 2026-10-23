@@ -6,12 +6,14 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self, cast, get_args
+from typing import Annotated, Any, Literal, cast, get_args
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field
 
 from swarm_arena._errors import ChainError, _core_error
 from swarm_arena._exec.executor import Job
+from swarm_arena._gateway.reports import KeyReport as _GatewaySpend
+from swarm_arena._gateway.reports import ReconcileReport
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._model.base import FrozenModel, Origin
 from swarm_arena._model.board_types import Frontier
@@ -190,24 +192,6 @@ class _GatewayKey(FrozenModel):
     cap: Literal["hard", "soft"]
 
 
-class _GatewaySpend(FrozenModel):
-    """Project one key's latest report, independently of ledger settlement."""
-
-    model_config = ConfigDict(extra="ignore")
-    candidate_id: _GatewayId
-    key_id: _GatewayId
-    alias: _GatewayId
-    reserved_usd: _GatewayUsd
-    observed_usd: _GatewayUsd | None
-    label: Literal["observed", "observed (completeness unverified)", "estimated"]
-
-    @model_validator(mode="after")
-    def _consistent_observation(self) -> Self:
-        if (self.observed_usd is None) != (self.label == "estimated"):
-            raise ValueError("gateway spend conflicts with report label")
-        return self
-
-
 @dataclass
 class RunState:
     """
@@ -368,8 +352,7 @@ class RunState:
             case EventType.RECONCILE:
                 if payload["run_id"] != event.run_id or not isinstance(payload["keys"], list):
                     raise ValueError("invalid gateway report identity")
-                for raw in payload["keys"]:
-                    report = _GatewaySpend.model_validate(raw)
+                for report in ReconcileReport.model_validate(payload).keys:
                     self.gateway_reconcile[(report.candidate_id, report.key_id)] = report
             case EventType.PROVIDER_FAILED:
                 self._provider_event(payload)

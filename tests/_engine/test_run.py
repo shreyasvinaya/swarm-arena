@@ -15,7 +15,7 @@ from _fakes.leases import force_take_over
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
-from swarm_arena import Ref, RunConfig, ScriptedManager
+from swarm_arena import Limits, Ref, RunConfig, ScriptedManager
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.run import RunRunner, _require_asyncio
 from swarm_arena._engine.swarm import Swarm
@@ -2253,12 +2253,12 @@ async def test_resume_preparation_sees_schedule_timeout(
     assert current_schedule_timeout() is None
 
 
-@pytest.mark.parametrize("hard", [False, True])
+@pytest.mark.parametrize("hard", [False, True, None])
 async def test_run_gateway_preflight_precedes_keys_and_manifest(
     run_config: RunConfig,
     fake_gateway: Any,
     monkeypatch: pytest.MonkeyPatch,
-    hard: bool,
+    hard: bool | None,
 ) -> None:
     from swarm_arena._engine import run as module
     from swarm_arena.config import GatewayConfig
@@ -2283,19 +2283,37 @@ async def test_run_gateway_preflight_precedes_keys_and_manifest(
     monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
     config = run_config.model_copy(
         update={
-            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=hard),
+            "llm_gateway": (
+                GatewayConfig(url=fake_gateway.url)
+                if hard is None
+                else GatewayConfig(url=fake_gateway.url, require_hard_cap=hard)
+            ),
+            "limits": Limits(max_usd=5),
         }
     )
-    runner = RunRunner(config, [], run_id="r-gateway", approve=None, replanner=None)
-    if hard:
+    approved: list[list[str]] = []
+
+    async def approve(estimate: Estimate, warnings: Sequence[str]) -> bool:
+        assert [path for _, path, _ in fake_gateway.requests] == [
+            "/health/liveliness",
+            "/model/info",
+        ]
+        approved.append(list(warnings))
+        return True
+
+    runner = RunRunner(config, [], run_id="r-gateway", approve=approve, replanner=None)
+    if hard is not False:
         with pytest.raises(ValueError, match="strict profile not verified"):
             await runner.run()
         assert constructed == []
+        assert approved == []
         assert not await anyio.Path(config.run_root, "r-gateway", "manifest.json").exists()
         assert not await anyio.Path(config.run_root, "r-gateway", "control", "owner.json").exists()
     else:
         assert await runner.run() == {}
         assert len(constructed) == len(adapters) == 1
+        assert len(approved) == 1
+        assert "LLM gateway uses a soft cap." in approved[0]
         assert runner._gateway is not None
         assert runner._gateway.adapter is adapters[0]
         assert runner._gateway.profile.verified is False

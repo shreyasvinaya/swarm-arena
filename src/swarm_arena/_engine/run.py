@@ -704,6 +704,9 @@ class RunRunner:
                         raise _core_error(
                             RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
                         ) from None
+                    self._gateway = await _prepare_gateway(self.config)
+                    if self._gateway is not None and self._gateway.cap == "soft":
+                        warnings.append("LLM gateway uses a soft cap.")
                     if self.approve is not None:
                         outcome = _Outcome()
                         try:
@@ -721,7 +724,6 @@ class RunRunner:
                         if not approved:
                             raise _core_error(RuntimeError, "run not approved")
                     await run_preflight(admitted, self.config, executor)
-                    self._gateway = await _prepare_gateway(self.config)
                     self.run_id = self.run_id or new_run_id(utc_now())
                     manifest = await build_manifest_async(
                         run_id=self.run_id,

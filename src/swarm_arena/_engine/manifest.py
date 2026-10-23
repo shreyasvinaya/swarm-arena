@@ -14,6 +14,7 @@ from pydantic import Field, field_validator, model_validator
 
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.labels import _profile_failures
 from swarm_arena._model.base import FrozenModel, StoredModel
 from swarm_arena._model.canonical import UtcDatetime, format_utc, sha256_hex, utc_now
 from swarm_arena._model.data import FiniteJsonObject, Sha256
@@ -32,6 +33,12 @@ class _GatewayManifest(FrozenModel):
     verified: Annotated[bool, Field(strict=True)]
     failures: tuple[Annotated[str, Field(strict=True)], ...]
     terminal_accounting: Annotated[bool, Field(strict=True)]
+
+    @field_validator("failures")
+    @classmethod
+    def _bounded_failures(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Keep printable bounded evidence through serialization and rereads."""
+        return _profile_failures(value)
 
     @field_validator("url")
     @classmethod
