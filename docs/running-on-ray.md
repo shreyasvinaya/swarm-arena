@@ -368,6 +368,11 @@ llm_tool = FunctionTool("my_connector.tools:solve", providers=["openai"])
 plain_tool = FunctionTool("my_connector.tools:score")
 ```
 
+Each keyed tool run can wait up to `settle_timeout_s` (60 seconds by default)
+for its first spend rows after the tool finishes, even if it made no LLM call.
+If that wait ends with no rows, the candidate gets a neutral note; later reads
+and reconciliation can still collect delayed observations.
+
 A keyed subprocess receives `OPENAI_BASE_URL=<url>/v1`,
 `ANTHROPIC_BASE_URL=<url>`, and both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` set
 to its virtual key. It must use those base URLs. The base URLs travel in

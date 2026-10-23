@@ -451,11 +451,11 @@ async def test_failed_or_incomplete_read_keeps_charge_and_warns_safely(
         assert SECRET not in caplog.text
 
 
-@pytest.mark.parametrize("mode", ["empty", "rows", "duplicate", "failed", "timeout"])
+@pytest.mark.parametrize("mode", ["empty", "no_rows", "rows", "duplicate", "failed", "timeout"])
 async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path, mode: str) -> None:
     gw = MemoryGateway()
     async with open_llm_run(tmp_path) as run:
-        manager = _manager(gw, run, settle_timeout_s=0.05 if mode == "timeout" else 60)
+        manager = _manager(gw, run, settle_timeout_s=0.05 if mode in {"timeout", "no_rows"} else 60)
         record, _ = await _open(manager, run)
         if mode in {"rows", "duplicate"}:
             gw.rows = [_row()]
@@ -466,8 +466,12 @@ async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path,
         if mode == "timeout":
             gw.read_release = anyio.Event()
         with anyio.fail_after(30):
-            calls, status = await manager.read_with_status([record], wait_first=mode == "timeout")
-        assert status == {"failed": "failed", "timeout": "incomplete"}.get(mode, "ok")
+            calls, status = await manager.read_with_status(
+                [record], wait_first=mode in {"timeout", "no_rows"}
+            )
+        assert status == {"failed": "failed", "timeout": "incomplete", "no_rows": "no_rows"}.get(
+            mode, "ok"
+        )
         assert len(calls) == (1 if mode == "rows" else 0)
         assert SECRET not in status
         assert await manager.read_with_status([], wait_first=False) == ([], "ok")

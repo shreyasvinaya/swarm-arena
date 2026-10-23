@@ -599,8 +599,9 @@ class KeyManager:
         tuple of list of LLMCall and str
             Newly recorded observations and a value-free status: ``ok`` for a
             successful read (including empty or duplicate-only reads), ``failed``
-            for a failed gateway operation, or ``incomplete`` for polling expiry
-            or an ordinary per-row recording failure. Success does not certify
+            for a failed gateway operation, ``no_rows`` when the first-row wait
+            ends after successful empty polling, or ``incomplete`` for a timed-out
+            gateway operation or an ordinary per-row recording failure. Success does not certify
             terminal accounting or final spend completeness. Controls propagate.
 
         Examples
@@ -652,8 +653,10 @@ class KeyManager:
                 if observations or not wait_first or anyio.current_time() >= deadline:
                     break
                 await anyio.sleep(min(1.0, max(0, deadline - anyio.current_time())))
+                if anyio.current_time() >= deadline:
+                    break
             calls: list[LLMCall] = []
-            status: GatewayReadStatus = "ok"
+            status: GatewayReadStatus = "no_rows" if wait_first and not observations else "ok"
             for record, row in observations:
                 outcome = _Outcome()
                 try:

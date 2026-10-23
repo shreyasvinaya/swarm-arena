@@ -2683,6 +2683,21 @@ async def test_unkeyed_run_has_no_gateway_env(rt_env: RtEnv, fake_gateway: FakeG
     assert candidate.llm_calls_source == "none"
 
 
+async def test_keyed_run_without_calls_gets_neutral_read_note(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    tool = _report_env_tool(providers=["openai"], env=[])
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert not candidate.llm_call_ids
+    assert candidate.warnings == [
+        "LLM gateway spend read-back: no rows observed within the first-row wait; "
+        "later reads and reconcile retry"
+    ]
+
+
 async def test_function_env_only_tool_gets_gateway_key(
     rt_env: RtEnv, fake_gateway: FakeGateway
 ) -> None:
@@ -2767,6 +2782,7 @@ async def test_keyed_run_without_usd_reservation_not_dispatched(
     ) as rt:
         candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
     assert candidate.output.status == RunStatus.ERROR
+    assert candidate.llm_calls_source == "unknown"
     assert candidate.warnings[-1] == (
         "LLM gateway key needs a USD reservation above 0; give Tool.estimate() a usd value or set "
         "limits.default_run_reservation.usd"
@@ -2844,6 +2860,7 @@ async def test_gateway_failures_never_stop_the_run(
         if fault == "slow":
             short["on"] = False
         assert first.output.status == status
+        assert first.llm_calls_source == ("gateway" if dispatched else "unknown")
         assert bool(rt_env.events("tool_start")) is dispatched
         assert first.warnings
         assert "LLM gateway" in first.warnings[-1]
