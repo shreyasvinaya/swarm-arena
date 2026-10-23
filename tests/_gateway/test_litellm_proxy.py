@@ -1550,3 +1550,47 @@ async def test_invalid_cache_section_preserves_label_and_other_rows(
     assert second.usage.input_tokens == 8
     assert first.key_id == second.key_id == key.key_id
     assert first.cost_usd == second.cost_usd == 0.1
+
+
+@pytest.mark.parametrize(
+    "case", ["matching", "run", "alias", "missing", "absent", "malformed", "wrong_echo"]
+)
+async def test_key_identity_uses_key_info_metadata(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from _fakes.gateway import OfflineGatewayOpener
+
+    from swarm_arena._gateway import litellm_proxy
+
+    wire = FakeGateway()
+    monkeypatch.setattr(litellm_proxy, "build_opener", lambda *args: OfflineGatewayOpener(wire))
+    proxy = _proxy_at("http://gateway.invalid")
+    inputs: dict[str, Any] = {**CREATE, "metadata": {"run_id": "run-1"}}
+    key, _ = await proxy.create_key(**inputs)
+    if case == "run":
+        wire.keys[key.key_id]["metadata"]["run_id"] = "PRIVATE"
+    elif case == "alias":
+        wire.keys[key.key_id]["alias"] = "PRIVATE"
+    elif case == "missing":
+        wire.keys[key.key_id]["metadata"].pop("run_id")
+    elif case == "absent":
+        wire.keys.pop(key.key_id)
+    elif case in {"malformed", "wrong_echo"}:
+        wire.responses["/key/info"] = {
+            "key": "PRIVATE" if case == "wrong_echo" else key.key_id,
+            "info": {
+                "key_alias": key.alias,
+                "metadata": "PRIVATE" if case == "malformed" else {"run_id": "run-1"},
+            },
+        }
+    wire.requests.clear()
+    if case in {"malformed", "wrong_echo"}:
+        with pytest.raises(GatewayError, match=r"GET /key/info") as caught:
+            await proxy.key_matches(key, run_id="run-1")
+        assert "PRIVATE" not in str(caught.value)
+    else:
+        result = await proxy.key_matches(key, run_id="run-1")
+        assert result is (
+            True if case == "matching" else None if case in {"missing", "absent"} else False
+        )
+    assert wire.requests == [("GET", "/key/info", {"key": key.key_id})]

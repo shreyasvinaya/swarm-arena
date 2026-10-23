@@ -64,6 +64,13 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _reported_call_id(value: str) -> str:
+    """Keep tool content out of the core gateway observation namespace."""
+    if value.startswith("gw:"):
+        raise ValueError("reserved report identifier")
+    return _identifier(value)
+
+
 def _reported_usage(value: Any) -> Usage:
     """Validate nested usage without coercing booleans or numeric strings."""
     return Usage.model_validate(value, strict=True)
@@ -92,6 +99,7 @@ class LLMCallRow(StoredModel):
         Input diagnostic; the recorder retains only a fixed error description.
     litellm_call_id : str or None, default=None
         Optional printable tool-observation identity, at most 128 characters.
+        The ``gw:`` prefix is reserved for core gateway observations and refused.
         Deduplication is separate from funded component calls.
     request, response : JsonValue, default=None
         Optional finite JSON payloads, stored only with tracing consent.
@@ -111,9 +119,9 @@ class LLMCallRow(StoredModel):
     latency_ms: Annotated[float, Field(ge=0, strict=True)] | None = None
     status: Literal["ok", "error"] = "ok"
     error: str | None = None
-    litellm_call_id: Annotated[str, Field(max_length=128), AfterValidator(_identifier)] | None = (
-        None
-    )
+    litellm_call_id: (
+        Annotated[str, Field(max_length=128), AfterValidator(_reported_call_id)] | None
+    ) = None
     request: Annotated[JsonValue, AfterValidator(finite_json)] = None
     response: Annotated[JsonValue, AfterValidator(finite_json)] = None
 

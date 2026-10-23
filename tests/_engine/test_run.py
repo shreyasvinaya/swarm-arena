@@ -359,8 +359,10 @@ async def test_resume_binding_keeps_the_rebased_acquired_head_clock(
         return await acquire(*args, **kwargs)
 
     def setup(_: RunConfig) -> None:
-        setup_clocks.append(_bindings["rebase"].clock)
-        assert _bindings["rebase"].clock._before == 20.0
+        binding_clock = _bindings["rebase"].clock
+        assert binding_clock is not None
+        setup_clocks.append(binding_clock)
+        assert binding_clock._before == 20.0
 
     monkeypatch.setattr(resume_module, "RunClock", Clock)
     monkeypatch.setattr(resume_module, "_acquire_lease", race)
@@ -2515,3 +2517,252 @@ async def test_stopping_run_slow_gateway_read_finishes(
     assert len(failures) == 1
     assert failures[0].payload["error"] == "gateway read incomplete"
     assert failures[0].payload["key_id"] in fake_gateway.keys
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_run_end_reconciles_under_existing_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.adapter import GatewayError
+
+    adapter = CapableGateway()
+    adapter.rows = [spend("end", 0.03)]
+    if failure:
+        adapter.errors["block"] = GatewayError("PRIVATE")
+    monkeypatch.setattr(module, "adapter_for", lambda config, environ: adapter)
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.journal.append(created(key_record("r-end")))
+        return {}
+
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    rows = events(config, "reconcile")
+    assert len(rows) == 1
+    report = rows[0].payload["keys"][0]
+    assert report["label"] == ("estimated" if failure else "observed (completeness unverified)")
+    assert report["observed_usd"] == (None if failure else 0.03)
+    assert not events(config, "takeover")
+    assert not events(config, "settle")
+    owner = read_owner(LocalStore(Path(config.run_root) / "r-end"))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+    if failure:
+        assert any(e.payload["action"] == "close_failed" for e in events(config, "gateway_key"))
+        assert "PRIVATE" not in repr(all_events(config))
+
+
+async def test_run_end_reconcile_timeout_still_finishes_stopping_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._engine import run as module
+
+    adapter = CapableGateway()
+    entered = anyio.Event()
+
+    async def held(*args: Any) -> None:
+        entered.set()
+        await anyio.sleep_forever()
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.journal.append(created(key_record(deps.run_id)))
+        deps.stops.stop = True
+        return {}
+
+    monkeypatch.setattr(adapter, "block_key", held)
+    monkeypatch.setattr(module, "adapter_for", lambda config, environ: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    with anyio.fail_after(60):
+        assert await runner.run() == {}
+    assert entered.is_set()
+    assert events(config, "reconcile")[0].payload["keys"][0]["label"] == "estimated"
+    assert any(e.payload["action"] == "close_failed" for e in events(config, "gateway_key"))
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+async def test_run_end_unrepresentable_spend_still_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.reports import ReconcileReport
+
+    adapter = CapableGateway()
+    costs = [1_000_000_000.0] * 10 + [0.000001]
+    records = [
+        key_record("r-end", key_id=f"hash-{n}", candidate_id=f"c-{n}")
+        for n in range(11 if aggregate else 1)
+    ]
+    adapter.rows = [
+        spend(str(n), cost, key_id=records[n if aggregate else 0].key_id)
+        for n, cost in enumerate(costs)
+    ]
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.gateway.restore([deps.journal.append(created(record)) for record in records])
+        return {}
+
+    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    [event] = events(config, "reconcile")
+    report = ReconcileReport.model_validate(event.payload)
+    assert report.total_label == "estimated"
+    assert report.spend_usd() == (11 if aggregate else 1)
+    assert len(report.keys) == len(records)
+    if not aggregate:
+        assert report.keys[0].reasons == ["unsupported gateway observation"]
+        assert not adapter.deleted
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+    assert not events(config, "settle")
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "invariant", "group"])
+async def test_run_end_optional_reconcile_failure_still_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._errors import _core_error
+    from swarm_arena._gateway import reconcile
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    adapter = CapableGateway()
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        event = deps.journal.append(created(key_record("r-end")))
+        deps.gateway.restore([event])
+        return {}
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if failure == "invariant":
+            raise _core_error(ValueError, "gateway candidate has multiple keys")
+        if failure == "group":
+            raise ExceptionGroup("PRIVATE", [ValueError("PRIVATE")])
+        raise RuntimeError("PRIVATE")
+
+    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    monkeypatch.setattr(reconcile, "reconcile_keys", fail)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    failures = [
+        event for event in events(config, "gateway_key") if event.payload["action"] == "read_failed"
+    ]
+    assert len(failures) == 1
+    row = GatewayKeyFailure.model_validate(
+        {key: value for key, value in failures[0].payload.items() if key != "run_elapsed_s"}
+    )
+    assert (row.key_id, row.candidate_id, row.error) == ("hash-1", "c-1", "gateway read failed")
+    assert "PRIVATE" not in repr(all_events(config))
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "fenced",
+        "terminal",
+        "storage",
+        "storage_group",
+        "control_group",
+        "hard_group",
+        "caller_cancel",
+    ],
+)
+async def test_run_end_reconcile_preserves_control_and_storage_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import asyncio
+
+    from _fakes.llm_run import open_llm_run
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._errors import StorageError, _core_error, _SignalCategory
+    from swarm_arena._gateway import reconcile
+    from swarm_arena._gateway.keys import KeyManager
+
+    error: BaseException
+    if failure == "fenced":
+        error = _core_error(Fenced, "run ownership lost")
+    elif failure == "terminal":
+        error = _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL)
+    elif failure == "storage":
+        error = _core_error(StorageError, "storage unavailable")
+    elif failure == "storage_group":
+        error = ExceptionGroup("group", [_core_error(StorageError, "storage unavailable")])
+    elif failure == "control_group":
+        error = BaseExceptionGroup(
+            "group",
+            [
+                asyncio.CancelledError(),
+                _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL),
+            ],
+        )
+    else:
+        error = BaseExceptionGroup("hard", [KeyboardInterrupt(), ValueError("PRIVATE")])
+
+    entered = anyio.Event()
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if failure == "caller_cancel":
+            entered.set()
+            await anyio.sleep_forever()
+        raise error
+
+    monkeypatch.setattr(reconcile, "reconcile_keys", fail)
+    config = config_at(tmp_path)
+    async with open_llm_run(tmp_path, config=config) as run:
+        adapter = CapableGateway()
+        assert config.llm_gateway is not None
+        manager = KeyManager(
+            adapter,
+            config.llm_gateway,
+            cap="soft",
+            journal=run.journal,
+            settle_timeout_s=0,
+            run_id=run.run_id,
+        )
+        event = run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        manager.restore([event])
+        runner = RunRunner(config, [], run_id=run.run_id, approve=None, replanner=None)
+        runner._gateway = Mock(adapter=adapter, profile=adapter.profile)
+        deps = Mock(
+            config=config, journal=run.journal, store=run.store, gateway=manager, run_id=run.run_id
+        )
+        if failure == "caller_cancel":
+            task = asyncio.create_task(runner._reconcile_gateway(deps))
+            try:
+                with anyio.fail_after(60):
+                    await entered.wait()
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+            finally:
+                task.cancel()
+                with anyio.fail_after(60):
+                    await asyncio.gather(task, return_exceptions=True)
+        else:
+            expected = RuntimeError if failure == "control_group" else type(error)
+            with pytest.raises(expected):
+                await runner._reconcile_gateway(deps)
+        await run.journal.commit()
+        assert not [
+            event for event in run.events("gateway_key") if event.payload["action"] == "read_failed"
+        ]

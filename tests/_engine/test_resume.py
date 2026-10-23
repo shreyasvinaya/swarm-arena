@@ -3700,3 +3700,57 @@ def test_resume_gateway_identity_ignores_userinfo_but_checks_failure_events() ->
     assert _check(state, same) == []
     with pytest.raises(ConfigError, match=r"^llm_gateway$"):
         _check(state, original.model_copy(update={"llm_gateway": None}))
+
+
+async def test_resume_gateway_closure_has_one_overall_allowance(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.gateway import FakeGateway
+    from _fakes.reconcile import CapableGateway
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    fake = FakeGateway()
+    fake.url = "http://gateway.invalid"
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake, monkeypatch)
+    adapter = CapableGateway()
+    adapter.closure = None
+    bounds: list[float] = []
+    attempted: list[tuple[str, float]] = []
+    original = module._gateway_deadline
+
+    def allowance(journal: JournalWriter, *, timeout_s: float | None = None) -> float:
+        deadline = min(original(journal, timeout_s=timeout_s), anyio.current_time() + 3)
+        bounds.append(deadline)
+        return deadline
+
+    async def held(key: VirtualKey) -> None:
+        deadline = anyio.current_effective_deadline()
+        attempted.append((key.key_id, deadline))
+        # Missing containment is observable immediately, without hanging RED.
+        if not bounds or deadline > bounds[0]:
+            return
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(module, "_gateway_deadline", allowance)
+    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(adapter, "block_key", held)
+    with anyio.fail_after(60):
+        runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+        try:
+            assert len(attempted) == 1
+            assert attempted[0][1] == bounds[0]
+            assert runner._key_manager is not None
+            records = runner._key_manager.records()
+            assert len(records) == 2
+            assert all(record.closed_at is None for record in records)
+            failures = [
+                e for e in _events(crashed, "gateway_key") if e.payload["action"] == "close_failed"
+            ]
+            assert [event.payload["key_id"] for event in failures] == [attempted[0][0]]
+        finally:
+            await runner.aclose()

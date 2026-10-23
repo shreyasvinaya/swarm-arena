@@ -66,6 +66,12 @@ class MemoryGateway:
         if self.block_error is not None:
             raise self.block_error
 
+    async def key_matches(self, key: VirtualKey, *, run_id: str) -> bool | None:
+        for index, record in enumerate(self.created, 1):
+            if key.key_id == f"hash-{index}":
+                return record["alias"] == key.alias and record["metadata"]["run_id"] == run_id
+        return None
+
     async def closed_at(self, key: VirtualKey) -> datetime | None:
         self.inspected.append(key.key_id)
         return datetime.now(UTC) if self.confirmed else None
@@ -1053,3 +1059,96 @@ async def test_restore_accepts_engine_elapsed_metadata(tmp_path: Path) -> None:
         )
         manager.restore([stamped])
         assert manager.records() == [record]
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "call",
+        "open_create",
+        "open_append",
+        "open_compensation",
+        "close_block",
+        "close_info",
+        "revoke",
+        "read",
+        "resume_close",
+    ],
+)
+async def test_key_operations_preserve_hard_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    operation: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine.run import _close_gateway
+
+    hard = control("process control")
+    raised = (
+        BaseExceptionGroup(
+            "nested hard control",
+            [
+                ValueError("ordinary"),
+                BaseExceptionGroup("inner", [hard, anyio.get_cancelled_exc_class()()]),
+            ],
+        )
+        if nested
+        else hard
+    )
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        before = run.journal._next_seq
+
+        async def fail(*args: Any, **kwargs: Any) -> Any:
+            raise raised
+
+        def fail_append(draft: EventDraft) -> Event:
+            if operation == "open_compensation":
+                raise ValueError("ordinary append failure")
+            raise raised
+
+        compensate = AsyncMock()
+        with monkeypatch.context() as patch:
+            if operation in {"open_create", "open_append"}:
+                patch.setattr(manager, "_compensate", compensate)
+            if operation == "open_create":
+                patch.setattr(gw, "create_key", fail)
+            elif operation in {"open_append", "open_compensation"}:
+                patch.setattr(run.journal, "append", fail_append)
+                if operation == "open_compensation":
+                    patch.setattr(gw, "block_key", fail)
+            elif operation == "close_info":
+                patch.setattr(gw, "closed_at", fail)
+            elif operation == "read":
+                patch.setattr(gw, "spend_rows", fail)
+            else:
+                patch.setattr(gw, "block_key", fail)
+
+            async def invoke() -> None:
+                if operation == "call":
+                    await manager._call(fail, "gateway test")
+                elif operation.startswith("open_"):
+                    await _open(manager, run, candidate_id="c-second")
+                elif operation == "read":
+                    await manager.read_with_status([record], wait_first=False)
+                elif operation == "resume_close":
+                    await _close_gateway(run.journal, manager)
+                elif operation == "revoke":
+                    await manager.revoke(record)
+                else:
+                    await manager.close(record)
+
+            with pytest.raises(BaseExceptionGroup if nested else control) as caught:
+                await invoke()
+        assert caught.value is raised
+        assert run.journal._next_seq == before
+        compensate.assert_not_awaited()
+        assert len(manager.records()) == 1
+        assert manager.records()[0].closed_at is None

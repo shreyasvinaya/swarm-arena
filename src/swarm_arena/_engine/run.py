@@ -952,6 +952,7 @@ class RunRunner:
                     result = await self._queue(deps)
                     await self._record_stops(deps)
                     await _read_gateway(deps.journal, deps.gateway)
+                    await self._reconcile_gateway(deps)
                     with anyio.CancelScope() as completion:
 
                         def stopping() -> None:
@@ -975,6 +976,46 @@ class RunRunner:
             if error is not None:
                 raise error
         return result
+
+    async def _reconcile_gateway(self, deps: EngineDeps) -> None:
+        """Reconcile under this owner; bound gateway work separately from storage."""
+        if self._gateway is None or deps.gateway is None:
+            return
+        from swarm_arena._gateway.reconcile import _key_event, reconcile_keys
+
+        assert deps.config.llm_gateway is not None
+        head = await deps.journal.commit()
+        assert head is not None
+        chain = await _read_chain(deps.store, head)
+        events = [event for _, batch in chain for event in batch]
+        deadline = _gateway_deadline(deps.journal)
+        outcome = _Outcome()
+        try:
+            await reconcile_keys(
+                events,
+                run_id=deps.run_id,
+                journal=deps.journal,
+                adapter=self._gateway.adapter,
+                executor=deps.executor,
+                gateway=deps.config.llm_gateway,
+                profile=self._gateway.profile,
+                _deadline=deadline,
+                _manager=deps.gateway,
+            )
+        except BaseExceptionGroup as error:
+            if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
+                raise
+            outcome.propagate_control(error)
+            if error.subgroup(StorageError) is not None:
+                raise
+        except (Exception, anyio.get_cancelled_exc_class()) as error:
+            outcome.propagate_control(error)
+            if isinstance(error, StorageError):
+                raise
+        else:
+            return
+        for record in deps.gateway.records():
+            _key_event(deps.journal, record, "read_failed", error="gateway read failed")
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
         await anyio.sleep(deps.clock.left(deps.config.limits.run_timeout_s))
@@ -1135,6 +1176,55 @@ async def _finish_queued_goal(
     )
 
 
+def _gateway_deadline(journal: JournalWriter, *, timeout_s: float | None = None) -> float:
+    """Bound external gateway work without spending durable completion's allowance."""
+    allowance = journal._settle_timeout_s
+    if timeout_s is not None:
+        allowance = min(allowance, timeout_s)
+    # Reserve time before an inherited deadline to publish the diagnostic. Only
+    # HTTP is timed: healthy durable recording retains its existing supervisor.
+    margin = min(0.05, journal._settle_timeout_s / 10)
+    deadline = min(
+        anyio.current_time() + allowance,
+        anyio.current_effective_deadline() - margin,
+        journal._closing_at - margin,
+    )
+    if journal._io_scope is not None:
+        deadline = min(deadline, journal._io_scope.deadline - margin)
+    return deadline
+
+
+async def _close_gateway(journal: JournalWriter, gateway: KeyManager) -> None:
+    """Bound recovery closure as a whole, retaining unvisited keys for reconcile."""
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    overall = _gateway_deadline(journal)
+    for record in gateway.records():
+        if record.closed_at is not None:
+            continue
+        deadline = min(
+            overall,
+            _gateway_deadline(journal, timeout_s=gateway._config.request_timeout_s),
+        )
+        if anyio.current_time() >= deadline:
+            break
+        closed = record
+        with anyio.move_on_at(deadline):
+            closed = await gateway.close(record)
+        if closed.closed_at is None:
+            journal.append(
+                gateway._draft(
+                    record,
+                    GatewayKeyFailure(
+                        action="close_failed",
+                        key_id=record.key_id,
+                        candidate_id=record.candidate_id,
+                        error="gateway closure unconfirmed",
+                    ).model_dump(mode="json"),
+                )
+            )
+
+
 async def _read_gateway(
     journal: JournalWriter, gateway: KeyManager | None, *, goal_id: str | None = None
 ) -> None:
@@ -1154,16 +1244,7 @@ async def _read_gateway(
         ]
     if not records:
         return
-    # Reserve time before an inherited deadline to publish the diagnostic. Only
-    # HTTP is timed: healthy durable recording retains its existing supervisor.
-    margin = min(0.05, journal._settle_timeout_s / 10)
-    deadline = min(
-        anyio.current_time() + journal._settle_timeout_s,
-        anyio.current_effective_deadline() - margin,
-        journal._closing_at - margin,
-    )
-    if journal._io_scope is not None:
-        deadline = min(deadline, journal._io_scope.deadline - margin)
+    deadline = _gateway_deadline(journal)
     token = _read_deadline.set(deadline)
     try:
         try:

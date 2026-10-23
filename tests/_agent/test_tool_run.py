@@ -3390,3 +3390,52 @@ async def test_outer_group_preserves_delivered_native_cancellation(
         task = asyncio.current_task()
         assert task is not None
         task.uncancel()
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("operation", ["create_key", "block_key"])
+async def test_keyed_gateway_hard_control_skips_cleanup_and_completion(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    operation: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+
+    hard = control("process control")
+    raised = (
+        BaseExceptionGroup(
+            "hard gateway control",
+            [
+                ValueError("ordinary"),
+                BaseExceptionGroup("nested", [hard, asyncio.CancelledError()]),
+            ],
+        )
+        if nested
+        else hard
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(tool_run, "_refund_undispatched", cleanup)
+    monkeypatch.setattr(
+        rt_env.rt.executor, "submit", AsyncMock(return_value=ToolOutput(status=RunStatus.OK))
+    )
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        assert rt.gateway is not None
+        monkeypatch.setattr(rt.gateway, "revoke", cleanup)
+        monkeypatch.setattr(rt.gateway, "_compensate", cleanup)
+        monkeypatch.setattr(rt.gateway._adapter, operation, AsyncMock(side_effect=raised))
+        with pytest.raises(BaseExceptionGroup if nested else control) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caught.value is raised
+        cleanup.assert_not_awaited()
+        assert not rt_env.events("tool_end")
+        assert not [
+            event for event in rt_env.events("gateway_key") if event.payload["action"] == "closed"
+        ]

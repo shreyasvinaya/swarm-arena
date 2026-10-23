@@ -1,11 +1,15 @@
-"""Submit unattended swarm drivers through the optional Ray Jobs API."""
+"""Submit cluster drivers and reconcile gateway keys after a run."""
 
 import argparse
+import os
 import re
 import sys
+from functools import partial
 from pathlib import Path
 
-from swarm_arena._errors import _core_error, _exception_type_name, _rebuild_core_signal
+import anyio
+
+from swarm_arena._errors import ConfigError, _core_error, _exception_type_name, _rebuild_core_signal
 
 _RAY_EXTRA_HINT = (
     "submit needs the 'ray' extra: uv add "
@@ -42,6 +46,58 @@ def register(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("run_toml", metavar="RUN_TOML")
     parser.add_argument("plans", metavar="PLAN", nargs="+")
     parser.set_defaults(handler=_submit)
+    reconcile = sub.add_parser("reconcile", help="reconcile gateway keys after a run")
+    reconcile.add_argument("run_dir", metavar="RUN_DIR", type=Path)
+    reconcile.add_argument("--config", metavar="RUN_TOML", type=Path)
+    reconcile.set_defaults(handler=_reconcile)
+
+
+async def _reconcile_async(args: argparse.Namespace) -> None:
+    """Load the addressed run's configuration and own the configured executor."""
+    from swarm_arena._engine.run import _close_executor, _start_executor
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+    from swarm_arena._gateway.reconcile import reconcile_run
+    from swarm_arena._model.run_config import RunConfig
+
+    config = await anyio.to_thread.run_sync(
+        RunConfig.load, args.config if args.config is not None else args.run_dir / "run.toml"
+    )
+    config = config.model_copy(update={"run_root": str(args.run_dir.parent)})
+    if config.llm_gateway is None:
+        raise _core_error(ConfigError, "llm_gateway")
+    adapter = adapter_for(config.llm_gateway, os.environ)
+    executor = await _start_executor(config)
+    failed, hard = True, False
+    try:
+        try:
+            report = await reconcile_run(config, args.run_dir.name, adapter, executor)
+        except FileNotFoundError:
+            raise _core_error(
+                ValueError, f"run {args.run_dir.name} has no control/owner.json"
+            ) from None
+        failed = False
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        hard = True
+        raise
+    except BaseExceptionGroup as error:
+        hard = error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+        raise
+    finally:
+        if not hard:
+            await _close_executor(executor, config, failed=failed)
+    print("candidate\tkey alias\treserved USD\tspend USD\tlabel")
+    for key in report.keys:
+        spend = key.reserved_usd if key.observed_usd is None else key.observed_usd
+        print(f"{key.candidate_id}\t{key.alias}\t{key.reserved_usd:.6f}\t{spend:.6f}\t{key.label}")
+
+
+def _reconcile(args: argparse.Namespace) -> int:
+    """Use the same local RUN_DIR addressing and interrupt owner as resume."""
+    from swarm_arena._cli.run_cmds import _interruptible
+
+    args.run_dir = args.run_dir.resolve()
+    anyio.run(_interruptible, partial(_reconcile_async, args), backend="asyncio")
+    return 0
 
 
 def _driver_files(args: argparse.Namespace) -> list[str]:

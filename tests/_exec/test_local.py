@@ -565,6 +565,35 @@ async def test_confirm_dead_unknown_boot_is_none(
 
 
 @pytest.mark.parametrize(
+    ("pid", "recorded", "current", "expected"),
+    [
+        (42, "old", "new", True),
+        (42, "same", "same", False),
+        (42, None, "new", False),
+        (42, "old", None, False),
+        (43, "old", "new", False),
+        (None, "old", "new", False),
+    ],
+)
+async def test_confirm_dead_requires_comparable_group_leader_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int | None,
+    recorded: str | None,
+    current: str | None,
+    expected: bool,
+) -> None:
+    from swarm_arena._exec import local, procinfo
+
+    monkeypatch.setattr(local, "host_id", lambda: "host:boot")
+    monkeypatch.setattr(local, "group_has_live_member", lambda group: True)
+    monkeypatch.setattr(procinfo, "process_start_time", lambda pid: current)
+    started = Job.Started(
+        kind="process", job_id="c", host_id="host:boot", pid=pid, pgid=42, start_time=recorded
+    )
+    assert await LocalExecutor().confirm_dead(started) is expected
+
+
+@pytest.mark.parametrize(
     ("staged", "declared"),
     [("p/run.py", "P/RUN.py"), ("problem/run.py", "Problem/out.txt")],
 )

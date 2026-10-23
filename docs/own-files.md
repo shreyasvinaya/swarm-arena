@@ -779,7 +779,7 @@ Only `model` is required. The supported fields are:
 | `latency_ms` | `null`; otherwise finite and nonnegative. |
 | `status` | `ok`, or `error`. |
 | `error` | `null`; the recorded event uses a fixed diagnostic rather than the supplied text. |
-| `litellm_call_id` | `null`; otherwise printable and at most 128 characters. Deduplicates tool-origin observations within the run, independently of funded manager/judge/planner/curator calls. |
+| `litellm_call_id` | `null`; otherwise printable and at most 128 characters. The `gw:` prefix is reserved for core gateway observations; such tool-reported rows are skipped as invalid. Deduplicates tool-origin observations within the run, independently of funded manager/judge/planner/curator calls. |
 | `request`, `response` | `null`; finite JSON payloads. Missing payloads produce no artifact. Present payloads are stored only when `tracing.store_payloads` is enabled. |
 
 Unknown fields are ignored. Run, candidate, role and ownership metadata always

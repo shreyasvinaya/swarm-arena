@@ -33,7 +33,6 @@ from swarm_arena._errors import (
 from swarm_arena._exec.executor import Executor, Job, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.reports import GatewayKeyFailure
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import _read_segment, read_chain
@@ -97,8 +96,8 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
     return events, RunState.from_events(events)
 
 
-def _check(state: RunState, config: RunConfig) -> list[str]:
-    """Reject intrinsic limit incompatibilities without mutating authority."""
+def _check_gateway_binding(state: RunState, config: RunConfig) -> None:
+    """Keep every journaled key attached to its original gateway without values."""
     if any(event.type == EventType.GATEWAY_KEY for event in state._events):
         old_gateway, new_gateway = state.config.llm_gateway, config.llm_gateway
         if old_gateway is None or new_gateway is None:
@@ -113,6 +112,11 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
 
         if binding(old_gateway.url) != binding(new_gateway.url):
             raise _core_error(ConfigError, "llm_gateway")
+
+
+def _check(state: RunState, config: RunConfig) -> list[str]:
+    """Reject intrinsic limit incompatibilities without mutating authority."""
+    _check_gateway_binding(state, config)
     for name in ("max_tokens", "max_usd"):
         old, new = getattr(state.config.limits, name), getattr(config.limits, name)
         if new is not None and (old is None or new < old):
@@ -383,21 +387,7 @@ class _ResumeServices:
                                         )
                                     )
                                 if gateway is not None:
-                                    for record in gateway.records():
-                                        if record.closed_at is None:
-                                            closed = await gateway.close(record)
-                                            if closed.closed_at is None:
-                                                journal.append(
-                                                    gateway._draft(
-                                                        record,
-                                                        GatewayKeyFailure(
-                                                            action="close_failed",
-                                                            key_id=record.key_id,
-                                                            candidate_id=record.candidate_id,
-                                                            error="gateway closure unconfirmed",
-                                                        ).model_dump(mode="json"),
-                                                    )
-                                                )
+                                    await run_module._close_gateway(journal, gateway)
                                     await run_module._read_gateway(journal, gateway)
                                 shares = weighted_shares(
                                     ledger.free(),
@@ -629,6 +619,8 @@ async def _take_over(
     review: bool = False,
     clock: Callable[[], RunClock | None] | None = None,
     stops: StopState | None = None,
+    allow_empty_head: bool = False,
+    owner_id: str | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     retain = stops is not None
@@ -641,7 +633,7 @@ async def _take_over(
                     raise FileNotFoundError(f"run {run_id} has no control/owner.json")
                 raise _core_error(ValueError, "run has no committed owner")
             doc, _ = owner
-            if doc.head is None:
+            if doc.head is None and not allow_empty_head:
                 raise _core_error(ValueError, f"run {run_id} has no committed events")
             if validate is not None:
                 await _validated_io(validate, doc)
@@ -657,7 +649,7 @@ async def _take_over(
                     partial(
                         Lease.take_over,
                         store,
-                        owner_id=uuid4().hex,
+                        owner_id=owner_id if owner_id is not None else uuid4().hex,
                         host=host_id(),
                         ttl_s=config.lease_ttl_s,
                         force=force,

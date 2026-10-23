@@ -544,3 +544,15 @@ def test_report_artifact_s3_fetch_is_bounded(monkeypatch: pytest.MonkeyPatch, ca
     else:
         assert reads == [ref.size + 1]
         assert gets[0].get("Range") == (f"bytes=0-{ref.size}" if ref.size else None)
+
+
+@pytest.mark.parametrize("status", ["ok", "error"])
+def test_report_reserves_gateway_observation_namespace(status: str) -> None:
+    import json
+
+    data = json.dumps(
+        {"model": "SECRET/model", "status": status, "litellm_call_id": "gw:PRIVATE"}
+    ).encode()
+    rows, warnings = _parsed(data)
+    assert rows == []
+    assert warnings == ["swarm/llm_calls.jsonl line 1: invalid row; line skipped"]

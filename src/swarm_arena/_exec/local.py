@@ -349,8 +349,9 @@ class LocalExecutor(Executor):
         Returns
         -------
         bool or None
-            True when no live member of the group is left, False while one
-            is, and None for a dispatch, another host, or an unknown boot.
+            True when the group has no live member or its leader has a known
+            different start time. False while alive without that proof, and
+            None for a dispatch, another host, or an unknown boot.
 
         Examples
         --------
@@ -365,7 +366,13 @@ class LocalExecutor(Executor):
             return None
         if recorded.endswith(":unknown") or recorded != await self._get_host_id():
             return None
-        return not await anyio.to_thread.run_sync(group_has_live_member, pgid)
+        if not await anyio.to_thread.run_sync(group_has_live_member, pgid):
+            return True
+        if started.pid == pgid and started.start_time is not None:
+            current = await anyio.to_thread.run_sync(procinfo.process_start_time, pgid)
+            if current is not None and current != started.start_time:
+                return True
+        return False
 
     async def kill_orphan(self, started: Job.Started) -> bool:
         """

@@ -25,6 +25,7 @@ from swarm_arena._errors import Fenced, StorageError, _core_error, _stop_cleanup
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
+from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -74,7 +75,7 @@ class _Binding:
     tracing: TracingConfig
     loop: asyncio.AbstractEventLoop
     stops: StopState
-    clock: RunClock
+    clock: RunClock | None
     limits: Limits
     settle_timeout_s: float
     seen_litellm: dict[str, str] = field(default_factory=dict)
@@ -102,6 +103,8 @@ class _Binding:
 
     def track_scope(self, scope: LLMScope) -> None:
         """Count each funded scope once until all its accounting has drained."""
+        if self.clock is None:
+            raise _core_error(ValueError, "maintenance binding refuses funded calls")
         if id(scope) not in self.scopes:
             self.scopes[id(scope)] = scope
             tranche = id(scope.tranche)
@@ -118,6 +121,10 @@ class _Binding:
         if not self.active:
             raise _core_error(Fenced, "run ownership lost")
         self.journal._raise_if_fenced()
+        if self.clock is None:
+            self.journal._check_open()
+            if self.journal._remaining() <= 0:
+                raise _core_error(Fenced, "maintenance lease is no longer held")
         if self.terminal is not None:
             raise self.terminal from None
 
@@ -146,6 +153,7 @@ def bind_run(
     clock: RunClock | None = None,
     limits: Limits | None = None,
     settle_timeout_s: float = 60,
+    _maintenance_lease: Lease | None = None,
 ) -> None:
     """Bind entered services and restore committed deduplication and cache indexes.
 
@@ -175,6 +183,9 @@ def bind_run(
         The owner's run limits, or standalone defaults.
     settle_timeout_s : float, default=60
         Report and post-stop accounting allowance.
+    _maintenance_lease : Lease or None, optional
+        Private reconcile authority. Requires this entered writer's live lease
+        and no paid-work clock; permits only external tool observations.
 
     Notes
     -----
@@ -200,6 +211,13 @@ def bind_run(
     if not math.isfinite(settle_timeout_s) or settle_timeout_s <= 0:
         raise _core_error(ValueError, "invalid settle_timeout_s")
     journal._check_open()
+    if _maintenance_lease is not None and (
+        clock is not None
+        or _maintenance_lease is not journal._lease
+        or _maintenance_lease.doc.epoch != journal.epoch
+        or journal._remaining() <= 0
+    ):
+        raise _core_error(ValueError, "maintenance binding requires the held writer lease")
     binding = _Binding(
         journal,
         ids,
@@ -207,7 +225,7 @@ def bind_run(
         tracing,
         asyncio.get_running_loop(),
         stops if stops is not None else StopState(),
-        clock if clock is not None else RunClock(0),
+        None if _maintenance_lease is not None else clock if clock is not None else RunClock(0),
         limits if limits is not None else Limits(),
         settle_timeout_s,
     )
@@ -318,6 +336,8 @@ def open_call(
     if asyncio.get_running_loop() is not binding.loop:
         raise _core_error(ValueError, "open_call requires the bound owner loop")
     binding.check()
+    if binding.clock is None:
+        raise _core_error(ValueError, "maintenance binding refuses funded calls")
     if binding.closing or any(id(owner) in binding.drained for owner in scope.lineage()):
         raise _core_error(ValueError, "LLM scope is drained")
     if scope.journal is not binding.journal or scope.artifacts is not binding.artifacts:
@@ -392,7 +412,9 @@ async def _watch_owner(
             except Exception:
                 scope.cancel()
                 return
-        left = binding.clock.left(binding.limits.run_timeout_s)
+        left = (
+            math.inf if binding.clock is None else binding.clock.left(binding.limits.run_timeout_s)
+        )
         if binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
             binding.begin_cleanup()
             if interrupt_reports:
@@ -755,6 +777,10 @@ def _owns_callback(binding: _Binding, meta: dict[str, str]) -> bool:
     """Require owner provenance before routing a late report into a successor."""
     if not binding.active:
         return False
+    if binding.clock is None:
+        # Maintenance has no funded lineage. Only explicit current-owner
+        # observations can enter; old callbacks retain their ignored outcome.
+        return meta.get("owner_epoch") == str(binding.journal.epoch)
     scope = current_llm_scope()
     if (
         scope is not None
@@ -913,6 +939,18 @@ async def _record(
     if not _owns_callback(binding, meta):
         return None
     external = kwargs.get("_external_observation", False)
+    if binding.clock is None and (
+        external is not True
+        or kwargs["settle"] is not False
+        or kwargs["charge_reservation"]
+        or meta.get("role") != "tool"
+        or "reservation_id" in meta
+        or "call_id" in meta
+        or current_llm_scope() is not None
+        or not isinstance(kwargs["litellm_call_id"], str)
+        or not kwargs["litellm_call_id"].startswith("gw:")
+    ):
+        raise _core_error(ValueError, "maintenance binding accepts only external tool observations")
     if type(external) is not bool or (external and kwargs["settle"]):
         raise _core_error(ValueError, "invalid external observation")
     entry = binding.pending.get(meta.get("reservation_id", ""))
@@ -1203,10 +1241,13 @@ async def _bound_run(
     artifacts: ArtifactStore,
     config: RunConfig,
     stops: StopState,
-    clock: RunClock,
+    clock: RunClock | None,
     state: RunState,
+    _maintenance_lease: Lease | None = None,
 ) -> AsyncGenerator[None]:
     """Bind once, then drain/close within usable services and unbind on every exit."""
+    if clock is None and _maintenance_lease is None:
+        raise _core_error(ValueError, "maintenance binding requires the held writer lease")
     bind_run(
         run_id,
         journal=journal,
@@ -1220,8 +1261,18 @@ async def _bound_run(
         clock=clock,
         limits=config.limits,
         settle_timeout_s=config.settle_timeout_s,
+        _maintenance_lease=_maintenance_lease,
     )
     binding = _bindings[run_id]
+    if _maintenance_lease is not None:
+        # There is no funded state to drain. Hard controls and cancellation
+        # therefore unbind synchronously without entering paid-work cleanup.
+        try:
+            yield
+        finally:
+            if _bindings.get(run_id) is binding:
+                unbind_run(run_id, journal=journal)
+        return
     failed = False
     try:
         yield
@@ -1235,7 +1286,7 @@ async def _bound_run(
             or binding.stops.stop
             or binding.stops.stop_now
             or binding.stops.run_timeout
-            or binding.clock.left(binding.limits.run_timeout_s) <= 0
+            or (binding.clock is not None and binding.clock.left(binding.limits.run_timeout_s) <= 0)
         ):
             binding.begin_cleanup()
         failure: BaseException | None = None

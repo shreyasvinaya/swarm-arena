@@ -412,6 +412,8 @@ class FakeGateway:
                     {
                         "key": key_id,
                         "info": {
+                            "key_alias": row["alias"],
+                            "metadata": row["metadata"],
                             "blocked": row["blocked"],
                             "status": "deleted"
                             if row["deleted"]
@@ -453,3 +455,33 @@ class FakeGateway:
             data.update(self.page_overrides.get(page, {}))
             return 200, data, {}
         return 404, {"detail": "Not Found"}, {}
+
+
+class OfflineGatewayOpener:
+    """Route production urllib Requests through the fake without opening sockets."""
+
+    def __init__(self, gateway: FakeGateway) -> None:
+        self.gateway = gateway
+
+    def open(self, request: Any, *, timeout: float) -> Any:
+        import io
+        from email.message import Message
+        from urllib.error import HTTPError
+
+        parsed = urlsplit(request.full_url)
+        body = (
+            json.loads(request.data)
+            if request.data
+            else {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        )
+        auth = request.get_header("Authorization")
+        self.gateway.requests.append((request.method, parsed.path, body))
+        status, payload, _ = self.gateway._route(request.method, parsed.path, body, auth)
+        data = json.dumps(payload).encode()
+        response: Any = io.BytesIO(data)
+        response.status = status
+        response.headers = Message()
+        response.headers["Content-Length"] = str(len(data))
+        if status >= 400:
+            raise HTTPError(request.full_url, status, "", response.headers, response)
+        return response

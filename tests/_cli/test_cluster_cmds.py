@@ -16,6 +16,83 @@ from swarm_arena._cli import cluster_cmds
 from swarm_arena._cli.main import main
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_reconcile_cmd_prints_labels_and_uses_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: bool,
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, seed_run
+
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._model.settings import GatewayConfig
+
+    config = config_at(tmp_path)
+    anyio.run(seed_run, config)
+    run_dir = Path(config.run_root) / "r-reconcile"
+    path = tmp_path / "override.toml" if override else run_dir / "run.toml"
+    path.write_text(config.model_copy(update={"run_root": str(tmp_path / "wrong")}).dumps())
+    adapter = CapableGateway()
+    adapter.profile = adapter.profile.model_copy(
+        update={"verified": False, "failures": ("unverified",), "request_timeout_s": None}
+    )
+    configured: list[GatewayConfig] = []
+
+    def build(gateway: GatewayConfig, env: Mapping[str, str]) -> Any:
+        configured.append(gateway)
+        return adapter
+
+    monkeypatch.setattr(litellm_proxy, "adapter_for", build)
+    args = ["reconcile", str(run_dir)] + (["--config", str(path)] if override else [])
+    assert main(args) == 0
+    captured = capsys.readouterr()
+    assert "estimated" in captured.out
+    assert "cand-c-1" in captured.out
+    assert "reserved USD" in captured.out
+    assert "spend USD" in captured.out
+    assert "1.000000" in captured.out
+    assert captured.err == ""
+    assert configured == [config.llm_gateway]
+    assert not (tmp_path / "wrong").exists()
+
+
+def test_reconcile_cmd_live_owner_exits_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at
+
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena._store.local import LocalStore
+
+    config = config_at(tmp_path)
+    run_dir = Path(config.run_root) / "r-reconcile"
+    lease = Lease.acquire_new(LocalStore(run_dir), owner_id="live", host="h", ttl_s=60)
+    (run_dir / "run.toml").write_text(config.dumps())
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: CapableGateway())
+    try:
+        assert main(["reconcile", str(run_dir)]) == 1
+        assert "has a live owner" in capsys.readouterr().err
+    finally:
+        lease.release()
+
+
+def test_reconcile_cmd_missing_gateway_is_safe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from swarm_arena import RunConfig
+
+    run_dir = tmp_path / "r-reconcile"
+    run_dir.mkdir()
+    (run_dir / "run.toml").write_text(RunConfig().dumps())
+    assert main(["reconcile", str(run_dir)]) == 1
+    assert capsys.readouterr().err == "llm_gateway\n"
+
+
 def test_submit_without_yes_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["submit", "run.toml", "plan.toml"]) == 2
     captured = capsys.readouterr()
