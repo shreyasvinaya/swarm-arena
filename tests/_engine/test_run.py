@@ -2251,3 +2251,89 @@ async def test_resume_preparation_sees_schedule_timeout(
         await module.resume_run(cfg, "existing", force=False, replanner=None)
     assert observed == [42.0]
     assert current_schedule_timeout() is None
+
+
+@pytest.mark.parametrize("hard", [False, True])
+async def test_run_gateway_preflight_precedes_keys_and_manifest(
+    run_config: RunConfig,
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    hard: bool,
+) -> None:
+    from swarm_arena._engine import run as module
+    from swarm_arena.config import GatewayConfig
+
+    constructed: list[Any] = []
+    adapters: list[Any] = []
+    original_manager, original_adapter = module.KeyManager, module.adapter_for
+
+    def manager(*args: Any, **kwargs: Any) -> Any:
+        kwargs["journal"]._check_open()
+        result = original_manager(*args, **kwargs)
+        constructed.append(result)
+        return result
+
+    def adapter(*args: Any, **kwargs: Any) -> Any:
+        result = original_adapter(*args, **kwargs)
+        adapters.append(result)
+        return result
+
+    monkeypatch.setattr(module, "KeyManager", manager)
+    monkeypatch.setattr(module, "adapter_for", adapter)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=hard),
+        }
+    )
+    runner = RunRunner(config, [], run_id="r-gateway", approve=None, replanner=None)
+    if hard:
+        with pytest.raises(ValueError, match="strict profile not verified"):
+            await runner.run()
+        assert constructed == []
+        assert not await anyio.Path(config.run_root, "r-gateway", "manifest.json").exists()
+        assert not await anyio.Path(config.run_root, "r-gateway", "control", "owner.json").exists()
+    else:
+        assert await runner.run() == {}
+        assert len(constructed) == len(adapters) == 1
+        assert runner._gateway is not None
+        assert runner._gateway.adapter is adapters[0]
+        assert runner._gateway.profile.verified is False
+        assert runner._key_manager is constructed[0]
+        assert constructed[0]._adapter is adapters[0]
+        assert constructed[0]._journal is runner._journal
+        assert constructed[0]._run_id == "r-gateway"
+        manifest = json.loads(
+            await anyio.Path(config.run_root, "r-gateway", "manifest.json").read_bytes()
+        )
+        event_manifest = events(config, "run_started")[0].payload["manifest"]
+        assert manifest == event_manifest
+        assert manifest["llm_gateway"] == {
+            "url": fake_gateway.url,
+            "cap": "soft",
+            "verified": False,
+            "failures": list(runner._gateway.profile.failures),
+            "terminal_accounting": False,
+        }
+        assert fake_gateway.master_key not in json.dumps(manifest)
+        async for path in anyio.Path(config.run_root, "r-gateway").rglob("*"):
+            if await path.is_file():
+                assert fake_gateway.master_key.encode() not in await path.read_bytes()
+    assert len(adapters) == 1
+    assert not fake_gateway.keys
+    assert [path for _, path, _ in fake_gateway.requests] == ["/health/liveliness", "/model/info"]
+
+
+async def test_run_without_gateway_constructs_no_services(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._engine import run as module
+
+    factory = Mock(side_effect=AssertionError("unexpected gateway"))
+    monkeypatch.setattr(module, "adapter_for", factory)
+    runner = RunRunner(run_config, [], run_id="r-no-gateway", approve=None, replanner=None)
+    assert await runner.run() == {}
+    assert runner._gateway is runner._key_manager is None
+    assert events(run_config, "run_started")[0].payload["manifest"]["llm_gateway"] is None
+    factory.assert_not_called()

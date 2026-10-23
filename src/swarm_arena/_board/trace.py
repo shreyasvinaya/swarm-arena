@@ -9,7 +9,7 @@ from swarm_arena._board.leaderboard import format_value
 from swarm_arena._journal.event import EventType
 from swarm_arena._journal.lease import Head
 from swarm_arena._journal.reader import read_chain
-from swarm_arena._journal.replay import RunState
+from swarm_arena._journal.replay import RunState, _GatewayKey, _GatewaySpend
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.plan import Plan
@@ -250,6 +250,8 @@ def _lines(
     revisions: Sequence[Plan],
     calls: Mapping[str, Mapping[str, LLMCall]],
     sessions: Mapping[str, _SessionCalls | None],
+    gateway_keys: Mapping[tuple[str, str], _GatewayKey],
+    gateway_reconcile: Mapping[tuple[str, str], _GatewaySpend],
 ) -> list[str]:
     """Render one committed candidate without consulting process-local hints."""
     plan, origin = _historical_plan(cache, frontier, candidate, seq, revisions)
@@ -310,6 +312,18 @@ def _lines(
         f"parents={parents} usage=in:{usage.input_tokens} out:{usage.output_tokens} "
         f"usd:{format_value(usage.usd)}",
     )
+    for identity, key in gateway_keys.items():
+        if key.candidate_id != candidate.id:
+            continue
+        lines.append(
+            f"gateway key {key.alias}: max_budget {key.max_budget_usd:.2f} USD, cap {key.cap}"
+        )
+        report = gateway_reconcile.get(identity)
+        if report is not None:
+            if report.observed_usd is None:
+                lines.append(f"gateway spend {report.reserved_usd:.2f} USD (estimated)")
+            else:
+                lines.append(f"gateway spend {report.observed_usd:.4f} USD ({report.label})")
     emit(
         candidate.run_id,
         (call.id for call in run_calls.values() if call.candidate_id == candidate.id),

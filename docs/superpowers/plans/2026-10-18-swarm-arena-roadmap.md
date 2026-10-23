@@ -284,7 +284,7 @@ Rules [plan]:
 | `_journal/writer.py` | `JournalWriter` (one writer task, group commit, unknown results) | M1b | `tests/_journal/test_writer.py` |
 | `_journal/reader.py` | `read_chain` with the chain check | M1b | `tests/_journal/test_reader.py` |
 | `_journal/views.py` | `ViewWriter`, source-head embedding | M1b +M2 | `tests/_journal/test_views.py` |
-| `_journal/replay.py` | `RunState`: pure fold of committed events, including dispatch intents | M1b +M2 +M4 | `tests/_journal/test_replay.py` |
+| `_journal/replay.py` | `RunState`: pure fold of committed events, including dispatch intents and gateway projections | M1b +M2 +M4 | `tests/_journal/test_replay.py` |
 | `_journal/a2a.py` | A2A `Task` and `Artifact` records for tool runs and agent rounds | M1b | `tests/_journal/test_a2a.py` |
 | `_journal/llm_record.py` | `bind_run`, `record_call` (R4.13.19). Core module: no optional import | M3 +M4 | `tests/_journal/test_llm_record.py` |
 | `_budget/__init__.py` | Empty | M1b | — |
@@ -315,8 +315,8 @@ Rules [plan]:
 | `_board/frontier.py` | Build frontiers (this run's mark in M1b, every run read in M2). It does not commit: `_engine/round.py` journals them | M1b +M2 | `tests/_board/test_frontier.py` |
 | `_board/digest.py` | Digest builder with the token cap | M1b +M2 +M3 | `tests/_board/test_digest.py` |
 | `_board/curator.py` | `Curator` ABC and the round-end hook | M2 | `tests/_board/test_curator.py` |
-| `_board/arena.py` | `ArenaBoard` | M2 | `tests/_board/test_arena.py` |
-| `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier | M2 | `tests/_board/test_cache.py` |
+| `_board/arena.py` | `ArenaBoard`, captured gateway projection | M2 +M4 | `tests/_board/test_arena.py` |
+| `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier, detached gateway projection | M2 +M4 | `tests/_board/test_cache.py` |
 | `_board/ingest.py` | Incremental chain download into the cache | M2 | `tests/_board/test_ingest.py` |
 | `_board/pointers.py` | `runs/<run-id>.json` pointers | M2 | `tests/_board/test_pointers.py` |
 | `_board/human_objects.py` | Review and curation objects and their fixed order | M2 | `tests/_board/test_human_objects.py` |
@@ -325,11 +325,11 @@ Rules [plan]:
 | `_board/leaderboard.py` | `Row` building, `min_improvement` | M2 | `tests/_board/test_leaderboard.py` |
 | `_board/pages.py` | Round pages | M2 | `tests/_board/test_pages.py` |
 | `_board/serve.py` | Board viewer (stdlib HTTP server) | M2 +M3 | `tests/_board/test_serve.py` |
-| `_board/trace.py` | `trace` chain | M2 +M3 | `tests/_board/test_trace.py` |
+| `_board/trace.py` | `trace` chain, committed gateway cap and spend | M2 +M3 +M4 | `tests/_board/test_trace.py` |
 | `_board/reindex.py` | Cache rebuild | M2 | `tests/_board/test_reindex.py` |
 | `_engine/__init__.py` | Empty | M1b | — |
 | `_engine/swarm.py` | `Swarm` facade | M1b | `tests/_engine/test_swarm.py` |
-| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3); inherited schedule-timeout scope (+M4) | M1b +M2 +M3 +M4 | `tests/_engine/test_run.py` |
+| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3); inherited schedule-timeout scope and run-owned gateway construction (+M4) | M1b +M2 +M3 +M4 | `tests/_engine/test_run.py` |
 | `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
 | `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
@@ -338,7 +338,7 @@ Rules [plan]:
 | `_engine/converge.py` | Select and team converge, final judge call | M1b | `tests/_engine/test_converge.py` |
 | `_engine/solution.py` | `solution.json` view, `NO_RESULT` | M1b | `tests/_engine/test_solution.py` |
 | `_engine/preflight.py` | Preflight per distinct tool config; storage checks, `check_storage` (+M2, R4.13.13); gateway (+M4) | M1b +M2 +M4 | `tests/_engine/test_preflight.py` |
-| `_engine/manifest.py` | `manifest.json` | M1b | `tests/_engine/test_manifest.py` |
+| `_engine/manifest.py` | `manifest.json`, validated optional gateway evidence | M1b +M4 | `tests/_engine/test_manifest.py` |
 | `_engine/control.py` | Stop files (one pair per epoch, R4.13.13), status report | M1b | `tests/_engine/test_control.py` |
 | `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed`; inherited schedule-timeout scope | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
 | `_cli/__init__.py` | Empty | M1a | — |
@@ -2503,13 +2503,19 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     # Admitted later revisions use this same preflight before dispatch. User construction/hooks use run_sync_daemon;
     # failures aggregate reference paths and exception types only.
 def build_manifest(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
-                   capacity: Resources | None) -> dict[str, Any]: ...  # _engine/manifest.py; synchronous callers only
+                   capacity: Resources | None,
+                   llm_gateway: _GatewayManifest | dict[str, Any] | None = None) -> dict[str, Any]: ...  # _engine/manifest.py; synchronous callers only
 async def build_manifest_async(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
-                              capacity: Resources | None) -> dict[str, Any]: ...  # supported async entry point
+                              capacity: Resources | None,
+                              llm_gateway: _GatewayManifest | dict[str, Any] | None = None) -> dict[str, Any]: ...  # supported async entry point
     # Tool identity config validation/serialization uses run_sync_daemon, then bounded host/git work uses to_thread.
     # Async callers must use build_manifest_async; never offload the whole sync builder to an ordinary AnyIO worker.
     # Validated JSON-mode RunManifest dump, with nulls preserved. Hash deterministic UTF-8 config/plan TOML dumps;
     # record GoalKey.files_sha256, base-ref tool identities (catalog settable fields excluded), and bounded git probes.
+    # llm_gateway defaults to null for backward reads. Otherwise: url without userinfo/query/fragment,
+    # cap hard|soft, verified bool, failures list[str], terminal_accounting bool. Cap is hard iff verified;
+    # failures are empty iff verified. Copied model instances are revalidated before serialization.
+    # One validated dump is used for manifest.json and run_started; no credential values.
 class GoalStatus(FrozenModel):
     status: str; round: int; rounds_total: int; candidates: int; best: float | None
     # best is the current main group's best ranking Score.value, or None when absent/non-scalar or unjoined.
@@ -2657,8 +2663,30 @@ class GatewayAdapter(Protocol):
     async def closed_at(self, key: VirtualKey) -> datetime | None: ...   # closure time T, confirmed by the API
     async def spend_rows(self, key: VirtualKey, *, start: datetime, end: datetime) -> list[SpendRow]: ...
     async def delete_key(self, key: VirtualKey) -> None: ...
+async def gateway_preflight(config: RunConfig, adapter: GatewayAdapter) -> tuple[Literal["hard", "soft"], ProfileReport]: ...
+    # _engine/preflight.py: verified => hard; otherwise hard_cap_required(limits) refuses before key creation.
+    # Pinned LiteLLM is always unverified/soft; max_usd defaults to requiring hard, so needs explicit false.
 async def reconcile_run(config: RunConfig, run_id: str, adapter: GatewayAdapter, executor: Executor) -> ReconcileReport: ...
 ```
+
+Run construction uses `_engine/run.py::_prepare_gateway(config)` before ownership,
+returning `_GatewaySetup(adapter, profile, manifest)` or None; `cap` reads the
+validated manifest. `_bind_gateway(setup, config, journal, run_id)` constructs
+one KeyManager under the entered writer. The runner retains `_gateway` and
+`_key_manager`. Runtime delivery and resume restoration reuse these instances
+and seams; no additional writer, recorder binding, watcher or cleanup timer.
+
+Committed trace projection: `RunState.gateway_keys[(candidate_id, key_id)]`
+retains `gateway_key` action `created` fields `candidate_id`, `key_id`, `alias`,
+`max_budget_usd`, `cap`. `RunState.gateway_reconcile` retains the latest report
+per same identity from `reconcile` payload `{run_id, keys: [...]}`. Each report
+row carries `candidate_id`, `key_id`, `alias`, `reserved_usd`, `observed_usd`,
+`label`, `reasons`, `deleted`; the projection keeps only display fields.
+`observed_usd` is null exactly for `estimated`; other labels are `observed` and
+`observed (completeness unverified)`. Amounts are finite nonnegative numbers.
+A foreign payload run_id is rejected. Cache publication detaches both maps at
+the captured frontier; ArenaBoard retains them by producing run and passes
+only that candidate's run to trace. Renderers do not scan events or refresh.
 
 All gateway models use the safe frozen base. `ProfileReport.failures` is an
 immutable tuple (a JSON array on the wire); `verified` must equal `not failures`,

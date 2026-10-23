@@ -32,6 +32,7 @@ from swarm_arena._board.pointers import (
 )
 from swarm_arena._errors import StorageError, _core_error
 from swarm_arena._journal.lease import Head, read_owner
+from swarm_arena._journal.replay import _GatewayKey, _GatewaySpend
 from swarm_arena._model.board_types import Frontier, LineageGraph, Row
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.goal import GoalKey
@@ -92,6 +93,8 @@ class _RunPlans:
     revisions: dict[str, tuple[Plan, ...]]
     current: dict[str, Plan]
     calls: dict[str, LLMCall]
+    gateway_keys: dict[tuple[str, str], _GatewayKey]
+    gateway_reconcile: dict[tuple[str, str], _GatewaySpend]
 
 
 @dataclass(frozen=True)
@@ -336,7 +339,9 @@ class ArenaBoard(Board):
             progress = state.goals[goal_id]
             round = max(1, progress.round, progress.rounds_closed + 1)
             current[goal_id] = state.plan_for_round(goal_id, round)
-        result = _RunPlans(revisions, current, state.llm_calls)
+        result = _RunPlans(
+            revisions, current, state.llm_calls, state.gateway_keys, state.gateway_reconcile
+        )
         self._run_plans[key] = (mark.model_copy(deep=True), result)
         return result
 
@@ -1725,6 +1730,8 @@ class _ArenaReader:
                         revisions,
                         {run: projection.calls for run, projection in self._state.plans.items()},
                         sessions,
+                        self._state.plans[candidate.run_id].gateway_keys,
+                        self._state.plans[candidate.run_id].gateway_reconcile,
                     )
         raise KeyError(identifier)
 

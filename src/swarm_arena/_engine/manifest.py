@@ -6,13 +6,15 @@ import subprocess
 from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Annotated, Any, ClassVar, Literal, Self
+from urllib.parse import urlsplit
 
 import anyio
+from pydantic import Field, field_validator, model_validator
 
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._model.base import StoredModel
+from swarm_arena._model.base import FrozenModel, StoredModel
 from swarm_arena._model.canonical import UtcDatetime, format_utc, sha256_hex, utc_now
 from swarm_arena._model.data import FiniteJsonObject, Sha256
 from swarm_arena._model.plan import Plan, Resources
@@ -20,6 +22,42 @@ from swarm_arena._model.run_config import RunConfig
 from swarm_arena._planning.catalog_check import find_entry
 from swarm_arena._tooling.staging import tool_identity
 from swarm_arena._version import __version__
+
+
+class _GatewayManifest(FrozenModel):
+    """Retain validated capability evidence without credential-bearing URLs."""
+
+    url: Annotated[str, Field(strict=True)]
+    cap: Literal["hard", "soft"]
+    verified: Annotated[bool, Field(strict=True)]
+    failures: tuple[Annotated[str, Field(strict=True)], ...]
+    terminal_accounting: Annotated[bool, Field(strict=True)]
+
+    @field_validator("url")
+    @classmethod
+    def _safe_url(cls, value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or any(c.isspace() or ord(c) < 32 for c in value)
+            ):
+                raise ValueError
+            _ = parsed.port
+        except ValueError:
+            raise ValueError("invalid gateway url") from None
+        return value
+
+    @model_validator(mode="after")
+    def _consistent_cap(self) -> Self:
+        if self.verified != (not self.failures) or self.verified != (self.cap == "hard"):
+            raise ValueError("gateway cap conflicts with profile verification")
+        return self
 
 
 class RunManifest(StoredModel):
@@ -50,6 +88,8 @@ class RunManifest(StoredModel):
         Plan goal identifiers, revisions, content hashes and file hashes.
     tools : list[dict[str, Any]]
         Reference paths, base identities and nullable git commits.
+    llm_gateway : _GatewayManifest or None, default=None
+        Secret-free gateway URL, cap label and verified profile evidence.
 
     Examples
     --------
@@ -66,6 +106,13 @@ class RunManifest(StoredModel):
     run_config_sha256: Sha256
     plans: list[FiniteJsonObject]
     tools: list[FiniteJsonObject]
+    llm_gateway: _GatewayManifest | None = None
+
+    @field_validator("llm_gateway", mode="before")
+    @classmethod
+    def _gateway_fields(cls, value: Any) -> Any:
+        """Revalidate copied instances without invoking a potentially unsafe serializer."""
+        return dict(vars(value)) if isinstance(value, _GatewayManifest) else value
 
 
 def _git_commit(base_dir: Path) -> str | None:
@@ -86,7 +133,12 @@ def _git_commit(base_dir: Path) -> str | None:
 
 
 def build_manifest(
-    *, run_id: str, config: RunConfig, plans: Sequence[Plan], capacity: Resources | None
+    *,
+    run_id: str,
+    config: RunConfig,
+    plans: Sequence[Plan],
+    capacity: Resources | None,
+    llm_gateway: _GatewayManifest | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Record run versions, host profile, configuration hashes and base tool identity.
@@ -103,6 +155,8 @@ def build_manifest(
         and catalog settable fields, independent of round overrides.
     capacity : Resources or None
         Executor-reported capacity, or None when unavailable.
+    llm_gateway : _GatewayManifest or dict or None, default=None
+        Validated preflight evidence, absent when no gateway is configured.
 
     Returns
     -------
@@ -133,11 +187,17 @@ def build_manifest(
         plans=plans,
         capacity=capacity,
         identities=_tool_identities(config, plans),
+        llm_gateway=llm_gateway,
     )
 
 
 async def build_manifest_async(
-    *, run_id: str, config: RunConfig, plans: Sequence[Plan], capacity: Resources | None
+    *,
+    run_id: str,
+    config: RunConfig,
+    plans: Sequence[Plan],
+    capacity: Resources | None,
+    llm_gateway: _GatewayManifest | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build run provenance with abandonable user configuration hooks.
@@ -153,6 +213,8 @@ async def build_manifest_async(
         and catalog settable fields, independent of round overrides.
     capacity : Resources or None
         Executor-reported capacity, or None when unavailable.
+    llm_gateway : _GatewayManifest or dict or None, default=None
+        Validated preflight evidence, absent when no gateway is configured.
 
     Returns
     -------
@@ -185,6 +247,7 @@ async def build_manifest_async(
             plans=plans,
             capacity=capacity,
             identities=identities,
+            llm_gateway=llm_gateway,
         )
     )
 
@@ -213,6 +276,7 @@ def _build_manifest(
     plans: Sequence[Plan],
     capacity: Resources | None,
     identities: Sequence[Sequence[tuple[str, str]]],
+    llm_gateway: _GatewayManifest | dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble host provenance using already resolved tool identities."""
     tools: list[FiniteJsonObject] = []
@@ -245,4 +309,9 @@ def _build_manifest(
             for plan in plans
         ],
         tools=tools,
+        llm_gateway=_GatewayManifest.model_validate(
+            dict(vars(llm_gateway)) if isinstance(llm_gateway, _GatewayManifest) else llm_gateway
+        )
+        if llm_gateway is not None
+        else None,
     ).model_dump(mode="json")

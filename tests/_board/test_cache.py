@@ -2615,3 +2615,30 @@ def test_cache_has_no_unused_projection_or_legacy_read_methods(tmp_path: Path) -
         )
     finally:
         cache.close()
+
+
+def test_committed_gateway_projection_is_detached(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._board.ingest import ingest_run
+    from swarm_arena._model.board_types import Frontier
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), gateway_key(), reconcile())
+    cache = ArenaCache(tmp_path / "gateway.sqlite")
+    try:
+        ingest_run(cache, run.store, "r1", run.run_root, head)
+        mark = Frontier.Mark(run_id="r1", run_root=run.run_root, **head.model_dump())
+        old = cache._committed_state(mark)
+        head2 = run.commit(reconcile(observed=0.25, label="observed"))
+        ingest_run(cache, run.store, "r1", run.run_root, head2)
+        new = cache._committed_state(mark.model_copy(update=head2.model_dump()))
+        key = ("c-1", "hash-1")
+        assert old.gateway_reconcile[key].observed_usd is None
+        assert new.gateway_reconcile[key].observed_usd == 0.25
+        new.gateway_keys.clear()
+        assert old.gateway_keys[key].cap == "soft"
+        assert cache._committed_state(mark).gateway_reconcile[key].observed_usd is None
+    finally:
+        cache.close()

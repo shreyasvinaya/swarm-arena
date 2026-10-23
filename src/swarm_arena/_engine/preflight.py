@@ -1,7 +1,7 @@
 """Check component prerequisites for admitted plan configurations."""
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 
@@ -10,6 +10,7 @@ from swarm_arena._board.arena import _effective_arena_root
 from swarm_arena._errors import ConfigError, StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.plan import Plan, RoundSpec
 from swarm_arena._model.ref import Ref
@@ -22,6 +23,56 @@ from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 _Component = Tool | Manager | Check | Judge
 _Site = tuple[Ref, type[_Component], Mapping[str, Any] | None]
+
+
+async def gateway_preflight(
+    config: RunConfig, adapter: GatewayAdapter
+) -> tuple[Literal["hard", "soft"], ProfileReport]:
+    """Check gateway evidence before constructing the run's key owner.
+
+    Parameters
+    ----------
+    config : RunConfig
+        Gateway policy; a dollar limit requires a hard cap by default.
+    adapter : GatewayAdapter
+        Run-owned adapter with bounded, cancellable preflight operations.
+
+    Returns
+    -------
+    tuple of str and ProfileReport
+        Hard for verified evidence, otherwise soft when policy permits it.
+
+    Raises
+    ------
+    ValueError
+        If no gateway is configured or required strict evidence is missing.
+    RuntimeError
+        If preflight fails. Ordinary failures contain only the exception type;
+        registered terminal controls and genuine cancellation propagate.
+
+    Examples
+    --------
+    >>> import inspect
+    >>> inspect.iscoroutinefunction(gateway_preflight)
+    True
+    """
+    if config.llm_gateway is None:
+        raise _core_error(ValueError, "llm_gateway is required")
+    outcome = _Outcome()
+    try:
+        result = await adapter.preflight()
+        report = ProfileReport.model_validate(dict(vars(result)))
+    except (Exception, anyio.get_cancelled_exc_class()) as error:
+        outcome.contain(error, RuntimeError, "gateway preflight")
+    if report.verified:
+        return "hard", report
+    if config.llm_gateway.hard_cap_required(config.limits):
+        raise _core_error(
+            ValueError,
+            f"LLM gateway strict profile not verified: {'; '.join(report.failures)}. "
+            "Fix the gateway, or set llm_gateway.require_hard_cap = false to run with a soft cap.",
+        )
+    return "soft", report
 
 
 def _sites(plans: Sequence[Plan]) -> Iterator[_Site]:

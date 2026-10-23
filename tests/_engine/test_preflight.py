@@ -23,9 +23,10 @@ from swarm_arena import (
     RunConfig,
     TeamSpec,
 )
+from swarm_arena._agent.manager import LimitReached
 from swarm_arena._engine import preflight
 from swarm_arena._engine.preflight import check_storage, run_preflight
-from swarm_arena._errors import ConditionalWritesUnsupported, _core_error
+from swarm_arena._errors import ConditionalWritesUnsupported, Fenced, _core_error
 from swarm_arena._exec.executor import Executor
 
 
@@ -357,3 +358,183 @@ async def test_storage_checked_first_in_worker_thread(monkeypatch: pytest.Monkey
     with pytest.raises(ConditionalWritesUnsupported):
         await run_preflight([_plan()], RunConfig(), _executor())
     assert CountingTool.calls == 0
+
+
+def _gateway_config(
+    gateway: Any, *, max_usd: float | None = None, require: bool | None = None
+) -> RunConfig:
+    from swarm_arena import Limits
+    from swarm_arena.config import GatewayConfig
+
+    return RunConfig(
+        limits=Limits(max_usd=max_usd),
+        llm_gateway=GatewayConfig(url=gateway.url, require_hard_cap=require),
+    )
+
+
+async def test_gateway_preflight_hard(fake_gateway: Any) -> None:
+    from _fakes.gateway import ABSENT_FAILURES
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
+    config = _gateway_config(fake_gateway)
+    assert config.llm_gateway is not None
+    adapter = adapter_for(config.llm_gateway, {"LITELLM_MASTER_KEY": fake_gateway.master_key})
+    cap, report = await gateway_preflight(config, adapter)
+    assert cap == "soft"
+    assert report.verified is False
+    assert report.failures == (*ABSENT_FAILURES, "gateway settings introspection unavailable")
+    assert not fake_gateway.keys
+
+
+async def test_gateway_preflight_fails_when_hard_cap_required(fake_gateway: Any) -> None:
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
+    config = _gateway_config(fake_gateway, max_usd=5)
+    assert config.llm_gateway is not None
+    adapter = adapter_for(config.llm_gateway, {"LITELLM_MASTER_KEY": fake_gateway.master_key})
+    report = await adapter.preflight()
+    with pytest.raises(ValueError, match="strict profile not verified") as caught:
+        await gateway_preflight(config, adapter)
+    assert str(caught.value) == (
+        f"LLM gateway strict profile not verified: {'; '.join(report.failures)}. "
+        "Fix the gateway, or set llm_gateway.require_hard_cap = false to run with a soft cap."
+    )
+    assert_secret_absent(caught.value, fake_gateway.master_key)
+    assert not fake_gateway.keys
+
+
+async def test_gateway_preflight_soft_when_not_required(fake_gateway: Any) -> None:
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
+    config = _gateway_config(fake_gateway, max_usd=5, require=False)
+    assert config.llm_gateway is not None
+    adapter = adapter_for(config.llm_gateway, {"LITELLM_MASTER_KEY": fake_gateway.master_key})
+    assert (await gateway_preflight(config, adapter))[0] == "soft"
+
+
+async def test_gateway_preflight_verified_capability_stub_is_hard() -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+    from swarm_arena.config import GatewayConfig
+
+    report = ProfileReport(
+        verified=True, failures=(), batch_write_interval_s=1, request_timeout_s=2
+    )
+    adapter = Mock(spec=GatewayAdapter, preflight=AsyncMock(return_value=report))
+    config = RunConfig(llm_gateway=GatewayConfig(url="http://example.test", require_hard_cap=True))
+    cap, actual = await gateway_preflight(config, adapter)
+    assert cap == "hard"
+    assert actual == report
+    adapter.create_key.assert_not_called()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_gateway_preflight_preserves_terminal(nested: bool, fenced: bool) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+    from swarm_arena._gateway.adapter import GatewayAdapter
+    from swarm_arena.config import GatewayConfig
+
+    error: Exception = _core_error(Fenced) if fenced else _stop_cleanup_error()
+    if nested:
+        error = ExceptionGroup("GATEWAY_SENTINEL", [error])
+    adapter = Mock(spec=GatewayAdapter, preflight=AsyncMock(side_effect=error))
+    config = RunConfig(llm_gateway=GatewayConfig(url="http://example.test"))
+    with pytest.raises(RuntimeError) as caught:
+        await gateway_preflight(config, adapter)
+    expected = _SignalCategory.FENCED if fenced else _SignalCategory.TERMINAL
+    assert _core_category(caught.value) is expected
+    assert_secret_absent(caught.value, "GATEWAY_SENTINEL")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("GATEWAY_SENTINEL"),
+        Fenced("GATEWAY_SENTINEL"),
+        LimitReached("stop", "GATEWAY_SENTINEL"),
+    ],
+)
+async def test_gateway_preflight_contains_untrusted_errors(error: Exception) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter
+    from swarm_arena.config import GatewayConfig
+
+    adapter = Mock(spec=GatewayAdapter, preflight=AsyncMock(side_effect=error))
+    with pytest.raises(RuntimeError) as caught:
+        await gateway_preflight(
+            RunConfig(llm_gateway=GatewayConfig(url="http://example.test")), adapter
+        )
+    assert_secret_absent(caught.value, "GATEWAY_SENTINEL")
+
+
+async def test_gateway_preflight_caller_cancel_propagates() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+    from swarm_arena.config import GatewayConfig
+
+    entered = anyio.Event()
+    scope = anyio.CancelScope()
+
+    async def held() -> ProfileReport:
+        entered.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def invoke() -> None:
+        with scope:
+            await gateway_preflight(
+                RunConfig(llm_gateway=GatewayConfig(url="http://example.test")),
+                Mock(spec=GatewayAdapter, preflight=held),
+            )
+
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as group:
+            group.start_soon(invoke)
+            await entered.wait()
+            scope.cancel()
+    assert scope.cancelled_caught
+
+
+@pytest.mark.parametrize("kind", [KeyboardInterrupt, SystemExit, GeneratorExit])
+async def test_gateway_preflight_passes_process_control_unchanged(
+    kind: type[BaseException],
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter
+    from swarm_arena.config import GatewayConfig
+
+    error = kind()
+    adapter = Mock(spec=GatewayAdapter, preflight=AsyncMock(side_effect=error))
+    with pytest.raises(kind) as caught:
+        await gateway_preflight(
+            RunConfig(llm_gateway=GatewayConfig(url="http://example.test")), adapter
+        )
+    assert caught.value is error
+
+
+async def test_gateway_preflight_requires_gateway_config() -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter
+
+    adapter = Mock(spec=GatewayAdapter)
+    with pytest.raises(ValueError, match="llm_gateway is required"):
+        await gateway_preflight(RunConfig(), adapter)
+    adapter.preflight.assert_not_called()
