@@ -60,7 +60,7 @@ def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "stubborn"])
+@pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "queued_interrupt", "stubborn"])
 def test_repeated_interrupt_reaps_editor_and_finishes_session(
     tmp_path: Path, editor_kind: str
 ) -> None:
@@ -68,42 +68,84 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
     result = tmp_path / "result.json"
     terminated = tmp_path / "editor-terminated"
     second_sent = tmp_path / "second-sent"
+    waiting = tmp_path / "reviewer-waiting"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal, time\n"
         f"second_sent = pathlib.Path({str(second_sent)!r})\n"
-        "def slow_exit(*args):\n"
-        "    deadline = time.monotonic() + 15\n"
+        "interrupted = False\n"
+        "def interrupt(*args: object) -> None:\n"
+        "    global interrupted\n"
+        "    interrupted = True\n"
+        "def slow_exit(*args: object) -> None:\n"
+        "    deadline = time.monotonic() + 60\n"
         "    while not second_sent.exists():\n"
         "        if time.monotonic() >= deadline: os._exit(1)\n"
         "        time.sleep(0.01)\n"
         "    os._exit(0)\n"
         + (
-            "signal.signal(signal.SIGINT, slow_exit)\n"
-            if editor_kind == "slow_interrupt"
+            "signal.signal(signal.SIGINT, interrupt)\n"
+            if editor_kind in {"slow_interrupt", "queued_interrupt"}
             else "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         )
-        + "def terminate(*args):\n"
+        + "def terminate(*args: object) -> None:\n"
         + f"    pathlib.Path({str(terminated)!r}).write_text('TERM')\n"
         + ("    return\n" if editor_kind == "stubborn" else "    slow_exit()\n")
         + "signal.signal(signal.SIGTERM, terminate)\n"
+        + (
+            "signals = {signal.SIGINT, signal.SIGTERM}\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, signals)\n"
+            if editor_kind == "queued_interrupt"
+            else ""
+        )
         + f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
-        "while True: time.sleep(1)\n",
+        + (
+            # Queue both callbacks before Python handles either, as when a
+            # loaded worker does not schedule the editor between signals.
+            "signal.sigwait({signal.SIGTERM})\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)\n"
+            if editor_kind == "queued_interrupt"
+            else ""
+        )
+        + "while not interrupted: signal.pause()\n"
+        + "slow_exit()\n",
     )
     code = f"""
 import asyncio, io, json, os, signal, termios
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+import anyio
 from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import all_events
 from swarm_arena import Goal
 from swarm_arena.llm import CollaborativePlanner, LLMPlanner
+from swarm_arena.llm import _terminal_reviewer
 from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
+original_timer_scope = _terminal_reviewer._local_timer_scope
+@contextmanager
+def controlled_grace(scope: anyio.CancelScope) -> Iterator[None]:
+    # This test exercises the second interrupt, independently of elapsed time.
+    # The unmodified grace-to-kill path is covered by the real-tty stubborn case.
+    scope.deadline = asyncio.get_running_loop().time() + 60
+    with original_timer_scope(scope):
+        yield
+_terminal_reviewer._local_timer_scope = controlled_grace
+original_sigint_wakeup = _terminal_reviewer._sigint_wakeup
+@contextmanager
+def observed_sigint_wakeup(*args: Callable[[], None]) -> Iterator[None]:
+    with original_sigint_wakeup(*args):
+        if not args:
+            Path({str(waiting)!r}).write_text('ready')
+        yield
+_terminal_reviewer._sigint_wakeup = observed_sigint_wakeup
 config = planner_config(Path.cwd())
 FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
 before = termios.tcgetattr(0)[3]
 handler = signal.getsignal(signal.SIGINT)
-async def main():
+async def main() -> None:
     reviewer = TerminalReviewer(stdin=io.StringIO('e\\n'), editor={editor!r})
     await CollaborativePlanner(LLMPlanner('planner'), reviewer).plan(
         Goal(id='g', namespace='n'), config, None)
@@ -142,7 +184,7 @@ Path({str(result)!r}).write_text(json.dumps({{
 
     try:
         deadline = time.monotonic() + 20
-        while not marker.exists() or not marker.read_text():
+        while not waiting.exists() or not marker.exists() or not marker.read_text():
             assert time.monotonic() < deadline, bytes(output)
             pump()
         editor_pid = int(marker.read_text())
@@ -152,7 +194,7 @@ Path({str(result)!r}).write_text(json.dumps({{
             assert time.monotonic() < deadline, bytes(output)
             pump()
         os.write(master, b"\x03")
-        second_sent.write_text("sent")
+        # Keep the editor held: only the second interrupt may end the grace.
         deadline = time.monotonic() + 10
         while True:
             exited, status = os.waitpid(pid, os.WNOHANG)
@@ -172,7 +214,8 @@ Path({str(result)!r}).write_text(json.dumps({{
         with pytest.raises(ProcessLookupError):
             os.kill(editor_pid, 0)
     finally:
-        with suppress(ProcessLookupError):
+        second_sent.write_text("release")
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
         if not reaped:
             os.waitpid(pid, 0)
