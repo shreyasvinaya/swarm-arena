@@ -23,7 +23,6 @@ from _fakes.proc import pid_alive, reap, require_visible_proc, spawn_group, wait
 from _fakes.read_counts import count_reads
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
-    COLLECTING,
     RELEASE,
     WRITE,
     BadCollectTool,
@@ -117,7 +116,11 @@ def _workspace_log(tmp_path: Path, which: int) -> bytes:
 async def test_tool_never_runs_when_start_commit_fails(
     local_executor: LocalExecutor, tmp_path: Path
 ) -> None:  # exit criterion
+    started: list[int] = []
+
     async def fail(s: Job.Started) -> None:
+        assert s.pid is not None
+        started.append(s.pid)
         raise RuntimeError("commit failed")
 
     marker = tmp_path / "ran"
@@ -125,7 +128,8 @@ async def test_tool_never_runs_when_start_commit_fails(
         await local_executor.submit(
             tool_job(tmp_path, f"open({str(marker)!r}, 'w')", on_started=fail)
         )
-    await anyio.sleep(1)
+    assert len(started) == 1
+    assert not pid_alive(started[0])
     assert not marker.exists()
     assert list((tmp_path / "ws").iterdir()) == []
 
@@ -228,9 +232,10 @@ async def test_cancel_delivers_partial_through_on_partial(
         got.append(o)
 
     code = (
-        WRITE.format("{'data': {'step': 2}}") + "; open('ready', 'w'); import time; time.sleep(60)"
+        WRITE.format("{'data': {'step': 2}}")
+        + "; open('ready', 'w'); import threading; threading.Event().wait(300)"
     )
-    job = tool_job(tmp_path, code, on_partial=on_partial)
+    job = tool_job(tmp_path, code, on_partial=on_partial, timeout_s=300)
 
     async def ready() -> None:
         deadline = time.monotonic() + 60
@@ -239,7 +244,7 @@ async def test_cancel_delivers_partial_through_on_partial(
                 raise TimeoutError("ready did not appear")
             await anyio.sleep(0.05)
 
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(local_executor.submit, job)
             await ready()
@@ -395,7 +400,7 @@ async def test_blocked_collect_cannot_stop_kill(
             (workspace / "swarm/stderr.log").unlink()
             os.mkfifo(workspace / "swarm/stderr.log")
 
-    code = "import time; time.sleep(60)"
+    code = "import threading; threading.Event().wait(300)"
     RELEASE.clear()  # a set event from an earlier case would not block collect
     collect = BlockingCollectTool.collect
     entered = threading.Event()
@@ -404,7 +409,7 @@ async def test_blocked_collect_cannot_stop_kill(
     def held_collect(*args: Any, **kwargs: Any) -> ToolOutput:
         workers.append(threading.current_thread())
         entered.set()
-        RELEASE.wait()
+        assert RELEASE.wait(300)
         return collect(*args, **kwargs)
 
     monkeypatch.setattr(BlockingCollectTool, "collect", held_collect)
@@ -434,10 +439,13 @@ async def test_blocked_collect_cannot_stop_kill(
         RELEASE.set()
         if not task.done():
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         for worker in workers:
             await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+    assert not pending_cleanup, "collector owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_fifo_log_does_not_hang(local_executor: LocalExecutor, tmp_path: Path) -> None:
@@ -623,7 +631,7 @@ async def cancel_when(
     submit: Callable[[], Coroutine[Any, Any, object]], ready: Callable[[], Awaitable[bool]]
 ) -> None:
     """Start ``submit``, wait (asynchronously) until ``ready()``, then cancel it."""
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(submit)
             # The conditions are files and threading.Events, which have no anyio event: poll.
@@ -639,7 +647,7 @@ def ready_file(ws: Path) -> Callable[[], Awaitable[bool]]:
     return ready
 
 
-@pytest.mark.parametrize(("budget", "kept"), [(30.0, True), (0.2, False)])
+@pytest.mark.parametrize(("budget", "kept"), [(60.0, True), (0.2, False)])
 async def test_cancel_after_normal_exit_keeps_the_result(
     kept_executor: LocalExecutor,
     tmp_path: Path,
@@ -647,35 +655,81 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     budget: float,
     kept: bool,
 ) -> None:
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", budget)  # bounds the original collect
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     got: list[ToolOutput] = []
+    scopes: list[anyio.CancelScope] = []
+    collecting: list[local_run._JobRun] = []
+    wait_collect = local_run._JobRun._wait_post_collect
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 300.0)
 
     async def on_partial(o: ToolOutput) -> None:
         got.append(o)
 
-    async def collecting() -> bool:
-        return COLLECTING.is_set()
+    def collect(
+        tool: SlowCollectTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(300)
+        return PyTool.collect(tool, request, workspace, run)
 
-    COLLECTING.clear()
-    code = WRITE.format("{'data': {'v': 7}}")  # exits 0 with a valid result
+    async def observed_collect(run: local_run._JobRun) -> None:
+        collecting.append(run)
+        await wait_collect(run)
+
+    monkeypatch.setattr(SlowCollectTool, "collect", collect)
+    monkeypatch.setattr(local_run._JobRun, "_wait_post_collect", observed_collect)
+    code = WRITE.format("{'data': {'v': 7}}")
     job = tool_job(tmp_path, code, tool_cls=SlowCollectTool, on_partial=on_partial)
-    await cancel_when(lambda: kept_executor.submit(job), collecting)
-    [out] = got
-    assert out.status is RunStatus.CANCELLED
-    assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
-    assert out.started_at is not None
-    assert out.ended_at is not None
-    assert out.started_at <= out.ended_at
-    if not kept:
-        assert b"no partial output" in _workspace_log(tmp_path, 2)
-    assert out.logs_ref is None
+
+    async def submit() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await kept_executor.submit(job)
+        assert scope.cancelled_caught
+
+    task = asyncio.create_task(submit())
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        assert collecting
+        # Start the short abandonment experiment only after the real collector has entered.
+        collecting[0]._collect_deadline = anyio.current_time() + budget
+        scopes[0].cancel()
+        await anyio.wait_all_tasks_blocked()
+        if kept:
+            release.set()
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "cancelled job waited for the held original collector"
+        task.result()
+        assert release.is_set() is kept
+        [out] = got
+        assert out.status is RunStatus.CANCELLED
+        assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
+        assert out.started_at is not None
+        assert out.ended_at is not None
+        assert out.started_at <= out.ended_at
+        if not kept:
+            assert b"no partial output" in _workspace_log(tmp_path, 2)
+        assert out.logs_ref is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "cancelled job did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
 async def test_stop_facts_are_stamped_on_the_partial(
     local_executor: LocalExecutor, tmp_path: Path, stop: str
 ) -> None:  # OkCollectTool returns status OK and partial False whatever happened
-    code = "open('ready', 'w'); import time; time.sleep(60)"
+    code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
     if stop == "timeout":
         out = await local_executor.submit(
             tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=1.0, grace_s=0.2)
@@ -687,7 +741,9 @@ async def test_stop_facts_are_stamped_on_the_partial(
     async def on_partial(o: ToolOutput) -> None:
         got.append(o)
 
-    job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
+    job = tool_job(
+        tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial, timeout_s=300
+    )
     await cancel_when(lambda: local_executor.submit(job), ready_file(tmp_path / "ws"))
     assert [(o.status, o.partial, o.data) for o in got] == [(RunStatus.CANCELLED, True, {"k": 1})]
 
@@ -749,11 +805,11 @@ async def test_cancel_skips_unavailable_uploads_and_sends_no_unstored_refs(
     code = (
         "import os; os.makedirs('out'); open('out/p.txt', 'w').write('x'); "
         + WRITE.format("{'data': {'s': 1}, 'files': ['out/p.txt']}")
-        + "; open('ready', 'w'); import time; time.sleep(60)"
+        + "; open('ready', 'w'); import threading; threading.Event().wait(300)"
     )
     ws = tmp_path / "kept"
     ex = LocalExecutor(workspace_root=str(ws), keep_workspaces=True)
-    job = tool_job(tmp_path, code, grace_s=0.2, on_partial=on_partial)
+    job = tool_job(tmp_path, code, grace_s=0.2, on_partial=on_partial, timeout_s=300)
     await cancel_when(lambda: ex.submit(job), ready_file(ws))
     [out] = got
     assert (out.status, out.partial, out.data, out.files) == (
@@ -984,10 +1040,10 @@ async def test_failed_cleanup_never_replaces_output_or_cancel(
     [left] = list((tmp_path / "ws").iterdir())
     assert f"could not remove workspace {left}" in caplog.text
 
-    code = "open('ready', 'w'); import time; time.sleep(60)"
-    with anyio.move_on_after(30) as scope:  # the cancel still propagates (no ExceptionGroup)
+    code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
+    with anyio.move_on_after(60) as scope:  # the cancel still propagates (no ExceptionGroup)
         await cancel_when(
-            lambda: local_executor.submit(tool_job(tmp_path, code, grace_s=0.2)),
+            lambda: local_executor.submit(tool_job(tmp_path, code, grace_s=0.2, timeout_s=300)),
             ready_file(tmp_path / "ws"),
         )
     assert not scope.cancelled_caught
@@ -1008,14 +1064,14 @@ RELEASE.clear()
 collect = BlockingCollectTool.collect
 
 def held_collect(*args: Any, **kwargs: Any) -> ToolOutput:
-    RELEASE.wait()  # never released in this interpreter
+    assert RELEASE.wait(300)  # parent watchdog must observe exit before this backstop
     return collect(*args, **kwargs)
 
 BlockingCollectTool.collect = held_collect
 
 
 async def main() -> None:
-    tool = Ref.of(BlockingCollectTool({"code": "import time; time.sleep(60)"}))
+    tool = Ref.of(BlockingCollectTool({"code": "import threading; threading.Event().wait(300)"}))
     job = make_job(kind="tool", command=None, tool=tool, request=ToolRequest(),
                    timeout_s=0.5, grace_s=0.1, artifact_root=sys.argv[2])
     out = await LocalExecutor(workspace_root=sys.argv[1]).submit(job)
@@ -1034,7 +1090,7 @@ def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> 
         capture_output=True,
         text=True,
         env=env,
-        timeout=30,
+        timeout=60,
         check=False,
     )
     assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
@@ -1134,7 +1190,7 @@ async def test_tool_that_locks_its_own_workspace_root_is_removed(
 ) -> None:
     code = "import os; os.makedirs('out/deep'); open('out/deep/f', 'w').close(); "
     code += f"os.chmod('out/deep', 0o500); os.chmod('.', {mode:#o})"
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         await local_executor.submit(tool_job(tmp_path, code))
     assert list((tmp_path / "ws").iterdir()) == []
 
@@ -1228,13 +1284,20 @@ async def test_collect_must_return_a_valid_tool_output(
         async def on_partial(o: ToolOutput) -> None:
             got.append(o)
 
-        code = "open('ready', 'w'); import time; time.sleep(60)"
-        job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
+        code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
+        job = tool_job(
+            tmp_path,
+            code,
+            tool_cls=OkCollectTool,
+            grace_s=0.2,
+            on_partial=on_partial,
+            timeout_s=300,
+        )
         await cancel_when(lambda: kept_executor.submit(job), ready_file(tmp_path / "ws"))
         [out] = got
         status = RunStatus.CANCELLED
     elif path == "timeout":
-        code = "import time; time.sleep(60)"
+        code = "import threading; threading.Event().wait(300)"
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=0.5, grace_s=0.2)
         out = await kept_executor.submit(job)
         status = RunStatus.TIMEOUT
@@ -1264,8 +1327,9 @@ async def _cancel_when_ready(
 
     job = tool_job(
         tmp_path,
-        code + "; open('ready', 'w'); import time; time.sleep(60)",
+        code + "; open('ready', 'w'); import threading; threading.Event().wait(300)",
         grace_s=0.2,
+        timeout_s=300,
         on_partial=on_partial,
         **job_kw,
     )
@@ -1315,7 +1379,7 @@ async def test_valid_empty_collect_output_is_partial_only_if_it_says_so(
     if stop == "timeout":
         job = tool_job(
             tmp_path,
-            "import time; time.sleep(60)",
+            "import threading; threading.Event().wait(300)",
             tool_cls=OkCollectTool,
             timeout_s=0.5,
             grace_s=0.2,
@@ -1417,7 +1481,7 @@ async def test_user_system_exit_is_a_job_failure(
     monkeypatch.setattr(PyTool, where, exit_user)
     job = tool_job(
         tmp_path,
-        "import time; time.sleep(60)" if stop else "pass",
+        "import threading; threading.Event().wait(300)" if stop else "pass",
         timeout_s=0.2 if stop else 30.0,
         grace_s=0.0,
     )
@@ -1470,14 +1534,16 @@ async def test_cancel_waits_for_the_original_collect_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     calls: list[RunStatus] = []
     got: list[ToolOutput] = []
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 60.0)
 
     def collect(*args: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
         calls.append(args[-1].status)
         entered.set()
-        release.wait(180)
+        assert release.wait(300)
         return ToolOutput(status=RunStatus.OK, data={"kept": 1})
 
     async def on_partial(out: ToolOutput) -> None:
@@ -1507,23 +1573,37 @@ async def test_cancel_waits_for_the_original_collect_once(
         ]
     finally:
         release.set()
+        for thread in workers:
+            await anyio.to_thread.run_sync(thread.join, 60)
+    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_hung_post_exit_collect_releases_pool_slot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release = threading.Event()
+    release, entered = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     calls = 0
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.2)
 
     def collect(*args: Any) -> ToolOutput:
         nonlocal calls
         calls += 1
+        workers.append(threading.current_thread())
+        entered.set()
         if calls == 1:
-            release.wait(180)
+            assert release.wait(300)
         return ToolOutput(status=RunStatus.OK, data={"kept": 1})
 
+    wait_collect = local_run._JobRun._wait_post_collect
+
+    async def after_ready(run: local_run._JobRun) -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        run._collect_deadline = anyio.current_time() + supervisor.BEFORE_KILL_TIMEOUT_S
+        await wait_collect(run)
+
+    monkeypatch.setattr(local_run._JobRun, "_wait_post_collect", after_ready)
     monkeypatch.setattr(PyTool, "collect", collect)
     executor = LocalExecutor(max_concurrent=1, workspace_root=str(tmp_path / "ws"))
     try:
@@ -1534,6 +1614,9 @@ async def test_hung_post_exit_collect_releases_pool_slot(
             assert (await executor.submit(tool_job(tmp_path, "pass"))).status == RunStatus.OK
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
@@ -1559,7 +1642,12 @@ async def test_files_only_collect_counts_as_partial(
         expected = RunStatus.CANCELLED
     else:
         out = await executor.submit(
-            tool_job(tmp_path, "import time; time.sleep(60)", timeout_s=0.2, grace_s=0.0)
+            tool_job(
+                tmp_path,
+                "import threading; threading.Event().wait(300)",
+                timeout_s=0.2,
+                grace_s=0.0,
+            )
         )
         expected = RunStatus.TIMEOUT
     assert (out.status, out.partial, out.data) == (expected, True, {})
