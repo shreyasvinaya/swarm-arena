@@ -1098,3 +1098,42 @@ def test_replay_dispatch_with_end_is_not_started(end: str) -> None:
         assert "c-a-e1-0001" in state.lost
         assert "c-a-e1-0001" not in state.candidates
         assert state.reservations["r-1"].state == "open"
+
+
+def test_gateway_projection_keeps_latest_report_and_detaches_input() -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    created, first, last = gateway_key(), reconcile(), reconcile(observed=0.25, label="observed")
+    for draft in (created, first, last):
+        draft.payload["run_id"] = "r"
+    events = [
+        _ev(i, draft.type.value, draft.payload) for i, draft in enumerate((created, first, last), 1)
+    ]
+    state = RunState.from_events(events)
+    key = ("c-1", "hash-1")
+    assert state.gateway_keys[key].cap == "soft"
+    assert state.gateway_reconcile[key].observed_usd == 0.25
+    events[-1].payload["keys"][0]["observed_usd"] = 99
+    assert state.gateway_reconcile[key].observed_usd == 0.25
+    assert state.gateway_keys[key].max_budget_usd == 1
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"observed_usd": -1},
+        {"label": "SECRET"},
+        {"observed_usd": 0.2, "label": "estimated"},
+        {"observed_usd": None, "label": "observed"},
+        {"reserved_usd": True},
+    ],
+)
+def test_gateway_projection_rejects_invalid_report_safely(patch: dict[str, Any]) -> None:
+    from _fakes.gateway_events import reconcile
+    from _fakes.secrecy import assert_secret_absent
+
+    draft = reconcile(run_id="r")
+    draft.payload["keys"][0].update(patch)
+    with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
+        RunState.from_events([_ev(1, draft.type.value, draft.payload)])
+    assert_secret_absent(caught.value, "SECRET")

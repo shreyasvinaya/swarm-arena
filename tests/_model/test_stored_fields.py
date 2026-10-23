@@ -42,7 +42,7 @@ FIELD_SETS = {
     ("candidate_output", 1): "71060b6a928593fec41a4c0c5b316e670225549db0f650d324f6c8cf22de4e39",
     ("check_result", 1): "ab48eb85724967a6c6862ddc3ae3e09da29dd534ed83de29811007dba709443f",
     ("judge_result", 1): "655351cea722865ef47b488b51a1adfde5446c0dd3548d9aea8d22c6ff454770",
-    ("manifest", 1): "1d2a6841f6bef3f68d79b19eba61c50bce6f00f834a7d5b58291a2a6be64fd95",
+    ("manifest", 1): "937d60c769ad19cdceb6cd56f0a4dcd1339ef21391823bf253428c5c989f5689",
     ("solution", 1): "a325bf2c0a9df566ae25ad655f29491c59ec671bead59f34048deb4808a1d449",
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",

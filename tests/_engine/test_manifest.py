@@ -66,6 +66,7 @@ def test_manifest_keys_and_no_secret_values(monkeypatch: pytest.MonkeyPatch) -> 
         "run_config_sha256",
         "plans",
         "tools",
+        "llm_gateway",
     }
     assert b"sk-secret-123" not in canonical_json(m)
     assert RunManifest.model_validate_json(canonical_json(m)).schema_version == 1
@@ -341,3 +342,76 @@ print("interpreter_exiting", flush=True)
         "manifest_returned cancel_called=True",
         "interpreter_exiting",
     ]
+
+
+def _gateway_block() -> dict[str, Any]:
+    return {
+        "url": "https://gateway.example",
+        "cap": "soft",
+        "verified": False,
+        "failures": ["no maximum request duration is enforced"],
+        "terminal_accounting": False,
+    }
+
+
+async def test_manifest_records_gateway_cap() -> None:
+    block = _gateway_block()
+    for result in (
+        build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None, llm_gateway=block),
+        await build_manifest_async(
+            run_id="r", config=RunConfig(), plans=[], capacity=None, llm_gateway=block
+        ),
+    ):
+        assert result["llm_gateway"] == block
+        assert RunManifest.model_validate_json(canonical_json(result)).llm_gateway is not None
+
+
+def test_manifest_without_gateway_is_null() -> None:
+    raw = build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None)
+    assert raw["llm_gateway"] is None
+    del raw["llm_gateway"]
+    assert RunManifest.model_validate(raw).llm_gateway is None
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"url": "https://user:MANIFEST_SECRET@example.test"},
+        {"url": "https://example.test?key=MANIFEST_SECRET"},
+        {"url": "https://example.test#MANIFEST_SECRET"},
+        {"url": "MANIFEST_SECRET"},
+        {"cap": "MANIFEST_SECRET"},
+        {"cap": "hard"},
+        {"verified": True},
+        {"verified": "MANIFEST_SECRET"},
+        {"failures": []},
+        {"failures": [123]},
+        {"terminal_accounting": "MANIFEST_SECRET"},
+        {"master_key": "MANIFEST_SECRET"},
+    ],
+)
+def test_manifest_gateway_rejects_invalid_evidence_without_values(patch: dict[str, Any]) -> None:
+    raw = build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None)
+    raw["llm_gateway"] = {**_gateway_block(), **patch}
+    with pytest.raises(ValueError, match="validation") as caught:
+        RunManifest.model_validate(raw)
+    assert_secret_absent(caught.value, "MANIFEST_SECRET")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("url", "https://u:MANIFEST_SECRET@example.test"),
+        ("failures", [123]),
+        ("terminal_accounting", "MANIFEST_SECRET"),
+    ],
+)
+def test_manifest_gateway_revalidates_copied_models(field: str, value: Any) -> None:
+    from swarm_arena._engine.manifest import _GatewayManifest
+
+    block = _GatewayManifest.model_validate(_gateway_block()).model_copy(update={field: value})
+    raw = build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None)
+    raw["llm_gateway"] = block
+    with pytest.raises(ValueError, match="validation") as caught:
+        RunManifest.model_validate(raw)
+    assert_secret_absent(caught.value, "MANIFEST_SECRET")

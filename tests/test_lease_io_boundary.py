@@ -193,6 +193,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_journal/writer.py",
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",
+        _ROOT / "_gateway/keys.py",
         _ROOT / "_planning/validate.py",
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
@@ -394,4 +395,20 @@ def test_guard_scans_ray_executor_publication(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(AssertionError, match=r"ray/_executor.py:\d+: RayExecutor.submit"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_gateway_key_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_gateway/keys.py"
+    original = Path.read_text
+    unsafe = (
+        target.read_text()
+        + '\nasync def unsafe_gateway_publish(store):\n    store.create("x", b"x")\n'
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_gateway/keys.py:\d+: unsafe_gateway_publish"):
         test_lease_owned_modules_use_abandonable_workers()
