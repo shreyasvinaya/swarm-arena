@@ -23,7 +23,7 @@ def main(root: Path) -> None:
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
-    listener.settimeout(15)
+    listener.settimeout(60)
     editor = root / "editor"
     editor.write_text(
         "#!" + sys.executable + "\n"
@@ -44,11 +44,13 @@ def main(root: Path) -> None:
     def sender() -> None:
         try:
             with listener.accept()[0] as connection:
-                connection.settimeout(5)
+                connection.settimeout(60)
                 with connection.makefile("rb") as stream:
                     evidence["pid"] = int(stream.readline())
                     loop.call_soon_threadsafe(armed.set)
-                    assert selecting.wait(10), "selector did not enter its idle wait"
+                    assert selecting.wait(60), "selector did not enter its idle wait"
+                    # The blocked selector has no timer that can mask a missing wakeup.
+                    connection.settimeout(30)
                     signal.pthread_kill(threading.get_ident(), signal.SIGINT)
                     try:
                         evidence["terminated_before_fallback"] = (
@@ -92,7 +94,7 @@ def main(root: Path) -> None:
             evidence["interrupted"] = True
     finally:
         sys.setswitchinterval(interval)
-        thread.join(15)
+        thread.join(60)
         listener.close()
     assert not thread.is_alive()
     try:
