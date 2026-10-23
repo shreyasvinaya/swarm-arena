@@ -28,7 +28,7 @@ from swarm_arena._errors import (
     _core_error,
     _exception_type_name,
 )
-from swarm_arena._exec.executor import Executor, schedule_timeout_scope
+from swarm_arena._exec.executor import Executor, Job, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -123,6 +123,47 @@ def _restore_import_paths(state: RunState) -> None:
         directory = str(revisions[0][0].base_dir)
         if directory not in sys.path:
             sys.path.append(directory)
+
+
+async def _recover_orphans(
+    executor: Executor, jobs: list[Job.Started], timeout_s: float
+) -> list[bool]:
+    """Recover once per job concurrently, retaining input order and one allowance."""
+    timeout_s = min(timeout_s, getattr(executor.config, "cancel_margin_s", timeout_s))
+    confirmed = [False] * len(jobs)
+    errors: list[BaseException | None] = [None] * len(jobs)
+    boundary = _Outcome()
+
+    async def recover(index: int, started: Job.Started) -> None:
+        outcome = _Outcome()
+        try:
+            result = await executor.kill_orphan(started)
+            confirmed[index] = result is True and not scope.cancel_called
+        except anyio.get_cancelled_exc_class() as error:
+            # Real caller/deadline cancellation propagates; a hook-raised
+            # cancellation without pending cancellation is an ordinary failure.
+            errors[index] = outcome.classify(error)
+        except BaseExceptionGroup as error:
+            if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
+                raise
+            errors[index] = error
+        except Exception as error:
+            errors[index] = error
+
+    with anyio.move_on_after(timeout_s) as scope:
+        async with anyio.create_task_group() as group:
+            for index, started in enumerate(jobs):
+                group.start_soon(recover, index, started)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        classified = boundary.classify(
+            failures[0] if len(failures) == 1 else BaseExceptionGroup("orphan recovery", failures)
+        )
+        _raise_terminal(classified)
+        raise _core_error(
+            RuntimeError, f"orphan recovery failed: {_exception_type_name(classified)}"
+        ) from None
+    return confirmed
 
 
 class _ResumeServices:
@@ -271,60 +312,52 @@ class _ResumeServices:
                                     for e in events
                                     if e.type == EventType.COMMAND_START
                                 }
-                                for jobs, index, event_type in (
-                                    (state.started, starts, EventType.RUN_LOST),
-                                    (state.started_commands, commands, EventType.COMMAND_END),
+                                pending = [
+                                    (id, started, index[id], event_type)
+                                    for jobs, index, event_type in (
+                                        (state.started, starts, EventType.RUN_LOST),
+                                        (state.started_commands, commands, EventType.COMMAND_END),
+                                    )
+                                    for id, started in jobs.items()
+                                ]
+                                confirmations = await _recover_orphans(
+                                    executor,
+                                    [started for _, started, _, _ in pending],
+                                    config.settle_timeout_s,
+                                )
+                                for (id, started, source, event_type), confirmed in zip(
+                                    pending, confirmations, strict=True
                                 ):
-                                    for id, started in jobs.items():
-                                        outcome = _Outcome()
-                                        confirmed = False
-                                        try:
-                                            with anyio.move_on_after(
-                                                config.settle_timeout_s
-                                            ) as orphan_scope:
-                                                confirmed = (
-                                                    await executor.kill_orphan(started) is True
-                                                )
-                                        except BaseException as error:
-                                            error = outcome.classify(error)
-                                            _raise_terminal(error)
-                                            name = _exception_type_name(error)
-                                            raise _core_error(
-                                                RuntimeError,
-                                                f"orphan recovery failed: {name}",
-                                            ) from None
-                                        confirmed = confirmed and not orphan_scope.cancel_called
-                                        if confirmed:
-                                            killed.append(id)
-                                        source = index[id]
-                                        payload: dict[str, Any] = (
-                                            {
-                                                "candidate_id": id,
-                                                "reservation_id": source.payload["reservation_id"],
-                                            }
-                                            if event_type == EventType.RUN_LOST
-                                            else {"job_id": id, "status": "lost"}
+                                    if confirmed:
+                                        killed.append(id)
+                                    payload: dict[str, Any] = (
+                                        {
+                                            "candidate_id": id,
+                                            "reservation_id": source.payload["reservation_id"],
+                                        }
+                                        if event_type == EventType.RUN_LOST
+                                        else {"job_id": id, "status": "lost"}
+                                    )
+                                    if (
+                                        event_type == EventType.RUN_LOST
+                                        and started.kind == "dispatch"
+                                    ):
+                                        payload.update(
+                                            kind="dispatch",
+                                            task_name=started.task_name,
+                                            confirmed_dead=confirmed,
                                         )
-                                        if (
-                                            event_type == EventType.RUN_LOST
-                                            and started.kind == "dispatch"
-                                        ):
-                                            payload.update(
-                                                kind="dispatch",
-                                                task_name=started.task_name,
-                                                confirmed_dead=confirmed,
-                                            )
-                                        journal.append(
-                                            EventDraft(
-                                                type=event_type,
-                                                task_id=source.task_id,
-                                                goal_id=source.goal_id,
-                                                team=source.team,
-                                                agent=source.agent,
-                                                round=source.round,
-                                                payload=payload,
-                                            )
+                                    journal.append(
+                                        EventDraft(
+                                            type=event_type,
+                                            task_id=source.task_id,
+                                            goal_id=source.goal_id,
+                                            team=source.team,
+                                            agent=source.agent,
+                                            round=source.round,
+                                            payload=payload,
                                         )
+                                    )
                                 shares = weighted_shares(
                                     ledger.free(),
                                     {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
