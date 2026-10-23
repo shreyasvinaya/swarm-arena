@@ -9,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import RtEnv
 from _fakes.gateway import FakeGateway
 from _fakes.tools import WRITE, CommandRaisesTool, PyTool, write_then_sleep
@@ -657,12 +658,12 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
 
     monkeypatch.setattr(PyTool, "__init__", init)
     monkeypatch.setattr(PyTool, "command", command)
+    task = asyncio.create_task(_run_and_store(rt, rt_env))
     try:
         with anyio.fail_after(60):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_run_and_store, rt, rt_env)
-                assert await anyio.to_thread.run_sync(entered.wait, 60)
-                rt_env.cancel_inflight()
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+            rt_env.cancel_inflight()
+            await observe_task(task)
             cand = rt_env.result
             assert cand is not None
             assert cand.output.status == RunStatus.CANCELLED
@@ -682,9 +683,13 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
             assert workspaces[0].joinpath("late_write").exists()
     finally:
         release.set()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
 
 
 async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> None:
@@ -1292,15 +1297,19 @@ async def test_inflight_grace_remains_during_cancel_collection(rt_env: RtEnv) ->
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", grace_s=3.0))
     executor = CollectingExecutor(rt.executor)
     rt = dataclasses.replace(rt, executor=executor)
-    with anyio.fail_after(60):
-        async with anyio.create_task_group() as group:
-            group.start_soon(_run_capturing, rt, {"x": 1}, [])
+    task = asyncio.create_task(_run_capturing(rt, {"x": 1}, []))
+    try:
+        with anyio.fail_after(60):
             await executor.entered.wait()
             rt_env.inflight.close()
             rt_env.inflight.cancel_all()
             await executor.collecting.wait()
             assert rt_env.inflight.max_grace_s() == 3.0
             executor.release.set()
+            await observe_task(task)
+    finally:
+        executor.release.set()
+        await settle_tasks(task)
     assert rt_env.inflight.max_grace_s() == 0.0
     assert rt_env.events("tool_end")[-1].payload["candidate"]["output"]["status"] == "cancelled"
 
@@ -1594,15 +1603,14 @@ async def test_fingerprint_abandonment_discards_late_mutation(
             assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-        _, pending_cleanup = await asyncio.wait([task], timeout=60)
-        if task.done() and not task.cancelled():
-            task.exception()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-    assert not pending_cleanup, "fingerprint owner did not finish cleanup"
-    assert all(not worker.is_alive() for worker in workers)
+        try:
+            await settle_tasks(task)
+            assert task.done(), "fingerprint owner did not finish cleanup"
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(not worker.is_alive() for worker in workers)
 
 
 def _fingerprint_round(rt_env: RtEnv) -> Any:
@@ -1722,15 +1730,14 @@ async def test_round_finishes_with_blocked_fingerprint(
         assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-        _, pending_cleanup = await asyncio.wait([task], timeout=60)
-        if task.done() and not task.cancelled():
-            task.exception()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-    assert not pending_cleanup, "fingerprint owner did not finish cleanup"
-    assert all(not worker.is_alive() for worker in workers)
+        try:
+            await settle_tasks(task)
+            assert task.done(), "fingerprint owner did not finish cleanup"
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "extra-action"])
@@ -2188,18 +2195,19 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
         assert candidate.output.logs_ref is None
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-        _, pending_cleanup = await asyncio.wait([task], timeout=60)
-        if task.done() and not task.cancelled():
-            task.exception()
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 60)
-    assert not pending_cleanup, "log publication owner did not finish cleanup"
-    assert all(
-        not worker.is_alive() for worker in workers if worker.name.startswith("swarm-arena-daemon-")
-    )
+        try:
+            await settle_tasks(task)
+            assert task.done(), "log publication owner did not finish cleanup"
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    if worker.name.startswith("swarm-arena-daemon-"):
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(
+                    not worker.is_alive()
+                    for worker in workers
+                    if worker.name.startswith("swarm-arena-daemon-")
+                )
     assert len(writes) == 1, "abandoned log write published another file"
 
 
@@ -2450,18 +2458,14 @@ async def test_interrupted_recording_preserves_candidate_links(
             with anyio.fail_after(60):
                 await entered.wait()
                 rt_env.cancel_inflight()
-                candidate = await task
+                candidate = await observe_task(task)
             calls = [event.payload["call"] for event in rt_env.events("llm_call")]
             assert len(calls) == 1
             assert candidate.llm_call_ids == [calls[0]["id"]]
             assert candidate.llm_calls_source == "reported"
         finally:
-            if not task.done():
-                task.cancel()
-            _, pending_cleanup = await asyncio.wait([task], timeout=60)
-            if task.done() and not task.cancelled():
-                task.exception()
-        assert not pending_cleanup, "recording owner did not finish cleanup"
+            await settle_tasks(task)
+            assert task.done(), "recording owner did not finish cleanup"
 
 
 @pytest.mark.parametrize("claimed_size", [1, 3])

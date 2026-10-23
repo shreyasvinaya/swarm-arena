@@ -19,6 +19,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.gateway import ABSENT_FAILURES, FakeGateway
 
 from swarm_arena._gateway.adapter import GatewayError, VirtualKey
@@ -336,15 +337,14 @@ async def test_cancelled_create_blocks_late_key(fake_gateway: FakeGateway) -> No
         await _wait(entered)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         release.set()
         await _wait(blocked)
         assert len(fake_gateway.keys) == 1
         assert len([p for _, p, _ in fake_gateway.requests if p == "/key/generate"]) == 1
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
+        await settle_tasks(task)
 
 
 async def test_cancelled_read_starts_no_later_page(
@@ -353,10 +353,12 @@ async def test_cancelled_read_starts_no_later_page(
     import swarm_arena._gateway.litellm_proxy as module
 
     done = threading.Event()
+    workers: list[threading.Thread] = []
     original = module.run_sync_daemon
 
     async def tracked(work: Any, operation: Any) -> Any:
         def wrapped() -> Any:
+            workers.append(threading.current_thread())
             try:
                 return work(operation)
             finally:
@@ -376,10 +378,19 @@ async def test_cancelled_read_starts_no_later_page(
         await _wait(entered)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
     finally:
         release.set()
-    await _wait(done)
+        try:
+            await settle_tasks(task)
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await _wait(done)
+                finally:
+                    for worker in workers:
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                    assert all(not worker.is_alive() for worker in workers)
     assert len([p for _, p, _ in fake_gateway.requests if p == "/spend/logs/v2"]) == 1
 
 
@@ -679,22 +690,25 @@ async def test_anyio_cancellation_propagates(fake_gateway: FakeGateway) -> None:
     fake_gateway.entered["/model/info"] = entered
     fake_gateway.hold["/model/info"] = release
     propagated = False
+    scope = anyio.CancelScope()
 
     async def invoke() -> None:
         nonlocal propagated
-        try:
-            await _proxy(fake_gateway).preflight()
-        except anyio.get_cancelled_exc_class():
-            propagated = True
-            raise
+        with scope:
+            try:
+                await _proxy(fake_gateway).preflight()
+            except anyio.get_cancelled_exc_class():
+                propagated = True
+                raise
 
+    task = asyncio.create_task(invoke())
     try:
-        async with anyio.create_task_group() as group:
-            group.start_soon(invoke)
-            await _wait(entered)
-            group.cancel_scope.cancel()
+        await _wait(entered)
+        scope.cancel()
+        await observe_task(task)
     finally:
         release.set()
+        await settle_tasks(task)
     assert propagated
 
 
@@ -730,8 +744,10 @@ async def test_abandoned_block_owner_is_bounded(
     proxy, key = await _proxy_and_key(fake_gateway)
     proxy = _proxy(fake_gateway, http_timeout_s=0.2)
     entered, release, owner_done, worker_done = (threading.Event() for _ in range(4))
+    workers: list[threading.Thread] = []
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
         entered.set()
         try:
             assert release.wait(300)
@@ -755,10 +771,17 @@ async def test_abandoned_block_owner_is_bounded(
     finally:
         release.set()
         try:
-            await _wait(worker_done)
+            with anyio.CancelScope(shield=True):
+                await _wait(worker_done)
         finally:
-            thread.join(60)
-            assert not thread.is_alive()
+            try:
+                thread.join(60)
+                assert not thread.is_alive()
+            finally:
+                with anyio.CancelScope(shield=True):
+                    for worker in workers:
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_spend_retains_own_hash_and_one_cost(fake_gateway: FakeGateway) -> None:
@@ -1219,8 +1242,10 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
     proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=60)
     original = proxy._request
     operations: list[Any] = []
+    workers: list[threading.Thread] = []
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
         operations.append(args[0])
         try:
             return original(*args, **kwargs)
@@ -1254,16 +1279,24 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
         assert all(sock.fileno() == -1 for sock in sockets)
     finally:
         release.set()
-        task.cancel()
         try:
-            with anyio.fail_after(60, shield=True):
-                await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         finally:
-            server.shutdown()
-            server.server_close()
-            server_thread.join(60)
-            await _wait(finished)
-            assert not server_thread.is_alive()
+            try:
+                server.shutdown()
+            finally:
+                try:
+                    server.server_close()
+                finally:
+                    server_thread.join(60)
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await _wait(finished)
+                        finally:
+                            for worker in workers:
+                                await anyio.to_thread.run_sync(worker.join, 60)
+                            assert all(not worker.is_alive() for worker in workers)
+                    assert not server_thread.is_alive()
 
 
 @pytest.mark.parametrize("status", [200, 404])
@@ -1313,8 +1346,10 @@ async def test_body_drip_worker_exits_at_deadline(
     proxy = _proxy_at(f"http://127.0.0.1:{server.server_port}", http_timeout_s=60)
     original = proxy._request
     operations: list[Any] = []
+    workers: list[threading.Thread] = []
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
         operations.append(args[0])
         try:
             return original(*args, **kwargs)
@@ -1343,16 +1378,24 @@ async def test_body_drip_worker_exits_at_deadline(
             assert await anyio.to_thread.run_sync(finished.wait, 30)
     finally:
         release.set()
-        task.cancel()
         try:
-            with anyio.fail_after(60, shield=True):
-                await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(60)
-            await _wait(finished)
-            assert not thread.is_alive()
+            try:
+                server.shutdown()
+            finally:
+                try:
+                    server.server_close()
+                finally:
+                    thread.join(60)
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await _wait(finished)
+                        finally:
+                            for worker in workers:
+                                await anyio.to_thread.run_sync(worker.join, 60)
+                            assert all(not worker.is_alive() for worker in workers)
+                    assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("termination", ["cancel", "timeout"])

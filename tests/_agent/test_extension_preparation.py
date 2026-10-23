@@ -1,9 +1,12 @@
 """Request-time synchronous extension hooks remain outside the event loop."""
 
+import asyncio
 import threading
 from typing import Any
 
+import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import CtxEnv, RtEnv
 from pydantic import (
     BaseModel,
@@ -181,12 +184,11 @@ async def test_old_inflight_cancellation_does_not_skip_new_request_checks(rt_env
 async def test_action_validator_abandoned_without_late_handler(
     ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import anyio
-
     from swarm_arena.manager import LimitReached
 
     entered, done = anyio.Event(), anyio.Event()
     release = threading.Event()
+    workers: list[threading.Thread] = []
     token = anyio.lowlevel.current_token()
     handled: list[bool] = []
     errors: list[LimitReached] = []
@@ -197,8 +199,9 @@ async def test_action_validator_abandoned_without_late_handler(
         @field_validator("x")
         @classmethod
         def validate_x(cls, value: int) -> int:
+            workers.append(threading.current_thread())
             anyio.from_thread.run_sync(entered.set, token=token)
-            release.wait()
+            assert release.wait(300), "test did not release the validator"
             return value
 
     async def handler(ctx: Any, args: BaseModel) -> str:
@@ -222,14 +225,21 @@ async def test_action_validator_abandoned_without_late_handler(
         finally:
             done.set()
 
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(invoke)
+    task = asyncio.create_task(invoke())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+            ctx_env.env.inflight.cancel_all()
+            await done.wait()
+        await observe_task(task)
+        assert [error.limit for error in errors] == ["stop"]
+        assert not handled
+    finally:
+        release.set()
         try:
-            with anyio.fail_after(60):
-                await entered.wait()
-                ctx_env.env.inflight.cancel_all()
-                await done.wait()
-            assert [error.limit for error in errors] == ["stop"]
-            assert not handled
+            await settle_tasks(task)
         finally:
-            release.set()
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(not worker.is_alive() for worker in workers)
