@@ -4,7 +4,7 @@ import asyncio
 import time
 import traceback
 from collections.abc import Callable, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Lock, get_ident
@@ -152,6 +152,45 @@ def _writer(
         sync_interval_s=sync_interval_s,
         group_window_s=group_window_s,
     )
+
+
+class _LeaseClock:
+    def __init__(self) -> None:
+        self.now = utc_now()
+        self.retrying = anyio.Event()
+
+    def utc_now(self) -> datetime:
+        return self.now
+
+    def renewal_due(self, writer: JournalWriter) -> None:
+        self.now = writer._lease.doc.expires_at - timedelta(seconds=writer._lease.ttl_s * 2 / 3)
+        writer._wake.set()
+
+    def expire(self, writer: JournalWriter) -> None:
+        assert writer._io_scope is not None, "expiry requires an in-flight storage operation"
+        self.now = writer._lease.doc.expires_at
+        writer._io_scope.deadline = anyio.current_time()
+
+
+@pytest.fixture
+def lease_clock(monkeypatch: pytest.MonkeyPatch) -> _LeaseClock:
+    from swarm_arena._journal import lease as lease_module
+    from swarm_arena._journal import writer as writer_module
+
+    clock = _LeaseClock()
+
+    class Backend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        async def sleep(self, delay: float) -> None:
+            clock.retrying.set()
+            await anyio.sleep_forever()
+
+    monkeypatch.setattr(lease_module, "utc_now", clock.utc_now)
+    monkeypatch.setattr(writer_module, "utc_now", clock.utc_now)
+    monkeypatch.setattr(writer_module, "anyio", Backend())
+    return clock
 
 
 async def test_append_durable_returns_after_head_covers_it(
@@ -327,11 +366,19 @@ async def test_unknown_advance_failed_then_takeover_is_fenced(tmp_path: Path) ->
     assert owner[0].head is None
 
 
-async def test_storage_error_until_expiry_fails_waiters(tmp_path: Path) -> None:
+async def test_storage_error_until_expiry_fails_waiters(
+    tmp_path: Path, lease_clock: _LeaseClock
+) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), create_raises=StorageError("disk full"))
-    async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
-        with anyio.fail_after(60), pytest.raises(Fenced):
-            await w.append_durable(EventDraft(type=EventType.RESERVE))
+    async with _writer(flaky, tmp_path) as w:
+        waiter = asyncio.create_task(w.append_durable(EventDraft(type=EventType.RESERVE)))
+        with anyio.fail_after(60):
+            await lease_clock.retrying.wait()
+            assert flaky.create_calls >= 1
+            assert not waiter.done()
+            lease_clock.expire(w)
+            with pytest.raises(Fenced):
+                await waiter
         assert w.fenced.is_set()
     assert flaky.replace_calls == flaky.replaces_at_first_create
 
@@ -409,10 +456,17 @@ async def test_lease_renewed_every_third_of_ttl(
                 scope.cancel()
 
 
-async def test_fenced_when_renewal_fails_until_expiry(tmp_path: Path) -> None:
+async def test_fenced_when_renewal_fails_until_expiry(
+    tmp_path: Path, lease_clock: _LeaseClock
+) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), replace_raises=StorageError("down"))
-    async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
+    async with _writer(flaky, tmp_path) as w:
+        lease_clock.renewal_due(w)
         with anyio.fail_after(60):
+            await lease_clock.retrying.wait()
+            assert flaky.replace_calls >= 1
+            assert not w.fenced.is_set()
+            lease_clock.expire(w)
             await w.fenced.wait()
 
 
@@ -482,11 +536,19 @@ async def test_unknown_create_not_found_retries(tmp_path: Path) -> None:
     assert flaky.create_calls == 2
 
 
-async def test_oserror_retries_until_expiry_without_renewal(tmp_path: Path) -> None:
+async def test_oserror_retries_until_expiry_without_renewal(
+    tmp_path: Path, lease_clock: _LeaseClock
+) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), create_raises=OSError("disk full"))
-    async with _writer(flaky, tmp_path, ttl_s=0.3, group_window_s=0) as w:
-        with anyio.fail_after(60), pytest.raises(Fenced):
-            await w.append_durable(EventDraft(type=EventType.RESERVE))
+    async with _writer(flaky, tmp_path, group_window_s=0) as w:
+        waiter = asyncio.create_task(w.append_durable(EventDraft(type=EventType.RESERVE)))
+        with anyio.fail_after(60):
+            await lease_clock.retrying.wait()
+            assert flaky.create_calls == 1
+            assert not waiter.done()
+            lease_clock.expire(w)
+            with pytest.raises(Fenced):
+                await waiter
     assert flaky.create_calls == 1
     assert flaky.replace_calls == 0
 
@@ -512,7 +574,9 @@ async def test_store_operations_run_off_loop(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("after", [True, False])
-async def test_unknown_renewal_checks_identity(tmp_path: Path, after: bool) -> None:
+async def test_unknown_renewal_checks_identity(
+    tmp_path: Path, after: bool, lease_clock: _LeaseClock
+) -> None:
     taken = anyio.Event()
     token = anyio.lowlevel.current_token()
 
@@ -526,8 +590,8 @@ async def test_unknown_renewal_checks_identity(tmp_path: Path, after: bool) -> N
         unknown_before_replace=int(not after),
         after_unknown=take_and_signal,
     )
-    # This checks unknown-write identity, not expiry under a subsecond lease.
-    async with _writer(flaky, tmp_path, ttl_s=3) as w:
+    async with _writer(flaky, tmp_path) as w:
+        lease_clock.renewal_due(w)
         with anyio.fail_after(60):
             await taken.wait()
             await w.fenced.wait()
@@ -756,11 +820,39 @@ async def test_unknown_create_conflicting_bytes_is_fatal(tmp_path: Path) -> None
     assert flaky.replace_calls == 0
 
 
-async def test_expiry_during_create_prevents_head_advance(tmp_path: Path) -> None:
-    flaky = FlakyStore(LocalStore(tmp_path / "run"), create_delay_s=0.2)
-    async with _writer(flaky, tmp_path, ttl_s=0.1, group_window_s=0) as w:
-        with anyio.fail_after(60), pytest.raises(Fenced):
-            await w.append_durable(EventDraft(type=EventType.RESERVE))
+async def test_expiry_during_create_prevents_head_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_clock: _LeaseClock
+) -> None:
+    flaky = FlakyStore(LocalStore(tmp_path / "run"))
+    flaky.create_started = anyio.Event()
+    flaky.create_release = ThreadEvent()
+    returned = ThreadEvent()
+    original_create = flaky.create
+
+    def create(key: str, data: bytes) -> str:
+        try:
+            return original_create(key, data)
+        finally:
+            returned.set()
+
+    writer = _writer(flaky, tmp_path, group_window_s=0)
+    monkeypatch.setattr(flaky, "create", create)
+    async with writer as w:
+        waiter = asyncio.create_task(w.append_durable(EventDraft(type=EventType.RESERVE)))
+        try:
+            with anyio.fail_after(60):
+                await flaky.create_started.wait()
+                assert flaky.create_calls == 1
+                lease_clock.expire(w)
+                with pytest.raises(Fenced):
+                    await waiter
+            assert not returned.is_set(), "expiry waited for the held create"
+        finally:
+            flaky.create_release.set()
+            assert await anyio.to_thread.run_sync(returned.wait, 60)
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
     assert flaky.replace_calls == 0
     assert w.committed == ()
 
@@ -937,12 +1029,16 @@ async def test_blocked_publication_expires_without_late_state_change(
 
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
-    writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
+    ttl = 180 if deadline == "lease" else 60
+    writer = _writer(store, tmp_path, ttl_s=ttl, group_window_s=0)
     # Allow normal release work to start and finish reliably after expiry.
     writer._settle_timeout_s = 2
-    wall_start, monotonic_start = utc_now(), time.monotonic()
+    wall_start = writer._lease.doc.expires_at - timedelta(seconds=ttl)
+    monotonic_start: float | None = None
 
     def slow_utc_now() -> datetime:
+        if monotonic_start is None:
+            return wall_start
         return wall_start + timedelta(seconds=(time.monotonic() - monotonic_start) * clock_rate)
 
     monkeypatch.setattr(writer_module, "utc_now", slow_utc_now)
@@ -966,7 +1062,12 @@ async def test_blocked_publication_expires_without_late_state_change(
     try:
         with anyio.fail_after(60):
             assert await anyio.to_thread.run_sync(entered.wait, 60)
-        if deadline == "settlement":
+        monotonic_start = time.monotonic()
+        if deadline == "lease":
+            wall_start = writer._lease.doc.expires_at - timedelta(seconds=3)
+            assert writer._io_scope is not None
+            writer._io_scope.deadline = anyio.current_time() + 3
+        else:
             writer._stop_storage()
         done, _ = await asyncio.wait([task], timeout=30)
         assert done, "publication wait outlived its deadline"
