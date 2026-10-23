@@ -3489,6 +3489,7 @@ async def test_resume_reads_back_open_keys(
     retry_acquire: bool,
 ) -> None:
     from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
     from swarm_arena._gateway.keys import gateway_call_id
 
     crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
@@ -3502,7 +3503,7 @@ async def test_resume_reads_back_open_keys(
     row = fake_gateway._spend[-1][1]
     managers: list[Any] = []
     adapters: list[Any] = []
-    bind, adapter_for = module._bind_gateway, module.adapter_for
+    bind, adapter_for = module._bind_gateway, litellm_proxy.adapter_for
 
     def capture_bind(*args: Any, **kwargs: Any) -> Any:
         manager = bind(*args, **kwargs)
@@ -3515,7 +3516,7 @@ async def test_resume_reads_back_open_keys(
         return adapter
 
     monkeypatch.setattr(module, "_bind_gateway", capture_bind)
-    monkeypatch.setattr(module, "adapter_for", capture_adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", capture_adapter)
     if retry_acquire:
         take_over = Lease.take_over.__func__
         attempts: list[bool] = []
@@ -3728,6 +3729,7 @@ async def test_resume_gateway_closure_has_one_overall_allowance(
     from _fakes.reconcile import CapableGateway
 
     from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
     from swarm_arena._gateway.adapter import VirtualKey
 
     fake = FakeGateway()
@@ -3753,7 +3755,7 @@ async def test_resume_gateway_closure_has_one_overall_allowance(
         await anyio.sleep_forever()
 
     monkeypatch.setattr(module, "_gateway_deadline", allowance)
-    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
     monkeypatch.setattr(adapter, "block_key", held)
     with anyio.fail_after(60):
         runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)

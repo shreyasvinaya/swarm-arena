@@ -2295,12 +2295,13 @@ async def test_run_gateway_preflight_precedes_keys_and_manifest(
     monkeypatch: pytest.MonkeyPatch,
     hard: bool | None,
 ) -> None:
-    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import keys, litellm_proxy
+    from swarm_arena._gateway.reconcile import KeyManager
     from swarm_arena.config import GatewayConfig
 
     constructed: list[Any] = []
     adapters: list[Any] = []
-    original_manager, original_adapter = module.KeyManager, module.adapter_for
+    original_manager, original_adapter = KeyManager, litellm_proxy.adapter_for
 
     def manager(*args: Any, **kwargs: Any) -> Any:
         kwargs["journal"]._check_open()
@@ -2313,8 +2314,8 @@ async def test_run_gateway_preflight_precedes_keys_and_manifest(
         adapters.append(result)
         return result
 
-    monkeypatch.setattr(module, "KeyManager", manager)
-    monkeypatch.setattr(module, "adapter_for", adapter)
+    monkeypatch.setattr(keys, "KeyManager", manager)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", adapter)
     monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
     config = run_config.model_copy(
         update={
@@ -2381,10 +2382,10 @@ async def test_run_without_gateway_constructs_no_services(
     run_config: RunConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
 
     factory = Mock(side_effect=AssertionError("unexpected gateway"))
-    monkeypatch.setattr(module, "adapter_for", factory)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", factory)
     runner = RunRunner(run_config, [], run_id="r-no-gateway", approve=None, replanner=None)
     assert await runner.run() == {}
     assert runner._gateway is runner._key_manager is None
@@ -2559,14 +2560,14 @@ async def test_run_end_reconciles_under_existing_owner(
 ) -> None:
     from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
 
-    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
     from swarm_arena._gateway.adapter import GatewayError
 
     adapter = CapableGateway()
     adapter.rows = [spend("end", 0.03)]
     if failure:
         adapter.errors["block"] = GatewayError("PRIVATE")
-    monkeypatch.setattr(module, "adapter_for", lambda config, environ: adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda config, environ: adapter)
 
     async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
         deps.journal.append(created(key_record("r-end")))
@@ -2596,7 +2597,7 @@ async def test_run_end_reconcile_timeout_still_finishes_stopping_run(
 ) -> None:
     from _fakes.reconcile import CapableGateway, config_at, created, key_record
 
-    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
 
     adapter = CapableGateway()
     entered = anyio.Event()
@@ -2611,7 +2612,7 @@ async def test_run_end_reconcile_timeout_still_finishes_stopping_run(
         return {}
 
     monkeypatch.setattr(adapter, "block_key", held)
-    monkeypatch.setattr(module, "adapter_for", lambda config, environ: adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda config, environ: adapter)
     monkeypatch.setattr(RunRunner, "_queue", queue)
     config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
     runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
@@ -2629,7 +2630,7 @@ async def test_run_end_unrepresentable_spend_still_exports(
 ) -> None:
     from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
 
-    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
     from swarm_arena._gateway.reports import ReconcileReport
 
     adapter = CapableGateway()
@@ -2647,7 +2648,7 @@ async def test_run_end_unrepresentable_spend_still_exports(
         deps.gateway.restore([deps.journal.append(created(record)) for record in records])
         return {}
 
-    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
     monkeypatch.setattr(RunRunner, "_queue", queue)
     config = config_at(tmp_path)
     runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
@@ -2670,9 +2671,8 @@ async def test_run_end_optional_reconcile_failure_still_exports(
 ) -> None:
     from _fakes.reconcile import CapableGateway, config_at, created, key_record
 
-    from swarm_arena._engine import run as module
     from swarm_arena._errors import _core_error
-    from swarm_arena._gateway import reconcile
+    from swarm_arena._gateway import litellm_proxy, reconcile
     from swarm_arena._gateway.reports import GatewayKeyFailure
 
     adapter = CapableGateway()
@@ -2689,7 +2689,7 @@ async def test_run_end_optional_reconcile_failure_still_exports(
             raise ExceptionGroup("PRIVATE", [ValueError("PRIVATE")])
         raise RuntimeError("PRIVATE")
 
-    monkeypatch.setattr(module, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
     monkeypatch.setattr(RunRunner, "_queue", queue)
     monkeypatch.setattr(reconcile, "reconcile_keys", fail)
     config = config_at(tmp_path)
