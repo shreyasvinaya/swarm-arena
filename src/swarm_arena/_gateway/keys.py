@@ -314,7 +314,12 @@ class KeyManager:
         outcome = _Outcome()
         try:
             return await operation()
-        except BaseException as error:
+        except BaseExceptionGroup as error:
+            if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
+                raise
+            outcome.propagate_control(error)
+            raise GatewayError(f"{site} failed") from None
+        except (Exception, anyio.get_cancelled_exc_class()) as error:
             outcome.propagate_control(error)
             raise GatewayError(f"{site} failed") from None
 
@@ -418,12 +423,23 @@ class KeyManager:
                 )
             self._records[record.key_id] = record
             return record, secret
-        except BaseException as error:
+        except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+            if (
+                isinstance(error, BaseExceptionGroup)
+                and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+            ):
+                raise
             cleanup_error: BaseException | None = None
             if key is not None:
                 try:
                     await self._compensate(key, deadline)
-                except BaseException as caught:
+                except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as caught:
+                    if (
+                        isinstance(caught, BaseExceptionGroup)
+                        and caught.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit))
+                        is not None
+                    ):
+                        raise
                     cleanup_error = caught
             outcome.propagate_control(error)
             if cleanup_error is not None:

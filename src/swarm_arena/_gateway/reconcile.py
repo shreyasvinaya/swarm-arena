@@ -22,7 +22,13 @@ from swarm_arena._engine.run import (
 from swarm_arena._engine.stops import StopState
 from swarm_arena._errors import ConfigError, Fenced, LeaseHeld, _core_error
 from swarm_arena._exec.executor import Executor, Job
-from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport, SpendRow
+from swarm_arena._gateway.adapter import (
+    GatewayAdapter,
+    GatewayError,
+    ProfileReport,
+    SpendRow,
+    VirtualKey,
+)
 from swarm_arena._gateway.keys import _CLOCK_SKEW, KeyManager, KeyRecord, _virtual, gateway_call_id
 from swarm_arena._gateway.labels import _observation_label
 from swarm_arena._gateway.reports import (
@@ -86,6 +92,23 @@ async def _external(operation: Callable[[], Awaitable[_T]], deadline: float) -> 
     except (Exception, anyio.get_cancelled_exc_class()) as error:
         outcome.propagate_control(error)
         raise GatewayError("gateway operation failed") from None
+
+
+async def _identity_reason(
+    adapter: GatewayAdapter, key: VirtualKey, *, run_id: str, deadline: float
+) -> str | None:
+    """Check ownership immediately before eligible gateway work."""
+    try:
+        matches = await _external(partial(adapter.key_matches, key, run_id=run_id), deadline)
+    except _AllowanceExpired:
+        return _ALLOWANCE_REASON
+    except GatewayError:
+        return "gateway key identity unavailable"
+    if matches is True:
+        return None
+    return (
+        "gateway key identity mismatch" if matches is False else "gateway key identity unavailable"
+    )
 
 
 def _key_event(
@@ -291,7 +314,7 @@ async def reconcile_keys(
                 assert isinstance(key_id, str)
                 deleted.add(key_id)
     reports: list[KeyReport] = []
-    for record in records:
+    for record in sorted(records, key=lambda item: closed[item.key_id] is not None):
         if record.key_id in deleted:
             retained: float | None = None
             retained_reasons: list[str] = []
@@ -320,19 +343,14 @@ async def reconcile_keys(
         deadline = min(overall, _gateway_deadline(journal, timeout_s=gateway.request_timeout_s))
         reasons: list[str] = []
         key = _virtual(record)
-        try:
-            matches = await _external(partial(adapter.key_matches, key, run_id=run_id), deadline)
-        except _AllowanceExpired:
-            reasons.append(_ALLOWANCE_REASON)
-        except GatewayError:
-            reasons.append("gateway key identity unavailable")
-        else:
-            if matches is not True:
-                reasons.append(
-                    "gateway key identity mismatch"
-                    if matches is False
-                    else "gateway key identity unavailable"
-                )
+        closure = closed[record.key_id]
+        identity_checked = False
+        if closure is None:
+            reason = await _identity_reason(adapter, key, run_id=run_id, deadline=deadline)
+            if reason is not None:
+                reasons.append(reason)
+            else:
+                identity_checked = True
         if reasons:
             reports.append(
                 KeyReport(
@@ -347,18 +365,6 @@ async def reconcile_keys(
                 )
             )
             continue
-        start = starts.get(record.candidate_id)
-        dead: bool | None = True
-        if start is not None:
-            try:
-                dead = await _external(partial(executor.confirm_dead, start), deadline)
-            except _AllowanceExpired:
-                reasons.append(_ALLOWANCE_REASON)
-            except GatewayError:
-                dead = None
-        if dead is not True:
-            reasons.append("tool not confirmed dead")
-        closure = closed[record.key_id]
         if closure is None and record.key_id not in deleted:
             try:
                 await _external(partial(adapter.block_key, key), deadline)
@@ -391,6 +397,22 @@ async def reconcile_keys(
             and (instant - closure).total_seconds() < gateway.request_timeout_s + interval
         ):
             reasons.append("request_timeout_s has not passed since closure")
+        start = starts.get(record.candidate_id)
+        dead: bool | None = True
+        if not reasons and start is not None:
+            try:
+                dead = await _external(partial(executor.confirm_dead, start), deadline)
+            except _AllowanceExpired:
+                dead = None
+                reasons.append(_ALLOWANCE_REASON)
+            except GatewayError:
+                dead = None
+        if dead is not True and _ALLOWANCE_REASON not in reasons:
+            reasons.append("tool not confirmed dead")
+        if not reasons and not identity_checked:
+            reason = await _identity_reason(adapter, key, run_id=run_id, deadline=deadline)
+            if reason is not None:
+                reasons.append(reason)
         observed: float | None = None
         if not reasons:
             try:
@@ -457,6 +479,8 @@ async def reconcile_keys(
                 deleted=record.key_id in deleted,
             )
         )
+    order = {record.key_id: index for index, record in enumerate(records)}
+    reports.sort(key=lambda item: order[item.key_id])
     report = ReconcileReport(run_id=run_id, keys=reports)
     journal.append(EventDraft(type=EventType.RECONCILE, payload=report.model_dump(mode="json")))
     return report
