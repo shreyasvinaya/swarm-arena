@@ -10,6 +10,9 @@ from typing import Any, NoReturn
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _fakes.fake_models import registered_model
 from _fakes.llm_run import HeldOperation, LLMRun, open_llm_run
 from agents import Agent, Model, ModelResponse, ModelSettings, Runner
@@ -110,7 +113,6 @@ def config() -> RunConfig:
                 )
             }
         ),
-        settle_timeout_s=2,
     )
 
 

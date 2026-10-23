@@ -86,7 +86,6 @@ def _budget_config(root: Path) -> RunConfig:
     return config.model_copy(
         update={
             "lease_ttl_s": 3,
-            "settle_timeout_s": 2,
             "limits": config.limits.model_copy(update={"max_usd": 0.000500, "max_tokens": None}),
         }
     )

@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("agents")
+
 from _fakes.llm_run import open_llm_run
 from _fakes.secrecy import assert_secret_absent
 
@@ -101,7 +104,7 @@ async def test_structured_call_routing_and_cap(
     monkeypatch.setattr(
         _structured, "supports", lambda spec, capability: supported or spec.model == "fake/fmt"
     )
-    async with open_llm_run(tmp_path, config=RunConfig(models=models, settle_timeout_s=2)) as run:
+    async with open_llm_run(tmp_path, config=RunConfig(models=models)) as run:
         scope = run.scope("judge")
         with llm_scope(scope):
             output, ids = await structured_call(
@@ -150,7 +153,7 @@ async def test_unknown_prices_and_formatter_own_cap(
     a.register("a")
     fmt.register("fmt")
     monkeypatch.setattr(_structured, "supports", lambda spec, feature: spec.model == "fake/fmt")
-    async with open_llm_run(tmp_path, config=RunConfig(models=models, settle_timeout_s=2)) as run:
+    async with open_llm_run(tmp_path, config=RunConfig(models=models)) as run:
         scope = run.scope("judge")
         with llm_scope(scope):
             output, ids = await structured_call(
@@ -180,7 +183,7 @@ async def test_invalid_call_output_is_value_free(tmp_path: Path, text: str) -> N
     fake = FakeModel([FakeTurn(text=text)])
     fake.register("a")
     models = ModelCatalog({"a": ModelSpec(model="fake/a", roles=["judge"])})
-    async with open_llm_run(tmp_path, config=RunConfig(models=models, settle_timeout_s=2)) as run:
+    async with open_llm_run(tmp_path, config=RunConfig(models=models)) as run:
         scope = run.scope("judge")
         with (
             llm_scope(scope),
@@ -220,7 +223,7 @@ async def test_empty_draft_never_starts_formatter(
     first.register("a")
     formatter.register("fmt")
     monkeypatch.setattr(_structured, "supports", lambda spec, feature: spec.model == "fake/fmt")
-    async with open_llm_run(tmp_path, config=RunConfig(models=models, settle_timeout_s=2)) as run:
+    async with open_llm_run(tmp_path, config=RunConfig(models=models)) as run:
         scope = run.scope("judge")
         with llm_scope(scope), pytest.raises(ValueError, match="empty structured draft"):
             await structured_call(

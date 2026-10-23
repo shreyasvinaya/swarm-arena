@@ -1429,7 +1429,6 @@ def _planning_config(
             "models": ModelCatalog(
                 {"p": ModelSpec(model="unpriced/planner-test", roles=["planner"], max_tokens=10)}
             ),
-            "settle_timeout_s": 2,
         }
     )
 

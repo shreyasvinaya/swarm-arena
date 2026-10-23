@@ -2821,7 +2821,7 @@ async def test_public_resume_refuses_planning_session_without_mutation(
         next_seq=1,
         local_path=tmp_path / "planning.jsonl",
         sync_interval_s=60,
-        settle_timeout_s=2,
+        settle_timeout_s=config.settle_timeout_s,
     ) as journal:
         journal.append(
             EventDraft(type="run_config", payload={"config": config.model_dump(mode="json")})

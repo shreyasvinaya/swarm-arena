@@ -2,11 +2,15 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _fakes.llm_components import LateFakeModel
 from _fakes.llm_run import open_llm_run
 from _fakes.planning_llm import planner_config, planner_output
@@ -14,7 +18,8 @@ from _fakes.run import all_events
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, Limits, PartSpec, Plan, Ref, RoundSpec
-from swarm_arena._budget.llm_scope import llm_scope
+from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+from swarm_arena._budget.tranche import Tranche, TrancheOutcome
 from swarm_arena._model.planning_types import History
 from swarm_arena._model.tooling import Estimate
 from swarm_arena.llm import Approve, CollaborativePlanner, Edited, Feedback, LLMPlanner
@@ -630,6 +635,9 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
     try:
         async with open_llm_run(tmp_path, config=config) as run:
             scope = run.scope("planner")
+            if never:
+                # Only the event-held missing report gets a short cutoff.
+                scope = replace(scope, settle_timeout_s=2)
 
             async def call() -> Plan:
                 with llm_scope(scope):
@@ -1101,3 +1109,53 @@ async def test_custom_cleanup_preserves_primary_and_ignores_handled_exception(
         }[primary]
     )
     assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("phase", ["drain", "close"])
+async def test_planning_cleanup_survives_delayed_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from swarm_arena._engine import run
+
+    entered = anyio.Event()
+    release = anyio.Event()
+    delay_elapsed = anyio.Event()
+    original_drain = run.drain
+    original_close = Tranche.close
+
+    async def hold() -> None:
+        entered.set()
+        await release.wait()
+
+    async def drain(scope: LLMScope, *, wait: bool) -> None:
+        if phase == "drain" and not wait:
+            await hold()
+        await original_drain(scope, wait=wait)
+
+    async def close(tranche: Tranche) -> TrancheOutcome:
+        if phase == "close":
+            await hold()
+        return await original_close(tranche)
+
+    async def delayed_storage() -> None:
+        await entered.wait()
+        # Model a descheduled storage worker; no work must beat this timer.
+        with anyio.move_on_after(2.1):
+            await release.wait()
+        delay_elapsed.set()
+        release.set()
+
+    monkeypatch.setattr(run, "drain", drain)
+    monkeypatch.setattr(Tranche, "close", close)
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    config = planner_config(tmp_path)
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as group:
+            group.start_soon(delayed_storage)
+            try:
+                result = await LLMPlanner("planner").plan(GOAL, config, None)
+            finally:
+                release.set()
+    assert delay_elapsed.is_set()
+    assert result.goal == GOAL
+    assert len([event for event in all_events(config) if event.type == "goal_finished"]) == 1

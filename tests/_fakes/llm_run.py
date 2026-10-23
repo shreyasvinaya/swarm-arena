@@ -148,7 +148,7 @@ class LLMRun:
 async def open_llm_run(
     tmp_path: Path, *, config: RunConfig | None = None
 ) -> AsyncGenerator[LLMRun]:
-    config = config or RunConfig(limits=Limits(max_tokens=None, max_usd=None), settle_timeout_s=2)
+    config = config or RunConfig(limits=Limits(max_tokens=None, max_usd=None))
     run_id = f"llm-test-{uuid4().hex}"
     store = LocalStore(tmp_path / run_id)
     artifacts = ArtifactStore(LocalStore(tmp_path / "artifacts"))

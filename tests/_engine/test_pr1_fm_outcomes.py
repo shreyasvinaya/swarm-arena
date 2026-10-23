@@ -34,7 +34,6 @@ def config(root: Path) -> RunConfig:
         arena_root=str(root / "arena"),
         executor=Ref.of(LocalExecutor(workspace_root=str(root / "ws"))),
         limits=Limits(max_tokens=1000, max_usd=0.001, run_timeout_s=120, round_timeout_s=60),
-        settle_timeout_s=2.0,
     )
 
 
