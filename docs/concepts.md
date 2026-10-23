@@ -149,7 +149,8 @@ candidate; an ordinary manager exception ends only that agent's round.
 Registered ownership and terminal cleanup failures retain their core stop behavior.
 
 `AgentsSDKManager` uses the optional Agents SDK integration (`uv add
-"swarm-arena[llm]"`) to choose these actions. Its `model` is an alias in the
+"swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`) to choose
+these actions. Its `model` is an alias in the
 run configuration's model catalog and must permit the `manager` role:
 
 ```python
@@ -250,7 +251,8 @@ or changing limits, and [Planning modes](planning-modes.md) for runnable plans.
 
 ## Models
 
-Install the optional integration with `uv add 'swarm-arena[llm]'`. The human's
+Install the optional integration with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. The human's
 `RunConfig` declares the provider models available to LLM components:
 
 ```toml
@@ -342,7 +344,8 @@ configuration error; use the installed settings or start a new process.
 Role read/write switches and namespaces remain per scope and may differ between runs.
 
 Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
-extra (`uv add "swarm-arena[llm,cache]"`). Configure `RunConfig.cache` in TOML:
+extra (`uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"`).
+Configure `RunConfig.cache` in TOML:
 
 ```toml
 [cache]

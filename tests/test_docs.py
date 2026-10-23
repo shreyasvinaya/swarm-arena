@@ -19,6 +19,16 @@ GUIDES = sorted(
 ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
 
 
+def test_optional_install_examples_use_prerelease_uv() -> None:
+    source = "git+https://github.com/shreyasvinaya/swarm-arena"
+    readme = (ROOT / "README.md").read_text()
+    for extra in ("llm", "cache", "langfuse"):
+        assert f'uv add "swarm-arena[{extra}] @ {source}"' in readme
+    concepts = re.sub(r"\s+", " ", (ROOT / "docs/concepts.md").read_text())
+    for extras in ("llm", "llm,cache"):
+        assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
+
+
 @pytest.mark.parametrize(
     ("module", "name"),
     [

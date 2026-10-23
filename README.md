@@ -69,12 +69,12 @@ isolated `FakeModel` conversations and check exact accounting, replay and final 
 
 Install the optional model adapter dependencies, response-cache backends, or
 Langfuse tracing dependencies as needed (combine extras for both model calls
-and caching or tracing):
+and caching or tracing). Until M5's first release, install from the git source:
 
 ```sh
-pip install 'swarm-arena[llm]'
-pip install 'swarm-arena[cache]'
-pip install 'swarm-arena[langfuse]'
+uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"
 ```
 
 ## Test one connector

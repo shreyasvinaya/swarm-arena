@@ -20,6 +20,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.plan import Plan
+from swarm_arena._model.ref import _LLM_EXTRA_HINT
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.toml_io import read_toml
 from swarm_arena._outcomes import _Outcome
@@ -126,9 +127,7 @@ async def _generate(args: argparse.Namespace, output: Path) -> None:
         from swarm_arena.llm import CollaborativePlanner, LLMPlanner
         from swarm_arena.llm._terminal_reviewer import TerminalReviewer
     except ImportError:
-        raise _core_error(
-            ValueError, "plan generation requires the llm extra: uv add 'swarm-arena[llm]'"
-        ) from None
+        raise _core_error(ValueError, _LLM_EXTRA_HINT) from None
     base_dir = args.source.parent.resolve()
     if str(base_dir) not in sys.path:
         sys.path.append(str(base_dir))

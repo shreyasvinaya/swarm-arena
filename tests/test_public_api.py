@@ -292,7 +292,10 @@ def test_llm_facade_names_the_extra_when_missing(missing: str) -> None:
     code = f"import sys; sys.modules[{missing!r}] = None; import swarm_arena.llm"
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     assert proc.returncode != 0
-    assert "pip install 'swarm-arena[llm]'" in proc.stderr
+    assert (
+        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        in proc.stderr
+    )
     assert "ModuleNotFoundError" in proc.stderr
 
 
@@ -316,7 +319,10 @@ try:
     import swarm_arena.llm
 except ModuleNotFoundError as error:
     assert error.name == {module!r}
-    assert "pip install 'swarm-arena[llm]'" in str(error)
+    assert (
+        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        in str(error)
+    )
 else:
     raise AssertionError("missing extra imported")
 """
