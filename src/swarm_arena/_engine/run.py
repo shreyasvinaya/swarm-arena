@@ -142,21 +142,33 @@ async def _watch_fence(journal: JournalWriter, scope: anyio.CancelScope) -> None
     scope.cancel()
 
 
+def _has_driver_control(error: BaseException) -> bool:
+    """Recognize hard controls captured from the awaiting body, including groups."""
+    controls = (KeyboardInterrupt, SystemExit, GeneratorExit)
+    return isinstance(error, controls) or (
+        isinstance(error, BaseExceptionGroup) and error.subgroup(controls) is not None
+    )
+
+
 @asynccontextmanager
 async def _supervise_writer(journal: JournalWriter) -> AsyncGenerator[None]:
     """Retain the existing fence watcher through preparation and publication."""
     error: BaseException | None = None
-    with anyio.CancelScope() as scope:
-        async with anyio.create_task_group() as watchers:
-            watchers.start_soon(_watch_fence, journal, scope)
-            try:
-                await anyio.lowlevel.checkpoint_if_cancelled()
-                journal._raise_if_fenced()
-                yield
-            except BaseException as caught:
-                error = caught
-            finally:
-                watchers.cancel_scope.cancel()
+    try:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as watchers:
+                watchers.start_soon(_watch_fence, journal, scope)
+                try:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    journal._raise_if_fenced()
+                    yield
+                except BaseException as caught:
+                    error = caught
+                finally:
+                    watchers.cancel_scope.cancel()
+    finally:
+        if error is not None and _has_driver_control(error):
+            raise error
     if journal._stopped and isinstance(error, anyio.get_cancelled_exc_class()):
         raise error
     journal._raise_if_fenced()
@@ -604,17 +616,24 @@ class RunRunner:
                 self._used = True
                 assert services.deps is not None
                 failed = False
+                hard: BaseException | None = None
                 try:
                     return await self._drive(services.deps, self.resumed.epoch)
                 except BaseException as error:
                     failed = True
-                    if _has_fenced(error):
+                    if _has_driver_control(error):
+                        hard = error
+                    elif _has_fenced(error):
                         if services.deps.journal._stopped:
                             raise anyio.get_cancelled_exc_class()() from None
                         raise _core_error(Fenced) from None
                     raise
                 finally:
-                    await services._aclose(failed=failed)
+                    try:
+                        await services._aclose(failed=failed)
+                    finally:
+                        if hard is not None:
+                            raise hard
             outcome = _Outcome()
             try:
                 self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
@@ -632,6 +651,7 @@ class RunRunner:
             artifacts = ArtifactStore(open_store(self.config.artifact_root))
             executor: Executor | None = None
             failed = False
+            hard = None
             try:
                 with TemporaryDirectory(prefix="swarm-arena-approval-") as directory:
                     stage = Path(directory)
@@ -738,14 +758,20 @@ class RunRunner:
                 )
             except BaseException as exc:
                 failed = True
-                if _has_fenced(exc):
+                if _has_driver_control(exc):
+                    hard = exc
+                elif _has_fenced(exc):
                     if self._journal is not None and self._journal._stopped:
                         raise anyio.get_cancelled_exc_class()() from None
                     raise _core_error(Fenced) from None
                 raise
             finally:
-                if executor is not None:
-                    await _close_executor(executor, self.config, failed=failed)
+                try:
+                    if executor is not None:
+                        await _close_executor(executor, self.config, failed=failed)
+                finally:
+                    if hard is not None:
+                        raise hard
 
     async def _execute(
         self,

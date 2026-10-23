@@ -2766,3 +2766,110 @@ async def test_run_end_reconcile_preserves_control_and_storage_failures(
         assert not [
             event for event in run.events("gateway_key") if event.payload["action"] == "read_failed"
         ]
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_writer_supervision_preserves_driver_hard_control(
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from swarm_arena._engine import run as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    journal = Mock(fenced=anyio.Event(), _stopped=False)
+    entered = anyio.Event()
+    order: list[str] = []
+
+    async def watch(*args: Any) -> None:
+        entered.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            order.append("watcher closed")
+            if cleanup_fails:
+                raise OSError("watcher cleanup failed")
+
+    monkeypatch.setattr(module, "_watch_fence", watch)
+
+    async def invoke() -> None:
+        async with module._supervise_writer(journal):
+            with anyio.fail_after(60):
+                await entered.wait()
+            if fenced:
+                journal._raise_if_fenced.side_effect = _core_error(Fenced)
+            order.append("body failed")
+            raise error
+
+    with pytest.raises(type(error)) as caught:
+        await invoke()
+    assert caught.value is error
+    assert order == ["body failed", "watcher closed"]
+    assert journal._raise_if_fenced.call_count == 1
+
+
+@pytest.mark.parametrize("boundary", ["new", "resumed"])
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_run_preserves_driver_hard_control_through_cleanup(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    journal = Mock(_stopped=False)
+    if fenced:
+        journal._raise_if_fenced.side_effect = _core_error(Fenced)
+    order: list[str] = []
+
+    async def fail(*args: Any) -> Any:
+        order.append("body failed")
+        raise error
+
+    async def close(*args: Any, **kwargs: Any) -> None:
+        order.append("closed")
+        if cleanup_fails:
+            raise _core_error(Fenced) if fenced else OSError("cleanup failed")
+
+    cleanup = AsyncMock(side_effect=close)
+    runner = RunRunner(run_config, [], run_id="driver-control", approve=None, replanner=None)
+    runner._journal = journal
+    if boundary == "resumed":
+        services = Mock(closed=False, deps=Mock(journal=journal), _aclose=cleanup)
+        runner.resumed = Mock(_services=services, epoch=2)
+        monkeypatch.setattr(runner, "_drive", fail)
+    else:
+        executor = Mock(capacity=AsyncMock(return_value=None))
+        monkeypatch.setattr(module, "_start_executor", AsyncMock(return_value=executor))
+        monkeypatch.setattr(module, "run_preflight", AsyncMock())
+        monkeypatch.setattr(module, "_close_executor", cleanup)
+        monkeypatch.setattr(runner, "_execute", fail)
+    with pytest.raises(type(error)) as caught:
+        await runner.run()
+    assert caught.value is error
+    assert order == ["body failed", "closed"]
+    assert cleanup.await_count == 1
+    assert cleanup.call_args.kwargs["failed"] is True
