@@ -529,8 +529,8 @@ def _metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
 @dataclass(frozen=True)
 class _Prepared:
     call: LLMCall
-    request: bytes
-    response: bytes
+    request: bytes | None
+    response: bytes | None
     request_sha: str
     cache_identity: str | None
     actual: Amount
@@ -619,8 +619,8 @@ def _prepare_call(
     response = canonical_json(_plain(kwargs["response"]))
     return _Prepared(
         call,
-        request,
-        response,
+        request if kwargs["request"] is not None else None,
+        response if kwargs["response"] is not None else None,
         sha256_hex(request),
         _digest(kwargs["cache_identity"]),
         actual,
@@ -784,6 +784,7 @@ async def record_call(
     settle: bool,
     charge_reservation: bool = False,
     cache_identity: str | None = None,
+    _external_observation: bool = False,
 ) -> LLMCall | None:
     """Prepare, journal and settle one call, suppressing duplicate or late reports.
 
@@ -821,6 +822,10 @@ async def record_call(
     cache_identity : str or None, optional
         SHA-256 of the namespace, effective key and generating response identity.
         Missing/ambiguous provenance leaves cached_from_call_id unset.
+
+    _external_observation : bool, default=False
+        Private core ingestion path for settlement-free external observations.
+        Without a pending reservation, never adopt an ambient funded scope.
 
     Returns
     -------
@@ -867,6 +872,7 @@ async def record_call(
         settle=settle,
         charge_reservation=charge_reservation,
         cache_identity=cache_identity,
+        _external_observation=_external_observation,
     )
     if asyncio.get_running_loop() is not binding.loop:
         future = asyncio.run_coroutine_threadsafe(_record(binding, meta, kwargs), binding.loop)
@@ -879,6 +885,9 @@ async def _record(
 ) -> LLMCall | None:
     if not _owns_callback(binding, meta):
         return None
+    external = kwargs.get("_external_observation", False)
+    if type(external) is not bool or (external and kwargs["settle"]):
+        raise _core_error(ValueError, "invalid external observation")
     entry = binding.pending.get(meta.get("reservation_id", ""))
     cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
     reservation = binding.call_reservations.get(cid)
@@ -901,8 +910,13 @@ async def _record(
         assert prepared is not None
         call = prepared.call
         if binding.tracing.store_payloads:
-            refs: list[str] = []
-            for content in (prepared.request, prepared.response):
+            refs: dict[str, str] = {}
+            for field, content in (
+                ("request_ref", prepared.request),
+                ("response_ref", prepared.response),
+            ):
+                if content is None:
+                    continue
                 ready, digest = await _owned(
                     binding,
                     partial(
@@ -913,8 +927,8 @@ async def _record(
                 if not ready or _duplicate(binding, cid, lid, entry):
                     return None
                 assert digest is not None
-                refs.append(digest)
-            call = call.model_copy(update={"request_ref": refs[0], "response_ref": refs[1]})
+                refs[field] = digest
+            call = call.model_copy(update=refs)
         if call.cache_hit and prepared.cache_identity is not None:
             call = call.model_copy(
                 update={"cached_from_call_id": binding.originals.get(prepared.cache_identity)}
@@ -923,7 +937,7 @@ async def _record(
         if entry is not None:
             entry.state = "claimed"
         _append(binding, call, prepared.request_sha, prepared.cache_identity)
-        scope = entry.scope if entry is not None else current_llm_scope()
+        scope = entry.scope if entry is not None else None if external else current_llm_scope()
         if scope is not None and scope.run_id == call.run_id:
             for owner in scope.lineage():
                 if call.id not in owner.call_ids:

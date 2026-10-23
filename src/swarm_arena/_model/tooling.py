@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Final
 
-from pydantic import AfterValidator, Field, TypeAdapter, field_serializer
+from pydantic import AfterValidator, Field, PrivateAttr, TypeAdapter, field_serializer
 
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.canonical import UtcDatetime, sha256_hex
@@ -420,6 +420,9 @@ class ToolOutput(FrozenModel):
         Token consumption and reported cost.
     logs_ref : str or None, default=None
         Transport log hashes or the run-relative log reference.
+    llm_calls_file : FileRef or None, default=None
+        Optional cooperating-tool report, collected from swarm/llm_calls.jsonl.
+        Files over 16 MiB and at most 1 GiB are fully hashed but not uploaded.
     started_at : datetime or None, default=None
         Aware start time, normalized to UTC milliseconds.
     ended_at : datetime or None, default=None
@@ -447,6 +450,8 @@ class ToolOutput(FrozenModel):
     files: list[FileRef] = []
     usage: Usage = Usage()
     logs_ref: str | None = None
+    llm_calls_file: FileRef | None = None
+    _collection_diagnostics: tuple[tuple[str, int], ...] = PrivateAttr(default=())
     started_at: UtcDatetime | None = None
     ended_at: UtcDatetime | None = None
     failed_provider: str | None = None

@@ -33,12 +33,14 @@ from swarm_arena._model.tooling import (
 from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control, _raise_terminal
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.io import _storage_io, _validated_io
+from swarm_arena._tooling.llm_calls import collect_llm_calls
 from swarm_arena._tooling.materialize import (
     _open_output_file,
     _stage_layout,
     collect_output_files,
     materialize,
 )
+from swarm_arena._tooling.output import detach_tool_output, with_collection_diagnostics
 from swarm_arena._tooling.paths import output_paths
 from swarm_arena._tooling.result_file import (
     _OUTPUT_BYTE_LIMIT,
@@ -358,7 +360,7 @@ class _JobRun:
             timed = run or self._provisional
             times = None if timed is None else (timed.started_at, timed.ended_at)
             # Preserve collected data, but never publish refs from an abandoned upload.
-            update: dict[str, Any] = {"files": [], "logs_ref": None}
+            update: dict[str, Any] = {"files": [], "logs_ref": None, "llm_calls_file": None}
             if times is not None:
                 update["started_at"], update["ended_at"] = times
             partial = output.model_copy(update=update)
@@ -406,7 +408,7 @@ class _JobRun:
                 note_in_log(run.stderr_path, "too many declared files")
                 return None
             # model_copy and model_construct skip validation (the finite-JSON rule too).
-            return _detach_model(ToolOutput, output)
+            return detach_tool_output(output)
         except (Fenced, BaseExceptionGroup):
             raise
         except (Exception, SystemExit) as error:
@@ -526,6 +528,11 @@ class _JobRun:
         finally:
             call.abandon()
 
+    def _upload_report(self, data: bytes, expected: str) -> None:
+        """Publish one report and validate the backend's content-addressed result."""
+        if self._artifacts.put_bytes(data) != expected:
+            raise ValueError("invalid report artifact digest")
+
     async def _finish(
         self, output: ToolOutput, times: tuple[datetime, datetime] | None
     ) -> ToolOutput:
@@ -553,6 +560,16 @@ class _JobRun:
         for rel in (_STDOUT, _STDERR):
             hashes.append(await self._workspace_io(self._upload_log, rel))
         update["logs_ref"] = format_logs_ref(hashes[0], hashes[1])
+        ref, report, diagnostics = await self._workspace_io(
+            collect_llm_calls, self._workspace, validation=True
+        )
+        if report is not None:
+            assert ref is not None
+            await self._workspace_io(self._upload_report, report, ref.sha256)
+        update["llm_calls_file"] = ref
+        output = with_collection_diagnostics(
+            output, (*output._collection_diagnostics, *diagnostics)
+        )
         if times is not None:
             update["started_at"], update["ended_at"] = times
         return output.model_copy(update=update)

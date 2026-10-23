@@ -649,3 +649,13 @@ The kit checks that the judge leaves no reservation pending and that closed
 charges equal journaled LLM costs. A contained terminal control fails the
 conformance check; propagated controls and ordinary judge errors retain their
 existing handling.
+
+### Reporting calls made by your tool
+
+A connector whose subprocess calls an LLM can write
+`swarm/llm_calls.jsonl`
+with one call per line. See {ref}`Reporting LLM calls <reporting-llm-calls>`
+for the schema, limits, candidate source labels and trace correlation variables.
+The executor collects this optional file automatically; do not add its reserved
+workspace path to `ToolOutput.files`. Keep aggregate tool usage in the result
+file: individual report rows are informational and never create a second charge.

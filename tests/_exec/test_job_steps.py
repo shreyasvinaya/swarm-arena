@@ -502,7 +502,7 @@ async def test_collection_keeps_terminal_authority_and_ordinary_containment(
         job_steps, "command_output_from_result", lambda *args: ToolOutput(status=RunStatus.OK)
     )
     monkeypatch.setattr(
-        job_steps, "command_output_from_result" if site == "collect" else "_detach_model", fail
+        job_steps, "command_output_from_result" if site == "collect" else "detach_tool_output", fail
     )
     if kind == "terminal":
         with pytest.raises(RuntimeError, match="terminal test"):
@@ -952,3 +952,206 @@ async def test_process_control_error_passes_through_pending_cancel(
     assert caught == [error]
     assert caught[0] is error
     failure_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("size", [17, 17 * 1024 * 1024, 1024 * 1024 * 1024 + 1])
+async def test_upload_outputs_sets_llm_calls_file(
+    tmp_path: Path, artifacts: ArtifactStore, size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    run = _completed(ws)
+    report = ws / "swarm/llm_calls.jsonl"
+    with report.open("wb") as stream:
+        stream.truncate(size)
+    puts: list[bytes] = []
+    put = artifacts.put_bytes
+
+    def capture(data: bytes) -> str:
+        puts.append(data)
+        return put(data)
+
+    monkeypatch.setattr(artifacts, "put_bytes", capture)
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=1024, max_output_bytes=1024)
+    output = await runner._finish(
+        ToolOutput(status=RunStatus.OK, data={"valid": True}), (run.started_at, run.ended_at)
+    )
+    assert output.data == {"valid": True}
+    assert output.status == RunStatus.OK
+    if size > 1024 * 1024 * 1024:
+        assert output.llm_calls_file is None
+        assert output._collection_diagnostics == (("llm_calls_hash_limit", 1),)
+    else:
+        assert output.llm_calls_file == FileRef(
+            name="llm_calls.jsonl",
+            path="llm_calls.jsonl",
+            sha256=sha256_hex(b"\0" * size),
+            size=size,
+        )
+    assert len(puts) == (3 if size <= 16 * 1024 * 1024 else 2)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "missing"])
+async def test_optional_report_refusal_preserves_result(
+    tmp_path: Path, artifacts: ArtifactStore, kind: str
+) -> None:
+    import os
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    run = _completed(ws)
+    path = ws / "swarm/llm_calls.jsonl"
+    if kind == "symlink":
+        path.symlink_to(ws / "missing")
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=1024, max_output_bytes=1024)
+    output = await runner._finish(ToolOutput(status=RunStatus.OK, data={"valid": True}), None)
+    assert output.status == RunStatus.OK
+    assert output.data == {"valid": True}
+    assert output.llm_calls_file is None
+    assert bool(output._collection_diagnostics) == (kind != "missing")
+    assert "diagnostic" not in output.model_dump_json()
+    assert "diagnostic" not in repr(output)
+    assert run.status == RunStatus.OK
+
+
+async def test_cancelled_report_read_never_starts_upload(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._exec import job_steps
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    _completed(ws)
+    (ws / "swarm/llm_calls.jsonl").write_bytes(b'{"model":"a/b"}')
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=1024, max_output_bytes=1024)
+    held = HeldOperation()
+    collect = job_steps.collect_llm_calls
+    puts: list[bytes] = []
+    put = artifacts.put_bytes
+
+    def hold(workspace: Path) -> Any:
+        held.wait()
+        return collect(workspace)
+
+    def capture(data: bytes) -> str:
+        puts.append(data)
+        return put(data)
+
+    monkeypatch.setattr(job_steps, "collect_llm_calls", hold)
+    monkeypatch.setattr(artifacts, "put_bytes", capture)
+    task = asyncio.create_task(runner._finish(ToolOutput(status=RunStatus.OK), None))
+    try:
+        await held.ready()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await held.finish()
+        assert puts == [b"o", b"e"]
+    finally:
+        held.release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await held.finish()
+
+
+async def test_partial_delivery_strips_report_reference(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    received: list[ToolOutput] = []
+
+    async def partial(output: ToolOutput) -> None:
+        received.append(output)
+
+    job = _job(tmp_path, on_partial=partial)
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=1024, max_output_bytes=1024)
+    runner._output = ToolOutput(
+        status=RunStatus.OK,
+        data={"keep": True},
+        llm_calls_file=FileRef(
+            name="llm_calls.jsonl",
+            path="llm_calls.jsonl",
+            sha256="0" * 64,
+            size=1,
+        ),
+    )
+    await runner._deliver_partial()
+    assert received[0].data == {"keep": True}
+    assert received[0].llm_calls_file is None
+    assert received[0].files == []
+    assert received[0].logs_ref is None
+
+
+@pytest.mark.parametrize("site", ["read", "upload"])
+async def test_abandoned_report_operation_retains_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    import threading
+
+    import anyio
+
+    from swarm_arena._exec import job_steps
+    from swarm_arena.executor import LocalExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    workspaces: list[Path] = []
+    collect = job_steps.collect_llm_calls
+    upload = _JobRun._upload_report
+
+    def hold(workspace: Path) -> None:
+        workers.append(threading.current_thread())
+        workspaces.append(workspace)
+        entered.set()
+        assert release.wait(30)
+        (workspace / "late-report").write_text("retained")
+
+    def held_read(workspace: Path) -> Any:
+        hold(workspace)
+        return collect(workspace)
+
+    def held_upload(self: _JobRun, data: bytes, expected: str) -> None:
+        hold(self._workspace)
+        upload(self, data, expected)
+
+    if site == "read":
+        monkeypatch.setattr(job_steps, "collect_llm_calls", held_read)
+    else:
+        monkeypatch.setattr(_JobRun, "_upload_report", held_upload)
+    executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
+    command = Command(
+        argv=[
+            "python",
+            "-c",
+            "from pathlib import Path; Path('swarm/llm_calls.jsonl').write_text('{}')",
+        ]
+    )
+    task = asyncio.create_task(executor.submit(_job(tmp_path, command=command)))
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        task.cancel()
+        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            await task
+        assert workspaces[0].is_dir(), "workspace removed while report operation still owns it"
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(10):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+        await executor.aclose()
+    assert len(workers) == 1
+    assert (workspaces[0] / "late-report").read_text() == "retained"

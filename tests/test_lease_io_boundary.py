@@ -344,3 +344,35 @@ def test_guard_scans_shared_job_publication(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(AssertionError, match=r"_exec/job_steps.py:\d+: unsafe_upload"):
         test_lease_owned_modules_use_abandonable_workers()
+
+
+@pytest.mark.parametrize(
+    ("module", "safe", "unsafe"),
+    [
+        (
+            "_agent/tool_run.py",
+            "_storage_io(\n                        _reported_rows,",
+            "anyio.to_thread.run_sync(\n                        _reported_rows,",
+        ),
+        (
+            "_exec/job_steps.py",
+            "self._workspace_io(self._upload_report,",
+            "anyio.to_thread.run_sync(self._upload_report,",
+        ),
+    ],
+)
+def test_guard_scans_report_storage(
+    monkeypatch: pytest.MonkeyPatch, module: str, safe: str, unsafe: str
+) -> None:
+    target = _ROOT / module
+    source = target.read_text()
+    replaced = source.replace(safe, unsafe)
+    assert replaced != source
+    original = Path.read_text
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return replaced if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="unprotected worker calls"):
+        test_lease_owned_modules_use_abandonable_workers()

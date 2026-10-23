@@ -2192,3 +2192,150 @@ async def test_predispatch_error_retains_candidate_after_completion_cancel(
     assert rt_env.reservation_state(reservation) == "settled"
     assert rt_env.charged(reservation) == Amount()
     assert not rt_env.inflight._scopes
+
+
+async def test_reported_rows_recorded_as_tool_calls(rt_env: RtEnv) -> None:
+    import json
+
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.replay import RunState
+
+    report = "\n".join(
+        json.dumps(row)
+        for row in [
+            {"model": "a/b", "cost_usd": 0.01, "owner_epoch": "999", "candidate_id": "forged"},
+            {"model": "a/c", "cost_usd": 0.02},
+        ]
+    )
+    result = json.dumps({"data": {"ok": True}, "usage": {"usd": 0.04}})
+    code = (
+        "from pathlib import Path; import os; "
+        f"Path('swarm/llm_calls.jsonl').write_text({report!r}); "
+        f"Path(os.environ['SWARM_ARENA_RESULT']).write_text({result!r})"
+    )
+    rt = rt_env.with_tool(PyTool({"code": code}))
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=rt.config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState(),
+    ):
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    calls = [event.payload["call"] for event in rt_env.events("llm_call")]
+    assert candidate.output.data == {"ok": True}
+    assert [call["role"] for call in calls] == ["tool", "tool"]
+    assert [call["candidate_id"] for call in calls] == [candidate.id, candidate.id]
+    assert candidate.llm_calls_source == "reported"
+    assert len(candidate.llm_call_ids) == 2
+    assert set(candidate.llm_call_ids) == {call["id"] for call in calls}
+    assert rt_env.charged(candidate).usd == 0.04
+
+
+@pytest.mark.parametrize("kind", ["oversize", "hash_limit", "symlink", "malformed"])
+async def test_bad_optional_report_warns_preserving_candidate(rt_env: RtEnv, kind: str) -> None:
+    scripts = {
+        "oversize": "p.open('wb').truncate(17*1024*1024)",
+        "hash_limit": "p.open('wb').truncate(1024*1024*1024+1)",
+        "symlink": "p.symlink_to('missing')",
+        "malformed": "p.write_text('SECRET malformed input')",
+    }
+    code = (
+        "from pathlib import Path; import os; p=Path('swarm/llm_calls.jsonl'); "
+        + scripts[kind]
+        + "; Path(os.environ['SWARM_ARENA_RESULT']).write_text('{\"data\":{\"ok\":true}}')"
+    )
+    rt = rt_env.with_tool(PyTool({"code": code}))
+    candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.output.data == {"ok": True}
+    assert len(candidate.warnings) == 1
+    assert "swarm/llm_calls.jsonl" in candidate.warnings[0]
+    assert "SECRET" not in candidate.warnings[0]
+    assert not rt_env.events("llm_call")
+    if kind == "oversize":
+        assert "over the 16 MiB limit; not collected" in candidate.warnings[0]
+
+
+@pytest.mark.parametrize("provider", [True, False])
+async def test_tool_with_providers_or_env_and_no_rows_is_unknown(
+    rt_env: RtEnv, provider: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = FunctionTool(
+        "_fakes.tools:square",
+        providers=["openai"] if provider else [],
+        env=[] if provider else ["OPENAI_API_KEY"],
+    )
+    rt = rt_env.with_tool(tool)
+    received: list[Job] = []
+    submit = rt.executor.submit
+
+    async def capture(job: Job) -> ToolOutput:
+        received.append(job)
+        return await submit(job)
+
+    monkeypatch.setattr(rt.executor, "submit", capture)
+    monkeypatch.setenv("OPENAI_API_KEY", "sentinel")
+    candidate = await execute_tool_run(rt, {"x": 2}, parents=(), replicate=None, edits=None)
+    assert candidate.llm_calls_source == "unknown"
+    assert received[0].secret_env == (() if provider else ("OPENAI_API_KEY",))
+
+
+@pytest.mark.parametrize("site", ["read", "upload"])
+async def test_report_backend_failure_propagates(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    if site == "upload":
+        rt = rt_env.with_tool(
+            PyTool(
+                {
+                    "code": "from pathlib import Path; "
+                    "Path('swarm/llm_calls.jsonl').write_bytes(b'REPORT')"
+                }
+            )
+        )
+        put = rt.artifacts.put_bytes
+
+        def fail_upload(data: bytes) -> str:
+            if data == b"REPORT":
+                raise RuntimeError("SECRET")
+            return put(data)
+
+        # The LocalExecutor opens its own ArtifactStore for the same backend.
+        from swarm_arena._store.artifacts import ArtifactStore
+
+        original = ArtifactStore.put_bytes
+
+        def upload(self: ArtifactStore, data: bytes) -> str:
+            if data == b"REPORT":
+                return fail_upload(data)
+            return original(self, data)
+
+        monkeypatch.setattr(ArtifactStore, "put_bytes", upload)
+    else:
+        from unittest.mock import AsyncMock, Mock
+
+        ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256="0" * 64, size=1)
+        executor = Mock(
+            spec=Executor,
+            submit=AsyncMock(return_value=ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+        )
+        rt = dataclasses.replace(rt_env.rt, executor=executor)
+
+        def fail_read(digest: str) -> bytes:
+            raise RuntimeError("SECRET")
+
+        monkeypatch.setattr(rt.artifacts, "get_bytes", fail_read)
+    with pytest.raises(StorageError) as caught:
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert_secret_absent(caught.value, "SECRET")
+    assert not rt_env.events("tool_end")

@@ -754,3 +754,79 @@ solution:
 ```sh
 uv run pytest tests/e2e/test_own_script.py -v
 ```
+
+(reporting-llm-calls)=
+## Reporting LLM calls: `swarm/llm_calls.jsonl`
+
+A cooperating tool can write one UTF-8 JSON object per line in
+`swarm/llm_calls.jsonl`, relative to its workspace. For example:
+
+```json
+{"model":"openai/gpt-6","usage":{"input_tokens":100,"output_tokens":20},"cost_usd":0.002,"latency_ms":120,"status":"ok","litellm_call_id":"my-call-1"}
+{"schema_version":1,"model":"local-model","status":"error","error":"provider failed"}
+```
+
+Only `model` is required. The supported fields are:
+
+| Field | Default and meaning |
+| --- | --- |
+| `schema_version` | `1`; optional, newer versions are refused per line. |
+| `model` | Required model identifier. |
+| `provider` | Prefix before the first `/` in `model`, or `unknown` when there is no prefix. |
+| `usage` | Empty usage: nonnegative `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cache_write_5m_tokens`, `cache_write_1h_tokens`; optional nonnegative `usd`. Cache-write subsets are not counted twice. |
+| `cost_usd` | `0`; finite nonnegative cost for this observation. |
+| `latency_ms` | `null`; otherwise finite and nonnegative. |
+| `status` | `ok`, or `error`. |
+| `error` | `null`; the recorded event uses a fixed diagnostic rather than the supplied text. |
+| `litellm_call_id` | `null`; a supplied ID deduplicates reports across the run. |
+| `request`, `response` | `null`; finite JSON payloads. Missing payloads produce no artifact. Present payloads are stored only when `tracing.store_payloads` is enabled. |
+
+Unknown fields are ignored. Run, candidate, role and ownership metadata always
+come from the core. Rows are informational `LLMCall` events with role `tool`;
+they do not reserve or settle money and do not join a manager's funded call
+list. Continue reporting the tool's aggregate usage in `swarm/result.json`:
+that usage drives ordinary tool settlement. Reported rows alone do not establish
+complete spend or a hard spending cap.
+
+Collection parses and uploads at most **16 MiB** and reads at most **10,000
+nonempty rows**, counting invalid rows too. Blank lines are ignored. Invalid
+JSON, unsupported schemas, negative counts, nonfinite numbers and invalid
+payloads are skipped with value-free candidate warnings. At most 20 individual
+bad-line warnings are retained, followed by one omitted-warning count and an
+optional row-limit warning.
+
+A regular report over 16 MiB and at most **1 GiB** is fully hashed but is not
+uploaded or fetched by the driver; its size produces a warning. Above 1 GiB,
+collection refuses the file before reading it and returns no reference. Files
+with symlink components, nonregular files, unreadable files and files observed
+to change during their pinned read also warn without discarding the valid tool
+result. An absent file is normal. Core storage failures and ownership loss
+still propagate. `ToolOutput.llm_calls_file`, when present, uses
+`path="llm_calls.jsonl"` with its real SHA-256 and size; the reserved `swarm/`
+prefix describes the workspace location, not the artifact reference path.
+
+The core supplies `SWARM_ARENA_RUN_ID`, `SWARM_ARENA_GOAL_ID`,
+`SWARM_ARENA_CANDIDATE_ID`, `SWARM_ARENA_TEAM`, `SWARM_ARENA_AGENT` and
+`SWARM_ARENA_ROUND`. For tool-owned Langfuse traces, use `SWARM_ARENA_RUN_ID`
+as `session_id` and `SWARM_ARENA_CANDIDATE_ID` as `metadata.candidate_id`.
+`SWARM_ARENA_RESULT` gives the absolute result-file path. These identity
+variables help correlate traces; they do not make those traces visible to the
+core recorder.
+
+`Candidate.llm_calls_source` describes the available evidence:
+
+- `gateway`: the core keyed this run through its gateway; gateway integration
+  takes precedence over tool reports and skips their ingestion.
+- `reported`: at least one valid row was supplied, including a row deduplicated
+  against a prior report.
+- `unknown`: no valid rows, but declared providers or recognized provider
+  credential names indicate possible LLM use.
+- `none`: no valid rows and neither declaration indicates LLM use.
+- `langfuse`: reserved by the model; the core never sets it in v1 because it
+  cannot inspect a tool's own Langfuse traces.
+
+Declare providers on LLM tools. Without a gateway, plan validation warns for
+agents whose tools declare providers. Credential discovery uses the validated
+effective configuration, including `ScriptTool` and `FunctionTool` env
+allowlists. A `Command.env` created only inside a worker's `Tool.command()`
+cannot be discovered by the driver before dispatch.
