@@ -148,9 +148,10 @@ class AgentRuntime:
     sibling_views : Mapping[str, BoardView], optional
         Fixed declared sibling capabilities; the main group key is empty.
     started_runs : int, default=0
-        Starts whose durable tool_start returned in this round. On resume the
-        runner restores the current goal/team/agent/round count from committed
-        tool_start events, including completed and lost runs.
+        Starts whose durable tool_start or tool_dispatch returned in this round.
+        On resume the runner restores the current goal/team/agent/round count
+        from committed tool_start or tool_dispatch events, including completed
+        and lost runs.
     seed_parents : tuple[str, ...], default=()
         Ordered assigned parent ids; exposed read-only to the manager and
         prepended to explicit parents with stable deduplication. The runner

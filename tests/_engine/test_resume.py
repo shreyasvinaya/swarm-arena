@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
@@ -34,13 +35,14 @@ from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.repeats import repeat_key
 from swarm_arena._agent.tool_run import Inflight
+from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.base import Board
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
-from swarm_arena._engine.round import RoundOutcome, RoundRunner
+from swarm_arena._engine.round import EngineDeps, RoundOutcome, RoundRunner
 from swarm_arena._errors import (
     ChainError,
     ConditionalWritesUnsupported,
@@ -3081,10 +3083,26 @@ async def test_resume_counts_dispatch_toward_tool_runs(
         run_config,
         recorders,
         dispatch=True,
-        lost=(),
+        completed=(),
+        lost=("a",),
         plans=[_plan(agents=("a",), rounds=1)],
         counters={"a": {"turns": 1, "board_reads": 0, "tool_runs": 3}} if durable else None,
     )
+    # Inspect the crash prefix before recovery adds RUN_LOST: neither a tool end
+    # nor recovery's retirement may mask a missing dispatch admission fallback.
+    plan = RunState.from_events(_events(c)).plans["g"][0][0]
+    restored = RoundRunner(
+        Mock(spec=EngineDeps, store=c.store, journal=Mock(head=c.old_lease.doc.head)),
+        goal_id="g",
+        plan=plan,
+        agents=[],
+        round_spec=plan.rounds[0],
+        rounds_left=1,
+        frontier=c.frontier,
+    )
+    await restored._restore(1)
+    assert restored._counters["t/a"].get("tool_runs") == (3 if durable else 1)
+    assert restored.started_runs == {"t/a": 1}
     recorders["a"].requests = {1: [9.0]}
     await Swarm(with_limits(c.config, max_tool_runs_per_round=3 if durable else 1)).resume(
         c.run_id, force=True
@@ -3136,3 +3154,227 @@ async def test_resume_dispatch_never_submitted_is_lost(
     state = RunState.from_events(_events(c))
     assert c.in_flight[0] in state.lost
     assert c.in_flight[0] not in state.started
+
+
+@pytest.mark.parametrize("idle_limit", [1, 3])
+async def test_resume_dispatch_preserves_closed_idle_rounds(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    idle_limit: int,
+) -> None:
+    config = with_limits(run_config, watchdog_idle_rounds=idle_limit)
+    c = await _crash(
+        tmp_path,
+        config,
+        recorders,
+        dispatch=True,
+        plans=[_plan(agents=("a",), rounds=2)],
+        completed=(("a", 1.0, RunStatus.ERROR),),
+        lost=(),
+    )
+    await _append(c, EventDraft(type="round_closed", goal_id="g", round=1, payload={"round": 1}))
+    live = Watchdog(c.config.limits)
+    live.record_run(RunStatus.ERROR, passed=False)
+    live.end_round(ran=True)
+    observed: list[tuple[int, str | None]] = []
+    restore = GoalRunner._restore_watchdog
+
+    def capture(self: GoalRunner, key: str) -> Watchdog:
+        watchdog = restore(self, key)
+        observed.append((watchdog._idle_rounds, watchdog.limit))
+        return watchdog
+
+    monkeypatch.setattr(GoalRunner, "_restore_watchdog", capture)
+    with anyio.fail_after(30):
+        await Swarm(c.config).resume(c.run_id, force=True)
+    assert observed == [(live._idle_rounds, live.limit)]
+    if idle_limit == 1:
+        assert not [e for e in _events(c, "tool_start") if e.epoch > 1]
+
+
+@pytest.mark.parametrize("expire", [False, True])
+async def test_resume_orphans_share_deadline_and_journal_order(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    expire: bool,
+) -> None:
+    c = await _crash(
+        tmp_path,
+        with_limits(run_config, max_agents_per_fingerprint=3),
+        recorders,
+        dispatch=True,
+        completed=(),
+        lost=("a", "b", "c"),
+        command=True,
+        plans=[_plan(agents=("a", "b", "c"), rounds=1)],
+    )
+    c.config = c.config.model_copy(update={"settle_timeout_s": 2.0})
+    ids = [*c.in_flight, "command1"]
+    calls: list[str] = []
+    deadlines: list[float] = []
+    finished: list[str] = []
+    all_entered = anyio.Event()
+    released = {id: anyio.Event() for id in ids}
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        id = started.job_id
+        calls.append(id)
+        deadlines.append(anyio.current_effective_deadline())
+        if len(calls) == len(ids):
+            all_entered.set()
+        try:
+            await all_entered.wait()
+            if expire:
+                await anyio.sleep_forever()
+            index = ids.index(id)
+            if index < len(ids) - 1:
+                await released[ids[index + 1]].wait()
+            finished.append(id)
+            released[id].set()
+            return index % 2 == 0
+        except anyio.get_cancelled_exc_class():
+            # A late True is deliberately untrustworthy, even for the command.
+            finished.append(id)
+            return True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    with anyio.fail_after(30):
+        runner = await resume_run(
+            c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None
+        )
+        try:
+            assert calls == ids
+            assert all_entered.is_set()
+            assert len(set(deadlines)) == 1
+            assert len(finished) == len(ids)
+            assert runner.resumed is not None
+            assert runner.resumed.orphans_killed == ([] if expire else ids[::2])
+        finally:
+            await runner.aclose()
+    if not expire:
+        assert finished == list(reversed(ids))
+    retired = [e for e in _events(c) if e.type in {"run_lost", "command_end"}]
+    assert [e.payload.get("candidate_id", e.payload.get("job_id")) for e in retired] == ids
+    assert [e.payload["confirmed_dead"] for e in retired[:-1]] == (
+        [False] * 3 if expire else [True, False, True]
+    )
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal"])
+async def test_concurrent_orphan_control_beats_ordinary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    import traceback
+
+    from swarm_arena._engine.resume import _recover_orphans
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    spy = _SpyExecutor(tmp_path / "spy")
+    entered: list[str] = []
+    ready = anyio.Event()
+
+    async def orphan(started: Job.Started) -> bool:
+        entered.append(started.job_id)
+        if len(entered) == 2:
+            ready.set()
+        await ready.wait()
+        if started.job_id == "ordinary":
+            raise ValueError("private-orphan-concurrent-value")
+        if control == "fenced":
+            raise _core_error(Fenced, "run ownership lost")
+        raise _stop_cleanup_error()
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    with (
+        anyio.fail_after(30),
+        pytest.raises(Fenced if control == "fenced" else RuntimeError) as caught,
+    ):
+        await _recover_orphans(
+            spy, [Job.Started(kind="dispatch", job_id=id) for id in ("ordinary", "control")], 30
+        )
+    assert _core_category(caught.value) is (
+        _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+    )
+    assert "private-orphan-concurrent-value" not in "".join(
+        traceback.format_exception(caught.value)
+    )
+
+
+async def test_concurrent_orphan_caller_cancellation_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.resume import _recover_orphans
+
+    spy = _SpyExecutor(tmp_path / "spy")
+    entered: list[str] = []
+    all_entered = anyio.Event()
+    cancelled: list[str] = []
+    returned: list[list[bool]] = []
+
+    async def orphan(started: Job.Started) -> bool:
+        entered.append(started.job_id)
+        if len(entered) == 3:
+            all_entered.set()
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            cancelled.append(started.job_id)
+            # Mirrors an executor which suppresses cancellation during recovery.
+            return True
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    owner = anyio.CancelScope()
+
+    async def recover() -> None:
+        with owner:
+            returned.append(
+                await _recover_orphans(
+                    spy, [Job.Started(kind="dispatch", job_id=str(i)) for i in range(3)], 30
+                )
+            )
+
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as group:
+            group.start_soon(recover)
+            await all_entered.wait()
+            owner.cancel()
+    assert entered == ["0", "1", "2"]
+    assert sorted(cancelled) == entered
+    assert returned == []
+
+
+@pytest.mark.parametrize(("margin", "settlement"), [(1.0, 30.0), (30.0, 1.0)])
+async def test_orphan_batch_uses_shorter_executor_or_settlement_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, margin: float, settlement: float
+) -> None:
+    from swarm_arena._engine.resume import _recover_orphans
+
+    class MarginExecutor(_SpyExecutor):
+        class Config(LocalExecutor.Config):  # ty: ignore[invalid-attribute-override]
+            cancel_margin_s: float = margin
+
+    executor = MarginExecutor(tmp_path / "spy")
+    deadlines: list[float] = []
+    remaining: list[float] = []
+
+    async def orphan(started: Job.Started) -> bool:
+        deadline = anyio.current_effective_deadline()
+        deadlines.append(deadline)
+        remaining.append(deadline - anyio.current_time())
+        return False
+
+    monkeypatch.setattr(executor, "kill_orphan", orphan)
+    assert await _recover_orphans(
+        executor,
+        [Job.Started(kind="dispatch", job_id=str(i)) for i in range(3)],
+        settlement,
+    ) == [False, False, False]
+    assert len(deadlines) == 3
+    assert len(set(deadlines)) == 1
+    assert all(0 < value <= min(margin, settlement) for value in remaining)

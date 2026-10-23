@@ -469,7 +469,7 @@ class GoalRunner:
             if event.goal_id != self.goal_id:
                 continue
             if f"{event.team}/{event.agent}" == key:
-                if event.type == EventType.TOOL_START:
+                if event.type in {EventType.TOOL_START, EventType.TOOL_DISPATCH}:
                     started.add(event.round)
                 elif event.type == EventType.TOOL_END:
                     candidate = self.recorded.candidates[event.payload["candidate"]["id"]]
