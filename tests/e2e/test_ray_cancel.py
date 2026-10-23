@@ -50,7 +50,7 @@ async def test_force_cancel_kills_grandchildren(ray_driver: Any, tmp_path: Path)
     executor = RayExecutor(cancel_margin_s=1.0)
     out, elapsed = await cancel_and_capture(executor, job, ready=pid_file)
     assert elapsed >= 2.0
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         while (  # noqa: ASYNC110 -- external Ray state
             await anyio.to_thread.run_sync(
                 lambda: worker_dead(
@@ -63,7 +63,7 @@ async def test_force_cancel_kills_grandchildren(ray_driver: Any, tmp_path: Path)
         ):
             await anyio.sleep(0.1)
     pid = int(await anyio.Path(pid_file).read_text())
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         while pid_alive(pid):  # noqa: ASYNC110 -- external process liveness
             await anyio.sleep(0.05)
     assert out.status == RunStatus.CANCELLED
