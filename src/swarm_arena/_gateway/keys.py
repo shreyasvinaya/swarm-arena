@@ -529,6 +529,7 @@ class KeyManager:
             observations; no estimate or ledger balance is changed. Invalid model
             and provider labels become "unknown". An ordinary recording failure
             warns once for that row and does not prevent later rows from recording.
+            Cancellation and process-control exceptions propagate unchanged.
 
         Notes
         -----
@@ -618,7 +619,7 @@ class KeyManager:
                         settle=False,
                         _external_observation=True,
                     )
-                except BaseException as error:
+                except Exception as error:
                     outcome.propagate_control(error)
                     _LOG.warning("gateway spend row recording failed")
                     continue
