@@ -1,9 +1,10 @@
 """Bounded stdlib transport for the private LiteLLM Proxy adapter.
 
-The pinned proxy cannot verify the strict profile. One deadline bounds DNS,
-connect, TLS, headers, body reads and every pagination request. DNS uses a
-killable stdlib child; a deadline watchdog shuts down active sockets. No transport
-worker publishes core state. Undelivered creates have a data-only cleanup owner.
+The pinned proxy cannot verify the strict profile. One deadline bounds the caller
+and shuts down active sockets across connect, TLS, headers and body reads. DNS
+runs in the daemon HTTP worker; an abandoned lookup ends at the OS resolver
+timeout. No worker publishes core state. Undelivered creates have a data-only
+cleanup owner.
 """
 
 import contextlib
@@ -13,14 +14,12 @@ import json
 import math
 import socket
 import ssl
-import subprocess
-import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from ipaddress import ip_address
 from types import TracebackType
 from typing import Annotated, Any, Literal, Self, TypeVar
@@ -58,11 +57,6 @@ _MISSING = object()
 _T = TypeVar("_T")
 _Count = Annotated[int, Field(strict=True, ge=0)]
 _Text = Annotated[str, Field(strict=True, min_length=1)]
-_RESOLVER_CODE = """
-import json, socket, sys
-rows = socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), type=socket.SOCK_STREAM)
-print(json.dumps(rows[:256]))
-"""
 
 
 class _Health(FrozenModel):
@@ -290,7 +284,6 @@ class _Transport:
         self._lock = threading.Lock()
         self._stopped = False
         self._sockets: list[socket.socket] = []
-        self._resolver: subprocess.Popen[bytes] | None = None
         self._timer = threading.Timer(operation.remaining(), self.stop)
         self._timer.daemon = True
 
@@ -304,6 +297,7 @@ class _Transport:
         with self.operation.lock:
             self.operation.remaining(retain_response=self.retain_response)
             self._sent = True
+        self.refresh_timeout()
 
     def __enter__(self) -> Self:
         with self.operation.lock:
@@ -325,7 +319,7 @@ class _Transport:
             self.operation.transport = None
 
     def stop(self) -> None:
-        """Wake blocked header/body/TLS I/O and kill an unfinished resolver."""
+        """Wake blocked header/body/TLS I/O; an OS DNS lookup owns no socket."""
         with self._lock:
             self._stopped = True
             for sock in self._sockets:
@@ -333,9 +327,6 @@ class _Transport:
                     sock.shutdown(socket.SHUT_RDWR)
                 sock.close()
             self._sockets.clear()
-            if self._resolver is not None:
-                with contextlib.suppress(OSError):
-                    self._resolver.kill()
 
     def track(self, sock: socket.socket) -> socket.socket:
         """Close a socket arriving after abandonment instead of starting more I/O."""
@@ -346,41 +337,31 @@ class _Transport:
             self._sockets.append(sock)
         return sock
 
+    def refresh_timeout(self) -> None:
+        """Shrink the socket allowance before send, headers and each body read."""
+        remaining = self.operation.remaining(retain_response=self.retain_response)
+        with self._lock:
+            for sock in self._sockets:
+                if sock.fileno() >= 0:
+                    sock.settimeout(remaining)
+
     def addresses(self, host: str, port: int) -> list[Any]:
-        """Resolve without leaving an uninterruptible getaddrinfo worker behind."""
+        """Resolve inside the existing daemon HTTP worker, before opening a socket.
+
+        The operation deadline bounds the caller, not the OS resolver. A lookup
+        that outlives an abandoned wait leaves only this daemon thread without
+        a socket until the OS resolver timeout. Once resolution returns, check
+        abandonment/deadline before opening any socket or sending a request.
+        """
+        self.operation.remaining()
         try:
             address = ip_address(host)
         except ValueError:
-            pass
-        else:
-            family = socket.AF_INET if address.version == 4 else socket.AF_INET6
-            return [(family, socket.SOCK_STREAM, 0, "", (host, port))]
-        with self._lock:
-            if self._stopped:
-                raise TimeoutError
-            child = subprocess.Popen(
-                [sys.executable, "-I", "-c", _RESOLVER_CODE, host, str(port)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            self._resolver = child
-        try:
-            try:
-                output, _ = child.communicate(
-                    timeout=self.operation.remaining(retain_response=self.retain_response)
-                )
-            except subprocess.TimeoutExpired:
-                raise TimeoutError from None
-            self.operation.remaining(retain_response=self.retain_response)
-            if child.returncode != 0:
-                raise OSError
-            return json.loads(output)
-        finally:
-            with self._lock:
-                child.kill()
-                self._resolver = None
-            child.communicate()
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            self.operation.remaining()
+            return addresses
+        family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+        return [(family, socket.SOCK_STREAM, 0, "", (host, port))]
 
     def connect(self, address: tuple[str, int], *args: Any) -> socket.socket:
         """Share the remaining allowance across resolution and address attempts."""
@@ -410,6 +391,10 @@ class _HTTPConnection(HTTPConnection):
         self._transport.begin_request()
         super().send(data)
 
+    def getresponse(self) -> HTTPResponse:
+        self._transport.refresh_timeout()
+        return super().getresponse()
+
 
 class _HTTPSConnection(HTTPSConnection):
     """Register the TLS socket before starting a potentially blocking handshake."""
@@ -426,6 +411,10 @@ class _HTTPSConnection(HTTPSConnection):
             self.connect()
         self._transport.begin_request()
         super().send(data)
+
+    def getresponse(self) -> HTTPResponse:
+        self._transport.refresh_timeout()
+        return super().getresponse()
 
     def connect(self) -> None:
         HTTPConnection.connect(self)
@@ -512,7 +501,8 @@ class LiteLLMProxy:
     Notes
     -----
     There are no retries, redirects or environment/system proxies. Hostname
-    resolution runs in a killable stdlib subprocess; numeric IPs need no child.
+    resolution runs in the daemon HTTP worker; numeric IPs bypass resolution.
+    An abandoned DNS lookup owns no socket and ends at the OS resolver timeout.
     A watchdog shuts down sockets at the operation deadline, including during
     headers and TLS. Limits are 4 MiB per response, 16 MiB per operation, 200
     pages and 10,000 wire rows. Capped/inconsistent results raise GatewayError.
@@ -611,7 +601,7 @@ class LiteLLMProxy:
                 chunks: list[bytes] = []
                 size = 0
                 while True:
-                    operation.remaining(retain_response=retain_response)
+                    transport.refresh_timeout()
                     chunk = response.read1(min(65536, limit - size + 1))
                     if not chunk:
                         break
