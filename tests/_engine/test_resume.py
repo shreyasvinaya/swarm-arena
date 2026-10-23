@@ -3777,6 +3777,8 @@ async def test_resume_preserves_driver_hard_control_through_cleanup(
         error = BaseExceptionGroup(
             "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
         )
+    context = RuntimeError("original driver context")
+    error.__context__ = context
     journal = Mock(_stopped=False)
     if fenced:
         journal._raise_if_fenced.side_effect = _core_error(Fenced)
@@ -3815,6 +3817,7 @@ async def test_resume_preserves_driver_hard_control_through_cleanup(
         with pytest.raises(type(error)) as caught:
             await module.resume_run(run_config, "driver-control", force=False, replanner=None)
         assert caught.value is error
+        assert error.__context__ is context
         assert order == ["body failed", "closed"]
         services._aclose.assert_awaited_once_with(failed=True)
     finally:
