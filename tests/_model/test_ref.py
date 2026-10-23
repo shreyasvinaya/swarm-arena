@@ -607,9 +607,14 @@ def test_untrusted_missing_llm_import_keeps_values_hidden(monkeypatch: pytest.Mo
     def fail(name: str) -> object:
         raise ModuleNotFoundError(secret, name="agents")
 
+    # An earlier test in the same process may have cached the real lookup.
+    load_object.cache_clear()
     monkeypatch.setattr(importlib, "import_module", fail)
-    with pytest.raises(ValueError, match=r"cannot import swarm_arena\.llm:LLMJudge") as caught:
-        load_object("swarm_arena.llm:LLMJudge")
+    try:
+        with pytest.raises(ValueError, match=r"cannot import swarm_arena\.llm:LLMJudge") as caught:
+            load_object("swarm_arena.llm:LLMJudge")
+    finally:
+        load_object.cache_clear()
     assert_secret_absent(caught.value, secret, sanitized=True)
 
 
