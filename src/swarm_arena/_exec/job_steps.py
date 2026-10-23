@@ -281,7 +281,7 @@ class _JobRun:
                 await self._wait_post_collect()
                 output = self._output or ToolOutput(status=RunStatus.ERROR)
             return await self._finish(output, (run.started_at, run.ended_at))
-        except BaseException as error:
+        except (Exception, anyio.get_cancelled_exc_class()) as error:
             await self._raise_failure(error, outcome)
 
     async def _raise_failure(self, error: BaseException, outcome: _Outcome) -> NoReturn:

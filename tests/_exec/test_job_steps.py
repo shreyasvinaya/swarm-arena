@@ -875,3 +875,73 @@ async def test_pending_scope_cancel_wins_collector_handback(
         await runner.run(Mock(run=run), None)
         pytest.fail("pending cancellation became a collector outcome")
     assert scope.cancelled_caught
+
+
+async def test_run_coroutine_closes_without_awaiting_generator_exit(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from unittest.mock import Mock
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    runner = _JobRun(
+        job, prepare_job(job, ws, artifacts), ws, artifacts, max_log_bytes=10, max_output_bytes=10
+    )
+
+    async def suspended(*args: Any, **kwargs: Any) -> CompletedRun:
+        await asyncio.sleep(0)
+        pytest.fail("supervisor resumed after coroutine close")
+
+    invocation = runner.run(Mock(run=suspended), None)
+    try:
+        assert invocation.send(None) is None
+        invocation.close()
+    finally:
+        invocation.close()
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("cancellation", ["native", "scope"])
+async def test_process_control_error_passes_through_pending_cancel(
+    tmp_path: Path, artifacts: ArtifactStore, error_type: type[BaseException], cancellation: str
+) -> None:
+    import contextlib
+    from unittest.mock import AsyncMock, Mock
+
+    import anyio
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    runner = _JobRun(
+        job, prepare_job(job, ws, artifacts), ws, artifacts, max_log_bytes=10, max_output_bytes=10
+    )
+    error = error_type("process control")
+    failure_handler = AsyncMock(wraps=runner._raise_failure)
+    runner._raise_failure = failure_handler
+    caught: list[BaseException] = []
+
+    async def invoke() -> None:
+        with anyio.CancelScope() as scope:
+
+            async def interrupted(*args: Any, **kwargs: Any) -> CompletedRun:
+                if cancellation == "native":
+                    task = asyncio.current_task()
+                    assert task is not None
+                    task.cancel()
+                else:
+                    scope.cancel()
+                raise error
+
+            try:
+                await runner.run(Mock(run=interrupted), None)
+            except BaseException as propagated:
+                caught.append(propagated)
+            finally:
+                # Consume the pending cancellation within its owner task/scope.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await anyio.lowlevel.checkpoint()
+
+    await asyncio.create_task(invoke())
+    assert caught == [error]
+    assert caught[0] is error
+    failure_handler.assert_not_awaited()
