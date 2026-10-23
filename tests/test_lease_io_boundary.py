@@ -8,6 +8,9 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1] / "src" / "swarm_arena"
 # Exact module, enclosing function, and worker callback; no module-wide escapes.
 _ALLOW = {
+    ("ray/_executor.py", "RayExecutor._init", "self._connect"): (
+        "Abandonable Ray initialization, under the caller allowance; no storage publication."
+    ),
     ("_engine/run.py", "RunRunner.run", "_promote"): "Artifact promotion precedes acquisition.",
     ("_engine/run.py", "_open_board", "board.open"): "Contained daemon under owner supervision.",
     ("_engine/run.py", "_close_board", "board.close"): "Contained daemon with bounded cleanup.",
@@ -196,6 +199,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_exec/local_run.py",
         _ROOT / "_exec/job_steps.py",
         _ROOT / "_exec/local.py",
+        _ROOT / "ray/_executor.py",
         _ROOT / "_scoring/human_review.py",
         _ROOT / "_agent/tool_run.py",
         _ROOT / "_tooling/script_tool.py",
@@ -375,4 +379,19 @@ def test_guard_scans_report_storage(
 
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(AssertionError, match="unprotected worker calls"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_ray_executor_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "ray/_executor.py"
+    original = Path.read_text
+    source = target.read_text()
+    unsafe = source.replace("await _storage_io(", "await anyio.to_thread.run_sync(")
+    assert unsafe != source
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"ray/_executor.py:\d+: RayExecutor.submit"):
         test_lease_owned_modules_use_abandonable_workers()

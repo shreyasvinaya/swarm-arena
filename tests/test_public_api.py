@@ -141,7 +141,7 @@ try:
 except importlib.metadata.PackageNotFoundError:
     pass
 else:
-    PUBLIC["swarm_arena.ray"] = []
+    PUBLIC["swarm_arena.ray"] = ["RayExecutor"]
 
 
 @pytest.mark.parametrize("module", sorted(PUBLIC))
@@ -368,3 +368,19 @@ else:
     subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
     )
+
+
+def test_ray_all() -> None:
+    module = pytest.importorskip("swarm_arena.ray")
+    assert module.__all__ == ["RayExecutor"]
+
+
+def test_ray_facade_publishes_methods() -> None:
+    module = pytest.importorskip("swarm_arena.ray")
+    cls = module.RayExecutor
+    assert {
+        cls.__module__,
+        cls.Config.__module__,
+        cls.submit.__module__,
+        cls.confirm_dead.__module__,
+    } == {"swarm_arena.ray"}

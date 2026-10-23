@@ -256,7 +256,7 @@ Rules [plan]:
 | `_tooling/result_file.py` | Parse and validate `swarm/result.json`; write `swarm/request.json`; `NOTE_PREFIX`, `MAX_DECLARED_FILES`, collection byte-budget context | M1a | `tests/_tooling/test_result_file.py` |
 | `_tooling/llm_calls.py` | Collect `swarm/llm_calls.jsonl`; set `llm_calls_source` | M4 | `tests/_tooling/test_llm_calls.py` |
 | `_exec/__init__.py` | Empty | M1a | — |
-| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started`; `Job.drop_env` excludes node/file values before driver overlays | M1a +M4 | `tests/_exec/test_executor.py` |
+| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` with original `ray_job_id`; private schedule-timeout scope; `Job.drop_env` excludes node/file values before driver overlays | M1a +M4 | `tests/_exec/test_executor.py` |
 | `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (shared isolated launcher argv; local group ownership unchanged) | M1a +M4 | `tests/_exec/test_supervisor.py` |
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are skipped before reading node/file sources; explicit environment, result-path and secret-value overlays still apply (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
@@ -329,7 +329,7 @@ Rules [plan]:
 | `_board/reindex.py` | Cache rebuild | M2 | `tests/_board/test_reindex.py` |
 | `_engine/__init__.py` | Empty | M1b | — |
 | `_engine/swarm.py` | `Swarm` facade | M1b | `tests/_engine/test_swarm.py` |
-| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3) | M1b +M2 +M3 | `tests/_engine/test_run.py` |
+| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3); inherited schedule-timeout scope (+M4) | M1b +M2 +M3 +M4 | `tests/_engine/test_run.py` |
 | `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
 | `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
@@ -340,7 +340,7 @@ Rules [plan]:
 | `_engine/preflight.py` | Preflight per distinct tool config; storage checks, `check_storage` (+M2, R4.13.13); gateway (+M4) | M1b +M2 +M4 | `tests/_engine/test_preflight.py` |
 | `_engine/manifest.py` | `manifest.json` | M1b | `tests/_engine/test_manifest.py` |
 | `_engine/control.py` | Stop files (one pair per epoch, R4.13.13), status report | M1b | `tests/_engine/test_control.py` |
-| `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed` | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
+| `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed`; inherited schedule-timeout scope | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
 | `_cli/__init__.py` | Empty | M1a | — |
 | `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 +M4 | `tests/_cli/test_main.py` |
 | `_cli/run_cmds.py` | `run`, `status`, `stop`, `resume` | M1b +M2 | `tests/_cli/test_run_cmds.py` |
@@ -371,7 +371,7 @@ Rules [plan]:
 | `llm/_curator.py` | `LLMCurator` | M3 | `tests/llm/test_curator.py` |
 | `llm/_langfuse.py` | Langfuse export | M3 | `tests/llm/test_langfuse.py` |
 | `ray/__init__.py` | Facade `swarm_arena.ray`; clear `ImportError` without the extra | M4 | `tests/test_public_api.py` |
-| `ray/_executor.py` | `RayExecutor` | M4 | `tests/ray/test_executor.py` (marker `ray`) |
+| `ray/_executor.py` | `RayExecutor`: lazy cluster binding, resource feasibility, owned blob publication, bounded cancel/recovery | M4 | `tests/ray/test_executor.py` (cluster cases marked `ray`), `tests/e2e/test_ray_cancel.py` (marker `ray`) |
 | `ray/_task.py` | Framed one-shot task; shared staged/collection/publication owner; worker-group supervisor | M4 | `tests/ray/test_task.py` (cluster cases marked `ray`) |
 | `ray/_state.py` | Explicit-dashboard REST task/job lookup and identity-joined `worker_dead` evidence | M4 | `tests/ray/test_state_unit.py`, `tests/ray/test_state.py` (marker `ray`) |
 | `ray/_files.py` | Object-store file transport with the 256 MiB cap | M4 | `tests/ray/test_files.py` (marker `ray`) |

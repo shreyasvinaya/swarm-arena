@@ -1558,3 +1558,17 @@ class EditSpyTool(PyTool):
                 "collect_edits": dict(request.edits),
             },
         )
+
+
+class StallCollectTool(PyTool):
+    """Hold cancellation collection until the driver must force-stop the worker."""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        script = "spawn_grandchild.py"
+        argv = [script, "--pid-file", request.inputs["pid_file"], "--ignore-term"]
+        code = f"import sys; sys.argv = {argv!r}\n" + WORKER_SCRIPTS[script]
+        return Command(argv=[sys.executable, "-c", code])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        time.sleep(60)
+        return super().collect(request, workspace, run)

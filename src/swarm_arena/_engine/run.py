@@ -48,7 +48,7 @@ from swarm_arena._errors import (
     _SignalCategory,
     _stop_cleanup_error,
 )
-from swarm_arena._exec.executor import Executor
+from swarm_arena._exec.executor import Executor, schedule_timeout_scope
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
@@ -538,141 +538,150 @@ class RunRunner:
         >>> await runner.run()  # doctest: +SKIP
         {}
         """
-        _require_asyncio()
-        if self.resumed is not None:
-            services = self.resumed._services
-            if services.closed or self._used:
-                raise _core_error(RuntimeError, "resumed runner is closed or already used")
-            self._used = True
-            assert services.deps is not None
+        with schedule_timeout_scope(self.config.schedule_timeout_s):
+            _require_asyncio()
+            if self.resumed is not None:
+                services = self.resumed._services
+                if services.closed or self._used:
+                    raise _core_error(RuntimeError, "resumed runner is closed or already used")
+                self._used = True
+                assert services.deps is not None
+                failed = False
+                try:
+                    return await self._drive(services.deps, self.resumed.epoch)
+                except BaseException as error:
+                    failed = True
+                    if _has_fenced(error):
+                        if services.deps.journal._stopped:
+                            raise anyio.get_cancelled_exc_class()() from None
+                        raise _core_error(Fenced) from None
+                    raise
+                finally:
+                    await services._aclose(failed=failed)
+            outcome = _Outcome()
+            try:
+                self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
+            except BaseException as error:
+                error = outcome.classify(error)
+                _raise_terminal(error)
+                raise _core_error(
+                    PlanError, [f"invalid plan: {_exception_type_name(error)}"]
+                ) from None
+            seen: set[str] = set()
+            for plan in self.plans:
+                if plan.goal.id in seen:
+                    raise _core_error(PlanError, [f"duplicate goal id '{plan.goal.id}'"])
+                seen.add(plan.goal.id)
+            artifacts = ArtifactStore(open_store(self.config.artifact_root))
+            executor: Executor | None = None
             failed = False
             try:
-                return await self._drive(services.deps, self.resumed.epoch)
-            except BaseException as error:
-                failed = True
-                if _has_fenced(error):
-                    if services.deps.journal._stopped:
-                        raise anyio.get_cancelled_exc_class()() from None
-                    raise _core_error(Fenced) from None
-                raise
-            finally:
-                await services._aclose(failed=failed)
-        outcome = _Outcome()
-        try:
-            self.plans = [await run_sync_daemon(_detach_plan, plan) for plan in self.plans]
-        except BaseException as error:
-            error = outcome.classify(error)
-            _raise_terminal(error)
-            raise _core_error(PlanError, [f"invalid plan: {_exception_type_name(error)}"]) from None
-        seen: set[str] = set()
-        for plan in self.plans:
-            if plan.goal.id in seen:
-                raise _core_error(PlanError, [f"duplicate goal id '{plan.goal.id}'"])
-            seen.add(plan.goal.id)
-        artifacts = ArtifactStore(open_store(self.config.artifact_root))
-        executor: Executor | None = None
-        failed = False
-        try:
-            with TemporaryDirectory(prefix="swarm-arena-approval-") as directory:
-                stage = Path(directory)
-                staged = ArtifactStore(LocalStore(stage))
-                admitted: list[Plan] = []
-                warnings: list[str] = []
-                for plan in self.plans:
-                    if str(plan.base_dir) not in sys.path:
-                        sys.path.append(str(plan.base_dir))
-                    outcome = _Outcome()
-                    try:
-                        frozen, notes = await run_sync_daemon(
-                            partial(
-                                admit_revision,
-                                stamp(plan, origin=plan.origin, parent=None),
-                                self.config,
-                                staged,
+                with TemporaryDirectory(prefix="swarm-arena-approval-") as directory:
+                    stage = Path(directory)
+                    staged = ArtifactStore(LocalStore(stage))
+                    admitted: list[Plan] = []
+                    warnings: list[str] = []
+                    for plan in self.plans:
+                        if str(plan.base_dir) not in sys.path:
+                            sys.path.append(str(plan.base_dir))
+                        outcome = _Outcome()
+                        try:
+                            frozen, notes = await run_sync_daemon(
+                                partial(
+                                    admit_revision,
+                                    stamp(plan, origin=plan.origin, parent=None),
+                                    self.config,
+                                    staged,
+                                )
                             )
-                        )
-                    except BaseException as error:
-                        classified = outcome.classify(error)
-                        _raise_terminal(classified)
-                        if isinstance(classified, PlanError):
-                            raise classified from None
-                        raise _core_error(
-                            PlanError, [f"admission failed: {_exception_type_name(classified)}"]
-                        ) from None
-                    admitted.append(frozen)
-                    warnings.extend(notes)
-                if collisions := _goal_key_errors(admitted):
-                    raise _core_error(PlanError, collisions)
-                self.plans = admitted
-                warnings.extend(await _check_startup_models(self.config, self.replanner))
-                outcome = _Outcome()
-                try:
-                    estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
-                except BaseException as exc:
-                    exc = outcome.classify(exc)
-                    _raise_terminal(exc)
-                    raise _core_error(
-                        RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
-                    ) from None
-                if _exceeds_limit(estimate, self.config):
-                    raise _core_error(
-                        RuntimeError, "worst-case estimate exceeds the configured run limit"
-                    )
-                total = sum(slices.values(), Amount())
-                if _exceeds_limit(total, self.config, Fraction(str(self.config.reserve_fraction))):
-                    raise _core_error(RuntimeError, "reserve cannot hold the final slices")
-                executor = await _start_executor(self.config)
-                outcome = _Outcome()
-                try:
-                    capacity = await executor.capacity()
-                    invalid_capacity = capacity is not None and not isinstance(capacity, Resources)
-                    if not invalid_capacity:
-                        if capacity is not None:
-                            capacity = await run_sync_daemon(_detach_model, Resources, capacity)
-                        warnings.extend(_capacity_warning(admitted, capacity))
-                except BaseException as exc:
-                    exc = outcome.classify(exc)
-                    _raise_terminal(exc)
-                    raise _core_error(
-                        RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
-                    ) from None
-                if invalid_capacity:
-                    raise _core_error(
-                        RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
-                    ) from None
-                if self.approve is not None:
+                        except BaseException as error:
+                            classified = outcome.classify(error)
+                            _raise_terminal(classified)
+                            if isinstance(classified, PlanError):
+                                raise classified from None
+                            raise _core_error(
+                                PlanError, [f"admission failed: {_exception_type_name(classified)}"]
+                            ) from None
+                        admitted.append(frozen)
+                        warnings.extend(notes)
+                    if collisions := _goal_key_errors(admitted):
+                        raise _core_error(PlanError, collisions)
+                    self.plans = admitted
+                    warnings.extend(await _check_startup_models(self.config, self.replanner))
                     outcome = _Outcome()
                     try:
-                        approved = await self.approve(estimate.to_estimate(), warnings)
+                        estimate, slices = await run_sync_daemon(_estimates, admitted, self.config)
                     except BaseException as exc:
                         exc = outcome.classify(exc)
                         _raise_terminal(exc)
                         raise _core_error(
-                            RuntimeError, f"approval failed: {_exception_type_name(exc)}"
+                            RuntimeError, f"estimate failed: {_exception_type_name(exc)}"
                         ) from None
-                    if type(approved) is not bool:
+                    if _exceeds_limit(estimate, self.config):
                         raise _core_error(
-                            RuntimeError, f"approval failed: {type(approved).__name__}"
+                            RuntimeError, "worst-case estimate exceeds the configured run limit"
+                        )
+                    total = sum(slices.values(), Amount())
+                    if _exceeds_limit(
+                        total, self.config, Fraction(str(self.config.reserve_fraction))
+                    ):
+                        raise _core_error(RuntimeError, "reserve cannot hold the final slices")
+                    executor = await _start_executor(self.config)
+                    outcome = _Outcome()
+                    try:
+                        capacity = await executor.capacity()
+                        invalid_capacity = capacity is not None and not isinstance(
+                            capacity, Resources
+                        )
+                        if not invalid_capacity:
+                            if capacity is not None:
+                                capacity = await run_sync_daemon(_detach_model, Resources, capacity)
+                            warnings.extend(_capacity_warning(admitted, capacity))
+                    except BaseException as exc:
+                        exc = outcome.classify(exc)
+                        _raise_terminal(exc)
+                        raise _core_error(
+                            RuntimeError, f"executor capacity failed: {_exception_type_name(exc)}"
                         ) from None
-                    if not approved:
-                        raise _core_error(RuntimeError, "run not approved")
-                await run_preflight(admitted, self.config, executor)
-                self.run_id = self.run_id or new_run_id(utc_now())
-                manifest = await build_manifest_async(
-                    run_id=self.run_id, config=self.config, plans=admitted, capacity=capacity
+                    if invalid_capacity:
+                        raise _core_error(
+                            RuntimeError, f"executor capacity failed: {type(capacity).__name__}"
+                        ) from None
+                    if self.approve is not None:
+                        outcome = _Outcome()
+                        try:
+                            approved = await self.approve(estimate.to_estimate(), warnings)
+                        except BaseException as exc:
+                            exc = outcome.classify(exc)
+                            _raise_terminal(exc)
+                            raise _core_error(
+                                RuntimeError, f"approval failed: {_exception_type_name(exc)}"
+                            ) from None
+                        if type(approved) is not bool:
+                            raise _core_error(
+                                RuntimeError, f"approval failed: {type(approved).__name__}"
+                            ) from None
+                        if not approved:
+                            raise _core_error(RuntimeError, "run not approved")
+                    await run_preflight(admitted, self.config, executor)
+                    self.run_id = self.run_id or new_run_id(utc_now())
+                    manifest = await build_manifest_async(
+                        run_id=self.run_id, config=self.config, plans=admitted, capacity=capacity
+                    )
+                    await anyio.to_thread.run_sync(_promote, stage, artifacts)
+                return await self._execute(
+                    executor, artifacts, estimate, slices, warnings, manifest
                 )
-                await anyio.to_thread.run_sync(_promote, stage, artifacts)
-            return await self._execute(executor, artifacts, estimate, slices, warnings, manifest)
-        except BaseException as exc:
-            failed = True
-            if _has_fenced(exc):
-                if self._journal is not None and self._journal._stopped:
-                    raise anyio.get_cancelled_exc_class()() from None
-                raise _core_error(Fenced) from None
-            raise
-        finally:
-            if executor is not None:
-                await _close_executor(executor, self.config, failed=failed)
+            except BaseException as exc:
+                failed = True
+                if _has_fenced(exc):
+                    if self._journal is not None and self._journal._stopped:
+                        raise anyio.get_cancelled_exc_class()() from None
+                    raise _core_error(Fenced) from None
+                raise
+            finally:
+                if executor is not None:
+                    await _close_executor(executor, self.config, failed=failed)
 
     async def _execute(
         self,

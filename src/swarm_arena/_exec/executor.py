@@ -1,7 +1,9 @@
 """Define staged jobs and the asynchronous executor contract."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any, ClassVar, Literal
@@ -21,6 +23,23 @@ from swarm_arena._tooling.result_file import (
     RequestFile,
     _workspace_envelope,
 )
+
+_SCHEDULE_TIMEOUT: ContextVar[float | None] = ContextVar("schedule_timeout", default=None)
+
+
+@contextmanager
+def schedule_timeout_scope(seconds: float | None) -> Generator[None]:
+    """Bind the run's resource-feasibility allowance to all child execution tasks."""
+    token = _SCHEDULE_TIMEOUT.set(seconds)
+    try:
+        yield
+    finally:
+        _SCHEDULE_TIMEOUT.reset(token)
+
+
+def current_schedule_timeout() -> float | None:
+    """Return the enclosing run's schedule allowance, or None outside a run."""
+    return _SCHEDULE_TIMEOUT.get()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -179,6 +198,8 @@ class Job:
             Recorded process start time used to guard against pid reuse.
         task_name : str or None, default=None
             Remote task name for a dispatch.
+        ray_job_id : str or None, default=None
+            Original Ray driver job identifier, retained for identity-bound recovery.
 
         Examples
         --------
@@ -197,6 +218,7 @@ class Job:
         pgid: int | None = None
         start_time: str | None = None
         task_name: str | None = None
+        ray_job_id: str | None = None
 
     id: str
     kind: Literal["tool", "command"]
