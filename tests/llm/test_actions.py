@@ -520,7 +520,7 @@ async def test_read_learning_gives_each_evidence_score_or_error() -> None:
     ]
 
 
-@pytest.mark.parametrize("max_reads", [2, 20])
+@pytest.mark.parametrize("max_reads", [1, 2, 20])
 async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
     tmp_path: Path, max_reads: int
 ) -> None:
@@ -594,7 +594,7 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         assert [item["id"] for item in found] == ["L-shared"]
         raw = await invoke(tools, deps, "read_learning", {"id": "L-shared"})
         result = decoded(raw)
-        if max_reads == 2:
+        if max_reads == 1:
             assert result == {"error": "max_board_reads_per_round reached"}
             return
         assert result["text"] == text
@@ -604,7 +604,9 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         assert raw.startswith(UNTRUSTED_OPEN)
         assert raw.endswith(UNTRUSTED_CLOSE)
         assert "out-of-view-candidate-secret" not in raw
-        assert (runtime.counters.turns, runtime.counters.board_reads) == (3, 3)
+        assert (runtime.counters.turns, runtime.counters.board_reads) == (2, 2)
+        if max_reads == 2:
+            return
         assert decoded(await invoke(tools, deps, "read_learning", {"id": "L-later"})) == {
             "error": "unknown learning: L-later"
         }
@@ -615,16 +617,70 @@ async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
         board.close()
 
 
-@pytest.mark.parametrize("kind", ["soft", "unregistered", "limit", "terminal", "fence"])
-async def test_learning_evidence_does_not_hide_other_read_failures(kind: str) -> None:
+@pytest.mark.parametrize("visibility", ["visible", "foreign"])
+@pytest.mark.parametrize("search_first", [False, True])
+async def test_long_learning_evidence_preserves_text_at_default_read_limit(
+    ctx_env: CtxEnv, visibility: str, search_first: bool
+) -> None:
+    fake = fake_context()
+    batch = [fake.add_candidate(f"c-{i}") for i in range(9)]
+    learning = await fake.post_learning("Hint", "Keep this authorized text.", [c.id for c in batch])
+    ctx = ctx_env.ctx(own=[learning, *(batch if visibility == "visible" else [])], limits=Limits())
+    tools, deps = await _prepare(partial(tool_set, ctx))
+    if search_first:
+        found = decoded(await invoke(tools, deps, "search_learnings", {"query": "Hint"}))
+        assert [item["id"] for item in found] == [learning.id]
+    result = decoded(await invoke(tools, deps, "read_learning", {"id": learning.id}))
+    assert result["text"] == learning.text
+    if visibility == "visible":
+        assert result["evidence"] == [
+            {"id": c.id, "scores": [], "error": None if i < 4 else "read limit reached"}
+            for i, c in enumerate(batch)
+        ]
+        assert ctx_env.counters.board_reads == Limits().max_board_reads_per_round == 10
+        assert ctx_env.counters.turns == 11
+    else:
+        assert result["evidence"] == [
+            {"id": c.id, "scores": [], "error": "not in this view"} for c in batch
+        ]
+        assert ctx_env.counters.board_reads == ctx_env.counters.turns == 1 + search_first
+
+
+async def test_learning_evidence_keeps_mixed_view_membership(ctx_env: CtxEnv) -> None:
+    fake = fake_context()
+    visible = fake.add_candidate("visible")
+    learning = await fake.post_learning(
+        "Hint", "Mixed evidence.", ["visible", "foreign", "visible"]
+    )
+    ctx = ctx_env.ctx(own=[visible, learning])
+    tools, deps = await _prepare(partial(tool_set, ctx))
+    result = decoded(await invoke(tools, deps, "read_learning", {"id": learning.id}))
+    assert result["text"] == learning.text
+    assert result["evidence"] == [
+        {"id": "visible", "scores": [], "error": None},
+        {"id": "foreign", "scores": [], "error": "not in this view"},
+        {"id": "visible", "scores": [], "error": None},
+    ]
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (5, 5)
+
+
+@pytest.mark.parametrize(
+    "kind", ["soft", "unregistered", "unregistered_limit", "limit", "terminal", "fence"]
+)
+@pytest.mark.parametrize("operation", ["get_candidate", "scores_of"])
+async def test_learning_evidence_does_not_hide_other_read_failures(
+    kind: str, operation: str
+) -> None:
     error = {
-        "soft": _core_error(SoftError, "max_board_reads_per_round reached"),
+        "soft": _core_error(SoftError, "board read unavailable"),
         "unregistered": SoftError("unknown candidate: c-1"),
+        "unregistered_limit": SoftError("max_board_reads_per_round reached"),
         "limit": _core_error(LimitReached, "stop", "the round is stopping"),
         "terminal": _stop_cleanup_error(),
         "fence": _core_error(Fenced, "run ownership lost"),
     }[kind]
-    fake = fake_context(raise_on={"get_candidate": error})
+    fake = fake_context(raise_on={operation: error})
+    fake.add_candidate("c-1")
     learning = await fake.post_learning("Hint", "permitted-learning-text", ["c-1"])
     tools, deps = tool_set(fake)
     if kind in {"limit", "terminal", "fence"}:
@@ -635,7 +691,7 @@ async def test_learning_evidence_does_not_hide_other_read_failures(kind: str) ->
     else:
         result = decoded(await invoke(tools, deps, "read_learning", {"id": learning.id}))
         assert result == {
-            "error": "max_board_reads_per_round reached"
+            "error": "board read unavailable"
             if kind == "soft"
             else "internal error in read_learning: SoftError"
         }

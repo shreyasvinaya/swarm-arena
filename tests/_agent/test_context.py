@@ -117,6 +117,25 @@ async def test_board_reads_capped(ctx_env: CtxEnv) -> None:
         ctx.read_learning("L-x")
 
 
+@pytest.mark.parametrize("max_reads", [0, 10])
+async def test_missing_candidate_lookup_does_not_charge_reads(
+    ctx_env: CtxEnv, max_reads: int
+) -> None:
+    ctx = ctx_env.ctx(limits=Limits(max_board_reads_per_round=max_reads))
+    with pytest.raises(SoftError, match="unknown candidate: missing"):
+        ctx.get_candidate("missing")
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (0, 0)
+    assert ctx_env.events("agent_counters") == []
+
+
+async def test_missing_candidate_still_checks_live_admission(ctx_env: CtxEnv) -> None:
+    ctx = ctx_env.ctx(gate=lambda: _core_error(LimitReached, "stop", "the round is stopping"))
+    with pytest.raises(LimitReached) as caught:
+        ctx.get_candidate("missing")
+    assert caught.value.limit == "stop"
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (0, 0)
+
+
 async def test_learning_rules(ctx_env: CtxEnv) -> None:
     ctx = ctx_env.ctx()
     c = await ctx.run_tool({"x": 1.0})

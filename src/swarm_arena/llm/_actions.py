@@ -213,19 +213,27 @@ def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
     learning = ctx.read_learning(args["id"])
     result = learning.model_dump(mode="json")
     evidence = []
+    read_limited = False
     for candidate_id in learning.evidence:
+        if read_limited:
+            evidence.append({"id": candidate_id, "scores": [], "error": "read limit reached"})
+            continue
         try:
             candidate = ctx.get_candidate(candidate_id)
+            scores = ctx.scores_of(candidate_id)
         except SoftError as error:
             known = _rebuild_core_signal(error)
-            if (
-                not isinstance(known, SoftError)
-                or str(known) != f"unknown candidate: {candidate_id}"
-            ):
+            if not isinstance(known, SoftError):
                 raise
-            evidence.append({"id": candidate_id, "scores": [], "error": "not in this view"})
+            if str(known) == "max_board_reads_per_round reached":
+                read_limited = True
+                marker = "read limit reached"
+            elif str(known) == f"unknown candidate: {candidate_id}":
+                marker = "not in this view"
+            else:
+                raise
+            evidence.append({"id": candidate_id, "scores": [], "error": marker})
             continue
-        scores = ctx.scores_of(candidate_id)
         # ToolOutput has no error field. Core execution diagnostics are carried
         # by Candidate.warnings; overlay and past-run hints are not errors.
         error = (

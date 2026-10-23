@@ -944,6 +944,8 @@ class AgentContext:
         """
         Read a visible candidate with private feedback removed.
 
+        A lookup outside the fixed view consumes neither a turn nor a board read.
+
         Parameters
         ----------
         id : str
@@ -982,8 +984,9 @@ class AgentContext:
         id = _context_string(id, "id")
 
         def read() -> Candidate:
-            self._charge(board_read=True)
+            self._check_admission()
             candidate = self._candidate(id)
+            self._charge(board_read=True)
             self._read_ids[id] = None
             return self._manager(candidate)
 

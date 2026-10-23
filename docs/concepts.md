@@ -208,7 +208,10 @@ group. `search_learnings(scope="namespace")` can find learnings from other goals
 and earlier runs. The SDK `read_learning` action retains their full text; evidence
 outside the fixed candidate view includes only its id, an empty scores list and
 the value-free error marker `not in this view`. Visible evidence retains its
-scores or tool error. Candidate access and feedback permissions still apply.
+scores or tool error. Once evidence reads reach the round's read limit, remaining
+evidence carries the value-free marker `read limit reached` and the learning text
+is retained. Candidate lookups outside the view consume no turn or board read.
+Candidate access and feedback permissions still apply.
 Candidate and learning reads automatically populate `read_ids` provenance for subsequent tool runs. Converge
 agents get read-only `seed_parents`, prepended to their explicit parents. Check
 feedback permissions still apply to those parents. See the
