@@ -76,6 +76,11 @@ _ALLOW = {
         "procinfo.kill_orphan",
     ): "Local process cleanup.",
     ("_exec/local.py", "LocalExecutor._get_host_id", "host_id"): "Local host identity.",
+    (
+        "_exec/local.py",
+        "LocalExecutor.confirm_dead",
+        "procinfo.process_start_time",
+    ): "Local process identity inspection.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "self._run_folder"): "Before acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_build"): "Preownership snapshots.",
     (
@@ -191,6 +196,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",
         _ROOT / "_gateway/keys.py",
+        _ROOT / "_gateway/reconcile.py",
         _ROOT / "_planning/validate.py",
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
@@ -408,4 +414,19 @@ def test_guard_scans_gateway_key_owner(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(AssertionError, match=r"_gateway/keys.py:\d+: unsafe_gateway_publish"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_reconcile_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_gateway/reconcile.py"
+    original = Path.read_text
+    unsafe = (
+        target.read_text() + '\nasync def unsafe_reconcile(store):\n    store.create("x", b"x")\n'
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_gateway/reconcile.py:\d+: unsafe_reconcile"):
         test_lease_owned_modules_use_abandonable_workers()

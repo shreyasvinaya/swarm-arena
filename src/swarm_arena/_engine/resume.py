@@ -618,6 +618,8 @@ async def _take_over(
     review: bool = False,
     clock: Callable[[], RunClock | None] | None = None,
     stops: StopState | None = None,
+    allow_empty_head: bool = False,
+    owner_id: str | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     retain = stops is not None
@@ -630,7 +632,7 @@ async def _take_over(
                     raise FileNotFoundError(f"run {run_id} has no control/owner.json")
                 raise _core_error(ValueError, "run has no committed owner")
             doc, _ = owner
-            if doc.head is None:
+            if doc.head is None and not allow_empty_head:
                 raise _core_error(ValueError, f"run {run_id} has no committed events")
             if validate is not None:
                 await _validated_io(validate, doc)
@@ -646,7 +648,7 @@ async def _take_over(
                     partial(
                         Lease.take_over,
                         store,
-                        owner_id=uuid4().hex,
+                        owner_id=owner_id if owner_id is not None else uuid4().hex,
                         host=host_id(),
                         ttl_s=config.lease_ttl_s,
                         force=force,

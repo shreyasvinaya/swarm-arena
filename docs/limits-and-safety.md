@@ -205,6 +205,51 @@ LiteLLM range, reconciliation keeps the full reservation labelled `estimated`:
 without a verified duration bound, waiting longer cannot prove completeness.
 Observed rows can still inform provenance without lowering the ledger charge.
 
+## After the run: reconcile
+
+Run `swarm-arena reconcile RUN_DIR`, where `RUN_DIR` is `<run_root>/<run-id>`.
+It reads that run's `run.toml` by default; `--config PATH` selects an override.
+The command prints each candidate, key alias, reserved USD, spend USD and label.
+It checks storage conditional-write support (including an `s3://` run root)
+before takeover, refuses a live owner, and holds the run lease while publishing
+its report. The driver also attempts reconciliation before its final commit,
+using its existing owner and gateway profile. Gateway failures are recorded
+without failing completion; storage failures and ownership loss still propagate.
+
+A key's report becomes an observation only when all these conditions hold:
+
+1. The executor confirms the original tool is dead. A key with no start or
+   dispatch event counts as unused. A reused local process-group leader is dead
+   only when both recorded and current start times are known and differ.
+   A remote host or unavailable, stale or unbound Ray dashboard remains unknown.
+2. The gateway confirms closure at time T. Repeated reconciliations preserve the
+   earliest journaled confirmation; blocking alone is not confirmation.
+3. The gateway enforces a maximum request duration no longer than
+   `request_timeout_s`, reports a batch write interval, and both intervals have
+   passed since T.
+
+Otherwise the report keeps the full reservation as **estimated**, with the
+failed conditions listed. The pinned LiteLLM adapter cannot verify the duration
+and batch guarantees, so it stays estimated and does not delete keys for
+completeness. An adapter that can demonstrate these capabilities reports
+**observed (completeness unverified)** unless it also guarantees terminal
+accounting, in which case it reports **observed**. Unverified observed spend
+is not proof that every charge has arrived: late log batches may add rows.
+Deletion is attempted only after a successful eligible read and durable recording.
+
+Reports deduplicate gateway requests by key and request identity, retain earlier
+committed observations even when logs age out, and sum integer micro-dollars
+before displaying USD. Totals that cannot be represented without losing a
+micro-dollar are refused. A later reconcile can add late rows and update the
+report; readers retain their captured committed snapshot until refreshed.
+Reconciliation never refunds reservations, changes a live run's budget, or
+restarts the paid-work clock. Gateway waits have a separate bounded allowance;
+healthy journal storage is not charged against that external-work timer.
+
+A key created just before the open deadline but never journaled is unusable
+(its bearer never left the driver), expires after `key_duration_s`, and is not
+counted in reports.
+
 ## Tokens, USD, and tranches
 
 Metered LLM calls reserve before dispatch against their scope's committed

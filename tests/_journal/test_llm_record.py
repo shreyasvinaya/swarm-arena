@@ -30,6 +30,158 @@ from swarm_arena.tool import Usage
 ESTIMATE = Amount(tokens=9_000, usd=0.01)
 
 
+async def test_maintenance_binding_records_and_deduplicates_external_observations(
+    tmp_path: Path,
+) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        meta = {
+            "run_id": run.run_id,
+            "owner_epoch": str(run.journal.epoch),
+            "role": "tool",
+            "goal_id": "g",
+            "candidate_id": "c",
+        }
+        kwargs = record_kwargs(
+            meta,
+            request=None,
+            response=None,
+            settle=False,
+            _external_observation=True,
+            litellm_call_id="gw:earlier",
+        )
+        assert await record_call(**kwargs) is not None
+        await run.journal.commit()
+        state = run.state()
+        unbind_run(run.run_id, journal=run.journal)
+        run.clock._rebase(run.config.limits.run_timeout_s + 100)
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=state,
+            _maintenance_lease=run.journal._lease,
+        ):
+            binding = llm_record._bindings[run.run_id]
+            assert binding.clock is None
+            assert await record_call(**kwargs) is None
+            kwargs["litellm_call_id"] = "gw:late"
+            call = await record_call(**kwargs)
+            assert call is not None
+            assert call.role == "tool"
+            assert call.reservation_id is None
+            assert binding.scopes == {}
+            assert binding.pending == {}
+            await run.journal.commit()
+            assert len(run.calls()) == 2
+            assert run.events("settle") == []
+        assert run.run_id not in llm_record._bindings
+        assert await record_call(**kwargs) is None
+
+
+@pytest.mark.parametrize("invalid", ["funded", "settle", "reservation", "open_call"])
+async def test_maintenance_binding_refuses_funding(tmp_path: Path, invalid: str) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        state = run.state()
+        unbind_run(run.run_id, journal=run.journal)
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=state,
+            _maintenance_lease=run.journal._lease,
+        ):
+            meta = {
+                "run_id": run.run_id,
+                "owner_epoch": str(run.journal.epoch),
+                "role": "tool",
+                "goal_id": "g",
+            }
+            if invalid == "reservation":
+                meta["reservation_id"] = "SECRET"
+            kwargs = record_kwargs(
+                meta,
+                settle=invalid == "settle",
+                _external_observation=invalid != "funded",
+                litellm_call_id="gw:one",
+            )
+
+            async def attempt() -> None:
+                if invalid == "open_call":
+                    open_call(
+                        run.scope("judge"),
+                        reservation_id="SECRET",
+                        estimate=ESTIMATE,
+                        model_alias="opus",
+                        model="local",
+                        provider="local",
+                    )
+                else:
+                    await record_call(**kwargs)
+
+            with pytest.raises(ValueError, match="maintenance binding") as caught:
+                await attempt()
+            assert_secret_absent(caught.value, "SECRET")
+            await run.journal.commit()
+            assert run.calls() == []
+            assert run.events("settle") == []
+
+
+@pytest.mark.parametrize("invalid", ["missing", "unentered", "expired", "different"])
+async def test_maintenance_binding_requires_held_writer_lease(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    from datetime import timedelta
+
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena._model.canonical import utc_now
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+        lease = run.journal._lease
+        doc = lease.doc
+        supplied = lease
+        if invalid == "missing":
+            supplied = None
+        elif invalid == "unentered":
+            run.journal._entered = False
+        elif invalid == "expired":
+            lease.doc = doc.model_copy(update={"expires_at": utc_now() - timedelta(seconds=1)})
+        else:
+            supplied = Lease(run.store, lease.doc, lease.etag, ttl_s=lease.ttl_s)
+        try:
+            with pytest.raises((RuntimeError, ValueError), match=r"maintenance binding|not active"):
+                async with llm_record._bound_run(
+                    run.run_id,
+                    journal=run.journal,
+                    ids=run.ids,
+                    artifacts=run.artifacts,
+                    config=run.config,
+                    stops=run.stops,
+                    clock=None,
+                    state=run.state(),
+                    _maintenance_lease=supplied,
+                ):
+                    pytest.fail("invalid maintenance binding entered")
+            assert run.run_id not in llm_record._bindings
+        finally:
+            run.journal._entered = True
+            lease.doc = doc
+
+
 async def test_graceful_report_timeout_survives_delayed_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2065,3 +2217,86 @@ async def test_tool_dedup_namespace_rebuilds_from_committed_rows(tmp_path: Path)
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
         assert await record_reported(rows, metadata=metadata) == []
         await _assert_accounted(scope, run.store)
+
+
+@pytest.mark.parametrize("invalid", ["namespace", "scope", "released"])
+async def test_maintenance_observation_rechecks_authority(tmp_path: Path, invalid: str) -> None:
+    from datetime import timedelta
+
+    from swarm_arena._journal import llm_record
+    from swarm_arena._model.canonical import utc_now
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+        lease = run.journal._lease
+        doc = lease.doc
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=run.state(),
+            _maintenance_lease=lease,
+        ):
+            meta = {
+                "run_id": run.run_id,
+                "owner_epoch": str(run.journal.epoch),
+                "role": "tool",
+                "goal_id": "g",
+            }
+            kwargs = record_kwargs(
+                meta,
+                settle=False,
+                _external_observation=True,
+                litellm_call_id="SECRET" if invalid == "namespace" else "gw:one",
+            )
+            try:
+                if invalid == "released":
+                    lease.doc = doc.model_copy(
+                        update={"expires_at": utc_now() - timedelta(seconds=1)}
+                    )
+
+                async def attempt() -> None:
+                    if invalid == "scope":
+                        with llm_scope(run.scope("judge")):
+                            await record_call(**kwargs)
+                    else:
+                        await record_call(**kwargs)
+
+                with pytest.raises((ValueError, Fenced)) as caught:
+                    await attempt()
+                assert_secret_absent(caught.value, "SECRET")
+            finally:
+                lease.doc = doc
+        assert not run.calls()
+
+
+async def test_maintenance_ignores_old_epoch_and_unbinds_on_hard_control(tmp_path: Path) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+
+        async def attempt() -> None:
+            async with llm_record._bound_run(
+                run.run_id,
+                journal=run.journal,
+                ids=run.ids,
+                artifacts=run.artifacts,
+                config=run.config,
+                stops=run.stops,
+                clock=None,
+                state=run.state(),
+                _maintenance_lease=run.journal._lease,
+            ):
+                meta = {"run_id": run.run_id, "owner_epoch": "0", "role": "manager"}
+                assert await record_call(**record_kwargs(meta, settle=True)) is None
+                raise GeneratorExit
+
+        with pytest.raises(GeneratorExit):
+            await attempt()
+        assert run.run_id not in llm_record._bindings
+        assert not run.calls()

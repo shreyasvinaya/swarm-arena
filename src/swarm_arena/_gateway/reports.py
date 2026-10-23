@@ -1,16 +1,31 @@
 """Share gateway lifecycle vocabulary and reconciliation payloads with replay."""
 
-from typing import Annotated, Literal, Self
+import math
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import Field, model_validator
 
+from swarm_arena._budget.amount import _micro_units
+from swarm_arena._errors import _core_error
 from swarm_arena._model.base import FrozenModel
 
 GatewayId = Annotated[str, Field(strict=True, min_length=1, max_length=256)]
 GatewayUsd = Annotated[float, Field(strict=True, ge=0)]
 ReportLabel = Literal["observed", "observed (completeness unverified)", "estimated"]
-GatewayKeyAction = Literal["created", "closed", "read_failed", "close_failed"]
+GatewayKeyAction = Literal["created", "closed", "deleted", "read_failed", "close_failed"]
 GatewayReadStatus = Literal["ok", "failed", "incomplete"]
+
+
+def _report_usd(units: int) -> float:
+    """Convert an unbounded report total only if every micro-dollar survives."""
+    try:
+        usd = units / 1_000_000
+    except OverflowError:
+        raise _core_error(ValueError, "gateway report total is not representable") from None
+    if not math.isfinite(usd) or _micro_units(usd) != units:
+        raise _core_error(ValueError, "gateway report total is not representable")
+    return usd
 
 
 class KeyReport(FrozenModel):
@@ -75,6 +90,14 @@ class ReconcileReport(FrozenModel):
     run_id: GatewayId
     keys: list[KeyReport]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _run_envelope(cls, value: Any) -> Any:
+        """Accept the engine's clock stamp without making it part of the report."""
+        if isinstance(value, Mapping):
+            return {key: item for key, item in value.items() if key != "run_elapsed_s"}
+        return value
+
     def spend_usd(self) -> float:
         """Sum observed spend where available, otherwise full reservations.
 
@@ -88,10 +111,9 @@ class ReconcileReport(FrozenModel):
         >>> ReconcileReport(run_id="r", keys=[]).spend_usd()
         0.0
         """
-        return sum(
-            (
-                key.reserved_usd if key.observed_usd is None else key.observed_usd
+        return _report_usd(
+            sum(
+                _micro_units(key.reserved_usd if key.observed_usd is None else key.observed_usd)
                 for key in self.keys
-            ),
-            0.0,
+            )
         )

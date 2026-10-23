@@ -964,6 +964,7 @@ class RunRunner:
                         if self._stopping(deps):
                             stopping()
                         await _read_gateway(deps.journal, deps.gateway)
+                        await self._reconcile_gateway(deps)
                         await _finish_run(deps.store, deps.journal)
                     if completion.cancel_called:
                         raise _core_error(RuntimeError, "run completion timed out")
@@ -975,6 +976,34 @@ class RunRunner:
             if error is not None:
                 raise error
         return result
+
+    async def _reconcile_gateway(self, deps: EngineDeps) -> None:
+        """Reconcile under this owner; bound gateway work separately from storage."""
+        if self._gateway is None or deps.gateway is None:
+            return
+        from swarm_arena._gateway.reconcile import reconcile_keys
+
+        assert deps.config.llm_gateway is not None
+        head = await deps.journal.commit()
+        assert head is not None
+        chain = await _read_chain(deps.store, head)
+        events = [event for _, batch in chain for event in batch]
+        margin = min(0.1, deps.config.settle_timeout_s / 10)
+        deadline = min(
+            anyio.current_time() + deps.config.settle_timeout_s,
+            anyio.current_effective_deadline() - margin,
+        )
+        await reconcile_keys(
+            events,
+            run_id=deps.run_id,
+            journal=deps.journal,
+            adapter=self._gateway.adapter,
+            executor=deps.executor,
+            gateway=deps.config.llm_gateway,
+            profile=self._gateway.profile,
+            _deadline=deadline,
+            _manager=deps.gateway,
+        )
 
     async def _watch_clock(self, deps: EngineDeps) -> None:
         await anyio.sleep(deps.clock.left(deps.config.limits.run_timeout_s))

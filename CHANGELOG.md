@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `swarm-arena reconcile RUN_DIR` reports gateway spend under the run lease,
+  with conservative death evidence, exact deduplicated totals and a bounded
+  run-end attempt; the pinned LiteLLM profile retains estimated reservations.
+
 - Ray conformance and Rosenbrock integration coverage for object-store file transport,
   with worker setup, recovery limits and connector CI instructions.
 

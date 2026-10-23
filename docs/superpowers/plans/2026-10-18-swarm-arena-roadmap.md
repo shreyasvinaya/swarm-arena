@@ -1450,9 +1450,9 @@ class LocalExecutor(Executor):
     def __init__(self, config: "LocalExecutor.Config | None" = None, /, **fields: Any) -> None: ...
     # preflight() refuses a non-POSIX platform [plan].
     # [plan, M1a] The executor runs with `Job.timeout_s` and `Job.grace_s` and writes them into `Command.timeout_s` and `Command.grace_s`; the driver computes them with `effective_tool_timeout` and `tool_grace` (`_tooling/tool.py`).
-    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_has_live_member(pgid), or if process_start_time(pid)
-    # differs from started.start_time. False if the group is alive with the recorded start time or an unknown one. None on
-    # another host or for kind "dispatch".
+    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_has_live_member(pgid), or if pid == pgid
+    # and both process_start_time(pid) and started.start_time are known and differ. False if the group is alive
+    # with the recorded identity or unknown identity. None on another host or for kind "dispatch".
 ```
 
 ### R4.8 `swarm_arena.config`
@@ -2911,6 +2911,8 @@ M3 metering and control bridge extension:
   the actual writer cause. The core never imports the optional SDK.
 
 #### R4.13.18 CLI — M1a (root) and later
+
+[plan] Run-state commands (`status`, `stop`, `resume`, `reconcile`) take `RUN_DIR` (`<run_root>/<run-id>`) and, with no `--config`, use the run's own `run.toml`. Arena commands (M2: `review`, `leaderboard`, `board`, `learnings`, `trace`) take a run id or a namespace plus `--config PATH` (default `./run.toml`).
 
 ```python
 def main(argv: Sequence[str] | None = None) -> int: ...   # _cli/main.py; argparse [plan]; exit codes 0 ok, 1 error, 2 usage
