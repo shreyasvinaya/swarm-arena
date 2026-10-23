@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from functools import partial
 from time import monotonic
 from typing import Annotated, Any, Final, cast
@@ -11,9 +12,9 @@ import ray
 import ray.exceptions
 from pydantic import ConfigDict, Field
 
-from swarm_arena._errors import _core_error, _exception_type_name
+from swarm_arena._errors import StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor, Job, current_schedule_timeout
-from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.tooling import RunStatus, ToolOutput
@@ -81,7 +82,7 @@ def _error(error: Exception) -> ToolOutput:
     return ToolOutput(status=status, data={"swarm_arena_error": _exception_type_name(error)})
 
 
-def _prepare(job: Job, config: "RayExecutor.Config") -> bytes:
+def _prepare(job: Job, config: "RayExecutor.Config") -> ray.ObjectRef:
     """Finish reads, connector imports and serialization before dispatch intent."""
     cap = config.object_store_cap_mib * MIB if uses_object_store(job.artifact_root) else None
     blobs = None
@@ -97,11 +98,12 @@ def _prepare(job: Job, config: "RayExecutor.Config") -> bytes:
                 ValueError,
                 "Ray inputs exceed object_store_cap_mib or are invalid; use an s3:// artifact_root",
             ) from None
-    return job_payload(
+    payload = job_payload(
         job,
         TaskSettings(poll_s=config.poll_s, cap_bytes=cap, import_roots=driver_import_roots(job)),
         blobs=blobs,
     )
+    return ray.put(payload)
 
 
 def _decode(raw: bytes, cap_bytes: int) -> tuple[ToolOutput, dict[str, bytes]]:
@@ -192,10 +194,14 @@ class RayExecutor(Executor):
         """Validate settings without connecting to Ray."""
         super().__init__(config_or_fields(config, fields))
         self._init_lock = anyio.Lock()
-        self._init_started = False
+        self._init_call: _DaemonCall[tuple[str | None, str | None]] | None = None
         self._initialized = False
         self._dashboard_url: str | None = None
         self._driver_job_id: str | None = None
+        self._nodes_lock = anyio.Lock()
+        self._nodes_call: _DaemonCall[list[dict[str, Any]]] | None = None
+        self._nodes_snapshot: list[Mapping[str, float]] | None = None
+        self._nodes_refresh_at = float("-inf")
 
     @property
     def config(self) -> Config:
@@ -244,8 +250,11 @@ class RayExecutor(Executor):
 
     def _connect(self) -> tuple[str | None, str | None]:
         context = ray.init(address=self.config.address, ignore_reinit_error=True)
+        runtime = ray.get_runtime_context()
+        if self.config.address != "auto" and runtime.gcs_address != self.config.address:
+            raise _core_error(RuntimeError, "Ray connected cluster does not match address")
         dashboard = context.dashboard_url
-        job_id = ray.get_runtime_context().get_job_id()
+        job_id = runtime.get_job_id()
         return dashboard, job_id
 
     async def _init(self) -> None:
@@ -253,23 +262,24 @@ class RayExecutor(Executor):
         async with self._init_lock:
             if self._initialized:
                 return
-            if self._init_started:
-                raise _core_error(RuntimeError, "Ray initialization failed or was abandoned")
-            self._init_started = True
-            # A timed-out caller must not wait for Ray's uninterruptible initialization.
-            # Never retry this executor's abandoned attempt or adopt its late result.
+            if self._init_call is None:
+                self._init_call = _DaemonCall(self._connect)
+            # Abandon only this wait. Later callers rejoin the same attempt under
+            # their own allowance; only an active caller may adopt its result.
             outcome = _Outcome()
             try:
-                dashboard, job_id = await anyio.to_thread.run_sync(
-                    self._connect, abandon_on_cancel=True
-                )
+                dashboard, job_id = await self._init_call.result()
                 await anyio.lowlevel.checkpoint_if_cancelled()
             except anyio.get_cancelled_exc_class() as error:
-                outcome.contain(error, RuntimeError, "Ray initialization")
+                classified = outcome.classify(error)
+                self._init_call = None
+                outcome.contain(classified, RuntimeError, "Ray initialization")
             except Exception as error:
+                self._init_call = None
                 outcome.contain(error, RuntimeError, "Ray initialization")
             self._dashboard_url, self._driver_job_id = dashboard, job_id
             self._initialized = True
+            self._init_call = None
 
     async def submit(self, job: Job) -> ToolOutput:
         """Dispatch a job once and return its validated, published result.
@@ -286,10 +296,12 @@ class RayExecutor(Executor):
 
         Notes
         -----
-        Cancellation soft-cancels, waits for grace plus the margin, then force-
-        cancels in a shield. Only ``job.on_partial`` receives cancelled data;
-        no new artifact upload begins on that path. Process controls propagate.
-        The private run scope bounds only continuously infeasible requests.
+        Cancellation soft-cancels, waits, then force-cancels in a shield. These
+        steps and ``job.on_partial`` share one deadline: grace plus the margin.
+        Only that callback receives cancelled data; no artifact upload begins.
+        Pending caller cancellation retains precedence over callback failures.
+        Hard process controls synchronously request force cancellation before
+        propagating. The private run scope bounds only infeasible requests.
 
         Examples
         --------
@@ -303,6 +315,9 @@ class RayExecutor(Executor):
             options = task_options(job, self.config)
         except anyio.get_cancelled_exc_class() as error:
             return _error(outcome.classify(error))
+        except StorageError as error:
+            outcome.propagate_control(error)
+            raise
         except ValueError as error:
             outcome.propagate_control(error)
             return ToolOutput(
@@ -330,9 +345,25 @@ class RayExecutor(Executor):
             outcome.propagate_control(error)
             return _error(error)
         try:
+            return await self._submitted(ref, job, options)
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, BaseExceptionGroup):
+            # Hard process controls cannot await cleanup. Queue the force request
+            # on this thread before preserving the original process control.
+            with suppress(Exception):
+                ray.cancel(ref, force=True)
+            raise
+
+    async def _submitted(self, ref: Any, job: Job, options: Mapping[str, Any]) -> ToolOutput:
+        """Own result publication and bounded cleanup after exactly one dispatch."""
+        outcome = _Outcome()
+        cleanup_started = False
+        deadline: float | None = None
+        try:
             raw, timed_out = await self._wait(ref, job, options)
             if timed_out is not None:
-                await self._cancel(ref, job)
+                cleanup_started = True
+                deadline = anyio.current_time() + job.grace_s + self.config.cancel_margin_s
+                await self._cancel(ref, job, deadline=deadline)
                 return timed_out
             assert raw is not None
             output, blobs = await run_sync_daemon(
@@ -344,6 +375,8 @@ class RayExecutor(Executor):
             await anyio.lowlevel.checkpoint_if_cancelled()
             return output
         except anyio.get_cancelled_exc_class() as error:
+            if deadline is None:
+                deadline = anyio.current_time() + job.grace_s + self.config.cancel_margin_s
             classified: Exception | None = None
             try:
                 classified = outcome.classify(error)
@@ -351,7 +384,10 @@ class RayExecutor(Executor):
                 pass
             with anyio.CancelScope(shield=True):
                 try:
-                    output = await self._cancel(ref, job)
+                    output = ToolOutput(status=RunStatus.CANCELLED)
+                    if not cleanup_started:
+                        cleanup_started = True
+                        output = await self._cancel(ref, job, deadline=deadline)
                 except Exception as cleanup_error:
                     if classified is not None:
                         outcome.propagate_control(cleanup_error)
@@ -359,22 +395,28 @@ class RayExecutor(Executor):
                     output = ToolOutput(status=RunStatus.CANCELLED)
                 if classified is None and job.on_partial is not None:
                     try:
-                        with anyio.move_on_after(self.config.cancel_margin_s):
+                        with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
                             await job.on_partial(output)
-                    except Exception:
-                        pass
+                    except (Exception, anyio.get_cancelled_exc_class()) as late_error:
+                        # Match LocalExecutor: classify against the original
+                        # caller snapshot, then preserve its pending cancellation.
+                        with suppress(anyio.get_cancelled_exc_class()):
+                            outcome.classify(late_error)
             if classified is not None:
                 return _error(classified)
             raise anyio.get_cancelled_exc_class()() from None
         except Exception as error:
             cleanup_error: Exception | None = None
-            try:
-                await self._cancel(ref, job)
-            except Exception as caught:
-                cleanup_error = caught
+            if not cleanup_started:
+                try:
+                    await self._cancel(ref, job)
+                except Exception as caught:
+                    cleanup_error = caught
             outcome.propagate_control(error)
             if cleanup_error is not None:
                 outcome.propagate_control(cleanup_error)
+            if isinstance(error, StorageError):
+                raise error from None
             return _error(error)
 
     async def _wait(
@@ -433,12 +475,13 @@ class RayExecutor(Executor):
                             deadline=now + _STATE_RPC_S,
                         )
                     )
-                    if info is not None and info.state not in PENDING_STATES:
-                        await anyio.sleep_forever()
-                    nodes = await run_sync_daemon(ray.nodes)
-                if poll.cancelled_caught or fits_any_node(
-                    request, [node["Resources"] for node in nodes if node["Alive"] is True]
-                ):
+                    pending = info is None or info.state in PENDING_STATES
+                    totals = await self._node_totals() if pending else None
+                if not poll.cancelled_caught and not pending:
+                    # One-shot tasks cannot return to pending. Stay dormant until
+                    # receive finishes or the owner cancels, outside the RPC timer.
+                    await anyio.sleep_forever()
+                if poll.cancelled_caught or totals is None or fits_any_node(request, totals):
                     infeasible_since = None
                 else:
                     observed = monotonic()
@@ -462,14 +505,45 @@ class RayExecutor(Executor):
                 infeasible_since = None
             await anyio.sleep(_SCHEDULE_POLL_S)
 
-    async def _cancel(self, ref: Any, job: Job) -> ToolOutput:
+    async def _node_totals(self) -> list[Mapping[str, float]] | None:
+        """Share one rate-limited, single-flight resource read across pending jobs."""
+        async with self._nodes_lock:
+            if self._nodes_call is None:
+                if monotonic() < self._nodes_refresh_at:
+                    return self._nodes_snapshot
+                self._nodes_refresh_at = monotonic() + _SCHEDULE_POLL_S
+                self._nodes_call = _DaemonCall(ray.nodes)
+            outcome = _Outcome()
+            try:
+                nodes = await self._nodes_call.result()
+            except anyio.get_cancelled_exc_class() as error:
+                # Genuine cancellation abandons only this waiter, never starts
+                # another RPC while the shared call is still running.
+                classified = outcome.classify(error)
+                self._nodes_call = None
+                self._nodes_snapshot = None
+                raise classified from None
+            except Exception:
+                self._nodes_call = None
+                self._nodes_snapshot = None
+                raise
+            self._nodes_call = None
+            self._nodes_snapshot = None
+            self._nodes_snapshot = [
+                dict(node["Resources"]) for node in nodes if node["Alive"] is True
+            ]
+            return self._nodes_snapshot
+
+    async def _cancel(self, ref: Any, job: Job, *, deadline: float | None = None) -> ToolOutput:
+        if deadline is None:
+            deadline = anyio.current_time() + job.grace_s + self.config.cancel_margin_s
         output = ToolOutput(status=RunStatus.CANCELLED)
         errors: list[Exception] = []
         with anyio.CancelScope(shield=True):
             outcome = _Outcome()
             process_control = False
             try:
-                with anyio.move_on_after(job.grace_s + self.config.cancel_margin_s):
+                with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
                     await run_sync_daemon(ray.cancel, ref)
                     output = await run_sync_daemon(
                         _partial, await ref, self.config.object_store_cap_mib * MIB
@@ -484,7 +558,7 @@ class RayExecutor(Executor):
             finally:
                 if not process_control:
                     try:
-                        with anyio.move_on_after(self.config.cancel_margin_s):
+                        with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
                             await run_sync_daemon(partial(ray.cancel, ref, force=True))
                     except anyio.get_cancelled_exc_class() as error:
                         errors.append(outcome.classify(error))

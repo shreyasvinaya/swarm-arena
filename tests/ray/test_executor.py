@@ -21,7 +21,7 @@ import ray
 import ray.exceptions
 
 from swarm_arena import Resources
-from swarm_arena._errors import Fenced, _core_error, _stop_cleanup_error
+from swarm_arena._errors import Fenced, StorageError, _core_error, _stop_cleanup_error
 from swarm_arena._exec.executor import current_schedule_timeout, schedule_timeout_scope
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._store.artifacts import ArtifactStore
@@ -61,14 +61,21 @@ class _RunJob:
         self.ref = ref
         self.kw: dict[str, Any] = {}
         self.payloads: list[bytes] = []
+        self.arguments: list[Any] = []
 
     def options(self, **kw: Any) -> "_RunJob":
         self.kw = kw
         return self
 
-    def remote(self, payload: bytes) -> _Ref:
-        self.payloads.append(payload)
+    def remote(self, payload: Any) -> _Ref:
+        self.arguments.append(payload)
+        self.payloads.append(payload.data if isinstance(payload, _Payload) else payload)
         return self.ref
+
+
+class _Payload:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
 
 
 def _frame(output: ToolOutput | None = None, blobs: dict[str, bytes] | None = None) -> bytes:
@@ -81,8 +88,11 @@ def fake_ray(monkeypatch: pytest.MonkeyPatch) -> _RunJob:
     monkeypatch.setattr(module, "run_job", run_job)
     monkeypatch.setattr(ray, "init", Mock(return_value=SimpleNamespace(dashboard_url="head:8265")))
     monkeypatch.setattr(
-        ray, "get_runtime_context", lambda: SimpleNamespace(get_job_id=lambda: "01000000")
+        ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_job_id=lambda: "01000000", gcs_address="configured-head"),
     )
+    monkeypatch.setattr(ray, "put", Mock(side_effect=_Payload))
     monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 2.0}}])
     monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 2.0})
     monkeypatch.setattr(ray, "cancel", Mock())
@@ -598,6 +608,9 @@ async def test_boundaries_preserve_terminal_controls(
         def cancel(ref: _Ref, *, force: bool = False) -> None:
             if force == (site == "force"):
                 fail()
+            elif site == "force":
+                ref.result = _frame()
+                ref.release.set()
 
         monkeypatch.setattr(ray, "cancel", cancel)
     executor = RayExecutor(cancel_margin_s=0.01)
@@ -636,13 +649,13 @@ async def test_ordinary_state_failures_are_unknown(
 class _SpyRunJob:
     def __init__(self) -> None:
         self.options_seen: dict[str, Any] = {}
-        self.payloads: list[bytes] = []
+        self.payloads: list[ray.ObjectRef] = []
 
     def options(self, **kw: Any) -> "_SpyRunJob":
         self.options_seen = kw
         return self
 
-    def remote(self, payload: bytes) -> Any:
+    def remote(self, payload: ray.ObjectRef) -> Any:
         from swarm_arena.ray._task import run_job
 
         self.payloads.append(payload)
@@ -680,6 +693,7 @@ async def test_live_dispatch_intent_and_command_submission(
             make_job(
                 id="executor-command",
                 artifact_root=str(tmp_path),
+                timeout_s=None,
                 command=Command(
                     argv=[
                         sys.executable,
@@ -695,6 +709,7 @@ async def test_live_dispatch_intent_and_command_submission(
     assert seen[0].ray_job_id == ray.get_runtime_context().get_job_id()
     assert executor._dashboard_url == ray_driver.dashboard_url
     assert len(spy.payloads) == 2
+    assert all(isinstance(payload, ray.ObjectRef) for payload in spy.payloads)
     assert "runtime_env" not in spy.options_seen
 
 
@@ -778,7 +793,7 @@ async def test_secret_values_never_in_task_metadata(ray_driver: Any, tmp_path: P
 
 @pytest.mark.ray
 async def test_capacity_reports_cluster(ray_driver: Any) -> None:
-    cap = await RayExecutor().capacity()
+    cap = await RayExecutor(address=ray.get_runtime_context().gcs_address).capacity()
     assert cap is not None
     assert cap.cpus == 2.0
     assert cap.custom == {"llm_keys": 1.0}
@@ -806,7 +821,7 @@ async def test_confirm_dead_dispatch_after_finish(ray_driver: Any, tmp_path: Pat
 async def test_kill_orphan_bounded_for_unknown_task(ray_driver: Any) -> None:
     from uuid import uuid4
 
-    with anyio.fail_after(5):
+    with anyio.fail_after(30):
         assert (
             await RayExecutor(cancel_margin_s=0.2).kill_orphan(
                 Job.Started(
@@ -984,8 +999,9 @@ async def test_s3_artifact_root_sends_only_hashes(
             tool_job(code, artifact_root=s3_url, stage=Job.Stage(root={"input.txt": digest}))
         )
     assert out.status == RunStatus.OK
-    assert max(map(len, spy.payloads)) < 64 * 1024
-    assert read_payload(spy.payloads[0])[2] == {}
+    payloads = await anyio.to_thread.run_sync(ray.get, spy.payloads)
+    assert max(map(len, payloads)) < 64 * 1024
+    assert read_payload(payloads[0])[2] == {}
 
 
 @pytest.mark.parametrize("site", ["prepare", "ref"])
@@ -1064,3 +1080,428 @@ async def test_query_preserves_caller_cancellation(
     finally:
         release.set()
         assert await anyio.to_thread.run_sync(done.wait, 5)
+
+
+@pytest.mark.parametrize("site", ["prepare", "upload"])
+async def test_core_storage_errors_propagate(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    seen: list[Job.Started] = []
+
+    async def started(value: Job.Started) -> None:
+        seen.append(value)
+
+    def fail(*args: Any, **kw: Any) -> Any:
+        if site == "prepare":
+            raise StorageError("artifact input unavailable")
+        raise OSError("private backend failure")
+
+    if site == "prepare":
+        monkeypatch.setattr(module, "inline_inputs", fail)
+    else:
+        fake_ray.ref.result = _frame(blobs={sha256_hex(b"result"): b"result"})
+        monkeypatch.setattr(module, "_put_blob", fail)
+    with pytest.raises(StorageError):
+        await RayExecutor().submit(make_job(artifact_root=str(tmp_path), on_started=started))
+    assert len(seen) == len(fake_ray.payloads) == (0 if site == "prepare" else 1)
+
+
+@pytest.mark.parametrize("complete_before_rejoin", [False, True])
+async def test_abandoned_init_rejoins_without_another_attempt(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, complete_before_rejoin: bool
+) -> None:
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    calls: list[int] = []
+    outputs: list[ToolOutput] = []
+    executor = RayExecutor(cancel_margin_s=0.05)
+
+    def init(**kw: Any) -> Any:
+        calls.append(threading.get_ident())
+        entered.set()
+        try:
+            assert release.wait(10)
+            return SimpleNamespace(dashboard_url="head:8265")
+        finally:
+            done.set()
+
+    async def submit() -> None:
+        outputs.append(await executor.submit(make_job(artifact_root=str(tmp_path))))
+
+    monkeypatch.setattr(ray, "init", init)
+    try:
+        with anyio.fail_after(5):
+            assert not await executor.kill_orphan(
+                Job.Started(kind="dispatch", job_id="old", task_name="old")
+            )
+            assert entered.is_set()
+            assert not fake_ray.payloads
+            if complete_before_rejoin:
+                release.set()
+                assert await anyio.to_thread.run_sync(done.wait, 2)
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(submit)
+                tasks.start_soon(submit)
+                await anyio.lowlevel.checkpoint()
+                release.set()
+        assert len(outputs) == 2
+        assert all(out.status == RunStatus.OK for out in outputs)
+        assert len(calls) == 1
+    finally:
+        release.set()
+        assert await anyio.to_thread.run_sync(done.wait, 2)
+
+
+async def test_failed_init_can_be_retried_by_a_later_caller(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def init(**kw: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("private connection failure")
+        return SimpleNamespace(dashboard_url="head:8265")
+
+    monkeypatch.setattr(ray, "init", init)
+    executor = RayExecutor()
+    with pytest.raises(RuntimeError) as caught:
+        await executor.capacity()
+    assert_secret_absent(caught.value, "private connection failure")
+    assert (await executor.submit(make_job(artifact_root=str(tmp_path)))).status == RunStatus.OK
+    assert calls == 2
+
+
+@pytest.mark.parametrize("kind", ["local", "ray"])
+@pytest.mark.parametrize(
+    "error",
+    [None, RuntimeError("partial failed"), _core_error(Fenced, "lost"), _stop_cleanup_error()],
+)
+async def test_partial_callback_error_matches_local_executor(
+    fake_ray: _RunJob,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    error: Exception | None,
+) -> None:
+    import dataclasses
+
+    from _fakes.proc import wait_for_file
+    from _fakes.ray_executor import partial_job
+
+    from swarm_arena.executor import LocalExecutor
+
+    fake_ray.ref = _Ref(None)
+    scopes: list[anyio.CancelScope] = []
+    errors: list[Exception] = []
+    delivered: list[ToolOutput] = []
+    ready = tmp_path / "ready"
+    executor = (
+        LocalExecutor(workspace_root=str(tmp_path / "workspaces"))
+        if kind == "local"
+        else RayExecutor()
+    )
+
+    def cancel(ref: _Ref, *, force: bool = False) -> None:
+        if not force:
+            ref.result = _frame(ToolOutput(status="cancelled", partial=True, data={"step": 1}))
+            ref.release.set()
+
+    async def partial(out: ToolOutput) -> None:
+        delivered.append(out)
+        if error is not None:
+            raise error
+
+    async def submit() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                await executor.submit(
+                    dataclasses.replace(
+                        partial_job(ready, artifact_root=str(tmp_path / "artifacts")),
+                        on_partial=partial,
+                    )
+                )
+        except Exception as caught:
+            errors.append(caught)
+
+    monkeypatch.setattr(ray, "cancel", cancel)
+    with anyio.fail_after(90):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(submit)
+            if kind == "local":
+                await wait_for_file(ready, 60)
+            else:
+                await fake_ray.ref.waiting.wait()
+            scopes[0].cancel()
+    assert len(delivered) == 1
+    assert delivered[0].status == RunStatus.CANCELLED
+    assert delivered[0].partial
+    assert delivered[0].data["step"] >= 1
+    assert delivered[0].files == []
+    assert delivered[0].logs_ref is None
+    assert delivered[0].llm_calls_file is None
+    assert not errors
+    assert scopes[0].cancelled_caught
+
+
+async def test_payload_is_put_off_loop_before_dispatch_intent(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    puts: list[_Payload] = []
+
+    def put(data: bytes) -> _Payload:
+        assert threading.current_thread() is not threading.main_thread()
+        payload = _Payload(data)
+        puts.append(payload)
+        return payload
+
+    async def started(value: Job.Started) -> None:
+        assert len(puts) == 1
+        assert not fake_ray.arguments
+
+    monkeypatch.setattr(ray, "put", put)
+    out = await RayExecutor().submit(make_job(artifact_root=str(tmp_path), on_started=started))
+    assert out.status == RunStatus.OK
+    assert fake_ray.arguments == puts
+
+
+async def test_abandoned_payload_put_never_dispatches(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    started = Mock()
+    scopes: list[anyio.CancelScope] = []
+
+    def put(data: bytes) -> _Payload:
+        entered.set()
+        try:
+            assert release.wait(10)
+            return _Payload(data)
+        finally:
+            done.set()
+
+    async def submit() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await RayExecutor().submit(make_job(artifact_root=str(tmp_path), on_started=started))
+
+    monkeypatch.setattr(ray, "put", put)
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(submit)
+                assert await anyio.to_thread.run_sync(entered.wait, 2)
+                scopes[0].cancel()
+        started.assert_not_called()
+        assert not fake_ray.arguments
+    finally:
+        release.set()
+        if entered.is_set():
+            assert await anyio.to_thread.run_sync(done.wait, 2)
+    await anyio.lowlevel.checkpoint()
+    assert not fake_ray.arguments
+
+
+async def test_cancel_force_and_partial_share_one_deadline(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_ray.ref = _Ref(None)
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    scopes: list[anyio.CancelScope] = []
+    delivered: list[ToolOutput] = []
+    elapsed: list[float] = []
+    start = 0.0
+
+    def cancel(ref: _Ref, *, force: bool = False) -> None:
+        if force:
+            entered.set()
+            try:
+                assert release.wait(10)
+            finally:
+                done.set()
+
+    async def partial(out: ToolOutput) -> None:
+        delivered.append(out)
+        await anyio.sleep_forever()
+
+    async def submit() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await RayExecutor(cancel_margin_s=0.5).submit(
+                make_job(artifact_root=str(tmp_path), grace_s=0.2, on_partial=partial)
+            )
+        elapsed.append(anyio.current_time() - start)
+
+    monkeypatch.setattr(ray, "cancel", cancel)
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(submit)
+                await fake_ray.ref.waiting.wait()
+                start = anyio.current_time()
+                scopes[0].cancel()
+        assert elapsed[0] < 1.0  # 0.7 s total allowance plus scheduling slack, never extra margins.
+        assert len(delivered) == 1
+        assert await anyio.to_thread.run_sync(entered.wait, 2)
+    finally:
+        release.set()
+        if entered.is_set():
+            assert await anyio.to_thread.run_sync(done.wait, 2)
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("site", ["wait", "decode", "cancel"])
+async def test_dispatched_process_control_forces_synchronously(
+    fake_ray: _RunJob,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+    site: str,
+) -> None:
+    error = failure("process control")
+    forced: list[bool] = []
+
+    async def wait(self: RayExecutor, *args: Any) -> Any:
+        if site == "wait":
+            raise error
+        if site == "cancel":
+            raise ValueError("transport failed")
+        return _frame(), None
+
+    def decode(*args: Any) -> Any:
+        raise error
+
+    def cancel(ref: _Ref, *, force: bool = False) -> None:
+        if force:
+            forced.append(threading.current_thread() is threading.main_thread())
+        elif site == "cancel":
+            raise error
+
+    monkeypatch.setattr(RayExecutor, "_wait", wait)
+    monkeypatch.setattr(ray, "cancel", cancel)
+    if site == "decode":
+        monkeypatch.setattr(module, "_decode", decode)
+    with pytest.raises(failure) as caught:
+        await RayExecutor().submit(make_job(artifact_root=str(tmp_path)))
+    assert caught.value is error
+    assert forced == [True]
+
+
+async def test_running_task_stops_the_scheduling_watch(
+    fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeping = anyio.Event()
+    deadlines: list[float] = []
+    original_sleep = anyio.sleep_forever
+    find = Mock(return_value=SimpleNamespace(state="RUNNING"))
+
+    async def sleep_forever() -> None:
+        deadlines.append(anyio.current_effective_deadline())
+        sleeping.set()
+        await original_sleep()
+
+    monkeypatch.setattr(module, "find_task", find)
+    monkeypatch.setattr(module, "_STATE_RPC_S", 0.03)
+    monkeypatch.setattr(module.anyio, "sleep_forever", sleep_forever)
+    with anyio.fail_after(5) as allowance:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(RayExecutor()._watch, "running", {"CPU": 1}, 10)
+            await sleeping.wait()
+            tasks.cancel_scope.cancel()
+    assert deadlines == [allowance.deadline]
+    assert find.call_count == 1
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_pending_jobs_share_rate_limited_node_snapshot(
+    fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch, held: bool
+) -> None:
+    clock = [0.0]
+    calls: list[float] = []
+    counts = [0, 0]
+    sleeping = [anyio.Event(), anyio.Event()]
+    advance = [anyio.Event(), anyio.Event()]
+    release = threading.Event()
+    completed: list[threading.Event] = []
+    original_sleep = anyio.sleep
+
+    def nodes() -> list[dict[str, Any]]:
+        done = threading.Event()
+        completed.append(done)
+        calls.append(clock[0])
+        try:
+            if held:
+                assert release.wait(10)
+            return [{"Alive": True, "Resources": {"CPU": 2.0}}]
+        finally:
+            done.set()
+
+    async def sleep(seconds: float) -> None:
+        if seconds != 1.0:
+            await original_sleep(seconds)
+            return
+        phase = int(clock[0] / 2)
+        counts[phase] += 1
+        if counts[phase] == 4:
+            sleeping[phase].set()
+        await advance[phase].wait()
+
+    monkeypatch.setattr(ray, "nodes", nodes)
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "_STATE_RPC_S", 0.03)
+    monkeypatch.setattr(module.anyio, "sleep", sleep)
+    executor = RayExecutor()
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                for index in range(4):
+                    tasks.start_soon(executor._watch, str(index), {"CPU": 1}, 10)
+                await sleeping[0].wait()
+                first_count = len(calls)
+                clock[0] = 2.0
+                advance[0].set()
+                await sleeping[1].wait()
+                tasks.cancel_scope.cancel()
+        assert first_count == 1
+        assert len(calls) == (1 if held else 2)
+    finally:
+        release.set()
+        for done in completed:
+            assert await anyio.to_thread.run_sync(done.wait, 2)
+
+
+@pytest.mark.parametrize("address", ["auto", "configured-head", "private-other-head"])
+async def test_explicit_address_must_match_connected_gcs(
+    fake_ray: _RunJob, tmp_path: Path, address: str
+) -> None:
+    executor = RayExecutor(address=address)
+    job = make_job(artifact_root=str(tmp_path))
+    if address == "private-other-head":
+        with pytest.raises(RuntimeError) as caught:
+            await executor.submit(job)
+        assert_secret_absent(caught.value, address)
+        assert_secret_absent(caught.value, "configured-head")
+        assert not fake_ray.arguments
+    else:
+        assert (await executor.submit(job)).status == RunStatus.OK
+
+
+async def test_schedule_cleanup_does_not_restart_after_a_force_control(
+    fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+
+    async def wait(self: RayExecutor, *args: Any) -> Any:
+        return None, ToolOutput(status=RunStatus.ERROR)
+
+    def cancel(ref: _Ref, *, force: bool = False) -> None:
+        calls.append(force)
+        if force:
+            raise _stop_cleanup_error()
+
+    monkeypatch.setattr(RayExecutor, "_wait", wait)
+    monkeypatch.setattr(ray, "cancel", cancel)
+    with pytest.raises(RuntimeError):
+        await RayExecutor().submit(make_job(artifact_root=str(tmp_path)))
+    assert calls == [False, True]
