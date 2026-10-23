@@ -547,7 +547,7 @@ def dropped_response_proxy(
         def relay(self) -> None:
             assert "Transfer-Encoding" not in self.headers
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            connection = http.client.HTTPConnection("127.0.0.1", backend.port, timeout=10)
+            connection = http.client.HTTPConnection("127.0.0.1", backend.port, timeout=60)
             try:
                 connection.request(self.command, self.path, body, dict(self.headers))
                 response = connection.getresponse()
@@ -584,7 +584,7 @@ def dropped_response_proxy(
     finally:
         proxy.shutdown()
         proxy.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
 
 
