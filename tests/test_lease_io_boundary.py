@@ -8,9 +8,6 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1] / "src" / "swarm_arena"
 # Exact module, enclosing function, and worker callback; no module-wide escapes.
 _ALLOW = {
-    ("ray/_executor.py", "RayExecutor._init", "self._connect"): (
-        "Abandonable Ray initialization, under the caller allowance; no storage publication."
-    ),
     ("_engine/run.py", "RunRunner.run", "_promote"): "Artifact promotion precedes acquisition.",
     ("_engine/run.py", "_open_board", "board.open"): "Contained daemon under owner supervision.",
     ("_engine/run.py", "_close_board", "board.close"): "Contained daemon with bounded cleanup.",
@@ -393,5 +390,5 @@ def test_guard_scans_ray_executor_publication(monkeypatch: pytest.MonkeyPatch) -
         return unsafe if path == target else original(path, encoding=encoding, errors=errors)
 
     monkeypatch.setattr(Path, "read_text", read_text)
-    with pytest.raises(AssertionError, match=r"ray/_executor.py:\d+: RayExecutor.submit"):
+    with pytest.raises(AssertionError, match=r"ray/_executor.py:\d+: RayExecutor._submitted"):
         test_lease_owned_modules_use_abandonable_workers()
