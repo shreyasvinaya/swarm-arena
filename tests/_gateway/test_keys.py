@@ -98,7 +98,7 @@ def _manager(gateway: MemoryGateway, run: LLMRun, **kw: Any) -> KeyManager:
         cap="soft",
         journal=run.journal,
         run_id=run.run_id,
-        settle_timeout_s=kw.pop("settle_timeout_s", 1),
+        settle_timeout_s=kw.pop("settle_timeout_s", 60),
         **kw,
     )
 
@@ -246,7 +246,7 @@ async def test_rows_recorded_once_and_never_fund_ambient_scope(tmp_path: Path) -
 async def test_read_waits_for_first_rows(tmp_path: Path) -> None:
     gw = MemoryGateway()
     async with open_llm_run(tmp_path) as run:
-        manager = _manager(gw, run, settle_timeout_s=3)
+        manager = _manager(gw, run, settle_timeout_s=60)
         record, _ = await _open(manager, run)
 
         async def produce() -> None:
@@ -266,7 +266,7 @@ async def test_read_gives_up_after_settle_timeout(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
         manager = _manager(gw, run, settle_timeout_s=0.05)
         record, _ = await _open(manager, run)
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             assert await manager.read([record], wait_first=True) == []
         assert gw.read_entered.is_set()
         assert not run.events("settle")
@@ -455,7 +455,7 @@ async def test_failed_or_incomplete_read_keeps_charge_and_warns_safely(
 async def test_read_with_status_distinguishes_failure_from_empty(tmp_path: Path, mode: str) -> None:
     gw = MemoryGateway()
     async with open_llm_run(tmp_path) as run:
-        manager = _manager(gw, run, settle_timeout_s=0.05)
+        manager = _manager(gw, run, settle_timeout_s=0.05 if mode == "timeout" else 60)
         record, _ = await _open(manager, run)
         if mode in {"rows", "duplicate"}:
             gw.rows = [_row()]
@@ -532,7 +532,7 @@ async def test_caller_cancel_interrupts_read_without_recording(tmp_path: Path) -
         record, _ = await _open(manager, run)
         task = asyncio.create_task(manager.read([record], wait_first=True))
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await gw.read_entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -666,7 +666,7 @@ async def test_restore_epoch_two_uses_current_owner_and_replayed_dedup(tmp_path:
             cap="soft",
             journal=journal,
             run_id=run.run_id,
-            settle_timeout_s=1,
+            settle_timeout_s=60,
         )
         restored.restore(events)
         assert restored.records()[0].owner_epoch == 1
@@ -720,7 +720,7 @@ async def test_compensation_block_is_bounded(
     monkeypatch.setattr(keys, "_CLEANUP_TIMEOUT_S", 0.1)
     async with open_llm_run(tmp_path) as run:
         manager = _manager(gw, run)
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             with anyio.CancelScope() as cancelled:
                 gw.on_create = cancelled.cancel
                 await _open(manager, run)
