@@ -28,23 +28,28 @@ def _leader_missing(pid: int) -> bool:
 def reap_children(children: list[tuple[subprocess.Popen[Any], bool, str | None]]) -> list[str]:
     """Reap captured children, checking leader identity and liveness before group kills.
 
-    A reaped leader with no current identity can still have live descendants;
-    their group retains its id until its last member exits. A replacement
-    leader or an empty group is never signalled. An unavailable start-time
-    lookup alone is not evidence that the leader is missing.
+    An unreaped leader is signalled directly: its pid, and so its group id,
+    cannot be reused while the Popen holds it. A reaped leader with no current
+    identity can still have live descendants; their group retains its id until
+    its last member exits. A replacement leader or an empty group is never
+    signalled. An unavailable start-time lookup alone is not evidence that the
+    leader is missing.
     """
     errors: list[str] = []
     for process, own_group, start_time in children:
         try:
             with suppress(ProcessLookupError, PermissionError):
-                if own_group:
+                if own_group and process.poll() is None:
+                    # An unreaped leader keeps its pid, so its group id cannot
+                    # have been reused: no identity lookup is needed.
+                    if group_has_live_member(process.pid):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                elif own_group:
                     current = process_start_time(process.pid)
                     same_leader = start_time is not None and current == start_time
-                    leader_gone = (
-                        current is None
-                        and process.poll() is not None
-                        and _leader_missing(process.pid)
-                    )
+                    leader_gone = current is None and _leader_missing(process.pid)
                     if (same_leader or leader_gone) and group_has_live_member(process.pid):
                         os.killpg(process.pid, signal.SIGKILL)
                 elif process.poll() is None:

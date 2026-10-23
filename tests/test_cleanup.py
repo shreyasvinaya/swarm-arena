@@ -320,3 +320,35 @@ def test_owned_group_cleanup_checks_identity_and_liveness(
                     child.kill()
                 child.wait(timeout=60)
             owner.close()
+
+
+def test_unreaped_own_group_child_is_killed_when_identity_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import signal
+    import subprocess
+    import sys
+    from collections.abc import Generator
+    from inspect import unwrap
+    from typing import cast
+
+    from _fakes import process_cleanup
+
+    with monkeypatch.context() as patch:
+        patch.setattr(process_cleanup, "process_start_time", lambda pid: None, raising=False)
+        owner = cast(Generator[None, None, None], unwrap(process_cleanup.owned_processes)(patch))
+        next(owner)
+        child = None
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+            )
+            with pytest.raises(AssertionError, match="left an owned child alive"):
+                next(owner)
+            assert child.poll() == -signal.SIGKILL
+        finally:
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=60)
+            owner.close()
