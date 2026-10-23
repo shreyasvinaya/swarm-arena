@@ -77,6 +77,20 @@ uv add "swarm-arena[cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
 uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"
 ```
 
+## Run on a Ray cluster
+
+Install the current development source and select the executor in `run.toml`:
+
+```sh
+uv add 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena'
+# run.toml: executor = { path = "swarm_arena.ray:RayExecutor" }
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+uv run swarm-arena submit --address http://<head>:8265 --working-dir . --yes run.toml plan.toml
+```
+
+Provision workers, module paths and authentication as described in
+[Running on Ray](docs/running-on-ray.md), including the dashboard requirement for recovery.
+
 ## Test one connector
 
 Install from a clone (Python 3.11+, POSIX). In a fresh directory outside the clone,

@@ -14,8 +14,54 @@ Intel macOS has no wheel for this version. macOS CI checks the core package;
 the dedicated Linux Ray jobs check the optional runtime.
 
 Set `RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` before starting a Ray driver with `uv run`
-to prevent Ray from automatically packaging the driver's uv environment.
+and before importing Ray. Ray's uv runtime-env hook otherwise packages the
+driver's project and runs workers through uv, which can create a different
+environment on the worker. Disable it in the launching shell, rather than in
+per-task `runtime_env`; provision the worker dependencies explicitly.
 Cluster authentication and worker dependency provisioning are separate setup steps.
+
+## Worker environments and nodes
+
+Every worker needs `swarm-arena[ray]`, the connector package, and the tool's
+own environment. Bake these into the worker image or install them on each VM.
+The tool's configured Python interpreter runs as a **subprocess** of the Ray
+worker; `runtime_env.py_executable` is not used. Its interpreter path and
+dependencies must exist on every eligible node.
+
+A `FunctionTool` module beside the plan file, or available on the driver's
+`sys.path`, contributes an import-root **path**, not a code upload. That exact
+path must exist on every eligible worker: on one host, on a shared filesystem,
+or at the same location in each image. Otherwise install the module in the
+worker image and make its driver-resolved import root available there too.
+Uploading a Ray Job's `working_dir` does not by itself establish that an
+arbitrary absolute driver import root exists on every node.
+
+With dependencies and authentication provisioned, start a head and join VMs:
+
+```sh
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+uv run ray start --head --num-cpus=2 --include-dashboard=true --disable-usage-stats
+# On each worker VM (replace <head> with the head node's hostname):
+uv run ray start --address=<head>:6379 --disable-usage-stats
+```
+
+Ray 2.59 enables token authentication by default for local clusters. Local
+same-user discovery can read Ray's token file; a remote driver needs externally
+provisioned `RAY_AUTH_TOKEN` and `RAY_AUTH_MODE=token`. Provision matching
+authentication for joining nodes and HTTP Jobs clients as well. Keep those
+values out of uploaded files and `runtime_env`.
+
+Set tool secrets in each eligible node's environment, or provide
+`secrets.file` at the configured path on each node. Restrict secret-using jobs
+to nodes carrying a named resource:
+
+```sh
+uv run ray start --address=<head>:6379 --resources='{"llm_keys": 1}' --disable-usage-stats
+```
+
+Select `RayExecutor(secret_resource="llm_keys")`, or set
+`executor.config.secret_resource = "llm_keys"` in the configuration below.
+This is a scheduling convention: provision the keys on those nodes separately.
 
 ## Running the driver as a Ray Job
 
@@ -207,3 +253,29 @@ plain-HTTP dashboard reachable at `RayContext.dashboard_url`. HTTPS, proxied or
 `RAY_OVERRIDE_DASHBOARD_URL` dashboards make lost runs stay unconfirmed; their
 spend stays estimated.** No environment discovery fallback is used for state
 lookups.
+
+On resume, the committed `tool_dispatch` event supplies the task name and the
+original driver's Ray job ID. The resumed driver queries the connected
+cluster's State API for that identity and makes one bounded orphan-recovery
+attempt per unfinished dispatch. Ray's owner fate sharing cleans up tasks of
+the dead driver; resume does not kill an arbitrary matching task. Missing
+rows do not prove that no task ran. Recovery records a lost run with
+`confirmed_dead=false` when it cannot confirm both task termination and worker
+death. Keep the dashboard **and its State API** enabled and reachable from
+the driver; a disabled dashboard also leaves recovery unconfirmed.
+
+## What the integration tests establish
+
+The Ray conformance tests compare the Rosenbrock function with local execution
+and exercise snapshotted goal/tool inputs, inherited parent overlays, live
+edits, declared output files and both logs through the object store. A local
+test fixture denies worker reads of the driver's artifact root and driver
+reads of worker temporary workspaces; results are read with the public kit
+readers after execution. The shipped Rosenbrock plan checks dispatch events,
+two finalists and committed candidate logs. Soft cancellation checks the
+data-only partial contract, without new artifact publication.
+
+These are local-cluster tests with explicit Python filesystem-access denial.
+They do not establish multi-node deployment, remote token provisioning,
+worker-image installation or real S3 acceptance. Verify those paths in your
+deployment environment.
