@@ -214,7 +214,17 @@ def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
     result = learning.model_dump(mode="json")
     evidence = []
     for candidate_id in learning.evidence:
-        candidate = ctx.get_candidate(candidate_id)
+        try:
+            candidate = ctx.get_candidate(candidate_id)
+        except SoftError as error:
+            known = _rebuild_core_signal(error)
+            if (
+                not isinstance(known, SoftError)
+                or str(known) != f"unknown candidate: {candidate_id}"
+            ):
+                raise
+            evidence.append({"id": candidate_id, "scores": [], "error": "not in this view"})
+            continue
         scores = ctx.scores_of(candidate_id)
         # ToolOutput has no error field. Core execution diagnostics are carried
         # by Candidate.warnings; overlay and past-run hints are not errors.

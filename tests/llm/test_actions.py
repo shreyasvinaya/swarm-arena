@@ -4,16 +4,22 @@ import asyncio
 import json
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from threading import Event, get_ident
 from typing import Any, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
+
+pytest.importorskip("agents")
+
 from _agent.conftest import ctx_env as ctx_env
 from _agent.conftest import rt_env as rt_env
 from _fakes.agent_ctx import FakeAgentContext
 from _fakes.board import score
 from _fakes.engine import CtxEnv
+from _fakes.journals import FakeRun
 from _fakes.pr1_r5_ids import hostile
 from _fakes.secrecy import assert_secret_absent
 from agents import Agent, FunctionTool, ModelResponse, Runner
@@ -25,9 +31,11 @@ from agents.usage import Usage
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field
 
-from swarm_arena import Limits, ScriptTool
+from swarm_arena import AgentSpec, Limits, Ref, RoundSpec, ScriptTool, TeamSpec
 from swarm_arena._agent.context import _prepare_metadata
+from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.digest import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
+from swarm_arena._board.pointers import RunPointer, write_pointer
 from swarm_arena._errors import (
     Fenced,
     SoftError,
@@ -36,6 +44,7 @@ from swarm_arena._errors import (
     _stop_cleanup_error,
 )
 from swarm_arena._model.base import FrozenModel, JsonValue
+from swarm_arena._store.base import open_store
 from swarm_arena.board import Row
 from swarm_arena.llm._actions import MAX_RESULT_CHARS, build_tools, candidate_view
 from swarm_arena.llm._hooks import _prepare, _unwrap_control
@@ -509,6 +518,127 @@ async def test_read_learning_gives_each_evidence_score_or_error() -> None:
         {"id": "c-2", "scores": [], "error": "tool error: RuntimeError"},
         {"id": "c-3", "scores": [], "error": None},
     ]
+
+
+@pytest.mark.parametrize("max_reads", [2, 20])
+async def test_read_learning_keeps_cross_goal_text_in_a_real_fixed_view(
+    tmp_path: Path, max_reads: int
+) -> None:
+    current = FakeRun(str(tmp_path / "runs"), "current", goal_id="new-goal")
+    current.commit(current.plan())
+    prior = FakeRun(current.run_root, "prior", goal_id="old-goal")
+    text = "Use slow cooling for lower viscosity."
+    old = prior.candidate("old-candidate")
+    old.payload["candidate"]["output"]["data"] = {"private": "out-of-view-candidate-secret"}
+    prior.commit(
+        prior.plan(),
+        old,
+        prior.score("old-score", "old-candidate", 1),
+        prior.learning("L-shared", "viscosity", text=text, evidence=["old-candidate"]),
+    )
+    arena_root = str(tmp_path / "arena")
+    board = ArenaBoard(arena_root=arena_root, cache_dir=str(tmp_path / "cache"))
+    try:
+        write_pointer(
+            open_store(arena_root),
+            "toy",
+            RunPointer(run_id=prior.run_id, run_root=prior.run_root),
+        )
+        board.open(current.run_id, current.run_root, ["toy"])
+        view = board.snapshot(current.goal.key(), board.frontier())
+        assert view.search_learnings("toy", "viscosity", goal=current.goal.key()) == []
+        assert view.get_learning("L-shared").text == text
+        with pytest.raises(KeyError):
+            view.get_candidate("old-candidate")
+
+        # Refreshing the board cannot widen the capability already given to the agent.
+        prior.commit(prior.learning("L-later", "viscosity", text="later-learning-text"))
+        board.frontier()
+        tool = ScriptTool(command=["echo"])
+        spec = AgentSpec(
+            name="agent",
+            rationale="Explore",
+            tool=Ref.of(tool),
+            manager=Ref(path="example:Manager"),
+        )
+        runtime = Mock(
+            goal=current.goal,
+            goal_id=current.goal.id,
+            goal_key=current.goal.key(),
+            address="new-goal/team/agent",
+            team=TeamSpec(name="team", rationale="Explore", agents=[spec]),
+            round=1,
+            round_spec=RoundSpec(),
+            digest="",
+            notes="",
+            resumed=(),
+            checks=[],
+            tool=tool,
+            own=[],
+            limits=Limits(max_board_reads_per_round=max_reads),
+            watchdog=Mock(limit=None),
+            counters=Mock(turns=0, board_reads=0, learnings=0),
+            part=None,
+            rankings={"": "j"},
+            sibling_views={},
+            view=view,
+            repeats=Mock(run_id=current.run_id),
+        )
+        runtime.spec = spec
+        tools, deps = await _prepare(partial(tool_set, AgentContext(runtime)))
+        found = decoded(
+            await invoke(
+                tools, deps, "search_learnings", {"query": "viscosity", "scope": "namespace"}
+            )
+        )
+        assert [item["id"] for item in found] == ["L-shared"]
+        raw = await invoke(tools, deps, "read_learning", {"id": "L-shared"})
+        result = decoded(raw)
+        if max_reads == 2:
+            assert result == {"error": "max_board_reads_per_round reached"}
+            return
+        assert result["text"] == text
+        assert result["evidence"] == [
+            {"id": "old-candidate", "scores": [], "error": "not in this view"}
+        ]
+        assert raw.startswith(UNTRUSTED_OPEN)
+        assert raw.endswith(UNTRUSTED_CLOSE)
+        assert "out-of-view-candidate-secret" not in raw
+        assert (runtime.counters.turns, runtime.counters.board_reads) == (3, 3)
+        assert decoded(await invoke(tools, deps, "read_learning", {"id": "L-later"})) == {
+            "error": "unknown learning: L-later"
+        }
+        assert decoded(await invoke(tools, deps, "get_candidate", {"id": "old-candidate"})) == {
+            "error": "unknown candidate: old-candidate"
+        }
+    finally:
+        board.close()
+
+
+@pytest.mark.parametrize("kind", ["soft", "unregistered", "limit", "terminal", "fence"])
+async def test_learning_evidence_does_not_hide_other_read_failures(kind: str) -> None:
+    error = {
+        "soft": _core_error(SoftError, "max_board_reads_per_round reached"),
+        "unregistered": SoftError("unknown candidate: c-1"),
+        "limit": _core_error(LimitReached, "stop", "the round is stopping"),
+        "terminal": _stop_cleanup_error(),
+        "fence": _core_error(Fenced, "run ownership lost"),
+    }[kind]
+    fake = fake_context(raise_on={"get_candidate": error})
+    learning = await fake.post_learning("Hint", "permitted-learning-text", ["c-1"])
+    tools, deps = tool_set(fake)
+    if kind in {"limit", "terminal", "fence"}:
+        with pytest.raises(AgentsException) as caught:
+            await invoke(tools, deps, "read_learning", {"id": learning.id})
+        assert type(_unwrap_control(caught.value)) is type(error)
+        assert _is_core_control(_unwrap_control(caught.value))
+    else:
+        result = decoded(await invoke(tools, deps, "read_learning", {"id": learning.id}))
+        assert result == {
+            "error": "max_board_reads_per_round reached"
+            if kind == "soft"
+            else "internal error in read_learning: SoftError"
+        }
 
 
 @pytest.mark.parametrize("text", ["x", '"\\\n', "🙂", UNTRUSTED_CLOSE])

@@ -204,7 +204,12 @@ Genuine caller cancellation retains highest precedence. See the [LLM API](api/ll
 
 An agent sees the board at the round's recorded frontier plus its own new work.
 `best(part=...)` reads the agent's own group or an explicitly declared sibling
-group. Candidate and learning reads automatically populate `read_ids` provenance for subsequent tool runs. Converge
+group. `search_learnings(scope="namespace")` can find learnings from other goals
+and earlier runs. The SDK `read_learning` action retains their full text; evidence
+outside the fixed candidate view includes only its id, an empty scores list and
+the value-free error marker `not in this view`. Visible evidence retains its
+scores or tool error. Candidate access and feedback permissions still apply.
+Candidate and learning reads automatically populate `read_ids` provenance for subsequent tool runs. Converge
 agents get read-only `seed_parents`, prepended to their explicit parents. Check
 feedback permissions still apply to those parents. See the
 [manager API](api/manager.md) and [scoring guide](scoring-and-review.md).
