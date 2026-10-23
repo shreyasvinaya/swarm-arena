@@ -28,7 +28,7 @@ from swarm_arena._errors import (
     _core_error,
     _exception_type_name,
 )
-from swarm_arena._exec.executor import Executor
+from swarm_arena._exec.executor import Executor, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -631,69 +631,70 @@ async def resume_run(
     >>> runner = await resume_run(config, "run-id", force=False, replanner=None)  # doctest: +SKIP
     >>> results = await runner.run()  # doctest: +SKIP
     """
-    await _check_storage(config)
-    run_module._require_asyncio()
-    store = open_store(config.run_root).child(run_id)
+    with schedule_timeout_scope(config.schedule_timeout_s):
+        await _check_storage(config)
+        run_module._require_asyncio()
+        store = open_store(config.run_root).child(run_id)
 
-    clock: RunClock | None = None
-    stops = StopState()
-    validated_head: Head | None = None
-    model_warnings: list[str] = []
+        clock: RunClock | None = None
+        stops = StopState()
+        validated_head: Head | None = None
+        model_warnings: list[str] = []
 
-    def validate(doc: OwnerDoc) -> None:
-        nonlocal clock, validated_head
-        _, state = _read(store, doc)
-        _check(state, config)
-        _restore_import_paths(state)
-        if clock is None:
-            clock = RunClock(state.run_elapsed_s)
-        else:
-            clock._rebase(state.run_elapsed_s)
-        validated_head = doc.head
+        def validate(doc: OwnerDoc) -> None:
+            nonlocal clock, validated_head
+            _, state = _read(store, doc)
+            _check(state, config)
+            _restore_import_paths(state)
+            if clock is None:
+                clock = RunClock(state.run_elapsed_s)
+            else:
+                clock._rebase(state.run_elapsed_s)
+            validated_head = doc.head
 
-    async def check_startup_models() -> None:
-        nonlocal model_warnings
-        model_warnings = await run_module._check_startup_models(config, replanner)
+        async def check_startup_models() -> None:
+            nonlocal model_warnings
+            model_warnings = await run_module._check_startup_models(config, replanner)
 
-    lease = await _take_over(
-        config,
-        run_id,
-        store,
-        force=force,
-        validate=validate,
-        before_acquire=check_startup_models,
-        clock=lambda: clock,
-        stops=stops,
-    )
-    assert clock is not None
-    assert validated_head is not None
-    services = _ResumeServices(
-        config,
-        run_id,
-        store,
-        lease,
-        force=force,
-        clock=clock,
-        validated_head=validated_head,
-        model_warnings=model_warnings,
-        stops=stops,
-    )
-    services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
-    try:
-        await services.ready.wait()
-        if services.failure is not None:
-            await services._aclose()
-        assert services.resumed is not None
-        state = services.resumed.state
-        return run_module.RunRunner(
+        lease = await _take_over(
             config,
-            [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
-            run_id=run_id,
-            approve=None,
-            replanner=replanner,
-            resumed=services.resumed,
+            run_id,
+            store,
+            force=force,
+            validate=validate,
+            before_acquire=check_startup_models,
+            clock=lambda: clock,
+            stops=stops,
         )
-    except BaseException:
-        if not services.closed:
-            await services._aclose(failed=True)
-        raise
+        assert clock is not None
+        assert validated_head is not None
+        services = _ResumeServices(
+            config,
+            run_id,
+            store,
+            lease,
+            force=force,
+            clock=clock,
+            validated_head=validated_head,
+            model_warnings=model_warnings,
+            stops=stops,
+        )
+        services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
+        try:
+            await services.ready.wait()
+            if services.failure is not None:
+                await services._aclose()
+            assert services.resumed is not None
+            state = services.resumed.state
+            return run_module.RunRunner(
+                config,
+                [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
+                run_id=run_id,
+                approve=None,
+                replanner=replanner,
+                resumed=services.resumed,
+            )
+        except BaseException:
+            if not services.closed:
+                await services._aclose(failed=True)
+            raise

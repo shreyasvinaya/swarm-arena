@@ -14,4 +14,5 @@ config
 protocol
 testing
 llm
+ray
 ```

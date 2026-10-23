@@ -90,3 +90,92 @@ the submitting client and the in-cluster driver separately; local discovery
 does not establish remote access. Keep tokens out of job metadata and uploaded
 files. Set `RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` in the launching environment
 before Ray initialization to retain explicit packaging control.
+
+## The Ray executor
+
+Select the executor in `run.toml`:
+
+```toml
+schedule_timeout_s = 600.0
+
+[executor]
+path = "swarm_arena.ray:RayExecutor"
+
+[executor.config]
+address = "auto"
+poll_s = 0.2
+cancel_margin_s = 10.0
+object_store_cap_mib = 256
+# secret_resource = "llm_keys"
+```
+
+`RayExecutor()` validates settings without I/O. Its first operation connects to
+an existing cluster in a worker thread. `address` chooses the cluster;
+`ray://` addresses are refused. `poll_s` controls worker subprocess polling.
+`cancel_margin_s` adds time after the job's grace period for soft cancellation
+and bounds recovery operations, including connection and lock waits. Both
+intervals must be finite and positive. An abandoned connection attempt is not
+retried by that executor; create a new executor if a connection failed or its
+caller stopped waiting. `aclose()` leaves the shared Ray connection open and
+never calls `ray.shutdown()`.
+
+Each job gets one task named with its job ID. When provided, `on_started`
+receives the dispatch intent and original Ray driver job ID before submission.
+A failed callback prevents submission. Tasks are not resubmitted after a Ray
+error. Out-of-memory failures become `oom`; other Ray failures become `error`
+with type-only diagnostics.
+
+Resources map directly to logical Ray requests: `cpus` to `num_cpus`, `gpus`
+to `num_gpus`, `memory_gib` to integer bytes, and `custom` to named resources.
+With `secret_resource = "llm_keys"`, jobs needing node/file secrets also request
+one `llm_keys` resource. Names in `drop_env` and names already supplied by
+explicit driver environment or secret overlays do not require that resource.
+Secret values never enter task options or `runtime_env`. Driver-supplied
+secrets travel only inside the task payload; Ray may spill that payload from
+its object store to local disk. Provision and protect cluster storage accordingly.
+
+For an `s3://` artifact root, workers read and write artifacts by SHA-256 against
+the shared backend. For a local root, the driver sends staged blobs through
+Ray's object store and stores hash-checked result blobs in its own artifact
+store. Each upload is supervised separately; cancelled publication cannot start
+the next upload. Input and output blobs each have a **256 MiB default cap**.
+`object_store_cap_mib` accepts integers from 1 through 1024; use S3 for larger
+transport. Log blobs count toward the output cap. Workers need access to their
+connector packages and to any FunctionTool module roots resolved by the driver.
+A local test with shared paths does not establish that those paths exist on a
+remote worker node.
+
+`schedule_timeout_s` measures continuous resource infeasibility while a task is
+pending or not yet visible in state. Every second, the executor compares its
+request with each alive node's **total** capacity. If no single node can meet
+it for the whole allowance, the job returns an error and is cancelled. The
+clock resets when a fitting node joins or becomes visible. A feasible request
+waiting for busy resources keeps its queue position; this schedule limit does
+not expire it. Queue time still counts toward the enclosing round timeout.
+Unavailable resource/state evidence is handled conservatively. Outside a run,
+the executor uses 600 seconds.
+
+Cancellation is shielded: request `ray.cancel(ref)`, wait up to
+`grace_s + cancel_margin_s`, then request `ray.cancel(ref, force=True)` even if
+the soft step failed. The force request has its own bounded margin. Pending
+work is cancelled before it can later start. A soft-cancelled worker may return
+a collected partial; only `Job.on_partial` receives it. As with LocalExecutor,
+that result retains data and drops file, log and report references, and starts
+no new artifact upload. A timed-out or failed partial wait gives an empty
+`cancelled` result. A schedule timeout has no partial callback. Hard process
+controls propagate unchanged.
+
+Ray preserves its assigned `CUDA_VISIBLE_DEVICES` in the tool subprocess.
+Ray resources are logical scheduling quantities, so subprocess resource limits
+still apply where the operating system supports them; a logical memory request
+is not an isolation boundary.
+
+Recovery uses the connected cluster's `RayContext.dashboard_url` and the
+recorded original driver's job ID. `confirm_dead` requires identity-matched
+terminal-task and dead-worker evidence. `kill_orphan` waits for Ray's owner
+fate sharing and never kills another task itself. Missing, ambiguous, dropped,
+unavailable or late state stays unknown. **Recovery confirmation needs a
+plain-HTTP dashboard reachable at `RayContext.dashboard_url`. HTTPS, proxied or
+`RAY_OVERRIDE_DASHBOARD_URL` dashboards make lost runs stay unconfirmed; their
+spend stays estimated.** No environment discovery fallback is used for state
+lookups.

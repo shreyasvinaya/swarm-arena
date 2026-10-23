@@ -53,7 +53,7 @@ FIELD_SETS = {
     ("llm_call", 1): "a1173597b9e95c35e761ccdf608c93809cb0d8164767effc5dba90e58c297c3f",
     ("plan", 1): "72cf827e6a89feaed4f75dd19867c98dbecf9b57ba87cb45abeee78f53e39f89",
     ("run_config", 1): "4e8be36b4a984eb29c94074399a9415d8a0015c236c8493ecaab34b0b79fcc52",
-    ("job_started", 1): "9014b7001623ba750fd0c7bd48434c3cb80ff11fbdb669a627d8188ec3257a80",
+    ("job_started", 1): "237fdb12287452b9309f010994d452813755353410e771cac98d04ad65f79fe9",
     ("tool_result", 1): "b0f03da03916731b82f5d6e1a2c6d7e844a1cb0e207c8b29d89bc34dea07841f",
 }
 

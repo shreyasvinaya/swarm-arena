@@ -2083,3 +2083,68 @@ except KeyboardInterrupt:
             process.kill()
         process.wait(timeout=10)
         stdout.close()
+
+
+async def test_every_submit_sees_schedule_timeout(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena import ScriptJudge
+    from swarm_arena._engine import run as module
+    from swarm_arena._exec.executor import current_schedule_timeout
+    from swarm_arena.executor import Job, LocalExecutor
+    from swarm_arena.tool import ToolOutput
+
+    timeouts: list[float | None] = []
+    jobs: list[Job] = []
+
+    class Recording(LocalExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            timeouts.append(current_schedule_timeout())
+            jobs.append(job)
+            return await super().submit(job)
+
+    executor = Recording()
+    monkeypatch.setattr(module, "_build_executor", lambda config: executor)
+    cfg = run_config.model_copy(update={"schedule_timeout_s": 42.0})
+    judge = ScriptJudge(
+        command=[
+            sys.executable,
+            "-c",
+            (
+                "import json, os; "
+                "json.dump({'value': 1.0}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
+            ),
+        ]
+    )
+    spec = plan(rounds=1).model_copy(
+        update={
+            "judges": [Ref.of(judge).model_copy(update={"name": "score"})],
+            "ranking": "score",
+        }
+    )
+    assert current_schedule_timeout() is None
+    await Swarm(cfg).run(spec)
+    assert timeouts
+    assert set(timeouts) == {42.0}
+    assert {job.kind for job in jobs} == {"tool", "command"}
+    assert current_schedule_timeout() is None
+
+
+async def test_resume_preparation_sees_schedule_timeout(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import resume as module
+    from swarm_arena._exec.executor import current_schedule_timeout
+
+    observed: list[float | None] = []
+
+    async def check(config: RunConfig) -> None:
+        observed.append(current_schedule_timeout())
+        raise RuntimeError("preparation reached")
+
+    monkeypatch.setattr(module, "_check_storage", check)
+    cfg = run_config.model_copy(update={"schedule_timeout_s": 42.0})
+    with pytest.raises(RuntimeError, match="preparation reached"):
+        await module.resume_run(cfg, "existing", force=False, replanner=None)
+    assert observed == [42.0]
+    assert current_schedule_timeout() is None
