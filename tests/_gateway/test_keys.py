@@ -376,7 +376,7 @@ async def test_restore_refuses_missing_creation_fields(tmp_path: Path, missing: 
         with pytest.raises(ValidationError) as caught:
             restored.restore([incomplete])
         assert caught.value.errors(include_input=False, include_url=False) == [
-            {"type": "missing", "loc": (missing,), "msg": "Field required"}
+            {"type": "missing", "loc": (missing,), "msg": "missing"}
         ]
         assert restored.records()[0].closed_at == closed.closed_at
         with pytest.raises(ValueError, match="binding mismatch"):
