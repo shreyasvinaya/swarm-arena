@@ -1004,7 +1004,7 @@ async def test_delayed_manager_setup_keeps_engine_round_deadline(
     async def held_prepare(hook: Any, *args: Any, **kwargs: Any) -> Any:
         if hook.__name__ == "prepare":
             release = anyio.Event()
-            handle = asyncio.get_running_loop().call_at(deadlines[-1] - 1, release.set)
+            handle = asyncio.get_running_loop().call_at(deadlines[-1] - 58, release.set)
             try:
                 with anyio.fail_after(60):
                     await release.wait()
@@ -1025,7 +1025,7 @@ async def test_delayed_manager_setup_keeps_engine_round_deadline(
     monkeypatch.setattr(_manager, "_local_timer_scope", observed_timer)
     monkeypatch.setattr(FakeModel, "get_response", observed_response)
     cfg = config(
-        limits=Limits(max_tokens=10_000_000, max_usd=100, round_timeout_s=3),
+        limits=Limits(max_tokens=10_000_000, max_usd=100, round_timeout_s=60),
         run_root=str(tmp_path / "runs"),
         artifact_root=str(tmp_path / "artifacts"),
         arena_root=str(tmp_path / "arena"),
@@ -1041,7 +1041,7 @@ async def test_delayed_manager_setup_keeps_engine_round_deadline(
             }
         )
     )
-    with anyio.fail_after(30):
+    with anyio.fail_after(120):
         await Swarm(cfg).run(current, run_id="delayed-manager")
     assert provider_entries
     assert all(value < 0 for value in provider_entries)
@@ -1314,9 +1314,25 @@ async def test_later_finish_round_call_returns_a_soft_tool_error() -> None:
 @pytest.mark.parametrize("owner", ["task", "scope"])
 @pytest.mark.parametrize("nested", [False, True])
 async def test_caller_cancellation_gracefully_finishes_owned_tool_without_cancelling_peer(
-    tmp_path: Path, ctx_env: CtxEnv, owner: str, nested: bool
+    tmp_path: Path, ctx_env: CtxEnv, owner: str, nested: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import signal
+    from contextlib import suppress
+
     from _fakes.tools import PyTool
+
+    from swarm_arena._exec import supervisor
+
+    owned: list[tuple[subprocess.Popen[bytes], int]] = []
+    original_spawn = supervisor._spawn
+
+    def spawn(*args: Any, procs: list[subprocess.Popen[bytes]], **kwargs: Any) -> None:
+        try:
+            original_spawn(*args, procs=procs, **kwargs)
+        finally:
+            owned.extend((proc, proc.pid) for proc in procs)
+
+    monkeypatch.setattr(supervisor, "_spawn", spawn)
 
     ready, release = tmp_path / "peer-ready", tmp_path / "peer-release"
     owned_ready = tmp_path / "owned-ready"
@@ -1355,6 +1371,7 @@ else:
 
         task = asyncio.create_task(manage())
         peer_task = asyncio.create_task(peer.run_tool({"n": 2}))
+        failure: BaseException | None = None
         try:
             with anyio.fail_after(60):
                 await ctx_env.env.wait_for(ready)
@@ -1362,15 +1379,21 @@ else:
                 assert len(ctx_env.env.events("tool_start")) == 2
                 if owner == "task":
                     task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await task
                 else:
                     owner_scope.cancel()
-                    await task
+                done, _ = await asyncio.wait({task}, timeout=30)
+                assert task in done, "manager cancellation did not finish"
+                if owner == "task":
+                    with pytest.raises(asyncio.CancelledError):
+                        task.result()
+                else:
+                    task.result()
                 assert cancelled.is_set()
                 assert not peer_task.done()
                 release.touch()
-                candidate = await peer_task
+                done, _ = await asyncio.wait({peer_task}, timeout=30)
+                assert peer_task in done, "released peer did not finish"
+                candidate = peer_task.result()
             assert candidate.output.status == "ok"
             assert len(ctx_env.env.events("tool_end")) == 2
             assert {
@@ -1378,13 +1401,42 @@ else:
             } == {event.payload["id"] for event in ctx_env.env.events("settle")}
             assert len(run.events("reserve")) == len(run.events("settle")) == 1
             assert len(fake.calls) == 1
+            assert len(owned) == 2
+            assert all(proc.returncode is not None for proc, _ in owned)
+        except (Exception, asyncio.CancelledError) as error:
+            failure = error
+            raise
         finally:
             release.touch()
-            if not task.done():
-                task.cancel()
+            task.cancel()
             if not peer_task.done():
                 ctx_env.env.inflight.cancel_all()
-            await asyncio.gather(task, peer_task, return_exceptions=True)
+                peer_task.cancel()
+            cleanup_errors: list[str] = []
+            try:
+                done, pending = await asyncio.wait({task, peer_task}, timeout=60)
+                await asyncio.gather(*done, return_exceptions=True)
+                if pending:
+                    cleanup_errors.append("task cleanup did not finish")
+            finally:
+                for proc, pgid in owned:
+                    if proc.poll() is None:
+                        with suppress(ProcessLookupError):
+                            os.killpg(pgid, signal.SIGKILL)
+                    try:
+                        await anyio.to_thread.run_sync(proc.wait, 60)
+                    except subprocess.TimeoutExpired:
+                        cleanup_errors.append("owned child cleanup did not finish")
+                # Emergency reaping may unblock the product's cancellation cleanup.
+                done, pending = await asyncio.wait({task, peer_task}, timeout=60)
+                await asyncio.gather(*done, return_exceptions=True)
+                if pending:
+                    cleanup_errors.append("task cleanup remained pending after child reaping")
+                if cleanup_errors:
+                    if failure is not None:
+                        failure.add_note("; ".join(cleanup_errors))
+                    else:
+                        raise AssertionError("; ".join(cleanup_errors))
 
 
 class NestedActionTool(PyTool):

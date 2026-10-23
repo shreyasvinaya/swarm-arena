@@ -1,6 +1,8 @@
 """Metering, authoritative settings and SDK control transport."""
 
 import asyncio
+import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -1327,13 +1329,28 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
 async def test_provider_stop_collects_scripted_manager_partial_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import signal
+    from contextlib import suppress
+
     from _fakes.run import all_events, plan
     from _fakes.tools import ProviderPyTool
 
     from swarm_arena import Swarm
     from swarm_arena._agent.runtime import AgentRuntime
     from swarm_arena._engine.round import RoundRunner
+    from swarm_arena._exec import supervisor
     from tests.llm.test_manager import config as manager_config
+
+    owned: list[tuple[subprocess.Popen[bytes], int]] = []
+    original_spawn = supervisor._spawn
+
+    def spawn(*args: Any, procs: list[subprocess.Popen[bytes]], **kwargs: Any) -> None:
+        try:
+            original_spawn(*args, procs=procs, **kwargs)
+        finally:
+            owned.extend((proc, proc.pid) for proc in procs)
+
+    monkeypatch.setattr(supervisor, "_spawn", spawn)
 
     ready = tmp_path / "ready"
     code = f"""
@@ -1366,24 +1383,57 @@ time.sleep(300)
                 await anyio.sleep(0.01)
         await runtimes[0].stops.fail("fake", source="judge")
 
-    with anyio.fail_after(30):
-        async with anyio.create_task_group() as group:
-            group.start_soon(fail_provider)
-            await Swarm(cfg).run(current, run_id="provider-scripted")
-    events = all_events(cfg)
-    ends = [e for e in events if e.type == "tool_end"]
-    assert len(ends) == 1
-    output = ends[0].payload["candidate"]["output"]
-    assert output["status"] == "cancelled"
-    assert output["data"] == {"y": 42.0}
-    assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
-        e.payload["id"] for e in events if e.type == "settle"
-    }
-    status = next(e for e in events if e.type == "agent_status")
-    assert (status.payload["status"], status.payload["reason"]) == (
-        "stopped",
-        "provider unavailable",
-    )
+    run_task = asyncio.create_task(Swarm(cfg).run(current, run_id="provider-scripted"))
+    stop_task = asyncio.create_task(fail_provider())
+    failure: BaseException | None = None
+    try:
+        with anyio.fail_after(60):
+            done, pending = await asyncio.wait({run_task, stop_task}, timeout=30)
+            for task in done:
+                task.result()
+            assert not pending, "provider stop did not finish while the child was held"
+        events = all_events(cfg)
+        ends = [e for e in events if e.type == "tool_end"]
+        assert len(ends) == 1
+        output = ends[0].payload["candidate"]["output"]
+        assert output["status"] == "cancelled"
+        assert output["data"] == {"y": 42.0}
+        assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+            e.payload["id"] for e in events if e.type == "settle"
+        }
+        status = next(e for e in events if e.type == "agent_status")
+        assert (status.payload["status"], status.payload["reason"]) == (
+            "stopped",
+            "provider unavailable",
+        )
+        assert owned
+        assert all(proc.returncode is not None for proc, _ in owned)
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+        raise
+    finally:
+        run_task.cancel()
+        stop_task.cancel()
+        cleanup_errors: list[str] = []
+        try:
+            for proc, pgid in owned:
+                if proc.poll() is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(pgid, signal.SIGKILL)
+                try:
+                    await anyio.to_thread.run_sync(proc.wait, 60)
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("owned child cleanup did not finish")
+        finally:
+            done, pending = await asyncio.wait({run_task, stop_task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                cleanup_errors.append("task cleanup did not finish")
+            if cleanup_errors:
+                if failure is not None:
+                    failure.add_note("; ".join(cleanup_errors))
+                else:
+                    raise AssertionError("; ".join(cleanup_errors))
 
 
 async def test_probe_preserves_upstream_type_without_message(

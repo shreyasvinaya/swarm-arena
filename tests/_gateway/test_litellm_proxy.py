@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import traceback
@@ -507,6 +508,7 @@ async def test_create_delivery_race(
     import swarm_arena._gateway.litellm_proxy as module
 
     deadlines: list[anyio.CancelScope] = []
+    workers: list[threading.Thread] = []
 
     @contextmanager
     def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
@@ -525,6 +527,7 @@ async def test_create_delivery_race(
     original = module._CreateOwner.publish
 
     def publish(owner: Any, key: VirtualKey) -> None:
+        workers.append(threading.current_thread())
         if order == "after_publish":
             original(owner, key)
         entered.set()
@@ -559,8 +562,14 @@ async def test_create_delivery_race(
     finally:
         release.set()
         task.cancel()
-        with anyio.fail_after(60, shield=True):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            done, pending = await asyncio.wait({task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            assert not pending, "gateway task cleanup did not finish"
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -1352,28 +1361,53 @@ async def test_tls_handshake_worker_exits(
 ) -> None:
     from socketserver import BaseRequestHandler, ThreadingTCPServer
 
+    import swarm_arena._gateway.litellm_proxy as module
+
     entered, release, finished = (threading.Event() for _ in range(3))
+    workers: list[threading.Thread] = []
+    operations: list[Any] = []
+    deadlines: list[anyio.CancelScope] = []
+    loop = asyncio.get_running_loop()
+
+    @contextmanager
+    def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
+        assert delay == 60
+        with anyio.fail_after(delay) as scope:
+            deadlines.append(scope)
+            yield scope
+
+    monkeypatch.setattr(
+        module, "anyio", SimpleNamespace(fail_after=observed_deadline, run=anyio.run)
+    )
+    original_handshake = ssl.SSLSocket.do_handshake
+
+    def handshake(sock: ssl.SSLSocket, *args: Any, **kwargs: Any) -> None:
+        if termination == "timeout":
+            # Startup cannot spend the experiment's allowance. Arm both clocks
+            # and the real SSL wait only at the handshake boundary.
+            operations[0].deadline = time.monotonic() + 0.5
+            sock.settimeout(0.5)
+            loop.call_soon_threadsafe(setattr, deadlines[0], "deadline", loop.time() + 0.5)
+        original_handshake(sock, *args, **kwargs)
+
+    monkeypatch.setattr(ssl.SSLSocket, "do_handshake", handshake)
 
     class Handler(BaseRequestHandler):
         def handle(self) -> None:
-            self.request.settimeout(300)
+            self.request.settimeout(180)
             self.request.recv(4096)
             entered.set()
-            release.wait(300)
+            release.wait(180)
 
     server = ThreadingTCPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
     thread.start()
-    # The worker must exit at its own operation deadline, long before the server
-    # releases the handshake. The cancel case gets a deadline that the cancel
-    # always beats under load; the timeout case keeps the short deadline under test.
-    http_timeout_s = 60 if termination == "cancel" else 0.5
-    proxy = _proxy_at(
-        f"https://127.0.0.1:{server.server_address[1]}", http_timeout_s=http_timeout_s
-    )
+    proxy = _proxy_at(f"https://127.0.0.1:{server.server_address[1]}", http_timeout_s=60)
     original = proxy._request
 
     def request(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
+        operations.append(args[0])
         try:
             return original(*args, **kwargs)
         finally:
@@ -1400,13 +1434,17 @@ async def test_tls_handshake_worker_exits(
         release.set()
         task.cancel()
         try:
-            with anyio.fail_after(60, shield=True):
-                await asyncio.gather(task, return_exceptions=True)
+            done, pending = await asyncio.wait({task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            assert not pending, "gateway task cleanup did not finish"
         finally:
             server.shutdown()
             server.server_close()
             thread.join(60)
-            await _wait(finished)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
+            assert finished.is_set()
             assert not thread.is_alive()
 
 
@@ -1472,6 +1510,7 @@ async def test_abandoned_dns_never_opens_socket(
     import swarm_arena._gateway.litellm_proxy as module
 
     deadlines: list[anyio.CancelScope] = []
+    workers: list[threading.Thread] = []
 
     @contextmanager
     def observed_deadline(delay: float) -> Generator[anyio.CancelScope]:
@@ -1493,6 +1532,7 @@ async def test_abandoned_dns_never_opens_socket(
     original_request = proxy._request
 
     def resolve(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
         entered.set()
         assert release.wait(300)
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 4000))]
@@ -1540,11 +1580,17 @@ async def test_abandoned_dns_never_opens_socket(
     finally:
         release.set()
         task.cancel()
-        with anyio.fail_after(60, shield=True):
-            await asyncio.gather(task, return_exceptions=True)
-        await _wait(finished)
-        for sock in sockets:
-            sock.close()
+        try:
+            done, pending = await asyncio.wait({task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            assert not pending, "gateway task cleanup did not finish"
+            await _wait(finished)
+            for sock in sockets:
+                sock.close()
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_51_row_shifted_listing_is_incomplete(fake_gateway: FakeGateway) -> None:

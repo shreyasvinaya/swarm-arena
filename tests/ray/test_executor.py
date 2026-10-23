@@ -455,9 +455,11 @@ async def test_recovery_uses_connected_dashboard_and_original_job(
 async def test_recovery_allowance_includes_init_lock_and_rpc(
     fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch, method: str, held: str
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
 
     def block(*args: Any, **kw: Any) -> Any:
+        workers.append(threading.current_thread())
         entered.set()
         try:
             assert release.wait(300)
@@ -482,10 +484,15 @@ async def test_recovery_allowance_includes_init_lock_and_rpc(
             assert entered.is_set()
     finally:
         release.set()
-        if held == "lock":
-            executor._init_lock.release()
-        else:
-            assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            if held == "lock":
+                executor._init_lock.release()
+            else:
+                assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_aclose_does_not_shutdown(fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -526,6 +533,7 @@ async def test_schedule_clock_resets_when_request_becomes_feasible(
 async def test_cancel_during_upload_starts_no_later_publication(
     fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     blobs = {sha256_hex(data): data for data in [b"first", b"second"]}
     fake_ray.ref.result = _frame(ToolOutput(status="ok", data={"kept": True}), blobs)
@@ -534,6 +542,7 @@ async def test_cancel_during_upload_starts_no_later_publication(
     scopes: list[anyio.CancelScope] = []
 
     def put(artifacts: ArtifactStore, data: bytes) -> str:
+        workers.append(threading.current_thread())
         writes.append(sha256_hex(data))
         entered.set()
         try:
@@ -568,7 +577,12 @@ async def test_cancel_during_upload_starts_no_later_publication(
         assert partials[0].files == []
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
     assert len(writes) == 1
 
 
@@ -1065,9 +1079,11 @@ async def test_query_hook_cancellation_is_an_ordinary_failure(
 async def test_query_preserves_caller_cancellation(
     fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch, method: str
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
 
     def held(*args: Any, **kwargs: Any) -> Any:
+        workers.append(threading.current_thread())
         entered.set()
         try:
             assert release.wait(300)
@@ -1096,7 +1112,12 @@ async def test_query_preserves_caller_cancellation(
         assert not returned
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("site", ["prepare", "upload"])
@@ -1127,12 +1148,14 @@ async def test_core_storage_errors_propagate(
 async def test_abandoned_init_rejoins_without_another_attempt(
     fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, complete_before_rejoin: bool
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     calls: list[int] = []
     outputs: list[ToolOutput] = []
     executor = RayExecutor(cancel_margin_s=0.05)
 
     def init(**kw: Any) -> Any:
+        workers.append(threading.current_thread())
         calls.append(threading.get_ident())
         entered.set()
         try:
@@ -1165,7 +1188,12 @@ async def test_abandoned_init_rejoins_without_another_attempt(
         assert len(calls) == 1
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_failed_init_can_be_retried_by_a_later_caller(
@@ -1286,11 +1314,13 @@ async def test_payload_is_put_off_loop_before_dispatch_intent(
 async def test_abandoned_payload_put_never_dispatches(
     fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     started = Mock()
     scopes: list[anyio.CancelScope] = []
 
     def put(data: bytes) -> _Payload:
+        workers.append(threading.current_thread())
         entered.set()
         try:
             assert release.wait(300)
@@ -1314,8 +1344,13 @@ async def test_abandoned_payload_put_never_dispatches(
         assert not fake_ray.arguments
     finally:
         release.set()
-        if entered.is_set():
-            assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            if entered.is_set():
+                assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
     await anyio.lowlevel.checkpoint()
     assert not fake_ray.arguments
 
@@ -1323,6 +1358,7 @@ async def test_abandoned_payload_put_never_dispatches(
 async def test_cancel_force_and_partial_share_one_deadline(
     fake_ray: _RunJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    workers: list[threading.Thread] = []
     fake_ray.ref = _Ref(None)
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     scopes: list[anyio.CancelScope] = []
@@ -1348,6 +1384,7 @@ async def test_cancel_force_and_partial_share_one_deadline(
 
     def cancel(ref: _Ref, *, force: bool = False) -> None:
         if force:
+            workers.append(threading.current_thread())
             entered.set()
             clock[0] = 101.0
             try:
@@ -1385,8 +1422,13 @@ async def test_cancel_force_and_partial_share_one_deadline(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
     finally:
         release.set()
-        if entered.is_set():
-            assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            if entered.is_set():
+                assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, GeneratorExit])
@@ -1456,6 +1498,7 @@ async def test_running_task_stops_the_scheduling_watch(
 async def test_pending_jobs_share_rate_limited_node_snapshot(
     fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch, held: bool
 ) -> None:
+    workers: list[threading.Thread] = []
     clock = [0.0]
     calls: list[float] = []
     counts = [0, 0]
@@ -1466,6 +1509,7 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
     original_sleep = anyio.sleep
 
     def nodes() -> list[dict[str, Any]]:
+        workers.append(threading.current_thread())
         done = threading.Event()
         completed.append(done)
         calls.append(clock[0])
@@ -1506,8 +1550,13 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
         assert len(calls) == (1 if held else 2)
     finally:
         release.set()
-        for done in completed:
-            assert await anyio.to_thread.run_sync(done.wait, 60)
+        try:
+            for done in completed:
+                assert await anyio.to_thread.run_sync(done.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+            assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("address", ["localhost:6379", "127.0.0.1:6379", "auto"])
@@ -1555,6 +1604,7 @@ async def test_disconnected_process_can_claim_a_new_address(
 async def test_concurrent_executors_serialize_connection_ownership(
     fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    workers: list[threading.Thread] = []
     entered, second_entered, release = threading.Event(), threading.Event(), threading.Event()
     connected = [False]
     calls: list[str] = []
@@ -1569,6 +1619,7 @@ async def test_concurrent_executors_serialize_connection_ownership(
         return SimpleNamespace(dashboard_url="head:8265")
 
     def connect_started(self: RayExecutor) -> tuple[str | None, str | None]:
+        workers.append(threading.current_thread())
         if self.config.address == "second-private-head":
             second_entered.set()
         return connect(self)
@@ -1597,6 +1648,9 @@ async def test_concurrent_executors_serialize_connection_ownership(
         assert_secret_absent(errors[0], "second-private-head")
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+        assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.ray
