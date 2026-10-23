@@ -2532,11 +2532,11 @@ remain immutable.
 ```python
 class GatewayError(RuntimeError): ...  # method, route and HTTP status or error type; never values
 class ProfileReport(FrozenModel):
-    verified: bool; failures: list[str]; batch_write_interval_s: float | None; request_timeout_s: float | None
+    verified: bool; failures: tuple[str, ...]; batch_write_interval_s: float | None; request_timeout_s: float | None
 class VirtualKey(FrozenModel):
     key_id: str; alias: str                          # the secret key value is never stored or journaled
 class SpendRow(FrozenModel):
-    request_id: str; litellm_call_id: str | None; model: str; usage: Usage
+    key_id: str; request_id: str; litellm_call_id: str | None; model: str; usage: Usage
     cost_usd: float; ts: datetime; metadata: dict[str, Any]
 class GatewayAdapter(Protocol):
     terminal_accounting: bool                        # LiteLLM adapter: False
@@ -2550,12 +2550,34 @@ class GatewayAdapter(Protocol):
 async def reconcile_run(config: RunConfig, run_id: str, adapter: GatewayAdapter, executor: Executor) -> ReconcileReport: ...
 ```
 
-All gateway models use the safe frozen base. Costs and timings are finite and
-nonnegative; metadata is finite JSON. `SpendRow.request_id` is required and
-nonblank, `litellm_call_id` is nullable and not globally unique, and `ts` is aware
-and normalized to UTC. The HTTP adapter extracts cache counts from
-`metadata.additional_usage_values`, never top-level spend fields. Spend queries
-require both aware UTC bounds for one fixed inclusive window across all pages.
+All gateway models use the safe frozen base. `ProfileReport.failures` is an
+immutable tuple (a JSON array on the wire); `verified` must equal `not failures`,
+and verification requires a known `request_timeout_s`. Costs and timings are
+finite and nonnegative; metadata is finite JSON. `VirtualKey.key_id`,
+`VirtualKey.alias` and `SpendRow.key_id` are strict nonblank strings of 1-256
+characters; identities are preserved without trimming. `SpendRow.request_id` is
+required and nonblank, and `litellm_call_id` is nullable and not globally unique.
+`SpendRow.key_id` comes from the row's own `api_key` hash; the adapter rejects a
+mismatch with the queried key through GatewayError, never substituting the query
+identity or returning a partial total. `usage` is strictly revalidated without
+serialization warnings, including copied/constructed instances. Token counts
+cannot be bools, strings or floats. `cost_usd` is the sole authoritative cost;
+`usage.usd` is either None or exactly equal and is never added separately. `ts`
+accepts only aware datetimes or timezone-aware ISO strings and normalizes to UTC;
+Unix numbers and numeric strings are rejected. The HTTP adapter extracts cache
+counts from `metadata.additional_usage_values`, never top-level spend fields.
+Spend queries require both aware UTC bounds for one fixed inclusive window
+across all pages.
+
+`block_key` and `delete_key` are idempotent: None means success, including an
+already blocked/deleted/missing key. Deleting a blocked but existing key still
+performs deletion. Transient transport/server or malformed responses raise
+GatewayError rather than being interpreted as successful closure/deletion.
+`closed_at` returns an aware UTC confirmation time for blocked/deleted keys,
+including archived HTTP 200 `info.status="deleted"` and definitive key-info 404;
+use the observation time when no reliable closure timestamp exists, never an
+earlier invented time. None means open/unconfirmed; failed inspection raises
+GatewayError. Consumers do not parse error messages for idempotency.
 
 ```python
 # _gateway/profile.py (LiteLLM Proxy 1.107.0rc2)
@@ -2567,7 +2589,7 @@ VIRTUAL_KEYS_REQUIRED: Final[str | None] = None
 PASS_THROUGH: Final[str | None] = "pass_through_endpoints"
 MAX_TOKENS_BOUND: Final[str | None] = None
 RESERVED_ROUTES_ONLY: Final[str | None] = "allowed_routes"
-def check_profile(settings: Mapping[str, Any] | None, models: Sequence[Mapping[str, Any]], *,
+def check_profile(settings: Mapping[str, Any] | None, models: Sequence[object], *,
                   request_timeout_s: float) -> ProfileReport: ...
 ```
 
@@ -2581,7 +2603,8 @@ empty custom pass-through lists. Only `/chat/completions` and
 `/v1/chat/completions` plus the adapter's management/health routes are accepted;
 unknown routes, non-chat modes and known zero-cost models cannot establish
 reservation coverage. Prices and advertised output limits have independent
-model failures. Unknown batch timing is None without an additional failure.
+model failures. Non-mapping model entries receive both model failures under
+`<unknown>`, without rendering their values. Unknown batch timing is None without an additional failure.
 The pinned profile cannot verify hard caps, even with complete fixture settings;
 `default_estimated_output_tokens` remains an estimate. A capable test stub is
 separate from this LiteLLM path.

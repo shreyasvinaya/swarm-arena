@@ -43,19 +43,19 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) and number >= 0 else None
 
 
-def _model_info(model: Mapping[str, Any]) -> Mapping[str, Any]:
+def _model_info(model: object) -> Mapping[str, Any]:
     """Read validated model metadata, treating malformed shapes as unknown."""
-    value = model.get("model_info")
+    value = model.get("model_info") if isinstance(model, Mapping) else None
     return value if isinstance(value, Mapping) else {}
 
 
-def _model_name(model: Mapping[str, Any]) -> str:
+def _model_name(model: object) -> str:
     """Keep model identifiers, never representations of malformed values."""
-    name = model.get("model_name")
+    name = model.get("model_name") if isinstance(model, Mapping) else None
     return name if isinstance(name, str) and name else "<unknown>"
 
 
-def _reserved_routes(value: Any, models: Sequence[Mapping[str, Any]]) -> bool:
+def _reserved_routes(value: Any, models: Sequence[object]) -> bool:
     """Require a narrow route list and reject known non-reserving model modes."""
     if not isinstance(value, list) or not value or not models:
         return False
@@ -81,7 +81,7 @@ def _reserved_routes(value: Any, models: Sequence[Mapping[str, Any]]) -> bool:
 
 def check_profile(
     settings: Mapping[str, Any] | None,
-    models: Sequence[Mapping[str, Any]],
+    models: Sequence[object],
     *,
     request_timeout_s: float,
 ) -> ProfileReport:
@@ -93,9 +93,10 @@ def check_profile(
     settings : Mapping of str to Any or None
         Flattened general and LiteLLM settings, or None when introspection is
         unavailable. None never implies that an unreadable switch is disabled.
-    models : Sequence of Mapping of str to Any
-        Validated ``/model/info`` data entries. Model metadata supplies per-token
-        prices and advertised output limits; neither proves a per-key cap.
+    models : Sequence of object
+        ``/model/info`` data entries. Non-mapping entries receive both model
+        failures under the fixed identifier ``<unknown>``. Model metadata supplies
+        per-token prices and advertised output limits; neither proves a per-key cap.
     request_timeout_s : float
         Caller's gateway allowance. The pinned proxy has no enforced total
         duration to compare with it; the report therefore always returns None
@@ -165,7 +166,7 @@ def check_profile(
         batch = _number(settings.get(BATCH_WRITE_INTERVAL))
     return ProfileReport(
         verified=not failures,
-        failures=failures,
+        failures=tuple(failures),
         batch_write_interval_s=batch,
         request_timeout_s=None,
     )

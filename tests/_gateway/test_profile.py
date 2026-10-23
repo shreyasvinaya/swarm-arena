@@ -19,7 +19,7 @@ from swarm_arena._gateway.profile import (
 )
 
 
-def _pinned_merge(absent: list[str], *texts: str) -> list[str]:
+def _pinned_merge(absent: list[str], *texts: str) -> tuple[str, ...]:
     order = [
         "budget reservations are disabled",
         "spend enforcement",
@@ -33,9 +33,11 @@ def _pinned_merge(absent: list[str], *texts: str) -> list[str]:
         "pass-through",
         "gateway settings",
     ]
-    return sorted(
-        [*absent, *texts],
-        key=lambda text: next(i for i, fragment in enumerate(order) if fragment in text),
+    return tuple(
+        sorted(
+            [*absent, *texts],
+            key=lambda text: next(i for i, fragment in enumerate(order) if fragment in text),
+        )
     )
 
 
@@ -63,7 +65,7 @@ def test_strict_profile_verified() -> None:
         request_timeout_s=600.0,
     )
     assert report.verified is False
-    assert report.failures == ABSENT_FAILURES
+    assert report.failures == tuple(ABSENT_FAILURES)
     assert report.batch_write_interval_s == 10.0
     assert report.request_timeout_s is None
 
@@ -119,7 +121,7 @@ def test_unknown_batch_interval_is_none_not_failure(batch: Any) -> None:
     report = check_profile(
         strict_settings(batch_write_interval_s=batch), strict_models(), request_timeout_s=600.0
     )
-    assert report.failures == ABSENT_FAILURES
+    assert report.failures == tuple(ABSENT_FAILURES)
     assert report.batch_write_interval_s is None
 
 
@@ -153,7 +155,7 @@ def test_reservation_opt_out_is_inverted(value: Any) -> None:
     report = check_profile(
         strict_settings(disable_budget_reservation=value), strict_models(), request_timeout_s=600.0
     )
-    assert report.failures == ABSENT_FAILURES
+    assert report.failures == tuple(ABSENT_FAILURES)
 
 
 @pytest.mark.parametrize(
@@ -178,12 +180,9 @@ def test_management_routes_do_not_prevent_the_restricted_profile() -> None:
         "/v1/model/info",
         "/health/liveliness",
     ]
-    assert (
-        check_profile(
-            strict_settings(allowed_routes=routes), strict_models(), request_timeout_s=600.0
-        ).failures
-        == ABSENT_FAILURES
-    )
+    assert check_profile(
+        strict_settings(allowed_routes=routes), strict_models(), request_timeout_s=600.0
+    ).failures == tuple(ABSENT_FAILURES)
 
 
 @pytest.mark.parametrize("value", [None, False, "off", {}])
@@ -230,12 +229,12 @@ def test_model_failures_keep_pinned_order_and_inputs_unchanged() -> None:
     settings = strict_settings()
     before = deepcopy((settings, models))
     report = check_profile(settings, models, request_timeout_s=600.0)
-    assert report.failures[:4] == [
+    assert report.failures[:4] == (
         "model first: no price (input and output cost per token)",
         "model second: no price (input and output cost per token)",
         "model first: no max output token bound",
         "model second: no max output token bound",
-    ]
+    )
     assert (settings, models) == before
 
 
@@ -272,7 +271,7 @@ def test_malformed_model_info_has_safe_model_failures(info: Any) -> None:
 
 def test_unavailable_settings_keep_exact_absent_order_with_valid_models() -> None:
     report = check_profile(None, strict_models(), request_timeout_s=600)
-    assert report.failures == [*ABSENT_FAILURES, "gateway settings introspection unavailable"]
+    assert report.failures == (*ABSENT_FAILURES, "gateway settings introspection unavailable")
 
 
 def test_missing_settings_are_not_the_unavailable_settings_path() -> None:
@@ -290,5 +289,21 @@ def test_free_input_is_priced_when_output_has_a_positive_cost() -> None:
     models = strict_models()
     models[0]["model_info"]["input_cost_per_token"] = 0
     report = check_profile(strict_settings(batch_write_interval_s=0), models, request_timeout_s=600)
-    assert report.failures == ABSENT_FAILURES
+    assert report.failures == tuple(ABSENT_FAILURES)
     assert report.batch_write_interval_s == 0
+
+
+@pytest.mark.parametrize("model", [None, "model-secret-sentinel", 42, []])
+@pytest.mark.parametrize("settings", [None, strict_settings()])
+def test_non_mapping_model_entries_fail_without_value_leaks(model: Any, settings: Any) -> None:
+    report = check_profile(settings, [model], request_timeout_s=600)
+    expected = [
+        "model <unknown>: no price (input and output cost per token)",
+        "model <unknown>: no max output token bound",
+        *ABSENT_FAILURES,
+    ]
+    if settings is None:
+        expected.append("gateway settings introspection unavailable")
+    assert list(report.failures) == expected
+    assert not report.verified
+    assert "model-secret-sentinel" not in repr(report)

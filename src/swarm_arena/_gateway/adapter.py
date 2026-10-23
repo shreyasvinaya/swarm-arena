@@ -2,13 +2,25 @@
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Protocol, Self
 
-from pydantic import AwareDatetime, Field, field_validator
+from pydantic import AfterValidator, AwareDatetime, Field, field_validator, model_validator
 
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.data import FiniteJsonObject
 from swarm_arena._model.tooling import Usage
+
+
+def _nonblank(value: str) -> str:
+    """Reject blank identifiers without changing meaningful identity text."""
+    if not value.strip():
+        raise ValueError("identifier must be nonblank")
+    return value
+
+
+_KeyText = Annotated[
+    str, Field(min_length=1, max_length=256, strict=True), AfterValidator(_nonblank)
+]
 
 
 class GatewayError(RuntimeError):
@@ -33,8 +45,9 @@ class ProfileReport(FrozenModel):
     ----------
     verified : bool
         Whether every profile requirement was verified.
-    failures : list of str
-        Ordered, value-free rule diagnostics (model identifiers are allowed).
+    failures : tuple of str
+        Immutable ordered, value-free diagnostics (model identifiers are allowed).
+        Empty exactly when verified; a verified report also requires a duration.
     batch_write_interval_s : float or None
         Finite nonnegative configured interval, not a maximum spend-log lag.
     request_timeout_s : float or None
@@ -42,16 +55,25 @@ class ProfileReport(FrozenModel):
 
     Examples
     --------
-    >>> report = ProfileReport(verified=False, failures=["unverified"],
+    >>> report = ProfileReport(verified=False, failures=("unverified",),
     ...     batch_write_interval_s=10, request_timeout_s=None)
     >>> report.verified
     False
     """
 
     verified: bool
-    failures: list[str]
+    failures: tuple[str, ...]
     batch_write_interval_s: Annotated[float, Field(ge=0, strict=True)] | None
     request_timeout_s: Annotated[float, Field(ge=0, strict=True)] | None
+
+    @model_validator(mode="after")
+    def _consistent_evidence(self) -> Self:
+        """Require the decision, failures and duration evidence to agree."""
+        if self.verified != (not self.failures):
+            raise ValueError("profile verification conflicts with failures")
+        if self.verified and self.request_timeout_s is None:
+            raise ValueError("verified profile requires request_timeout_s")
+        return self
 
 
 class VirtualKey(FrozenModel):
@@ -61,9 +83,10 @@ class VirtualKey(FrozenModel):
     Parameters
     ----------
     key_id : str
-        Gateway token hash, safe to persist.
+        Gateway token hash, safe to persist; strict nonblank text, 1-256 characters.
     alias : str
-        Candidate alias supplied when creating the key.
+        Candidate alias supplied when creating the key; strict nonblank text,
+        1-256 characters. Identifiers are preserved, not trimmed.
 
     Examples
     --------
@@ -71,8 +94,8 @@ class VirtualKey(FrozenModel):
     {'key_id': 'hash', 'alias': 'cand-1'}
     """
 
-    key_id: str
-    alias: str
+    key_id: _KeyText
+    alias: _KeyText
 
 
 class SpendRow(FrozenModel):
@@ -81,6 +104,10 @@ class SpendRow(FrozenModel):
 
     Parameters
     ----------
+    key_id : str
+        The row's own ``api_key`` hash, not the queried key substituted by the
+        caller. Strict nonblank text, 1-256 characters. Adapters reject a row
+        whose key identity differs from the query's VirtualKey.
     request_id : str
         Required nonempty primary spend-row ID. Together with key identity, this
         identifies the observation; the upstream call ID is not a dedup key.
@@ -89,26 +116,29 @@ class SpendRow(FrozenModel):
     model : str
         Model identifier reported by the gateway.
     usage : Usage
-        Validated nonnegative token counters and optional cost. The HTTP adapter
+        Strictly validated nonnegative integer token counters and optional cost.
+        ``usd`` must be None or equal to authoritative ``cost_usd``. The HTTP adapter
         reads cache counts from ``metadata.additional_usage_values``; missing
         counts follow Usage's zero/unknown convention.
     cost_usd : float
-        Finite nonnegative row cost.
-    ts : datetime
-        Aware start timestamp, normalized to UTC.
+        Authoritative finite nonnegative row cost; never add ``usage.usd`` to it.
+    ts : datetime or str
+        Aware start datetime or timezone-aware ISO string, normalized to UTC.
+        Unix numbers and numeric strings are rejected.
     metadata : dict of str to Any
         Finite JSON metadata, validated through the shared JSON boundary.
 
     Examples
     --------
-    >>> row = SpendRow(request_id="row-1", litellm_call_id=None, model="chat",
+    >>> row = SpendRow(key_id="hash", request_id="row-1", litellm_call_id=None, model="chat",
     ...     usage=Usage(input_tokens=3), cost_usd=0.001,
     ...     ts=datetime(2026, 10, 23, tzinfo=UTC), metadata={})
     >>> row.request_id, row.ts.tzinfo is UTC
     ('row-1', True)
     """
 
-    request_id: Annotated[str, Field(min_length=1, strict=True)]
+    key_id: _KeyText
+    request_id: Annotated[str, Field(min_length=1, strict=True), AfterValidator(_nonblank)]
     litellm_call_id: str | None
     model: str
     usage: Usage
@@ -116,20 +146,26 @@ class SpendRow(FrozenModel):
     ts: AwareDatetime
     metadata: FiniteJsonObject
 
-    @field_validator("request_id")
-    @classmethod
-    def _primary_identity(cls, value: str) -> str:
-        """Reject blank identity without changing a meaningful upstream ID."""
-        if not value.strip():
-            raise ValueError("request_id must be nonempty")
-        return value
-
     @field_validator("usage", mode="before")
     @classmethod
-    def _validated_usage(cls, value: Any) -> Any:
+    def _validated_usage(cls, value: Any) -> Usage:
         """Revalidate copied or constructed Usage instances at the row boundary."""
         if isinstance(value, Usage):
-            return value.model_dump(mode="python")
+            # Serialization of invalid copied fields can warn with their values.
+            value = dict(vars(value))
+        return Usage.model_validate(value, strict=True)
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def _timestamp_form(cls, value: Any) -> datetime:
+        """Accept datetime/ISO forms without Pydantic's epoch-number inference."""
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError:
+                raise ValueError("ts must be an aware datetime or ISO timestamp") from None
+        if not isinstance(value, datetime):
+            raise ValueError("ts must be an aware datetime or ISO timestamp")
         return value
 
     @field_validator("ts")
@@ -137,6 +173,13 @@ class SpendRow(FrozenModel):
     def _utc_timestamp(cls, value: datetime) -> datetime:
         """Normalize an already validated aware timestamp."""
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _consistent_cost(self) -> Self:
+        """Prevent duplicate cost carriers from disagreeing."""
+        if self.usage.usd is not None and self.usage.usd != self.cost_usd:
+            raise ValueError("usage.usd conflicts with cost_usd")
+        return self
 
 
 class GatewayAdapter(Protocol):
@@ -215,12 +258,24 @@ class GatewayAdapter(Protocol):
 
     async def block_key(self, key: VirtualKey) -> None:
         """
-        Prevent the key from authorizing new requests.
+        Prevent new requests with an idempotent key operation.
 
         Parameters
         ----------
         key : VirtualKey
             Durable key identity.
+
+        Returns
+        -------
+        None
+            Success, including a key already blocked, deleted or missing.
+
+        Raises
+        ------
+        GatewayError
+            Closure could not be confirmed, including transient transport/server
+            failures. Adapters normalize already-closed responses to success;
+            consumers never parse exception messages to decide idempotency.
 
         Examples
         --------
@@ -242,7 +297,17 @@ class GatewayAdapter(Protocol):
         Returns
         -------
         datetime or None
-            Aware UTC closure time, or None when closure is unconfirmed.
+            Aware UTC confirmation time when the API confirms blocked or deleted,
+            including an archived HTTP 200 response with ``status="deleted"`` or
+            a definitive key-info 404. Use the observation time when the API has
+            no reliable closure timestamp; never fabricate an earlier time.
+            None means the key is still open or closure is unconfirmed.
+
+        Raises
+        ------
+        GatewayError
+            A transport, server or malformed-response failure prevents inspection.
+            Such a failure is not proof of closure or key absence.
 
         Examples
         --------
@@ -272,6 +337,9 @@ class GatewayAdapter(Protocol):
         list of SpendRow
             Validated rows from every page. Incomplete or capped responses fail
             with GatewayError; a successful read does not prove terminal spend.
+            Each row retains its upstream ``api_key`` as ``key_id``. The adapter
+            requires ``row.key_id == key.key_id`` and raises GatewayError on a
+            mismatch; never substitute the queried key or return a partial total.
 
         Examples
         --------
@@ -283,12 +351,25 @@ class GatewayAdapter(Protocol):
 
     async def delete_key(self, key: VirtualKey) -> None:
         """
-        Delete the key without discarding its historical spend identity.
+        Delete the key with an idempotent operation, retaining spend identity.
 
         Parameters
         ----------
         key : VirtualKey
             Durable key identity.
+
+        Returns
+        -------
+        None
+            Success, including a key already blocked, deleted or missing. A
+            blocked but existing key is still deleted; closed is not absent.
+
+        Raises
+        ------
+        GatewayError
+            Deletion could not be confirmed, including transient transport/server
+            failures. Already-deleted responses are normalized to success, so
+            retries after a crash need no exception-message parsing.
 
         Examples
         --------
