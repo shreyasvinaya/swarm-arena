@@ -278,10 +278,12 @@ async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    workers: list[threading.Thread] = []
     daemon: list[bool] = []
     completed: list[bool] = []
 
     def score(goal: Goal, candidate: Candidate) -> Score:
+        workers.append(threading.current_thread())
         daemon.append(threading.current_thread().daemon)
         started.set()
         try:
@@ -309,7 +311,9 @@ async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
         assert judge_ctx.errors == {}
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
 
 
 async def test_candidate_mutation_does_not_leak_to_later_members(

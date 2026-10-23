@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import EngineEnv, take_over_retrying
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, write_then_sleep
@@ -1956,7 +1957,7 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
             assert not resolved["stuck-b"].is_set(), "slot expiry cancelled its peer"
             assert not task.done()
             scopes["stuck-b"].deadline = anyio.current_time()
-            out = await task
+            out = await observe_task(task)
         assert resolved["stuck-b"].is_set()
         assert not release.is_set()
         assert all(worker.is_alive() for worker in workers)
@@ -1968,10 +1969,12 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("flag", ["run_budget", "goal_budget"])

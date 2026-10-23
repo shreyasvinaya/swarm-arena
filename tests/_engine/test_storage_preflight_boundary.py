@@ -6,6 +6,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import RunConfig
@@ -61,12 +62,14 @@ async def test_storage_preflight_keeps_caller_cancellation(
             assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
-            await task
+            await observe_task(task)
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()

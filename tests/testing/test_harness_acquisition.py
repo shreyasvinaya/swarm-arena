@@ -6,6 +6,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.lease_acquisition import HeldOwnerResponse
 from _fakes.tools import GOAL, NoopManager
 
@@ -107,11 +108,12 @@ async def test_conformance_acquisition_supervision(
         held.held.release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             assert await anyio.to_thread.run_sync(held.held.exited.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     await held.assert_released()
     assert setups == calls == []

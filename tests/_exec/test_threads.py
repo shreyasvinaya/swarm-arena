@@ -31,8 +31,10 @@ async def test_cancel_stops_waiting_and_drops_the_thread() -> None:
     release = threading.Event()
     entered = threading.Event()
     finished = threading.Event()
+    workers: list[threading.Thread] = []
 
     def blocked() -> None:
+        workers.append(threading.current_thread())
         entered.set()
         try:
             assert release.wait(180), "test did not release the held thread"
@@ -53,7 +55,12 @@ async def test_cancel_stops_waiting_and_drops_the_thread() -> None:
         assert not finished.is_set()  # the awaiting side returned while the thread still ran
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        try:
+            assert await anyio.to_thread.run_sync(finished.wait, 60)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
 
 
 def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,6 +12,8 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 pytest.importorskip("agents")
 
@@ -43,6 +45,8 @@ from swarm_arena.llm import AgentsSDKManager, BudgetExceeded
 from swarm_arena.manager import AgentContext, LimitReached, Manager, RoundReport
 from swarm_arena.testing import FakeModel, FakeTurn
 from swarm_arena.tool import Action, Usage
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 class Inputs(FrozenModel):
@@ -195,10 +199,10 @@ async def test_cancel_mid_call_charges_reservation_in_full(tmp_path: Path, nativ
                         await fake.entered.wait()
                     task.cancel()
                     with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
                 finally:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await settle_tasks(task)
             else:
                 async with anyio.create_task_group() as tasks:
                     tasks.start_soon(AgentsSDKManager(model="opus").run_round, context())
@@ -242,7 +246,7 @@ async def test_round_timeout_charges_the_cut_call_without_waiting(
             (timer,) = timers
             timer.deadline = anyio.current_time()
             with anyio.fail_after(30), pytest.raises(LimitReached) as e:
-                await task
+                await observe_task(task)
             (call,) = run.calls()
             assert e.value.limit == "round_timeout_s"
             assert timer.cancel_called
@@ -252,7 +256,7 @@ async def test_round_timeout_charges_the_cut_call_without_waiting(
             assert scope.call_ids == [call.id]
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 async def test_alias_without_manager_role_fails_before_any_call(tmp_path: Path) -> None:
@@ -460,7 +464,7 @@ async def test_manager_waits_for_controlled_late_callback(tmp_path: Path) -> Non
             assert run.calls() == []
             release.set()
             with anyio.fail_after(60):
-                assert (await task).summary == "tried lr 0.01"
+                assert (await observe_task(task)).summary == "tried lr 0.01"
                 await fake.flush()
             (call,) = run.calls()
             assert call.error is None
@@ -468,8 +472,10 @@ async def test_manager_waits_for_controlled_late_callback(tmp_path: Path) -> Non
             assert scope.call_ids == [call.id]
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 @pytest.mark.parametrize("never", [False, True])
@@ -535,15 +541,17 @@ async def test_cancel_while_draining_still_settles(
                 await draining.wait()
             task.cancel()
             with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             (call,) = run.calls()
             assert call.error is not None
             assert call.error.startswith("estimated:")
             assert run.charged(scope).usd == call.cost_usd
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 async def test_concurrent_managers_keep_action_links_local(tmp_path: Path) -> None:
@@ -622,12 +630,12 @@ def test_fresh_process_resume_installs_the_call_logger(
             with anyio.fail_after(60):
                 done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
                 if task in done:
-                    await task
+                    await observe_task(task)
                     pytest.fail("run finished before the second-round pause")
         finally:
             task.cancel()
             waiter.cancel()
-            await asyncio.gather(task, waiter, return_exceptions=True)
+            await settle_tasks(task, waiter)
         assert swarm.run_id is not None
         return swarm.run_id
 
@@ -711,7 +719,7 @@ async def test_real_action_control_beats_round_timer(
                 assert not task.done(), "round returned while its action was unwinding"
                 release.set()
                 with pytest.raises(RuntimeError) as caught:
-                    await task
+                    await observe_task(task)
             expected = _SignalCategory.TERMINAL if kind == "cleanup" else _SignalCategory.FENCED
             assert _core_category(caught.value) is expected
             assert finished.is_set()
@@ -722,9 +730,11 @@ async def test_real_action_control_beats_round_timer(
             release.set()
             if not task.done():
                 task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            with anyio.fail_after(60):
-                await finished.wait()
+            try:
+                await settle_tasks(task)
+            finally:
+                with anyio.fail_after(60):
+                    await finished.wait()
 
 
 @pytest.mark.parametrize("kind", ["cleanup", "fence"])
@@ -790,9 +800,9 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
                 release.set()
                 if owner == "task":
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
                 else:
-                    await task
+                    await observe_task(task)
                     assert cancelled.is_set()
             assert finished.is_set()
             assert len(fake.calls) == 1
@@ -800,9 +810,11 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
             release.set()
             if not task.done():
                 task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            with anyio.fail_after(60):
-                await finished.wait()
+            try:
+                await settle_tasks(task)
+            finally:
+                with anyio.fail_after(60):
+                    await finished.wait()
 
 
 @pytest.mark.parametrize("swallow", [False, True])
@@ -855,7 +867,7 @@ async def test_real_action_round_expiry_is_an_ordinary_limit(
                 assert not task.done(), "round returned while its action was unwinding"
                 release.set()
                 with pytest.raises(LimitReached) as caught:
-                    await task
+                    await observe_task(task)
             assert _core_category(caught.value) is _SignalCategory.LIMIT
             assert caught.value.limit == "round_timeout_s"
             assert drained == [True], "manager drain returned before action unwind"
@@ -865,7 +877,7 @@ async def test_real_action_round_expiry_is_an_ordinary_limit(
             release.set()
             if not task.done():
                 task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -974,11 +986,11 @@ async def test_caller_cancellation_wins_over_terminal_drain(
                 await fake.entered.wait()
             task.cancel()
             with anyio.fail_after(60), pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             assert len(run.calls()) == 1
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 async def test_delayed_manager_setup_keeps_engine_round_deadline(

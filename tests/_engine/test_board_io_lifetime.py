@@ -10,6 +10,7 @@ import anyio
 import pytest
 from _engine.test_goal import _curation_checkpoint, _plan
 from _engine.test_round import _round, _runner
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import EngineEnv
 
 from swarm_arena._board.arena import ArenaView
@@ -97,11 +98,13 @@ async def test_blocked_io_does_not_retain_goal(
             assert not (Path(env.store.url) / page_key).exists()
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
-        assert await anyio.to_thread.run_sync(exited.wait, 60)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 60)
+        try:
+            await settle_tasks(task)
+        finally:
+            assert await anyio.to_thread.run_sync(exited.wait, 60)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 60)
     assert exited.is_set()
     assert all(
         not worker.is_alive() for worker in workers if worker.name.startswith("swarm-arena-daemon-")

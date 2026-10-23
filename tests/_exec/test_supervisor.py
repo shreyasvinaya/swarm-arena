@@ -12,13 +12,17 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.proc import THREADED, pid_alive, require_visible_proc, wait_for_file, wait_until
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.procinfo import ExitWatch, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._model.tooling import CompletedRun, RunStatus
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 # A grandchild that ignores SIGTERM (so only the group SIGKILL ends it); the tool waits until the
 # grandchild has installed the ignore, writes its pid to gc.pid, and sleeps.
@@ -295,7 +299,7 @@ async def test_stop_returns_early_when_group_is_gone(
             scope.deadline = float("-inf")
         if not task.done():
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await settle_tasks(task)
 
 
 async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit criterion
@@ -358,7 +362,7 @@ async def test_blocked_before_kill_is_bounded(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await settle_tasks(task)
 
 
 async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> None:
@@ -665,6 +669,7 @@ async def test_safety_net_reap_does_not_block_the_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     entered, release = threading.Event(), threading.Event()
+    returned = threading.Event()
 
     def no_watch(pid: int) -> ExitWatch:
         raise OSError(errno.EMFILE, "Too many open files")
@@ -680,8 +685,11 @@ async def test_safety_net_reap_does_not_block_the_loop(
 
         def held_wait(timeout: float | None = None) -> int:
             entered.set()
-            assert release.wait(180)
-            return real_wait(timeout)
+            try:
+                assert release.wait(180)
+                return real_wait(timeout)
+            finally:
+                returned.set()
 
         monkeypatch.setattr(proc, "wait", held_wait)
 
@@ -701,6 +709,8 @@ async def test_safety_net_reap_does_not_block_the_loop(
                     await call(tmp_path, py("open('ran', 'w')"))
     finally:
         release.set()
+        # This call uses AnyIO's reusable pool, whose thread is not test-owned.
+        assert await anyio.to_thread.run_sync(returned.wait, 60)
     assert not pid_alive(pids[0])
     assert not (tmp_path / "ran").exists()
 

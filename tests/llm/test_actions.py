@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 
 pytest.importorskip("agents")
 
@@ -406,7 +407,7 @@ async def test_real_owner_cancellation_beats_timer_and_unwind_control(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
     assert raised == [kind]
     assert len(model.calls) == 1
 
@@ -880,13 +881,12 @@ async def test_schema_hooks_run_in_abandonable_preparation() -> None:
         assert not finished.is_set()
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert finished.is_set()
 
 
@@ -915,7 +915,7 @@ async def test_real_caller_cancellation_is_not_a_tool_result(swallow: bool) -> N
             task.result()
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 async def test_untrusted_cancellation_is_sanitized() -> None:
@@ -1078,12 +1078,12 @@ async def test_returned_action_serialization_is_abandonable(ctx_env: CtxEnv) -> 
         assert not finished.is_set()
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert finished.is_set()
 
 

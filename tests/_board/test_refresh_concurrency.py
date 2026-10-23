@@ -1,5 +1,6 @@
 """Fixed views remain usable while another goal refreshes shared journal state."""
 
+import asyncio
 from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Timer
@@ -8,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.journals import FakeRun
 
 from swarm_arena import Goal
@@ -86,10 +88,10 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
             await anyio.sleep(0.01)
 
     timer = Timer(30, release.set)
+    refresh_task = asyncio.create_task(refresh())
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(heartbeat)
-            group.start_soon(refresh)
             assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()  # Escape even if the regression blocks the loop itself.
             try:
@@ -112,14 +114,19 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 assert not completed.is_set()
             finally:
                 release.set()
-                await completed.wait()
-                group.cancel_scope.cancel()
+                try:
+                    await observe_task(refresh_task)
+                finally:
+                    group.cancel_scope.cancel()
     finally:
         release.set()
-        timer.cancel()
-        if timer.ident is not None:
-            timer.join(60)
-        board.close()
+        try:
+            await settle_tasks(refresh_task)
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                timer.join(60)
+            board.close()
 
 
 @pytest.mark.parametrize("phase", ["pointers", "journal", "ingest"])
@@ -232,9 +239,9 @@ async def test_public_board_reads_use_published_state_during_refresh(
             await anyio.sleep(0.01)
 
     timer = Timer(30, release.set)
+    refresh_task = asyncio.create_task(refresh())
     try:
         async with anyio.create_task_group() as group:
-            group.start_soon(refresh)
             group.start_soon(heartbeat)
             assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()
@@ -251,15 +258,20 @@ async def test_public_board_reads_use_published_state_during_refresh(
                 assert not finished.is_set()
             finally:
                 release.set()
-                await finished.wait()
-                group.cancel_scope.cancel()
+                try:
+                    await observe_task(refresh_task)
+                finally:
+                    group.cancel_scope.cancel()
         assert board.best(key, 1, judge="j")[0].id == "new"
     finally:
         release.set()
-        timer.cancel()
-        if timer.ident is not None:
-            timer.join(60)
-        board.close()
+        try:
+            await settle_tasks(refresh_task)
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                timer.join(60)
+            board.close()
 
 
 @pytest.mark.parametrize("published", [False, True])

@@ -9,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.leases import force_take_over
 from _fakes.run import all_events, plan
 
@@ -104,13 +105,14 @@ async def test_inherited_read_ends_without_late_entry(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        if successor is not None:
-            successor.release()
+            if successor is not None:
+                successor.release()
     assert returned.is_set()
     assert not any(event.type == "takeover" for event in all_events(config))
     owner = read_owner(store)
@@ -245,7 +247,7 @@ async def test_takeover_clock_uses_inherited_head(
         assert checkpoint >= earlier + 50
         release.set()
         with anyio.fail_after(60):
-            result = await task
+            result = await observe_task(task)
         assert list(result) == ["g"]
         assert observed
         assert len(clocks) == 1
@@ -255,8 +257,9 @@ async def test_takeover_clock_uses_inherited_head(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             await old.resumed._services._aclose(failed=True)
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)

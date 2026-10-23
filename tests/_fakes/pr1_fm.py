@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from _fakes.cleanup import settle_tasks
 from pydantic import BaseModel
 
 from swarm_arena import Goal, Score, ScriptTool
@@ -89,10 +90,8 @@ class Broken(Manager):
                 finally:
                     if not task.done():
                         task.cancel()
-                        from contextlib import suppress
 
-                        with suppress(asyncio.CancelledError):
-                            await task
+                        await settle_tasks(task)
             try:
                 await ctx.call_action("broken", {})
             except Fenced:

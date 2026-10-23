@@ -7,11 +7,12 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
-from threading import Lock, get_ident
+from threading import Lock, Thread, current_thread, get_ident
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.leases import force_take_over
 
 from swarm_arena._errors import (
@@ -63,6 +64,7 @@ class FlakyStore(Store):
         self.lock = Lock()
         self.create_started: anyio.Event | None = None
         self.create_release: ThreadEvent | None = None
+        self.held_workers: list[Thread] = []
         self.token = anyio.lowlevel.current_token()
         for key, data in (prewrite or {}).items():
             inner.create(key, data)
@@ -97,6 +99,7 @@ class FlakyStore(Store):
             if self.create_started is not None:
                 anyio.from_thread.run_sync(self.create_started.set, token=self.token)
             if self.create_release is not None:
+                self.held_workers.append(current_thread())
                 assert self.create_release.wait(180)
             time.sleep(self.create_delay_s)
             if self.create_raises is not None:
@@ -254,7 +257,7 @@ async def test_native_cancel_wakes_durable_waiters_and_refuses_later_appends(
                     assert task is not None
                     task.cancel(secret)
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
                     for event in finished:
                         await event.wait()
                 assert task.cancelled()
@@ -284,7 +287,7 @@ async def test_native_cancel_wakes_durable_waiters_and_refuses_later_appends(
                 for waiter in waiters:
                     waiter.cancel()
                 with anyio.CancelScope(shield=True):
-                    await asyncio.gather(*waiters, return_exceptions=True)
+                    await settle_tasks(*waiters)
 
 
 async def test_commits_run_one_at_a_time(tmp_path: Path) -> None:
@@ -845,14 +848,16 @@ async def test_expiry_during_create_prevents_head_advance(
                 assert flaky.create_calls == 1
                 lease_clock.expire(w)
                 with pytest.raises(Fenced):
-                    await waiter
+                    await observe_task(waiter)
             assert not returned.is_set(), "expiry waited for the held create"
         finally:
             flaky.create_release.set()
-            assert await anyio.to_thread.run_sync(returned.wait, 60)
-            if not waiter.done():
-                waiter.cancel()
-            await asyncio.gather(waiter, return_exceptions=True)
+            try:
+                await settle_tasks(waiter)
+            finally:
+                for worker in flaky.held_workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
     assert flaky.replace_calls == 0
     assert w.committed == ()
 
@@ -1091,8 +1096,9 @@ async def test_blocked_publication_expires_without_late_state_change(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
                     await anyio.to_thread.run_sync(worker.join, 60)
@@ -1158,8 +1164,9 @@ async def test_settlement_timeout_bounds_the_release_attempt(
         unblock.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()

@@ -17,9 +17,11 @@ from swarm_arena import Ref, RunConfig, Swarm
 @pytest.fixture(autouse=True)
 def reset_board(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     act = LifecycleBoard._act
+    workers: list[threading.Thread] = []
 
     def held_act(board: LifecycleBoard, mode: str) -> None:
         if mode == "block":
+            workers.append(threading.current_thread())
             board.entered.set()
             assert board.release.wait(180), "test did not release board"
         else:
@@ -30,8 +32,13 @@ def reset_board(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     LifecycleBoard.entered.clear()
     LifecycleBoard.release.clear()
     LifecycleBoard.closed.clear()
-    yield
-    LifecycleBoard.release.set()
+    try:
+        yield
+    finally:
+        LifecycleBoard.release.set()
+        for worker in workers:
+            worker.join(60)
+            assert not worker.is_alive()
 
 
 def configured(config: RunConfig, tmp_path: Path, **modes: str) -> RunConfig:

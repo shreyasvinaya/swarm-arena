@@ -7,6 +7,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.run import plan
 from _fakes.secrecy import assert_secret_absent
 
@@ -85,8 +86,9 @@ async def test_completion_export_observes_remaining_run_time(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -145,8 +147,9 @@ async def test_driver_signal_abandons_journal_publication(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -194,8 +197,9 @@ async def test_graceful_stop_abandons_goal_solution_storage(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()

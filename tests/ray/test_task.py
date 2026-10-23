@@ -17,8 +17,10 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.dependencies import ray_dependency
 from _fakes.proc import pid_alive, wait_until
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import RELEASE, WORKER_SCRIPTS, _write_module, make_job
 
@@ -46,6 +48,8 @@ from swarm_arena.ray._task import (
     run_in_worker,
     run_job,
 )
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 def _job(script: str = "report_env.py", *, args: list[str] | None = None, **kw: Any) -> Job:
@@ -642,13 +646,12 @@ async def test_cancel_preparation_never_launches_and_retains_workspace(
         assert not (tmp_path / "launched").exists()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert entered.is_set()
     assert (tmp_path / "late").exists()
     assert not (tmp_path / "launched").exists()
@@ -707,13 +710,12 @@ async def test_cancel_publication_is_data_only_and_no_next_object(
         assert len(writes) == 1
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert len(writes) == 1
 
 
@@ -761,13 +763,12 @@ async def test_pending_cancel_beats_collector_control(
         assert worker.partial.status == RunStatus.CANCELLED
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
 
 
 def test_run_job_retains_abandoned_collector_workspace(

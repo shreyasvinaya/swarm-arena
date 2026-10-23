@@ -8,6 +8,7 @@ from typing import Any
 import anyio
 import pytest
 from _engine.test_resume import _finished_without_round_page
+from _fakes.cleanup import settle_tasks
 
 from swarm_arena import RunConfig, Swarm
 from swarm_arena._journal.lease import read_owner
@@ -53,11 +54,13 @@ async def test_resume_page_storage_abandons_cancelled_owner(
         assert owner[0].expires_at <= utc_now()
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
-        assert await anyio.to_thread.run_sync(exited.wait, 60)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 60)
+        try:
+            await settle_tasks(task)
+        finally:
+            assert await anyio.to_thread.run_sync(exited.wait, 60)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 60)
     assert read_owner(store) == owner
     if site == "exists":
         assert not (Path(store.url) / PAGE).exists()

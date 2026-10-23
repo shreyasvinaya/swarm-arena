@@ -4,7 +4,6 @@ import json
 import re
 import socket
 from collections.abc import Generator, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from http.client import HTTPConnection
@@ -18,6 +17,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import pytest
+from _fakes.cleanup import BoundedThreadPoolExecutor
 from _fakes.journals import FakeRun, add_pointer
 
 from swarm_arena._board.arena import ArenaBoard
@@ -277,7 +277,7 @@ def test_refresh_is_throttled_and_synchronized(
             return response.read().decode()
 
     try:
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with BoundedThreadPoolExecutor(max_workers=4) as pool:
             assert all("Learning" in body for body in pool.map(fetch, range(8)))
         assert len(calls) == 1
         server.run.commit(server.run.learning("L-new", "Newly published", evidence=["c-child"]))
@@ -439,7 +439,7 @@ def test_loopback_startup_does_not_wait_for_reverse_dns(
         return "localhost"
 
     monkeypatch.setattr(socket, "getfqdn", stalled_lookup)
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with BoundedThreadPoolExecutor(max_workers=1) as pool:
         starting = pool.submit(make_server, server.board, ["toy"], author="alice", port=0)
         try:
             http = starting.result(timeout=30)
@@ -471,7 +471,7 @@ def test_refresh_never_blocks_published_gets(
         assert "Learning" in get(site, "/")
         monkeypatch.setattr(arena, "read_owner", read_owner)
         clock[0] = 106.0
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with BoundedThreadPoolExecutor(max_workers=2) as pool:
             refreshing = pool.submit(get, site, "/")
             try:
                 assert entered.wait(60)
@@ -500,7 +500,7 @@ def test_response_write_does_not_block_other_gets(
             original(self, status, body, location=location)
 
         monkeypatch.setattr(handler, "_reply", reply)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with BoundedThreadPoolExecutor(max_workers=2) as pool:
             writing = pool.submit(get, site, "/learning/L-1", timeout=360)
             try:
                 assert entered.wait(60)
@@ -674,7 +674,7 @@ def test_llm_get_retains_calls_during_refresh_and_close(
 
     monkeypatch.setattr(_ArenaReader, method, held)
     monkeypatch.setattr(server.board._lifetime, "stop", stopping)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with BoundedThreadPoolExecutor(max_workers=2) as pool:
         pending = pool.submit(get, server, path, timeout=360)
         close = None
         try:

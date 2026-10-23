@@ -1,7 +1,6 @@
 """Regression coverage for approval, convergence estimates and bounded shutdown."""
 
 import asyncio
-import contextlib
 import traceback
 from collections.abc import Sequence
 from functools import partial
@@ -10,7 +9,9 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import take_over_retrying, with_limits
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, wait_tool_started
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, RecordingExecutor
@@ -26,6 +27,8 @@ from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.tooling import CompletedRun, Estimate, ToolOutput, ToolRequest, Usage
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 SECRET = "c672c04b-19af-4b0b-9a06-9d047ecf811f"
 
@@ -285,8 +288,7 @@ async def test_shutdown_preserves_approval_refusal(
     finally:
         if not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await settle_tasks(task)
 
 
 @pytest.mark.parametrize("takeover", [False, True])
@@ -348,11 +350,12 @@ async def test_hung_shutdown_returns_original_result_or_real_fence(
             result = task.result()
             assert len(result["g"]) == 1
     finally:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Fenced):
-                await task
-        await LocalExecutor.aclose(executor)
+        try:
+            if not task.done():
+                task.cancel()
+                await settle_tasks(task)
+        finally:
+            await LocalExecutor.aclose(executor)
 
 
 async def test_shutdown_timeout_keeps_result_when_close_unwinding_raises(

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 from _fakes.admission import SENTINEL as BOUNDARY_SECRET
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import (
@@ -2623,7 +2624,7 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
         assert await anyio.to_thread.run_sync(held.entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         assert not held.exited.is_set(), "cancellation waited for the held upload"
         assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         await held.finish()
@@ -2632,8 +2633,7 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
         await held.finish()
         if not task.done():
             task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
+            await settle_tasks(task)
 
 
 @pytest.mark.parametrize("count", [4, 24])
@@ -2757,7 +2757,7 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
             assert await anyio.to_thread.run_sync(held.entered.wait, 60)
             task.cancel()
             with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             assert not held.exited.is_set(), "cancellation waited for held preparation"
             await held.finish()
         else:
@@ -2771,7 +2771,7 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
             await held.finish()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 def test_providers_without_gateway_warns() -> None:

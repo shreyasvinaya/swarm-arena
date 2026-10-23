@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.dependencies import ray_dependency
 from _fakes.engine import with_executor, with_limits
 from _fakes.finished import FinishedRun
@@ -2601,8 +2602,7 @@ async def model_resume_run(
                 pytest.fail("seed finished before the round-two checkpoint")
         finally:
             task.cancel()
-            with anyio.fail_after(60):
-                await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         assert task.cancelled()
     return config, LocalStore(Path(config.run_root) / "model-resume")
 

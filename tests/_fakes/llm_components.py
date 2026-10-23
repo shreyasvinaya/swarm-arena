@@ -7,6 +7,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from agents import AgentOutputSchemaBase, Handoff, ModelResponse, ModelSettings, Tool
 from agents.items import TResponseInputItem
 from agents.models.interface import ModelTracing
@@ -194,11 +195,12 @@ class LateFakeModel(FakeModel):
 
     async def aclose(self) -> None:
         """Cancel and join outstanding callbacks without leaking tasks."""
-        for task in self.callbacks:
-            task.cancel()
-        if self.callbacks:
-            await asyncio.gather(*self.callbacks, return_exceptions=True)
-        self.callbacks.clear()
+        if self.release is not None:
+            self.release.set()
+        try:
+            await settle_tasks(*self.callbacks)
+        finally:
+            self.callbacks.clear()
 
 
 def missing_callback_timeout(patch: pytest.MonkeyPatch) -> None:

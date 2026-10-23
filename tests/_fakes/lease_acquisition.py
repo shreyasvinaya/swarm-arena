@@ -8,6 +8,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.llm_run import HeldOperation
 
 from swarm_arena._engine import run as run_module
@@ -58,9 +59,11 @@ class HeldOwnerResponse:
         """Release the worker and join the owner, including failure cleanup."""
         if not task.done():
             task.cancel()
-        await self.held.finish()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        self.held.release.set()
+        try:
+            await settle_tasks(task)
+        finally:
+            await self.held.finish()
 
     async def assert_released(self) -> None:
         """Observe late cleanup and an expired durable owner document."""

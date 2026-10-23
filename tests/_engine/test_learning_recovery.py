@@ -6,6 +6,7 @@ from typing import ClassVar
 import anyio
 import pytest
 from _engine.test_goal import _plan
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import EngineEnv
 
 from swarm_arena import Ref
@@ -80,7 +81,7 @@ async def test_resumed_round_restores_only_own_learnings(
             await RecoverLearning.ready.wait()
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
     await env.deps.journal.commit()
     state = RunState.from_events(env._events())
     assert len(state.learnings) == 2

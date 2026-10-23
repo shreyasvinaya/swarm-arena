@@ -9,9 +9,11 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import take_over_retrying, with_executor, with_limits
 from _fakes.finished import FinishedRun, run_again
 from _fakes.leases import force_take_over
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
@@ -29,6 +31,8 @@ from swarm_arena._model.results import LLMCall
 from swarm_arena._model.tooling import Estimate
 from swarm_arena._store.local import LocalStore
 from swarm_arena.manager import AgentContext, RoundReport
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -2787,11 +2791,10 @@ async def test_run_end_reconcile_preserves_control_and_storage_failures(
                     await entered.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
             finally:
                 task.cancel()
-                with anyio.fail_after(60):
-                    await asyncio.gather(task, return_exceptions=True)
+                await settle_tasks(task)
         else:
             expected = RuntimeError if failure == "control_group" else type(error)
             with pytest.raises(expected):

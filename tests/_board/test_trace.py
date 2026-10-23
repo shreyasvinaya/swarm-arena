@@ -1,12 +1,12 @@
 from collections import Counter
 from collections.abc import Generator, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event as ThreadEvent
 from typing import Any
 
 import pytest
+from _fakes.cleanup import BoundedThreadPoolExecutor
 from _fakes.finished import FinishedRun
 from _fakes.journals import START, FakeRun, add_pointer
 
@@ -478,7 +478,7 @@ def test_trace_does_not_hold_board_lock_during_cache_reads(
 
     monkeypatch.setattr(cache, "_citing_learning_ids", blocked)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with BoundedThreadPoolExecutor(max_workers=1) as pool:
             result = pool.submit(trace, board, "target")
             acquired = False
             try:
@@ -623,7 +623,7 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
         expected = trace(board, "target")
         monkeypatch.setattr(board, "_prepare_published", blocked)
         monkeypatch.setattr(board, "_pin_state", counted_capture)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with BoundedThreadPoolExecutor(max_workers=2) as pool:
             refreshed = pool.submit(board.frontier)
             try:
                 assert entered.wait(60)
@@ -655,7 +655,7 @@ def test_trace_pins_its_generation_against_concurrent_close(tmp_path: Path) -> N
         assert release.wait(300)
         return candidates(self, *args, **kwargs)
 
-    with pytest.MonkeyPatch.context() as patched, ThreadPoolExecutor(max_workers=2) as pool:
+    with pytest.MonkeyPatch.context() as patched, BoundedThreadPoolExecutor(max_workers=2) as pool:
         patched.setattr(ArenaCache, "candidates", paused)
         result = pool.submit(trace, board, "c-1")
         try:
@@ -912,7 +912,7 @@ def test_trace_cli_core_only_uses_producer_root(
     wrong.commit(_record(_call(wrong, "wrong-session", "planner")))
     path = tmp_path / "run.toml"
     path.write_text(config.dumps())
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with BoundedThreadPoolExecutor(max_workers=1) as executor:
         code = executor.submit(
             Context().run,
             main,

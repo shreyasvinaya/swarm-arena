@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import EngineEnv
 from _fakes.planners import SequencePlanner
 from _fakes.run import all_events, events, plan
@@ -111,14 +112,14 @@ async def test_public_replanner_preserves_real_caller_cancellation(run_config: R
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
         assert task.cancelled()
         assert not events(run_config, "plan_rejected")
     finally:
         if not task.done():
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            await settle_tasks(task)
+            assert task.cancelled()
 
 
 @pytest.mark.parametrize("kind", ["base", "ordinary_group", "mixed_group", "cancelled"])

@@ -9,7 +9,9 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.proc import wait_for_file
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, make_job
 
@@ -22,6 +24,8 @@ from swarm_arena._tooling.staging import edit_hashes, put_edits
 from swarm_arena.executor import Job
 from swarm_arena.testing import read_logs, read_output_file
 from swarm_arena.tool import Command, CompletedRun, FileRef, RunStatus, ToolOutput, ToolRequest
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 EDITS = {"p.txt": "hello", "q.txt": "sha256:hello"}
 SECRET = "f810e652-43d2-4555-8280-90e395b4ee31"
@@ -402,14 +406,15 @@ async def test_cancel_nonlocal_publication_starts_no_next_object(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         assert published == [b"one"]
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -447,13 +452,14 @@ async def test_live_request_await_is_abandonable(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -505,9 +511,9 @@ async def test_abandoned_collector_retains_its_workspace(
             if stop == "cancel":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             else:
-                output = await task
+                output = await observe_task(task)
                 assert output.status == (
                     RunStatus.TIMEOUT if stop == "timeout" else RunStatus.ERROR
                 )
@@ -517,12 +523,13 @@ async def test_abandoned_collector_retains_its_workspace(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert (workspaces[0] / "late-collect").read_text() == "retained"
 
 
@@ -607,16 +614,17 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
             if stop == "cancel":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             else:
                 with pytest.raises(RuntimeError, match="terminal test"):
-                    await task
+                    await observe_task(task)
     finally:
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
-        await executor.aclose()
+        try:
+            await settle_tasks(task)
+        finally:
+            await executor.aclose()
     assert collected == [True]
     assert list((tmp_path / "ws").iterdir()) == []
 
@@ -730,12 +738,13 @@ async def test_caller_cancellation_owns_collector_outcome(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
 
 
 @pytest.mark.parametrize("stop", [False, True])
@@ -843,18 +852,19 @@ async def test_abandoned_publication_retains_workspace(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         assert workspaces[0].is_dir(), "workspace removed while publication still owns it"
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert len(workers) == 1
     assert (workspaces[0] / "late-publication").read_text() == "retained"
 
@@ -893,14 +903,15 @@ async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         assert runner.publication_finished
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -1128,8 +1139,10 @@ async def test_cancelled_report_read_never_starts_upload(
     finally:
         held.release.set()
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await held.finish()
+        try:
+            await settle_tasks(task)
+        finally:
+            await held.finish()
 
 
 async def test_partial_delivery_strips_report_reference(
@@ -1210,18 +1223,19 @@ async def test_abandoned_report_operation_retains_workspace(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
         with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         assert workspaces[0].is_dir(), "workspace removed while report operation still owns it"
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert len(workers) == 1
     assert (workspaces[0] / "late-report").read_text() == "retained"
 

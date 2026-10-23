@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -614,7 +615,7 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -622,10 +623,12 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 async def test_formatter_input_refusal_preserves_first_charge(

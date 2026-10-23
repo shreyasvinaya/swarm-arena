@@ -9,15 +9,16 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import pytest
+from _fakes.proc import wait_until
 from _fakes.run import plan
 from _fakes.tools import PyTool
 
 from swarm_arena import RunConfig
-from swarm_arena._exec.procinfo import group_has_live_member
+from swarm_arena._exec.procinfo import group_has_live_member, host_id, process_start_time
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._model.canonical import utc_now
@@ -509,6 +510,34 @@ def _wait_started(process: subprocess.Popen[bytes], root: Path, *, epoch: int) -
     pytest.fail("no committed tool_start before timeout")
 
 
+@contextmanager
+def _reap_recorded_tools(root: Path) -> Generator[None]:
+    """Reap the held tools even when the CLI fails before its normal stop path."""
+    try:
+        yield
+    finally:
+        for directory in root.iterdir() if root.exists() else ():
+            if not directory.is_dir():
+                continue
+            read = read_committed(LocalStore(directory))
+            if read is None:
+                continue
+            for event in read[1]:
+                if event.type != "tool_start":
+                    continue
+                started = event.payload["started"]
+                pid = started["pid"]
+                if (
+                    started["host_id"] == host_id()
+                    and started["pgid"] == pid
+                    and started["start_time"] is not None
+                    and process_start_time(pid) == started["start_time"]
+                ):
+                    with suppress(ProcessLookupError):
+                        os.killpg(pid, signal.SIGKILL)
+                    assert wait_until(lambda pid=pid: not group_has_live_member(pid), 60)
+
+
 @pytest.mark.parametrize("command", ["run", "resume"])
 def test_sigint_during_active_work_cleans_up(
     inputs: tuple[Path, Path],
@@ -524,25 +553,26 @@ def test_sigint_during_active_work_cleans_up(
     )
     argv = ["run", "--yes", str(config_path), str(plan_path)]
     root = Path(run_config.run_root)
-    if command == "resume":
-        # A real interrupted run supplies committed state for the resume process.
+    with _reap_recorded_tools(root):
+        if command == "resume":
+            # A real interrupted run supplies committed state for the resume process.
+            with _child(argv, cli_env) as (process, _):
+                store = _wait_started(process, root, epoch=1)
+                process.send_signal(signal.SIGINT)
+                process.communicate(timeout=60)
+            argv = ["resume", str(next(root.iterdir()))]
         with _child(argv, cli_env) as (process, _):
-            store = _wait_started(process, root, epoch=1)
+            store = _wait_started(process, root, epoch=2 if command == "resume" else 1)
             process.send_signal(signal.SIGINT)
-            process.communicate(timeout=60)
-        argv = ["resume", str(next(root.iterdir()))]
-    with _child(argv, cli_env) as (process, _):
-        store = _wait_started(process, root, epoch=2 if command == "resume" else 1)
-        process.send_signal(signal.SIGINT)
-        stdout, stderr = process.communicate(timeout=60)
-        assert process.returncode == 130, (stdout, stderr)
-        assert stderr == b"interrupted\n"
-    owner = read_owner(store)
-    assert owner is not None
-    assert owner[0].expires_at <= utc_now()
-    read = read_committed(store)
-    assert read is not None
-    starts = [e for e in read[1] if e.type == "tool_start"]
-    assert starts
-    for event in starts:
-        assert not group_has_live_member(event.payload["started"]["pgid"])
+            stdout, stderr = process.communicate(timeout=60)
+            assert process.returncode == 130, (stdout, stderr)
+            assert stderr == b"interrupted\n"
+        owner = read_owner(store)
+        assert owner is not None
+        assert owner[0].expires_at <= utc_now()
+        read = read_committed(store)
+        assert read is not None
+        starts = [e for e in read[1] if e.type == "tool_start"]
+        assert starts
+        for event in starts:
+            assert not group_has_live_member(event.payload["started"]["pgid"])

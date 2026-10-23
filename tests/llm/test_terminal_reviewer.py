@@ -17,6 +17,8 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 pytest.importorskip("agents")
 
@@ -27,6 +29,8 @@ from swarm_arena import Goal, Plan
 from swarm_arena.llm import Approve, CollaborativePlanner, Edited, Feedback, LLMPlanner
 from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
 
@@ -50,7 +54,7 @@ def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
         finally:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            process.wait(timeout=60)
     evidence = json.loads(stdout)
     assert evidence.pop("pid") > 0
     assert evidence == {
@@ -297,11 +301,11 @@ async def test_editor_restores_real_tty_on_every_exit(
             assert not termios.tcgetattr(slave)[3] & termios.ICANON
             if exit_path in {"success", "failure"}:
                 released.write_text("exit")
-                await task
+                await observe_task(task)
             elif exit_path in {"cancel", "stubborn"}:
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             else:
                 (directory,) = await anyio.to_thread.run_sync(
                     lambda: list(Path(config.run_root).iterdir())
@@ -315,7 +319,7 @@ async def test_editor_restores_real_tty_on_every_exit(
                         LocalStore(directory), owner_id="replacement", host="test", ttl_s=60
                     )
                 with pytest.raises(Fenced if exit_path == "fence" else RuntimeError):
-                    await task
+                    await observe_task(task)
             after = termios.tcgetattr(slave)
             # The kernel may set its pending-input bookkeeping bit on restore.
             after[3] &= ~getattr(termios, "PENDIN", 0)
@@ -326,18 +330,20 @@ async def test_editor_restores_real_tty_on_every_exit(
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
     finally:
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        if pid is not None:
-            with suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        if replacement is not None:
-            replacement.release()
-        os.dup2(original_stdin, 0)
-        os.close(original_stdin)
-        os.close(master)
-        os.close(slave)
+        try:
+            if task is not None:
+                task.cancel()
+                await settle_tasks(task)
+        finally:
+            if pid is not None:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            if replacement is not None:
+                replacement.release()
+            os.dup2(original_stdin, 0)
+            os.close(original_stdin)
+            os.close(master)
+            os.close(slave)
 
 
 async def test_approve() -> None:
@@ -590,7 +596,7 @@ async def test_terminal_cancellation_restores_descriptor() -> None:
             finally:
                 if not task.done():
                     task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                await settle_tasks(task)
             assert scope.cancel_called
             assert os.get_blocking(reader)
             os.write(writer, b"a\n")

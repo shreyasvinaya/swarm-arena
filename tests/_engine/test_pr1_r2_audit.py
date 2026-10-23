@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Any, cast
 
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.pr1_r2 import SECRET, failure
 from _fakes.run import plan
 from _fakes.tools import cand
@@ -458,7 +459,5 @@ async def test_offline_harness_preserves_native_caller_cancel(
     finally:
         if not task.done():
             task.cancel()
-            from contextlib import suppress
 
-            with suppress(BaseException):
-                await task
+            await settle_tasks(task)

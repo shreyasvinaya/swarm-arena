@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, get_ident
 from typing import Any
@@ -12,6 +11,7 @@ from typing import Any
 import anyio
 import pytest
 from _engine.test_pr1_fm_outcomes import config
+from _fakes.cleanup import BoundedThreadPoolExecutor
 
 from swarm_arena import Swarm
 from swarm_arena.tool import Estimate
@@ -122,7 +122,7 @@ def test_serializer_marker_is_published_atomically(
         return original_write(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", paused_write)
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with BoundedThreadPoolExecutor(max_workers=1) as pool:
         result = pool.submit(fake.BlockingScore.maximize(1.0).model_dump)
         try:
             assert opened.wait(60), "serializer did not start publishing"

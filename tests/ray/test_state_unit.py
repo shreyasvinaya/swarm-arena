@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.dependencies import ray_dependency
 from _fakes.secrecy import assert_secret_absent
 
@@ -501,13 +502,12 @@ async def test_held_rpc_is_abandonable_and_cannot_start_next_lookup(
         assert not finished.is_set()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 60)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert not rpc["calls"]
 
 
