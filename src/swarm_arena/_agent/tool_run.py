@@ -1,11 +1,13 @@
 """Validate, reserve, execute, and durably publish one agent tool request."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Awaitable, Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import anyio
 
@@ -30,7 +32,7 @@ from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._gateway.adapter import GatewayError
-from swarm_arena._gateway.keys import REPLACED_KEYS, KeyRecord, gateway_job, needs_key
+from swarm_arena._gateway.keys import REPLACED_KEYS, gateway_job, needs_key
 from swarm_arena._journal.a2a import agent_task_id, task_to_json, tool_run_task
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
@@ -73,6 +75,9 @@ from swarm_arena._tooling.staging import (
     validate_edits,
 )
 from swarm_arena._tooling.tool import effective_tool_timeout, tool_grace
+
+if TYPE_CHECKING:
+    from swarm_arena._gateway.keys import KeyRecord
 
 FINGERPRINT_TIMEOUT_S = 10.0
 """Maximum seconds to await the optional fingerprint hook before recording null."""

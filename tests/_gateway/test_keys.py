@@ -367,9 +367,7 @@ async def test_restore_refuses_missing_creation_fields(tmp_path: Path, missing: 
         incomplete = events[0].model_copy(
             update={
                 "payload": {
-                    key: value
-                    for key, value in events[0].payload.items()
-                    if key != missing
+                    key: value for key, value in events[0].payload.items() if key != missing
                 }
             }
         )

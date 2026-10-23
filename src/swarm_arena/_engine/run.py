@@ -1,5 +1,7 @@
 """Approve and execute one run with shared budgets and durable ownership."""
 
+from __future__ import annotations
+
 import asyncio
 import importlib
 import os
@@ -51,9 +53,6 @@ from swarm_arena._errors import (
 )
 from swarm_arena._exec.executor import Executor, schedule_timeout_scope
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport
-from swarm_arena._gateway.keys import KeyManager
-from swarm_arena._gateway.litellm_proxy import adapter_for
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
 from swarm_arena._journal.llm_record import _bound_run, drain
@@ -84,6 +83,8 @@ from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 if TYPE_CHECKING:
     from swarm_arena._engine.resume import ResumeState
+    from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+    from swarm_arena._gateway.keys import KeyManager
 
 
 _run_setups: list[Callable[[RunConfig], None]] = []
@@ -270,7 +271,7 @@ class _RunJournal(JournalWriter):
 
     clock: RunClock | None = None
 
-    async def __aenter__(self) -> "_RunJournal":
+    async def __aenter__(self) -> _RunJournal:
         await super().__aenter__()
         return self
 
@@ -499,6 +500,8 @@ async def _prepare_gateway(config: RunConfig) -> _GatewaySetup | None:
     """Resolve credentials and verify policy before ownership or publication."""
     if config.llm_gateway is None:
         return None
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
     adapter = adapter_for(config.llm_gateway, os.environ)
     cap, profile = await gateway_preflight(config, adapter)
     manifest = _GatewayManifest(
@@ -522,6 +525,8 @@ def _bind_gateway(
     """
     if setup is None:
         return None
+    from swarm_arena._gateway.keys import KeyManager
+
     assert config.llm_gateway is not None
     return KeyManager(
         setup.adapter,
@@ -567,7 +572,7 @@ class RunRunner:
         run_id: str | None,
         approve: Callable[[Estimate, Sequence[str]], Awaitable[bool]] | None,
         replanner: Planner | None,
-        resumed: "ResumeState | None" = None,
+        resumed: ResumeState | None = None,
     ) -> None:
         self.config, self.plans = config, list(plans)
         self.run_id, self.approve, self.replanner = run_id, approve, replanner
@@ -1292,6 +1297,7 @@ async def _read_gateway(
     """Record informational spend under the existing owner, reporting safe failures."""
     if gateway is None:
         return
+    from swarm_arena._gateway.adapter import GatewayError
     from swarm_arena._gateway.keys import _read_deadline
     from swarm_arena._gateway.reports import GatewayKeyFailure
 

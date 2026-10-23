@@ -22,6 +22,17 @@ PUBLIC = (
 OPTIONAL = ("agents", "litellm", "ray", "s3fs", "langfuse", "a2a")
 
 
+def test_core_import_does_not_load_gateway_transport() -> None:
+    code = """
+import sys
+import swarm_arena
+assert 'swarm_arena._gateway.litellm_proxy' not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )
+
+
 @pytest.mark.parametrize("missing", ["openai-agents", "litellm"])
 @pytest.mark.parametrize(
     "entry", ["import", "FakeModel", "FakeTurn", "ref", "validate", "snapshot"]
