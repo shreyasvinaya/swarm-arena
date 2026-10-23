@@ -9,7 +9,7 @@ from pathlib import Path
 
 import anyio
 
-from swarm_arena._errors import _core_error, _exception_type_name, _rebuild_core_signal
+from swarm_arena._errors import ConfigError, _core_error, _exception_type_name, _rebuild_core_signal
 
 _RAY_EXTRA_HINT = (
     "submit needs the 'ray' extra: uv add "
@@ -64,7 +64,7 @@ async def _reconcile_async(args: argparse.Namespace) -> None:
     )
     config = config.model_copy(update={"run_root": str(args.run_dir.parent)})
     if config.llm_gateway is None:
-        raise _core_error(ValueError, "reconcile requires llm_gateway")
+        raise _core_error(ConfigError, "llm_gateway")
     adapter = adapter_for(config.llm_gateway, os.environ)
     executor = await _start_executor(config)
     failed, hard = True, False

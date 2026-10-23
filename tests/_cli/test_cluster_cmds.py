@@ -90,7 +90,7 @@ def test_reconcile_cmd_missing_gateway_is_safe(
     run_dir.mkdir()
     (run_dir / "run.toml").write_text(RunConfig().dumps())
     assert main(["reconcile", str(run_dir)]) == 1
-    assert "requires llm_gateway" in capsys.readouterr().err
+    assert capsys.readouterr().err == "llm_gateway\n"
 
 
 def test_submit_without_yes_exits_2(capsys: pytest.CaptureFixture[str]) -> None:

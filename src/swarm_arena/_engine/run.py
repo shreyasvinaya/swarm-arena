@@ -988,11 +988,7 @@ class RunRunner:
         assert head is not None
         chain = await _read_chain(deps.store, head)
         events = [event for _, batch in chain for event in batch]
-        margin = min(0.1, deps.config.settle_timeout_s / 10)
-        deadline = min(
-            anyio.current_time() + deps.config.settle_timeout_s,
-            anyio.current_effective_deadline() - margin,
-        )
+        deadline = _gateway_deadline(deps.journal)
         await reconcile_keys(
             events,
             run_id=deps.run_id,
@@ -1164,6 +1160,24 @@ async def _finish_queued_goal(
     )
 
 
+def _gateway_deadline(journal: JournalWriter, *, timeout_s: float | None = None) -> float:
+    """Bound external gateway work without spending durable completion's allowance."""
+    allowance = journal._settle_timeout_s
+    if timeout_s is not None:
+        allowance = min(allowance, timeout_s)
+    # Reserve time before an inherited deadline to publish the diagnostic. Only
+    # HTTP is timed: healthy durable recording retains its existing supervisor.
+    margin = min(0.05, journal._settle_timeout_s / 10)
+    deadline = min(
+        anyio.current_time() + allowance,
+        anyio.current_effective_deadline() - margin,
+        journal._closing_at - margin,
+    )
+    if journal._io_scope is not None:
+        deadline = min(deadline, journal._io_scope.deadline - margin)
+    return deadline
+
+
 async def _read_gateway(
     journal: JournalWriter, gateway: KeyManager | None, *, goal_id: str | None = None
 ) -> None:
@@ -1183,16 +1197,7 @@ async def _read_gateway(
         ]
     if not records:
         return
-    # Reserve time before an inherited deadline to publish the diagnostic. Only
-    # HTTP is timed: healthy durable recording retains its existing supervisor.
-    margin = min(0.05, journal._settle_timeout_s / 10)
-    deadline = min(
-        anyio.current_time() + journal._settle_timeout_s,
-        anyio.current_effective_deadline() - margin,
-        journal._closing_at - margin,
-    )
-    if journal._io_scope is not None:
-        deadline = min(deadline, journal._io_scope.deadline - margin)
+    deadline = _gateway_deadline(journal)
     token = _read_deadline.set(deadline)
     try:
         try:

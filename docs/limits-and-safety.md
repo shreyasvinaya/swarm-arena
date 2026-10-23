@@ -212,7 +212,9 @@ It reads that run's `run.toml` by default; `--config PATH` selects an override.
 The command prints each candidate, key alias, reserved USD, spend USD and label.
 It checks storage conditional-write support (including an `s3://` run root)
 before takeover, refuses a live owner, and holds the run lease while publishing
-its report. The driver also attempts reconciliation before its final commit,
+its report. Recorded gateway keys require the original gateway URL (userinfo
+is ignored); a missing or changed binding is refused before takeover and
+rechecked after acquisition. The driver also attempts reconciliation before its final commit,
 using its existing owner and gateway profile. Gateway failures are recorded
 without failing completion; storage failures and ownership loss still propagate.
 
@@ -244,7 +246,11 @@ micro-dollar are refused. A later reconcile can add late rows and update the
 report; readers retain their captured committed snapshot until refreshed.
 Reconciliation never refunds reservations, changes a live run's budget, or
 restarts the paid-work clock. Gateway waits have a separate bounded allowance;
-healthy journal storage is not charged against that external-work timer.
+healthy journal storage is not charged against that external-work timer. The
+allowance is at most `settle_timeout_s` and `request_timeout_s`, capped before
+inherited cancellation and writer closing/I/O deadlines. Run-end reads and
+reconciliation finish before the final completion allowance is armed. Failure
+events include the nonsecret key and candidate IDs for later recovery.
 
 A key created just before the open deadline but never journaled is unusable
 (its bearer never left the driver), expires after `key_duration_s`, and is not

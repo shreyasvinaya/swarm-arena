@@ -97,8 +97,8 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
     return events, RunState.from_events(events)
 
 
-def _check(state: RunState, config: RunConfig) -> list[str]:
-    """Reject intrinsic limit incompatibilities without mutating authority."""
+def _check_gateway_binding(state: RunState, config: RunConfig) -> None:
+    """Keep every journaled key attached to its original gateway without values."""
     if any(event.type == EventType.GATEWAY_KEY for event in state._events):
         old_gateway, new_gateway = state.config.llm_gateway, config.llm_gateway
         if old_gateway is None or new_gateway is None:
@@ -113,6 +113,11 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
 
         if binding(old_gateway.url) != binding(new_gateway.url):
             raise _core_error(ConfigError, "llm_gateway")
+
+
+def _check(state: RunState, config: RunConfig) -> list[str]:
+    """Reject intrinsic limit incompatibilities without mutating authority."""
+    _check_gateway_binding(state, config)
     for name in ("max_tokens", "max_usd"):
         old, new = getattr(state.config.limits, name), getattr(config.limits, name)
         if new is not None and (old is None or new < old):

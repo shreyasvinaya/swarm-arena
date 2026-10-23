@@ -11,27 +11,29 @@ import anyio
 
 from swarm_arena._budget.amount import Amount, _micro_units
 from swarm_arena._engine.preflight import check_storage
-from swarm_arena._engine.resume import _take_over
+from swarm_arena._engine.resume import _check_gateway_binding, _take_over
 from swarm_arena._engine.run import (
     _close_stop_watcher,
+    _gateway_deadline,
     _local_journal_path,
     _supervise_initialization,
     _supervise_writer,
 )
 from swarm_arena._engine.stops import StopState
-from swarm_arena._errors import Fenced, LeaseHeld, _core_error
+from swarm_arena._errors import ConfigError, Fenced, LeaseHeld, _core_error
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport, SpendRow
 from swarm_arena._gateway.keys import _CLOCK_SKEW, KeyManager, KeyRecord, _virtual, gateway_call_id
 from swarm_arena._gateway.labels import _observation_label
 from swarm_arena._gateway.reports import (
     GatewayKeyAction,
+    GatewayKeyFailure,
     KeyReport,
     ReconcileReport,
     _report_usd,
 )
 from swarm_arena._journal.event import Event, EventDraft, EventType
-from swarm_arena._journal.lease import Lease
+from swarm_arena._journal.lease import Lease, OwnerDoc
 from swarm_arena._journal.llm_record import _bound_run, record_call
 from swarm_arena._journal.reader import _read_segment, read_chain
 from swarm_arena._journal.replay import RunState
@@ -76,6 +78,14 @@ async def _external(operation: Callable[[], Awaitable[_T]], deadline: float) -> 
 def _key_event(
     journal: JournalWriter, record: KeyRecord, action: GatewayKeyAction, **fields: Any
 ) -> None:
+    payload = {
+        "action": action,
+        "key_id": record.key_id,
+        "candidate_id": record.candidate_id,
+        **fields,
+    }
+    if action in {"read_failed", "close_failed"}:
+        payload = GatewayKeyFailure.model_validate(payload).model_dump(mode="json")
     journal.append(
         EventDraft(
             type=EventType.GATEWAY_KEY,
@@ -84,12 +94,7 @@ def _key_event(
             agent=record.agent,
             round=record.round,
             task_id=record.candidate_id,
-            payload={
-                "action": action,
-                "key_id": record.key_id,
-                "candidate_id": record.candidate_id,
-                **fields,
-            },
+            payload=payload,
         )
     )
 
@@ -208,8 +213,10 @@ async def reconcile_keys(
     now : callable, default=utc_now
         Aware wall clock for closure waits and fixed query windows.
     _deadline : float or None, optional
-        Private shared external-work deadline. By default allow at most
-        request_timeout_s; it never wraps healthy recorder or journal storage.
+        Private shared external-work deadline. The allowance is at most the
+        smaller of request_timeout_s and the writer settlement timeout, capped
+        before inherited, closing and I/O deadlines. It never wraps healthy
+        recorder or journal storage.
 
     _manager : KeyManager or None, optional
         Existing run key owner; maintenance constructs one when absent.
@@ -226,7 +233,9 @@ async def reconcile_keys(
     0.0
     """
     journal._check_open()
-    deadline = anyio.current_time() + gateway.request_timeout_s if _deadline is None else _deadline
+    deadline = _gateway_deadline(journal, timeout_s=gateway.request_timeout_s)
+    if _deadline is not None:
+        deadline = min(deadline, _deadline)
     manager = (
         _manager
         if _manager is not None
@@ -284,7 +293,7 @@ async def reconcile_keys(
                 await _external(partial(adapter.block_key, key), deadline)
                 closure = await _external(partial(adapter.closed_at, key), deadline)
             except GatewayError:
-                _key_event(journal, record, "close_failed", error="gateway closure failed")
+                _key_event(journal, record, "close_failed", error="gateway closure unconfirmed")
             else:
                 if closure is not None:
                     _key_event(journal, record, "closed", closed_at=closure.isoformat())
@@ -340,14 +349,12 @@ async def reconcile_keys(
                             observed = None
                             break
             if reasons:
-                _key_event(
-                    journal, record, "read_failed", error="gateway reconciliation incomplete"
-                )
+                _key_event(journal, record, "read_failed", error="gateway read incomplete")
             elif record.key_id not in deleted:
                 try:
                     await _external(partial(adapter.delete_key, key), deadline)
                 except GatewayError:
-                    _key_event(journal, record, "read_failed", error="gateway deletion failed")
+                    _key_event(journal, record, "read_failed", error="gateway read incomplete")
                 else:
                     deleted.add(record.key_id)
                     _key_event(journal, record, "deleted")
@@ -410,6 +417,19 @@ async def take_run(
     """
     await _validated_io(check_storage, config)
     store = await _storage_io(lambda: open_store(config.run_root).child(run_id))
+
+    def validate(doc: OwnerDoc) -> None:
+        events = (
+            []
+            if doc.head is None
+            else [
+                event
+                for _, batch in read_chain(store, doc.head, _read=partial(_read_segment, store))
+                for event in batch
+            ]
+        )
+        _check_gateway_binding(RunState.from_events(events), config)
+
     stops = StopState() if _stops is None else _stops
     lease: Lease | None = None
     delivered = False
@@ -424,6 +444,7 @@ async def take_run(
             stops=stops,
             allow_empty_head=True,
             owner_id=owner_id,
+            validate=validate,
         )
         head = lease.doc.head
         writer = JournalWriter(
@@ -446,6 +467,8 @@ async def take_run(
                     validated=True,
                 )
                 events = [event for _, batch in chain for event in batch]
+            state = await _validated_io(RunState.from_events, events)
+            _check_gateway_binding(state, config)
             completed = True
         if not completed:
             raise _core_error(RuntimeError, "reconcile stopped")
@@ -501,7 +524,7 @@ async def reconcile_run(
     """
     gateway = config.llm_gateway
     if gateway is None:
-        raise _core_error(ValueError, "reconcile requires llm_gateway")
+        raise _core_error(ConfigError, "llm_gateway")
     stops = StopState()
     try:
         lease, events, writer = await take_run(
@@ -539,7 +562,7 @@ async def reconcile_run(
                     state=state,
                     _maintenance_lease=lease,
                 ):
-                    deadline = anyio.current_time() + gateway.request_timeout_s
+                    deadline = _gateway_deadline(writer, timeout_s=gateway.request_timeout_s)
                     try:
                         profile = await _external(adapter.preflight, deadline)
                     except GatewayError:
