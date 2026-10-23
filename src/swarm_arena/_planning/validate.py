@@ -20,6 +20,7 @@ from swarm_arena._errors import (
     PlanError,
     _core_error,
     _exception_type_name,
+    _rebuild_core_signal,
 )
 from swarm_arena._exec.threads import _DaemonCall
 from swarm_arena._model.base import LLMRole, Origin
@@ -119,7 +120,13 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
     except BaseException as error:
         error = _classify_outcome(error)
         _raise_terminal(error)
-        raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
+        raise _core_error(PlanError, [f"{pointer}: {_admission_diagnostic(error)}"]) from None
+
+
+def _admission_diagnostic(error: BaseException) -> str:
+    """Preserve vetted configuration messages, hiding arbitrary exception values."""
+    restored = _rebuild_core_signal(error)
+    return str(restored) if isinstance(restored, ConfigError) else _exception_type_name(error)
 
 
 def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
@@ -1170,7 +1177,7 @@ def admit_revision(
     except BaseException as error:
         error = _classify_outcome(error)
         _raise_terminal(error)
-        raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
+        raise _core_error(PlanError, [f"/snapshot: {_admission_diagnostic(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )

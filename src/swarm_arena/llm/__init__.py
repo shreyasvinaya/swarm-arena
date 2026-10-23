@@ -2,14 +2,15 @@
 
 import importlib.metadata
 
-_MSG = "swarm_arena.llm needs the 'llm' extra: pip install 'swarm-arena[llm]'"
+from swarm_arena._model.ref import _LLM_EXTRA_HINT as _MSG
+
 _EXTRA_DEPS = ("agents", "litellm")
 
 for _dist, _module in (("openai-agents", "agents"), ("litellm", "litellm")):
     try:
         importlib.metadata.version(_dist)
-    except importlib.metadata.PackageNotFoundError as _exc:
-        raise ModuleNotFoundError(_MSG, name=_module) from _exc
+    except importlib.metadata.PackageNotFoundError:
+        raise ModuleNotFoundError(_MSG, name=_module) from None
 
 try:
     from swarm_arena.llm import _catalog as _catalog  # noqa: I001
@@ -19,7 +20,7 @@ try:
     import agents as _agents  # noqa: F401
 except ModuleNotFoundError as _exc:
     if _exc.name in _EXTRA_DEPS:
-        raise ModuleNotFoundError(_MSG, name=_exc.name) from _exc
+        raise ModuleNotFoundError(_MSG, name=_exc.name) from None
     raise
 
 from swarm_arena._facade import publish as _publish

@@ -30,6 +30,11 @@ from swarm_arena._model.data import TomlJsonObject
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._outcomes import _classify_outcome, _propagate_control, _raise_terminal
 
+_LLM_EXTRA_HINT = (
+    "swarm_arena.llm needs the 'llm' extra: "
+    'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+)
+
 
 class EmptyConfig(_SafeModel):
     """
@@ -189,6 +194,13 @@ def load_object(path: str) -> object:
         raise
     except BaseException as error:
         _propagate_control(error)
+        if (
+            path.partition(":")[0] == "swarm_arena.llm"
+            and type(error) is ModuleNotFoundError
+            and error.name in {"agents", "litellm"}
+            and str(error) == _LLM_EXTRA_HINT
+        ):
+            raise _core_error(ConfigError, _LLM_EXTRA_HINT) from None
         raise ValueError(f"cannot import {path}") from None
     return obj
 

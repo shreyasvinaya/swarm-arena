@@ -73,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Lazy `FakeModel` and `FakeTurn` helpers replay isolated offline LLM
   conversations, capture SDK inputs, and record exact catalog-priced usage
-  through the real journal and reservation settlement path.
+  through the real journal and reservation settlement path. Missing LLM extras
+  retain one safe installation hint through lazy imports and plan admission.
 - Per-call LLM settings with tracking metadata, Claude prompt-cache points,
   per-role response-cache controls, complete probe bypass and replayable cache origins.
 

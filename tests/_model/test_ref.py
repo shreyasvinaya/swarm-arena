@@ -601,6 +601,18 @@ def test_reference_of_omits_absent_typed_defaults() -> None:
     assert ref.build(LocalExecutor).config == LocalExecutor().config
 
 
+def test_untrusted_missing_llm_import_keeps_values_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "untrusted-module-secret-sentinel"
+
+    def fail(name: str) -> object:
+        raise ModuleNotFoundError(secret, name="agents")
+
+    monkeypatch.setattr(importlib, "import_module", fail)
+    with pytest.raises(ValueError, match=r"cannot import swarm_arena\.llm:LLMJudge") as caught:
+        load_object("swarm_arena.llm:LLMJudge")
+    assert_secret_absent(caught.value, secret, sanitized=True)
+
+
 def test_reference_of_never_drops_explicit_null_with_nonnull_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

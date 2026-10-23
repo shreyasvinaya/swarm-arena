@@ -26,6 +26,7 @@ _LAZY = ("FakeModel", "FakeTurn")
 def __getattr__(name: str) -> Any:
     if name not in _LAZY:
         raise AttributeError(name)
+    _importlib.import_module("swarm_arena.llm")
     obj = getattr(_importlib.import_module("swarm_arena.testing._fake_model"), name)
     globals()[name] = obj
     _publish(__name__, [name])
