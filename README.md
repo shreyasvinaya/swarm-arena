@@ -21,7 +21,9 @@
 Full offline swarm runs, scripted managers, pruning, convergence, and resumable
 run journals work today, alongside tools, checks, judges, `LocalExecutor`, and the
 `swarm_arena.testing` conformance kit. Model-driven managers and judge panels are
-available with the `llm` extra.
+available with the `llm` extra. The `ray` extra adds cluster execution and Ray Job
+submission; an optional LiteLLM gateway records tool-internal calls and supports
+post-run spend reconciliation. See [Running on Ray](docs/running-on-ray.md).
 
 ## Quickstart
 

@@ -9,17 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Gateway end-to-end coverage for normal, converge and resumed tool runs, key
-  isolation and reconciliation, with cluster gateway and connector setup guidance.
+- Public `swarm_arena.ray.RayExecutor` and the `[ray]` extra provide resource-aware
+  cluster scheduling, bounded recovery and two-step cancellation with data-only
+  partial results. Hash-checked files travel through Ray's object store for local
+  artifact roots or through shared S3 storage, with cluster and connector guides.
+
+- `swarm-arena submit` launches an unattended driver through Ray Jobs, with explicit
+  approval, working-directory and dependency packaging, and bounded submission.
+
+- Optional LLM gateway keys per LLM-calling tool run, strict-profile preflight,
+  full-reservation charging and recorded cap labels. The pinned LiteLLM profile
+  supports soft caps and estimated spend only; requiring a hard cap fails preflight.
 
 - `swarm-arena reconcile RUN_DIR` reports gateway spend under the run lease,
   with conservative death evidence, exact deduplicated totals and a bounded
-  run-end attempt; the pinned LiteLLM profile retains estimated reservations.
+  run-end attempt. Labels are `estimated`, `observed (completeness unverified)`
+  and `observed`; the pinned LiteLLM profile retains estimated reservations.
 
-- Ray conformance and Rosenbrock integration coverage for object-store file transport,
-  with worker setup, recovery limits and connector CI instructions.
+- `ScriptTool` and `FunctionTool` expose provider declarations through
+  `providers()` and their `providers` setting for gateway key selection and
+  provider-aware validation.
 
-- Public `swarm_arena.ray.RayExecutor` with resource-aware scheduling, bounded cluster-bound recovery, hash-checked artifact transport and two-step cancellation with data-only partial results.
+- Tools can report informational LLM calls through bounded `swarm/llm_calls.jsonl`
+  files, with validated rows, deduplication and call-source labels on candidates.
 
 - Rosenbrock examples with LLM managers and an advisory judge panel, plus offline
   exit tests for exact call accounting, replay and a model-managed final slice.
