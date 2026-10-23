@@ -786,7 +786,7 @@ async def _run(
         await rt.journal.append_durable(
             _draft(
                 rt,
-                EventType.TOOL_START,
+                EventType.TOOL_DISPATCH if event.kind == "dispatch" else EventType.TOOL_START,
                 candidate_id=id,
                 reservation_id=res.id,
                 started=event.model_dump(mode="json"),

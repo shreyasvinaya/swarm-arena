@@ -68,6 +68,7 @@ from swarm_arena._planning.validate import admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store
 from swarm_arena._store.local import LocalStore
+from tests.ray.conftest import ray_driver as ray_driver
 
 _T = TypeVar("_T", bound=Configurable)
 
@@ -206,6 +207,8 @@ async def _crash(
     terminal: str | None = None,
     counters: dict[str, dict[str, int]] | None = None,
     command: bool = False,
+    dispatch: bool = False,
+    ray_job_id: str = "driver-1",
     charge: Amount | None = None,
     budget_usd: float = 1000,
     slice_usd: float = 10,
@@ -308,7 +311,9 @@ async def _crash(
                 reservation = await ledger.reserve(f"{g}/t/{agent}", charge, kind="tool", goal_id=g)
                 id = f"c{index}" if len(plans) == 1 else f"{g}-c{index}"
                 started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name=id if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id=id,
                     host_id="old-host:boot",
                     pid=999999,
@@ -317,7 +322,8 @@ async def _crash(
                 )
                 journal.append(
                     EventDraft(
-                        type="tool_start",
+                        type="tool_dispatch" if dispatch else "tool_start",
+                        task_id=id,
                         goal_id=g,
                         team="t",
                         agent=agent,
@@ -381,7 +387,9 @@ async def _crash(
                 id = f"lost-{g}-{agent}"
                 c.in_flight.append(id)
                 started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name=id if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id=id,
                     host_id="old-host:boot",
                     pid=999998,
@@ -390,7 +398,8 @@ async def _crash(
                 )
                 journal.append(
                     EventDraft(
-                        type="tool_start",
+                        type="tool_dispatch" if dispatch else "tool_start",
+                        task_id=id,
                         goal_id=g,
                         team="t",
                         agent=agent,
@@ -415,7 +424,9 @@ async def _crash(
                 )
             if command:
                 c.command_started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name="command1" if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id="command1",
                     host_id="old-host:boot",
                     pid=999997,
@@ -2978,3 +2989,150 @@ async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
     g_done = next(e.seq for e in events if e.type == "goal_finished" and e.goal_id == "g")
     h_start = next(e.seq for e in events if e.type == "goal_started" and e.goal_id == "h")
     assert g_done < h_start
+
+
+@pytest.mark.parametrize("confirmed", [True, False, "timeout", "late"])
+async def test_resume_marks_dispatch_lost_after_kill_orphan(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool | str,
+) -> None:
+    c = await _crash(tmp_path, run_config, recorders, dispatch=True)
+    source = next(e for e in _events(c, "tool_dispatch") if e.agent == "b")
+    calls: list[Job.Started] = []
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        calls.append(started)
+        if confirmed in {"timeout", "late"}:
+            try:
+                await anyio.sleep_forever()
+            except anyio.get_cancelled_exc_class():
+                if confirmed == "late":
+                    return True
+                raise
+        return confirmed is True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    if confirmed in {"timeout", "late"}:
+        c.config = c.config.model_copy(update={"settle_timeout_s": 2.0})
+    runner = await resume_run(c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None)
+    assert runner.resumed is not None
+    assert runner.resumed.orphans_killed == (c.in_flight if confirmed is True else [])
+    assert runner.resumed.ledger.remaining("g/t/b") == c.share - c.r1_amount
+    await runner.aclose()
+    assert calls == [Job.Started.model_validate(source.payload["started"])]
+    lost = _events(c, "run_lost")[0]
+    assert lost.payload["kind"] == "dispatch"
+    assert lost.payload["task_name"] == source.payload["started"]["task_name"]
+    assert lost.payload["confirmed_dead"] is (confirmed is True)
+    assert (lost.task_id, lost.goal_id, lost.team, lost.agent, lost.round) == (
+        source.task_id,
+        source.goal_id,
+        source.team,
+        source.agent,
+        source.round,
+    )
+    state = RunState.from_events(_events(c))
+    id = source.payload["candidate_id"]
+    reservation = source.payload["reservation_id"]
+    assert id in state.lost
+    assert id not in state.started
+    assert id not in state.candidates
+    assert state.reservations[reservation].state == "open"
+    assert _settle_for(c, reservation) is None
+
+
+async def test_resume_kills_dispatched_command_orphan(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    c = await _crash(
+        tmp_path, run_config, recorders, completed=(), lost=(), command=True, dispatch=True
+    )
+    calls: list[Job.Started] = []
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        calls.append(started)
+        return True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    for _ in range(2):
+        runner = await resume_run(
+            c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None
+        )
+        await runner.aclose()
+    assert calls == [c.command_started]
+    assert len(_events(c, "command_end")) == 1
+    assert RunState.from_events(_events(c)).started_commands == {}
+
+
+@pytest.mark.parametrize("durable", [False, True])
+async def test_resume_counts_dispatch_toward_tool_runs(
+    tmp_path: Path, run_config: RunConfig, recorders: dict[str, _Recorder], durable: bool
+) -> None:
+    c = await _crash(
+        tmp_path,
+        run_config,
+        recorders,
+        dispatch=True,
+        lost=(),
+        plans=[_plan(agents=("a",), rounds=1)],
+        counters={"a": {"turns": 1, "board_reads": 0, "tool_runs": 3}} if durable else None,
+    )
+    recorders["a"].requests = {1: [9.0]}
+    await Swarm(with_limits(c.config, max_tool_runs_per_round=3 if durable else 1)).resume(
+        c.run_id, force=True
+    )
+    assert recorders["a"].limits_hit == ["max_tool_runs_per_round"]
+    assert not [
+        e
+        for e in _events(c)
+        if e.epoch > 1 and e.agent == "a" and e.type in {"tool_start", "tool_dispatch"}
+    ]
+
+
+@pytest.mark.ray
+async def test_resume_dispatch_never_submitted_is_lost(
+    ray_cluster: str,
+    ray_driver: Any,
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+) -> None:
+    pytest.importorskip("swarm_arena.ray")
+    from swarm_arena.ray import RayExecutor
+
+    identity = RayExecutor()
+    try:
+        await identity.capacity()
+        driver_job_id = identity._driver_job_id
+        assert driver_job_id is not None
+    finally:
+        await identity.aclose()
+    c = await _crash(
+        tmp_path,
+        run_config,
+        recorders,
+        dispatch=True,
+        completed=(),
+        lost=("a",),
+        ray_job_id=driver_job_id,
+        plans=[_plan(agents=("a",), rounds=1)],
+    )
+    recorders["a"].requests = {}
+    config = c.config.model_copy(
+        update={"executor": Ref.of(RayExecutor(cancel_margin_s=1.0)), "lease_ttl_s": 3.0}
+    )
+    with anyio.fail_after(30):
+        await Swarm(config).resume(c.run_id, force=True)
+    lost = _events(c, "run_lost")[0]
+    assert lost.payload["confirmed_dead"] is False
+    state = RunState.from_events(_events(c))
+    assert c.in_flight[0] in state.lost
+    assert c.in_flight[0] not in state.started

@@ -387,7 +387,7 @@ class RunState:
                         "actual": deepcopy(payload["actual"]),
                     }
                 )
-            case EventType.TOOL_START:
+            case EventType.TOOL_START | EventType.TOOL_DISPATCH:
                 self.started[payload["candidate_id"]] = Job.Started.model_validate(
                     payload["started"]
                 )

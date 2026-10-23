@@ -2469,3 +2469,53 @@ async def test_report_fetch_refuses_large_local_blob_before_read(
     with pytest.raises(StorageError):
         await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
     assert reads == []
+
+
+class _DispatchSpy(_QueuedExecutor):
+    def __init__(self, env: RtEnv, *, close_first: str = "") -> None:
+        super().__init__(env.rt.executor)
+        self.env = env
+        self.close_first = close_first
+        self.committed_at_submit: list[str] | None = None
+        self.head_at_submit: Any = None
+
+    async def submit(self, job: Job) -> ToolOutput:
+        if self.close_first:
+            self.env.inflight.close(budget=self.close_first == "budget")
+        assert job.on_started is not None
+        await job.on_started(
+            Job.Started(kind="dispatch", job_id=job.id, task_name=job.id, ray_job_id="driver-1")
+        )
+        self.committed_at_submit = self.env.committed_types()
+        owner = read_owner(self.env.run_store)
+        assert owner is not None
+        self.head_at_submit = owner[0].head
+        return ToolOutput(status=RunStatus.OK, data={"y": 1.0})
+
+
+@pytest.mark.parametrize("close_first", ["", "budget"])
+async def test_dispatch_start_is_durable_before_submit(rt_env: RtEnv, close_first: str) -> None:
+    fake = _DispatchSpy(rt_env, close_first=close_first)
+    rt = dataclasses.replace(rt_env.rt, executor=fake)
+    candidate = await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert fake.committed_at_submit is not None
+    assert fake.committed_at_submit[-1] == "tool_dispatch"
+    intent = rt_env.events("tool_dispatch")[-1]
+    assert fake.head_at_submit.seq == intent.seq
+    assert intent.task_id == candidate.id
+    assert intent.payload["started"]["task_name"] == candidate.id
+    assert intent.payload["started"]["ray_job_id"] == "driver-1"
+    assert rt.started_runs == 1
+
+
+async def test_closed_admission_refuses_dispatch_before_intent(rt_env: RtEnv) -> None:
+    fake = _DispatchSpy(rt_env, close_first="hard")
+    rt = dataclasses.replace(rt_env.rt, executor=fake)
+    with pytest.raises(LimitReached) as err:
+        await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert err.value.limit == "stop"
+    assert fake.committed_at_submit is None
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert "tool_dispatch" not in rt_env.committed_types()
+    assert rt_env.charged(reservation) == Amount()
+    assert rt.started_runs == 0
