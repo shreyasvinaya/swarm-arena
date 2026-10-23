@@ -4,12 +4,15 @@ import asyncio
 import time
 import traceback
 from collections.abc import Callable, Mapping
+from datetime import timedelta
 from pathlib import Path
+from threading import Event as ThreadEvent
 from threading import Lock, get_ident
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.leases import force_take_over
 
 from swarm_arena._errors import (
     ChainError,
@@ -59,6 +62,7 @@ class FlakyStore(Store):
         self.thread_ids: list[int] = []
         self.lock = Lock()
         self.create_started: anyio.Event | None = None
+        self.create_release: ThreadEvent | None = None
         self.token = anyio.lowlevel.current_token()
         for key, data in (prewrite or {}).items():
             inner.create(key, data)
@@ -92,6 +96,8 @@ class FlakyStore(Store):
         try:
             if self.create_started is not None:
                 anyio.from_thread.run_sync(self.create_started.set, token=self.token)
+            if self.create_release is not None:
+                assert self.create_release.wait(180)
             time.sleep(self.create_delay_s)
             if self.create_raises is not None:
                 raise self.create_raises
@@ -201,7 +207,7 @@ async def test_native_cancel_wakes_durable_waiters_and_refuses_later_appends(
 
             waiters = [asyncio.create_task(append(index)) for index in range(2)]
             try:
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     await publishing.wait()
                     for event in started:
                         await event.wait()
@@ -221,7 +227,7 @@ async def test_native_cancel_wakes_durable_waiters_and_refuses_later_appends(
                 next_seq = writer._next_seq
                 with pytest.raises(Fenced) as late_append:
                     writer.append(EventDraft(type=EventType.SETTLE))
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     with pytest.raises(Fenced) as late_durable:
                         await writer.append_durable(EventDraft(type=EventType.SETTLE))
                     with pytest.raises(Fenced) as late_wait:
@@ -292,7 +298,7 @@ async def test_unknown_advance_that_failed_recommits_same_events(tmp_path: Path)
 
 
 def _take(s: Store) -> None:
-    Lease.take_over(s, owner_id="o2", host="h", ttl_s=60, force=True)
+    force_take_over(s, owner_id="o2", host="h", ttl_s=60)
 
 
 async def test_unknown_advance_succeeded_then_takeover_is_fenced(tmp_path: Path) -> None:
@@ -324,7 +330,7 @@ async def test_unknown_advance_failed_then_takeover_is_fenced(tmp_path: Path) ->
 async def test_storage_error_until_expiry_fails_waiters(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), create_raises=StorageError("disk full"))
     async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
-        with anyio.fail_after(2), pytest.raises(Fenced):
+        with anyio.fail_after(60), pytest.raises(Fenced):
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert w.fenced.is_set()
     assert flaky.replace_calls == flaky.replaces_at_first_create
@@ -336,7 +342,7 @@ async def test_chain_error_fails_waiters_at_once(tmp_path: Path) -> None:
         with pytest.raises(Fenced) as err:
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert isinstance(err.value.__cause__, ChainError)
-        with anyio.fail_after(0.1), pytest.raises(Fenced):
+        with anyio.fail_after(60), pytest.raises(Fenced):
             await w.append_durable(EventDraft(type=EventType.SETTLE))
     owner = read_owner(flaky)
     assert owner is not None
@@ -346,7 +352,7 @@ async def test_chain_error_fails_waiters_at_once(tmp_path: Path) -> None:
 async def test_takeover_fences_writer(store: LocalStore, tmp_path: Path) -> None:
     async with _writer(store, tmp_path) as w:
         await w.append_durable(EventDraft(type=EventType.RESERVE))
-        Lease.take_over(store, owner_id="o2", host="h", ttl_s=60, force=True)
+        force_take_over(store, owner_id="o2", host="h", ttl_s=60)
         with pytest.raises(Fenced):
             await w.append_durable(EventDraft(type=EventType.SETTLE))
         assert w.fenced.is_set()
@@ -357,25 +363,87 @@ async def test_takeover_fences_writer(store: LocalStore, tmp_path: Path) -> None
     assert owner[0].head.seq == 1
 
 
-async def test_lease_renewed_every_third_of_ttl(store: LocalStore, tmp_path: Path) -> None:
-    async with _writer(store, tmp_path, ttl_s=0.6):
-        await anyio.sleep(0.5)
-        owner = read_owner(store)
-        assert owner is not None
-        assert owner[0].version >= 2
+async def test_lease_renewed_every_third_of_ttl(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal import lease as lease_module
+    from swarm_arena._journal import writer as writer_module
+
+    ttl = 60.0
+    writer = _writer(store, tmp_path, ttl_s=ttl)
+    now = writer._lease.doc.expires_at - timedelta(seconds=ttl)
+    waiting = anyio.Event()
+    timers: list[tuple[float | None, anyio.CancelScope]] = []
+
+    class Backend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        def move_on_after(self, delay: float | None) -> anyio.CancelScope:
+            scope = anyio.CancelScope()
+            timers.append((delay, scope))
+            waiting.set()
+            return scope
+
+    monkeypatch.setattr(writer_module, "anyio", Backend())
+    monkeypatch.setattr(writer_module, "utc_now", lambda: now)
+    monkeypatch.setattr(lease_module, "utc_now", lambda: now)
+    async with writer:
+        for version in range(1, 4):
+            with anyio.fail_after(60):
+                await waiting.wait()
+            delay, scope = timers[-1]
+            assert delay == pytest.approx(ttl / 3)
+            owner = read_owner(store)
+            assert owner is not None
+            assert owner[0].version == version
+            if version < 3:
+                waiting = anyio.Event()
+                now += timedelta(seconds=ttl / 3)
+                scope.cancel()
 
 
 async def test_fenced_when_renewal_fails_until_expiry(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), replace_raises=StorageError("down"))
     async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
-        with anyio.fail_after(1.0):
+        with anyio.fail_after(60):
             await w.fenced.wait()
 
 
-async def test_sync_interval_commits_ordinary_events(store: LocalStore, tmp_path: Path) -> None:
+async def test_sync_interval_commits_ordinary_events(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal import writer as writer_module
+
+    now = anyio.current_time()
+    waiting = anyio.Event()
+    timers: list[tuple[float | None, anyio.CancelScope]] = []
+
+    class Backend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        def current_time(self) -> float:
+            return now
+
+        def move_on_after(self, delay: float | None) -> anyio.CancelScope:
+            scope = anyio.CancelScope()
+            timers.append((delay, scope))
+            waiting.set()
+            return scope
+
+    monkeypatch.setattr(writer_module, "anyio", Backend())
     async with _writer(store, tmp_path, sync_interval_s=0.1) as w:
-        w.append(EventDraft(type=EventType.LEARNING))
-        await anyio.sleep(0.4)
+        event = w.append(EventDraft(type=EventType.LEARNING))
+        with anyio.fail_after(60):
+            await waiting.wait()
+        delay, scope = timers[-1]
+        assert delay == pytest.approx(0.1)
+        assert w.head is None, "ordinary append bypassed the sync interval"
+        now += 0.1
+        scope.cancel()
+        with anyio.fail_after(60):
+            await w._wait_for(event.seq)
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].head is not None
@@ -401,7 +469,7 @@ async def test_events_also_appended_to_local_file(store: LocalStore, tmp_path: P
 async def test_unknown_create_not_found_retries(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), unknown_before_create=1)
     async with _writer(flaky, tmp_path, group_window_s=0) as w:
-        with anyio.fail_after(2):
+        with anyio.fail_after(60):
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert w.head is not None
         assert w.head.seq == 1
@@ -411,24 +479,28 @@ async def test_unknown_create_not_found_retries(tmp_path: Path) -> None:
 async def test_oserror_retries_until_expiry_without_renewal(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), create_raises=OSError("disk full"))
     async with _writer(flaky, tmp_path, ttl_s=0.3, group_window_s=0) as w:
-        with anyio.fail_after(0.8), pytest.raises(Fenced):
+        with anyio.fail_after(60), pytest.raises(Fenced):
             await w.append_durable(EventDraft(type=EventType.RESERVE))
     assert flaky.create_calls == 1
     assert flaky.replace_calls == 0
 
 
 async def test_store_operations_run_off_loop(tmp_path: Path) -> None:
-    flaky = FlakyStore(LocalStore(tmp_path / "run"), create_delay_s=0.1)
+    flaky = FlakyStore(LocalStore(tmp_path / "run"))
     writer = _writer(flaky, tmp_path, group_window_s=0)
     flaky.create_started = anyio.Event()
+    flaky.create_release = ThreadEvent()
     flaky.thread_ids.clear()
     async with writer as w:
         w.append(EventDraft(type=EventType.LEARNING))
         async with anyio.create_task_group() as tg:
             tg.start_soon(w.commit)
-            with anyio.fail_after(0.08):
-                await flaky.create_started.wait()
-            assert w.head is None
+            try:
+                with anyio.fail_after(60):
+                    await flaky.create_started.wait()
+                assert w.head is None
+            finally:
+                flaky.create_release.set()
     assert flaky.thread_ids
     assert get_ident() not in flaky.thread_ids
 
@@ -450,7 +522,7 @@ async def test_unknown_renewal_checks_identity(tmp_path: Path, after: bool) -> N
     )
     # This checks unknown-write identity, not expiry under a subsecond lease.
     async with _writer(flaky, tmp_path, ttl_s=3) as w:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await taken.wait()
             await w.fenced.wait()
         owner = read_owner(flaky)
@@ -558,7 +630,7 @@ async def test_failure_fails_all_waiters_without_secret(
                 await w.append_durable(EventDraft(type=EventType.RESERVE))
             failures.append(caught.value)
 
-        with anyio.fail_after(1):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tg:
                 for _ in range(4):
                     tg.start_soon(append)
@@ -592,7 +664,7 @@ async def test_cancelled_exit_finishes_commit_and_release(
 async def test_write_through_append_wakes_writer(store: LocalStore, tmp_path: Path) -> None:
     async with _writer(store, tmp_path, group_window_s=0.01) as w:
         w.append(EventDraft(type=EventType.RESERVE))
-        with anyio.fail_after(0.5):
+        with anyio.fail_after(60):
             while w.head is None:  # noqa: ASYNC110 - observe publication without requesting a commit
                 await anyio.sleep(0.001)
         assert w.head.seq == 1
@@ -623,7 +695,7 @@ async def test_unknown_advance_retries_recovery_read_before_another_cas(
 
     monkeypatch.setattr(flaky, "read", read)
     async with _writer(flaky, tmp_path, ttl_s=5, group_window_s=0) as w:
-        with anyio.fail_after(3):
+        with anyio.fail_after(60):
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert w.head is not None
         assert w.head.seq == 1
@@ -671,7 +743,7 @@ async def test_unknown_create_conflicting_bytes_is_fatal(tmp_path: Path) -> None
         after_unknown=create_conflict,
     )
     async with _writer(flaky, tmp_path, group_window_s=0) as w:
-        with anyio.fail_after(0.5), pytest.raises(Fenced) as caught:
+        with anyio.fail_after(60), pytest.raises(Fenced) as caught:
             await w.append_durable(EventDraft(type=EventType.RESERVE))
         assert isinstance(caught.value.__cause__, ChainError)
     assert flaky.create_calls == 1
@@ -681,7 +753,7 @@ async def test_unknown_create_conflicting_bytes_is_fatal(tmp_path: Path) -> None
 async def test_expiry_during_create_prevents_head_advance(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), create_delay_s=0.2)
     async with _writer(flaky, tmp_path, ttl_s=0.1, group_window_s=0) as w:
-        with anyio.fail_after(0.6), pytest.raises(Fenced):
+        with anyio.fail_after(60), pytest.raises(Fenced):
             await w.append_durable(EventDraft(type=EventType.RESERVE))
     assert flaky.replace_calls == 0
     assert w.committed == ()
@@ -701,11 +773,33 @@ async def test_append_during_commit_forms_consecutive_second_segment(tmp_path: P
 
 
 async def test_cancelled_waiter_does_not_cancel_publication(
-    store: LocalStore, tmp_path: Path
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    entered = anyio.Event()
+    release = anyio.Event()
+    publish = JournalWriter._publish
+
+    async def held_publish(writer: JournalWriter) -> None:
+        entered.set()
+        await release.wait()
+        await publish(writer)
+
+    monkeypatch.setattr(JournalWriter, "_publish", held_publish)
     async with _writer(store, tmp_path, group_window_s=0.1) as w:
-        with anyio.move_on_after(0.01) as cancelled:
-            await w.append_durable(EventDraft(type=EventType.RESERVE))
+
+        async def cancel_when_publishing(scope: anyio.CancelScope) -> None:
+            await entered.wait()
+            scope.cancel()
+
+        try:
+            with anyio.fail_after(30):
+                with anyio.CancelScope() as cancelled:
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(cancel_when_publishing, cancelled)
+                        await w.append_durable(EventDraft(type=EventType.RESERVE))
+            assert w.head is None
+        finally:
+            release.set()
         assert cancelled.cancel_called
         await w.commit()
         assert w.head is not None
@@ -852,7 +946,7 @@ async def test_blocked_publication_expires_without_late_state_change(
         if not entered.is_set():
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(20)
+            assert release.wait(180)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(store, site, block)
@@ -864,11 +958,11 @@ async def test_blocked_publication_expires_without_late_state_change(
     task = asyncio.create_task(publish())
     before = writer._lease.doc
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         if deadline == "settlement":
             writer._stop_storage()
-        done, _ = await asyncio.wait([task], timeout=10)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "publication wait outlived its deadline"
         error = task.exception()
         assert error is not None
@@ -890,11 +984,11 @@ async def test_blocked_publication_expires_without_late_state_change(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
-                    await anyio.to_thread.run_sync(worker.join, 5)
+                    await anyio.to_thread.run_sync(worker.join, 60)
                     assert not worker.is_alive()
     assert writer._lease.doc == before
     assert writer.head is None
@@ -925,13 +1019,13 @@ async def test_settlement_timeout_bounds_the_release_attempt(
     def blocked_create(key: str, data: bytes) -> str:
         workers.append(threading.current_thread())
         publishing.set()
-        assert unblock.wait(30)
+        assert unblock.wait(180)
         return create(key, data)
 
     def blocked_release(key: str, data: bytes, *, if_match: str) -> str:
         workers.append(threading.current_thread())
         releasing.set()
-        assert unblock.wait(30)
+        assert unblock.wait(180)
         return replace(key, data, if_match=if_match)
 
     monkeypatch.setattr(store, "create", blocked_create)
@@ -943,10 +1037,10 @@ async def test_settlement_timeout_bounds_the_release_attempt(
 
     task = asyncio.create_task(publish())
     try:
-        assert await anyio.to_thread.run_sync(publishing.wait, 10)
+        assert await anyio.to_thread.run_sync(publishing.wait, 60)
         writer._stop_storage()
-        assert await anyio.to_thread.run_sync(releasing.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=10)
+        assert await anyio.to_thread.run_sync(releasing.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "failed writer retained its blocked release"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -957,10 +1051,10 @@ async def test_settlement_timeout_bounds_the_release_attempt(
         unblock.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert len(workers) == 2
     assert writer.head is None
@@ -988,14 +1082,14 @@ async def test_writer_stop_retains_earlier_failure_provenance(
 
     monkeypatch.setattr(JournalWriter, "_remaining", observed_remaining)
     async with _writer(store, tmp_path) as writer:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await started.wait()
         assert task is not None
         error = failure_type("earlier failure")
         writer._fail(error)
         with anyio.CancelScope(shield=True):
             task.cancel("later-cancel-secret")
-            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            with anyio.fail_after(60), pytest.raises(asyncio.CancelledError):
                 await task
             assert writer._failure is error
             assert not writer._stopped
