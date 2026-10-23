@@ -794,11 +794,27 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
 
 @pytest.mark.parametrize("swallow", [False, True])
 async def test_real_action_round_expiry_is_an_ordinary_limit(
-    tmp_path: Path, ctx_env: CtxEnv, swallow: bool
+    tmp_path: Path, ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, swallow: bool
 ) -> None:
-    finished = anyio.Event()
+    from swarm_arena.llm import _actions
+
+    entered, unwinding, draining, release, finished = (anyio.Event() for _ in range(5))
+    original_wait = _actions._OwnedActions.wait
+    drained: list[bool] = []
+
+    async def wait_for_actions(owner: _actions._OwnedActions) -> None:
+        draining.set()
+        await original_wait(owner)
+        drained.append(finished.is_set())
+
+    monkeypatch.setattr(_actions._OwnedActions, "wait", wait_for_actions)
 
     async def handler(context: AgentContext, args: Inputs) -> JsonValue:
+        entered.set()
+        owner = _actions._owned_actions.get()
+        assert owner is not None
+        # Expire the real manager timer only after dispatch and validation finish.
+        owner.timer.scope.deadline = anyio.current_time()
         try:
             await anyio.sleep_forever()
         except asyncio.CancelledError:
@@ -806,22 +822,37 @@ async def test_real_action_round_expiry_is_an_ordinary_limit(
                 return {"late": "success"}
             raise
         finally:
+            unwinding.set()
+            with anyio.CancelScope(shield=True):
+                await release.wait()
             finished.set()
 
     ctx = ctx_env.ctx()
     ctx.actions = (Action(name="held", description="Held", input_model=Inputs, handler=handler),)
     fake = register([FakeTurn(tool_calls=(("held", {}),)), finish()])
-    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=0.5))) as run:
-        with (
-            llm_scope(run.scope("manager")),
-            anyio.fail_after(5),
-            pytest.raises(LimitReached) as caught,
-        ):
-            await AgentsSDKManager(model="opus").run_round(ctx)
-        assert _core_category(caught.value) is _SignalCategory.LIMIT
-        assert caught.value.limit == "round_timeout_s"
-        assert finished.is_set()
-        assert len(fake.calls) == 1
+    async with open_llm_run(tmp_path, config=config(limits=Limits(round_timeout_s=60))) as run:
+        with llm_scope(run.scope("manager")):
+            task = asyncio.create_task(AgentsSDKManager(model="opus").run_round(ctx))
+        try:
+            with anyio.fail_after(10):
+                await unwinding.wait()
+                await draining.wait()
+                assert entered.is_set()
+                assert not finished.is_set()
+                assert not task.done(), "round returned while its action was unwinding"
+                release.set()
+                with pytest.raises(LimitReached) as caught:
+                    await task
+            assert _core_category(caught.value) is _SignalCategory.LIMIT
+            assert caught.value.limit == "round_timeout_s"
+            assert drained == [True], "manager drain returned before action unwind"
+            assert finished.is_set()
+            assert len(fake.calls) == 1
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("reverse", [False, True])
