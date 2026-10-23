@@ -1,5 +1,6 @@
 """Committed, deterministic journals without an engine or JournalWriter."""
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,18 @@ if TYPE_CHECKING:
     from swarm_arena._board.cache import ArenaCache
 
 START: Final = datetime(2026, 10, 18, tzinfo=UTC)
+
+
+def committed_events(root: Path) -> list[dict[str, Any]]:
+    """Decode the owner's committed segment chain in chronological order."""
+    head = json.loads((root / "control/owner.json").read_text())["head"]
+    segments: list[list[dict[str, Any]]] = []
+    key = head["segment"]
+    while key is not None:
+        rows = [json.loads(line) for line in (root / key).read_text().splitlines()]
+        key = rows[0]["link"]
+        segments.append(rows[1:])
+    return [event for segment in reversed(segments) for event in segment]
 
 
 class FakeRun:

@@ -1,7 +1,8 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Worker mechanics run locally; only transport/lifetime tests need the shared head."""
 
 import dataclasses
-import importlib.metadata
 import json
 import os
 import signal
@@ -14,6 +15,7 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.proc import pid_alive, wait_until
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import RELEASE, WORKER_SCRIPTS, _write_module, make_job
@@ -27,10 +29,7 @@ from swarm_arena._tooling.staging import edit_hashes, put_edits
 from swarm_arena.executor import Job, LocalExecutor
 from swarm_arena.tool import Command, CompletedRun, RunStatus, ToolOutput, ToolRequest
 
-try:
-    importlib.metadata.version("ray")
-except importlib.metadata.PackageNotFoundError:
-    pytest.skip("Ray worker tests require the ray extra", allow_module_level=True)
+ray_dependency()
 
 # isort: split
 import ray

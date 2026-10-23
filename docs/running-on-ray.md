@@ -40,10 +40,24 @@ With dependencies and authentication provisioned, start a head and join VMs:
 
 ```sh
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-uv run ray start --head --num-cpus=2 --include-dashboard=true --disable-usage-stats
+uv run ray start --head --include-dashboard=true --disable-usage-stats
 # On each worker VM (replace <head> with the head node's hostname):
 uv run ray start --address=<head>:6379 --disable-usage-stats
 ```
+
+The dashboard defaults to localhost. For submission from a laptop, keep an SSH
+forward open in a separate terminal (replace `<head>` with your SSH host):
+
+```sh
+ssh -N -L 8265:127.0.0.1:8265 <head>
+```
+
+Submit to `http://127.0.0.1:8265` through that tunnel. A driver running as a
+Ray Job on the head can keep the dashboard's localhost default; its recovery
+queries reach the State API locally. To expose the dashboard directly instead,
+use `--dashboard-host=0.0.0.0` **only with token authentication and a firewall
+or VPN restricting access**. This exposes the Jobs and State APIs, including
+job submission; do not expose them to an untrusted network.
 
 Ray 2.59 enables token authentication by default for local clusters. Local
 same-user discovery can read Ray's token file; a remote driver needs externally
@@ -51,8 +65,10 @@ provisioned `RAY_AUTH_TOKEN` and `RAY_AUTH_MODE=token`. Provision matching
 authentication for joining nodes and HTTP Jobs clients as well. Keep those
 values out of uploaded files and `runtime_env`.
 
-Set tool secrets in each eligible node's environment, or provide
-`secrets.file` at the configured path on each node. Restrict secret-using jobs
+Set tool secrets in the environment of the `ray start` process on each
+eligible node, before starting it; restart the node after changing that
+environment. Alternatively, provide `secrets.file` at the configured path on
+each node. Restrict secret-using jobs
 to nodes carrying a named resource:
 
 ```sh
@@ -73,10 +89,11 @@ estimate locally before approving unattended execution:
 ```sh
 swarm-arena plan run.toml plan.toml
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-swarm-arena submit --address http://<head>:8265 --working-dir . --yes run.toml plan.toml
+swarm-arena submit --address http://127.0.0.1:8265 --working-dir . --yes run.toml plan.toml
 ```
 
-Replace `<head>` with your head node's hostname. With `--address`, any
+The address is the local end of the SSH forward above, or the head's own
+localhost when submitting there. With `--address`, any
 different nonempty value in `RAY_ADDRESS` or `RAY_API_SERVER_ADDRESS` is refused before
 contacting Ray; unset the conflicting variable. Without `--address`, Ray's
 environment fallback applies (`RAY_API_SERVER_ADDRESS` before `RAY_ADDRESS`).
@@ -99,7 +116,7 @@ The worker image or repeatable `--pip SPEC` options must provide
 console script. For example, before the first release:
 
 ```sh
-swarm-arena submit --address http://<head>:8265 --working-dir . \
+swarm-arena submit --address http://127.0.0.1:8265 --working-dir . \
   --pip 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena' \
   --pip deepretro-swarm --yes run.toml plan.toml
 ```
@@ -269,8 +286,10 @@ the driver; a disabled dashboard also leaves recovery unconfirmed.
 The Ray conformance tests compare the Rosenbrock function with local execution
 and exercise snapshotted goal/tool inputs, inherited parent overlays, live
 edits, declared output files and both logs through the object store. A local
-test fixture denies worker reads of the driver's artifact root and driver
-reads of worker temporary workspaces; results are read with the public kit
+test fixture imports connector code, then denies worker reads of the driver's
+artifact root and source/plan directories, and driver reads of worker temporary
+workspaces. The tool script also rejects driver-source paths in its request
+and environment. Results are read with the public kit
 readers after execution. The shipped Rosenbrock plan checks dispatch events,
 two finalists and committed candidate logs. Soft cancellation checks the
 data-only partial contract, without new artifact publication.

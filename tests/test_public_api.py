@@ -7,6 +7,7 @@ import sys
 import types
 
 import pytest
+from _fakes.dependencies import ray_dependency
 from pydantic import BaseModel
 
 import swarm_arena
@@ -371,12 +372,12 @@ else:
 
 
 def test_ray_all() -> None:
-    module = pytest.importorskip("swarm_arena.ray")
+    module = ray_dependency()
     assert module.__all__ == ["RayExecutor"]
 
 
 def test_ray_facade_publishes_methods() -> None:
-    module = pytest.importorskip("swarm_arena.ray")
+    module = ray_dependency()
     cls = module.RayExecutor
     assert {
         cls.__module__,

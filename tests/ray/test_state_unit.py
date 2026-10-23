@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Conservative state normalization without starting a Ray cluster."""
 
 import asyncio
@@ -9,9 +11,10 @@ from urllib.parse import parse_qs, urlsplit
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.secrecy import assert_secret_absent
 
-pytest.importorskip("swarm_arena.ray")
+ray_dependency()
 
 # isort: split
 from swarm_arena._agent.manager import LimitReached

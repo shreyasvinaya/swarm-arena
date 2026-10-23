@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.engine import with_executor, with_limits
 from _fakes.finished import FinishedRun
 
@@ -3123,7 +3124,7 @@ async def test_resume_dispatch_never_submitted_is_lost(
     run_config: RunConfig,
     recorders: dict[str, _Recorder],
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import RayExecutor
 
     identity = RayExecutor()

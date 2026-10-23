@@ -9,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._cli import cluster_cmds
@@ -41,7 +42,7 @@ def test_submit_without_yes_never_imports_ray() -> None:
 def test_submit_prints_submission_id(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     calls: list[tuple[str | None, str, Mapping[str, Any] | None]] = []
@@ -63,7 +64,7 @@ def test_submit_prints_submission_id(
 def test_submit_forwards_explicit_options(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     calls: list[tuple[str | None, str, Mapping[str, Any] | None]] = []
@@ -120,7 +121,7 @@ def test_submit_forwards_explicit_options(
 
 
 def test_submit_without_yes_submits_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     def unexpected(*args: Any, **kwargs: Any) -> str:
@@ -134,7 +135,7 @@ def test_submit_without_yes_submits_nothing(monkeypatch: pytest.MonkeyPatch) -> 
 def test_submit_ray_errors_preserve_safe_diagnostic_and_suppress_values(
     stage: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     class FailedClient:
@@ -170,7 +171,7 @@ def test_help_loads_no_ray() -> None:
 def test_submit_error_has_no_secret_on_exception_surfaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     def failed(*args: Any, **kwargs: Any) -> str:
@@ -306,7 +307,7 @@ raise SystemExit(main(["submit", "--yes", "--working-dir", *sys.argv[1:]]))
 def test_working_directory_rewrites_paths_relative_to_upload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     monkeypatch.chdir(tmp_path)
@@ -373,7 +374,7 @@ raise SystemExit(main(["submit", "--yes", "--pip", sys.argv[1], "run.toml", "pla
 def test_submission_timeout_abandons_one_wait_with_recoverable_id(
     stage: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import _submit
 
     assert _submit._SUBMIT_TIMEOUT_S == 300
@@ -444,7 +445,7 @@ def test_submission_timeout_abandons_one_wait_with_recoverable_id(
 
 
 def test_interrupt_prints_submission_id_and_status_instruction() -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     code = """
 import os
 import signal

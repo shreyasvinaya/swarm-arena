@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Executor policy tests need no cluster; marked cases exercise the shared head."""
 
 import asyncio
@@ -14,10 +16,11 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
 
-pytest.importorskip("swarm_arena.ray")
+ray_dependency()
 
 # isort: split
 import ray

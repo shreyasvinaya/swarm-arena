@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Exercise actual soft and force cancellation through the public executor."""
 
 from pathlib import Path
@@ -5,12 +7,13 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.proc import pid_alive
 from _fakes.ray_executor import cancel_and_capture, partial_job, tool_job
 
 from tests.ray.conftest import ray_driver as ray_driver
 
-pytest.importorskip("swarm_arena.ray")
+ray_dependency()
 
 # isort: split
 from swarm_arena.ray import RayExecutor
