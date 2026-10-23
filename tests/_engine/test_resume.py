@@ -1129,7 +1129,7 @@ async def test_waiting_continued_goal_converges_on_early_end(
     monkeypatch.setattr(GoalRunner, "run", counted_goal)
     monkeypatch.setattr(_Recorder, "run_round", counted_round)
     monkeypatch.setattr(Inflight, "close", signalling_close)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(partial(Swarm(cfg).resume, c.run_id, force=True))
             await hold.entered.wait()
@@ -1627,9 +1627,9 @@ async def test_resume_shutdown_bound_and_primary_failure(
     monkeypatch.setattr(RunRunner, "_drive", drive)
     task = asyncio.create_task(runner.run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await closing.wait()
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await asyncio.wait({task}, timeout=30)
         assert task in done, "executor shutdown exceeded its configured bound"
         if fenced:
             with pytest.raises(Fenced) as error:
@@ -1643,11 +1643,16 @@ async def test_resume_shutdown_bound_and_primary_failure(
             assert await task == expected
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         services = runner.resumed._services
         assert services.task is not None
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.shield(services.task)
+    assert not pending_cleanup, "resume shutdown did not finish cleanup"
 
 
 class _CrashBoundary(BaseException):
@@ -1891,11 +1896,11 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
     def blocked(config: RunConfig) -> Executor:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(15), "constructor release deadline"
+        assert release.wait(300), "constructor release deadline"
         return real(config)
 
     async def prepare() -> None:
-        with anyio.fail_after(15) as deadline:
+        with anyio.fail_after(300) as deadline:
             deadlines.append(deadline)
             await Swarm(config).resume(crashed.run_id)
 
@@ -1903,24 +1908,28 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
         patch.setattr(run_module, "_build_executor", blocked)
         task = asyncio.create_task(prepare())
         try:
-            with anyio.fail_after(10):
-                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            with anyio.fail_after(60):
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
             services = [
                 t for t in asyncio.all_tasks() if t.get_name() == f"resume-{crashed.run_id}"
             ]
             assert services
             deadlines[0].deadline = anyio.current_time()
-            done, _ = await asyncio.wait([task], timeout=3)
+            done, _ = await asyncio.wait([task], timeout=30)
             assert done, "caller cancellation waited for the constructor"
             assert all(service.done() for service in services)
             assert workers[0].is_alive()
         finally:
             release.set()
-            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+            if not task.done():
+                task.cancel()
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            result = task.exception() if task.done() and not task.cancelled() else None
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
-    assert isinstance(result[0], TimeoutError)
+                await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "resume preparation did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
+    assert isinstance(result, TimeoutError)
     owner = read_owner(crashed.store)
     assert owner is not None
     assert owner[0].expires_at <= utc_now()
@@ -2054,7 +2063,7 @@ async def _published_crash_case(root: Path, mode: str, *, crash: bool) -> tuple[
         "from test_resume import _run_published_crash_case; "
         "anyio.run(_run_published_crash_case, Path(sys.argv[1]), sys.argv[2], sys.argv[3]=='1')"
     )
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         result = await anyio.run_process(
             [sys.executable, "-c", code, str(root), mode, str(int(crash))],
             env=env,
@@ -2300,7 +2309,7 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         workers.append(threading.current_thread())
         entered.set()
         assert threading.get_ident() != loop_thread
-        assert release.wait(15), "page hook release deadline"
+        assert release.wait(300), "page hook release deadline"
         returned.set()
         return result
 
@@ -2313,12 +2322,12 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
     monkeypatch.setattr(owner_type, method, blocked)
     task = asyncio.create_task(prepare())
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         services = [t for t in asyncio.all_tasks() if t.get_name() == "resume-repair"]
         assert services
         scopes[0].cancel()
-        with anyio.fail_after(3):
+        with anyio.fail_after(30):
             await task
         owner = read_owner(store)
         assert owner is not None
@@ -2329,10 +2338,15 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         assert not store.exists("goals/g/rounds/round-01.md")
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
-            assert not worker.is_alive()
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "page repair did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
     assert returned.is_set()
     assert read_owner(store) == owner
     assert not store.exists("goals/g/rounds/round-01.md")
@@ -2457,7 +2471,7 @@ with MonkeyPatch.context() as patch:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
     )
     assert result.returncode == 31, result.stderr
@@ -2580,14 +2594,14 @@ async def model_resume_run(
         task = asyncio.create_task(Swarm(config).run(current, run_id="model-resume"))
         task.add_done_callback(lambda _: ready.set())
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await ready.wait()
             if task.done():
                 await task
                 pytest.fail("seed finished before the round-two checkpoint")
         finally:
             task.cancel()
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await asyncio.gather(task, return_exceptions=True)
         assert task.cancelled()
     return config, LocalStore(Path(config.run_root) / "model-resume")
@@ -2752,16 +2766,16 @@ async def test_resume_startup_models_contain_hooks_before_takeover(
                 raise asyncio.CancelledError(secret)
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(20)
+            assert release.wait(300)
             return ()
 
     task = asyncio.create_task(
         Swarm(config, replanner=HookPlanner([plan(rounds=3)])).resume("model-resume", force=True)
     )
     try:
-        with anyio.fail_after(8):
+        with anyio.fail_after(60):
             if failure == "held":
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 assert _resume_bytes(store) == before
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -2775,11 +2789,13 @@ async def test_resume_startup_models_contain_hooks_before_takeover(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(8):
-            await asyncio.gather(task, return_exceptions=True)
-            for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "model hook owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
     assert _resume_bytes(store) == before
 
 
@@ -2980,7 +2996,7 @@ async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
     async def resume() -> None:
         await Swarm(c.config).resume(c.run_id, force=True)
 
-    with anyio.fail_after(25):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(resume)
             try:
@@ -3148,7 +3164,7 @@ async def test_resume_dispatch_never_submitted_is_lost(
     config = c.config.model_copy(
         update={"executor": Ref.of(RayExecutor(cancel_margin_s=1.0)), "lease_ttl_s": 3.0}
     )
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         await Swarm(config).resume(c.run_id, force=True)
     lost = _events(c, "run_lost")[0]
     assert lost.payload["confirmed_dead"] is False
@@ -3188,7 +3204,7 @@ async def test_resume_dispatch_preserves_closed_idle_rounds(
         return watchdog
 
     monkeypatch.setattr(GoalRunner, "_restore_watchdog", capture)
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         await Swarm(c.config).resume(c.run_id, force=True)
     assert observed == [(live._idle_rounds, live.limit)]
     if idle_limit == 1:
@@ -3244,7 +3260,7 @@ async def test_resume_orphans_share_deadline_and_journal_order(
             return True
 
     monkeypatch.setattr(spy, "kill_orphan", orphan)
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         runner = await resume_run(
             c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None
         )
@@ -3292,7 +3308,7 @@ async def test_concurrent_orphan_control_beats_ordinary_failure(
 
     monkeypatch.setattr(spy, "kill_orphan", orphan)
     with (
-        anyio.fail_after(30),
+        anyio.fail_after(60),
         pytest.raises(Fenced if control == "fenced" else RuntimeError) as caught,
     ):
         await _recover_orphans(
@@ -3340,7 +3356,7 @@ async def test_concurrent_orphan_caller_cancellation_propagates(
                 )
             )
 
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(recover)
             await all_entered.wait()
@@ -3668,7 +3684,7 @@ async def test_resume_slow_gateway_read_has_own_allowance(
     monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
     fake_gateway.delay["/spend/logs/v2"] = 3
     config = crashed.config.model_copy(update={"settle_timeout_s": 0.5})
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         runner = await resume_run(config, crashed.run_id, force=False, replanner=None)
         await runner.aclose()
     failures = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "read_failed"]

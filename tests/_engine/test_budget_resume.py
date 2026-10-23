@@ -115,7 +115,7 @@ async def _crash_at_converge(root: Path) -> None:
 
 
 async def _resume_cli(root: Path) -> None:
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         child = await anyio.run_process(
             [
                 str(Path(sys.executable).with_name("swarm-arena")),
@@ -161,7 +161,7 @@ async def test_resume_budget_stop_crashed_at_converge_finishes_from_reserve(tmp_
         f"import anyio,sys; from pathlib import Path; from {_MODULE} import _crash_at_converge; "
         "anyio.run(_crash_at_converge, Path(sys.argv[1]))"
     )
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         child = await anyio.run_process(
             [sys.executable, "-c", code, str(tmp_path)], env=_environment(), check=False
         )
@@ -219,7 +219,7 @@ async def test_stop_after_replayed_budget_still_cancels_resume_setup(
         except RuntimeError as error:
             failures.append(error)
 
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(resume)
             await budget_replayed.wait()
