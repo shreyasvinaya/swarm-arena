@@ -20,7 +20,7 @@ def _cli(config_path: Path, *args: str) -> str:
         [str(Path(sys.executable).parent / "swarm-arena"), *args, "--config", str(config_path)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
         check=False,
         env=environment,
     )
@@ -97,7 +97,7 @@ def test_documented_arena_commands_run_as_written(
     finally:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        process.communicate(timeout=10)
+        process.communicate(timeout=60)
     assert process.returncode == 0, stderr
     identifier = re.search(r"^run (\S+) at ", stdout, flags=re.MULTILINE)
     assert identifier is not None

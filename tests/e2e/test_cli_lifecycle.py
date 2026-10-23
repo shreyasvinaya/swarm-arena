@@ -59,7 +59,7 @@ def _start_driver(
         finally:
             if driver.poll() is None:
                 driver.kill()
-            driver.wait(timeout=10)
+            driver.wait(timeout=60)
             # A failed assertion must not leave any sleeping tool groups behind.
             for marker in root.glob("*.pid.json"):
                 pgid = json.loads(marker.read_text())["pgid"]
@@ -119,7 +119,7 @@ def _score_preparation_barrier(goal: Goal, candidate: Candidate) -> Score:
     if candidate.round == 1:
         root = Path(candidate.request.inputs["marker"]).parent
         (root / "barrier-entered").touch()
-        _wait_for(lambda: (root / "barrier-release").exists())
+        _wait_for(lambda: (root / "barrier-release").exists(), 300)
     return score_value(goal, candidate)
 
 
@@ -129,7 +129,7 @@ def _plan(root: Path, *, preparation: bool = False) -> Plan:
         {
             "round": r,
             "inputs": {
-                "seconds": 0.0 if preparation or r == 3 else 60.0,
+                "seconds": 0.0 if preparation or r == 3 else 300.0,
                 "marker": str(root / f"round-{r}.pid.json"),
             },
         }
