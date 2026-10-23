@@ -2,6 +2,7 @@
 
 import ast
 import importlib
+import importlib.metadata
 import inspect
 import re
 import subprocess
@@ -16,6 +17,44 @@ GUIDES = sorted(
     path for path in (ROOT / "docs").glob("*.md") if path.name != "writing-a-connector.md"
 )
 ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
+
+
+def test_optional_install_examples_use_prerelease_uv() -> None:
+    source = "git+https://github.com/shreyasvinaya/swarm-arena"
+    readme = (ROOT / "README.md").read_text()
+    for extra in ("llm", "cache", "langfuse"):
+        assert f'uv add "swarm-arena[{extra}] @ {source}"' in readme
+    concepts = re.sub(r"\s+", " ", (ROOT / "docs/concepts.md").read_text())
+    for extras in ("llm", "llm,cache"):
+        assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
+    bare_install = re.compile(
+        r"\b(?:uv\s+add|(?:uv\s+)?pip(?:3)?\s+install)\s+[\"']?"
+        r"swarm-arena\[(?:llm|cache|langfuse)[^\]]*\](?!\s+@\s+git\+)"
+    )
+    stale: list[str] = []
+    for directory in (ROOT / "docs", ROOT / "src"):
+        for path in sorted(directory.rglob("*")):
+            if path.suffix not in {".md", ".rst", ".py"}:
+                continue
+            if ROOT / "docs/superpowers" in path.parents:
+                continue
+            text = path.read_text()
+            for match in bare_install.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                stale.append(f"{path.relative_to(ROOT)}:{line}")
+    assert not stale, "Bare optional install commands: " + ", ".join(stale)
+
+
+def test_roadmap_records_supported_llm_dependency_deviation() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    constraints = text.split("### R5.1 ", 1)[1].split("### R5.2 ", 1)[0]
+    decisions = text.split("### R5.4 ", 1)[1]
+    for section in (constraints, decisions):
+        assert "openai-agents[litellm]>=0.24,<0.25" in section
+        assert "litellm>=1.107.0rc2,<1.108" in section
+    assert "Ruling P39" in decisions
+    assert "M5" in decisions
+    assert "1.107.0 final" in decisions
 
 
 @pytest.mark.parametrize(
@@ -146,6 +185,11 @@ class RenderedText(HTMLParser):
 
 
 def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
+    for distribution in ("openai-agents", "litellm"):
+        try:
+            importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip("Full Sphinx API docs require the 'llm' extra: swarm-arena[llm]")
     output = tmp_path / "html"
     done = subprocess.run(
         [sys.executable, "-m", "sphinx", "-W", "-q", str(ROOT / "docs"), str(output)],
@@ -164,6 +208,8 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
         rendered = RenderedText()
         rendered.feed(html)
         text = "".join(rendered.chunks)
+        assert ".. py:" not in text, path.name
+        assert ".. automodule::" not in text, path.name
         if "swarm_arena._" in html or "swarm_arena._" in text:
             leaks.append(f"{path.name}: private import path")
         names = sorted(set(re.findall(r"(?<![\w])_(?!_)[A-Za-z]\w*", text)))
@@ -176,6 +222,10 @@ def test_api_html_hides_model_implementation_details(tmp_path: Path) -> None:
     assert 'id="swarm_arena.Goal"' in root_api
     assert 'id="swarm_arena.Plan.loads"' in root_api
     assert "Parameters" in root_api
+    llm = (output / "api" / "llm.html").read_text()
+    assert 'id="swarm_arena.llm.AgentsSDKManager"' in llm
+    testing = (output / "api" / "testing.html").read_text()
+    assert 'id="swarm_arena.testing.FakeModel"' in testing
     protocol = RenderedText()
     protocol.feed((output / "api" / "protocol.html").read_text())
     assert "data=..." in "".join(protocol.chunks).replace(" ", "")

@@ -9,7 +9,7 @@ from typing import Any
 import anyio
 
 from swarm_arena._agent.manager import LimitReached, Manager
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import _exception_type_name, _is_core_signal
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.supervisor import BEFORE_KILL_TIMEOUT_S
@@ -29,7 +29,12 @@ from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
 from swarm_arena.testing._components import _DEFAULT_GOAL, _build, _check_goal
 from swarm_arena.testing._contracts import _check_judge_methods, _check_result, _check_scores, _fail
 from swarm_arena.testing._execution import _executor, _failed_runs, _failed_runs_on
-from swarm_arena.testing._harness import OfflineHarness
+from swarm_arena.testing._harness import (
+    OfflineHarness,
+    _assert_drained,
+    _judge_scope,
+    _LLMContractError,
+)
 from swarm_arena.testing._state import _artifact_root, _ids
 from swarm_arena.testing._tool import _check_tool_output, _plan_tool, _probe_collect
 
@@ -275,6 +280,7 @@ async def check_judge(
     candidates: Sequence[Candidate],
     *,
     executor: Executor | None = None,
+    config: RunConfig | None = None,
 ) -> list[Score]:
     """
     Judge one batch of candidates and stamp the scores, as the core does.
@@ -293,7 +299,10 @@ async def check_judge(
     log. If the call raises an error instead (a failed contract assert, or an
     error from ``judge()`` itself), each command with any status but ``ok``
     adds that text as a note to the error, which is otherwise passed on
-    unchanged.
+    unchanged. An undrained normal return is an assertion failure, and so is a
+    closed charge that differs from the journaled LLM call costs; an existing
+    failure or caller interruption keeps its outcome and receives a value-free
+    drain-rule note.
 
     Parameters
     ----------
@@ -306,6 +315,10 @@ async def check_judge(
     executor : Executor or None, default=None
         Executor for ``ctx.execute``; None makes a ``LocalExecutor`` and closes
         it afterwards.
+    config : RunConfig or None, default=None
+        Model catalog, cache, tracing, limits and settlement settings. None
+        selects defaults. A bound temporary run supplies a judge LLM scope
+        and invokes registered run setups after building the judge.
 
     Returns
     -------
@@ -319,7 +332,10 @@ async def check_judge(
         If the judge identity is not stable, an optional Judge method returns
         the wrong type, or ``judge()`` does not return a list of valid
         ``Score`` objects, returns a score for an unknown candidate, or two
-        scores for one candidate.
+        scores for one candidate, leaves LLM calls undrained, or its closed
+        charge differs from the journaled LLM call costs.
+    RuntimeError
+        If a registered run setup fails or owned core cleanup fails.
     ValueError
         If any candidate goal_id does not match the goal id, a file glob
         matches no file, or the judge cannot be built.
@@ -351,15 +367,32 @@ async def check_judge(
     _check_goal(goal, candidates)
     ref, built, goal = await anyio.to_thread.run_sync(_build, judge, Judge, goal)
     await anyio.to_thread.run_sync(_check_judge_methods, ref, built)
-    async with _executor(executor) as runner, _failed_runs_on(runner):  # an error gets the tails
+    async with (
+        _executor(executor) as runner,
+        _failed_runs_on(runner),
+        _judge_scope(goal, RunConfig() if config is None else config) as (scope, ids),
+    ):
         ctx = JudgeContext(
             goal=goal,
             executor=runner,
             artifact_root=_artifact_root(),
-            ids=_ids(),
+            run_id=scope.run_id,
+            ids=ids,
             batch_id="b-" + secrets.token_hex(4),
         )
-        returned = await built.judge(goal, candidates, ctx)
+        outcome = _Outcome()
+        try:
+            returned = await built.judge(goal, candidates, ctx)
+        except BaseException as error:
+            outcome.propagate_control(error)
+            raise
+        await _assert_drained(scope)
+        try:
+            scope.tranche._ledger._check_usage_overflow()
+        except LimitReached:
+            raise _fail(
+                "TERMINAL control rule: Judge.judge() must propagate terminal overflow"
+            ) from None
         valid, scored = await run_sync_daemon(_check_scores, returned, candidates, ctx)
         stamped = await run_sync_daemon(
             partial(
@@ -367,7 +400,7 @@ async def check_judge(
                 valid,
                 judge=built,
                 judge_name=ref.component_name(),
-                ids=_ids(),
+                ids=ids,
                 batch_id=ctx.batch_id,
             )
         )
@@ -405,6 +438,13 @@ async def check_manager(
     type-only ``AssertionError`` with its original cause and failed-run stderr
     notes retained for debugging. Cancellation and fencing propagate.
     Successful calls warn with the stderr tail of every non-OK tool run.
+    Registered run setups execute after component construction, inside the
+    bound temporary run. Each round has a manager LLM scope. The kit forces
+    ``parallel_tool_calls=True`` when the manager's Config has that field and
+    asserts self-drain, closed-charge accounting against the journaled LLM call
+    costs, and requesting-call membership before returning reports.
+    A drain violation annotates an existing failure or owner interruption with
+    a value-free note; a normal return raises the drain-rule AssertionError.
 
     Parameters
     ----------
@@ -429,11 +469,23 @@ async def check_manager(
     Raises
     ------
     AssertionError
-        If the manager raises or returns a malformed report. The message
-        contains only the exception type; its original cause may contain the
-        connector's own text, as permitted by the kit diagnostic policy.
+        If the manager raises, returns a malformed report, leaves LLM calls
+        undrained, closes a round whose charge differs from its journaled LLM
+        call costs, or links a candidate to a call outside its round scope.
+        Component failures name only the exception type; the original cause
+        may contain connector text, as permitted by the kit diagnostic policy.
+        LLM contract failures name the violated rule.
+    RuntimeError
+        If a registered run setup fails or owned core cleanup fails.
     ValueError
         If components cannot be built or snapshotted, or rounds is not positive.
+
+    Notes
+    -----
+    The offline kit has no engine deadline watcher for in-flight tool runs.
+    If an LLM manager's round timer fires during a core tool run, the tool
+    finishes under core rules: ``round_timeout_s`` does not cut the in-flight
+    run in the kit; ``tool_timeout_s`` bounds it.
 
     Examples
     --------
@@ -447,7 +499,15 @@ async def check_manager(
     """
     if rounds < 1:
         raise ValueError("rounds must be positive")
-    _, built_manager, goal = await anyio.to_thread.run_sync(_build, manager, Manager, goal)
+
+    def build_manager() -> tuple[Ref, Manager, Goal]:
+        ref = manager if isinstance(manager, Ref) else Ref.of(manager)
+        cls = ref.load()
+        if issubclass(cls, Manager) and "parallel_tool_calls" in cls.Config.model_fields:
+            ref = ref.model_copy(update={"config": {**ref.config, "parallel_tool_calls": True}})
+        return _build(ref, Manager, goal)
+
+    _, built_manager, goal = await anyio.to_thread.run_sync(build_manager)
     _, built_tool, goal = await anyio.to_thread.run_sync(_build, tool, Tool, goal)
     config = RunConfig() if config is None else config
     limits = config.limits if limits is None else limits
@@ -462,11 +522,23 @@ async def check_manager(
             limits=limits,
             config=config,
         )
-        if harness.manager_errors:
-            raise harness.manager_errors[0]
-        return reports
-    except LimitReached:
+    except (
+        LimitReached,
+        _LLMContractError,
+        KeyboardInterrupt,
+        SystemExit,
+        anyio.get_cancelled_exc_class(),
+    ):
         raise
     except BaseException as error:
+        # Component outcomes were classified inside the harness and are reported
+        # below. Registered failures here belong to its owned run services.
+        if _is_core_signal(error):
+            raise
+        outcome.propagate_control(error)
         error = outcome.classify(error)
         raise AssertionError(f"manager raised {_exception_type_name(error)}") from error
+    if harness.manager_errors:
+        error = harness.manager_errors[0]
+        raise AssertionError(f"manager raised {_exception_type_name(error)}") from error
+    return reports

@@ -9,11 +9,18 @@ cancellation cleanup and prints ``interrupted`` without a traceback.
 """
 
 import argparse
+import asyncio
+import io
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from os import get_blocking, read, set_blocking
 from pathlib import Path
+from threading import current_thread, main_thread
+from typing import TextIO
 
 import anyio
 from anyio import wait_readable
@@ -67,26 +74,118 @@ def register(sub: argparse._SubParsersAction) -> None:
     resume.set_defaults(handler=_resume)
 
 
-async def _prompt() -> bool:
-    """Await terminal readiness without a thread startup or buffered stdin lock."""
-    answer = bytearray()
-    fd = sys.stdin.fileno()
-    blocking = get_blocking(fd)
+_interrupt_owner: ContextVar[Callable[[], None] | None] = ContextVar(
+    "cli_interrupt_owner", default=None
+)
+
+
+async def _interruptible(operation: Callable[[], Awaitable[None]]) -> None:
+    """Keep repeated SIGINT inside the CLI until cancellation cleanup finishes."""
+    task = asyncio.current_task()
+    assert task is not None
+    interrupts = 0
+
+    def interrupt() -> None:
+        nonlocal interrupts
+        interrupts += 1
+        if interrupts == 1:
+            task.cancel()
+        elif interrupts >= 3:
+            raise KeyboardInterrupt
+
     try:
-        set_blocking(fd, False)
-        while True:
-            await wait_readable(fd)
-            try:
-                chunk = read(fd, 1)
-            except BlockingIOError:
-                # A terminal signal may flush input after readiness was reported.
-                continue
-            if not chunk or chunk == b"\n":
-                break
-            answer.extend(chunk)
+        with _sigint_wakeup(interrupt):
+            await operation()
+    except asyncio.CancelledError:
+        if not interrupts or interrupts >= 3:
+            raise
+    if 0 < interrupts < 3:
+        raise KeyboardInterrupt
+
+
+@contextmanager
+def _sigint_wakeup(on_interrupt: Callable[[], None] | None = None) -> Generator[None]:
+    """Wake the selector even when SIGINT is delivered to another OS thread."""
+    handler = signal.getsignal(signal.SIGINT)
+    if current_thread() is not main_thread() or not callable(handler):
+        yield
+        return
+    owner = _interrupt_owner.get()
+    if owner is not None and on_interrupt is None:
+        yield
+        return
+    loop = asyncio.get_running_loop()
+
+    # Runner's Python signal handler cannot wake an idle main thread until
+    # Python runs it. add_signal_handler installs a wakeup fd written by the
+    # low-level signal handler, including when a worker receives the signal.
+    def interrupt() -> None:
+        try:
+            if on_interrupt is not None:
+                on_interrupt()
+            else:
+                handler(signal.SIGINT, None)
+        except (KeyboardInterrupt, SystemExit):
+            # An escaping callback ends Runner.run before prompt cleanup.
+            # Expose its handler now so its restoration check can succeed.
+            if signal.getsignal(signal.SIGINT) is temporary_handler:
+                signal.signal(signal.SIGINT, handler)
+            raise
+
+    token = _interrupt_owner.set(interrupt)
+    loop.add_signal_handler(signal.SIGINT, interrupt)
+    temporary_handler = signal.getsignal(signal.SIGINT)
+    try:
+        yield
     finally:
-        set_blocking(fd, blocking)
-    return bytes(answer).strip().lower() in {b"y", b"yes"}
+        _interrupt_owner.reset(token)
+        current_handler = signal.getsignal(signal.SIGINT)
+        if current_handler is temporary_handler and owner is not None:
+            # Replace the callback without dropping the wakeup fd or SIGINT ownership.
+            loop.add_signal_handler(signal.SIGINT, owner)
+        else:
+            loop.remove_signal_handler(signal.SIGINT)
+            # Removal resets SIGINT to default_int_handler. Restore only the
+            # handler we still own; retain any earlier Runner restoration.
+            if current_handler is temporary_handler:
+                signal.signal(signal.SIGINT, handler)
+            elif signal.getsignal(signal.SIGINT) is not current_handler:
+                signal.signal(signal.SIGINT, current_handler)
+
+
+async def _readline(stdin: TextIO) -> str:
+    """Await terminal readiness without a thread startup or buffered stdin lock."""
+    if isinstance(stdin, io.StringIO):
+        return stdin.readline()
+    answer = bytearray()
+    fd = stdin.fileno()
+    blocking = get_blocking(fd)
+    with _sigint_wakeup():
+        try:
+            set_blocking(fd, False)
+            while True:
+                await anyio.lowlevel.checkpoint()
+                try:
+                    chunk = read(fd, 1)
+                except BlockingIOError:
+                    # Files and device EOF need no poller; wait only for empty pipes/ttys.
+                    await wait_readable(fd)
+                    continue
+                if not chunk:
+                    break
+                answer.extend(chunk)
+                if chunk == b"\n":
+                    break
+        finally:
+            set_blocking(fd, blocking)
+    return bytes(answer).decode(getattr(stdin, "encoding", None) or "utf-8", errors="replace")
+
+
+async def _prompt() -> bool:
+    """Read approval through the shared cancellable terminal reader."""
+    answer = await _readline(sys.stdin)
+    encoded = answer.encode(getattr(sys.stdin, "encoding", None) or "utf-8", errors="replace")
+    return encoded.strip().lower() in {b"y", b"yes"}
 
 
 def _summaries(run_root: str, run_id: str, goal_ids: Sequence[str]) -> list[str]:
@@ -150,7 +249,7 @@ def _run(args: argparse.Namespace) -> int:
     if not args.yes and not sys.stdin.isatty():
         print("run requires a terminal or --yes", file=sys.stderr)
         return 2
-    anyio.run(_run_async, args, backend="asyncio")
+    anyio.run(_interruptible, partial(_run_async, args), backend="asyncio")
     return 0
 
 
@@ -161,7 +260,7 @@ async def _status_async(run_dir: Path) -> None:
 
 def _status(args: argparse.Namespace) -> int:
     """Dispatch status using the asyncio backend."""
-    anyio.run(_status_async, args.run_dir.resolve(), backend="asyncio")
+    anyio.run(_interruptible, partial(_status_async, args.run_dir.resolve()), backend="asyncio")
     return 0
 
 
@@ -169,6 +268,7 @@ def _stop(args: argparse.Namespace) -> int:
     """Request the selected run's current epoch stop key."""
     run_dir = args.run_dir.resolve()
     anyio.run(
+        _interruptible,
         partial(request_stop, str(run_dir.parent), run_dir.name, now=args.now),
         backend="asyncio",
     )
@@ -188,5 +288,5 @@ async def _resume_async(args: argparse.Namespace) -> None:
 def _resume(args: argparse.Namespace) -> int:
     """Dispatch resume using the asyncio backend."""
     args.run_dir = args.run_dir.resolve()
-    anyio.run(_resume_async, args, backend="asyncio")
+    anyio.run(_interruptible, partial(_resume_async, args), backend="asyncio")
     return 0

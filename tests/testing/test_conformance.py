@@ -1,12 +1,14 @@
+import json
 import math
 import subprocess
 import sys
 import traceback
 import warnings
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import anyio
 import pytest
@@ -51,6 +53,7 @@ from swarm_arena import (
     Limits,
     ProgramJudge,
     Ref,
+    RunConfig,
     Score,
     ScriptCheck,
     ScriptedManager,
@@ -779,7 +782,7 @@ async def test_check_judge_stamps_and_warns(local_executor: LocalExecutor) -> No
     scores = await check_judge(ProgramJudge(rosen_score), GOAL, [c1, c2], executor=local_executor)
     assert [s.candidate_id for s in scores] == [c1.id, c2.id]
     assert {s.judge for s in scores} == {"program"}
-    assert all(s.id.startswith(f"s-{run_tag('local')}-e0-") and s.rubric_hash for s in scores)
+    assert all(s.id.startswith("s-") and "-e1-" in s.id and s.rubric_hash for s in scores)
     assert len({s.batch_id for s in scores}) == 1
     assert scores[0].batch_id.startswith("b-")
     with pytest.warns(UserWarning, match=f"judge error for {c1.id}"):
@@ -1217,3 +1220,1634 @@ async def test_check_manager_after_run_board_removal() -> None:
         )
         == 2
     )
+
+
+@pytest.mark.parametrize("registered", [False, True])
+async def test_check_manager_distinguishes_user_limit_from_nested_core_limit(
+    registered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import _core_error
+    from swarm_arena.manager import LimitReached
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if registered:
+            raise ExceptionGroup(
+                "outer", [ExceptionGroup("inner", [_core_error(LimitReached, "budget", "private")])]
+            )
+        raise LimitReached("budget", "private")
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    if registered:
+        reports = await check_manager(
+            NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+        )
+        assert reports == [RoundReport(), RoundReport()]
+    else:
+        with pytest.raises(AssertionError, match=r"^manager raised LimitReached$") as caught:
+            await check_manager(NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"))
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert "private" not in str(caught.value.__cause__)
+
+
+def _llm_config(*, role: Literal["manager", "judge"] = "manager") -> RunConfig:
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    return RunConfig(
+        models=ModelCatalog(
+            {
+                "m": ModelSpec(
+                    model="fake/m",
+                    roles=[role],
+                    max_tokens=100,
+                    prices=ModelSpec.Prices(input=1, output=3),
+                )
+            }
+        ),
+        settle_timeout_s=2,
+    )
+
+
+async def test_check_manager_round_with_fake_model(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena.llm import AgentsSDKManager
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    FakeModel([FakeTurn(text="done")]).register("m")
+    assert await check_manager(
+        AgentsSDKManager(model="m"),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        rounds=1,
+        config=_llm_config(),
+    ) == [RoundReport(summary="done")]
+
+
+async def test_check_manager_runs_the_run_setups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._engine import run
+    from swarm_arena._journal import llm_record
+
+    calls: list[RunConfig] = []
+    run_ids: list[str] = []
+
+    def spy(config: RunConfig) -> None:
+        [run_id] = [
+            run_id
+            for run_id, binding in llm_record._bindings.items()
+            if Path(binding.journal._store.url).parent == Path(config.run_root).resolve()
+        ]
+        run_ids.append(run_id)
+        calls.append(config)
+
+    monkeypatch.setattr(run, "_run_setups", [])
+    run.register_run_setup(spy)
+    config = RunConfig(settle_timeout_s=2)
+    await check_manager(
+        ScriptedManager([]),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        rounds=2,
+        config=config,
+    )
+    assert len(calls) == 1
+    harness_config = config.model_copy(
+        update={
+            "run_root": calls[0].run_root,
+            "artifact_root": _artifact_root(),
+        }
+    )
+    assert calls == [harness_config]
+    assert len(run_ids) == 1
+    assert run_ids[0] not in llm_record._bindings
+
+
+async def test_check_judge_opens_a_judge_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._engine import run
+    from swarm_arena._journal import llm_record
+
+    seen: list[LLMScope] = []
+    setups: list[RunConfig] = []
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        assert scope.run_id in llm_record._bindings
+        scope.journal._check_open()
+        seen.append(scope)
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    monkeypatch.setattr(run, "_run_setups", [])
+    run.register_run_setup(setups.append)
+    config = _llm_config(role="judge")
+    [score] = await check_judge(
+        FixedJudge({"value": 1}),
+        GOAL,
+        [make_candidate(ok(), goal_id=GOAL.id)],
+        config=config,
+    )
+    assert score.key == (1.0,)
+    [scope] = seen
+    assert (scope.role, scope.models) == ("judge", config.models)
+    assert scope.cache == config.cache
+    assert len(setups) == 1
+    assert scope.run_id not in llm_record._bindings
+
+
+async def test_check_manager_forces_parallel_tool_calls(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena.llm import AgentsSDKManager
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    fake = FakeModel(
+        [
+            FakeTurn(
+                tool_calls=(("run_tool", {"inputs": {"x": 1}}), ("run_tool", {"inputs": {"x": 2}}))
+            ),
+            FakeTurn(text="done"),
+        ]
+    )
+    fake.register("m")
+    await check_manager(
+        AgentsSDKManager(model="m", parallel_tool_calls=False),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        config=_llm_config(),
+    )
+    assert fake.calls[0]["model_settings"].parallel_tool_calls is True
+
+
+async def test_two_parallel_runs_in_one_turn_share_the_requesting_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena.llm import AgentsSDKManager
+    from swarm_arena.testing import FakeModel, FakeTurn, _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    harness = OfflineHarness()
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+    fake = FakeModel(
+        [
+            FakeTurn(
+                tool_calls=(("run_tool", {"inputs": {"x": 1}}), ("run_tool", {"inputs": {"x": 2}}))
+            ),
+            FakeTurn(text="done"),
+        ]
+    )
+    fake.register("m")
+    await check_manager(
+        AgentsSDKManager(model="m"),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        config=_llm_config(),
+    )
+    assert len(harness.candidates) == 2
+    assert len({c.id for c in harness.candidates}) == 2
+    assert len({c.requested_by_call for c in harness.candidates}) == 1
+    assert harness.candidates[0].requested_by_call is not None
+    second_input = json.dumps(fake.calls[1]["input"])
+    assert all(c.id in second_input for c in harness.candidates)
+
+
+class _PrivateFeedback(Check):
+    feedback = "pass_fail"
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        return CheckResult(
+            check="private",
+            passed=False,
+            reasons=["hidden case 3 failed"],
+            details={"case": 3},
+        )
+
+
+async def test_pass_fail_reasons_never_reach_the_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agents")
+    from dataclasses import replace
+
+    from swarm_arena._agent.runtime import AgentRuntime
+    from swarm_arena.llm import AgentsSDKManager
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.testing._harness import OfflineHarness
+
+    original = OfflineHarness._rounds
+
+    async def with_check(
+        self: OfflineHarness,
+        manager: Manager,
+        rt: AgentRuntime,
+        rounds: int,
+        ranking: str,
+        judges: Sequence[tuple[Ref, Judge]],
+    ) -> list[RoundReport]:
+        return await original(
+            self,
+            manager,
+            replace(rt, checks=[("private", _PrivateFeedback())]),
+            rounds,
+            ranking,
+            judges,
+        )
+
+    monkeypatch.setattr(OfflineHarness, "_rounds", with_check)
+    fake = FakeModel(
+        [
+            FakeTurn(tool_calls=(("run_tool", {"inputs": {"x": 1}}),)),
+            FakeTurn(text="done"),
+        ]
+    )
+    fake.register("m")
+    await check_manager(
+        AgentsSDKManager(model="m"),
+        goal=GOAL,
+        tool=FunctionTool("_fakes.tools:square"),
+        config=_llm_config(),
+    )
+    second_input = json.dumps(fake.calls[1]["input"])
+    assert "hidden case 3 failed" not in second_input
+    assert '"case"' not in second_input
+
+
+async def test_manager_that_leaves_calls_open_fails_the_kit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agents")
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena.llm._hooks import MeteredModel
+    from swarm_arena.testing import FakeModel, _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    sdk = sys.modules["agents"]
+    entered = anyio.Event()
+    scopes: list[Any] = []
+    config = _llm_config()
+    harness = OfflineHarness()
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+
+    class HeldModel(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            await anyio.sleep_forever()
+
+    async def invoke() -> None:
+        spec = config.models.resolve("m", "manager")
+        model = MeteredModel(HeldModel([]), alias="m", spec=spec, namespace="test")
+        await model.get_response(
+            "sys",
+            [],
+            sdk.ModelSettings(),
+            [],
+            None,
+            [],
+            sdk.models.interface.ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+
+    async def leak(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scopes.append(current_llm_scope())
+        group.start_soon(invoke)
+        await entered.wait()
+        return RoundReport()
+
+    monkeypatch.setattr(NoopManager, "run_round", leak)
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as group:
+            try:
+                with pytest.raises(AssertionError, match="drain"):
+                    await check_manager(
+                        NoopManager(),
+                        goal=GOAL,
+                        tool=FunctionTool("_fakes.tools:square"),
+                        config=config,
+                    )
+                committed = read_committed(harness.store)
+                assert committed is not None
+                assert len([e for e in committed[1] if e.type == "llm_call"]) == 1
+                assert scopes[0].tranche._closed
+                assert scopes[0].run_id not in llm_record._bindings
+            finally:
+                group.cancel_scope.cancel()
+
+
+async def test_check_manager_rejects_requested_calls_outside_its_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    async def foreign(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        candidate = await ctx.run_tool({"x": 1})
+        ctx._rt.own[:] = [candidate.model_copy(update={"requested_by_call": SECRET})]
+        return RoundReport()
+
+    monkeypatch.setattr(NoopManager, "run_round", foreign)
+    with pytest.raises(AssertionError, match="requested_by_call") as caught:
+        await check_manager(
+            NoopManager(),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+        )
+    assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_check_judge_cleans_up_a_component_with_open_calls(
+    fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+
+    seen: list[LLMScope] = []
+
+    async def leaking(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        seen.append(scope)
+        estimate = Amount(tokens=120, usd=0.001)
+        reservation = await scope.tranche.reserve_call(estimate)
+        llm_record.open_call(
+            scope,
+            reservation_id=reservation,
+            estimate=estimate,
+            model_alias="m",
+            model="fake/m",
+            provider="fake",
+        )
+        if fails:
+            raise RuntimeError("judge failed")
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(FixedJudge, "judge", leaking)
+    with pytest.raises(RuntimeError if fails else AssertionError, match=r"judge failed|drain"):
+        await check_judge(
+            FixedJudge({"value": 1}),
+            GOAL,
+            [make_candidate(ok(), goal_id=GOAL.id)],
+            config=_llm_config(role="judge"),
+        )
+    [scope] = seen
+    assert scope.tranche._closed
+    assert scope.tranche.pending() == 0
+    assert scope.run_id not in llm_record._bindings
+    committed = read_committed(scope.journal._store)
+    assert committed is not None
+    calls = [event.payload["call"] for event in committed[1] if event.type == "llm_call"]
+    assert len(calls) == 1
+    assert calls[0]["error"].startswith("estimated:")
+    assert calls[0]["cost_usd"] == 0.001
+    assert scope.call_ids == [calls[0]["id"]]
+
+
+async def test_check_judge_setup_is_abandoned_on_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._engine import run
+    from swarm_arena._journal import llm_record
+
+    held = HeldOperation()
+    entered = False
+    bindings_before = dict(llm_record._bindings)
+
+    def setup(config: RunConfig) -> None:
+        held.wait()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        nonlocal entered
+        entered = True
+        return []
+
+    monkeypatch.setattr(run, "_run_setups", [setup])
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    owner = anyio.CancelScope()
+    finished = anyio.Event()
+
+    async def invoke() -> None:
+        with owner:
+            await check_judge(
+                FixedJudge({"value": 1}),
+                GOAL,
+                [],
+                config=RunConfig(settle_timeout_s=2),
+            )
+        finished.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(invoke)
+        try:
+            await held.ready()
+            owner.cancel()
+            with anyio.fail_after(5):
+                await finished.wait()
+            assert not entered
+            assert llm_record._bindings == bindings_before
+            assert not held.release.is_set()
+        finally:
+            owner.cancel()
+            await held.finish()
+
+
+def test_offline_llm_connector_example_runs() -> None:
+    pytest.importorskip("agents")
+    import re
+
+    text = (Path(__file__).resolve().parents[2] / "docs/writing-a-connector.md").read_text()
+    section = text.split("### Testing managers and judges offline\n", 1)[1].split("\n### ", 1)[0]
+    blocks = re.findall(r"```python\n(.*?)```", section, re.DOTALL)
+    assert len(blocks) == 2
+    done = subprocess.run(
+        [sys.executable, "-c", "\n".join(blocks)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert done.stderr == ""
+
+
+@pytest.mark.parametrize("cut", ["acquire", "writer-entry"])
+async def test_check_judge_releases_a_lease_before_writer_ownership(
+    cut: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena._journal.writer import JournalWriter
+    from swarm_arena._store.base import Store
+
+    held = HeldOperation()
+    released = anyio.Event()
+    leases: list[Lease] = []
+    acquire_new, release = Lease.acquire_new, Lease.release
+    loop = asyncio.get_running_loop()
+
+    def acquire(store: Store, **kwargs: Any) -> Lease:
+        lease = acquire_new(store, **kwargs)
+        leases.append(lease)
+        if cut == "acquire":
+            held.wait()
+        return lease
+
+    def release_spy(lease: Lease) -> None:
+        release(lease)
+        loop.call_soon_threadsafe(released.set)
+
+    async def refuse_entry(self: JournalWriter) -> JournalWriter:
+        raise RuntimeError("writer entry failed")
+
+    monkeypatch.setattr(Lease, "acquire_new", staticmethod(acquire))
+    monkeypatch.setattr(Lease, "release", release_spy)
+    if cut == "writer-entry":
+        monkeypatch.setattr(JournalWriter, "__aenter__", refuse_entry)
+        try:
+            with pytest.raises(RuntimeError, match="writer entry failed"):
+                await check_judge(FixedJudge({"value": 1}), GOAL, [])
+            assert released.is_set()
+        finally:
+            if not released.is_set():
+                await anyio.to_thread.run_sync(release, leases[0])
+        return
+
+    owner = anyio.CancelScope()
+    finished = anyio.Event()
+
+    async def invoke() -> None:
+        with owner:
+            await check_judge(FixedJudge({"value": 1}), GOAL, [])
+        finished.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(invoke)
+        try:
+            await held.ready()
+            owner.cancel()
+            with anyio.fail_after(5):
+                await finished.wait()
+            assert not released.is_set()
+            await held.finish()
+            with anyio.fail_after(2):
+                await released.wait()
+        finally:
+            owner.cancel()
+            await held.finish()
+            if not released.is_set():
+                await anyio.to_thread.run_sync(release, leases[0])
+
+
+@pytest.mark.parametrize("kind", ["judge", "manager"])
+async def test_overlapping_conformance_runs_are_isolated(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+
+    baseline = dict(llm_record._bindings)
+    first_entered, release = anyio.Event(), anyio.Event()
+    second_finished = anyio.Event()
+    scopes: list[LLMScope] = []
+    results: dict[str, list[Any]] = {}
+    failures: dict[str, Exception] = {}
+
+    async def hold(scope: LLMScope) -> None:
+        scopes.append(scope)
+        scope.journal._check_open()
+        assert scope.run_id in llm_record._bindings
+        assert Path(scope.journal._store.url).name == scope.run_id
+        if len(scopes) == 1:
+            first_entered.set()
+            await release.wait()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        assert ctx.run_id == scope.run_id
+        assert ctx.ids.next("x").startswith(f"x-{run_tag(scope.run_id)}-")
+        await hold(scope)
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    async def manage(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scope = current_llm_scope()
+        assert scope is not None
+        candidate = await ctx.run_tool({"x": 1})
+        assert candidate.run_id == scope.run_id
+        assert candidate.id.startswith(f"c-{run_tag(scope.run_id)}-")
+        await hold(scope)
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    monkeypatch.setattr(NoopManager, "run_round", manage)
+    candidate = make_candidate(ok(), goal_id=GOAL.id)
+
+    async def invoke(label: str) -> None:
+        try:
+            if kind == "judge":
+                results[label] = await check_judge(FixedJudge({"value": 1}), GOAL, [candidate])
+            else:
+                results[label] = await check_manager(
+                    NoopManager(),
+                    goal=GOAL,
+                    tool=FunctionTool("_fakes.tools:square"),
+                )
+        except Exception as error:
+            failures[label] = error
+        finally:
+            if label == "second":
+                second_finished.set()
+            elif label in failures:
+                first_entered.set()
+
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as group:
+            group.start_soon(invoke, "first")
+            await first_entered.wait()
+            try:
+                assert not failures
+                group.start_soon(invoke, "second")
+                await second_finished.wait()
+                assert not failures
+                assert len(scopes) == 2
+                first, second = scopes
+                assert first.run_id != second.run_id
+                assert first.run_id in llm_record._bindings
+                assert second.run_id not in llm_record._bindings
+            finally:
+                release.set()
+    assert not failures
+    assert llm_record._bindings == baseline
+    assert set(results) == {"first", "second"}
+    if kind == "judge":
+        for label, scope in zip(("first", "second"), scopes, strict=True):
+            [score] = results[label]
+            assert score.candidate_id == candidate.id
+            assert score.key == (1.0,)
+            assert score.id.startswith(f"s-{run_tag(scope.run_id)}-")
+    else:
+        assert all(returned == [RoundReport(summary="done")] for returned in results.values())
+    for scope in scopes:
+        assert scope.tranche._closed
+        committed = read_committed(scope.journal._store)
+        assert committed is not None
+        assert all(event.run_id == scope.run_id for event in committed[1])
+        assert all(event.context_id == scope.run_id for event in committed[1])
+
+
+async def _reserve_conformance_call(*, opened: bool = True) -> Any:
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._journal.llm_record import open_call
+
+    scope = current_llm_scope()
+    assert scope is not None
+    estimate = Amount(tokens=120, usd=0.001)
+    reservation = await scope.tranche.reserve_call(estimate)
+    if opened:
+        open_call(
+            scope,
+            reservation_id=reservation,
+            estimate=estimate,
+            model_alias="m",
+            model="fake/m",
+            provider="fake",
+        )
+    return scope
+
+
+async def _run_conformance_kind(kind: str, *, config: RunConfig | None = None) -> list[Any]:
+    from _fakes.tools import NoopManager
+
+    if kind == "manager":
+        return await check_manager(
+            NoopManager(),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+            config=config,
+        )
+    return await check_judge(
+        FixedJudge({"value": 1}),
+        GOAL,
+        [make_candidate(ok(), goal_id=GOAL.id)],
+        config=config,
+    )
+
+
+@pytest.mark.parametrize("contains", [False, True])
+async def test_check_manager_stops_after_authoritative_overflow(
+    contains: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agents")
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena._journal.llm_record import drain
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena.llm import AgentsSDKManager
+    from swarm_arena.llm._hooks import MeteredModel
+    from swarm_arena.manager import LimitReached
+    from swarm_arena.testing import FakeModel, FakeTurn, _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+    from swarm_arena.tool import Usage
+
+    fake = FakeModel([FakeTurn(text="overflow", usage=Usage(input_tokens=2 * 10**15))])
+    fake.register("m")
+    config = _llm_config()
+    harness = OfflineHarness()
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+
+    async def contain(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        from swarm_arena._budget.llm_scope import current_llm_scope
+
+        scope = current_llm_scope()
+        assert scope is not None
+        model = MeteredModel(
+            fake, alias="m", spec=config.models.resolve("m", "manager"), namespace="t"
+        )
+        sdk = sys.modules["agents"]
+        with suppress(LimitReached):
+            await model.get_response(
+                "sys",
+                "hi",
+                sdk.ModelSettings(),
+                [],
+                None,
+                [],
+                sdk.models.interface.ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
+        await drain(scope, wait=False)
+        return RoundReport(summary="contained")
+
+    monkeypatch.setattr(NoopManager, "run_round", contain)
+    with pytest.raises(LimitReached) as caught:
+        await check_manager(
+            NoopManager() if contains else AgentsSDKManager(model="m"),
+            goal=GOAL,
+            tool=FunctionTool("_fakes.tools:square"),
+            rounds=2,
+            config=config,
+        )
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert len(fake.calls) == 1
+    committed = read_committed(harness.store)
+    assert committed is not None
+    events = committed[1]
+    assert [e.round for e in events if e.type == "round_started"] == [1]
+    assert len([e for e in events if e.type == "llm_call"]) == 1
+
+
+@pytest.mark.parametrize("contains", [False, True])
+async def test_check_judge_rejects_contained_terminal_overflow(
+    contains: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena._journal.llm_record import drain
+    from swarm_arena.llm._hooks import MeteredModel
+    from swarm_arena.manager import LimitReached
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Usage
+
+    config = _llm_config(role="judge")
+    fake = FakeModel([FakeTurn(text="overflow", usage=Usage(input_tokens=2 * 10**15))])
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scope = current_llm_scope()
+        assert scope is not None
+        model = MeteredModel(
+            fake, alias="m", spec=config.models.resolve("m", "judge"), namespace="t"
+        )
+        sdk = sys.modules["agents"]
+        try:
+            await model.get_response(
+                "sys",
+                "hi",
+                sdk.ModelSettings(),
+                [],
+                None,
+                [],
+                sdk.models.interface.ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
+        except LimitReached:
+            if not contains:
+                raise
+            ctx.judge_error(candidates[0].id, "model failed")
+        await drain(scope, wait=False)
+        return []
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    if contains:
+        with pytest.raises(AssertionError, match=r"TERMINAL.*rule|rule.*TERMINAL"):
+            await _run_conformance_kind("judge", config=config)
+    else:
+        with pytest.raises(LimitReached) as caught:
+            await _run_conformance_kind("judge", config=config)
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_preserves_cleanup_expiry_control(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import _core_category, _SignalCategory
+    from swarm_arena._journal import llm_record
+
+    async def settle(*args: Any, **kwargs: Any) -> None:
+        await anyio.sleep_forever()
+
+    async def hold() -> None:
+        scope = await _reserve_conformance_call()
+        llm_record._bindings[scope.run_id].stops.run_timeout = True
+        await anyio.sleep_forever()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await hold()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await hold()
+        return []
+
+    monkeypatch.setattr(llm_record, "_settle", settle)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with (
+        anyio.fail_after(12),
+        pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
+    ):
+        await _run_conformance_kind(
+            kind,
+            config=RunConfig(settle_timeout_s=2),
+        )
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_preserves_native_caller_cancellation(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from _fakes.tools import NoopManager
+
+    entered = anyio.Event()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        entered.set()
+        await anyio.sleep_forever()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        entered.set()
+        await anyio.sleep_forever()
+        return []
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    task = asyncio.create_task(_run_conformance_kind(kind))
+    try:
+        with anyio.fail_after(10):
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert task.cancelled()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_rejects_reservations_without_calls(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    scopes: list[Any] = []
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scopes.append(await _reserve_conformance_call(opened=False))
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scopes.append(await _reserve_conformance_call(opened=False))
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(AssertionError, match="drain rule"):
+        await _run_conformance_kind(kind)
+    assert scopes[0].tranche._closed
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("opened", [False, True])
+async def test_conformance_rejects_leaks_inside_a_caller_exception_handler(
+    kind: str,
+    opened: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._journal import llm_record
+
+    scopes: list[LLMScope] = []
+    baseline = dict(llm_record._bindings)
+    caller_error = KeyError("handled caller failure")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        scopes.append(await _reserve_conformance_call(opened=opened))
+        return RoundReport(summary="leaked")
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        scopes.append(await _reserve_conformance_call(opened=opened))
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with anyio.fail_after(15):
+        try:
+            raise caller_error
+        except KeyError:
+            with pytest.raises(AssertionError, match="drain rule"):
+                await (
+                    check_manager(
+                        NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square")
+                    )
+                    if kind == "manager"
+                    else check_judge(
+                        FixedJudge({"value": 1}), GOAL, [make_candidate(ok(), goal_id=GOAL.id)]
+                    )
+                )
+        finally:
+            assert not getattr(caller_error, "__notes__", ())
+            assert len(scopes) == 1
+            assert scopes[0].tranche._closed
+            assert scopes[0].tranche.pending() == 0
+            assert llm_record._bindings == baseline
+
+
+async def test_check_manager_closes_each_round_inside_a_caller_exception_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+    from swarm_arena._journal import llm_record
+
+    scopes: list[LLMScope] = []
+    baseline = dict(llm_record._bindings)
+    caller_error = KeyError("handled caller failure")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if scopes:
+            assert scopes[-1].tranche._closed
+        scope = current_llm_scope()
+        assert scope is not None
+        scopes.append(scope)
+        return RoundReport(summary="done")
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    with anyio.fail_after(15):
+        try:
+            raise caller_error
+        except KeyError:
+            reports = await check_manager(
+                NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+            )
+    assert reports == [RoundReport(summary="done"), RoundReport(summary="done")]
+    assert len(scopes) == 2
+    assert all(scope.tranche._closed for scope in scopes)
+    assert not getattr(caller_error, "__notes__", ())
+    assert llm_record._bindings == baseline
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_reports_setup_failure_at_its_own_boundary(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._engine import run
+    from swarm_arena._journal import llm_record
+
+    baseline = dict(llm_record._bindings)
+
+    def fail(config: RunConfig) -> None:
+        raise KeyError(SECRET)
+
+    monkeypatch.setattr(run, "_run_setups", [fail])
+    with pytest.raises(RuntimeError, match=r"^run setup failed: KeyError$") as caught:
+        await _run_conformance_kind(kind)
+    assert_secret_absent(caught.value, SECRET)
+    assert llm_record._bindings == baseline
+
+
+def _has_drain_note(error: BaseException | None) -> bool:
+    while error is not None:
+        if any("drain rule" in note for note in getattr(error, "__notes__", ())):
+            return True
+        error = error.__cause__
+    return False
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("opened", [False, True])
+async def test_conformance_keeps_component_failure_with_a_drain_note(
+    kind: str,
+    opened: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    failure = KeyError("component failed")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await _reserve_conformance_call(opened=opened)
+        raise failure
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await _reserve_conformance_call(opened=opened)
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(AssertionError if kind == "manager" else KeyError) as caught:
+        await _run_conformance_kind(kind)
+    assert (caught.value.__cause__ if kind == "manager" else caught.value) is failure
+    assert _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("stop", ["native", "anyio", "run"])
+async def test_conformance_keeps_owner_interruption_with_a_drain_note(
+    kind: str,
+    stop: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal import llm_record
+
+    entered = anyio.Event()
+    scopes: list[Any] = []
+    timers: list[Any] = []
+    cancellations: list[BaseException] = []
+    owner = anyio.CancelScope()
+    baseline = dict(llm_record._bindings)
+
+    async def hold() -> None:
+        scope = await _reserve_conformance_call()
+        scopes.append(scope)
+        entered.set()
+        if stop == "run":
+            llm_record._bindings[scope.run_id].stops.run_timeout = True
+        await anyio.sleep_forever()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await hold()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await hold()
+        return []
+
+    async def invoke() -> None:
+        with owner:
+            try:
+                async with asyncio.timeout(None) as timer:
+                    timers.append(timer)
+                    await _run_conformance_kind(kind, config=RunConfig(settle_timeout_s=2))
+            except asyncio.CancelledError as error:
+                cancellations.append(error)
+                raise
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    task = asyncio.create_task(invoke())
+    try:
+        with anyio.fail_after(12):
+            await entered.wait()
+            if stop == "native":
+                timers[0].reschedule(asyncio.get_running_loop().time())
+                with pytest.raises(TimeoutError) as caught:
+                    await task
+                assert _has_drain_note(caught.value)
+            elif stop == "anyio":
+                owner.cancel()
+                await task
+                assert len(cancellations) == 1
+                assert _has_drain_note(cancellations[0])
+            else:
+                with pytest.raises(RuntimeError, match="offline harness stopped") as caught:
+                    await task
+                assert _has_drain_note(caught.value)
+        assert scopes[0].tranche._closed
+        assert llm_record._bindings == baseline
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("control", ["terminal", "fenced"])
+async def test_conformance_keeps_core_control_with_a_drain_note(
+    kind: str,
+    control: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._errors import Fenced, _core_category, _SignalCategory, _stop_cleanup_error
+
+    failure = (
+        _stop_cleanup_error()
+        if control == "terminal"
+        else _core_error(Fenced, "run ownership lost")
+    )
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await _reserve_conformance_call()
+        raise failure
+
+    async def judge(
+        self: FixedJudge,
+        goal: Goal,
+        candidates: Sequence[Candidate],
+        ctx: JudgeContext,
+    ) -> list[Score]:
+        await _reserve_conformance_call()
+        raise failure
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(RuntimeError if control == "terminal" else Fenced) as caught:
+        await _run_conformance_kind(kind)
+    expected = _SignalCategory.TERMINAL if control == "terminal" else _SignalCategory.FENCED
+    assert _core_category(caught.value) is expected
+    assert _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+async def test_conformance_preserves_process_interrupts(
+    kind: str, error_type: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    error = error_type()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        raise error
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise error
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(error_type) as caught:
+        await _run_conformance_kind(kind)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("shape", ["chained", "group", "limit"])
+async def test_check_judge_preserves_error_identity_and_chain(
+    shape: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent.manager import LimitReached
+
+    cause = KeyError("cause")
+    error = (
+        ExceptionGroup("group", [ValueError("child")])
+        if shape == "group"
+        else LimitReached("user", "user limit")
+        if shape == "limit"
+        else ValueError("failure")
+    )
+    error.__cause__ = cause
+    error.__context__ = cause
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise error
+
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    with pytest.raises(type(error)) as caught:
+        await _run_conformance_kind("judge")
+    assert caught.value is error
+    assert error.__cause__ is cause
+    assert error.__context__ is cause
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_rejects_reservation_admitted_during_close(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+
+    entered, closing = anyio.Event(), anyio.Event()
+    tasks: list[asyncio.Task[None]] = []
+    original_close = Tranche.close
+    original_reserve = Ledger.reserve
+
+    async def reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await closing.wait()
+        return await original_reserve(self, *args, **kwargs)
+
+    async def close(self: Tranche) -> Any:
+        closing.set()
+        return await original_close(self)
+
+    async def leak() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        await scope.tranche.reserve_call(Amount(usd=0.001))
+
+    async def start() -> None:
+        tasks.append(asyncio.create_task(leak()))
+        await entered.wait()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await start()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await start()
+        return []
+
+    monkeypatch.setattr(Ledger, "reserve", reserve)
+    monkeypatch.setattr(Tranche, "close", close)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    try:
+        with anyio.fail_after(10), pytest.raises(AssertionError, match="drain rule"):
+            await _run_conformance_kind(kind)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("estimated", [False, True])
+async def test_conformance_accepts_exact_closed_scope_accounting(
+    kind: str, estimated: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._journal.llm_record import drain, record_call
+    from swarm_arena._model.tooling import Usage
+
+    async def finish() -> None:
+        scope = await _reserve_conformance_call()
+        if not estimated:
+            reservation = next(iter(scope.tranche._calls))
+            await record_call(
+                metadata={
+                    "run_id": scope.run_id,
+                    "reservation_id": reservation,
+                    "goal_id": scope.goal_id,
+                    "team": scope.team,
+                    "agent": scope.agent,
+                    "round": str(scope.round),
+                },
+                model="fake/m",
+                provider="fake",
+                usage=Usage(),
+                cost_usd=0.000321,
+                cache_hit=False,
+                latency_ms=None,
+                status="ok",
+                error=None,
+                request=None,
+                response=None,
+                litellm_call_id=None,
+                tool_call_ids=[],
+                settle=True,
+            )
+        await drain(scope, wait=False)
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await finish()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await finish()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    assert await _run_conformance_kind(kind)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+async def test_conformance_accepts_a_round_total_above_one_amount(
+    kind: Literal["manager", "judge"], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two direct calls of 6e8 USD each: neither overflows, but the round total exceeds USD_LIMIT.
+    pytest.importorskip("agents")
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena.llm._hooks import MeteredModel
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Usage
+
+    turn = FakeTurn(text="x", usage=Usage(input_tokens=6 * 10**14))
+    fake = FakeModel([turn, turn])
+    fake.register("m")
+    config = _llm_config(role=kind)
+    config = config.model_copy(
+        update={"limits": config.limits.model_copy(update={"llm_tranche_usd": 0.00001})}
+    )
+
+    async def calls() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        model = MeteredModel(fake, alias="m", spec=config.models.resolve("m", kind), namespace="t")
+        sdk = sys.modules["agents"]
+        for _ in range(2):
+            await model.get_response(
+                "sys",
+                "hi",
+                sdk.ModelSettings(),
+                [],
+                None,
+                [],
+                sdk.models.interface.ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await calls()
+        return RoundReport(summary="ok")
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await calls()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    assert await _run_conformance_kind(kind, config=config)
+    assert len(fake.calls) == 2
+
+
+async def test_later_round_stop_does_not_inherit_drain_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.tools import NoopManager
+
+    from swarm_arena.testing import _conformance
+    from swarm_arena.testing._harness import OfflineHarness
+
+    harness = OfflineHarness()
+    monkeypatch.setattr(_conformance, "OfflineHarness", lambda: harness)
+    failure = KeyError("first round")
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if ctx._rt.round == 1:
+            await _reserve_conformance_call(opened=False)
+            raise failure
+        from swarm_arena._budget.llm_scope import current_llm_scope
+        from swarm_arena._journal import llm_record
+
+        scope = current_llm_scope()
+        assert scope is not None
+        llm_record._bindings[scope.run_id].stops.run_timeout = True
+        await anyio.sleep_forever()
+        raise AssertionError("stop must interrupt the round")
+
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    with (
+        anyio.fail_after(10),
+        pytest.raises(RuntimeError, match="offline harness stopped") as caught,
+    ):
+        await check_manager(
+            NoopManager(), goal=GOAL, tool=FunctionTool("_fakes.tools:square"), rounds=2
+        )
+    assert _has_drain_note(failure)
+    assert not _has_drain_note(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["manager", "judge"])
+@pytest.mark.parametrize("mismatch", [False, True])
+async def test_conformance_stops_when_accounting_read_is_interrupted(
+    kind: str, mismatch: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    from _fakes.tools import NoopManager
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.ledger import Ledger
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._store.local import LocalStore
+    from swarm_arena.testing import _harness
+
+    loop = asyncio.get_running_loop()
+    entered, reserving, closing = anyio.Event(), anyio.Event(), anyio.Event()
+    release = threading.Event()
+    workers: list[threading.Thread] = []
+    stragglers: list[asyncio.Task[str]] = []
+    scopes: list[Any] = []
+    accounting_store: list[Any] = []
+    baseline = dict(llm_record._bindings)
+    original_reserve, original_close = Ledger.reserve, Tranche.close
+    original_chain, original_read = _harness._read_chain, LocalStore.read
+
+    async def reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        reserving.set()
+        await closing.wait()
+        return await original_reserve(self, *args, **kwargs)
+
+    async def close(self: Tranche) -> Any:
+        closing.set()
+        return await original_close(self)
+
+    async def read_chain(store: Any, head: Any) -> Any:
+        accounting_store.append(store)
+        return await original_chain(store, head)
+
+    def read(self: LocalStore, key: str) -> Any:
+        if accounting_store and self is accounting_store[0] and key.startswith("journal/"):
+            workers.append(threading.current_thread())
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(30):
+                raise AssertionError("accounting read safety release expired")
+        return original_read(self, key)
+
+    async def prepare() -> None:
+        scope = current_llm_scope()
+        assert scope is not None
+        scopes.append(scope)
+        if mismatch:
+            stragglers.append(asyncio.create_task(scope.tranche.reserve_call(Amount(usd=0.001))))
+            await reserving.wait()
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        await prepare()
+        return RoundReport()
+
+    async def judge(
+        self: FixedJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        await prepare()
+        return [Score.maximize(1).model_copy(update={"candidate_id": c.id}) for c in candidates]
+
+    monkeypatch.setattr(Ledger, "reserve", reserve)
+    monkeypatch.setattr(Tranche, "close", close)
+    monkeypatch.setattr(_harness, "_read_chain", read_chain)
+    monkeypatch.setattr(LocalStore, "read", read)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    monkeypatch.setattr(FixedJudge, "judge", judge)
+    task = asyncio.create_task(_run_conformance_kind(kind))
+    try:
+        with anyio.fail_after(10):
+            await entered.wait()
+            # Expire the actual owner's allowance only once the accounting read is held.
+            llm_record._bindings[scopes[0].run_id].stops.run_timeout = True
+            with pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+                await task
+        assert not release.is_set()
+        assert scopes[0].tranche._closed
+        assert llm_record._bindings == baseline
+    finally:
+        release.set()
+        task.cancel()
+        for straggler in stragglers:
+            straggler.cancel()
+        await asyncio.gather(task, *stragglers, return_exceptions=True)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
+    accounting_store.clear()
+    committed = read_committed(scopes[0].journal._store)
+    assert committed is not None
+    events = committed[1]
+    assert not [event for event in events if event.type == "llm_call"]
+    settled = sum(
+        (Amount(usd=event.payload["actual"]["usd"]) for event in events if event.type == "settle"),
+        Amount(),
+    )
+    assert settled == Amount(usd=0.001 if mismatch else 0)
+
+
+async def test_check_judge_runs_an_llm_judge_offline(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    fake = FakeModel(
+        [
+            FakeTurn(
+                text=json.dumps(
+                    {
+                        "scores": [
+                            {"index": i, "value": 7.5, "verdict": "ok", "notes": "rubric"}
+                            for i in range(2)
+                        ]
+                    }
+                )
+            )
+        ]
+    )
+    fake.register("m")
+    config = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
+        settle_timeout_s=2,
+    )
+    candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=GOAL) for _ in range(2)]
+    scores = await check_judge(LLMJudge("r", ["m"]), GOAL, candidates, config=config)
+    assert [s.candidate_id for s in scores] == [c.id for c in candidates]
+    assert all(s.llm_call_ids for s in scores)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_check_tool_validation_exit_terminal(
+    monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from pydantic import BaseModel, model_validator
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    class Input(BaseModel):
+        a: int
+
+        @model_validator(mode="before")
+        @classmethod
+        def fail(cls, value: Any) -> Any:
+            reached.append(True)
+            error = _stop_cleanup_error()
+            if nested:
+                raise BaseExceptionGroup("tool", [BaseExceptionGroup("validation", [error])])
+            raise error
+
+    monkeypatch.setattr(FunctionTool, "get_input_model", lambda _: Input)
+    with pytest.raises(RuntimeError) as caught:
+        await check_tool(FunctionTool("_fakes.tools:add"), {"a": 1}, executor=RecordingExecutor())
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL

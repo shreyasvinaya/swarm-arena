@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -23,9 +24,11 @@ class BlockingScore(Score):
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         assert ROOT is not None
         if not (ROOT / "dump-exited").exists():
-            (ROOT / "dump-entered").write_text(
+            pending = ROOT / "dump-entered.tmp"
+            pending.write_text(
                 json.dumps({"loop_thread": LOOP_THREAD, "hook_thread": threading.get_ident()})
             )
+            os.replace(pending, ROOT / "dump-entered")
             released = threading.Event()
 
             def release_on_file() -> None:

@@ -557,3 +557,124 @@ async def test_failed_overflow_report_can_be_committed_by_close(
     assert env.count("settle") == 1
     assert env.charged("g1/t/a") == Amount(tokens=7, usd=USD_LIMIT)
     assert _replay(env).run_exhausted()
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("retry", ["close", "report"])
+async def test_normalized_overflow_retries_without_invalid_amount(
+    direct: bool, retry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = await _env(Limits())
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    rid = await tranche.reserve_call(Amount(usd=0.5 if direct else 0.1))
+    actual = Amount(tokens=7, usd=USD_LIMIT)
+    append = env.journal.append_durable
+    failed = False
+
+    async def fail_once(event: EventDraft) -> None:
+        nonlocal failed
+        if event.type == "settle" and not failed:
+            failed = True
+            raise RuntimeError("journal unavailable")
+        await append(event)
+
+    monkeypatch.setattr(env.journal, "append_durable", fail_once)
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        await tranche._settle_call(rid, actual, overflow=True)
+    assert env.ledger.run_exhausted()
+    if retry == "report":
+        assert (await tranche._settle_call(rid, actual, overflow=True)).overflow
+    assert (await tranche.close()).overflow
+    assert (await tranche.close()).overflow
+    assert env.charged("g1/t/a") == actual
+    assert env.count("settle") == 1
+    assert _replay(env).run_exhausted()
+
+
+async def test_overflow_marker_requires_normalized_limit(env: LedgerEnv) -> None:
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount())
+    rid = await tranche.reserve_call(Amount(usd=0.1))
+    with pytest.raises(ValueError, match="supported USD limit"):
+        await tranche._settle_call(rid, Amount(usd=0.01), overflow=True)
+    assert tranche.pending() == 1
+    assert env.count("settle") == 0
+    assert not (await tranche.settle_call(rid, Amount(usd=0.01))).overflow
+    assert env.charged("g1/t/a") == Amount(usd=0.01)
+
+
+@pytest.mark.parametrize(
+    "case", ["free credit fits", "tranche used up, ledger fits one tranche", "neither"]
+)
+async def test_can_cover_matches_reserve_call(case: str, tmp_path: Path) -> None:
+    env = await _env(Limits(max_usd=1 if case != "neither" else 0.3))
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(tokens=25_000, usd=0.25))
+    await tranche.reserve_call(Amount(usd=0.1 if case == "free credit fits" else 0.25))
+    est = Amount(usd=0.1)
+    before = list(env.journal.events)
+    assert tranche.can_cover(est) is (case != "neither")
+    assert env.journal.events == before
+    if case == "neither":
+        with pytest.raises(LimitReached):
+            await tranche.reserve_call(est)
+    else:
+        await tranche.reserve_call(est)
+    await tranche.close()
+
+
+@pytest.mark.parametrize(("tokens", "usd"), [(None, None), (100, None), (None, 0.1), (100, 0.1)])
+@pytest.mark.parametrize("size", [Amount(), Amount(tokens=25_000, usd=0.25)])
+async def test_can_cover_shrinks_batches_and_respects_uncapped_units(
+    tokens: int | None,
+    usd: float | None,
+    size: Amount,
+) -> None:
+    env = await _env(Limits(max_tokens=tokens, max_usd=usd))
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=size)
+    estimate = Amount(tokens=10, usd=0.01)
+    assert tranche.can_cover(estimate)
+    await tranche.reserve_call(estimate)
+    await tranche.close()
+    assert not tranche.can_cover(Amount())
+
+
+async def test_can_cover_rejects_overflow_even_with_free_credit(env: LedgerEnv) -> None:
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    await tranche.reserve_call(Amount(usd=0.01))
+    other = Tranche(env.ledger, "g1/t/a", "g1", size=Amount())
+    rid = await other.reserve_call(Amount(usd=0.01))
+    await other._settle_call(rid, Amount(usd=USD_LIMIT), overflow=True)
+    assert not tranche.can_cover(Amount())
+    with pytest.raises(LimitReached, match="overflow"):
+        await tranche.reserve_call(Amount())
+
+
+async def test_cancelled_overflow_lock_wait_keeps_one_admission_latch(env: LedgerEnv) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory
+
+    tranche = Tranche(env.ledger, "g1/t/a", "g1", size=Amount(usd=0.25))
+    rid = await tranche.reserve_call(Amount(usd=0.1))
+    batch = tranche._calls[rid].batch
+    assert batch is not None
+    entry = env.ledger._entries[batch.id]
+    await entry.lock.acquire()
+    task = asyncio.create_task(tranche._settle_call(rid, Amount(usd=USD_LIMIT), overflow=True))
+    try:
+        await anyio.wait_all_tasks_blocked()
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        before = list(env.journal.events)
+        assert not tranche.can_cover(Amount())
+        with pytest.raises(LimitReached) as caught:
+            await tranche.reserve_call(Amount())
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        assert env.journal.events == before
+    finally:
+        entry.lock.release()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert (await tranche.close()).overflow
+    assert env.count("settle") == 1
+    assert _replay(env).run_exhausted()

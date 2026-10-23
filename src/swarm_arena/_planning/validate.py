@@ -1,38 +1,55 @@
 """Admit frozen revisions after import-free authorization and aggregate plan rules."""
 
 import re
+import threading
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
-from typing import Any, TypeVar
+from pathlib import Path
+from tempfile import TemporaryFile
+from typing import Any, BinaryIO, TypeVar, cast
 
+import anyio
+import anyio.from_thread
 from pydantic import BaseModel
 
 from swarm_arena._agent.manager import Manager
-from swarm_arena._errors import ConfigError, PlanError, _core_error, _exception_type_name
+from swarm_arena._budget.estimate import make_price_of
+from swarm_arena._errors import (
+    ConfigError,
+    PlanError,
+    _core_error,
+    _exception_type_name,
+    _rebuild_core_signal,
+)
+from swarm_arena._exec.threads import _DaemonCall
+from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
-from swarm_arena._model.catalog import CatalogEntry, _human_only_inputs
+from swarm_arena._model.catalog import CatalogEntry, ModelSpec, _human_only_inputs
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import json_equal
+from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import FileSet, Goal, GoalKey
 from swarm_arena._model.locations import _safe_location
 from swarm_arena._model.plan import AgentSpec, Plan, TeamSpec
 from swarm_arena._model.ref import Configurable, Ref
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._model.tooling import ToolRequest
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control, _raise_terminal
 from swarm_arena._planning.catalog_check import _check_catalog_defaults, authorize_revision
 from swarm_arena._planning.policy import Policy
-from swarm_arena._planning.provenance import RefSite, is_nested_ref, ref_sites
+from swarm_arena._planning.provenance import RefSite, _detach_plan, is_nested_ref, ref_sites, stamp
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.io import _storage_io
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
 from swarm_arena._tooling.paths import fold_key, matches
 from swarm_arena._tooling.staging import tool_root
 from swarm_arena._tooling.tool import Tool, effective_tool_ref
 
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
-ModelCheck = Callable[[Plan, RunConfig], tuple[list[str], list[str]]]
+ModelCheck = Callable[[Mapping[LLMRole, Sequence[str]], RunConfig], tuple[list[str], list[str]]]
 _MODEL_CHECKS: list[ModelCheck] = []
 _T = TypeVar("_T")
 _BASES: dict[str, type[Configurable]] = {
@@ -102,7 +119,14 @@ def _safe_call(pointer: str, action: Callable[[], _T]) -> _T:
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_error(PlanError, [f"{pointer}: {_exception_type_name(error)}"]) from None
+        _raise_terminal(error)
+        raise _core_error(PlanError, [f"{pointer}: {_admission_diagnostic(error)}"]) from None
+
+
+def _admission_diagnostic(error: BaseException) -> str:
+    """Preserve vetted configuration messages, hiding arbitrary exception values."""
+    restored = _rebuild_core_signal(error)
+    return str(restored) if isinstance(restored, ConfigError) else _exception_type_name(error)
 
 
 def _site_pointers(sites: Sequence[RefSite]) -> dict[str, str]:
@@ -414,6 +438,7 @@ def _rule_configs(
             raise
         except BaseException as error:
             error = _classify_outcome(error)
+            _raise_terminal(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
             continue
         try:
@@ -701,6 +726,144 @@ def _rule_part_files(plan: Plan, config: RunConfig, history: Sequence[Plan]) -> 
     ]
 
 
+def _normalized_uses(uses: Mapping[LLMRole, Sequence[str]]) -> dict[LLMRole, list[str]]:
+    """Detach aliases before any comparison, hashing or registered hook call."""
+    return {
+        cast(LLMRole, _context_string(role, "role")): list(
+            dict.fromkeys(_context_string(alias, "alias") for alias in aliases)
+        )
+        for role, aliases in uses.items()
+    }
+
+
+def check_llm_aliases(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> list[str]:
+    """
+    Check role permissions, the token cap, and required model prices.
+
+    Parameters
+    ----------
+    uses : Mapping[LLMRole, Sequence[str]]
+        Model aliases declared by role, never raw provider/model names.
+    config : RunConfig
+        Human-approved model catalog and run limits.
+
+    Returns
+    -------
+    list[str]
+        Identifier-only errors for invalid aliases, roles or missing limits/prices.
+
+    Notes
+    -----
+    Price hooks run synchronously; async callers use supervised daemon preparation.
+
+    Examples
+    --------
+    >>> check_llm_aliases({}, RunConfig())
+    []
+    """
+    uses = _safe_call("/models", partial(_normalized_uses, uses))
+    errors: list[str] = []
+    if any(uses.values()) and config.limits.max_tokens is None:
+        errors.append("/models: limits.max_tokens is required when model aliases are used")
+    price_of = make_price_of(config.models)
+    priced: set[str] = set()
+    for role, aliases in uses.items():
+        if role not in {"manager", "judge", "planner", "curator"}:
+            errors.append(f"/models: unknown role {role!r}")
+            continue
+        for alias in aliases:
+            spec = config.models.root.get(alias)
+            if spec is None or role not in spec.roles:
+                errors.append(f"/models: alias {alias!r} is not allowed for role {role!r}")
+                continue
+            if config.limits.max_usd is not None and alias not in priced:
+                priced.add(alias)
+                try:
+
+                    def known_price(alias: str = alias) -> bool:
+                        prices = price_of(alias)
+                        if prices is None:
+                            return False
+                        _detach_model(ModelSpec.Prices, prices)
+                        return True
+
+                    if not _safe_call("/models", known_price):
+                        errors.append(f"/models: alias {alias!r} has no known price")
+                except PlanError as error:
+                    errors.extend(error.errors)
+    return errors
+
+
+def check_models(
+    uses: Mapping[LLMRole, Sequence[str]], config: RunConfig
+) -> tuple[list[str], list[str]]:
+    """
+    Run core alias validation followed by every registered capability check.
+
+    Parameters
+    ----------
+    uses : Mapping[LLMRole, Sequence[str]]
+        Role-to-alias declarations from admitted components or startup hooks.
+    config : RunConfig
+        Catalog and budget limits supplied by the human.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        Core and hook errors, followed by hook warnings, as plain strings.
+
+    Notes
+    -----
+    Hook calls and returned-data normalization are synchronous and belong in
+    supervised daemon preparation when invoked by an asynchronous owner.
+
+    Examples
+    --------
+    >>> check_models({}, RunConfig())
+    ([], [])
+    """
+    uses = _safe_call("/models", partial(_normalized_uses, uses))
+    errors = check_llm_aliases(uses, config)
+    warnings: list[str] = []
+    for hook in tuple(_MODEL_CHECKS):
+        try:
+
+            def invoke(hook: ModelCheck = hook) -> tuple[list[str], list[str]]:
+                hook_errors, hook_warnings = hook(
+                    {role: list(aliases) for role, aliases in uses.items()}, config
+                )
+                return (
+                    [_context_string(e, "model error") for e in hook_errors],
+                    [_context_string(w, "model warning") for w in hook_warnings],
+                )
+
+            hook_errors, hook_warnings = _safe_call("/models", invoke)
+            errors.extend(hook_errors)
+            warnings.extend(hook_warnings)
+        except PlanError as error:
+            errors.extend(error.errors)
+    return errors, warnings
+
+
+def _model_uses(built: Mapping[str, Configurable]) -> dict[LLMRole, list[str]]:
+    """Collect admitted managers and recursive/main/part judges from the cache."""
+    uses: dict[LLMRole, list[str]] = {}
+    for pointer, component in built.items():
+        role: LLMRole
+        if isinstance(component, Manager):
+            role = "manager"
+        elif isinstance(component, Judge):
+            role = "judge"
+        else:
+            continue
+        aliases = _safe_call(
+            pointer,
+            lambda component=component: [_context_string(a, "alias") for a in component.models()],
+        )
+        uses.setdefault(role, []).extend(aliases)
+    return _normalized_uses(uses)
+
+
 def register_model_check(check: ModelCheck) -> None:
     """
     Register an optional model admission hook.
@@ -708,13 +871,13 @@ def register_model_check(check: ModelCheck) -> None:
     Parameters
     ----------
     check : ModelCheck
-        Callable accepting plan and config and returning errors and warnings.
+        Callable accepting a role-to-aliases map and config and returning errors and warnings.
         Hook diagnostics must contain identifiers only, never secret values.
 
     Examples
     --------
     >>> before = len(_MODEL_CHECKS)
-    >>> register_model_check(lambda plan, config: ([], []))
+    >>> register_model_check(lambda uses, config: ([], []))
     >>> len(_MODEL_CHECKS) == before + 1
     True
     >>> _ = _MODEL_CHECKS.pop()
@@ -804,13 +967,11 @@ def validate_plan(
         errors.extend(_rule_private_files(plan, config, history, built=built, private=private))
     except PlanError as error:
         errors.extend(error.errors)
-    for hook in _MODEL_CHECKS:
-        try:
-            hook_errors, hook_warnings = _safe_call("/models", partial(hook, plan, config))
-            errors.extend(hook_errors)
-            warnings.extend(hook_warnings)
-        except PlanError as error:
-            errors.extend(error.errors)
+    try:
+        model_errors, warnings = check_models(_model_uses(built), config)
+        errors.extend(model_errors)
+    except PlanError as error:
+        errors.extend(error.errors)
     if errors:
         raise _core_error(PlanError, errors) from None
     return warnings
@@ -880,6 +1041,7 @@ def _validate_round_refs(plan: Plan) -> None:
             raise
         except BaseException as error:
             error = _classify_outcome(error)
+            _raise_terminal(error)
             errors.append(f"{pointer}: {ref.path}: {_exception_type_name(error)}")
     if errors:
         raise _core_error(PlanError, errors) from None
@@ -1014,8 +1176,148 @@ def admit_revision(
         raise
     except BaseException as error:
         error = _classify_outcome(error)
-        raise _core_error(PlanError, [f"/snapshot: {_exception_type_name(error)}"]) from None
+        _raise_terminal(error)
+        raise _core_error(PlanError, [f"/snapshot: {_admission_diagnostic(error)}"]) from None
     warnings = validate_plan(
         frozen, config, history=history, other_active_agents=other_active_agents
     )
     return frozen, warnings
+
+
+class _DraftArtifacts(ArtifactStore):
+    """Spool immutable bytes without retaining the aggregate source set in RAM."""
+
+    def __init__(self, spool: BinaryIO, abandoned: threading.Event) -> None:
+        self.spool, self.abandoned = spool, abandoned
+        self.payloads: dict[str, tuple[int, int]] = {}
+
+    def put_bytes(self, data: bytes) -> str:
+        """Hash and spool each unique file before destination publication."""
+        if self.abandoned.is_set():
+            raise _core_error(RuntimeError, "draft preparation stopped")
+        digest = sha256_hex(data)
+        if digest not in self.payloads:
+            offset = self.spool.tell()
+            self.spool.write(data)
+            self.payloads[digest] = offset, len(data)
+        return digest
+
+
+def _publish_draft_artifact(artifacts: ArtifactStore, digest: str, data: bytes) -> None:
+    """Validate backend results inside the per-object storage worker."""
+    actual = _context_string(artifacts.put_bytes(data), "artifact digest")
+    if actual != digest:
+        raise ValueError("invalid artifact digest")
+
+
+async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: ArtifactStore) -> _T:
+    """Validate in a daemon, then stream frozen files through the owning task.
+
+    The worker owns its temporary spool through success, failure and abandonment.
+    Acknowledgement bounds the handoff to one file; only the awaiting owner may
+    start a destination upload. Cancelling that owner releases the worker to
+    close its spool, including when preparation or an upload returns late.
+    """
+    boundary = _Outcome()
+    token = anyio.lowlevel.current_token()
+    acknowledged, abandoned = threading.Event(), threading.Event()
+    sender, receiver = anyio.create_memory_object_stream[tuple[str, bytes] | None](1)
+
+    def offer(item: tuple[str, bytes] | None) -> None:
+        anyio.from_thread.run_sync(sender.send_nowait, item, token=token)
+
+    def prepare() -> _T:
+        try:
+            with TemporaryFile() as spool:
+                staging = _DraftArtifacts(spool, abandoned)
+                result = operation(staging)
+                for digest, (offset, size) in staging.payloads.items():
+                    acknowledged.clear()
+                    if abandoned.is_set():
+                        raise _core_error(RuntimeError, "draft preparation stopped")
+                    spool.seek(offset)
+                    data = spool.read(size)
+                    offer((digest, data))
+                    acknowledged.wait()
+                    del data
+                    if abandoned.is_set():
+                        raise _core_error(RuntimeError, "draft preparation stopped")
+                return result
+        finally:
+            if not abandoned.is_set():
+                offer(None)
+
+    async with sender, receiver:
+        worker = _DaemonCall(prepare)
+        try:
+            async for item in receiver:
+                if item is None:
+                    break
+                digest, data = item
+                del item
+                await _storage_io(_publish_draft_artifact, artifacts, digest, data)
+                del data
+                acknowledged.set()
+            return await worker.result()
+        except BaseException as error:
+            boundary.contain(error, ValueError, "draft admission")
+        finally:
+            abandoned.set()
+            acknowledged.set()
+
+
+async def _freeze_draft_goal(goal: Goal, *, base_dir: Path, artifacts: ArtifactStore) -> Goal:
+    """Freeze the human goal before generation, using the caller's source root."""
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        detached = _detach_model(Goal, goal)
+        files = snapshot_fileset(detached.files, Path(base_dir).resolve(), staging)
+        return detached.model_copy(update={"files": files})
+
+    return await _draft_work(prepare, artifacts)
+
+
+async def _admit_draft(
+    plan: Plan,
+    config: RunConfig,
+    artifacts: ArtifactStore,
+    *,
+    frozen_goal: Goal,
+    base_dir: Path,
+    history: Sequence[Plan] = (),
+    origin: Origin = "llm",
+    admit: Callable[..., tuple[Plan, list[str]]] = admit_revision,
+) -> Plan:
+    """Stamp, compare frozen identity and admit a generated or edited draft.
+
+    Async callers retain stop/clock/lease supervision across this operation.
+    Preparation cannot publish artifacts; the owner uploads each staged object
+    only after successful authorization and validation. The explicit directory
+    is the loaded plan's root, or cwd for a direct initial Python call.
+    """
+
+    def prepare(staging: ArtifactStore) -> Plan:
+        if origin == "human":
+            raise _core_error(PlanError, ["draft origin must be non-human"])
+        revisions = [_detach_plan(previous) for previous in history]
+        frozen = _detach_model(Goal, frozen_goal)
+        proposed = stamp(
+            _detach_plan(plan), origin=origin, parent=revisions[-1] if revisions else None
+        )
+        proposed._base_dir = Path(base_dir).resolve()
+        candidate_goal = proposed.goal
+        if not candidate_goal.files.snapshotted:
+            candidate_goal = candidate_goal.model_copy(
+                update={
+                    "files": snapshot_fileset(candidate_goal.files, proposed.base_dir, staging),
+                }
+            )
+        if candidate_goal.key() != frozen.key():
+            raise _core_error(PlanError, ["/goal: main goal differs from the frozen main goal"])
+        proposed = proposed.model_copy(update={"goal": frozen})
+        admitted, _ = admit(proposed, config, staging, history=revisions)
+        if admitted.goal.key() != frozen.key():
+            raise _core_error(PlanError, ["/goal: main goal differs from the frozen main goal"])
+        return admitted
+
+    return await _draft_work(prepare, artifacts)

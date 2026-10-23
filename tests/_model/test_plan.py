@@ -458,3 +458,50 @@ def test_fidelity_errors_do_not_leak_values() -> None:
     with pytest.raises(ValueError, match="tool_overrides") as exc:
         RoundSpec(tool_overrides={SECRET: SecretObject()}).effective_fidelity()
     assert_secret_absent(exc.value, SECRET)
+
+
+def test_plain_plan_has_no_planning_session() -> None:
+    plan = plan_with()
+    assert plan.planning_session is None
+    assert plan.planner_call_ids == ()
+    assert not plan.dumps().startswith("# swarm-arena planning session:")
+
+
+@pytest.mark.parametrize("suffix", ["", " ", "\t "])
+def test_planning_session_line_round_trips(tmp_path: Path, suffix: str) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+
+    original = plan_with()
+    marked = mark_planning_session(original, Mock(run_id="r-abc", call_ids=["llm-1"]))
+    assert original.planning_session is None
+    assert marked is not original
+    assert marked.planner_call_ids == ("llm-1",)
+    text = marked.dumps()
+    assert text.startswith("# swarm-arena planning session: r-abc\n")
+    text = text.replace("r-abc\n", f"r-abc{suffix}\n", 1)
+    path = tmp_path / "linked.toml"
+    path.write_text(text)
+    for loaded in (Plan.loads(text, base_dir=tmp_path), Plan.load(path)):
+        assert loaded.planning_session == "r-abc"
+        assert loaded.planner_call_ids == ()
+        assert loaded.base_dir == tmp_path
+        assert "planning_session" not in loaded.model_dump()
+        assert "planner_call_ids" not in loaded.model_dump()
+
+
+@pytest.mark.parametrize("bad", ["../secret", "a/b", "a\\b", "", ".", "..", "bad name", "a\x00b"])
+def test_planning_session_comment_is_validated(tmp_path: Path, bad: str) -> None:
+    text = f"# swarm-arena planning session: {bad}\n" + plan_with().dumps()
+    with pytest.raises(ConfigError, match=r"planning_session|invalid TOML") as caught:
+        Plan.loads(text, base_dir=tmp_path)
+    if bad not in {"", ".", ".."}:
+        assert_secret_absent(caught.value, bad)
+
+
+def test_planner_metadata_is_read_only() -> None:
+    plan = plan_with()
+    for field in ("planning_session", "planner_call_ids"):
+        with pytest.raises((AttributeError, ValidationError)):
+            setattr(plan, field, "r-other")

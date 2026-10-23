@@ -1,6 +1,6 @@
 # Concepts
 
-The current release runs local swarms with manual plans, scripted managers,
+The current release runs local swarms with manual plans, scripted and LLM managers,
 checks, judges, and pruning policies. This page explains how they fit together;
 see the [public API](api/swarm_arena.md) for their interfaces.
 
@@ -139,17 +139,82 @@ The public kit's `swarm_arena.testing.read_output_file` and `read_logs` read and
 verify output/log artifact bytes. See the runnable
 [four-file kit example](own-files.md#try-it-offline).
 
-## Manager
+## Managers
 
 A `Manager` chooses an agent's actions during one round through its
 `AgentContext`: run a tool, read candidates or learnings, publish a learning,
 save notes, or call a tool action. It returns a `RoundReport`. `ScriptedManager`
 executes configured requests without a model. A tool exception becomes an error
-candidate; a manager exception ends only that agent's round.
+candidate; an ordinary manager exception ends only that agent's round.
+Registered ownership and terminal cleanup failures retain their core stop behavior.
+
+`AgentsSDKManager` uses the optional Agents SDK integration (`uv add
+"swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`) to choose
+these actions. Its `model` is an alias in the
+run configuration's model catalog and must permit the `manager` role:
+
+```python
+from swarm_arena import Ref
+from swarm_arena.manager import Manager
+
+manager = Ref(
+    path="swarm_arena.llm:AgentsSDKManager",
+    config={"model": "opus", "instructions": "Explore promising learning rates."},
+).build(Manager)
+assert manager.models() == ("opus",)
+```
+
+The corresponding manager line in an agent's TOML table is:
+
+```toml
+manager = { path = "swarm_arena.llm:AgentsSDKManager", config = { model = "opus" } }
+```
+
+Each round starts a fresh conversation. Stable system instructions include the
+learning guide, manager instructions, tool description, goal and selected frozen
+reference files. Changing facts—round, fidelity, remaining budget, private notes,
+resume history, seed inputs and the fixed board digest—are supplied separately.
+Use `save_notes` to retain private state between rounds. Instructions do not
+change an agent's tool-and-model fingerprint.
+
+The model calls `finish_round(summary=...)` to end the round immediately; ordinary
+final text can also end it. The first accepted finish summary is retained, including
+an empty string; later finish calls return a soft tool error. The manager has no structured output schema or hosted
+tools. Core limits bound model turns, round duration, action work and spending.
+`action_timeout_s` defaults to 60 seconds for actions other than `run_tool`, whose
+timing belongs to the core. `parallel_tool_calls` defaults to true, with each action
+linked to its originating LLM call. Usage accounting drains before the manager
+returns; interrupted calls are conservatively charged without waiting for a late
+provider report. Actions run in the manager's task group, so SDK cancellation
+cannot discard an admitted tool run. Every exit waits for owned actions before
+accounting drains; the core's tool cancellation and grace rules govern in-flight
+work, including `run_tool` calls nested inside extra actions. A round stop closes
+each action's tool admission and lets admitted runs finish before cancelling the
+remaining handler work. An action timeout closes admission and starts graceful
+cancellation of its nested runs, waits for their completion and settlement, then
+cancels the rest of the handler. If that action deadline prevents the handler
+from starting more work, the model receives the action-timeout message and can
+continue the round. A concurrent run, round or sibling stop still ends the round,
+including a live admission stop that the engine watcher has not yet applied to
+the tool registry.
+Registered terminal cleanup and ownership loss take precedence over the ordinary
+round-time limit. Overflow from an owned action ends this manager; an otherwise
+completed report is preserved when a peer overflows the shared budget.
+Genuine caller cancellation retains highest precedence. See the [LLM API](api/llm.md).
 
 An agent sees the board at the round's recorded frontier plus its own new work.
-`best(part=...)` reads only the agent's own group. Candidate and learning reads
-automatically populate `read_ids` provenance for subsequent tool runs. Converge
+`best(part=...)` reads the agent's own group or an explicitly declared sibling
+group. `search_learnings(scope="namespace")` can find learnings from other goals
+and earlier runs. The SDK `read_learning` action prioritizes their text within its
+4,000-character result cap: it drops evidence entries from the end when needed
+and reports the count as `evidence_omitted`, preserving canonical JSON key order.
+Evidence outside the fixed candidate view includes only its id, an empty scores list and
+the value-free error marker `not in this view`. Visible evidence retains its
+scores or tool error. Once evidence reads reach the round's read limit, remaining
+evidence carries the value-free marker `read limit reached` and the learning text
+is retained. `get_candidate` lookups outside the view consume no turn or board read.
+Candidate access and feedback permissions still apply.
+Candidate and learning reads automatically populate `read_ids` provenance for subsequent tool runs. Converge
 agents get read-only `seed_parents`, prepended to their explicit parents. Check
 feedback permissions still apply to those parents. See the
 [manager API](api/manager.md) and [scoring guide](scoring-and-review.md).
@@ -167,11 +232,12 @@ See the [exact pruning rules](scoring-and-review.md#pruning-policies) and
 ## Board
 
 `Board` is the indexing interface for candidates, scores, learnings, decisions,
-and lineage; `BoardView` is a fixed-frontier read view. The engine's in-memory
-run board indexes this run's committed journal and is reconstructed on resume.
-The journal is the durable authority. There is no cross-run arena in this
-release; that is M2. Managers access permitted views through `AgentContext`,
-with read caps and a UTF-8-byte-bounded digest. See the [board API](api/board.md).
+and lineage; `BoardView` is a fixed-frontier read view. The engine defaults to
+`ArenaBoard`, which combines this run's committed journal with permitted
+cross-run arena data. The journal remains the durable authority, and run state
+is reconstructed on resume. Managers access permitted views through
+`AgentContext`, with read caps and a UTF-8-byte-bounded digest. See the
+[arena guide](arena.md) and [board API](api/board.md).
 
 ## Swarm
 
@@ -192,3 +258,212 @@ changed limits. Later solution views show the latest lifecycle; earlier final
 orders and stop reasons remain in the journal. See
 [Limits and safety](limits-and-safety.md#stop-modes-and-resume) before takeover
 or changing limits, and [Planning modes](planning-modes.md) for runnable plans.
+
+## Models
+
+Install the optional integration with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. The human's
+`RunConfig` declares the provider models available to LLM components:
+
+```toml
+[limits]
+max_tokens = 1000000
+
+[models.opus]
+model = "anthropic/claude-opus-5-5"
+max_tokens = 8000
+roles = ["manager", "judge", "planner"]
+prompt_cache = { ttl = "5m" }
+
+[models.gpt]
+model = "openai/gpt-6"
+roles = ["manager", "judge"]
+
+[models.flash]
+model = "gemini/gemini-3-flash"
+roles = ["judge", "curator"]
+prices = { input = 0.3, output = 2.5 }
+```
+
+Components declare **aliases only**, such as `opus` or `flash`. Every used alias
+must exist in the catalog and allow its caller's role. A run using any model
+alias requires `limits.max_tokens`; each model's `max_tokens` remains its output
+limit. With `limits.max_usd` set, every used alias must also have a known price.
+Unused catalog entries do not require prices or capabilities.
+
+Plan admission authorizes raw component references before importing or building
+them. It then validates aliases from the built managers and judges, including
+nested judges, part scoring, and convergence. Replanners and curators receive
+the same checks before run publication and before resume takes ownership.
+A refused resume leaves the epoch, lease and journal unchanged. Startup hooks
+run in cancellable daemon workers on both entry paths. Hook-raised interrupts,
+cancellations and exception groups become value-free startup failures; genuine
+caller cancellation still cancels preparation. Managers require function calling.
+Judges, planners, and curators without response-schema support produce a
+**two-stage** warning: a free-text answer needs a subsequent formatting call.
+On resume, these warnings are retained in the journal's takeover event.
+Offline `fake/` models support both capabilities and must be registered before
+model construction.
+
+Importing `swarm_arena.llm` registers capability and price checks and sets
+`LITELLM_LOCAL_MODEL_COST_MAP=True` before loading LiteLLM. Fallback prices use
+its bundled map, so importing does not fetch a changing remote price table.
+Explicit catalog `prices` are USD per million tokens and override the provider's
+reported response cost. Otherwise an authoritative response cost wins, followed
+by the bundled-map calculation. An unpriced model without a dollar cap can
+report zero cost when no authoritative response cost is available.
+
+`Usage.input_tokens` excludes cache reads and writes. Explicit prices charge
+ordinary input, output, cache reads, and cache writes separately; a missing
+cache-read price defaults to input and a missing cache-write price defaults to
+twice input. An explicit zero cache price stays zero. Provider fallback pricing
+retains the reported five-minute and one-hour write subsets. Unsplit writes
+use the largest of those tariffs and twice input, even if the requested TTL
+was five minutes. For Sonnet 4.6, 100 five-minute writes and 900 one-hour writes
+cost 5,775 micro-dollars, using rates of $3.75 and $6 per million respectively.
+All token-price products are added as exact decimal rationals and rounded once
+to whole micro-dollars, with ties to even.
+
+Per-call reservation estimates use `ceil(prompt_chars / 3)` input tokens and
+the output allowance. Include the complete serialized input, tools, and schema
+in `prompt_chars`. Estimated input costs `max(2 * input, cache_write)` per token.
+Character-to-token conversion is a heuristic; actual supported costs above the
+estimate are charged in full. A two-stage final judge also needs funding for
+its formatter's full input and output. An output-only judge allowance does not
+establish that both complete calls fit.
+
+## Caching
+
+Provider prompt caching is enabled by default. Stable instructions, tools, the
+frozen goal and its reference files precede changing round facts.
+
+| Provider | Prompt-cache behavior |
+| --- | --- |
+| Claude on `anthropic/`, `bedrock/`, or `vertex_ai/` | `[{"location": "message", "role": "system"}, {"location": "message", "index": -1}]` injection points. TTL defaults to `5m`; `prompt_cache = { ttl = "1h" }` adds an explicit ephemeral one-hour control to each point. |
+| OpenAI, DeepSeek, Fireworks/Kimi | Automatic caching of the stable prefix; no injected markers. |
+| Gemini | Implicit caching; no injected markers. Explicit context caching is a later option. |
+
+Set `prompt_cache = { enabled = false }` for a model to disable its injected
+prompt-cache points. Provider minimum prompt lengths still apply. Prompt-cache
+reads and writes retain their separate usage and pricing, including the 5m/1h
+write split described above.
+
+One response-cache backend, location (`disk_dir`, `s3_path`, or `redis_url_env`)
+and `ttl_s` can be installed per process. A conflicting setup raises a clear
+configuration error; use the installed settings or start a new process.
+Role read/write switches and namespaces remain per scope and may differ between runs.
+
+Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
+extra (`uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"`).
+Configure `RunConfig.cache` in TOML:
+
+```toml
+[cache]
+backend = "s3"                       # "disk" | "s3" | "redis"
+s3_path = "s3://bucket/swarm-arena/llm-cache"
+# disk_dir = ".cache/llm"             # for backend = "disk"
+# redis_url_env = "REDIS_URL"          # for backend = "redis"; full redis:// or rediss:// URL
+# namespace = "physika"               # optional override; defaults to each goal's namespace
+ttl_s = 2592000                       # 30 days
+
+[cache.roles]
+judge   = { read = true,  write = true  }
+planner = { read = false, write = true  }
+manager = { read = false, write = false }
+curator = { read = true,  write = true  }
+```
+
+The response cache uses `default_off`: each allowed call opts in with independent
+read and write switches and its effective namespace. Anchors and the final judge
+never read cached responses; their results may still be written when judge writes
+are enabled. Streamed and thinking calls never read or write the response cache.
+Thinking controls include provider-native Gemini configs and budget fields,
+Bedrock reasoning configs and Fireworks template controls, including inside
+provider request envelopes. Explicit thinking controls, including Ollama `think`,
+bypass response caching.
+Response caching fails closed: every supplied SDK field and provider parameter
+must be in a pinned allowlist of known non-thinking, non-streaming controls.
+This includes `stop` as a string or list of strings and `logit_bias` as a mapping
+from token IDs to finite numbers. Invalid shapes disable response caching.
+Unknown provider parameters disable both response-cache reads and writes,
+including unknown keys nested in provider request envelopes. The request still
+reaches the provider with those parameters. Schema properties and string-valued
+tracking metadata are payload data, not provider control parameters.
+Provider recovery probes bypass both directions. These restrictions take precedence
+over caller settings, including preset cache keys and provider extra arguments.
+
+Cache keys include request parameters such as tools, schemas, temperature, seed and
+reasoning settings. Tracking metadata is excluded, so reservation and call IDs do
+not invalidate cache hits. Each per-call settings object carries string-valued
+run, goal, team, agent, round, role, reservation, call and model-alias metadata.
+The output limit is capped by the model catalog, including caller aliases such
+as `max_completion_tokens`, `max_output_tokens` and native `maxOutputTokens`.
+Provider generation envelopes retain the cap when they replace generated settings.
+An explicit temperature is sent
+with `drop_params=True`, allowing providers that reject that parameter to omit it.
+
+A response-cache hit costs zero. Proven origin links distinguish namespace,
+effective cache key and the generating response, including replacements at the
+same key. When that evidence is unavailable or ambiguous, the origin stays unset.
+The recorder persists the opaque identity for replay even when payload storage
+is disabled.
+
+## Provider recovery preparation
+
+When a provider latch is outstanding, fresh-round preparation resolves slots
+concurrently before probing and selecting active agents. Healthy peers wait for
+the slowest slot to resolve or reach the effective round deadline. After this
+bounded preparation, the round has its own execution deadline, so a stuck slot
+can make preparation plus execution take about twice the effective round timeout.
+See [provider failures](limits-and-safety.md#provider-failures).
+
+
+## LLM call log and Langfuse
+
+The local journal always records every admitted LLM call and its accounting,
+including estimated charges when a provider report does not arrive. Calls link
+to their run, goal, component, reservation and model alias. Request/response
+payloads are stored as artifacts by default; `tracing.store_payloads = false`
+disables payload storage without disabling the call log. Langfuse is an optional
+view of these calls, not the source of truth for budgets or recovery.
+
+To enable export, install the `llm` and `langfuse` extras and set:
+
+```toml
+[tracing]
+langfuse = true
+```
+
+Configure the destination using Langfuse's own `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` (or `LANGFUSE_HOST`) environment
+variables. Keep credential values out of the plan and run configuration.
+With `langfuse = false` (the default), swarm-arena sends no tracing data to a
+vendor. Credentials alone do not enable export. This remains true after an
+enabled run and when enabled and disabled scopes run concurrently in one
+process. The Agents SDK's default OpenAI trace exporter is not installed by
+swarm-arena; enabled export uses an exclusive OpenInference processor.
+
+Each enabled run becomes a Langfuse session. Manager, judge, planner and curator
+calls carry the goal, team, agent, round and role; a call's `trace_url` links to
+the current trace when available. Both stages of a structured fallback call
+are traced and journaled. A missing trace URL does not remove the local record.
+SDK tracing omits sensitive request and response data; payloads remain in the
+local journal/artifacts according to `tracing.store_payloads`. Before Langfuse
+processes a span, error status descriptions and exception events/attributes are
+reduced to exception type names, without messages or stack traces. If the SDK
+has redacted the original type or the type is unrecognized, the exported type
+is `Exception`. Run, goal, component and accounting metadata remain available.
+The first enabled setup resolves the project identifier on a daemon using one
+request with a five-second timeout and no retries. Until resolution succeeds,
+and for the rest of the process after failure, trace URLs are absent. Looking up
+a call's trace URL performs no network I/O; pending or failed resolution never
+holds up a model call. Ordinary trace-context exit failures log only their type
+and preserve the completed result. Control signals still propagate.
+
+The client and instrumentation are shared for the process. Components finish
+all owned actions and accounting before leaving their tracing context, without
+flushing on each run. At normal process exit, a daemon flushes and shuts down
+the client and exporter, with a maximum five-second wait. A failed or timed-out
+close logs only an exception type and never writes the journal. Buffered spans
+can be lost on a hard kill or when that wait expires; durable call accounting
+is independent of export.

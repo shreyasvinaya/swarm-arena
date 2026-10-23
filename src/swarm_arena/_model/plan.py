@@ -1,7 +1,8 @@
 """Define declarative plans, component specifications, and TOML loading."""
 
+import re
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self, cast
 
 from pydantic import (
     Field,
@@ -14,12 +15,15 @@ from pydantic import (
 from swarm_arena._errors import ConfigError, _core_error
 from swarm_arena._model.base import Origin, StoredModel, _SafeModel
 from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.data import TomlJsonObject, finite_json
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal, _Slug
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.ref import Ref, RefField, unique_names
-from swarm_arena._model.toml_io import dumps_toml, loads_toml, read_toml
+from swarm_arena._model.toml_io import dumps_toml, loads_toml
+
+_SESSION_PREFIX = "# swarm-arena planning session: "
 
 _Rationale = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -346,6 +350,29 @@ class Plan(StoredModel):
     revision: int = 0
     parent_revision: int | None = None
     _base_dir: Path = PrivateAttr(default_factory=Path.cwd)
+    _planning_session: str | None = PrivateAttr(default=None)
+    _planner_call_ids: tuple[str, ...] = PrivateAttr(default=())
+
+    def _set_planner_provenance(self, session: object, call_ids: object) -> None:
+        """Validate private provenance before adopting it at a core boundary."""
+
+        def identifier(value: object, field: str) -> str:
+            try:
+                text = _context_string(value, field)
+            except TypeError:
+                raise _core_error(ValueError, f"invalid {field}") from None
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", text) is None:
+                raise _core_error(ValueError, f"invalid {field}") from None
+            return text
+
+        session_id = None if session is None else identifier(session, "planning_session")
+        if type(call_ids) not in (tuple, list):
+            raise _core_error(ValueError, "invalid planner_call_ids") from None
+        ids = tuple(
+            identifier(value, "planner_call_ids")
+            for value in cast(tuple[object, ...] | list[object], call_ids)
+        )
+        self._planning_session, self._planner_call_ids = session_id, ids
 
     @model_validator(mode="after")
     def _structure(self) -> Self:
@@ -406,13 +433,16 @@ class Plan(StoredModel):
         True
         """
         path = Path(path)
-        data = read_toml(path)
+        try:
+            text = path.read_text("utf-8")
+        except (OSError, UnicodeError):
+            raise _core_error(ConfigError, f"{path}: cannot read valid UTF-8 TOML") from None
         try:
             base_dir = path.parent.resolve()
         except (OSError, RuntimeError):
             raise _core_error(ConfigError, f"{path}: cannot resolve plan directory") from None
         try:
-            return cls._from_data(data, base_dir=base_dir)
+            return cls.loads(text, base_dir=base_dir)
         except ConfigError as err:
             raise _core_error(ConfigError, f"{path}: {err}") from None
 
@@ -447,8 +477,18 @@ class Plan(StoredModel):
         >>> Plan.loads(text, base_dir=Path(".")).origin
         'human'
         """
-        data = loads_toml(text, where="plan")
-        return cls._from_data(data, base_dir=base_dir)
+        first = text.partition("\n")[0].removesuffix("\r")
+        session = (
+            first[len(_SESSION_PREFIX) :].rstrip(" \t")
+            if first.startswith(_SESSION_PREFIX)
+            else None
+        )
+        plan = cls._from_data(loads_toml(text, where="plan"), base_dir=base_dir)
+        try:
+            plan._set_planner_provenance(session, ())
+        except (ValueError, TypeError):
+            raise _core_error(ConfigError, "invalid planning_session") from None
+        return plan
 
     def dumps(self) -> str:
         """
@@ -466,7 +506,45 @@ class Plan(StoredModel):
         >>> 'origin = "human"' in plan.dumps()
         True
         """
-        return dumps_toml(self.model_dump(mode="json", exclude_none=True))
+        self._set_planner_provenance(self._planning_session, self._planner_call_ids)
+        text = dumps_toml(self.model_dump(mode="json", exclude_none=True))
+        return (
+            f"{_SESSION_PREFIX}{self._planning_session}\n{text}"
+            if self._planning_session is not None
+            else text
+        )
+
+    @property
+    def planning_session(self) -> str | None:
+        """Return the standalone planning run linked by this plan.
+
+        Returns
+        -------
+        str or None
+            Validated run identifier, absent for an unmarked plan.
+
+        Examples
+        --------
+        >>> Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[]).planning_session is None
+        True
+        """
+        return self._planning_session
+
+    @property
+    def planner_call_ids(self) -> tuple[str, ...]:
+        """Return planner calls retained by core admission and journal replay.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Call identifiers. TOML reload retains the session link only.
+
+        Examples
+        --------
+        >>> Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[]).planner_call_ids
+        ()
+        """
+        return self._planner_call_ids
 
     @property
     def base_dir(self) -> Path:

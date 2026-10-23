@@ -11,6 +11,7 @@ from typing import Any, Literal, TypeVar, cast
 import anyio
 import anyio.lowlevel
 
+from swarm_arena._agent.context import _local_timer_scope
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.tool_run import command_journal
 from swarm_arena._agent.watchdog import Watchdog
@@ -35,16 +36,22 @@ from swarm_arena._engine.solution import solution_view
 from swarm_arena._errors import (
     Fenced,
     PlanError,
+    ProviderFailed,
     StorageError,
+    _core_category,
     _core_error,
     _exception_type_name,
+    _is_core_control,
     _is_core_signal,
+    _SignalCategory,
+    _stop_cleanup_error,
     _with_exception_type,
 )
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head
+from swarm_arena._journal.llm_record import await_reports, drain
 from swarm_arena._journal.reader import _read_chain
 from swarm_arena._journal.replay import STOP_REASONS, GoalState, RunState
 from swarm_arena._journal.segment import parse_segment_name
@@ -57,11 +64,11 @@ from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import AgentStatus, Candidate, Learning
 from swarm_arena._model.tooling import RunStatus
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _raise_terminal
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import _INACTIVE, Policy, guard
 from swarm_arena._planning.provenance import _detach_plan, stamp
-from swarm_arena._planning.validate import admit_revision
+from swarm_arena._planning.validate import _admit_draft, admit_revision
 from swarm_arena._scoring.judge import Judge, JudgeContext
 from swarm_arena._scoring.ranking import ranked
 from swarm_arena._scoring.runner import (
@@ -73,6 +80,11 @@ from swarm_arena._scoring.runner import (
 )
 
 _T = TypeVar("_T")
+
+
+def _report_timer(seconds: float) -> anyio.CancelScope:
+    """Give curator report arrival one allowance, separate from settlement."""
+    return anyio.move_on_after(seconds)
 
 
 @dataclass
@@ -117,7 +129,7 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
     Returns
     -------
     EventDraft
-        Plan, origin, base directory, and empty run planner-call ids.
+        Plan, origin, base directory, planning session and planner-call ids.
 
     Examples
     --------
@@ -133,7 +145,8 @@ def r0_revision_draft(plan: Plan, base_dir: Path) -> EventDraft:
             "plan": plan.model_dump(mode="json"),
             "origin": plan.origin,
             "base_dir": str(base_dir),
-            "planner_call_ids": [],
+            "planner_call_ids": list(plan.planner_call_ids),
+            "planning_session": plan.planning_session,
             "first_round": 1,
         },
     )
@@ -268,7 +281,9 @@ class GoalRunner:
     --------
     >>> from unittest.mock import Mock
     >>> from swarm_arena import Goal, RunConfig
-    >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+    >>> from swarm_arena._engine.stops import ProviderStops
+    >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None,
+    ...             provider_stops=ProviderStops(Mock()))
     >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
     >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
     0
@@ -338,15 +353,22 @@ class GoalRunner:
         --------
         >>> from unittest.mock import Mock
         >>> from swarm_arena import Goal, RunConfig
-        >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None)
+        >>> from swarm_arena._engine.stops import ProviderStops
+        >>> deps = Mock(spec=EngineDeps, config=RunConfig(), admission=None,
+        ...             provider_stops=ProviderStops(Mock()))
         >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
         >>> GoalRunner(deps, goal_id="g", plan=plan, replanner=None).active_agents()
         0
         """
         statuses = {f"{s.team.name}/{s.spec.name}": s.status for s in self.agents}
         statuses = {**self.state.agents, **statuses}
+        paused = self.deps.provider_stops.stopped()
         main = sum(
             statuses.get(f"{team.name}/{agent.name}") not in _INACTIVE
+            or (
+                statuses.get(f"{team.name}/{agent.name}") == AgentStatus.STOPPED
+                and f"{self.goal_id}/{team.name}/{agent.name}" in paused
+            )
             for team in self.plan.teams
             for agent in team.agents
         )
@@ -382,7 +404,11 @@ class GoalRunner:
         """Keep retained storage reads and writes within final-work supervision."""
         completed, result = await self._supervised_step(operation, final=True, settle_on_stop=True)
         if not completed:
-            raise _core_error(RuntimeError, "goal storage settlement timed out")
+            raise _core_error(
+                RuntimeError,
+                "goal storage settlement timed out",
+                _category=_SignalCategory.TERMINAL,
+            )
         return cast(_T, result)
 
     async def _write_view(self, key: str, content: bytes, *, source: Head) -> None:
@@ -462,6 +488,7 @@ class GoalRunner:
         goal = self.recorded.goals[self.goal_id]
         reason = goal.pending_reason
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             self.deps.journal.append(self._draft(EventType.GOAL_FINISHED, reason=reason))
             await self.deps.journal.commit()
             await self.deps.ledger.end_goal(self.goal_id)
@@ -619,13 +646,16 @@ class GoalRunner:
             models=deps.config.models,
             tracing=deps.config.tracing,
             cache=deps.config.cache,
+            limits=deps.config.limits,
+            settle_timeout_s=deps.config.settle_timeout_s,
             force_no_cache_read=final,
         )
 
-    async def _close(self, tranche: Tranche) -> None:
-        with anyio.move_on_after(self.deps.config.settle_timeout_s):
-            while tranche.pending():  # noqa: ASYNC110 - external call settlement
-                await anyio.sleep(0.05)
+    async def _close(self, tranche: Tranche, *, wait: bool = True) -> None:
+        if wait:
+            with anyio.move_on_after(self.deps.config.settle_timeout_s):
+                while tranche.pending():  # noqa: ASYNC110 - external call settlement
+                    await anyio.sleep(0.05)
         # Charges and overflow are already authoritative in the ledger/journal.
         await tranche.close()
 
@@ -666,8 +696,7 @@ class GoalRunner:
                 grace_until: float | None = None
                 try:
                     while True:
-                        if self.deps.journal.fenced.is_set():
-                            raise _core_error(Fenced, "run ownership lost")
+                        self.deps.journal._raise_if_fenced()
                         stopped = self._stop()
                         if stopped and not final:
                             break
@@ -740,6 +769,55 @@ class GoalRunner:
             read_cache=not final,
         )
 
+    def _lifecycle(self) -> list[int] | None:
+        """Identify this goal lifetime independently of a takeover epoch."""
+        return next(
+            (
+                [e.epoch, e.seq]
+                for e in reversed(self._events)
+                if e.goal_id == self.goal_id and e.type == EventType.GOAL_STARTED
+            ),
+            None,
+        )
+
+    def _provider_batches(self, round: int) -> list[dict[str, Any]]:
+        """Read completed failed batches before any hook or reservation."""
+        return [
+            record
+            for record in self.recorded.goals[self.goal_id].provider_batches.values()
+            if record.get("round") == round
+            and record.get("revision") == self.plan.revision
+            and record.get("lifecycle") == self._lifecycle()
+        ]
+
+    async def _report_judge_failure(self, outcome: JudgeOutcome, before: dict[str, int]) -> None:
+        """Report failures not already reported by their settled panel invocation."""
+        for provider in sorted(set(outcome.provider_failed.values())):
+            if self.deps.provider_stops.generations().get(provider) == before.get(provider):
+                await self.deps.provider_stops.fail(provider, source="judge")
+
+    async def _skip_policy(self, round: int) -> None:
+        """Complete managers, barrier and ineligible curation without a decision."""
+        await self.deps.journal.append_durable(
+            self._draft(
+                EventType.PROVIDER_FAILED,
+                round=round,
+                variant="receipt",
+                source="judge",
+                disposition="policy_skipped",
+                complete=True,
+                paused=True,
+                revision=self.plan.revision,
+                lifecycle=self._lifecycle(),
+                managers_complete=True,
+                barrier_complete=True,
+                policy="skipped",
+                curation="ineligible",
+                batches=[r["key"] for r in self._provider_batches(round) if r["ranking"]],
+            )
+        )
+        await self._refresh()
+
     def _publish_scores(
         self,
         outcome: JudgeOutcome,
@@ -749,6 +827,37 @@ class GoalRunner:
         barrier_batch: dict[str, Any] | None = None,
         final_batch: dict[str, Any] | None = None,
     ) -> None:
+        if outcome.provider_failed:
+            receipts: dict[str, Any] = {}
+            if barrier_batch is not None:
+                receipts["barrier_batch"] = barrier_batch
+            if final_batch is not None:
+                receipts["final_batch"] = final_batch
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PROVIDER_FAILED,
+                    round=round,
+                    variant="receipt",
+                    source="judge",
+                    complete=True,
+                    disposition="provider_failed",
+                    accounting="settled",
+                    provider_failed=outcome.provider_failed,
+                    **receipts,
+                )
+            )
+            return
+        for drop in outcome.panel_drops:
+            self.deps.journal.append(
+                self._draft(
+                    EventType.PROVIDER_FAILED,
+                    round=round,
+                    variant="receipt",
+                    source="judge",
+                    disposition="panel_drop",
+                    **drop.model_dump(),
+                )
+            )
         remaining = len(outcome.scores) + len(outcome.errors)
 
         def append(kind: EventType, **payload: Any) -> Event:
@@ -769,29 +878,79 @@ class GoalRunner:
         for error in outcome.errors:
             append(EventType.JUDGE_ERROR, **error.model_dump())
 
-    async def _barrier(self, candidates: Sequence[Candidate], round: int) -> bool:
+    async def _barrier(
+        self, candidates: Sequence[Candidate], round: int, *, retry: dict[str, Any] | None = None
+    ) -> bool:
         """Reuse committed batches, funding only missing barrier outcomes."""
-        tranche = self._tranche("judges")
+        tranches = [self._tranche("judges")]
         reservations: dict[str, tuple[Reservation, Amount, bool]] = {}
+        boundary = _Outcome()
         try:
-            completed, funded = await self._supervised_step(
-                partial(self._barrier_work, candidates, round, tranche, reservations), final=True
-            )
-            return bool(completed and funded)
+            try:
+                completed, funded = await self._supervised_step(
+                    partial(
+                        self._barrier_work, candidates, round, tranches, reservations, retry=retry
+                    ),
+                    final=True,
+                )
+            except BaseException as error:
+                error = boundary.classify(error)
+                self.deps.journal._raise_if_fenced()
+                if (
+                    _core_category(error) is _SignalCategory.TERMINAL
+                    and isinstance(error, LimitReached)
+                    and error.limit == "usage_overflow"
+                ):
+                    self.deps.stops.run_budget = True
+                    return False
+                if _core_category(error) is not _SignalCategory.LIMIT:
+                    raise error from None
+                self.deps.journal.append(
+                    self._draft(
+                        EventType.RESERVE_EXHAUSTED,
+                        round=round,
+                        needed=None,
+                        reason="reserve_exhausted",
+                    )
+                )
+                self.select_only = True
+                self.status, self.reason = "stopped", "reserve_exhausted"
+                completed, funded = True, False
         finally:
             for reservation, amount, dispatched in reservations.values():
                 await self.deps.ledger.settle(
                     reservation.id, amount if dispatched else Amount(), estimated=dispatched
                 )
-            await self._close(tranche)
+            for tranche in tranches:
+                await self._close(tranche)
             self._stop()
+        if completed:
+            await self._refresh()
+        return bool(completed and funded)
+
+    async def _complete_failed_batch(
+        self,
+        outcome: JudgeOutcome,
+        scope: LLMScope,
+        round: int,
+        completion: dict[str, Any],
+        before: dict[str, int],
+    ) -> None:
+        """Settle, latch and commit one zero-output batch before the next ref."""
+        await self._close(scope.tranche)
+        await self._report_judge_failure(outcome, before)
+        completion["providers"] = sorted(set(outcome.provider_failed.values()))
+        self._publish_scores(outcome, scope, round, barrier_batch=completion)
+        await self._refresh()
 
     async def _barrier_work(
         self,
         candidates: Sequence[Candidate],
         round: int,
-        tranche: Tranche,
+        tranches: list[Tranche],
         reservations: dict[str, tuple[Reservation, Amount, bool]],
+        *,
+        retry: dict[str, Any] | None = None,
     ) -> bool:
         for part in [None, *(p.name for p in self.plan.parts)]:
             batch = [
@@ -805,16 +964,23 @@ class GoalRunner:
                 continue
             _, refs, _ = part_scoring(self.plan, part)
             for ref in refs:
+                if retry is not None and (
+                    part != retry["part"] or ref.model_dump(mode="json") != retry["ref"]
+                ):
+                    continue
                 identity: dict[str, Any] = {
                     "goal_id": self.goal_id,
+                    "lifecycle": self._lifecycle(),
                     "revision": self.plan.revision,
                     "round": round,
                     "part": part,
                     "ref": ref.model_dump(mode="json"),
                     "candidates": sorted(c.id for c in batch),
                 }
+                if retry is not None:
+                    identity["retry_of"] = retry["key"]
                 key = sha256_hex(canonical_json(identity))
-                if any(
+                if key in self.recorded.goals[self.goal_id].provider_batches or any(
                     event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
                     and event.goal_id == self.goal_id
                     and event.round == round
@@ -824,13 +990,18 @@ class GoalRunner:
                 ):
                     continue
                 completion: dict[str, Any] = {
+                    **identity,
+                    "ranking": ref.component_name() == self._ranking_name(part),
+                    "managers_complete": True,
                     "key": key,
                     "members": sorted(c.id for c in batch),
                     "anchors": [],
                 }
                 leaders = [c for c, _ in self._round_state().ranked(part)]
+                tranche = tranches[-1]
                 scope = self._scope("judge", round, tranche)
                 preparation = _Outcome()
+                before = self.deps.provider_stops.generations()
                 try:
                     judge = await run_sync_daemon(ref.build, Judge)
                     prepared = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
@@ -849,6 +1020,23 @@ class GoalRunner:
                     )
                 except BaseException as error:
                     error = preparation.classify(error)
+                    self.deps.journal._raise_if_fenced()
+                    if _core_category(error) is _SignalCategory.PROVIDER:
+                        assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+                        await self._complete_failed_batch(
+                            JudgeOutcome(
+                                scores=[],
+                                errors=[],
+                                provider_failed={ref.component_name(): error.provider},
+                            ),
+                            scope,
+                            round,
+                            completion,
+                            before,
+                        )
+                        tranches.append(self._tranche("judges"))
+                        continue
+                    preparation.propagate_control(error)
                     outcome = JudgeOutcome(
                         scores=[],
                         errors=[
@@ -879,11 +1067,17 @@ class GoalRunner:
                         if amount != Amount()
                         else None
                     )
-                except LimitReached:
+                except LimitReached as error:
+                    if _core_category(error) is not _SignalCategory.LIMIT:
+                        preparation.propagate_control(error)
                     self.deps.journal.append(
                         self._draft(
                             EventType.RESERVE_EXHAUSTED,
-                            **{"round": round, "needed": amount.model_dump()},
+                            **{
+                                "round": round,
+                                "needed": amount.model_dump(),
+                                "reason": "reserve_exhausted",
+                            },
                         )
                     )
                     self.select_only = True
@@ -905,9 +1099,61 @@ class GoalRunner:
                 if reservation is not None:
                     await self.deps.ledger.settle(reservation.id, amount, estimated=True)
                     reservations.pop(reservation.id)
-                self._publish_scores(outcome, scope, round, barrier_batch=completion)
-                await self._refresh()
+                if outcome.provider_failed:
+                    await self._complete_failed_batch(outcome, scope, round, completion, before)
+                    tranches.append(self._tranche("judges"))
+                else:
+                    self._publish_scores(outcome, scope, round, barrier_batch=completion)
+                    if retry is not None and outcome.scores:
+                        for provider in set(retry.get("providers", [])):
+                            if provider in before:
+                                await self.deps.provider_stops.recover(
+                                    provider, generation=before[provider]
+                                )
+                    await self._refresh()
         return True
+
+    async def _retry_ranking(self) -> bool:
+        """Retry pre-join paused batches once, including under funded graceful stops."""
+        if self.join_retries:
+            return False
+        records = list(self.recorded.goals[self.goal_id].provider_batches.values())
+        paused = [
+            record
+            for record in records
+            if record.get("ranking")
+            and not record.get("retry_of")
+            and record.get("lifecycle") == self._lifecycle()
+            and record.get("revision") == self.plan.revision
+        ]
+        # A later successful batch may already have ranked the paused candidates.
+        state = self._round_state()
+        paused = [
+            record
+            for record in paused
+            if not set(record["candidates"]).issubset(
+                {
+                    score.candidate_id
+                    for score in state.scores
+                    if score.judge == self._ranking_name(record["part"])
+                }
+            )
+        ]
+        for record in paused:
+            self._stop()
+            if self.deps.stops.stop_now or self.deps.stops.run_timeout:
+                break
+            candidates = [
+                self.recorded.candidates[id]
+                for id in record["candidates"]
+                if id in self.recorded.candidates
+            ]
+            if not await self._barrier(candidates, 0, retry=record):
+                break
+        return any(
+            record.get("retry_of") in {item["key"] for item in paused}
+            for record in self.recorded.goals[self.goal_id].provider_batches.values()
+        )
 
     def _final_identity(self, finalists: Sequence[Candidate]) -> dict[str, Any]:
         """Bind final inputs to the lifecycle, plan, judge and candidate boundary."""
@@ -940,7 +1186,8 @@ class GoalRunner:
             if not (
                 event.goal_id == self.goal_id
                 and event.round == 0
-                and event.type in {EventType.SCORE, EventType.JUDGE_ERROR}
+                and event.type
+                in {EventType.SCORE, EventType.JUDGE_ERROR, EventType.PROVIDER_FAILED}
                 and isinstance(record := event.payload.get("final_batch"), dict)
             ):
                 continue
@@ -969,6 +1216,7 @@ class GoalRunner:
         ref = next(ref for ref in self.plan.judges if ref.component_name() == name)
         tranche = self._tranche("final")
         scope = self._scope("judge", 0, tranche, final=True)
+        before = self.deps.provider_stops.generations()
         reservation: Reservation | None = None
         dispatched = False
         amount = Amount()
@@ -1008,6 +1256,7 @@ class GoalRunner:
                     ctx,
                 )
 
+        boundary = _Outcome()
         try:
             order: list[Candidate] = []
             completed = True
@@ -1018,25 +1267,43 @@ class GoalRunner:
                     order, outcome = result
                 else:
                     raise TimeoutError
-            except Fenced:
+            except (KeyboardInterrupt, SystemExit):
                 raise
-            except LimitReached:
-                self.status, self.reason = "no_result", "final slice used up"
-                return []
-            except Exception as error:
-                if self.deps.journal.fenced.is_set():
-                    raise
-                outcome = JudgeOutcome(
-                    scores=[],
-                    errors=[
-                        JudgeError(
-                            candidate_id=c.id,
-                            judge=name,
-                            reason=f"judge error: {_exception_type_name(error)}",
-                        )
-                        for c in finalists
-                    ],
-                )
+            except BaseException as error:
+                error = boundary.classify(error)
+                self.deps.journal._raise_if_fenced()
+                if isinstance(error, StorageError) and _is_core_signal(error):
+                    raise error from None
+                if _core_category(error) is _SignalCategory.PROVIDER:
+                    assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+                    outcome = JudgeOutcome(
+                        scores=[], errors=[], provider_failed={name: error.provider}
+                    )
+                elif _is_core_control(error):
+                    if (
+                        _core_category(error) is _SignalCategory.TERMINAL
+                        and isinstance(error, LimitReached)
+                        and error.limit == "usage_overflow"
+                    ):
+                        self.deps.stops.run_budget = True
+                        self.status, self.reason = "no_result", "run budget"
+                        return []
+                    if _core_category(error) is _SignalCategory.LIMIT:
+                        self.status, self.reason = "no_result", "reserve_exhausted"
+                        return []
+                    raise error from None
+                else:
+                    outcome = JudgeOutcome(
+                        scores=[],
+                        errors=[
+                            JudgeError(
+                                candidate_id=c.id,
+                                judge=name,
+                                reason=f"judge error: {_exception_type_name(error)}",
+                            )
+                            for c in finalists
+                        ],
+                    )
             if not completed:
                 # Recovery storage belongs to the engine, outside judge classification.
                 await self._refresh()
@@ -1053,10 +1320,38 @@ class GoalRunner:
                             allow_partial=self.plan.converge.allow_partial,
                         )
                     ]
-            if not order and outcome.errors:
+            if not order and (outcome.errors or outcome.provider_failed):
                 self.status, self.reason = "no_result", "provider_failed"
-            # The last outcome proves completion of this exact batch. Queue it
-            # before settlement so a committed score/settle head includes order.
+            if not outcome.provider_failed:
+                # Healthy/error scores retain the existing completion carrier
+                # in the same committed head as their settlement.
+                self._publish_scores(
+                    outcome,
+                    scope,
+                    0,
+                    final_batch={
+                        "key": key,
+                        **batch_identity,
+                        "order": [c.id for c in order],
+                        "status": self.status,
+                        "reason": self.reason,
+                    },
+                )
+        finally:
+            try:
+                if reservation is not None:
+                    await self.deps.ledger.settle(
+                        reservation.id, amount if dispatched else Amount(), estimated=dispatched
+                    )
+                await self._close(tranche)
+                self._stop()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error:
+                raise boundary.classify(error) from None
+
+        if outcome.provider_failed:
+            await self._report_judge_failure(outcome, before)
             self._publish_scores(
                 outcome,
                 scope,
@@ -1064,19 +1359,14 @@ class GoalRunner:
                 final_batch={
                     "key": key,
                     **batch_identity,
-                    "order": [candidate.id for candidate in order],
+                    "order": [c.id for c in order],
                     "status": self.status,
                     "reason": self.reason,
                 },
             )
-            return order
-        finally:
-            if reservation is not None:
-                await self.deps.ledger.settle(
-                    reservation.id, amount if dispatched else Amount(), estimated=dispatched
-                )
-            await self._close(tranche)
-            self._stop()
+        # Completion is durable before selection or any subsequent publication.
+        await self._refresh()
+        return order
 
     async def _replan(self) -> bool:
         """Supervise the proposal, then atomically recheck capacity and publish."""
@@ -1111,19 +1401,30 @@ class GoalRunner:
                     proposed = await proposed
                 return await run_sync_daemon(_detach_plan, proposed)
 
+        boundary = _Outcome()
         try:
             try:
                 completed, proposed = await self._supervised_step(propose, final=False)
             finally:
                 await self._close(tranche)
-        except Fenced:
+        except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception as error:
-            if self.deps.journal.fenced.is_set():
-                raise
+        except BaseException as error:
+            error = boundary.classify(error)
+            self.deps.journal._raise_if_fenced()
+            if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                raise error from None
+            if isinstance(error, StorageError) and _is_core_signal(error):
+                raise error from None
+            provider_context: dict[str, Any] = {}
+            if _core_category(error) is _SignalCategory.PROVIDER:
+                assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+                await self.deps.provider_stops.fail(error.provider, source="planner")
+                provider_context = {"provider": error.provider, "disposition": "provider_failed"}
             self.deps.journal.append(
                 self._draft(
                     EventType.PLAN_REJECTED,
+                    **provider_context,
                     errors=[f"planner error: {_exception_type_name(error)}"],
                     origin="autonomous",
                     first_round=self.rounds_closed + 1,
@@ -1146,16 +1447,17 @@ class GoalRunner:
 
             async def prepare() -> Plan:
                 # Admission can execute extension Config validators.
-                admitted, _ = await run_sync_daemon(
-                    partial(
-                        admit_revision,
-                        revision,
-                        self.deps.config,
-                        self.deps.artifacts,
-                        history=self.history,
-                        other_active_agents=0,
-                    )
+                admitted = await _admit_draft(
+                    revision,
+                    self.deps.config,
+                    self.deps.artifacts,
+                    frozen_goal=self.history[0].goal,
+                    base_dir=self.history[0].base_dir,
+                    history=self.history,
+                    origin="autonomous",
+                    admit=admit_revision,
                 )
+                admitted._set_planner_provenance(None, tuple(scope.call_ids))
                 if (
                     self._join_retry_number is not None
                     and admitted.rounds_total(self.deps.config.limits) <= self.rounds_closed
@@ -1180,7 +1482,8 @@ class GoalRunner:
                         EventType.PLAN_REVISION,
                         plan=admitted.model_dump(mode="json"),
                         origin="autonomous",
-                        planner_call_ids=list(scope.call_ids),
+                        planner_call_ids=list(admitted.planner_call_ids),
+                        planning_session=admitted.planning_session,
                         first_round=self.rounds_closed + 1,
                     )
                 )
@@ -1228,6 +1531,7 @@ class GoalRunner:
             await run_preflight([plan], self.deps.config, self.deps.executor)
         except BaseException as error:
             error = outcome.classify(error)
+            _raise_terminal(error)
             raise PlanError([f"preflight failed: {_exception_type_name(error)}"]) from None
 
     def _stop(self) -> bool:
@@ -1270,14 +1574,17 @@ class GoalRunner:
                 proposed = await proposed
             return await run_sync_daemon(lambda: guard(_detach_model(Decision, proposed), state))
 
+        boundary = _Outcome()
         try:
             completed, result = await self._supervised_step(invoke, final=False)
             decision = result if completed and result is not None else Decision()
-        except Fenced:
+        except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception as error:
-            if self.deps.journal.fenced.is_set():
-                raise
+        except BaseException as error:
+            error = boundary.classify(error)
+            self.deps.journal._raise_if_fenced()
+            if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                raise error from None
             decision = guard(Decision(policy=f"policy error: {_exception_type_name(error)}"), state)
         event = self.deps.journal.append(
             self._draft(
@@ -1294,6 +1601,7 @@ class GoalRunner:
             reason = decision.prune.get(key, decision.prune.get(slot.team.name))
             if reason is not None:
                 slot.status = AgentStatus.PRUNED
+                self.deps.provider_stops.release(slot.address)
                 self.deps.journal.append(
                     EventDraft(
                         type=EventType.AGENT_STATUS,
@@ -1381,34 +1689,130 @@ class GoalRunner:
                 return [], [_curator_error(outcome.classify(error))]
 
         completed = False
+        interrupted = False
         result: tuple[list[Learning], list[str]] | None = None
+        boundary = _Outcome()
+        failure: BaseException | None = None
+        accounting_failure: BaseException | None = None
         try:
+            completed, result = await self._supervised_step(invoke, final=False)
+            interrupted = not completed
+        except BaseException as error:
+            failure = error
             try:
-                completed, result = await self._supervised_step(invoke, final=False)
-            except LimitReached as error:
-                completed, result = True, ([], [f"curator limit: {error.limit}"])
-                # Only registered limits escape the plugin boundary above.
-                self.deps.journal.append(
-                    self._draft(
-                        EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                error = boundary.classify(error)
+                interrupted = _core_category(error) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
+                if _core_category(error) is _SignalCategory.LIMIT:
+                    limit = cast(LimitReached, error)
+                    completed, result = True, ([], [f"curator limit: {limit.limit}"])
+                    self.deps.journal.append(
+                        self._draft(
+                            EventType.RESERVE_EXHAUSTED, round=round, reason="reserve_exhausted"
+                        )
                     )
-                )
-                self.select_only = True
-                self.status, self.reason = "stopped", "reserve_exhausted"
-            except Exception as error:
-                # The supervisor can raise sanitized cancellation-shaped failures.
-                completed, result = True, ([], [_curator_error(error)])
+                    self.select_only = True
+                    self.status, self.reason = "stopped", "reserve_exhausted"
+                    failure = None
+            except anyio.get_cancelled_exc_class() as cancelled:
+                interrupted, failure = True, cancelled
+            except BaseException as control:
+                interrupted = _core_category(control) in {
+                    _SignalCategory.FENCED,
+                    _SignalCategory.TERMINAL,
+                }
+                failure = control
         finally:
-            # Only pending usage waits are bounded; admitted durable settlement
-            # retains the ledger's existing finality and conservative charges.
-            with anyio.CancelScope(shield=True):
-                await self._close(tranche)
+            # Close on every exit, including a custom curator interrupted before
+            # _prepare_curator could drain. No late result may publish a receipt.
+            if not interrupted:
+                try:
+                    # Report arrival and durable settlement have separate budgets.
+                    with (
+                        _report_timer(scope.settle_timeout_s) as report_timer,
+                        _local_timer_scope(report_timer) as report_wait,
+                    ):
+                        await await_reports(scope)
+                    if report_wait.failure is not None:
+                        raise report_wait.failure from None
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as report_error:
+                    accounting_failure = report_error
+                    failure = (
+                        BaseExceptionGroup("curator reports", [failure, report_error])
+                        if failure is not None
+                        else report_error
+                    )
+            timer = anyio.CancelScope(
+                deadline=anyio.current_time() + self.deps.config.settle_timeout_s,
+                shield=True,
+            )
+            try:
+                with _local_timer_scope(timer) as local_timer:
+                    with timer:
+                        await drain(scope, wait=False)
+                    if local_timer.failure is not None:
+                        raise local_timer.failure from None
+                    if timer.cancel_called:
+                        raise _stop_cleanup_error()
+                # The report allowance is already spent. Direct reservations
+                # have no recorder to wait for and close conservatively now.
+                with anyio.CancelScope(shield=True):
+                    await self._close(tranche, wait=False)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as cleanup_error:
+                accounting_failure = (
+                    BaseExceptionGroup("curator accounting", [accounting_failure, cleanup_error])
+                    if accounting_failure is not None
+                    else cleanup_error
+                )
+                failure = (
+                    BaseExceptionGroup("curator cleanup", [failure, cleanup_error])
+                    if failure is not None
+                    else cleanup_error
+                )
             self._stop()
+        if failure is not None:
+            # Classify while the captured exception is active so AnyIO can
+            # still recognize its own cancellation through the context chain.
+            try:
+                raise failure
+            except BaseException as error:
+                error = boundary.classify(error)
+                self.deps.journal._raise_if_fenced()
+                if _core_category(error) in {_SignalCategory.FENCED, _SignalCategory.TERMINAL}:
+                    raise error from None
+                if accounting_failure is not None:
+                    # An incomplete drain/close must not complete the curator phase.
+                    boundary.contain(accounting_failure, StorageError, "curator accounting")
+                if _core_category(error) is _SignalCategory.PROVIDER:
+                    assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+                    await self.deps.provider_stops.fail(error.provider, source="curator")
+                    await self.deps.journal.append_durable(
+                        self._draft(
+                            EventType.PROVIDER_FAILED,
+                            round=round,
+                            variant="receipt",
+                            source="curator",
+                            provider=error.provider,
+                            disposition="curator_skipped",
+                            complete=True,
+                            accounting="settled",
+                            revision=self.plan.revision,
+                            decision_seq=decision.seq,
+                        )
+                    )
+                    await self._refresh()
+                    return
+                completed, result = True, ([], [_curator_error(error)])
         if not completed or result is None:
             return
         await anyio.lowlevel.checkpoint_if_cancelled()
-        if self.deps.journal.fenced.is_set():
-            raise _core_error(Fenced)
+        self.deps.journal._raise_if_fenced()
         summaries, errors = result
         if self._stop():
             summaries, errors = [], [*errors, "curation stopped"]
@@ -1493,30 +1897,55 @@ class GoalRunner:
             round = self.rounds_closed + 1
             decision = next((d for r, d in self._decisions if r == round), None)
             funded = True
-            if decision is None:
+            skipped = self.recorded.goals[self.goal_id].skipped_policies.get(round)
+            policy_skipped = skipped is not None and skipped.get("lifecycle") == self._lifecycle()
+            if decision is None and not policy_skipped:
                 spec = self.plan.rounds[round - 1] if self.plan.rounds else RoundSpec()
                 recovered = [c for pairs in self._resumed.values() for _, c in pairs]
-                out = await RoundRunner(
-                    self.deps,
-                    goal_id=self.goal_id,
-                    plan=self.plan,
-                    agents=self.agents,
-                    supervisor=self,
-                    round_spec=spec,
-                    rounds_left=self.plan.rounds_total(self.deps.config.limits)
-                    - self.rounds_closed,
-                    resumed=self._resumed,
-                    repeat_entries=self.repeat_entries,
-                    frontier=self._frontier,
-                ).run(round)
-                self._merge_repeats(out.repeat_entries)
-                await self._refresh()
-                if round not in self.recorded.goals[self.goal_id].frontiers:
-                    break
-                funded = await self._barrier([*recovered, *out.candidates], round)
+                barrier_started = any(
+                    e.goal_id == self.goal_id
+                    and e.round == round
+                    and isinstance(record := e.payload.get("barrier_batch"), dict)
+                    and record.get("managers_complete") is True
+                    and record.get("lifecycle") == self._lifecycle()
+                    and record.get("revision") == self.plan.revision
+                    for e in self._events
+                )
+                if barrier_started:
+                    candidates = [
+                        c
+                        for c in self.recorded.candidates.values()
+                        if c.goal_id == self.goal_id and c.round == round
+                    ]
+                    self._merge_repeats(
+                        [pair for pairs in self._resumed.values() for pair in pairs]
+                    )
+                else:
+                    out = await RoundRunner(
+                        self.deps,
+                        goal_id=self.goal_id,
+                        plan=self.plan,
+                        agents=self.agents,
+                        supervisor=self,
+                        round_spec=spec,
+                        rounds_left=self.plan.rounds_total(self.deps.config.limits)
+                        - self.rounds_closed,
+                        resumed=self._resumed,
+                        repeat_entries=self.repeat_entries,
+                        frontier=self._frontier,
+                    ).run(round)
+                    self._merge_repeats(out.repeat_entries)
+                    await self._refresh()
+                    if round not in self.recorded.goals[self.goal_id].frontiers:
+                        break
+                    candidates = [*recovered, *out.candidates]
+                funded = await self._barrier(candidates, round)
                 self.rounds_closed = round
                 if funded:
-                    decision = await self._round_decision(round)
+                    if any(record["ranking"] for record in self._provider_batches(round)):
+                        await self._skip_policy(round)
+                    else:
+                        decision = await self._round_decision(round)
             else:
                 # Its policy checkpoint proves managers and barrier already completed.
                 self._merge_repeats([pair for pairs in self._resumed.values() for pair in pairs])
@@ -1589,8 +2018,14 @@ class GoalRunner:
         if self.status != "no_result" and self.reason != "reserve_exhausted":
             self.agents = await self._slots(self.plan.teams, reuse=False)
             if not self.state.converge_started and self.join_phase != "replan":
-                await self._run_rounds()
+                boundary = _Outcome()
+                try:
+                    await self._run_rounds()
+                except BaseException as error:
+                    boundary.propagate_control(error)
+                    raise
         finalists: list[Candidate] = []
+        ranking_still_failed = False
         if self.status != "no_result":
             self._stop()
             if self.join_phase != "replan":
@@ -1601,11 +2036,22 @@ class GoalRunner:
                     )
                 )
                 await self.deps.journal.commit()
-            finalists = await converge(self, select_only=self.select_only)
+            boundary = _Outcome()
+            try:
+                ranking_still_failed = await self._retry_ranking()
+                finalists = await converge(self, select_only=self.select_only)
+            except BaseException as error:
+                boundary.propagate_control(error)
+                raise
         self._stop()
         if not finalists and not (self.final_parts and any(self.final_parts.values())):
             if self.status != "no_result":
-                self.status, self.reason = "no_result", "no passing candidate"
+                self.status, self.reason = (
+                    "no_result",
+                    "provider_failed"
+                    if ranking_still_failed and not self.join_retries
+                    else "no passing candidate",
+                )
             self.deps.journal.append(self._draft(EventType.NO_RESULT, reason=self.reason))
         else:
             self.deps.journal.append(
@@ -1618,6 +2064,7 @@ class GoalRunner:
             )
         # Replay returns the pool at goal_finished; do not suspend before applying it live.
         with anyio.CancelScope(shield=True):
+            self.deps.provider_stops._release_goal(self.goal_id)
             await self.deps.journal.append_durable(
                 self._draft(EventType.GOAL_FINISHED, reason=self.reason)
             )

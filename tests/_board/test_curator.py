@@ -1,9 +1,11 @@
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
+from _engine.conftest import env as env
 from _fakes.curators import MergeAll
+from _fakes.engine import EngineEnv
 
 from swarm_arena import Ref
 from swarm_arena._board.curator import Curator, _prepare_curator, _stamp_summaries
@@ -224,3 +226,120 @@ async def test_serializer_cannot_intercept_authoritative_metadata_assignment() -
     assert summaries[0].verified
     assert not summaries[0].hidden
     assert not summaries[0].pinned
+
+
+@pytest.mark.parametrize(
+    ("link", "expected"), [(None, "llm-7"), ("llm-3", "llm-7"), ("llm-6", "llm-6")]
+)
+async def test_hook_stamps_empty_curated_ids(link: str | None, expected: str) -> None:
+    from types import SimpleNamespace
+
+    from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+
+    scope = SimpleNamespace(run_id="unbound", call_ids=[])
+
+    class Linked(Returning):
+        async def curate(
+            self, namespace: str, new: Sequence[Learning], view: BoardView
+        ) -> list[Learning]:
+            scope.call_ids.extend(["llm-6", "llm-7"])
+            return await super().curate(namespace, new, view)
+
+    with llm_scope(cast(LLMScope, scope)):
+        summaries, errors = await run(
+            Linked([learning(supersedes=["L1"], posted_by_call=link)]), [learning()]
+        )
+    assert errors == []
+    assert summaries[0].id.startswith("L-")
+    assert summaries[0].posted_by_call == expected
+
+
+async def test_terminal_cleanup_failure_is_not_a_curator_error() -> None:
+    from swarm_arena._errors import _stop_cleanup_error
+
+    with pytest.raises(RuntimeError, match="stop cleanup timed out"):
+        await run(Returning(_stop_cleanup_error()), [])
+
+
+@pytest.mark.parametrize("stage", ["hook", "close"])
+async def test_engine_never_publishes_after_terminal_curator_failure(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from _engine.test_goal import _curation_checkpoint
+
+    from swarm_arena._engine.goal import GoalRunner
+    from swarm_arena._errors import _stop_cleanup_error
+
+    runner = await _curation_checkpoint(env)
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        raise _stop_cleanup_error()
+
+    if stage == "hook":
+        monkeypatch.setattr(MergeAll, "curate", fail)
+    else:
+        monkeypatch.setattr(GoalRunner, "_close", fail)
+    with pytest.raises(RuntimeError, match="stop cleanup timed out"):
+        await runner._curate_round(1)
+    await env.deps.journal.commit()
+    assert env.events("curated") == []
+    assert all(event.payload["learning"]["author"] != "curator" for event in env.events("learning"))
+
+
+async def test_engine_terminal_overflow_is_not_reserve_exhaustion(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _engine.test_goal import _curation_checkpoint
+
+    from swarm_arena._errors import _SignalCategory
+
+    runner = await _curation_checkpoint(env)
+
+    async def overflow(*args: Any, **kwargs: Any) -> Any:
+        raise _core_error(
+            LimitReached, "usage_overflow", "usage overflow", _category=_SignalCategory.TERMINAL
+        )
+
+    monkeypatch.setattr(MergeAll, "curate", overflow)
+    with pytest.raises(LimitReached) as caught:
+        await runner._curate_round(1)
+    assert caught.value.limit == "usage_overflow"
+    await env.deps.journal.commit()
+    assert env.events("curated") == env.events("reserve_exhausted") == []
+
+
+async def test_engine_curator_drain_has_a_bound(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+    from _engine.test_goal import _curation_checkpoint
+
+    from swarm_arena._engine import goal as goal_module
+
+    runner = await _curation_checkpoint(env)
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 0.05})
+    entered = anyio.Event()
+    exited = anyio.Event()
+
+    async def held_drain(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(goal_module, "drain", held_drain)
+    with anyio.fail_after(5), pytest.raises(RuntimeError, match="stop cleanup timed out"):
+        await runner._curate_round(1)
+    assert entered.is_set()
+    assert exited.is_set()
+    await env.deps.journal.commit()
+    assert env.events("curated") == []
+    assert all(event.payload["learning"]["author"] != "curator" for event in env.events("learning"))
+
+
+async def test_prepare_curator_reraises_provider_failed() -> None:
+    from swarm_arena._errors import ProviderFailed
+
+    with pytest.raises(ProviderFailed):
+        await run(Returning(_core_error(ProviderFailed, "anthropic")), [])

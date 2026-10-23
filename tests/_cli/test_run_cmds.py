@@ -1,5 +1,6 @@
 import os
 import re
+import signal
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
@@ -120,9 +121,11 @@ def test_run_without_tty_or_yes_exits_2_and_writes_nothing(
 def test_run_prompt_declined_exits_1(
     example: Example, monkeypatch: pytest.MonkeyPatch, terminal: None
 ) -> None:
+    handler = signal.getsignal(signal.SIGINT)
     answer = iter(b"n\n")
     monkeypatch.setattr(run_cmds, "read", lambda fd, size: bytes([next(answer)]))
     assert main(["run", str(example.run_toml), str(example.plan_toml)]) == 1
+    assert signal.getsignal(signal.SIGINT) is handler
     assert not example.run_root.exists()
     assert not example.artifact_root.exists()
 
@@ -626,3 +629,33 @@ def test_status_cli_exact_total_after_real_overflow_run(
     assert result.returncode == 0, result.stderr
     assert "$1000000000.000001" in result.stdout
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+@pytest.mark.parametrize("failure_kind", ["fence", "settlement"])
+def test_ordinary_core_failure_keeps_cli_diagnostic(
+    example: Example,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    failure_kind: str,
+) -> None:
+    from swarm_arena._errors import _core_error, _stop_cleanup_error
+
+    error = (
+        _core_error(Fenced, "run ownership lost")
+        if failure_kind == "fence"
+        else _stop_cleanup_error()
+    )
+
+    async def fail(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(run_cmds, f"_{command}_async", fail)
+    argv = (
+        [command, "--yes", str(example.run_toml), str(example.plan_toml)]
+        if command == "run"
+        else [command, str(example.run_root / "r")]
+    )
+    assert main(argv) == 1
+    assert capsys.readouterr().err == f"{error}\n"

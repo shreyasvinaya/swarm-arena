@@ -32,6 +32,42 @@ from swarm_arena._model.ref import _validate_config
 SECRET = "72637a4e-d59e-5316-bb5e-d65f326c5edf"
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_validation_wrapper_control_disposition(kind: str, nested: bool) -> None:
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena._model.base import FrozenModel
+    from swarm_arena.manager import LimitReached
+
+    class Input(FrozenModel):
+        @model_validator(mode="before")
+        @classmethod
+        def terminal(cls, value: Any) -> Any:
+            error: BaseException = (
+                _stop_cleanup_error()
+                if kind == "terminal"
+                else _core_signal(LimitReached("stop", "the round is stopping"))
+                if kind == "limit"
+                else _core_error(ProviderFailed, "provider")
+            )
+            if nested:
+                raise BaseExceptionGroup("model", [BaseExceptionGroup("validator", [error])])
+            raise error
+
+    with pytest.raises(RuntimeError if kind == "terminal" else ValidationError) as caught:
+        Input()
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else None
+    )
+
+
 def validate(model: type[BaseModel], entry: str, data: dict[str, Any]) -> BaseModel:
     if entry == "constructor":
         return model(**data)

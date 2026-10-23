@@ -216,3 +216,85 @@ async def test_stop_poll_failure_reaches_owner(
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("mode", ["run", "resume", "resume_retry"])
+async def test_one_stop_watcher_spans_acquisition_setup_and_driver(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
+    swarm = Swarm(config)
+    if mode != "run":
+        await swarm.run(plan(rounds=1), run_id="r")
+    from swarm_arena._errors import _core_error
+    from swarm_arena._journal.lease import Lease
+
+    attempts: list[bool] = []
+    original_take = Lease.take_over
+
+    def take(*args: Any, **kwargs: Any) -> Lease:
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise _core_error(Fenced)
+        return original_take(*args, **kwargs)
+
+    if mode == "resume_retry":
+        monkeypatch.setattr(Lease, "take_over", take)
+    original = run_module.watch_stop_files
+    started: list[object] = []
+    live: set[asyncio.Task[Any]] = set()
+    setup_watchers: list[int] = []
+
+    async def watch(store: Any, epoch: int, stops: Any) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        started.append(stops)
+        live.add(task)
+        try:
+            await original(store, epoch, stops, interval_s=0.01)
+        finally:
+            live.remove(task)
+
+    monkeypatch.setattr(run_module, "watch_stop_files", watch)
+    monkeypatch.setattr(
+        run_module, "_run_setups", [lambda config: setup_watchers.append(len(live))]
+    )
+    if mode != "run":
+        await Swarm(config).resume("r", force=True)
+    else:
+        await swarm.run(plan(rounds=1), run_id="r")
+    assert len(started) == 1
+    assert setup_watchers == [1]
+    assert not live
+    if mode == "resume_retry":
+        assert len(attempts) == 2
+
+
+async def test_stop_at_initialization_entry_has_stopped_outcome(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.lease_acquisition import stop_at_phase_entry
+
+    trigger, latched = stop_at_phase_entry(monkeypatch)
+    enter = run_module._RunJournal.__aenter__
+
+    async def entered(journal: run_module._RunJournal) -> run_module._RunJournal:
+        result = await enter(journal)
+        trigger.set()
+        return result
+
+    monkeypatch.setattr(run_module._RunJournal, "__aenter__", entered)
+    with (
+        anyio.fail_after(5),
+        pytest.raises(
+            RuntimeError,
+            match=r"^run initialization stopped before run_started$",
+        ),
+    ):
+        await Swarm(run_config).run(plan(rounds=1), run_id="r")
+    assert latched.is_set()
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "r"))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert owner[0].head is None

@@ -129,6 +129,26 @@ async def test_all_judge_errors_writes_no_result(env: EngineEnv) -> None:
     assert json.loads(env.store.read("goals/g/solution.json").data)["status"] == "no_result"
 
 
+@pytest.mark.parametrize("flag", ["stop", "run_budget"])
+async def test_stop_without_passing_candidate_records_selection_reason(
+    env: EngineEnv, flag: str
+) -> None:
+    env.on_commit("round_closed", lambda ev: _raise_flag(env.deps.stops, flag, goal_id="g"))
+    raising = Ref.of(ProgramJudge("_fakes.tools:raising_score")).model_copy(update={"name": "y"})
+    outcome = await GoalRunner(
+        env.deps, goal_id="g", plan=_plan(judges=[raising]), replanner=None
+    ).run()
+    assert (outcome.status, outcome.reason, outcome.finalists) == (
+        "no_result",
+        "no passing candidate",
+        [],
+    )
+    assert env.events("no_result")[-1].payload == {"reason": "no passing candidate"}
+    assert (
+        json.loads(env.store.read("goals/g/solution.json").data)["reason"] == "no passing candidate"
+    )
+
+
 @pytest.mark.parametrize(
     ("flag", "reason", "select_only"),
     [
@@ -442,8 +462,8 @@ async def test_final_judge_reservation_exhausted_writes_no_result(env: EngineEnv
         Ref.of(PyTool({"code": WRITE.format("{'data': {'y': 1.0}, 'usage': {'usd': 8.0}}")})),
     )
     out = await GoalRunner(e.deps, goal_id="g", plan=plan, replanner=None).run()
-    assert (out.status, out.reason, out.finalists) == ("no_result", "final slice used up", [])
-    assert e.events("no_result")[-1].payload["reason"] == "final slice used up"
+    assert (out.status, out.reason, out.finalists) == ("no_result", "reserve_exhausted", [])
+    assert e.events("no_result")[-1].payload["reason"] == "reserve_exhausted"
 
 
 def _catalog_env(env: EngineEnv, plan: Plan, **tools: Ref) -> EngineEnv:
@@ -527,7 +547,9 @@ async def test_replanner_runs_in_planner_scope_and_revisions_journal_call_ids(
     plan = _admitted(env, _plan(teams=1), tmp_path)
     _catalog_env(env, plan, **{"catalog-agent": plan.teams[0].agents[0].tool})
     planner = _ScopeProbePlanner(AddAgentPlanner("catalog-agent"))
-    await GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner).run()
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
+    await runner.run()
+    assert runner.plan.planner_call_ids == ("llm-p1",)
     s: LLMScope = planner.seen[0]
     assert (s.role, s.goal_id, s.team, s.agent, s.round, s.candidate_id) == (
         "planner",
@@ -558,6 +580,36 @@ async def test_rejected_revision_is_journaled_and_old_plan_kept(
     assert len(env.events("plan_revision")) == 1
     assert not env.store.exists("goals/g/plan.r1.toml")
     assert out.status == "finished"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_replanned_preflight_exit_terminal(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from _fakes.planners import SequencePlanner
+
+    from swarm_arena._engine import goal as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    async def fail(*args: Any) -> None:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("preflight", [BaseExceptionGroup("revision", [error])])
+        raise error
+
+    current = _admitted(env, _plan(teams=1), tmp_path)
+    _catalog_env(env, current, **{"catalog-agent": current.teams[0].agents[0].tool})
+    monkeypatch.setattr(module, "run_preflight", fail)
+    runner = GoalRunner(env.deps, goal_id="g", plan=current, replanner=SequencePlanner([current]))
+    with pytest.raises(RuntimeError) as caught:
+        await runner.run()
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    await env.deps.journal.commit()
+    assert not env.events("plan_rejected")
 
 
 async def test_planner_exception_is_type_only_and_skipped(env: EngineEnv) -> None:
@@ -1558,7 +1610,9 @@ async def test_curator_cancellation_retains_settlement_finality(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.create_task(runner._curate_round(1))
     else:
-        with anyio.fail_after(3):
+        # A missing report uses the full settlement allowance before durable
+        # close; leave headroom for stop detection, I/O, and CI scheduling.
+        with anyio.fail_after(5 * env.deps.config.settle_timeout_s):
             async with anyio.create_task_group() as group:
                 group.start_soon(runner._curate_round, 1)
                 await pending.wait()
@@ -2076,3 +2130,1179 @@ async def test_page_storage_preserves_control_and_chain_errors(kind: str) -> Non
 
     with pytest.raises(expected):
         await _page_storage(operation)
+
+
+async def test_llm_join_revision_is_admitted(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    from _fakes.planning_llm import planner_config
+    from _fakes.run import events
+
+    from swarm_arena import Swarm
+    from swarm_arena.llm import LLMPlanner
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Estimate
+
+    config = planner_config(tmp_path)
+    config = config.model_copy(
+        update={
+            "limits": config.limits.model_copy(
+                update={
+                    "max_rounds": 2,
+                    "default_run_reservation": Estimate(tokens=0, usd=0),
+                }
+            )
+        }
+    )
+    initial = _parts_plan(rounds=2, fail_join=True).model_copy(update={"rounds": [RoundSpec()]})
+    from swarm_arena.config import CatalogEntry, PlannerCatalog
+
+    tool = initial.teams[0].agents[0].tool
+    config = config.model_copy(
+        update={
+            "planner_catalog": PlannerCatalog(
+                entries=[
+                    *config.planner_catalog.entries,
+                    CatalogEntry(
+                        name="part-tool",
+                        kind="tool",
+                        ref=tool.path,
+                        config=tool.config,
+                        description="Approved part work in extra rounds",
+                    ),
+                ]
+            )
+        }
+    )
+    fake = FakeModel(
+        [
+            FakeTurn(
+                text=json.dumps(
+                    {
+                        "keep_teams": ["a1", "b1"],
+                        "keep_parts": ["a", "b"],
+                        "rounds": [{}],
+                    }
+                )
+            )
+        ]
+    )
+    fake.register("planner")
+    await Swarm(config, replanner=LLMPlanner("planner")).run(initial)
+    revisions = events(config, "plan_revision")
+    assert [e.payload["plan"]["revision"] for e in revisions] == [0, 1], events(
+        config, "plan_rejected"
+    )
+    assert revisions[1].payload["planner_call_ids"]
+    assert events(config, "join_failed")
+    assert "join_failures" in json.dumps(fake.calls[0], default=str)
+
+
+async def test_r0_payload_links_the_planning_session(env: EngineEnv) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+
+    initial = mark_planning_session(_plan(rounds=1), Mock(run_id="r-p", call_ids=["llm-1"]))
+    await GoalRunner(env.deps, goal_id="g", plan=initial, replanner=None).run()
+    r0 = env.events("plan_revision")[0].payload
+    assert (r0["planning_session"], r0["planner_call_ids"]) == ("r-p", ["llm-1"])
+
+
+async def test_provider_paused_capacity_is_reserved_before_and_after_slot_rebuild(
+    env: EngineEnv,
+) -> None:
+    from swarm_arena._engine.round import AgentStatus
+    from swarm_arena._journal.replay import GoalState
+
+    plan = _plan(teams=1, rounds=2)
+    spec = plan.teams[0].agents[0]
+    key = f"{plan.teams[0].name}/{spec.name}"
+    address = f"g/{key}"
+    stops = env.deps.provider_stops
+    stops.register(address, frozenset({"anthropic"}), lambda: None)
+    await stops.fail("anthropic", source="manager")
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        replanner=None,
+        state=GoalState(agents={key: AgentStatus.STOPPED}),
+    )
+    assert runner.active_agents() == 1
+    runner.agents = await runner._slots(plan.teams, reuse=True)
+    assert runner.active_agents() == 1
+    runner.agents[0].status = AgentStatus.PRUNED
+    assert runner.active_agents() == 0
+
+
+@pytest.mark.parametrize("ranking_failure", [True, False])
+async def test_provider_barrier_receipts_and_policy_eligibility(
+    env: EngineEnv, ranking_failure: bool
+) -> None:
+    from _fakes.non_agent import FailingJudge
+
+    failed = Ref.of(FailingJudge()).model_copy(update={"name": "failed"})
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=_plan(
+            rounds=1, judges=[failed, Y_JUDGE], ranking="failed" if ranking_failure else "y"
+        ),
+        replanner=None,
+    )
+    out = await runner.run()
+    failures = env.events("provider_failed")
+    batches = [e for e in failures if "barrier_batch" in e.payload]
+    assert len(batches) == (2 if ranking_failure else 1)
+    assert batches[0].payload["complete"] is True
+    assert batches[0].payload["disposition"] == "provider_failed"
+    assert batches[0].payload["barrier_batch"]["part"] is None
+    assert not env.events("judge_error")
+    assert bool(env.events("decision")) is not ranking_failure
+    assert len(env.events("round_closed")) == 1
+    if ranking_failure:
+        assert out.reason == "provider_failed"
+        assert any(e.payload.get("disposition") == "policy_skipped" for e in failures)
+    else:
+        assert out.finalists
+
+
+@pytest.mark.parametrize("kind", ["provider", "limit", "ordinary", "spoof"])
+async def test_final_failure_disposition(env: EngineEnv, kind: str) -> None:
+    from _fakes.non_agent import FailingJudge
+
+    judge = Ref.of(FailingJudge({"phase": "final", "kind": kind})).model_copy(update={"name": "y"})
+    out = await GoalRunner(
+        env.deps, goal_id="g", plan=_plan(rounds=1, judges=[judge]), replanner=None
+    ).run()
+    assert out.finalists == []
+    assert out.reason == ("reserve_exhausted" if kind == "limit" else "provider_failed")
+    failures = env.events("provider_failed")
+    assert bool(failures) is (kind == "provider")
+    if kind == "provider":
+        assert len([e for e in failures if "final_batch" in e.payload]) == 1
+        assert not env.events("judge_error")
+    assert "NON_AGENT_SECRET" not in repr(env._events())
+
+
+async def test_barrier_limit_exhaustion_is_not_judge_error(env: EngineEnv) -> None:
+    from _fakes.non_agent import FailingJudge
+
+    judge = Ref.of(FailingJudge({"phase": "barrier", "kind": "limit"})).model_copy(
+        update={"name": "y"}
+    )
+    runner = GoalRunner(env.deps, goal_id="g", plan=_plan(judges=[judge]), replanner=None)
+    await runner.run()
+    assert [e.payload["round"] for e in env.events("reserve_exhausted")] == [1]
+    assert env.events("reserve_exhausted")[0].payload["needed"] is None
+    assert runner.select_only
+    assert not env.events("judge_error")
+    assert not env.events("provider_failed")
+
+
+async def test_curator_provider_failure_receipt_completes_phase(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._errors import ProviderFailed, _core_error
+
+    runner = await _curation_checkpoint(env)
+    calls = 0
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise _core_error(ProviderFailed, "anthropic")
+
+    monkeypatch.setattr(MergeAll, "curate", fail)
+    await runner._curate_round(1)
+    await runner._curate_round(1)
+    assert calls == 1
+    assert not env.events("curated")
+    receipts = [
+        e
+        for e in env.events("provider_failed")
+        if e.payload.get("disposition") == "curator_skipped"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0].payload["decision_seq"] in runner.recorded.goals["g"].curated_decisions
+
+
+async def test_replanner_provider_failure_rejects_pending_proposal(env: EngineEnv) -> None:
+    from swarm_arena._errors import ProviderFailed, _core_error
+    from swarm_arena._planning.planner import Planner
+
+    class FailedPlanner(Planner):
+        async def plan(self, *args: Any, **kwargs: Any) -> Any:
+            raise _core_error(ProviderFailed, "anthropic")
+
+    await GoalRunner(env.deps, goal_id="g", plan=_plan(), replanner=FailedPlanner()).run()
+    assert len(env.events("plan_revision")) == 1
+    assert env.events("plan_rejected")[0].payload["provider"] == "anthropic"
+    assert env.events("plan_rejected")[0].payload["first_round"] == 2
+    assert any(e.payload.get("source") == "planner" for e in env.events("provider_failed"))
+
+
+async def test_state_free_reservation_terminal_escapes_manager(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import _core_error, _SignalCategory
+
+    async def reserve(self: Tranche, *args: Any, **kwargs: Any) -> str:
+        raise _core_error(
+            RuntimeError, "stop cleanup timed out", _category=_SignalCategory.TERMINAL
+        )
+
+    async def run(self: ScriptedManager, *args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        await scope.tranche.reserve_call(Amount(tokens=1))
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(Tranche, "reserve_call", reserve)
+    monkeypatch.setattr(ScriptedManager, "run_round", run)
+    with pytest.raises(RuntimeError, match="stop cleanup timed out"):
+        await GoalRunner(env.deps, goal_id="g", plan=_plan(teams=1), replanner=None).run()
+    assert not env.events("round_closed")
+    assert not any("manager error" in str(e.payload) for e in env.events("agent_status"))
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "batch",
+        "policy",
+        "ranking_retry",
+        "final",
+        "final_scores",
+        "curator",
+        "closed",
+        "page_before",
+        "page_after",
+        "planner",
+        "join",
+        "parts",
+    ],
+)
+async def test_provider_receipts_public_resume(tmp_path: Path, boundary: str) -> None:
+    import os
+    import sys
+
+    import anyio
+    from _fakes.non_agent import FailingPlanner
+    from _fakes.run import all_events, events
+
+    from swarm_arena import Swarm
+    from swarm_arena._journal.replay import RunState
+
+    repo = Path(__file__).parents[2]
+    environment = dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join([str(repo / "tests"), str(repo / "src")]),
+        XDG_CACHE_HOME=str(tmp_path / "cache"),
+    )
+    script = (
+        "import anyio,sys; from _fakes.non_agent import crash_driver; "
+        "anyio.run(crash_driver,sys.argv[1],sys.argv[2])"
+    )
+    with anyio.fail_after(60):
+        process = await anyio.run_process(
+            [sys.executable, "-c", script, str(tmp_path), boundary],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+        )
+    assert process.returncode == 91, process.stderr.decode()
+    config = RunConfig.load(tmp_path / "runs" / "failure" / "run.toml")
+    before = all_events(config)
+    calls_before = {
+        name: (tmp_path / name).read_text()
+        for name in ["judge-calls", "curator-calls", "planner-calls"]
+        if (tmp_path / name).exists()
+    }
+    with anyio.fail_after(60):
+        result = await Swarm(config, replanner=FailingPlanner()).resume("failure", force=True)
+    after = all_events(config)
+    if boundary in {"batch", "ranking_retry", "final", "final_scores", "curator", "join"}:
+        for name, contents in calls_before.items():
+            assert (tmp_path / name).read_text() == contents
+    if boundary == "policy":
+        assert (tmp_path / "judge-calls").read_text() == calls_before[
+            "judge-calls"
+        ] + "0:None:False\n"
+    if boundary == "planner":
+        assert (tmp_path / "planner-calls").read_text() == calls_before["planner-calls"]
+    if boundary in {"closed", "page_before", "page_after"}:
+        assert (tmp_path / "planner-calls").read_text().splitlines() == ["called"]
+    if boundary == "final_scores":
+        receipt = next(e.payload["final_batch"] for e in before if "final_batch" in e.payload)
+        assert [c.id for c in result["g"]] == receipt["order"]
+        state = RunState.from_events(before)
+        assert (
+            state.candidates[receipt["order"][0]].output.data["y"]
+            > state.candidates[receipt["order"][-1]].output.data["y"]
+        )
+    if boundary in {"policy", "final", "closed", "page_before", "page_after"}:
+        assert result["g"] == []
+        assert events(config, "no_result")[-1].payload["reason"] == "provider_failed"
+    if boundary == "parts":
+        assert (tmp_path / "judge-calls").read_text().splitlines() == [
+            "1:a:False",
+            "1:b:False",
+        ]
+        failed_parts = {
+            e.payload["barrier_batch"]["part"]
+            for e in after
+            if e.type == "provider_failed" and "barrier_batch" in e.payload
+        }
+        assert failed_parts == {"a", "b"}
+        assert events(config, "decision")
+    for event in events(config, "round_closed"):
+        assert (
+            tmp_path / "runs" / "failure" / "goals" / "g" / "rounds" / f"round-{event.round:02d}.md"
+        ).exists()
+
+    # Repeated resume of a finished run cannot repeat any component or phase.
+    def counters_now() -> dict[str, str]:
+        return {p.name: p.read_text() for p in tmp_path.glob("*-calls")}
+
+    counters = counters_now()
+    with anyio.fail_after(60):
+        again = await Swarm(config, replanner=FailingPlanner()).resume("failure", force=True)
+    assert {k: [c.id for c in v] for k, v in again.items()} == {
+        k: [c.id for c in v] for k, v in result.items()
+    }
+    assert counters_now() == counters
+    assert all(e.type == "takeover" for e in all_events(config)[len(after) :])
+
+
+@pytest.mark.parametrize("stage", ["anchor", "stamp"])
+async def test_provider_in_judge_preparation_is_a_failed_batch(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from _fakes.non_agent import FailingJudge
+
+    from swarm_arena._errors import ProviderFailed, _core_error
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise _core_error(ProviderFailed, "anthropic")
+
+    monkeypatch.setattr(FailingJudge, "anchor_count" if stage == "anchor" else "rubric_hash", fail)
+    ref = Ref.of(FailingJudge({"phase": "none"})).model_copy(update={"name": "failed"})
+    await GoalRunner(
+        env.deps, goal_id="g", plan=_plan(rounds=1, judges=[Y_JUDGE, ref]), replanner=None
+    ).run()
+    assert not env.events("judge_error")
+    assert len([e for e in env.events("provider_failed") if "barrier_batch" in e.payload]) == 1
+    assert env.events("decision")
+
+
+@pytest.mark.parametrize("phase", ["barrier", "final", "curator", "planner"])
+async def test_accounting_terminal_never_commits_provider_receipt(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from _fakes.curators import MergeAll
+    from _fakes.non_agent import FailingJudge, FailingPlanner
+
+    from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._errors import ProviderFailed, _core_error, _SignalCategory
+
+    close = GoalRunner._close
+
+    async def fail_close(self: GoalRunner, tranche: Tranche, *, wait: bool = True) -> None:
+        await close(self, tranche, wait=wait)
+        holder = "judges" if phase == "barrier" else phase
+        if tranche._holder.endswith(f"/:{holder}"):
+            raise _core_error(
+                RuntimeError, "stop cleanup timed out", _category=_SignalCategory.TERMINAL
+            )
+
+    monkeypatch.setattr(GoalRunner, "_close", fail_close)
+    if phase == "curator":
+        runner = await _curation_checkpoint(env)
+
+        async def fail(*args: Any, **kwargs: Any) -> Any:
+            raise _core_error(ProviderFailed, "anthropic")
+
+        monkeypatch.setattr(MergeAll, "curate", fail)
+        operation = runner._curate_round(1)
+    else:
+        judge = Ref.of(FailingJudge({"phase": phase})).model_copy(update={"name": "y"})
+        runner = GoalRunner(
+            env.deps,
+            goal_id="g",
+            plan=_plan(rounds=2, judges=[judge]),
+            replanner=FailingPlanner() if phase == "planner" else None,
+        )
+        operation = runner.run()
+    with pytest.raises(RuntimeError, match="stop cleanup timed out"):
+        await operation
+    assert not env.events("provider_failed")
+    assert not env.events("plan_rejected")
+    assert not env.events("no_result")
+
+
+@pytest.mark.parametrize("stage", ["drain", "close"])
+async def test_curator_accounting_failure_prevents_provider_completion(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._engine import goal as goal_module
+    from swarm_arena._errors import ProviderFailed, StorageError, _core_error, _is_core_signal
+
+    runner = await _curation_checkpoint(env)
+    calls: list[str] = []
+
+    async def fail_provider(*args: Any, **kwargs: Any) -> Any:
+        calls.append("curator")
+        raise _core_error(ProviderFailed, "anthropic")
+
+    async def fail_accounting(*args: Any, **kwargs: Any) -> None:
+        raise _core_error(StorageError, "LLM settlement failed: OSError")
+
+    monkeypatch.setattr(MergeAll, "curate", fail_provider)
+    monkeypatch.setattr(
+        goal_module if stage == "drain" else runner,
+        "drain" if stage == "drain" else "_close",
+        fail_accounting,
+    )
+    for _ in range(2):
+        with pytest.raises(StorageError, match="LLM settlement failed: OSError") as caught:
+            await runner._curate_round(1)
+        assert _is_core_signal(caught.value)
+        await env.deps.journal.commit()
+        assert not env.events("provider_failed")
+        assert not env.events("curated")
+        assert env.deps.provider_stops.generations() == {}
+    assert calls == ["curator", "curator"]
+
+
+@pytest.mark.parametrize(
+    ("source", "ranking"), [("tool", "y"), ("1", "y"), ("1", "panel"), ("0", "panel")]
+)
+async def test_llm_judge_usage_overflow_finishes_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, ranking: str
+) -> None:
+    pytest.importorskip("agents")
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._budget.amount import USD_LIMIT
+    from swarm_arena._exec.local import LocalExecutor
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+    from swarm_arena.tool import Usage
+
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            turn = FakeTurn(
+                text=json.dumps(
+                    {
+                        "scores": [
+                            {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                            for i in range(len(rows))
+                        ]
+                    }
+                ),
+                usage=Usage(input_tokens=10**16 if round_ == source else 1),
+            )
+            return await FakeModel([turn]).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    if source == "tool":
+        submit = LocalExecutor.submit
+        inflated: list[bool] = []
+
+        async def overflow(self: LocalExecutor, job: Any) -> Any:
+            output = await submit(self, job)
+            if job.kind == "tool" and not inflated:
+                inflated.append(True)
+                return output.model_copy(
+                    update={"usage": output.usage.model_copy(update={"usd": USD_LIMIT + 1})}
+                )
+            return output
+
+        monkeypatch.setattr(LocalExecutor, "submit", overflow)
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    result = await Swarm(config).run(
+        _plan(rounds=1, judges=[Y_JUDGE, panel], ranking=ranking), run_id="overflow"
+    )
+    events = all_events(config)
+    assert not [e for e in events if e.type == "judge_error"]
+    assert [e for e in events if e.type == "round_closed"]
+    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == (
+        "no passing candidate" if (source, ranking) == ("1", "panel") else "run budget"
+    )
+    assert (Path(config.run_root) / "overflow/goals/g/solution.json").exists()
+    assert bool(result["g"]) is (ranking == "y")
+    assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])
+
+
+@pytest.mark.parametrize("retry", [False, True])
+async def test_graceful_stop_judging_outlives_settlement_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry: bool
+) -> None:
+    pytest.importorskip("agents")
+    import asyncio
+
+    import anyio
+    import litellm  # noqa: TID251 - real provider failure classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._journal.llm_record import _bindings
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    entered = [anyio.Event() for _ in range(3 if retry else 2)]
+    release = [anyio.Event() for _ in entered]
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            metadata = args[2].metadata or {}
+            index = len(calls)
+            calls.append(metadata["round"])
+            entered[index].set()
+            await release[index].wait()
+            if retry and index == 0:
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE_PROVIDER_DIAGNOSTIC", llm_provider="fake", model="scorer"
+                )
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            return await FakeModel(
+                [
+                    FakeTurn(
+                        text=json.dumps(
+                            {
+                                "scores": [
+                                    {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                    for i in range(len(rows))
+                                ]
+                            }
+                        )
+                    )
+                ]
+            ).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    barrier = GoalRunner._barrier
+
+    async def stop_before_barrier(self: GoalRunner, *args: Any, **kwargs: Any) -> bool:
+        self.deps.stops.stop = True
+        return await barrier(self, *args, **kwargs)
+
+    monkeypatch.setattr(GoalRunner, "_barrier", stop_before_barrier)
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    task = asyncio.create_task(
+        Swarm(config).run(
+            _plan(teams=1, rounds=1, judges=[panel], ranking="panel"), run_id="graceful"
+        )
+    )
+
+    def finished(completed: asyncio.Task[Any]) -> None:
+        for event in entered:
+            event.set()
+
+    task.add_done_callback(finished)
+    try:
+        for index, event in enumerate(entered):
+            with anyio.fail_after(10):
+                await event.wait()
+            if task.done():
+                await task
+                break
+            # Hold actual judge work, after proving that the invocation entered.
+            # Each call stays well inside its judge/round/run limits.
+            if index:
+                with anyio.move_on_after(config.settle_timeout_s + 0.5):
+                    await anyio.Event().wait()
+            release[index].set()
+        with anyio.fail_after(10):
+            result = await task
+    finally:
+        for event in release:
+            event.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    events = all_events(config)
+    assert calls == (["1", "0", "0"] if retry else ["1", "0"])
+    assert result["g"]
+    assert [e for e in events if e.type == "goal_finished"]
+    assert not [e for e in events if e.type == "judge_error"]
+    assert (Path(config.run_root) / "graceful/goals/g/solution.json").exists()
+    assert "graceful" not in _bindings
+    if retry:
+        assert len([e for e in events if e.payload.get("barrier_batch", {}).get("retry_of")]) == 1
+
+
+@pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
+async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
+    pytest.importorskip("agents")
+    import litellm  # noqa: TID251 - exercise the real adapter classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMJudge
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    calls: list[str] = []
+
+    class Scorer(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            if recovery == "provider" or round_ != "0":
+                raise litellm.ServiceUnavailableError(
+                    message="PRIVATE_PROVIDER_DIAGNOSTIC", llm_provider="untrusted", model="wrong"
+                )
+            if recovery == "ordinary":
+                raise ValueError("PRIVATE_PROVIDER_DIAGNOSTIC")
+            rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+            return await FakeModel(
+                [
+                    FakeTurn(
+                        text=json.dumps(
+                            {
+                                "scores": [
+                                    {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                    for i in range(len(rows))
+                                ]
+                            }
+                        )
+                    )
+                ]
+            ).get_response(*args, **kwargs)
+
+    Scorer([]).register("scorer")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "scorer": ModelSpec(
+                        model="fake/scorer",
+                        roles=["judge"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000),
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    panel = Ref.of(LLMJudge(LLMJudge.Config(rubric="r", models=["scorer"], anchors=0))).model_copy(
+        update={"name": "panel"}
+    )
+    result = await Swarm(config).run(
+        _plan(rounds=1, judges=[Y_JUDGE, panel], ranking="panel"), run_id="retry"
+    )
+    events = all_events(config)
+    assert calls == (["1", "0", "0"] if recovery == "healthy" else ["1", "0"])
+    assert bool(result["g"]) is (recovery == "healthy")
+    failures = [e for e in events if e.type == "provider_failed"]
+    assert bool([e for e in events if e.type == "judge_error"]) is (recovery == "ordinary")
+    assert not [e for e in events if e.type == "decision"]
+    skipped = next(e for e in failures if e.payload.get("disposition") == "policy_skipped")
+    candidates = {
+        e.payload["candidate"]["id"]
+        for e in events
+        if e.type == "tool_end" and "candidate" in e.payload
+    }
+    ranked_before_skip = {
+        e.payload["score"]["candidate_id"]
+        for e in events
+        if e.type == "score" and e.seq < skipped.seq and e.payload["score"]["judge"] == "panel"
+    }
+    assert candidates
+    assert not ranked_before_skip
+    retries = [e for e in events if e.payload.get("barrier_batch", {}).get("retry_of")]
+    assert len(retries) == 1
+    assert bool([e for e in failures if e.payload.get("transition") == "recovered"]) is (
+        recovery == "healthy"
+    )
+    assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in repr(events)
+    if recovery != "healthy":
+        assert next(e for e in events if e.type == "no_result").payload["reason"] == (
+            "provider_failed" if recovery == "provider" else "no passing candidate"
+        )
+    before = list(calls)
+    await Swarm(config).resume("retry", force=True)
+    assert calls == before
+
+
+@pytest.mark.parametrize("component", ["judge", "final", "planner", "curator"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str, cleanup_failure: bool
+) -> None:
+    pytest.importorskip("agents")
+    import litellm  # noqa: TID251 - exercise the real adapter classification
+    from _fakes.engine import with_executor
+    from _fakes.run import all_events
+
+    from swarm_arena import Limits, Swarm
+    from swarm_arena._errors import StorageError, _core_error
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation
+    from swarm_arena.testing import FakeModel, FakeTurn
+
+    calls: list[str] = []
+    fired: list[str] = []
+    role = "judge" if component == "final" else component
+
+    class Down(FakeModel):
+        async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+            round_ = (args[2].metadata or {})["round"]
+            calls.append(round_)
+            if component == "final" and round_ != "0":
+                rows = json.loads(args[1].split("\n", 1)[1].rsplit("\n", 1)[0])
+                return await FakeModel(
+                    [
+                        FakeTurn(
+                            text=json.dumps(
+                                {
+                                    "scores": [
+                                        {"index": i, "value": 7, "verdict": "ok", "notes": "r"}
+                                        for i in range(len(rows))
+                                    ]
+                                }
+                            )
+                        )
+                    ]
+                ).get_response(*args, **kwargs)
+            raise litellm.ServiceUnavailableError(
+                message="PRIVATE_COMPONENT_FAILURE", llm_provider="untrusted", model="wrong"
+            )
+
+    Down([]).register("down")
+    config = with_executor(
+        RunConfig(
+            models=ModelCatalog(
+                {
+                    "down": ModelSpec(
+                        model="fake/down",
+                        roles=["judge", "planner", "curator"],
+                        max_tokens=1000,
+                        prices=ModelSpec.Prices(input=1, output=2),
+                    )
+                }
+            ),
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=str(tmp_path / "artifacts"),
+            settle_timeout_s=2,
+            limits=Limits(max_tokens=10_000_000, max_usd=1000, max_agents_per_fingerprint=4),
+            curator=Ref.of(LLMCurator(model="down")) if component == "curator" else None,
+        ),
+        workspace_root=str(tmp_path / "ws"),
+    )
+    if cleanup_failure:
+        finish = _invocation._finish_accounting
+
+        async def fail_accounting(scope: Any, *, interrupted: bool) -> None:
+            await finish(scope, interrupted=interrupted)
+            if component != "final" or scope.round == 0:
+                fired.append(scope.role)
+                raise _core_error(StorageError, "settlement storage unavailable")
+
+        monkeypatch.setattr(_invocation, "_finish_accounting", fail_accounting)
+    plan = _plan(teams=3, rounds=2 if role == "planner" else 1)
+    if role == "judge":
+        panel = Ref.of(
+            LLMJudge(LLMJudge.Config(rubric="r", models=["down"], anchors=0))
+        ).model_copy(update={"name": "panel"})
+        plan = plan.model_copy(update={"judges": [Y_JUDGE, panel], "ranking": "panel"})
+    if role == "curator":
+        plan = plan.model_copy(
+            update={
+                "teams": [
+                    team.model_copy(
+                        update={
+                            "agents": [
+                                agent.model_copy(
+                                    update={
+                                        "manager": agent.manager.model_copy(
+                                            update={
+                                                "path": "_fakes.curators:PostingManager",
+                                                "config": {
+                                                    **agent.manager.config,
+                                                    "post_learnings": True,
+                                                },
+                                            }
+                                        )
+                                    }
+                                )
+                                for agent in team.agents
+                            ]
+                        }
+                    )
+                    for team in plan.teams
+                ]
+            }
+        )
+    swarm = Swarm(config, replanner=LLMPlanner("down") if role == "planner" else None)
+    if cleanup_failure:
+        with pytest.raises(Exception, match=r"settlement|TaskGroup") as caught:
+            await swarm.run(plan, run_id="component")
+        pending: list[BaseException] = [caught.value]
+        leaves: list[BaseException] = []
+        while pending:
+            error = pending.pop()
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+            else:
+                leaves.append(error)
+        assert any(isinstance(error, StorageError) for error in leaves)
+        assert fired == [role]
+    else:
+        await swarm.run(plan, run_id="component")
+    events = all_events(config)
+    assert calls
+    failures = [e for e in events if e.type == "provider_failed"]
+    if cleanup_failure:
+        assert not failures
+        assert not [e for e in events if e.type in {"judge_error", "plan_rejected", "curated"}]
+    else:
+        assert failures
+        assert {
+            e.payload["provider"] for e in failures if e.payload.get("variant") == "transition"
+        } == {"fake"}
+        if component == "planner":
+            assert (
+                next(e for e in events if e.type == "plan_rejected").payload["provider"] == "fake"
+            )
+        if component == "curator":
+            assert (
+                next(
+                    e for e in failures if e.payload.get("disposition") == "curator_skipped"
+                ).payload["accounting"]
+                == "settled"
+            )
+    assert "PRIVATE_COMPONENT_FAILURE" not in repr(events)
+
+
+@pytest.mark.parametrize("flag", ["stop", "run_budget", "stop_now", "run_timeout", "join_retry"])
+async def test_paused_ranking_retry_obeys_stop_and_join_boundaries(
+    env: EngineEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    from collections.abc import Sequence
+
+    from _fakes.non_agent import FailingJudge
+
+    from swarm_arena._errors import ProviderFailed
+    from swarm_arena._model.results import Candidate, Score
+    from swarm_arena.scoring import JudgeContext
+
+    judge_call = FailingJudge.judge
+
+    async def recover_at_converge(
+        self: FailingJudge, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        try:
+            return await judge_call(self, goal, candidates, ctx)
+        except ProviderFailed:
+            if ctx.round != 0:
+                raise
+            return [Score(candidate_id=c.id, key=(1.0,)) for c in candidates]
+
+    monkeypatch.setattr(FailingJudge, "judge", recover_at_converge)
+
+    counter = tmp_path / "judge-calls"
+    judge = Ref.of(FailingJudge({"phase": "barrier", "counter": str(counter)})).model_copy(
+        update={"name": "y"}
+    )
+    if flag != "join_retry":
+        env.on_commit("round_closed", lambda ev: _raise_flag(env.deps.stops, flag, goal_id="g"))
+    runner = GoalRunner(
+        env.deps,
+        goal_id="g",
+        plan=_plan(rounds=1, judges=[judge]),
+        replanner=None,
+        state=GoalState(join_retries=int(flag == "join_retry")),
+    )
+    outcome = await runner.run()
+    permitted = flag in {"stop", "run_budget"}
+    assert counter.read_text().splitlines() == (
+        ["1:None:False", "0:None:False", "0:None:True"] if permitted else ["1:None:False"]
+    )
+    assert bool(outcome.finalists) is permitted
+    retries = [e for e in env.events("score") if e.payload.get("barrier_batch", {}).get("retry_of")]
+    assert bool(retries) is permitted
+    if not permitted:
+        assert env.events("no_result")[-1].payload == {"reason": "no passing candidate"}
+
+
+@pytest.mark.parametrize("mode", ["direct", "recorded", "abandoned"])
+async def test_curator_report_wait_only_counts_recorded_calls_once(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from contextlib import contextmanager
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._engine import goal as goal_module
+    from swarm_arena._journal import llm_record as recorder
+
+    runner = await _curation_checkpoint(env)
+    waiting = False
+    allowances: list[float] = []
+    waits: list[int] = []
+    report_scope: anyio.CancelScope | None = None
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal waiting
+        scope = current_llm_scope()
+        assert scope is not None
+        estimate = Amount(usd=0.01)
+        reservation = await scope.tranche.reserve_call(estimate)
+        if mode != "direct":
+            recorder.open_call(
+                scope,
+                reservation_id=reservation,
+                estimate=estimate,
+                model_alias="model",
+                model="fake/model",
+                provider="fake",
+            )
+            entry = recorder._bindings[scope.run_id].pending[reservation]
+            original_wait = entry.event.wait
+
+            async def wait() -> None:
+                waits.append(1)
+                assert report_scope is not None
+                report_scope.cancel()
+                await original_wait()
+
+            class ObservedEvent:
+                async def wait(self) -> None:
+                    await wait()
+
+                def set(self) -> None:
+                    original_event.set()
+
+            original_event = entry.event
+            entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
+            if mode == "abandoned":
+                recorder.abandon_call(scope, reservation)
+        waiting = True
+        raise KeyError("CURATOR_REPORT_SENTINEL")
+
+    @contextmanager
+    def report_timer(seconds: float) -> Any:
+        nonlocal report_scope
+        assert waiting
+        allowances.append(seconds)
+        # Cancel once the recorded report wait actually enters.
+        with anyio.CancelScope() as timer:
+            report_scope = timer
+            yield timer
+
+    monkeypatch.setattr(goal_module, "_report_timer", report_timer)
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    recorder.bind_run(
+        env.deps.run_id,
+        journal=env.deps.journal,
+        ids=env.deps.ids,
+        artifacts=env.deps.artifacts,
+        tracing=env.deps.config.tracing,
+        committed=[],
+        request_sha256={},
+        stops=env.deps.stops,
+        clock=env.deps.clock,
+        limits=env.deps.config.limits,
+        settle_timeout_s=env.deps.config.settle_timeout_s,
+    )
+    try:
+        with anyio.fail_after(5):
+            await runner._curate_round(1)
+    finally:
+        recorder.unbind_run(env.deps.run_id)
+    await env.deps.journal.commit()
+    assert len(env.events("curated")) == 1
+    assert waiting, env.events("curated")[0].payload
+    assert allowances == [env.deps.config.settle_timeout_s]
+    assert waits == ([1] if mode == "recorded" else [])
+    assert len(env.events("llm_call")) == int(mode != "direct")
+    assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
+
+
+@pytest.mark.parametrize("interruption", ["stop_now", "deadline", "lease_loss", "writer_failure"])
+async def test_curator_report_wait_observes_owner_interruptions(
+    env: EngineEnv, monkeypatch: pytest.MonkeyPatch, interruption: str
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.curators import MergeAll
+
+    from swarm_arena._budget.amount import Amount
+    from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._errors import (
+        Fenced,
+        _core_category,
+        _core_error,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena._journal import llm_record as recorder
+
+    runner = await _curation_checkpoint(env)
+    entered = anyio.Event()
+
+    async def curate(*args: Any, **kwargs: Any) -> Any:
+        scope = current_llm_scope()
+        assert scope is not None
+        estimate = Amount(usd=0.01)
+        reservation = await scope.tranche.reserve_call(estimate)
+        recorder.open_call(
+            scope,
+            reservation_id=reservation,
+            estimate=estimate,
+            model_alias="model",
+            model="fake/model",
+            provider="fake",
+        )
+        entry = recorder._bindings[scope.run_id].pending[reservation]
+        original_event = entry.event
+
+        class ObservedEvent:
+            async def wait(self) -> None:
+                entered.set()
+                await original_event.wait()
+
+            def set(self) -> None:
+                original_event.set()
+
+        entry.event = ObservedEvent()  # ty: ignore[invalid-assignment]
+        raise KeyError("CURATOR_REPORT_SENTINEL")
+
+    monkeypatch.setattr(MergeAll, "curate", curate)
+    recorder.bind_run(
+        env.deps.run_id,
+        journal=env.deps.journal,
+        ids=env.deps.ids,
+        artifacts=env.deps.artifacts,
+        tracing=env.deps.config.tracing,
+        committed=[],
+        request_sha256={},
+        stops=env.deps.stops,
+        clock=env.deps.clock,
+        limits=env.deps.config.limits,
+        settle_timeout_s=env.deps.config.settle_timeout_s,
+    )
+    binding = recorder._bindings[env.deps.run_id]
+    writer_check = env.deps.journal._raise_if_fenced
+    task = asyncio.create_task(runner._curate_round(1))
+    try:
+        with anyio.fail_after(5):
+            await entered.wait()
+        if interruption == "stop_now":
+            env.deps.stops.stop_now = env.deps.stops.stop = True
+        elif interruption == "deadline":
+            env.deps.clock._rebase(env.deps.config.limits.run_timeout_s)
+        elif interruption == "lease_loss":
+            binding.terminal = _core_error(Fenced, "run ownership lost")
+        else:
+
+            def failed_writer() -> None:
+                raise _stop_cleanup_error()
+
+            monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", failed_writer)
+        # A report is optional: interruption must shorten its 60 s allowance.
+        with anyio.fail_after(5):
+            if interruption in {"lease_loss", "writer_failure"}:
+                with pytest.raises(
+                    Fenced if interruption == "lease_loss" else RuntimeError
+                ) as caught:
+                    await asyncio.shield(task)
+                assert _core_category(caught.value) is (
+                    _SignalCategory.FENCED
+                    if interruption == "lease_loss"
+                    else _SignalCategory.TERMINAL
+                )
+            else:
+                await asyncio.shield(task)
+                assert binding.cleanup_at < float("inf")
+        if interruption in {"lease_loss", "writer_failure"}:
+            assert not env.events("curated")
+        else:
+            await env.deps.journal.commit()
+            assert runner.reason == (
+                "stop --now" if interruption == "stop_now" else "run_timeout_s"
+            )
+            assert len(env.events("curated")) == 1
+            assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        recorder.unbind_run(env.deps.run_id)
+        monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", writer_check)

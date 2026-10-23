@@ -61,6 +61,34 @@ def _executor() -> Executor:
     return RecordingExecutor()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["component", "executor"])
+async def test_preflight_exit_terminal(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[str] = []
+
+    def fail(*args: Any) -> None:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("preflight", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    executor = Mock(spec=Executor, preflight=fail)
+    plans = [] if site == "executor" else [_plan()]
+    if site == "component":
+        monkeypatch.setattr(preflight, "_run_hook", fail)
+    with pytest.raises(RuntimeError) as caught:
+        await run_preflight(plans, run_config, executor)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert reached == [site]
+
+
 async def test_preflight_once_per_distinct_config() -> None:
     CountingTool.calls = 0
     await run_preflight(

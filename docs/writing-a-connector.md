@@ -122,8 +122,10 @@ The rules:
   interpreter when it is None. A tool is never started with `uv run`.
 - **`collect()` always runs**, also after a timeout or a cancel (after SIGTERM
   and `grace_s`). Return the data you have with `partial=True` then. If
-  `collect()` raises, the run gets status `error` and the traceback goes to the
-  run's stderr log.
+  `collect()` raises an ordinary exception or `SystemExit`, stderr records only
+  `swarm-arena: collect failed: <Type>`, without the exception message or
+  traceback. The run gets status `error`, preserving `timeout` or `cancelled`
+  when already stopped. See the [executor outcome contract](own-files.md).
 
 ### The workspace and `swarm/result.json`
 
@@ -317,7 +319,7 @@ breaks its contract:
   The goal id must equal `candidate.goal_id`, or the kit raises `ValueError`
   before running the check. Omitting `goal` selects the kit's `check` goal,
   which is valid only for candidates with `goal_id="check"`.
-- `check_judge(judge, goal, candidates, *, executor)` judges one batch and
+- `check_judge(judge, goal, candidates, *, executor=None, config=None)` judges one batch and
   returns the stamped scores. Every candidate's `goal_id` must match the
   supplied goal id, or the kit raises `ValueError` before running the judge.
   Each score is validated again in strict mode, as
@@ -407,6 +409,117 @@ instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
 
+### Testing managers and judges offline
+
+Install the optional SDK with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. Importing
+`swarm_arena.testing` itself does not load the SDK; accessing `FakeModel` or
+`FakeTurn` loads it. No API key is needed for scripted calls:
+
+```python
+import asyncio
+
+from agents import Agent, Runner
+from agents import RunConfig as SDKRunConfig
+from swarm_arena.testing import FakeModel, FakeTurn
+
+model = FakeModel([FakeTurn(text="ready")])
+result = asyncio.run(
+    Runner.run(
+        Agent(name="offline", model=model),
+        "Check the connector",
+        run_config=SDKRunConfig(tracing_disabled=True),
+    )
+)
+assert result.final_output == "ready"
+assert model.calls[0]["input"]
+```
+
+For a component that resolves a catalog alias, register the instance and use
+the corresponding `fake/` model in the run configuration:
+
+```python
+import asyncio
+
+from swarm_arena import Goal, RunConfig, ScriptTool
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import AgentsSDKManager
+from swarm_arena.testing import FakeModel, FakeTurn, check_manager
+
+model = FakeModel(
+    [
+        FakeTurn(tool_calls=(("run_tool", {"inputs": {"x": 1}}),)),
+        FakeTurn(text="done"),
+    ]
+)
+model.register("connector")
+config = RunConfig(
+    models=ModelCatalog(
+        {
+            "manager": ModelSpec(
+                model="fake/connector",
+                roles=["manager"],
+                prices=ModelSpec.Prices(input=1.0, output=2.0),
+            ),
+        }
+    )
+)
+reports = asyncio.run(
+    check_manager(
+        AgentsSDKManager(model="manager", parallel_tool_calls=False),
+        goal=Goal(id="g", namespace="offline"),
+        tool=ScriptTool(command=["python", "-c", "print('ready')"]),
+        rounds=1,
+        config=config,
+    )
+)
+assert reports[0].summary == "done"
+assert model.calls[0]["model_settings"].parallel_tool_calls is True
+```
+
+The kit rebuilds a manager with `parallel_tool_calls=True` when its Config
+supports that field. It binds the temporary run before invoking registered run
+setups, and opens a fresh manager scope for each round. A normally returning
+component that leaves LLM calls or reservations pending raises an `AssertionError`
+naming the drain rule. On normal return, the kit also closes the round and
+checks that its settled charge equals the scope's journaled LLM call costs,
+using exact monetary arithmetic. A mismatch fails the same drain rule. If an
+exception or owner interruption is already in flight, that outcome is preserved
+with a value-free drain-rule note. Registered
+terminal controls and genuine caller cancellation propagate. A manager
+candidate linked to a call outside that round's scope fails the
+`requested_by_call` rule. Cleanup settles outstanding reservations before
+closing the owned services. Concurrent helper invocations use separate run
+identities and services.
+
+The offline kit has no engine deadline watcher for in-flight tool runs. If an
+LLM manager's round timer fires during a core tool run, the tool finishes under
+core rules: `round_timeout_s` does not cut the in-flight run in the kit;
+`tool_timeout_s` bounds it.
+
+`check_judge(judge, goal, candidates, config=config)` similarly opens a bound
+judge scope with a funded tranche. Omitting `config` uses `RunConfig()` defaults.
+Judge scripts can return their expected JSON as `FakeTurn.text` with a catalog
+alias authorized for `judge`. Both helpers run registered setups once per run,
+so real LiteLLM components receive the call logger too. A failing setup raises
+`RuntimeError("run setup failed: <Type>")` from either helper, with value-free
+diagnostics. Every metered fake call uses the real recorder, payload storage and reservation settlement;
+the default turn consumes 100 input and 20 output tokens, costing $0.00014
+at the example prices. Direct SDK calls without run metadata only replay turns.
+
+Each scoped conversation (run, goal, team, agent, round, role and candidate)
+has a separate replay queue. An explicit SDK `conversation_id` also separates
+queues; unscoped calls without an ID consume one sequence. Concurrent agents
+therefore do not alternate through one shared script. Tool-call IDs are unique
+within the model, starting with `fake-run_tool-1` for `run_tool`.
+
+Create and register a fresh model for each independent test or run to reset
+history and replace consumed registrations. Registration is process-local;
+test fixtures should restore previous registrations on teardown. Reusing an
+instance under a new scoped run ID starts a new queue but retains `calls`.
+Exhaustion raises `RuntimeError` containing `no turns left`; streaming raises
+`NotImplementedError("FakeModel does not stream")`.
+
 ### Testing a round override
 
 Pass round context explicitly to exercise a later round or replicate. Keep
@@ -493,3 +606,46 @@ The child's overlay retains the accepted parent's edits, with the child's new
 edits taking precedence at the same path. Passing that child as the next base
 parent preserves the chain. Checks and judges supplied with the same goal see
 the same effective files, without a manual overlay merge.
+
+
+### Testing an LLM judge offline
+
+The `llm` extra supplies `LLMJudge`; the conformance kit accepts its real model
+catalog through `config=`. Register a fresh `FakeModel` for each test. This
+example performs no provider request and verifies journaled call links:
+
+```python
+import asyncio
+import json
+
+from swarm_arena import Goal, RunConfig
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import LLMJudge
+from swarm_arena.testing import FakeModel, FakeTurn, check_judge, make_candidate
+from swarm_arena.tool import RunStatus, ToolOutput
+
+
+async def check_offline_judge() -> None:
+    goal = Goal(id="example", namespace="offline")
+    candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=goal)]
+    row = {"index": 0, "value": 7.5, "verdict": "good", "notes": "Meets the rubric"}
+    fake = FakeModel([FakeTurn(text=json.dumps({"scores": [row]}))])
+    fake.register("m")
+    config = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
+        settle_timeout_s=2,
+    )
+    scores = await check_judge(
+        LLMJudge("Correctness from 0 to 10", ["m"]), goal, candidates, config=config
+    )
+    assert scores[0].value == 7.5
+    assert scores[0].llm_call_ids
+
+
+asyncio.run(check_offline_judge())
+```
+
+The kit checks that the judge leaves no reservation pending and that closed
+charges equal journaled LLM costs. A contained terminal control fails the
+conformance check; propagated controls and ordinary judge errors retain their
+existing handling.

@@ -20,8 +20,8 @@
 
 Full offline swarm runs, scripted managers, pruning, convergence, and resumable
 run journals work today, alongside tools, checks, judges, `LocalExecutor`, and the
-`swarm_arena.testing` conformance kit. Model-driven managers arrive with the
-`llm` extra (M3).
+`swarm_arena.testing` conformance kit. Model-driven managers and judge panels are
+available with the `llm` extra.
 
 ## Quickstart
 
@@ -52,12 +52,30 @@ uv sync --all-extras --all-groups
 uv run swarm-arena run --yes examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
 ```
 
+`uv run swarm-arena plan examples/rosenbrock/run.toml examples/rosenbrock/plan.toml` validates and estimates a plan; [LLM and together modes](docs/planning-modes.md#from-the-command-line) generate journal-linked plan files.
+
 Two teams compare gradient descent and random search over at most two rounds.
 The CLI prints an estimate, the run directory, and `done: rosenbrock 2 finalists`.
 Read `<run-dir>/goals/rosenbrock/solution.json` for the ordered results; run data
 stays under `.swarm-arena/`. See [Getting started](docs/getting-started.md) for the
 included source, plan, limits, Python API, and `status`/`stop`/`resume` commands,
 or the [example README](examples/rosenbrock/README.md) for a short walkthrough.
+
+With Anthropic and OpenAI API keys, the [LLM Rosenbrock example](examples/rosenbrock/README.md#with-api-keys)
+uses model-driven managers and an advisory judge panel. Its offline exit tests use
+isolated `FakeModel` conversations and check exact accounting, replay and final funding.
+
+## Optional integrations
+
+Install the optional model adapter dependencies, response-cache backends, or
+Langfuse tracing dependencies as needed (combine extras for both model calls
+and caching or tracing). Until M5's first release, install from the git source:
+
+```sh
+uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"
+```
 
 ## Test one connector
 

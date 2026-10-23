@@ -79,6 +79,87 @@ so a judge can calibrate the batch against earlier evidence. Empty gated-in
 batches skip judging. Anchors remain in the same group and comparison domain;
 they do not authorize cross-part ranking.
 
+## LLM judges
+
+Install the `llm` extra and configure model aliases with the `judge` role.
+`LLMJudge` scores each candidate independently against a fixed rubric and a
+finite scale (0–10 by default). Include concrete score anchors in the rubric:
+
+```python
+from swarm_arena.llm import LLMJudge
+
+judge = LLMJudge(
+    "Correctness: 0 = unusable, 5 = partially correct, 10 = fully correct. "
+    "Explain the score using evidence from the candidate.",
+    ["opus", "gpt", "flash"],
+    "median",
+)
+```
+
+Aliases can refer to different providers. Every panel member scores every batch
+concurrently, at temperature zero. `mean` (the default), `median`, `min` and
+`max` aggregate votes. Repeated aliases retain separate votes and funding terms.
+A member that fails any batch is excluded from the entire invocation; all
+batches use the same surviving panel. A candidate is omitted unless every live
+member gives it a finite value inside the configured scale. If all members
+fail, no candidate receives a score. Budget refusals and core controls propagate;
+they never remove a panel member.
+
+The stable judge prompt includes the rubric and scale followed by the goal's
+description and structured inputs inside an untrusted-content boundary. The
+candidate batch follows in its own untrusted block. Changing the goal's
+description or inputs changes the dispatched prompt and its response-cache key.
+
+Ordinary batches contain at most eight candidates, including up to two earlier
+leaders requested as anchors. Every batch re-scores the anchors, leaving room
+for `batch_size - len(anchors)` other candidates. Configure these with
+`LLMJudge.Config`; `anchors` must be smaller than `batch_size`. Each anchor gets
+one score from the first batch, with later aggregated anchor values appended to
+its notes so drift is visible. Its call links include every batch that held it.
+The final judge scores all finalists in one call per member, regardless of
+`batch_size`. Anchors and the final judge never read the response cache.
+
+All four LLM judge aggregators preserve finite, in-scale votes as finite,
+in-scale scores, including votes near the floating-point limits. Mean and
+the median midpoint use exact-ratio summation before rounding to a float.
+
+An empty or whitespace-only first-stage answer fails that member without
+starting a formatting call. Its first-stage usage remains accounted.
+
+After a panel member reaches a funding limit, the invocation admits no further
+model calls. Already admitted calls finish and settle before the limit propagates.
+
+Each LLM judge invocation drains its own child scope, so multiple LLM judges
+can compose sequentially or recursively while their owner retains all call links.
+
+A missing or out-of-scale anchor row in a later batch adds an `invalid` drift
+note and retains the first score and the later batch's call links. An invalid
+first appearance is not replaced by a later score.
+
+The rubric identity includes the rubric, scale, aggregation and single-model
+alias. A panel identity hashes its sorted aliases, retaining repeats; a reduced
+panel records its surviving aliases, including a single survivor. Core stamping
+and recursive `Lexicographic` composition preserve that identity. Aliases are
+part of the identity: re-point a model under a **new alias** to avoid treating
+its scores as comparable to earlier results.
+
+Models without response-schema support use a free-text call followed by a
+formatting call. The formatter is the cheapest eligible schema-capable alias
+whose input, output and effective cache-write tariffs do not exceed the first
+model's terms. Otherwise the same alias formats with the schema in its prompt.
+The formatting output cap is no larger than either model's catalog cap. Each
+call reserves through `MeteredModel`; there is no second barrier hold for an
+LLM judge. Each returned score links the calls for its batch, including failed
+member attempts. The judge drains its scope before returning, so every link
+has a journaled call or an `estimated:` late-record placeholder.
+
+The final slice holds the **output terms only**; inputs are reserved at call
+time. A judge call whose serialized input (including schema) does not fit the
+remaining budget is refused before any provider call, so the judge never
+overspends through unfunded dispatch. `LLMJudge.judge` raises `BudgetExceeded`
+on that refusal, including a formatting-call refusal. Already incurred spend
+stays settled. Reported actual usage is never capped at the reservation.
+
 ## Pruning policies
 
 Policies consume `RoundState` after a round barrier and return a `Decision` with
@@ -117,8 +198,8 @@ judge remain separate evaluations.
 Team mode runs a converge team, seeded with leaders or `parents_per_part` ranked
 parents from each part. Assigned `AgentContext.seed_parents` are read-only and
 are prepended to explicit tool parents, removing duplicate IDs. A manager's
-`best(part=...)` is restricted to its own group; it does not grant arbitrary
-cross-part leaderboard access. Reads automatically populate later candidates'
+`best(part=...)` reads its own group or a declared sibling group, including
+`part=""` for the main group, and never an undeclared group. Reads automatically populate later candidates'
 `read_ids` provenance.
 
 Partial results require `converge.allow_partial=True`. `distinct=True` skips
@@ -138,8 +219,11 @@ Final judging uses the protected final slice. After an immediate stop or run
 deadline it is bounded by `settle_timeout_s`; if interrupted, only available
 committed ranking evidence can supply a fallback order and judge errors are
 recorded. If final judging fails and supplies no final order, the goal records
-`NO_RESULT` with reason `provider_failed`; judge-error events retain type-only
-diagnostics. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
+`NO_RESULT` with reason `provider_failed`: this reason means the final judges
+produced no order. Ordinary judge errors retain type-only diagnostics and do not
+claim a provider outage. Only a validated provider signal creates a provider
+transition or failed-provider receipt. A refused final reservation instead uses
+reason `reserve_exhausted`. See [stop and resume](limits-and-safety.md#stop-modes-and-resume).
 
 ## No result and solution records
 
@@ -242,3 +326,41 @@ otherwise they use `RunConfig.arena_root`.
 
 Human judge leaderboards compare all fidelities together and order verdict/score
 keys directly, without applying a program judge's `min_improvement` margin.
+
+
+## Provider failures during judging
+
+A validated provider failure produces no score or `judge_error` for the affected
+judge batch. Healthy judges still run, independently for each main-goal or part
+group. If a group's ranking judge fails, its candidates stay unjudged and the
+round skips policy pruning and curation. The engine records that skipped phase,
+closes the round, and publishes its page without inventing a policy decision.
+
+An `LLMJudge` panel drops a failed member across the entire logical call, even
+when the failure occurs in only one batch. Repeated aliases remain separate
+votes and paid members. Survivor scores carry the hash of the sorted remaining
+aliases, including when just one member survives; this is a new judge identity.
+Nested `Lexicographic` judges retain those identities. All-member provider failure
+propagates after accounting; a budget refusal is never a dropped panel member.
+
+For example, a configured panel `["a", "b", "c"]` that loses `"b"` produces
+scores under the identity of `["a", "c"]`, not its configured full-panel hash.
+The failed provider also pauses matching agents in other goals through the shared
+provider service.
+
+Completed failed batches have durable receipts despite producing no scores or
+judge errors. Resume reads those identities before preparing or funding another
+batch. A failed final batch retains its original input membership, lifecycle,
+revision and judge reference; resume completes `NO_RESULT(provider_failed)`
+without selecting again from final scores or repeating the call. A completed
+ranking-policy skip also prevents repeated manager or policy work.
+
+Before initial converge selection, the engine retries each paused ranking batch
+once through normal judge admission and the shared provider service. The judging
+reserve funds this retry under a graceful stop or a run-budget stop; an immediate
+stop or deadline skips it. Durable retry receipts and scores prevent repeat calls
+on resume. Only a validated provider failure in this retry can make an empty
+selection report `provider_failed`; otherwise it reports `no passing candidate`.
+Explicit no-result outcomes from final judging retain their own reasons.
+Batches paused in join-retry rounds are not retried and never determine the
+`provider_failed` selection reason.

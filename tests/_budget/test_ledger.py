@@ -974,6 +974,8 @@ async def test_aggregate_overspend_beyond_amount_range_stays_exact_and_exhausted
 
 
 async def test_usage_overflow_stops_all_goals_and_survives_replay(env: LedgerEnv) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory
+
     await _setup(env)
     reservation = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="call", goal_id="g1")
     late = await env.ledger.reserve("g1/t/b", Amount(usd=1), kind="tool", goal_id="g1")
@@ -999,6 +1001,7 @@ async def test_usage_overflow_stops_all_goals_and_survives_replay(env: LedgerEnv
             with pytest.raises(LimitReached) as exc:
                 await ledger.reserve(holder, Amount(), kind="call", goal_id=goal_id)
             assert exc.value.limit == "usage_overflow"
+            assert _core_category(exc.value) is _SignalCategory.TERMINAL
     assert await env.count("settle") == 1
 
 

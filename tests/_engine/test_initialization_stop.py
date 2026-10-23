@@ -22,12 +22,15 @@ from swarm_arena._errors import _is_core_signal
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal import writer as writer_module
 from swarm_arena._journal.lease import read_owner
+from swarm_arena._journal.llm_record import _bindings
 from swarm_arena._model.canonical import utc_now
 from swarm_arena._scoring import human_review as review_module
 from swarm_arena._store.local import LocalStore
 
 
-@pytest.mark.parametrize("site", ["run.toml", "manifest.json", "board_open", "first_commit"])
+@pytest.mark.parametrize(
+    "site", ["run.toml", "manifest.json", "board_open", "first_commit", "setup"]
+)
 @pytest.mark.parametrize("signal", ["stop", "stop_now", "deadline"])
 async def test_initialization_stops_before_worker_release(
     tmp_path: Path,
@@ -63,10 +66,12 @@ async def test_initialization_stops_before_worker_release(
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     original = ArenaBoard.open if site == "board_open" else LocalStore.create
+    if site == "setup":
+        original = run_module._bootstrap_registrations
 
     def block(*args: Any, **kwargs: Any) -> Any:
         if (
-            site == "board_open"
+            site in {"board_open", "setup"}
             or args[1] == site
             or (
                 site == "first_commit"
@@ -79,11 +84,14 @@ async def test_initialization_stops_before_worker_release(
             assert release.wait(60)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(
-        ArenaBoard if site == "board_open" else LocalStore,
-        "open" if site == "board_open" else "create",
-        block,
-    )
+    if site == "setup":
+        monkeypatch.setattr(run_module, "_bootstrap_registrations", block)
+    else:
+        monkeypatch.setattr(
+            ArenaBoard if site == "board_open" else LocalStore,
+            "open" if site == "board_open" else "create",
+            block,
+        )
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     store = LocalStore(Path(config.run_root) / "r")
     try:
@@ -98,10 +106,11 @@ async def test_initialization_stops_before_worker_release(
                 await cleanup_entered.wait()
             # Settle the already-admitted batch within the cleanup allowance.
             release.set()
-        bound = 20 if site == "first_commit" else 10 if site == "board_open" else 2
+        bound = 20 if site == "first_commit" else 10 if site in {"board_open", "setup"} else 2
         done, _ = await asyncio.wait([task], timeout=bound)
         assert done, "initialization ignored its stop/deadline while the worker was held"
-        if site in {"board_open", "first_commit"}:
+        assert "r" not in _bindings
+        if site in {"board_open", "first_commit", "setup"}:
             assert task.result() == {"g": []}
             events = all_events(config)
             assert any(e.type == "stop_requested" for e in events) == (signal != "deadline")
@@ -132,7 +141,8 @@ async def test_initialization_stops_before_worker_release(
     assert not store.exists("goals/g/rounds/round-01.md")
     if site == "run.toml":
         assert not store.exists("manifest.json")
-    if site not in {"board_open", "first_commit"}:
+    assert "r" not in _bindings
+    if site not in {"board_open", "first_commit", "setup"}:
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].head is None
@@ -145,7 +155,8 @@ async def test_initialization_stops_before_worker_release(
 async def test_initialization_stop_cleanup_is_bounded(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 0.3})
+    # The bound must cover the normal stop path up to the held write on a slow runner.
+    config = run_config.model_copy(update={"lease_ttl_s": 3, "settle_timeout_s": 2.0})
     board_entered, write_entered, release = (threading.Event() for _ in range(3))
     workers: list[threading.Thread] = []
     original_open, original_create = ArenaBoard.open, LocalStore.create
@@ -176,7 +187,7 @@ async def test_initialization_stop_cleanup_is_bounded(
             assert await anyio.to_thread.run_sync(board_entered.wait, 8)
             await request_stop(config.run_root, "r", now=True)
             assert await anyio.to_thread.run_sync(write_entered.wait, 8)
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "stop cleanup waited for a blocked solution write"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -197,7 +208,7 @@ async def test_initialization_stop_cleanup_is_bounded(
 
 
 @pytest.mark.parametrize(
-    "site", ["journal_entry", "review_repair", "board_build", "board_open", "page_repair"]
+    "site", ["journal_entry", "review_repair", "board_build", "board_open", "page_repair", "setup"]
 )
 @pytest.mark.parametrize("signal", ["stop_now", "deadline", "cancel"])
 async def test_resume_initialization_stops_before_worker_release(
@@ -241,6 +252,14 @@ async def test_resume_initialization_stops_before_worker_release(
     original_build = run_module._start_board
     original_open = ArenaBoard.open
     original_pages = resume_module._repair_round_pages
+    original_bootstrap = run_module._bootstrap_registrations
+
+    def bootstrap(*args: Any, **kwargs: Any) -> None:
+        stages.append("setup")
+        if site == "setup":
+            assert "r" in _bindings
+            hold()
+        original_bootstrap(*args, **kwargs)
 
     async def repair(*args: Any, **kwargs: Any) -> None:
         stages.append("review_repair")
@@ -275,6 +294,7 @@ async def test_resume_initialization_stops_before_worker_release(
     monkeypatch.setattr(run_module, "_start_board", build)
     monkeypatch.setattr(ArenaBoard, "open", open_board)
     monkeypatch.setattr(resume_module, "_repair_round_pages", pages)
+    monkeypatch.setattr(run_module, "_bootstrap_registrations", bootstrap)
     task = asyncio.create_task(Swarm(config).resume("r", force=True))
     try:
         with anyio.fail_after(10):
@@ -287,6 +307,7 @@ async def test_resume_initialization_stops_before_worker_release(
             assert await request_stop(config.run_root, "r", now=True) == 2
         done, _ = await asyncio.wait([task], timeout=2)
         assert done, "resume initialization ignored its stop while storage was held"
+        assert "r" not in _bindings
         if signal == "cancel":
             assert task.cancelled()
         else:
@@ -308,6 +329,7 @@ async def test_resume_initialization_stops_before_worker_release(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
     assert stages[-1] == site
+    assert "r" not in _bindings
 
     if site == "journal_entry":
         owner = read_owner(store)

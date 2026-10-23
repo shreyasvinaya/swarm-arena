@@ -21,6 +21,7 @@ from swarm_arena._board.pointers import RunPointer, _validate_namespace, _valida
 from swarm_arena._board.reindex import _reindex_with_diagnostics
 from swarm_arena._board.serve import make_server
 from swarm_arena._board.trace import trace
+from swarm_arena._cli.run_cmds import _interruptible
 from swarm_arena._errors import _core_error
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.reader import read_committed
@@ -136,7 +137,7 @@ def register(sub: argparse._SubParsersAction) -> None:
 def _handle(args: argparse.Namespace) -> int:
     """Enter the asyncio boundary without changing root interrupt handling."""
     try:
-        anyio.run(_execute, args, backend="asyncio")
+        anyio.run(_interruptible, partial(_execute, args), backend="asyncio")
     except KeyboardInterrupt:
         if args.command != "board" or args.action != "serve":
             raise

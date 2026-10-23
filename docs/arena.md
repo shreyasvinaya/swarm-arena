@@ -145,7 +145,8 @@ view's relevance order. These lists cover the whole namespace, including other
 goals and past runs, and exclude hidden learnings. They include IDs and verified
 markers on top learnings, so agents can use `read_learning` for bodies and evidence.
 Board rows and titles sit between `<<from other agents, unverified>>` and
-`<<end of content from other agents>>`.
+`<<end of content from other agents>>`. Marker text inside board content becomes
+`[marker removed]`, so board text cannot close the markers.
 
 The final line counts every visible learning not listed, gives the visible
 count for this goal, and directs agents to `search_learnings`. From round two
@@ -310,14 +311,16 @@ config = RunConfig(curator=Ref(path="my_project.curators:MergeRelated"))
 Curators follow the normal component configuration contract: an empty safe
 configuration by default, or a nested `Config` model. `models()` declares model
 aliases and defaults to `()`. The hook runs inside the curator LLM scope, with
-holder `<goal>/:curator` paid from the reserve. This hook adds no built-in LLM
-curator; `LLMCurator` is planned for the LLM milestone.
+holder `<goal>/:curator` paid from the reserve. The optional `llm` extra provides
+`LLMCurator`, described below.
 
 Proposals must supersede at least one learning from `new` or the visible
 namespace snapshot. Hidden and unknown learnings are refused. The core validates
 content with the production `Learning` rules, assigns IDs and run/goal/round
-metadata, sets `author="curator"`, clears pin/hide and requesting-call metadata,
-and combines evidence in supersedes order without duplicates. A summary is
+metadata, sets `author="curator"`, clears pin/hide flags, and combines evidence
+in supersedes order without duplicates. After draining the invocation, it keeps
+`posted_by_call` only if that call belongs to this invocation; otherwise it uses
+the invocation's final call, or `None` when no call was made. A summary is
 verified when any superseded learning is verified. Evidence-free summaries are
 dropped, including summaries of human learnings that have no evidence.
 
@@ -337,7 +340,9 @@ charged conservatively when the tranche closes.
 
 Cancellation-shaped failures raised by a curator hook also produce a type-only
 error receipt and allow the goal to continue. Real caller cancellation retains
-its cancellation behavior.
+its cancellation behavior. Terminal recording or storage cleanup failures and
+usage overflow propagate without publishing summaries or a successful curation
+receipt; they are never ordinary curator failures.
 
 Synchronous curator hooks run in abandonable daemon threads: the engine abandons
 their waits at stop-now and on timeouts. Async curator hooks run on the engine
@@ -367,6 +372,57 @@ uses the receipt only to prevent repeated curation. Recovery without a receipt
 may retry an eligible nonterminal attempt; terminal recovery performs no new
 paid curation. Curation does not change join-retry or pending-replan state.
 
+
+### LLM curator
+
+Install the optional integration with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`,
+then configure an approved model with the `curator` role:
+
+```python
+from swarm_arena import Limits, Ref, RunConfig
+from swarm_arena.config import ModelCatalog, ModelSpec
+from swarm_arena.llm import LLMCurator
+
+config = RunConfig(
+    limits=Limits(max_tokens=25_000),
+    models=ModelCatalog(
+        {
+            "cur": ModelSpec(
+                model="openai/gpt-4.1-mini",
+                roles=["curator"],
+                max_tokens=1000,
+            ),
+        }
+    ),
+    curator=Ref.of(LLMCurator(model="cur", max_group=8)),
+)
+```
+
+At round end, `LLMCurator` groups the new learnings from the completed round;
+it makes no model call for fewer than two learnings. Calls are paid from the
+reserve and use the shared metered structured-output path. Input learning text
+is wrapped in the shared untrusted-data markers. The supplied board snapshot
+remains fixed.
+
+Each accepted group has two to `max_group` distinct valid indices, with no index
+reused by an earlier accepted group. Titles must be nonempty, single-line and
+at most 120 characters; bodies have a 1,500-character limit. Invalid and
+evidence-free groups are dropped. Malformed structured output fails the
+invocation with a value-free diagnostic. Summaries carry `supersedes`, ordered
+unions of evidence and tags, and are verified if any member is verified.
+
+Each invocation drains its own child scope before returning. Late or absent
+usage reports are bounded by `settle_timeout_s`; absent reports are charged
+conservatively. A two-stage response links the summary to the formatting call
+that supplied its groups. For finalized, non-overflow accounting, the settled
+charge equals the sum of recorded call costs. Terminal overflow or interrupted
+publication retains the core's conservative accounting rules.
+
+The engine assigns the final learning IDs and publishes the summaries and
+curation receipt atomically. Undo a mistaken merge with
+`swarm-arena learnings hide <summary-id> --namespace NS`; add `--config run.toml`
+when using a non-default arena. The source learnings remain intact.
 
 ## Round pages
 
@@ -435,7 +491,7 @@ commands continue to take a local `RUN_DIR`.
 | `learnings pin ID --namespace NS [--author NAME]` | Create one immutable curation object. Unknown namespace-local IDs fail without a write. |
 | `learnings hide ID --namespace NS [--author NAME]` | Create one immutable hide object. Hidden targets remain available to explicit curation actions. |
 | `learnings add --namespace NS --title TITLE --text TEXT [--goal ID] [--tag TAG] [--evidence ID ...] [--author NAME]` | Create one human learning, print its `L-h-` ID, and verify evidence against the refreshed frontier in that namespace. Author defaults to the login name. |
-| `trace CANDIDATE (--namespace NS \| --run ID)` | Print committed plan provenance, run details, checks, scores and learning citations. |
+| `trace CANDIDATE (--namespace NS \| --run ID)` | Print committed plan and LLM provenance, run details, checks, scores and learning citations. |
 | `reindex [--namespace NS ...]` | Rebuild selected disposable caches, print `NS: N runs`, and report cache warnings on stderr. Without namespaces, rebuild existing local caches. |
 
 Leaderboard headers show `namespace/goal[/part]`, judge, and eight-character
@@ -483,6 +539,30 @@ uv run swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN
 uv run swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
 ```
 
+Trace includes the executing revision's planner calls, the manager call recorded
+in `requested_by_call`, the tool run and its internal calls, checks, recorded
+judge calls and scores, then citing learnings and their posting calls. Each call
+appears once and shows its recorded role, model, total tokens and six-decimal USD
+cost. A response-cache hit shows `cache-hit-of=ID` only when an origin was recorded;
+an optional trace URL is printed as text. A recorded call link without a matching
+call record prints `llm ID: not found`. For example:
+
+```text
+llm planner-call planner local/model tokens=120 cost=$0.000140
+llm judge-hit judge local/model tokens=120 cost=$0.000000 cache-hit-of=judge-original
+```
+
+An initial or queued goal's `planning_session` is read from the producing run's
+recorded root, even when the viewer uses another `run_root`. Completed and
+interrupted planning journals are readable provenance; trace never resumes them
+or acquires their lease. The session's committed head is captured at publication,
+with its recorded completion reason when present. An absent or unreadable session
+prints `planning session ID: not found`; an unreadable session leaves other runs
+available. A session capture is reused while its producing run's committed mark
+is unchanged, and is checked again when that mark advances. Later autonomous
+revisions use their own `planner_call_ids` and have no standalone-session link. Recorded plan `base_dir`
+is preserved; viewing a plan does not resolve files or import producer plugins.
+
 ## Board viewer
 
 From the example setup above, serve its namespace locally:
@@ -511,6 +591,31 @@ example, `/?q=viscosity&verified=1&page=2` shows the second page of verified
 matches. Each request uses one published frontier; incoming requests refresh
 it in a background worker at most once every five seconds. Once a generation
 exists, GET requests keep reading it during storage refresh or mutation I/O.
+
+`/run/<run-id>/llm` shows one row per recorded `team/agent`, or `:<role>` for
+calls without an agent. It reports call count, ordinary input tokens, provider
+prompt-cache read/write tokens, prompt-cache hit rate with one decimal percent,
+and response-cache hit count. The rate is
+`cache_read_tokens / (input_tokens + cache_read_tokens + cache_write_tokens)`,
+or `0.0%` when the denominator is zero. Ordinary input tokens exclude cache
+tokens; output tokens do not enter this rate. Failed calls, probes and planning
+calls within the displayed run count even when no candidate links to them.
+Response-cache hits count in calls and response hits, but add no input, cache-read
+or cache-write tokens: the rate measures provider prompt caching, excluding
+replayed cached-response usage. Standalone-session planner calls appear in
+`trace` only; they are not added to the producing run's statistics, and a session
+without an arena pointer has no statistics page. The viewer's selected namespaces
+also restrict which source runs may have a statistics page.
+Calls repeated in several namespace caches count once per source root, run and
+call ID. Candidate pages link to this statistics page.
+
+Trace and statistics use the request's retained published generation, including
+while another thread refreshes the board or closes it. Committed call and plan
+projections are prepared before publication from the existing event cache;
+SQLite schema version 4 is unchanged. Cold reads, warm reads and `reindex` produce
+the same projections. The CLI and viewer need no LLM extra to read these records.
+Existing immutable round pages are never rewritten for late calls or a newer
+frontier.
 
 A learning page shows its text, author, markers, and linked evidence with
 formatted scores or an unknown-candidate error. Candidate pages show a summary,

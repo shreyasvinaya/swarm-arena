@@ -7,10 +7,16 @@ from collections.abc import Sequence
 from functools import partial
 from inspect import isawaitable
 
-from swarm_arena._agent.manager import LimitReached
 from swarm_arena._board.base import BoardView
-from swarm_arena._errors import _exception_type_name, _rebuild_core_signal
+from swarm_arena._budget.llm_scope import current_llm_scope
+from swarm_arena._errors import (
+    StorageError,
+    _exception_type_name,
+    _is_core_control,
+    _is_core_signal,
+)
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.llm_record import drain
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ids import IdGen
@@ -98,11 +104,14 @@ class Curator(Configurable, ABC):
 
 
 def _curator_error(error: BaseException) -> str:
-    """Preserve rebuilt core controls and contain untrusted exception values."""
+    """Preserve validated provider/control signals; return only type diagnostics.
+
+    The owning goal settles the invocation before recording a provider skip.
+    Ordinary hook failures remain component errors without provider authority.
+    """
     error = _classify_outcome(error)
-    safe = _rebuild_core_signal(error)
-    if isinstance(safe, LimitReached):
-        raise safe from None
+    if _is_core_control(error) or (isinstance(error, StorageError) and _is_core_signal(error)):
+        raise error from None
     return f"curator error: {_exception_type_name(error)}"
 
 
@@ -114,6 +123,7 @@ def _normalize_summaries(
     run_id: str,
     goal_id: str,
     round: int,
+    call_ids: tuple[str, ...] = (),
 ) -> tuple[list[Learning], list[str]]:
     """Traverse and detach user objects in a daemon, without mutable services."""
     if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
@@ -151,7 +161,13 @@ def _normalize_summaries(
             verified=any(sources[id][1] for id in supersedes),
             pinned=False,
             hidden=False,
-            posted_by_call=None,
+            posted_by_call=(
+                data.get("posted_by_call")
+                if data.get("posted_by_call") in call_ids
+                else call_ids[-1]
+                if call_ids
+                else None
+            ),
         )
         # Production validators and a JSON round trip leave only core-owned values.
         summary = Learning.model_validate(data)
@@ -171,6 +187,10 @@ async def _prepare_curator(
 ) -> tuple[list[Learning], list[str]]:
     """Run hooks and detach a complete batch; the owning goal supervises this await."""
     outcome = _Outcome()
+    scope = current_llm_scope()
+    previous_calls = (
+        {_context_string(id, "call_id") for id in scope.call_ids} if scope is not None else set()
+    )
     try:
         namespace = _context_string(namespace, "namespace")
         run_id = _context_string(run_id, "run_id")
@@ -193,6 +213,19 @@ async def _prepare_curator(
         result = await run_sync_daemon(lambda: curator.curate(namespace, new, view))
         if isawaitable(result):
             result = await result
+        # The invocation owns all of its calls, including late custom callbacks.
+        # Resolve provenance only after their bounded accounting has completed.
+        if scope is not None:
+            await drain(scope, wait=True)
+        call_ids = (
+            tuple(
+                id
+                for raw in scope.call_ids
+                if (id := _context_string(raw, "call_id")) not in previous_calls
+            )
+            if scope is not None
+            else ()
+        )
         return await run_sync_daemon(
             partial(
                 _normalize_summaries,
@@ -202,6 +235,7 @@ async def _prepare_curator(
                 run_id=run_id,
                 goal_id=goal_id,
                 round=round,
+                call_ids=call_ids,
             )
         )
     except BaseException as error:

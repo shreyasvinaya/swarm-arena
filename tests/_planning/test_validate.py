@@ -1,7 +1,10 @@
 """Exercise plan admission, revision authority, and frozen file boundaries."""
 
+import contextlib
 import sys
+import threading
 import traceback
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,6 +45,96 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._tooling.files import snapshot_plan, snapshot_ref
 from swarm_arena._tooling.tool import effective_tool_ref
+
+
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_safe_call_control_disposition(kind: str, nested: bool) -> None:
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
+
+    def fail() -> None:
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
+        if nested:
+            raise BaseExceptionGroup("admission", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError if kind == "terminal" else PlanError) as caught:
+        validation._safe_call("/refs", fail)
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["configs", "round_refs", "snapshot"])
+def test_planning_conversion_preserves_terminal(
+    artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[str] = []
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("planning", [BaseExceptionGroup("boundary", [error])])
+        raise error
+
+    current = _plan(rounds=1)
+    if site == "configs":
+        monkeypatch.setattr(Ref, "load", fail)
+    elif site == "round_refs":
+        monkeypatch.setattr(
+            validation,
+            "_round_refs",
+            lambda _: iter([("/rounds/0", current.teams[0].agents[0].tool, {})]),
+        )
+        monkeypatch.setattr(validation, "effective_tool_ref", fail)
+    else:
+        monkeypatch.setattr(validation, "snapshot_plan", fail)
+
+    def invoke() -> None:
+        if site == "configs":
+            validation._rule_configs(current, RunConfig(), (), built={})
+        elif site == "round_refs":
+            validation._validate_round_refs(current)
+        else:
+            admit_revision(current, RunConfig(), artifacts)
+
+    with pytest.raises(RuntimeError) as caught:
+        invoke()
+    assert reached == [site]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+def test_admit_revision_preserves_plan_error(
+    artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._errors import _core_error
+
+    error = _core_error(PlanError, ["/snapshot: rejected"])
+    monkeypatch.setattr(validation, "snapshot_plan", Mock(side_effect=error))
+    with pytest.raises(PlanError) as caught:
+        admit_revision(_plan(rounds=1), RunConfig(), artifacts)
+    assert caught.value.errors == error.errors
+
 
 J_A = Ref(path="_fakes.tools:FixedJudge", config={"value": 1}, name="a")
 J_B = Ref(path="_fakes.tools:FixedJudge", config={"value": 2}, name="b")
@@ -229,9 +322,10 @@ def errs(plan: Plan, cfg: RunConfig, **kw: Any) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _clear_model_checks() -> Any:
+    before = validation._MODEL_CHECKS[:]
     validation._MODEL_CHECKS.clear()
     yield
-    validation._MODEL_CHECKS.clear()
+    validation._MODEL_CHECKS[:] = before
 
 
 def test_valid_plan_passes() -> None:
@@ -637,13 +731,13 @@ def test_non_human_part_files_outside_main_manifest_rejected() -> None:
 
 
 def test_all_errors_listed_and_model_check_hook() -> None:
-    register_model_check(lambda plan, cfg: (["model error"], ["model warning"]))
+    register_model_check(lambda uses, cfg: (["model error"], ["model warning"]))
     with pytest.raises(PlanError) as err:
         validate_plan(_plan(teams=5, rationale=" "), RunConfig())
     assert len(err.value.errors) == 3
     assert "model error" in err.value.errors
     validation._MODEL_CHECKS.clear()
-    register_model_check(lambda plan, cfg: ([], ["model warning"]))
+    register_model_check(lambda uses, cfg: ([], ["model warning"]))
     assert validate_plan(_plan(), RunConfig()) == ["model warning"]
 
 
@@ -2112,3 +2206,559 @@ async def test_admitted_default_tool_retains_identity_at_consumers(
     assert warnings == []
     assert overlay == {"work.txt": digest}
     assert stage.root["work.txt"] == digest
+
+
+def _model_plan(alias: str) -> Plan:
+    plan = _plan()
+    plan.teams[0].agents[0] = (
+        plan.teams[0]
+        .agents[0]
+        .model_copy(
+            update={"manager": Ref(path="_fakes.tools:NoopManager", config={"models": [alias]})}
+        )
+    )
+    return plan
+
+
+def test_llm_alias_unknown_or_wrong_role_rejected() -> None:
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    for config in [
+        RunConfig(),
+        RunConfig(models=ModelCatalog({"x": ModelSpec(model="fake/m", roles=["judge"])})),
+    ]:
+        with pytest.raises(PlanError) as error:
+            validate_plan(_model_plan("x"), config)
+        assert any(
+            "alias 'x'" in message and "role 'manager'" in message for message in error.value.errors
+        )
+
+
+def test_max_tokens_required_when_llm_component_used() -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    cfg = RunConfig(
+        limits=Limits(max_tokens=None),
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+    )
+    assert any("max_tokens" in e for e in errs(_model_plan("m"), cfg))
+
+
+def test_unpriced_model_rejected_when_max_usd_set() -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    cfg = RunConfig(
+        limits=Limits(max_usd=1),
+        models=ModelCatalog({"m": ModelSpec(model="fake/unpriced", roles=["manager"])}),
+    )
+    assert any("no known price" in e for e in errs(_model_plan("m"), cfg))
+
+
+def test_check_models_runs_registered_checks_on_a_role_map() -> None:
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    seen = []
+    register_model_check(lambda uses, config: (seen.append(uses) or [], ["warning"]))
+    cfg = RunConfig(
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000}),
+        models=ModelCatalog({"p": ModelSpec(model="fake/p", roles=["planner"])}),
+    )
+    assert check_models({"planner": ["p"]}, cfg) == ([], ["warning"])
+    assert seen == [{"planner": ["p"]}]
+
+
+def test_fresh_process_first_validation_runs_model_checks() -> None:
+    import os
+    import subprocess
+    import sys
+
+    pytest.importorskip("litellm")
+    plan = _model_plan("r1")
+    plan.teams[0].agents[0] = (
+        plan.teams[0]
+        .agents[0]
+        .model_copy(
+            update={
+                "manager": Ref(path="_fakes.llm_components:AliasManager", config={"model": "r1"})
+            }
+        )
+    )
+    script = (
+        "from swarm_arena import Plan, RunConfig, validate_plan\n"
+        "from swarm_arena.config import ModelCatalog, ModelSpec\n"
+        f"plan = Plan.model_validate_json({plan.model_dump_json()!r})\n"
+        "config = RunConfig(models=ModelCatalog({'r1': ModelSpec("
+        "model='deepseek/deepseek-reasoner', roles=['manager'])}))\n"
+        "validate_plan(plan, config)\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    proc = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode != 0
+    assert "function calling" in proc.stderr
+
+
+@pytest.mark.parametrize("site", ["manager", "judge", "nested member of a Lexicographic judge"])
+def test_rejected_ref_is_never_imported_or_built(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    (tmp_path / "evil_mod.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(tmp_path / 'imported')!r}).touch()\n"
+        "class X:\n    def __init__(self):\n"
+        f"        Path({str(tmp_path / 'built')!r}).touch()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    r0 = _plan()
+    rev = r0.model_copy(deep=True)
+    evil = Ref(path="evil_mod:X", name="evil")
+    if site == "manager":
+        rev.teams[0].agents[0] = rev.teams[0].agents[0].model_copy(update={"manager": evil})
+    else:
+        if site != "judge":
+            evil = Ref(
+                path="swarm_arena.scoring:Lexicographic",
+                name="evil",
+                config={"judges": [evil.model_dump(exclude_none=True)]},
+            )
+        rev = rev.model_copy(update={"judges": [*rev.judges, evil]})
+    rev = stamp(rev, origin="autonomous", parent=r0)
+    cfg = RunConfig()
+    if site == "nested member of a Lexicographic judge":
+        cfg = RunConfig(
+            planner_catalog=PlannerCatalog(
+                entries=[
+                    CatalogEntry(
+                        name="panel",
+                        kind="judge",
+                        ref=evil.path,
+                        config=evil.config,
+                        description="Panel",
+                    )
+                ]
+            )
+        )
+    with pytest.raises(PlanError) as error:
+        validate_plan(rev, cfg, history=[r0])
+    assert any("not in the planner catalog" in m for m in error.value.errors)
+    if site == "nested member of a Lexicographic judge":
+        assert any("/config/judges/0" in m for m in error.value.errors)
+    assert not (tmp_path / "imported").exists()
+    assert not (tmp_path / "built").exists()
+    assert "evil_mod" not in sys.modules
+
+
+def test_model_hooks_and_prices_hide_exception_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    from swarm_arena._budget import estimate
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    def fail(*args: object) -> Any:
+        raise RuntimeError(BOUNDARY_SECRET)
+
+    cfg = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000, "max_usd": 1}),
+    )
+    monkeypatch.setattr(estimate, "_price_sources", [fail])
+    register_model_check(fail)
+    errors, warnings = check_models({"manager": ["m"]}, cfg)
+    assert warnings == []
+    assert errors == ["/models: RuntimeError", "/models: RuntimeError"]
+    with pytest.raises(PlanError) as error:
+        validate_plan(_model_plan("m"), cfg)
+    assert_secret_absent(error.value, BOUNDARY_SECRET)
+
+
+def test_model_aliases_and_hook_diagnostics_are_plain_strings() -> None:
+    from swarm_arena._planning.validate import check_models
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    class Strange(str):
+        def __hash__(self) -> int:
+            raise AssertionError("subclass hash ran")
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("subclass comparison ran")
+
+        def __str__(self) -> str:
+            raise AssertionError("subclass str ran")
+
+    register_model_check(lambda uses, config: ([], [Strange("warning")]))
+    cfg = RunConfig(
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager"])}),
+        limits=RunConfig().limits.model_copy(update={"max_tokens": 1000}),
+    )
+    errors, warnings = check_models({"manager": [Strange("m")]}, cfg)
+    assert errors == []
+    assert warnings == ["warning"]
+    assert type(warnings[0]) is str
+
+
+@pytest.mark.parametrize("site", ["manager", "converge", "judge", "part", "nested"])
+def test_model_checks_cover_admitted_roles_without_rebuilding(
+    site: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    current = _model_plan("m")
+    if site == "converge":
+        current = current.model_copy(
+            update={
+                "converge": ConvergeSpec(
+                    mode="team", team=current.teams[0].model_copy(update={"name": "final"})
+                ),
+                "teams": [],
+            }
+        )
+    if site in {"judge", "part", "nested"}:
+        pytest.importorskip("litellm")
+        judge = Ref(path="_fakes.llm_components:AliasJudge", config={"model": "m"}, name="a")
+        if site == "nested":
+            judge = Ref(
+                path="swarm_arena.scoring:Lexicographic",
+                name="a",
+                config={"judges": [judge.model_dump(exclude_none=True)]},
+            )
+        if site == "part":
+            current = current.model_copy(
+                update={
+                    "parts": [
+                        PartSpec(
+                            name="p",
+                            goal=Goal(id="p", namespace="demo", files=FileSet(manifest={})),
+                            judges=[judge],
+                            ranking="a",
+                        )
+                    ]
+                }
+            )
+            current.teams[0] = current.teams[0].model_copy(update={"part": "p"})
+            current = current.model_copy(
+                update={
+                    "converge": ConvergeSpec(
+                        mode="team", team=TeamSpec(name="final", rationale="Join", agents=[])
+                    )
+                }
+            )
+        else:
+            current = current.model_copy(update={"judges": [judge]})
+        current.teams[0].agents[0] = (
+            current.teams[0].agents[0].model_copy(update={"manager": MANAGER})
+        )
+    built_managers = 0
+    original = Ref.build
+
+    def build(self: Ref, base: type[Any]) -> Any:
+        nonlocal built_managers
+        if base is Manager:
+            built_managers += 1
+        return original(self, base)
+
+    monkeypatch.setattr(Ref, "build", build)
+    seen = []
+    register_model_check(lambda uses, config: (seen.append(uses) or [], []))
+    cfg = RunConfig(
+        limits=Limits(max_tokens=10000),
+        models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["manager", "judge"])}),
+    )
+    assert validate_plan(current, cfg) == []
+    role = "manager" if site in {"manager", "converge"} else "judge"
+    assert seen[0][role] == ["m"]
+    assert built_managers == 1
+
+
+def test_instructions_do_not_change_the_fingerprint() -> None:
+    pytest.importorskip("agents")
+    from swarm_arena import Limits
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    original = _plan(agents_per_team=3, same_tool=True)
+    agents = [
+        spec.model_copy(
+            update={
+                "manager": Ref(
+                    path="swarm_arena.llm:AgentsSDKManager",
+                    config={"model": "opus", "instructions": instructions},
+                )
+            }
+        )
+        for spec, instructions in zip(original.teams[0].agents, ("a", "b", "c"), strict=True)
+    ]
+    plan = original.model_copy(
+        update={"teams": [original.teams[0].model_copy(update={"agents": agents})]}
+    )
+    cfg = RunConfig(
+        models=ModelCatalog({"opus": ModelSpec(model="fake/opus", roles=["manager"])}),
+        limits=Limits(max_agents_per_fingerprint=2, max_tokens=100_000),
+    )
+    two_agents = plan.model_copy(
+        update={"teams": [plan.teams[0].model_copy(update={"agents": agents[:2]})]}
+    )
+    assert validate_plan(two_agents, cfg) == []
+    with pytest.raises(PlanError, match="max_agents_per_fingerprint"):
+        validate_plan(plan, cfg)
+
+
+async def test_draft_admission_uses_explicit_base_dir_and_keeps_provenance(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._engine.run import mark_planning_session
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/run.py").write_text("print('source')")
+    original = _plan(tool=CATALOG_TOOL, judges=[J_B], ranking="b", base_dir=tmp_path)
+    original = original.model_copy(
+        update={"goal": original.goal.model_copy(update={"files": FileSet(globs=["problem/*"])})}
+    )
+    path = tmp_path / "plan.toml"
+    path.write_text(original.dumps())
+    loaded = Plan.load(path)
+    assert Path.cwd() != loaded.base_dir
+    current, _ = admit_revision(loaded, CFG_WITH_CATALOG, artifacts)
+    frozen_goal = await _freeze_draft_goal(
+        loaded.goal, base_dir=loaded.base_dir, artifacts=artifacts
+    )
+    proposed = mark_planning_session(current, Mock(run_id="r-p", call_ids=["llm-1"]))
+    admitted = await _admit_draft(
+        proposed,
+        CFG_WITH_CATALOG,
+        artifacts,
+        frozen_goal=frozen_goal,
+        base_dir=loaded.base_dir,
+        history=[current],
+        origin="autonomous",
+    )
+    assert admitted.goal.key() == current.goal.key()
+    assert admitted.base_dir == loaded.base_dir
+    assert admitted.planning_session == "r-p"
+    assert admitted.planner_call_ids == ("llm-1",)
+    assert (admitted.origin, admitted.revision, admitted.parent_revision) == ("autonomous", 1, 0)
+
+
+@pytest.mark.parametrize("change", ["inputs", "files", "mutate-inputs"])
+async def test_initial_draft_cannot_replace_frozen_human_goal(
+    tmp_path: Path, artifacts: ArtifactStore, change: str
+) -> None:
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    goal = Goal(id="g", namespace="demo", inputs={"value": "original"})
+    frozen = await _freeze_draft_goal(goal, base_dir=tmp_path, artifacts=artifacts)
+    if change == "mutate-inputs":
+        goal.inputs["value"] = "secret-sentinel"
+        altered = goal
+    elif change == "inputs":
+        altered = goal.model_copy(update={"inputs": {"value": "secret-sentinel"}})
+    else:
+        altered = goal.model_copy(update={"files": FileSet(manifest={"problem/data": "a" * 64})})
+    proposed = _plan().model_copy(update={"goal": altered, "origin": "human"})
+    with pytest.raises(PlanError, match="frozen main goal") as caught:
+        await _admit_draft(
+            proposed, CFG_WITH_CATALOG, artifacts, frozen_goal=frozen, base_dir=tmp_path
+        )
+    assert_secret_absent(caught.value, "secret-sentinel")
+
+
+async def test_initial_draft_cannot_claim_human_catalog_authority(
+    tmp_path: Path, artifacts: ArtifactStore
+) -> None:
+    from swarm_arena._planning.validate import _admit_draft, _freeze_draft_goal
+
+    proposed = _plan(tool=Ref(path="_fakes.import_canary:Tool"))
+    sys.modules.pop("_fakes.import_canary", None)
+    frozen = await _freeze_draft_goal(proposed.goal, base_dir=tmp_path, artifacts=artifacts)
+    with pytest.raises(PlanError, match="catalog"):
+        await _admit_draft(proposed, RunConfig(), artifacts, frozen_goal=frozen, base_dir=tmp_path)
+    assert "_fakes.import_canary" not in sys.modules
+
+
+async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_spool_closed: threading.Event,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    (tmp_path / "problem").mkdir()
+    (tmp_path / "problem/a").write_text("a")
+    (tmp_path / "problem/b").write_text("b")
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    held = HeldOperation()
+    uploaded: list[bytes] = []
+    original = artifacts.put_bytes
+
+    def put(data: bytes) -> str:
+        uploaded.append(data)
+        held.wait()
+        return original(data)
+
+    monkeypatch.setattr(artifacts, "put_bytes", put)
+    task = asyncio.create_task(
+        _freeze_draft_goal(
+            Goal(id="g", namespace="n", files=FileSet(globs=["problem/*"])),
+            base_dir=tmp_path,
+            artifacts=artifacts,
+        )
+    )
+    try:
+        await held.ready()
+        task.cancel()
+        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            await task
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        await held.finish()
+        assert len(uploaded) == 1
+    finally:
+        await held.finish()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+
+@pytest.mark.parametrize("count", [4, 24])
+async def test_draft_snapshot_retains_only_one_file_at_first_upload(
+    tmp_path: Path, count: int
+) -> None:
+    import gc
+    import tracemalloc
+
+    from swarm_arena._model.canonical import sha256_hex
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    size = 1024 * 1024
+    for index in range(count):
+        (tmp_path / str(index)).write_bytes(bytes([index]) * size)
+
+    class Sink(ArtifactStore):
+        def __init__(self) -> None:
+            self.live: list[int] = []
+
+        def put_bytes(self, data: bytes) -> str:
+            self.live.append(tracemalloc.get_traced_memory()[0])
+            return sha256_hex(data)
+
+    sink = Sink()
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = await _freeze_draft_goal(
+            Goal(id="g", namespace="n", files=FileSet(globs=["*"])),
+            base_dir=tmp_path,
+            artifacts=sink,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(result.files.manifest) == len(sink.live) == count
+    assert sink.live[0] < 3 * size
+    assert peak < 5 * size
+
+
+async def test_draft_snapshot_uploads_frozen_bytes_once_per_digest(tmp_path: Path) -> None:
+    from swarm_arena._model.canonical import sha256_hex
+    from swarm_arena._planning.validate import _freeze_draft_goal
+
+    (tmp_path / "a").write_bytes(b"first")
+    (tmp_path / "b").write_bytes(b"second")
+    (tmp_path / "c").write_bytes(b"first")
+
+    class Sink(ArtifactStore):
+        def __init__(self) -> None:
+            self.uploaded: list[bytes] = []
+
+        def put_bytes(self, data: bytes) -> str:
+            if not self.uploaded:
+                (tmp_path / "b").write_bytes(b"changed after snapshot")
+            self.uploaded.append(data)
+            return sha256_hex(data)
+
+    sink = Sink()
+    result = await _freeze_draft_goal(
+        Goal(id="g", namespace="n", files=FileSet(globs=["*"])), base_dir=tmp_path, artifacts=sink
+    )
+    assert sink.uploaded == [b"first", b"second"]
+    assert result.files.manifest == {
+        "a": sha256_hex(b"first"),
+        "b": sha256_hex(b"second"),
+        "c": sha256_hex(b"first"),
+    }
+
+
+@pytest.fixture
+def draft_spool_closed(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    from swarm_arena._planning import validate
+
+    original = validate.TemporaryFile
+    closed = threading.Event()
+
+    @contextlib.contextmanager
+    def tracked() -> Generator[Any]:
+        try:
+            with original() as spool:
+                yield spool
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(validate, "TemporaryFile", tracked)
+    return closed
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
+    tmp_path: Path,
+    draft_spool_closed: threading.Event,
+    cancel: bool,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.llm_run import HeldOperation
+
+    from swarm_arena._planning.validate import _draft_work
+
+    held = HeldOperation()
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        staging.put_bytes(b"snapshot")
+        if cancel:
+            held.wait()
+            return Goal(id="g", namespace="n")
+        raise ValueError("secret-sentinel")
+
+    task = asyncio.create_task(_draft_work(prepare, artifacts))
+    try:
+        if cancel:
+            await held.ready()
+            task.cancel()
+            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+                await task
+            await held.finish()
+        else:
+            with pytest.raises(ValueError, match="draft admission failed") as caught:
+                await task
+            assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+    finally:
+        if cancel:
+            await held.finish()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

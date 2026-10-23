@@ -3,6 +3,7 @@ from dataclasses import replace
 from doctest import SKIP, DocTestParser, DocTestRunner
 from threading import get_ident
 from typing import Any, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
@@ -17,7 +18,14 @@ from swarm_arena._board.base import BoardView
 from swarm_arena._board.learnings import LEARNING_GUIDE
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.llm_scope import requesting_call
-from swarm_arena._errors import SoftError, _core_error
+from swarm_arena._errors import (
+    SoftError,
+    _core_category,
+    _core_error,
+    _is_core_control,
+    _is_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -26,7 +34,7 @@ from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena.board import Candidate, Learning, Row
 from swarm_arena.executor import Job
 from swarm_arena.manager import LimitReached
-from swarm_arena.tool import Action, Estimate, ToolOutput, ToolRequest
+from swarm_arena.tool import Action, Estimate, RunStatus, ToolOutput, ToolRequest
 
 SECRET = "secret-context-value-9x"
 
@@ -108,6 +116,51 @@ async def test_board_reads_capped(ctx_env: CtxEnv) -> None:
         ctx.search_learnings(str(i))
     with pytest.raises(SoftError, match="max_board_reads_per_round"):
         ctx.read_learning("L-x")
+
+
+@pytest.mark.parametrize("max_reads", [0, 10])
+async def test_missing_candidate_lookup_does_not_charge_reads(
+    ctx_env: CtxEnv, max_reads: int
+) -> None:
+    ctx = ctx_env.ctx(limits=Limits(max_board_reads_per_round=max_reads))
+    with pytest.raises(SoftError, match="unknown candidate: missing"):
+        ctx.get_candidate("missing")
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (0, 0)
+    assert ctx_env.events("agent_counters") == []
+
+
+async def test_missing_candidate_still_checks_live_admission(ctx_env: CtxEnv) -> None:
+    ctx = ctx_env.ctx(gate=lambda: _core_error(LimitReached, "stop", "the round is stopping"))
+    with pytest.raises(LimitReached) as caught:
+        ctx.get_candidate("missing")
+    assert caught.value.limit == "stop"
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (0, 0)
+
+
+@pytest.mark.parametrize("kind", ["turn", "watchdog", "both"])
+async def test_missing_candidate_still_checks_latched_limits(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    ctx = ctx_env.ctx()
+    rt = ctx_env.rt
+    if kind in {"turn", "both"}:
+        rt.counters.turns = rt.limits.max_turns_per_round
+    if kind in {"watchdog", "both"}:
+        for _ in range(rt.limits.max_consecutive_failures):
+            rt.watchdog.record_run(RunStatus.ERROR, passed=False)
+        assert rt.watchdog.limit == "max_consecutive_failures"
+    lookup = Mock(wraps=rt.view.get_candidate)
+    monkeypatch.setattr(rt.view, "get_candidate", lookup)
+    turns = rt.counters.turns
+    with pytest.raises(LimitReached) as caught:
+        ctx.get_candidate("missing")
+    assert caught.value.limit == (
+        "max_turns_per_round" if kind == "turn" else "max_consecutive_failures"
+    )
+    assert _is_core_control(caught.value)
+    assert (rt.counters.turns, rt.counters.board_reads) == (turns, 0)
+    assert ctx_env.events("agent_counters") == []
+    lookup.assert_not_called()
 
 
 async def test_learning_rules(ctx_env: CtxEnv) -> None:
@@ -246,7 +299,7 @@ async def test_extra_action_counts_as_board_read(ctx_env: CtxEnv) -> None:
     ctx = await ctx_env.script_ctx()
     assert await ctx.call_action("list_files", {}) == {
         "files": ["problem/a.phyk", "problem/run.py"]
-    }  # M1a Task 19 shape
+    }
     assert ctx_env.counters.board_reads == 1
     with pytest.raises(SoftError):
         await ctx.call_action("nope", {})
@@ -283,6 +336,49 @@ async def test_gate_blocks_new_actions(ctx_env: CtxEnv) -> None:
     with pytest.raises(LimitReached) as err:
         await ctx.run_tool({"x": 1.0})
     assert err.value.limit == "stop"
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+@pytest.mark.parametrize("limit", [*Limits.model_fields, "budget", "stop"])
+async def test_context_accepts_only_ordinary_limit_authority(
+    ctx_env: CtxEnv, source: str, limit: str
+) -> None:
+    ctx_env.ctx()
+    blocked = LimitReached(limit, "stopping")
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+        ctx_env.rt.watchdog.reason = "stopping"
+    ctx = AgentContext(ctx_env.rt, gate=lambda: blocked if source == "gate" else None)
+    with pytest.raises(LimitReached, match=r"^stopping$") as error:
+        ctx.search_learnings("x")
+    assert error.value is not blocked
+    assert error.value.limit == limit
+    assert _core_category(error.value) is _SignalCategory.LIMIT
+    assert _is_core_control(error.value)
+    assert ctx_env.counters.turns == 0
+    assert ctx_env.events("agent_counters") == []
+
+
+@pytest.mark.parametrize("source", ["gate", "watchdog"])
+@pytest.mark.parametrize("limit", ["usage_overflow", SECRET, ""])
+async def test_context_rejects_unknown_limits_without_terminal_authority(
+    ctx_env: CtxEnv, source: str, limit: str
+) -> None:
+    ctx_env.ctx()
+    if source == "watchdog":
+        ctx_env.rt.watchdog.limit = limit
+        ctx_env.rt.watchdog.reason = SECRET
+    ctx = AgentContext(
+        ctx_env.rt, gate=lambda: LimitReached(limit, SECRET) if source == "gate" else None
+    )
+    with pytest.raises(ValueError, match=r"^invalid agent limit$") as error:
+        await ctx.save_notes("x")
+    assert _is_core_signal(error.value)
+    assert _core_category(error.value) is _SignalCategory.DIAGNOSTIC
+    assert not _is_core_control(error.value)
+    assert_secret_absent(error.value, SECRET, sanitized=True)
+    assert ctx_env.counters.turns == 0
+    assert ctx_env.events("agent_counters") == []
 
 
 async def test_actions_journal_counters(ctx_env: CtxEnv) -> None:
@@ -603,8 +699,9 @@ async def test_all_actions_obey_gate_and_watchdog(ctx_env: CtxEnv) -> None:
     assert error.value.limit == "max_consecutive_failures"
 
 
+@pytest.mark.parametrize("max_turns", [1, 20])
 async def test_worker_nested_reads_use_loop_and_charge_once(
-    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch, max_turns: int
 ) -> None:
     view = await _snapshot(ctx_env, candidates=(_candidate(),))
     owner = get_ident()
@@ -616,7 +713,7 @@ async def test_worker_nested_reads_use_loop_and_charge_once(
         return get(id)
 
     monkeypatch.setattr(view, "get_candidate", lookup)
-    ctx = ctx_env.ctx(view=view)
+    ctx = ctx_env.ctx(view=view, limits=Limits(max_turns_per_round=max_turns))
 
     def worker(context: AgentContext) -> JsonValue:
         assert get_ident() != owner
@@ -641,8 +738,14 @@ async def test_worker_nested_reads_use_loop_and_charge_once(
     assert threads == [owner, owner]
     assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
     assert len(ctx_env.events("agent_counters")) == 1
-    ctx.get_candidate("c-old")
-    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 2)
+    if max_turns == 1:
+        with pytest.raises(LimitReached) as caught:
+            ctx.get_candidate("c-old")
+        assert caught.value.limit == "max_turns_per_round"
+        assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 1)
+    else:
+        ctx.get_candidate("c-old")
+        assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 2)
 
 
 async def test_simultaneous_contexts_and_cancellation_keep_charges_independent(
@@ -1061,9 +1164,9 @@ async def test_action_connector_control_errors_are_sanitized(
     assert not getattr(caught.value, "__notes__", ())
 
 
-@pytest.mark.parametrize("control", ["soft", "limit", "gate", "watchdog", "fenced"])
+@pytest.mark.parametrize("control", ["soft", "limit", "gate", "watchdog", "fenced", "cleanup"])
 async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: str) -> None:
-    from swarm_arena._errors import Fenced
+    from swarm_arena._errors import Fenced, _is_core_control, _stop_cleanup_error
 
     blocked = False
     ctx = ctx_env.ctx(gate=lambda: LimitReached("stop", "stopping") if blocked else None)
@@ -1074,6 +1177,8 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
             return context.get_candidate("c-absent").id
         if control == "fenced":
             raise _core_error(Fenced, "run ownership lost")
+        if control == "cleanup":
+            raise _stop_cleanup_error()
         if control == "gate":
             blocked = True
         else:
@@ -1083,11 +1188,18 @@ async def test_action_preserves_core_control_signals(ctx_env: CtxEnv, control: s
         return None
 
     ctx.actions = (Action(name="core", description="Core", input_model=EmptyArgs, handler=handler),)
-    expected = Fenced if control == "fenced" else SoftError if control == "soft" else LimitReached
+    expected = {
+        "fenced": Fenced,
+        "soft": SoftError,
+        "cleanup": RuntimeError,
+    }.get(control, LimitReached)
     with pytest.raises(expected) as caught:
         await ctx.call_action("core", {})
     if control == "soft":
         assert str(caught.value) == "unknown candidate: c-absent"
+    elif control == "cleanup":
+        assert _is_core_control(caught.value)
+        assert str(caught.value) == "stop cleanup timed out"
     elif isinstance(caught.value, LimitReached):
         assert caught.value.limit == ("stop" if control == "gate" else "max_consecutive_failures")
 
@@ -1205,3 +1317,179 @@ async def test_best_reads_declared_fixed_siblings_and_preserves_permissions(
         ctx_env, scores=(Score(id="later", candidate_id="part", judge="part-rank", key=(9.0,)),)
     )
     assert ctx.best(1, part="p")[0].key == (3.0,)
+
+
+@pytest.mark.parametrize("provider_first", [True, False])
+async def test_provider_stop_cannot_become_action_timeout(
+    ctx_env: CtxEnv, provider_first: bool
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight, _local_timer_scope
+    from swarm_arena._agent.tool_run import Inflight
+    from swarm_arena._errors import ProviderFailed
+
+    ctx = ctx_env.ctx()
+    owned = _ActionInflight(Inflight())
+    outer_scope, manager_scope, action_scope = (anyio.CancelScope() for _ in range(3))
+    with (
+        _local_timer_scope(outer_scope) as outer,
+        _local_timer_scope(manager_scope, relay_provider_stop=True) as manager,
+        _local_timer_scope(action_scope) as action,
+    ):
+        if provider_first:
+            outer.stop_provider(_core_error(ProviderFailed, "openai"))
+        owned.stop(action_scope, cancel=True)
+        if not provider_first:
+            outer.stop_provider(_core_error(ProviderFailed, "openai"))
+        assert manager_scope.cancel_called
+        assert not outer_scope.cancel_called
+        assert manager.failure is not None
+        assert _core_category(manager.failure) is _SignalCategory.PROVIDER
+        assert not owned.is_timeout_refusal(
+            _core_error(LimitReached, "stop", "action stopped"), action, ctx
+        )
+    assert outer.provider_child is None
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal"])
+async def test_provider_timer_preserves_stronger_control(control: str) -> None:
+    from swarm_arena._agent.context import _local_timer_scope
+    from swarm_arena._errors import Fenced, ProviderFailed
+
+    error = (
+        _core_error(Fenced, "run ownership lost")
+        if control == "fenced"
+        else _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL)
+    )
+    with _local_timer_scope(anyio.CancelScope()) as timer:
+        timer.stop_provider(_core_error(ProviderFailed, "openai"))
+        timer.record(error)
+        timer.stop_provider(_core_error(ProviderFailed, "openai"))
+        assert timer.failure is not None
+        assert _core_category(timer.failure) is (
+            _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+        )
+
+
+@pytest.mark.parametrize("closed_registry", ["parent", "action"])
+@pytest.mark.parametrize("limit", ["budget", "run_timeout_s", "stop"])
+async def test_run_tool_preserves_live_gate_after_registry_closes(
+    ctx_env: CtxEnv, closed_registry: str, limit: str
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+    from swarm_arena._engine.stops import StopState
+
+    state = StopState()
+    parent = Inflight()
+    owned = _ActionInflight(parent)
+    ctx = ctx_env.ctx(gate=state.gate_for(ctx_env.rt.goal_id))
+    if limit == "budget":
+        state.goal_budget.add(ctx_env.rt.goal_id)
+    elif limit == "run_timeout_s":
+        state.run_timeout = True
+    else:
+        state.stop = True
+    (parent if closed_registry == "parent" else owned).close()
+
+    with (
+        anyio.fail_after(2),
+        track_inflight(owned),
+        pytest.raises(LimitReached) as caught,
+    ):
+        await ctx.run_tool({"x": 1.0})
+    assert caught.value.limit == limit
+    assert _is_core_signal(caught.value)
+    assert ctx_env.counters.turns == ctx_env.counters.tool_runs == 0
+    assert not ctx_env.events("reserve")
+    assert not ctx_env.events("tool_start")
+
+
+@pytest.mark.parametrize("closed_registry", ["parent", "action"])
+@pytest.mark.parametrize("exhausted", [False, True], ids=["fresh", "at-turn-limit"])
+async def test_closed_registry_refusal_does_not_charge(
+    ctx_env: CtxEnv, closed_registry: str, exhausted: bool
+) -> None:
+    from swarm_arena._agent.context import _ActionInflight
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+
+    parent = Inflight()
+    owned = _ActionInflight(parent)
+    ctx = ctx_env.ctx(gate=lambda: None)
+    if exhausted:
+        ctx_env.counters.turns = ctx_env.rt.limits.max_turns_per_round
+    turns_before = ctx_env.counters.turns
+    (parent if closed_registry == "parent" else owned).close()
+    counters_before = len(ctx_env.events("agent_counters"))
+    with track_inflight(owned), pytest.raises(LimitReached) as caught:
+        await ctx.run_tool({"x": 1.0})
+    assert caught.value.limit == "stop"
+    assert _core_category(caught.value) is _SignalCategory.LIMIT
+    assert _is_core_signal(caught.value)
+    await ctx_env.rt.journal.commit()
+    assert (
+        ctx_env.counters.turns - turns_before,
+        len(ctx_env.events("agent_counters")) - counters_before,
+    ) == (
+        0,
+        0,
+    )
+    assert ctx_env.counters.tool_runs == 0
+    assert not ctx_env.events("reserve")
+    assert not ctx_env.events("tool_start")
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_owned_action_inherits_engine_provider_deadline(expired: bool) -> None:
+    from swarm_arena._agent.context import (
+        _ActionInflight,
+        _check_provider_admission,
+        _provider_round_deadline,
+    )
+    from swarm_arena._agent.tool_run import Inflight, track_inflight
+
+    deadline = anyio.current_time() + (-1 if expired else 60)
+    slot = _ActionInflight(Inflight(), round_deadline=deadline)
+    action = _ActionInflight(slot)
+    with track_inflight(action):
+        assert _provider_round_deadline() == deadline
+        if not expired:
+            _check_provider_admission()
+            slot.close()
+        with pytest.raises(LimitReached) as caught:
+            _check_provider_admission()
+        assert caught.value.limit == ("round_timeout_s" if expired else "stop")
+
+
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_prepare_metadata_control_disposition(kind: str, nested: bool) -> None:
+    from unittest.mock import Mock
+
+    from swarm_arena._agent.context import _prepare_metadata
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
+
+    def fail() -> None:
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
+        if nested:
+            raise BaseExceptionGroup("metadata", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError if kind == "terminal" else SoftError) as caught:
+        _prepare_metadata(Mock(get_description=fail), [])
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )

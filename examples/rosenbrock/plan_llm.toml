@@ -1,0 +1,46 @@
+checks = [{path = "rosen:BoundsCheck"}]
+judges = [
+  {name = "f", path = "swarm_arena:ProgramJudge", config = {function = "rosen:score"}},
+  {name = "llm", path = "swarm_arena.llm:LLMJudge", config = {rubric = "Prefer smaller finite Rosenbrock objective f; explain the quality of each result.", models = ["gpt", "haiku"]}},
+]
+ranking = "f"
+policy = {path = "swarm_arena:SuccessiveHalving", config = {keep = 0.5}}
+converge = {mode = "select", top_n = 2}
+
+[goal]
+id = "rosenbrock"
+namespace = "toy"
+
+[[teams]]
+name = "descent"
+rationale = "Follow local gradients from different starting points."
+
+[[teams.agents]]
+name = "gd-1"
+rationale = "Explore the valley from a negative starting coordinate."
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:gradient_descent"}}
+manager = {path = "swarm_arena.llm:AgentsSDKManager", config = {model = "opus"}}
+
+[[teams.agents]]
+name = "gd-2"
+rationale = "Explore the valley from a positive starting coordinate."
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:gradient_descent"}}
+manager = {path = "swarm_arena.llm:AgentsSDKManager", config = {model = "opus"}}
+
+[[teams]]
+name = "random"
+rationale = "Sample broadly without depending on a local gradient."
+
+[[teams.agents]]
+name = "rs-1"
+rationale = "Try repeated searches with the first reproducible seed."
+replicates = 2
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:random_search", deterministic = false}}
+manager = {path = "swarm_arena.llm:AgentsSDKManager", config = {model = "sonnet"}}
+
+[[teams.agents]]
+name = "rs-2"
+rationale = "Try repeated searches with a different reproducible seed."
+replicates = 2
+tool = {path = "swarm_arena:FunctionTool", config = {function = "rosen:random_search", deterministic = false}}
+manager = {path = "swarm_arena.llm:AgentsSDKManager", config = {model = "sonnet"}}

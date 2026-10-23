@@ -42,8 +42,10 @@ and `settle_timeout_s` each default to 60 s; the lease renews every
 `lease_ttl_s / 3`. `schedule_timeout_s` defaults to 600 s. `ConvergeSpec`
 defaults are `top_n=2`, `parents_per_part=1`, and `max_join_attempts=1`.
 Learning titles hold at most 120 characters and text at most 1,500 characters.
-Built-in model integrations and their model-cap checks arrive in M3; configuring
-a model catalog alone does not provide them.
+The `llm` extra provides built-in model integrations and checks used aliases,
+role permissions, manager function calling, output caps, and prices under a
+dollar cap; structured roles without response-schema support receive a warning
+and use the two-stage fallback.
 
 The optional `Limits.max_usd` run cap must be positive and no greater than
 1,000,000,000 USD. Leaving it unset means there is no configured dollar cap.
@@ -79,10 +81,13 @@ control meaning. The CLI likewise renders safe core diagnostics or a type name.
 The budget is allocated as follows:
 
 1. Hold `reserve_fraction` at run level for judging, replanning, convergence,
-   and final judging. Curator integrations are future work.
+   and final judging. The configured-curator seam and built-in `LLMCurator`
+   also use this reserve.
 2. Hold a protected **final slice for every goal**, including queued goals.
    It covers one convergence plus `max_join_attempts` additional attempts and
-   the complete final ranking batch. Converge tools are estimated at **every
+   the final ranking batch's output terms; serialized inputs are reserved at
+   dispatch and can still be refused (see [LLM-judge funding](scoring-and-review.md#llm-judges)).
+   Converge tools are estimated at **every
    reachable round from 1 through R + 1**, taking the maximum in each budget
    unit, because a stop can converge before all R ordinary rounds finish.
    Ordinary judging and replanning cannot consume these protected slices.
@@ -110,9 +115,12 @@ Settlement is idempotent by reservation ID. Ordinary reported usage releases
 unused funding back to its original pools. After a committed start,
 provider-using tools retain the full reservation when usage cannot be recovered,
 including invalid output; available usage otherwise settles the reported amount.
-`settle_timeout_s` bounds the wait for pending call reports, not the subsequent
-durable settlement writes. Without a committed settle, the reservation stays
-charged in full. Cancelling construction or command preparation
+`settle_timeout_s` bounds the wait for pending call reports and post-stop or
+post-deadline settlement, including durable stop-result publication. Healthy
+live settlement remains under its owner's supervision without this fixed timer.
+Report arrival has its own timeout, including after a graceful stop; expiry
+records a conservative charge rather than a storage-cleanup failure.
+Without a committed settle, the reservation stays charged in full. Cancelling construction or command preparation
 before a committed start releases the reservation at zero while ownership is
 held; a late preparation result never launches or journals work.
 
@@ -129,9 +137,41 @@ that enforces tool-internal provider spending. Reported overspend is recorded
 and can exhaust the budget. Usage beyond the supported accounting range
 terminally exhausts the whole run, even with unset caps.
 
-The tranche machinery reserves before spending and settles unused portions;
-its default sizes are listed above. Built-in LLM calls and gateway enforcement
-are M3 work, not an available provider safety guarantee.
+## Tokens, USD, and tranches
+
+Metered LLM calls reserve before dispatch against their scope's committed
+tranche. Default tranche sizes are **0.25 USD and 25,000 tokens**. Small calls
+use available tranche credit; a new tranche shrinks to the remaining capped
+budget when necessary, and larger calls reserve independently. The advisory
+hook checks tranche credit as well as the remaining ledger balance; the actual
+reservation remains authoritative when calls overlap.
+
+Each admitted call gets its own reservation ID and preallocated LLM call ID.
+Callbacks settle by reservation ID, including concurrent identical requests.
+The output cap never exceeds the catalog's `max_tokens`; estimates include
+serialized prompts, input items, tools and output schemas. Provider-managed
+retry and fallback controls, including policy overrides in extra arguments or
+bodies, are stripped; numeric retries are forced to zero so hidden attempts
+cannot share one reservation. Runner retries, when enabled, enter the metered
+path again with a fresh reservation.
+
+Scope owners drain before closing their tranche. A missing report after
+`settle_timeout_s` produces an `estimated:` call error charged at the reservation;
+a cancelled call is abandoned so drain does not wait for its callback. A
+response-cache hit costs **0 USD and 0 charged tokens**, while retaining reported
+usage for display. Local budget refusal before reservation sends no request,
+creates no LLM call record and costs zero.
+
+`BudgetExceeded` is both an SDK exception and a `LimitReached`. Registered
+fencing, terminal cleanup failure and usage overflow stop the SDK operation
+without another model turn; sanitized hook failures do not gain that authority.
+The shared core classifier restores exact issued SDK carriers, including nested
+carriers, from private provenance. Copied, caller-created or subclassed carriers
+remain diagnostics. Caller cancellation takes precedence over carried controls.
+Usage overflow retains conservative charges. Exact journal/ledger equality
+applies to finalized, non-overflow accounting; fencing or interrupted publication
+can leave a reservation conservatively charged. Gateway enforcement of external
+tool spending remains later work.
 
 ## Three execution clocks and the watchdog
 
@@ -188,10 +228,18 @@ Built-in provider probing and model-provider recovery are M3 work.
 | `swarm-arena stop --now RUN_DIR` | Cancel with grace and partial collection | Judge available candidates, select-only convergence; no converge team; retain best parts as `unjoined` |
 
 Run budget exhaustion drains work and finalizes from reserve; goal budget
-exhaustion affects that goal. Goals still queued at any early ending never
-start and report `NO_RESULT` with reason `stopped`. A stop arriving during
-convergence or final judging remains the lifecycle's termination reason.
+exhaustion affects that goal. Resume completes setup even when replayed usage
+has exhausted the work budget, then finishes interrupted convergence and final
+judging from the remaining reserve. Resuming a completed budget-stopped goal
+reuses its recorded result without repeating paid work. Goals still queued at
+any early ending never start and report `NO_RESULT` with reason `stopped`. A stop
+arriving during convergence or final judging remains the lifecycle's termination reason.
 Interrupted part joins retain their best parts as `unjoined`.
+
+When budget exhaustion races with a new tool request, `LimitReached.limit` may
+be `budget` at the budget gate or `stop` after the round closes admission.
+Both outcomes refuse new work. Recovery retains the charged lost reservation
+and the recovered ledger balances regardless of which refusal arrives first.
 
 A graceful stop that preempts the round policy journals the default `Decision()`
 without pruning. If a stop or deadline cuts a judging barrier short, candidates
@@ -204,6 +252,13 @@ committed ranking evidence and records judge errors; it cannot wait forever for
 a fresh score. Executor shutdown is also shielded and bounded by that same
 setting. A shutdown timeout preserves the original result or exception, and
 shutdown failure never replaces an exception already raised by the run.
+
+After a graceful `stop`, reserve-funded barrier and final judging, including a
+paused-ranking retry at converge, retain their judge/round timeouts and the run
+deadline. Their combined duration does not consume one `settle_timeout_s`
+window. Each post-stop accounting/storage wait remains bounded, and real
+drain/teardown has its own settlement allowance after that work. Teardown
+deadline expiry raises the value-free `stop cleanup timed out` error.
 
 Stop files are scoped to the live ownership epoch: `control/stop-e<epoch>` and
 `control/stop-now-e<epoch>`, polled every two seconds. An old stop file does not
@@ -390,3 +445,94 @@ A post-stop final-selection recovery read can exhaust its storage settlement
 allowance. That failure propagates as a core storage-settlement error; it does
 not publish judge errors or a terminal provider-failure result. Resume can
 continue the unfinished goal from the committed journal.
+
+
+## Provider failures
+
+A provider outage pauses every registered agent in the run that uses that
+provider, across goals. The provider set includes the manager's model catalog
+entries and the tool's declared providers. An explicit tool
+`failed_provider` identifies one provider; a provider-failed output without that
+field applies to all providers declared by the tool.
+
+For example, a tool can write
+`{"data": {}, "failed_provider": "anthropic"}` to its result file. Agents using
+Anthropic through either their manager or tool pause; unrelated agents continue.
+The optional LLM adapter recognizes authentication, permission, rate-limit,
+connection, timeout and service failures. Credit failures use structured error
+fields first, with a message fallback confined to the adapter. Generic request-error
+types do not suppress the credit-balance fallback; a specific identifying code
+takes precedence. Provider messages
+are never copied into engine errors or provider events.
+
+Paused agents retain scheduler capacity. At the next fresh round, including
+convergence, the engine probes each failed provider needed by that goal before
+building its frontier or allocating shares. This includes newly queued goals
+and converge teams even when no paused address remains for the provider.
+Slot provider resolution runs concurrently, each bounded by the effective round
+timeout (and remaining run time). A stuck constructor ends only that slot with
+`runtime preparation cancelled`; known-provider probes and healthy peers continue. The probe uses the goal's judges
+budget, a manager scope, input `ping`, and `max_tokens=1`; both response-cache
+reads and writes are bypassed. Accounting drains before its tranche closes.
+With no probe adapter or no catalog alias for the saved provider, recovery
+succeeds without a model call. An ordinary probe error leaves the provider
+paused and logs only the error type. A refused probe reservation ends that goal's
+main rounds through the goal-budget stop path; other goals continue.
+
+Recovery clears only the generation that was probed. A newer failure or another
+unresolved provider keeps the agent paused. Recovery does not revive a pruned or
+watchdog-stopped agent. An admitted SDK tool action finishes under core grace
+before the manager drains; further actions are refused. For custom and scripted
+managers, a provider stop closes tool admission and gracefully cancels running
+tools so their partial results and settlements are collected before the agent
+scope ends. The engine kill bound still limits unresponsive work. Caller cancellation,
+lost ownership and terminal budget controls retain their precedence.
+
+Provider generations and address causes are journaled and restored on resume,
+independently of the current model catalog. A restarted partial round does not
+probe or clear its saved causes, and still writes the paused agent's STOPPED
+round status. A fresh resumed round may recover its reserved
+slots without exceeding `max_agents_total`. Permanent disposition or goal
+completion releases the reservation.
+
+
+### Failures outside agents
+
+Judges, panel members, replanners and curators use the same run-wide provider
+latch as managers and tools. A provider outage in one goal therefore pauses all
+matching agents, including later registrations, while their capacity remains
+reserved until recovery or permanent disposition.
+
+A failed non-ranking judge leaves its scores missing. A failed ranking judge
+skips the round's policy and makes curation ineligible; it never authorizes
+pruning on missing ranking evidence. At converge, paused ranking batches get
+one retry through normal admission and the shared provider service. A distinct
+batch identity makes a completed retry reusable on resume. Only a validated
+provider failure on that retry can produce `provider_failed` when no finalist
+passes; a recovered provider permits normal selection. A failed replanner keeps
+the current revision and records a safe `plan_rejected` completion, including the original
+`first_round` and any `join_retry`. A failed eligible curator records a completed
+skip without a `curated` event. These receipts survive takeover, so a missing
+decision or summary does not cause paid work to repeat.
+
+Each settled invocation reports a failed provider once, even when several panel
+members use it or a sibling is refused by the budget. A surviving panel carries
+its `panel_drop` metadata to the core, which commits it with the survivor scores.
+A drop describes a member loss, not whole-batch completion; single-member and
+all-member failures are failed batches instead.
+
+Failed judging and curation receipts are published only after accounting has a
+known disposition. Storage failures, settlement timeouts, fencing, terminal
+usage overflow and genuine caller cancellation are not provider failures and
+cannot manufacture these receipts. Error messages carry identifiers and type
+names, never prompts, outputs or provider diagnostic text.
+
+A registered judge budget refusal at the barrier records `reserve_exhausted`
+and ends ordinary rounds in select-only mode. At final judging it produces
+`no_result` with reason `reserve_exhausted`. Registered limits in replanning and
+policy retain their existing contained rejection/error-decision behavior.
+
+A registered usage overflow from a manager or judge takes the run-budget stop path:
+ordinary rounds end, and the free final selection can still run. A registered
+cleanup or storage terminal failure escapes the run even when no ledger or
+binding state accompanies it. Neither kind is recorded as a manager or judge error.

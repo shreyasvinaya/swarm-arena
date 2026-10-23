@@ -326,7 +326,10 @@ def test_sigkill_mid_round_then_resume(tmp_path: Path, run_config: RunConfig) ->
         assert all(_tool_starts_for(events, request) == 1 for request in fast)
         assert _tool_starts_for(events, extra) == 0
         assert not Path(extra.inputs["marker"]).exists()
-        assert marker.with_suffix(".limit").read_text() == "budget"
+        # Budget exhaustion may close round admission before the next request
+        # reaches the budget gate. Both documented refusal paths must preserve
+        # the recovered balances and refuse extra work, as asserted above.
+        assert marker.with_suffix(".limit").read_text() in {"budget", "stop"}
         assert sum(e.type == "tool_start" and e.epoch == 2 for e in events) == 1
         [retry] = [
             Candidate.model_validate(e.payload["candidate"])

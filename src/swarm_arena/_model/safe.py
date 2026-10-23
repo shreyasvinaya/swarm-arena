@@ -19,7 +19,7 @@ from swarm_arena._model.locations import (
     _schema_index,
     _sequence_paths,
 )
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _propagate_control, _raise_terminal
 
 # One allowlist for all models: custom codes and messages cannot carry user data.
 _VALIDATION_ERROR_TYPES: Final = frozenset(get_args(ErrorType))
@@ -284,6 +284,7 @@ def _validation_wrapper(
                 raise
             try:
                 error = _classify_outcome(error)
+                _raise_terminal(error)
                 safe = _sanitize_validation_error(
                     model, error, unknown_fields=getattr(model, "_unknown_fields", "hide")
                 )

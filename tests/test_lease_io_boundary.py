@@ -8,7 +8,6 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1] / "src" / "swarm_arena"
 # Exact module, enclosing function, and worker callback; no module-wide escapes.
 _ALLOW = {
-    ("_engine/run.py", "RunRunner.run", "admit_revision"): "Admission precedes acquisition.",
     ("_engine/run.py", "RunRunner.run", "_promote"): "Artifact promotion precedes acquisition.",
     ("_engine/run.py", "_open_board", "board.open"): "Contained daemon under owner supervision.",
     ("_engine/run.py", "_close_board", "board.close"): "Contained daemon with bounded cleanup.",
@@ -84,11 +83,6 @@ _ALLOW = {
         "OfflineHarness.run_rounds",
         "execution_ref.build",
     ): "Before acquisition.",
-    (
-        "testing/_harness.py",
-        "OfflineHarness.run_rounds",
-        "Lease.acquire_new",
-    ): "Initial acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_failed_runs"): "After writer release.",
     (
         "testing/_harness.py",
@@ -191,9 +185,12 @@ def _worker_calls(source: str) -> list[tuple[str, str, int]]:
 def test_lease_owned_modules_use_abandonable_workers() -> None:
     paths = [
         *_ROOT.joinpath("_engine").glob("*.py"),
+        *_ROOT.joinpath("llm").glob("*.py"),
+        _ROOT / "_journal/llm_record.py",
         _ROOT / "_journal/writer.py",
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",
+        _ROOT / "_planning/validate.py",
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
         _ROOT / "_exec/local_run.py",
@@ -215,6 +212,29 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
     assert not violations, "unprotected worker calls:\n" + "\n".join(violations)
     assert used == set(_ALLOW), "remove obsolete worker exceptions"
     assert all(_ALLOW.values())
+
+
+def test_guard_scans_planning_draft_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_planning/validate.py"
+    original = Path.read_text
+    source = target.read_text()
+    publication = "await _storage_io(_publish_draft_artifact, artifacts, digest, data)"
+    unsafe = source.replace(
+        publication,
+        "await anyio.to_thread.run_sync(_publish_draft_artifact, artifacts, digest, data)",
+    )
+    assert unsafe != source
+    assert any(
+        function == "_draft_work" and callback == "_publish_draft_artifact"
+        for function, callback, _ in _worker_calls(unsafe)
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_planning/validate.py:\d+: _draft_work"):
+        test_lease_owned_modules_use_abandonable_workers()
 
 
 def test_guard_finds_nested_calls_and_ignores_docstrings() -> None:

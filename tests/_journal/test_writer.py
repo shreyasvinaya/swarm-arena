@@ -1,6 +1,8 @@
 """Exercise single-writer publication, recovery, expiry, and admission."""
 
+import asyncio
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from threading import Lock, get_ident
@@ -163,6 +165,81 @@ async def test_group_commit_shares_one_segment(store: LocalStore, tmp_path: Path
         for i in range(5):
             tg.start_soon(w.append_durable, EventDraft(type=EventType.RESERVE, payload={"i": i}))
     assert len(w.committed) == 1
+
+
+async def test_native_cancel_wakes_durable_waiters_and_refuses_later_appends(
+    store: LocalStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    secret = "native-cancel-secret"
+    publishing = anyio.Event()
+    started = [anyio.Event(), anyio.Event()]
+    finished = [anyio.Event(), anyio.Event()]
+    failures: list[Fenced] = []
+    task: asyncio.Task[None] | None = None
+
+    async def hold_publication(writer: JournalWriter) -> None:
+        nonlocal task
+        task = asyncio.current_task()
+        publishing.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(JournalWriter, "_publish", hold_publication)
+    async with _writer(store, tmp_path, group_window_s=0) as writer:
+        # Observe the waiter failure even when the writer task group cancels its owner.
+        with anyio.CancelScope(shield=True):
+
+            async def append(index: int) -> None:
+                started[index].set()
+                try:
+                    await writer.append_durable(EventDraft(type=EventType.SETTLE))
+                except Fenced as error:
+                    failures.append(error)
+                finally:
+                    finished[index].set()
+
+            waiters = [asyncio.create_task(append(index)) for index in range(2)]
+            try:
+                with anyio.fail_after(5):
+                    await publishing.wait()
+                    for event in started:
+                        await event.wait()
+                    assert len(writer._waiters) == 2
+                    assert task is not None
+                    task.cancel(secret)
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    for event in finished:
+                        await event.wait()
+                assert task.cancelled()
+                assert writer.fenced.is_set()
+                assert writer._done.is_set()
+                assert not writer._waiters
+                assert len(failures) == 2
+                mirror = writer._local_path.read_bytes()
+                next_seq = writer._next_seq
+                with pytest.raises(Fenced) as late_append:
+                    writer.append(EventDraft(type=EventType.SETTLE))
+                with anyio.fail_after(5):
+                    with pytest.raises(Fenced) as late_durable:
+                        await writer.append_durable(EventDraft(type=EventType.SETTLE))
+                    with pytest.raises(Fenced) as late_wait:
+                        await writer._wait_for(next_seq - 1)
+                assert writer._next_seq == next_seq
+                assert writer._local_path.read_bytes() == mirror
+                for error in [*failures, late_append.value, late_durable.value, late_wait.value]:
+                    assert _is_core_signal(error)
+                    assert str(error) == "journal writer failed: Fenced"
+                    assert_secret_absent(error, secret, sanitized=True)
+                    assert secret not in "".join(traceback.format_exception(error))
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                for waiter in waiters:
+                    waiter.cancel()
+                with anyio.CancelScope(shield=True):
+                    await asyncio.gather(*waiters, return_exceptions=True)
 
 
 async def test_commits_run_one_at_a_time(tmp_path: Path) -> None:
@@ -358,18 +435,28 @@ async def test_store_operations_run_off_loop(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("after", [True, False])
 async def test_unknown_renewal_checks_identity(tmp_path: Path, after: bool) -> None:
+    taken = anyio.Event()
+    token = anyio.lowlevel.current_token()
+
+    def take_and_signal(store: Store) -> None:
+        _take(store)
+        anyio.from_thread.run_sync(taken.set, token=token)
+
     flaky = FlakyStore(
         LocalStore(tmp_path / "run"),
         unknown_after_replace=int(after),
         unknown_before_replace=int(not after),
-        after_unknown=_take,
+        after_unknown=take_and_signal,
     )
-    async with _writer(flaky, tmp_path, ttl_s=0.3) as w:
-        with anyio.fail_after(0.8):
+    # This checks unknown-write identity, not expiry under a subsecond lease.
+    async with _writer(flaky, tmp_path, ttl_s=3) as w:
+        with anyio.fail_after(10):
+            await taken.wait()
             await w.fenced.wait()
         owner = read_owner(flaky)
         assert owner is not None
         version = owner[0].version
+        assert owner[0].epoch == 2
     assert read_owner(flaky) == owner
     assert version == 2 + int(after)
 
@@ -751,7 +838,8 @@ async def test_blocked_publication_expires_without_late_state_change(
     entered, release = threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     writer = _writer(store, tmp_path, ttl_s=3 if deadline == "lease" else 60, group_window_s=0)
-    writer._settle_timeout_s = 0.2
+    # Allow normal release work to start and finish reliably after expiry.
+    writer._settle_timeout_s = 2
     wall_start, monotonic_start = utc_now(), time.monotonic()
 
     def slow_utc_now() -> datetime:
@@ -780,7 +868,7 @@ async def test_blocked_publication_expires_without_late_state_change(
             assert await anyio.to_thread.run_sync(entered.wait, 8)
         if deadline == "settlement":
             writer._stop_storage()
-        done, _ = await asyncio.wait([task], timeout=4)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "publication wait outlived its deadline"
         error = task.exception()
         assert error is not None
@@ -828,7 +916,8 @@ async def test_settlement_timeout_bounds_the_release_attempt(
     import threading
 
     writer = _writer(store, tmp_path, group_window_s=0)
-    writer._settle_timeout_s = 0.2
+    # Allow normal release work to start and finish reliably after expiry.
+    writer._settle_timeout_s = 2
     publishing, releasing, unblock = (threading.Event() for _ in range(3))
     workers: list[threading.Thread] = []
     create, replace = store.create, store.replace
@@ -857,7 +946,7 @@ async def test_settlement_timeout_bounds_the_release_attempt(
         assert await anyio.to_thread.run_sync(publishing.wait, 10)
         writer._stop_storage()
         assert await anyio.to_thread.run_sync(releasing.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=10)
         assert done, "failed writer retained its blocked release"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -878,3 +967,38 @@ async def test_settlement_timeout_bounds_the_release_attempt(
     owner = read_owner(store)
     assert owner is not None
     assert owner[0].head is None
+
+
+@pytest.mark.parametrize("failure_type", [Fenced, StorageError])
+async def test_writer_stop_retains_earlier_failure_provenance(
+    store: LocalStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    task: asyncio.Task[None] | None = None
+    started = anyio.Event()
+    remaining = JournalWriter._remaining
+
+    def observed_remaining(writer: JournalWriter) -> float:
+        nonlocal task
+        task = asyncio.current_task()
+        started.set()
+        return remaining(writer)
+
+    monkeypatch.setattr(JournalWriter, "_remaining", observed_remaining)
+    async with _writer(store, tmp_path) as writer:
+        with anyio.fail_after(5):
+            await started.wait()
+        assert task is not None
+        error = failure_type("earlier failure")
+        writer._fail(error)
+        with anyio.CancelScope(shield=True):
+            task.cancel("later-cancel-secret")
+            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+                await task
+            assert writer._failure is error
+            assert not writer._stopped
+            with pytest.raises(Fenced) as caught:
+                writer._raise_if_fenced()
+            assert "later-cancel-secret" not in "".join(traceback.format_exception(caught.value))

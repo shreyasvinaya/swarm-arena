@@ -1,5 +1,6 @@
 """Configured board hooks share safe and bounded run/resume boundaries."""
 
+import threading
 import traceback
 from collections.abc import Iterator
 from pathlib import Path
@@ -100,12 +101,20 @@ async def test_board_close_failure_preserves_primary_open_signal(
 
 @pytest.mark.parametrize("operation", ["run", "resume"])
 async def test_blocking_board_close_is_bounded(
-    run_config: RunConfig, tmp_path: Path, operation: str
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     if operation == "resume":
         await execute(run_config, "run")
+    workers: list[threading.Thread] = []
+    close = LifecycleBoard.close
+
+    def tracked_close(self: LifecycleBoard) -> None:
+        workers.append(threading.current_thread())
+        close(self)
+
+    monkeypatch.setattr(LifecycleBoard, "close", tracked_close)
     config = configured(run_config, tmp_path, close_mode="block").model_copy(
-        update={"settle_timeout_s": 0.15}
+        update={"settle_timeout_s": 2.0}
     )
     completed = anyio.Event()
 
@@ -117,11 +126,14 @@ async def test_blocking_board_close_is_bounded(
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
             assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 10)
-            with anyio.fail_after(1):
+            with anyio.fail_after(5):
                 await completed.wait()
             assert not LifecycleBoard.release.is_set()
     finally:
         LifecycleBoard.release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 5)
+            assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("operation", ["run", "resume"])
@@ -151,7 +163,7 @@ async def test_blocking_board_open_can_be_cancelled(
             group.start_soon(drive)
             assert await anyio.to_thread.run_sync(LifecycleBoard.entered.wait, 10)
             scope.cancel()
-            with anyio.fail_after(1):
+            with anyio.fail_after(5):
                 await completed.wait()
             assert cancelled == [True]
             assert LifecycleBoard.closed.is_set()

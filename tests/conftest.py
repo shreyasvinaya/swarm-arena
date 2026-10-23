@@ -3,6 +3,7 @@
 import importlib
 import importlib.metadata
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,22 @@ def isolated_board_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
 
 
+@pytest.fixture(autouse=True)
+def isolated_llm_process_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no process-wide LiteLLM response cache or call logger."""
+    # Only modules a test already imported are reset, so core-only tests import nothing.
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        monkeypatch.setattr(litellm, "cache", None)
+        monkeypatch.setattr(litellm, "callbacks", [])
+    tracing = sys.modules.get("swarm_arena.llm._langfuse")
+    if tracing is not None:
+        tracing._reset_langfuse(2)
+    logger = sys.modules.get("swarm_arena.llm._logger")
+    if logger is not None:
+        monkeypatch.setattr(logger, "_installed_policy", None)
+
+
 @pytest.fixture
 async def finished_run(tmp_path: Path, anyio_backend: str) -> "FinishedRun":
     """Finish the two-round public Rosenbrock example with posted learnings."""
@@ -175,3 +192,23 @@ async def finished_run(tmp_path: Path, anyio_backend: str) -> "FinishedRun":
     )
     await run_again(run, run_id=run.run_id)
     return run
+
+
+def pytest_sessionstart() -> None:
+    """Report a pre-existing default disk cache once, before collecting tests."""
+    if (Path.cwd() / ".litellm_cache").exists():
+        pytest.exit(
+            "pre-existing LiteLLM disk cache in cwd: remove it before running tests",
+            returncode=1,
+        )
+
+
+@pytest.fixture(autouse=True)
+def no_cwd_disk_cache() -> Iterator[None]:
+    """Reject a default disk directory created during the current test."""
+    cache = Path.cwd() / ".litellm_cache"
+    existed = cache.exists()
+    yield
+    assert existed or not cache.exists(), (
+        "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
+    )

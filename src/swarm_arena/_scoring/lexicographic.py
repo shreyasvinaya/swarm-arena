@@ -12,7 +12,7 @@ from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.goal import Goal
 from swarm_arena._model.ref import Ref, RefField, _ConfigInputModel
 from swarm_arena._model.results import Candidate, Score
-from swarm_arena._outcomes import _classify_outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control
 from swarm_arena._scoring.judge import Judge, JudgeContext, is_finite_score
 
 
@@ -351,16 +351,27 @@ class Lexicographic(Judge):
         (0.9, -2.0)
         >>> del sys.modules['lex_judge_demo']
         """
+        boundary = _Outcome()
         members = await run_sync_daemon(self._get_members)
         by_member: list[dict[str, Score]] = []
         for ref, member in zip(self.config.judges, members, strict=True):
             name = ref.name if ref.name is not None else member.name
             returned = await member.judge(goal, candidates, ctx)
-            valid, errors = await run_sync_daemon(self._prepare_member, returned, candidates, name)
+            try:
+                valid, errors = await run_sync_daemon(
+                    self._prepare_member, returned, candidates, name
+                )
+            except BaseException as error:
+                boundary.contain(error, RuntimeError, "judge member preparation")
             for candidate_id, reason in errors.items():
                 ctx.judge_error(candidate_id, reason)
             by_member.append(valid)
-        scores, errors = await run_sync_daemon(self._combine_scores, candidates, by_member, members)
+        try:
+            scores, errors = await run_sync_daemon(
+                self._combine_scores, candidates, by_member, members
+            )
+        except BaseException as error:
+            boundary.contain(error, RuntimeError, "judge combination")
         for candidate_id, reason in errors.items():
             ctx.judge_error(candidate_id, reason)
         return scores
@@ -390,6 +401,7 @@ class Lexicographic(Judge):
                 except KeyboardInterrupt:
                     raise
                 except BaseException as error:
+                    _Outcome(capture_caller=False).propagate_control(error)
                     error = _classify_outcome(error)
                     errors[candidate.id] = (
                         f"member {name} gave an invalid score: {_exception_type_name(error)}"
@@ -441,6 +453,7 @@ class Lexicographic(Judge):
             except KeyboardInterrupt:
                 raise
             except BaseException as error:
+                _Outcome(capture_caller=False).propagate_control(error)
                 error = _classify_outcome(error)
                 errors[candidate.id] = (
                     f"{_exception_type_name(error)}: cannot combine member scores"

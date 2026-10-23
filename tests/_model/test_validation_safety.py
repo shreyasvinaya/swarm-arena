@@ -1,10 +1,15 @@
 """Exercise the shared validation boundary and stable diagnostics."""
 
 import ast
+import gc
 import importlib
+import importlib.metadata
 import json
 import pkgutil
+from collections.abc import Iterable
+from importlib.machinery import PathFinder
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, LiteralString, Self, cast
 from uuid import NAMESPACE_OID, uuid5
 
@@ -95,6 +100,33 @@ def test_ref_build_text_snapshot() -> None:
 EXTERNAL_MODELS: set[tuple[str, str]] = set()
 
 
+def _module_available(module: str) -> bool:
+    optional = {
+        "swarm_arena.llm": ("openai-agents", "litellm"),
+        "swarm_arena.testing._fake_model": ("openai-agents", "litellm"),
+        "swarm_arena.ray": ("ray",),
+        "swarm_arena._store.s3": ("s3fs",),
+    }
+    for package, distributions in optional.items():
+        if module == package or module.startswith(package + "."):
+            for distribution in distributions:
+                try:
+                    importlib.metadata.version(distribution)
+                except importlib.metadata.PackageNotFoundError:
+                    return False
+    return True
+
+
+def _import_modules(path: Iterable[str], prefix: str) -> None:
+    # walk_packages imports packages before recursion; prune absent extras first.
+    for module in pkgutil.iter_modules(path, prefix):
+        if not _module_available(module.name):
+            continue
+        imported = importlib.import_module(module.name)
+        if module.ispkg:
+            _import_modules(imported.__path__, module.name + ".")
+
+
 def _source_models() -> list[tuple[str, str]]:
     candidates: list[tuple[str, str, list[str]]] = []
     root = Path(__file__).parents[2] / "src" / "swarm_arena"
@@ -112,9 +144,9 @@ def _source_models() -> list[tuple[str, str]]:
                 visit(node.body, module, name + ".")
 
     for path in sorted(root.rglob("*.py")):
-        visit(
-            ast.parse(path.read_text()).body, ".".join(path.relative_to(root).with_suffix("").parts)
-        )
+        module = ".".join(path.relative_to(root).with_suffix("").parts)
+        if _module_available("swarm_arena." + module):
+            visit(ast.parse(path.read_text()).body, module)
     names = {"BaseModel", "RootModel"}
     found: set[tuple[str, str]] = set()
     while True:
@@ -153,9 +185,11 @@ def _model_classes() -> list[type[BaseModel]]:
             function_input_model(_inventory_function),
         ]
     )
-    for module in pkgutil.walk_packages(swarm_arena.__path__, "swarm_arena."):
-        importlib.import_module(module.name)
-    found.extend(_runtime_models())
+    _import_modules(swarm_arena.__path__, "swarm_arena.")
+    # Subclass registries are weak: discard unreachable factory classes before
+    # inventorying live models, identically in every pytest worker.
+    gc.collect()
+    found.extend(sorted(_runtime_models(), key=lambda cls: (cls.__module__, cls.__qualname__)))
     return list(dict.fromkeys(found))
 
 
@@ -197,6 +231,44 @@ SHOW_MODELS = {
     "CachePolicy",
     "CachePolicy.RoleSwitch",
 }
+
+
+@pytest.mark.parametrize("missing", [None, "openai-agents", "litellm"])
+def test_inventory_prunes_missing_extras_before_importing(
+    missing: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    imported: list[str] = []
+
+    def version(distribution: str) -> str:
+        if distribution == missing:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return "1"
+
+    def modules(path: Iterable[str], prefix: str) -> list[pkgutil.ModuleInfo]:
+        children = {
+            "swarm_arena.": [("llm", True), ("_model", True)],
+            "swarm_arena.llm.": [("_config", False)],
+            "swarm_arena._model.": [("base", False)],
+        }
+        return [
+            pkgutil.ModuleInfo(PathFinder, prefix + name, package)
+            for name, package in children[prefix]
+        ]
+
+    def importing(module: str) -> Any:
+        imported.append(module)
+        return SimpleNamespace(__path__=[])
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importlib.metadata, "version", version)
+        patch.setattr(pkgutil, "iter_modules", modules)
+        patch.setattr(importlib, "import_module", importing)
+        _import_modules([], "swarm_arena.")
+
+    expected = ["swarm_arena._model", "swarm_arena._model.base"]
+    if missing is None:
+        expected = ["swarm_arena.llm", "swarm_arena.llm._config", *expected]
+    assert imported == expected
 
 
 def test_source_inventory_has_explicit_ownership() -> None:
@@ -359,3 +431,16 @@ def test_root_catalog_redacts_data_keys_colliding_with_schema_names() -> None:
     assert_secret_absent(caught.value, secret, sanitized=True)
     # RootModel.root is a serialization field, not an input mapping key identifier.
     assert all(item["loc"][0] == "<…>" for item in caught.value.errors())
+
+
+def test_inventory_ignores_unreachable_dynamic_models() -> None:
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        compile_object_schema("UnreachableInventoryProbe", {"count": {"type": "integer"}})
+        models = _model_classes()
+        assert "UnreachableInventoryProbe" not in {model.__name__ for model in models}
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()

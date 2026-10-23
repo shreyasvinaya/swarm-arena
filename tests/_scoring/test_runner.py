@@ -7,7 +7,7 @@ import pytest
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, AlwaysPass, RecordingExecutor, cand
 
-from swarm_arena._errors import Fenced, _core_error
+from swarm_arena._errors import Fenced, ProviderFailed, _core_error, _SignalCategory
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._journal.event import EventDraft, EventType
@@ -31,6 +31,54 @@ from swarm_arena._scoring.script_check import ScriptCheck
 from swarm_arena._scoring.script_judge import ScriptJudge
 
 SECRET = "runner-private-7e5cd74b"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_run_checks_preserves_terminal(nested: bool) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import _core_category, _stop_cleanup_error
+
+    error: BaseException = _stop_cleanup_error()
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(side_effect=error))
+    with pytest.raises(RuntimeError) as caught:
+        await run_checks(_cand(), [("check", check)], _check_ctx())
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+
+
+@pytest.mark.parametrize("kind", ["limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("site", ["check", "result"])
+async def test_check_control_disposition(
+    monkeypatch: pytest.MonkeyPatch, kind: str, nested: bool, site: str
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import _core_signal
+    from swarm_arena._scoring import runner as module
+    from swarm_arena.manager import LimitReached
+
+    error: BaseException = (
+        _core_signal(LimitReached("stop", "the round is stopping"))
+        if kind == "limit"
+        else _core_error(ProviderFailed, "provider")
+    )
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(return_value=CheckResult(check="c", passed=True)))
+    if site == "check":
+        check.check.side_effect = error
+    else:
+        monkeypatch.setattr(module, "_prepare_check_result", Mock(side_effect=error))
+    [result] = await run_checks(_cand(), [("check", check)], _check_ctx())
+    assert not result.passed
+    assert result.reasons == (
+        [f"check error: {'LimitReached' if kind == 'limit' else 'ProviderFailed'}"]
+        if site == "check"
+        else ["check error: invalid result"]
+    )
 
 
 def _cand(candidate_id: str = "c-1", *, failed: bool = False, **fields: Any) -> Candidate:
@@ -481,6 +529,8 @@ def test_judge_outcome_and_error_are_frozen_models() -> None:
     outcome = JudgeOutcome(scores=[], errors=[error])
     assert outcome.model_dump() == {
         "scores": [],
+        "provider_failed": {},
+        "panel_drops": [],
         "errors": [{"candidate_id": "c-1", "judge": "quality", "reason": "no score"}],
     }
     with pytest.raises(ValueError, match="frozen"):
@@ -886,3 +936,94 @@ async def test_metadata_runs_off_loop_but_score_ids_stay_on_loop() -> None:
     assert len(out.scores) == 1
     assert len(observed) == 2
     assert all(t is not threading.main_thread() and t.daemon for t in observed)
+
+
+async def test_omitted_candidate_is_a_judge_error() -> None:
+    judge = _RecordingJudge(values={"c0": 1.0, "c1": None})
+    outcome = await judge_round(
+        "g", [(Ref.of(judge), judge)], [_cand("c0"), _cand("c1")], [], lambda _: _judge_ctx()
+    )
+    assert [s.candidate_id for s in outcome.scores] == ["c0"]
+    assert [(e.candidate_id, e.reason) for e in outcome.errors] == [("c1", "no score")]
+
+
+class _ProviderJudge(_RecordingJudge):
+    async def judge(
+        self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+    ) -> list[Score]:
+        raise _core_error(ProviderFailed, "anthropic")
+
+
+class _ProviderMetadataJudge(_RecordingJudge):
+    def panel_hash(self) -> str:
+        raise _core_error(ProviderFailed, "anthropic")
+
+
+class _TerminalMetadataJudge(_RecordingJudge):
+    def panel_hash(self) -> str:
+        raise _core_error(
+            RuntimeError, "stop cleanup timed out", _category=_SignalCategory.TERMINAL
+        )
+
+
+@pytest.mark.parametrize(
+    ("member", "error_type"),
+    [(_ProviderMetadataJudge, ProviderFailed), (_TerminalMetadataJudge, RuntimeError)],
+)
+async def test_recursive_metadata_preserves_registered_signal(
+    member: type[Judge], error_type: type[Exception]
+) -> None:
+    from swarm_arena.scoring import Lexicographic
+
+    judge = Lexicographic([Lexicographic([member()])])
+    # Preserve the actual instances; this test is about combination, not factories.
+    inner = Lexicographic([member()])
+    inner._members = [member()]
+    judge._members = [inner]
+    with pytest.raises(error_type):
+        await judge.judge(GOAL, [_cand()], _judge_ctx())
+
+
+async def test_judge_round_reports_provider_failed_without_judge_errors() -> None:
+    failed, healthy = _ProviderJudge(), _RecordingJudge()
+    outcome = await judge_round(
+        "g",
+        [
+            (Ref.of(failed).model_copy(update={"name": "A"}), failed),
+            (Ref.of(healthy).model_copy(update={"name": "B"}), healthy),
+        ],
+        [_cand("c-1"), _cand("c-2")],
+        [],
+        lambda _: _judge_ctx(),
+    )
+    assert outcome.provider_failed == {"A": "anthropic"}
+    assert outcome.errors == []
+    assert {s.judge for s in outcome.scores} == {"B"}
+
+
+async def test_final_judge_reraises_provider_failed() -> None:
+    judge = _ProviderJudge()
+    with pytest.raises(ProviderFailed):
+        await final_judge("g", (Ref.of(judge), judge), [_cand()], _judge_ctx())
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_judge_round_reraises_registered_limits(terminal: bool) -> None:
+    from swarm_arena.manager import LimitReached
+
+    class Limited(_RecordingJudge):
+        async def judge(
+            self, goal: Goal, candidates: Sequence[Candidate], ctx: JudgeContext
+        ) -> list[Score]:
+            raise _core_error(
+                LimitReached,
+                "budget",
+                "judge budget",
+                _category=(_SignalCategory.TERMINAL if terminal else _SignalCategory.LIMIT),
+            )
+
+    judge = Limited()
+    with pytest.raises(LimitReached):
+        await judge_round(
+            "g", [(Ref.of(_RecordingJudge()), judge)], [_cand()], [], lambda _: _judge_ctx()
+        )

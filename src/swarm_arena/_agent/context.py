@@ -1,26 +1,33 @@
 """Expose loop-owned, limit-checked actions to manager connectors."""
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import get_ident
-from typing import Any, Literal, TypeVar
+from typing import Any, Final, Literal, TypeVar
 
 import anyio
 from pydantic import BaseModel, ValidationError
 
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
-from swarm_arena._agent.tool_run import _prepare_sync, execute_tool_run
+from swarm_arena._agent.tool_run import Inflight, _inflight, _prepare_sync, execute_tool_run
 from swarm_arena._board.arena import ArenaView
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
+from swarm_arena._budget.amount import USD_LIMIT
 from swarm_arena._budget.llm_scope import current_requesting_call
 from swarm_arena._errors import (
     ConfigError,
+    Fenced,
     SoftError,
+    _core_category,
+    _core_error,
     _core_signal,
     _exception_type_name,
+    _is_core_control,
     _is_core_signal,
+    _SignalCategory,
 )
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft, EventType
@@ -29,17 +36,31 @@ from swarm_arena._model.board_types import Row
 from swarm_arena._model.context_strings import _context_string
 from swarm_arena._model.diagnostics import validation_summary
 from swarm_arena._model.goal import Goal
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import AgentSpec, RoundSpec
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, Learning, Score
 from swarm_arena._model.tooling import Estimate
-from swarm_arena._outcomes import _classify_outcome, _Outcome
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _raise_terminal
 from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.runner import for_manager
 from swarm_arena._tooling.staging import effective_files
 from swarm_arena._tooling.tool import Action, Tool
 
 _T = TypeVar("_T")
+_CONTEXT_LIMITS = frozenset(Limits.model_fields) | {"budget", "stop"}
+_BOARD_READ_LIMIT_MESSAGE: Final = "max_board_reads_per_round reached"
+_UNKNOWN_CANDIDATE_MESSAGE: Final = "unknown candidate: {id}"
+
+
+def _context_limit(value: object) -> str:
+    """Validate ordinary stopping limits without invoking user string hooks."""
+    if not issubclass(type(value), str):
+        raise _core_error(ValueError, "invalid agent limit") from None
+    limit = _context_string(value, "limit")
+    if limit not in _CONTEXT_LIMITS:
+        raise _core_error(ValueError, "invalid agent limit") from None
+    return limit
 
 
 @dataclass(eq=False)
@@ -53,6 +74,230 @@ class _ActionLifetime:
 _nested: ContextVar[tuple[_ActionLifetime, ...]] = ContextVar("agent_nested_actions", default=())
 
 
+@dataclass(eq=False)
+class _LocalTimer:
+    """Keep derived cancellation and unwind controls owned by a local timer."""
+
+    scope: anyio.CancelScope
+    live: bool = True
+    failure: Exception | None = None
+    provider_stopped: bool = False
+    provider_child: "_LocalTimer | None" = None
+    provider_cancel: Callable[[], None] | None = None
+
+    def stop_provider(self, error: Exception) -> None:
+        """Route a provider stop through the live manager timer, when present."""
+        self.provider_stopped = True
+        self.record(error)
+        child = self.provider_child
+        if child is not None and child.live:
+            child.stop_provider(error)
+        elif self.provider_cancel is not None:
+            self.provider_cancel()
+        else:
+            self.scope.cancel()
+
+    def record(self, error: BaseException) -> None:
+        """Retain only registered controls using the shared authority precedence."""
+        if not self.live:
+            return
+        combined = (
+            BaseExceptionGroup("local timer unwind", [self.failure, error])
+            if self.failure is not None
+            else error
+        )
+        try:
+            classified = _classify_outcome(combined)
+        except Fenced as fenced:
+            classified = fenced
+        if _is_core_control(classified):
+            self.failure = classified
+
+
+_local_timers: ContextVar[tuple[_LocalTimer, ...]] = ContextVar("agent_local_timers", default=())
+
+
+@contextmanager
+def _local_timer_scope(
+    scope: anyio.CancelScope, *, relay_provider_stop: bool = False
+) -> Generator[_LocalTimer, None, None]:
+    """Keep timer provenance live until its owner finishes bounded cleanup."""
+    parents = tuple(timer for timer in _local_timers.get() if timer.live)
+    timer = _LocalTimer(scope)
+    parent = parents[-1] if relay_provider_stop and parents else None
+    if parent is not None:
+        parent.provider_child = timer
+        if parent.provider_stopped and parent.failure is not None:
+            timer.stop_provider(parent.failure)
+    token = _local_timers.set((*parents, timer))
+    try:
+        yield timer
+    finally:
+        timer.live = False
+        if parent is not None:
+            parent.provider_child = None
+        _local_timers.reset(token)
+
+
+def _defer_timer_error(error: BaseException) -> bool:
+    """Retain registered unwind controls until the timer owner checks its caller."""
+    timers = tuple(
+        timer for timer in _local_timers.get() if timer.live and timer.scope.cancel_called
+    )
+    if not timers:
+        return False
+    for timer in timers:
+        timer.record(error)
+    return True
+
+
+class _ActionInflight(Inflight):
+    """Keep one owned action visible to round stop and independently cancellable."""
+
+    def __init__(self, parent: Inflight, *, round_deadline: float = float("inf")) -> None:
+        self._round_deadline = min(
+            round_deadline,
+            parent._round_deadline if isinstance(parent, _ActionInflight) else float("inf"),
+        )
+        self._parent = parent
+        self._local = Inflight()
+        self._scopes = self._local._scopes
+        self._runs = 0
+        self._accepting = True
+        self._stop_scopes: set[anyio.CancelScope] = set()
+
+    @contextmanager
+    def run(self) -> Generator[None]:
+        """Retain a core run through every submission gap and final settlement."""
+        if not self._accepting or self.closed:
+            raise _core_error(LimitReached, "stop", "the round is stopping")
+        self._runs += 1
+        try:
+            yield
+        finally:
+            self._runs -= 1
+            if not self._runs:
+                for scope in self._stop_scopes:
+                    scope.cancel()
+
+    def stop(self, scope: anyio.CancelScope, *, cancel: bool) -> None:
+        """Close admission, optionally start core grace, then stop handler work."""
+        # A run already entered may still be preparing its reservation or
+        # submission. Non-caller stops refuse new run entries without cutting
+        # that work; deadlines and callers also close submission admission.
+        self._accepting = False
+        self._stop_scopes.add(scope)
+        if cancel:
+            self.close()
+            self.cancel_all()
+        if not self._runs:
+            scope.cancel()
+
+    def is_timeout_refusal(self, error: Exception, timer: _LocalTimer, ctx: "AgentContext") -> bool:
+        """Recognize an ordinary stop caused solely by this action's timer."""
+        return (
+            _core_category(error) is _SignalCategory.LIMIT
+            and isinstance(error, LimitReached)
+            and error.limit == "stop"
+            and timer.scope.cancel_called
+            and self._local.closed
+            and self._stop_scopes == {timer.scope}
+            and not self._parent.closed
+            # The live stop latch can precede the engine watcher closing the parent.
+            and ctx._gate() is None
+            and not any(
+                other.live
+                and other is not timer
+                and (other.scope.cancel_called or other.failure is not None)
+                for other in _local_timers.get()
+            )
+        )
+
+    @property
+    def closed(self) -> bool:
+        return self._parent.closed or self._local.closed
+
+    @closed.setter
+    def closed(self, value: bool) -> None:
+        self._local.closed = value
+
+    @property
+    def _starts_closed(self) -> bool:
+        return self._parent._starts_closed or self._local._starts_closed
+
+    @_starts_closed.setter
+    def _starts_closed(self, value: bool) -> None:
+        self._local._starts_closed = value
+
+    @property
+    def _cancel_generation(self) -> int:
+        return self._parent._cancel_generation + self._local._cancel_generation
+
+    @_cancel_generation.setter
+    def _cancel_generation(self, value: int) -> None:
+        self._local._cancel_generation = value - self._parent._cancel_generation
+
+    def add(
+        self,
+        scope: anyio.CancelScope,
+        *,
+        grace_s: float = 0.0,
+        admitted_generation: int | None = None,
+    ) -> None:
+        if admitted_generation is not None:
+            self._check_admitted(admitted_generation)
+        self._local.add(
+            scope,
+            grace_s=grace_s,
+            admitted_generation=(
+                self._local._cancel_generation if admitted_generation is not None else None
+            ),
+        )
+        try:
+            self._parent.add(
+                scope,
+                grace_s=grace_s,
+                admitted_generation=(
+                    self._parent._cancel_generation if admitted_generation is not None else None
+                ),
+            )
+        except BaseException:
+            self._local.discard(scope)
+            raise
+
+    def discard(self, scope: anyio.CancelScope) -> None:
+        self._local.discard(scope)
+        self._parent.discard(scope)
+
+    def cancel_all(self) -> None:
+        self._local.cancel_all()
+
+    def _add_completion(self, scope: anyio.CancelScope, *, grace_s: float, generation: int) -> bool:
+        if generation != self._cancel_generation:
+            return False
+        self._local._add_completion(
+            scope, grace_s=grace_s, generation=self._local._cancel_generation
+        )
+        return self._parent._add_completion(
+            scope, grace_s=grace_s, generation=self._parent._cancel_generation
+        )
+
+
+def _provider_round_deadline() -> float:
+    """Read the engine deadline inherited by this slot and its owned actions."""
+    registry = _inflight.get()
+    return registry._round_deadline if isinstance(registry, _ActionInflight) else float("inf")
+
+
+def _check_provider_admission() -> None:
+    """Refuse new calls without turning a round stop into an action timeout."""
+    if anyio.current_time() >= _provider_round_deadline():
+        raise _core_error(LimitReached, "round_timeout_s", "the manager round timed out")
+    registry = _inflight.get()
+    if registry is not None and registry.closed:
+        raise _core_error(LimitReached, "stop", "the round is stopping")
+
+
 @dataclass(frozen=True)
 class _ToolMetadata:
     """Carry prepared hook results without running connector code on the loop."""
@@ -64,22 +309,35 @@ class _ToolMetadata:
     feedback: Mapping[str, str]
 
 
+def _prepare_action(action: Action[Any]) -> Action[Any]:
+    """Detach connector metadata before any loop-owned action lookup."""
+    if not isinstance(action, Action):
+        raise TypeError("invalid action")
+    counts_as = _context_string(action.counts_as, "counts_as")
+    if counts_as not in {"board_read", "none"}:
+        raise TypeError("invalid action counter")
+    return Action(
+        name=_context_string(action.name, "name"),
+        description=_context_string(action.description, "description"),
+        input_model=action.input_model,
+        handler=action.handler,
+        counts_as=counts_as,
+    )
+
+
 def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolMetadata:
     """Read and validate metadata in the runner's abandonable daemon boundary."""
     try:
-        description = tool.get_description()
+        description = _context_string(tool.get_description(), "description")
         input_model = tool.get_input_model()
-        editable = tuple(tool.editable())
-        actions = tuple(tool.extra_actions())
-        feedback = {name: check.feedback for name, check in checks}
-        if not isinstance(description, str):
-            raise TypeError("invalid description")
+        editable = tuple(_context_string(path, "editable path") for path in tool.editable())
+        actions = tuple(_prepare_action(action) for action in tool.extra_actions())
+        feedback = {
+            _context_string(name, "check name"): _context_string(check.feedback, "feedback")
+            for name, check in checks
+        }
         if not isinstance(input_model, type) or not issubclass(input_model, BaseModel):
             raise TypeError("invalid input model")
-        if not all(isinstance(path, str) for path in editable):
-            raise TypeError("invalid editable paths")
-        if not all(isinstance(action, Action) for action in actions):
-            raise TypeError("invalid actions")
         if not all(mode in {"pass_fail", "reasons"} for mode in feedback.values()):
             raise TypeError("invalid feedback policy")
         return _ToolMetadata(description, input_model, editable, actions, feedback)
@@ -87,6 +345,7 @@ def _prepare_metadata(tool: Tool, checks: Sequence[tuple[str, Check]]) -> _ToolM
         raise
     except BaseException as error:
         error = _classify_outcome(error)
+        _raise_terminal(error)
         raise _core_signal(
             SoftError(f"invalid tool metadata: {_exception_type_name(error)}")
         ) from None
@@ -101,8 +360,10 @@ class AgentContext:
     are unsupported. Extra actions charge once, including their nested reads.
     Child tasks released after the enclosing action exits are charged normally.
     The runner prepares connector metadata in supervised daemon workers before
-    constructing this loop-owned context. Feedback uses the producing policy;
-    unknown policies hide reasons and details.
+    constructing this loop-owned context. Action metadata is copied into core
+    records with exact strings, as are editable paths and feedback identifiers,
+    so later lookups cannot invoke connector string hooks. Feedback uses the
+    producing policy; unknown policies hide reasons and details.
 
     Identifier and name arguments, including collection elements, are copied to
     exact strings at entry without invoking subclass hooks. Non-string values
@@ -113,7 +374,11 @@ class AgentContext:
     rt : AgentRuntime
         Agent services, snapshot and mutable round state.
     gate : Callable[[], LimitReached or None], optional
-        Return a stopping exception when new actions are blocked.
+        Return a stopping exception when new actions are blocked. Its limit,
+        like the watchdog's, must name a ``Limits`` field, ``budget``, or
+        ``stop``. Unknown limits (including ledger-only ``usage_overflow``)
+        raise a value-free core ``ValueError`` before admission. Accepted
+        limits carry ordinary limit authority, never terminal authority.
 
     Attributes
     ----------
@@ -222,21 +487,35 @@ class AgentContext:
             payload=payload,
         )
 
-    def _charge(self, *, board_read: bool = False) -> None:
-        """Check gates and update counters atomically on the loop."""
-        rt = self._rt
+    def _check_admission(self) -> None:
+        """Check the live gate without charging a turn or appending counters."""
         blocked = self._gate()
         if blocked is not None:
-            raise _core_signal(LimitReached(blocked.limit, str(blocked)))
+            limit = _context_limit(blocked.limit)
+            raise _core_signal(LimitReached(limit, str(blocked)), _category=_SignalCategory.LIMIT)
+
+    def _check_charge(self) -> bool:
+        """Check action limits without mutation; return whether a charge is due."""
+        self._check_admission()
+        rt = self._rt
         if rt.watchdog.limit is not None:
+            limit = _context_limit(rt.watchdog.limit)
             raise _core_signal(
-                LimitReached(rt.watchdog.limit, rt.watchdog.reason or "agent stopped")
+                LimitReached(limit, rt.watchdog.reason or "agent stopped"),
+                _category=_SignalCategory.LIMIT,
             )
         lifetime = next((item for item in reversed(_nested.get()) if item.owner is self), None)
         if lifetime is not None and lifetime.live:
-            return
+            return False
         if rt.counters.turns >= rt.limits.max_turns_per_round:
             raise _core_signal(LimitReached("max_turns_per_round", "turns used up for this round"))
+        return True
+
+    def _charge(self, *, board_read: bool = False) -> None:
+        """Check gates and update counters atomically on the loop."""
+        if not self._check_charge():
+            return
+        rt = self._rt
         rt.counters.turns += 1
         exhausted = board_read and rt.counters.board_reads >= rt.limits.max_board_reads_per_round
         if board_read and not exhausted:
@@ -248,7 +527,7 @@ class AgentContext:
             )
         )
         if exhausted:
-            raise _core_signal(SoftError("max_board_reads_per_round reached"))
+            raise _core_signal(SoftError(_BOARD_READ_LIMIT_MESSAGE))
 
     def _manager(self, candidate: Candidate) -> Candidate:
         """Filter feedback without exposing mutable runtime-owned containers."""
@@ -274,7 +553,7 @@ class AgentContext:
             try:
                 candidate = self._rt.view.get_candidate(id)
             except (KeyError, ValueError):
-                raise _core_signal(SoftError(f"unknown candidate: {id}")) from None
+                raise _core_signal(SoftError(_UNKNOWN_CANDIDATE_MESSAGE.format(id=id))) from None
         return candidate
 
     def _learning(self, id: str) -> Learning:
@@ -403,7 +682,9 @@ class AgentContext:
         Candidate
             Result with manager-visible check feedback. New results record the
             ordered read identifiers at action entry. Linked or recovered results
-            retain their original read provenance.
+            retain their original read provenance. A live admission gate keeps its
+            budget or deadline reason when the in-flight registry has also closed.
+            Registry refusal does not consume a turn or append counter events.
 
         Examples
         --------
@@ -415,12 +696,34 @@ class AgentContext:
             if edits is None
             else {_context_string(path, "edits path"): text for path, text in edits.items()}
         )
-        self._charge()
-        read_ids = tuple(self._read_ids)
-        candidate = await execute_tool_run(
-            self._rt, inputs, parents=parents, replicate=replicate, edits=edits, read_ids=read_ids
-        )
-        return self._manager(candidate)
+        self._check_admission()
+        inflight = _inflight.get()
+        with inflight.run() if isinstance(inflight, _ActionInflight) else nullcontext():
+            self._charge()
+            read_ids = tuple(self._read_ids)
+            candidate = await execute_tool_run(
+                self._rt,
+                inputs,
+                parents=parents,
+                replicate=replicate,
+                edits=edits,
+                read_ids=read_ids,
+            )
+            if (
+                isinstance(inflight, _ActionInflight)
+                and candidate.output.usage.usd is not None
+                and candidate.output.usage.usd > USD_LIMIT
+            ):
+                # Only this returned core result proves an owned overflow source.
+                # Preserve the ledger's registered outcome before a later read
+                # gate can replace it with an ordinary budget limit.
+                try:
+                    self._rt.ledger._check_usage_overflow()
+                except LimitReached as error:
+                    for timer in _local_timers.get():
+                        timer.record(error)
+                    raise
+            return self._manager(candidate)
 
     def my_candidates(self) -> list[Candidate]:
         """
@@ -650,6 +953,8 @@ class AgentContext:
         """
         Read a visible candidate with private feedback removed.
 
+        A lookup outside the fixed view consumes neither a turn nor a board read.
+
         Parameters
         ----------
         id : str
@@ -688,8 +993,9 @@ class AgentContext:
         id = _context_string(id, "id")
 
         def read() -> Candidate:
-            self._charge(board_read=True)
+            self._check_charge()
             candidate = self._candidate(id)
+            self._charge(board_read=True)
             self._read_ids[id] = None
             return self._manager(candidate)
 
@@ -954,6 +1260,11 @@ class AgentContext:
         JsonValue
             Handler result.
 
+        Notes
+        -----
+        Registered core controls, including terminal cleanup failures, propagate
+        to the caller. Other handler failures become safe ``SoftError`` results.
+
         Examples
         --------
         Use in-memory service doubles to exercise the action without storage.
@@ -998,8 +1309,14 @@ class AgentContext:
         try:
             return await action.handler(self, validated)
         except BaseException as error:
+            if _defer_timer_error(error):
+                # Only the timer owner can distinguish derived cancellation
+                # from caller cancellation after its cancel scope has exited.
+                raise
             error = outcome.classify(error)
-            if _is_core_signal(error) and isinstance(error, (SoftError, LimitReached)):
+            if _is_core_control(error) or (
+                _is_core_signal(error) and isinstance(error, (SoftError, LimitReached))
+            ):
                 raise error from None
             raise _core_signal(SoftError(f"action failed: {_exception_type_name(error)}")) from None
         finally:

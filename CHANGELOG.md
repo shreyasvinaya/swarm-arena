@@ -9,6 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rosenbrock examples with LLM managers and an advisory judge panel, plus offline
+  exit tests for exact call accounting, replay and a model-managed final slice.
+
+- `swarm-arena plan` validates and estimates manual plans or saves catalog-admitted
+  LLM and terminal-reviewed proposals with planning-session provenance, safe output
+  handling, and shared interrupt cleanup.
+
+- Candidate trace and board pages show recorded planner, manager, tool and judge
+  LLM calls, standalone planning provenance, cache origins and trace URLs; run
+  pages report per-agent prompt-cache rates and response-cache hit counts from
+  the same retained committed generation, without requiring LLM extras.
+
+- Opt-in Langfuse sessions and LLM trace links for managers, judges, planners and
+  curators, with per-scope consent, no default vendor tracing and bounded
+  process-exit exporter cleanup.
+
+- Provider failures outside agents preserve panel survivor identities, pause ranking
+  policies, and skip replanning or curation with durable completion receipts;
+  resume reuses failed batches and skipped phases without repeating paid work.
+
+- Run-wide provider pauses retain agent capacity, recover through uncached probes
+  before fresh-round shares, and replay provider generations and causes on resume.
+
+- CollaborativePlanner supports bounded human approval, accumulated feedback and
+  catalog-admitted edits in one planning session, with a cancellable terminal
+  reviewer and supervised editor cleanup.
+- `LLMCurator` merges evidence-backed round learnings through metered structured
+  calls, with bounded invocation cleanup and invocation-validated summary call links.
+
+- LLMPlanner generates catalog-authorized drafts, freezes human goal identity,
+  and preserves human components during autonomous replanning; standalone planning
+  sessions meter and journal calls with replayable provenance links in saved plans.
+
+- LLMJudge scores fixed rubrics against goal descriptions and inputs with
+  mixed-provider panels, repeated anchors,
+  survivor identities and metered structured-output fallback; full-call input
+  funding is checked before provider dispatch and accounting drains before return.
+
+- Offline manager and judge conformance checks run in isolated, bound LLM scopes with
+  registered run setups, verify self-drain and requesting-call provenance,
+  force parallel manager tool calls, and accept a model catalog through
+  `check_judge(..., config=...)`. `check_manager` classifies
+  user-created limit exceptions as manager errors while registered limits,
+  including nested groups, end only the affected round.
+
+- AgentsSDKManager runs a fresh metered Agents SDK conversation each round,
+  exposes authorized context actions and finish_round, honors core limits, and
+  drains usage accounting on success, failure, timeout and cancellation.
+
+- Manager actions as SDK function tools, with validated schemas, per-call
+  provenance, bounded feedback-redacted results, untrusted board content,
+  cross-goal learning text with evidence trimming and value-free out-of-view
+  and read-limit evidence markers,
+  recoverable soft errors, and terminal controls that stop further model turns.
+
+- Metered LLM calls reserve against committed tranche credit, protect per-call
+  tracking and output caps, link requested tools to their call, and preserve
+  registered budget, fencing and cleanup controls across SDK boundaries.
+
+- LiteLLM call logging with per-run catalog prices, exact cache-lifetime usage,
+  conservative failed-call charging, proven response-cache origins, and idempotent
+  logger/cache installation under the owning run lifetime. Cache backend settings
+  are process-wide, with clear configuration refusals; role switches and namespaces
+  remain per scope.
+
+- Lazy `FakeModel` and `FakeTurn` helpers replay isolated offline LLM
+  conversations, capture SDK inputs, and record exact catalog-priced usage
+  through the real journal and reservation settlement path. Missing LLM extras
+  retain one safe installation hint through lazy imports and plan admission.
+- Per-call LLM settings with tracking metadata, Claude prompt-cache points,
+  per-role response-cache controls, complete probe bypass and replayable cache origins.
+
+- Manager prompts keep system instructions and frozen reference files ahead of round facts;
+  shared untrusted-content wrapping removes embedded markers before digest byte capping.
+- Model alias, role, capability and price validation for plans, replanners and
+  curators; exact cache-lifetime-aware LLM costs, conservative call estimates,
+  and LiteLLM or registered offline model construction.
+
+- Optional `llm`, `cache`, and `langfuse` dependencies, an LLM import guard,
+  bundled LiteLLM prices, and offline upstream compatibility checks.
+
+- Core LLM call recording with replayable deduplication and cache provenance,
+  exact reservation accounting, bounded missing-report cleanup, and supervised
+  fresh/resumed run bindings without optional provider dependencies.
 - Local `board serve` viewer with search, filters, pagination, evidence and lineage
   pages, and token-protected pin, hide and add curation.
 - Offline arena commands export/import human reviews, rank runs and namespaces,
@@ -48,6 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Swarm.resume` continues committed runs with auditable lease takeover,
   conservative lost-run accounting, restored round state, and repaired result views.
+  Replayed budget exhaustion permits setup and reserve-funded completion;
+  completed budget-stopped goals reuse recorded results without new paid work.
 
 - CLI `run`, `status`, `stop`, and `resume` commands support terminal approval,
   sorted plan directories, committed status, epoch-scoped stops, and saved or

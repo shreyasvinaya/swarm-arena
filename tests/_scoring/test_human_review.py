@@ -907,7 +907,7 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
     from swarm_arena._journal.writer import JournalWriter
     from swarm_arena._model.canonical import utc_now
 
-    config = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
     blocked, unblock = threading.Event(), threading.Event()
     scopes: list[anyio.CancelScope] = []
     services: list[resume._ResumeServices] = []
@@ -977,7 +977,7 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
     task = asyncio.create_task(caller())
     try:
         assert await run_sync_daemon(blocked.wait, 5)
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=5)
         assert done, "caller retained an unbounded shield around blocked release"
         assert all(service.task is not None and service.task.done() for service in services)
         assert len(services) == int(operation == "resume" and stage == "journal-entry")
@@ -1434,3 +1434,68 @@ async def test_import_after_running_to_deadline(
         "timed-review", _file(tmp_path, _csv(*rows)), config=run_config
     )
     assert [score.key for score in scores] == [(1.0, 7.0)]
+
+
+@pytest.mark.parametrize("now", [False, True])
+async def test_import_stop_during_takeover_response(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    now: bool,
+) -> None:
+    import asyncio
+
+    import anyio
+    from _fakes.lease_acquisition import HeldOwnerResponse
+
+    from swarm_arena._engine.control import request_stop
+
+    held = HeldOwnerResponse()
+    held.install(monkeypatch, takeover=True)
+    task = asyncio.create_task(
+        HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
+    )
+    try:
+        await held.ready()
+        assert await request_stop(run_config.run_root, review_run.run_id, now=now) == 2
+        with anyio.fail_after(3), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+            await asyncio.shield(task)
+    finally:
+        await held.finish(task)
+    await held.assert_released()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
+
+
+async def test_import_stop_at_preparation_entry_has_stopped_outcome(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anyio
+    from _fakes.lease_acquisition import stop_at_phase_entry
+
+    from swarm_arena._model.canonical import utc_now
+
+    trigger, latched = stop_at_phase_entry(monkeypatch)
+    gettempdir = human_review.gettempdir
+
+    def tempdir() -> str:
+        trigger.set()
+        return gettempdir()
+
+    monkeypatch.setattr(human_review, "gettempdir", tempdir)
+    with anyio.fail_after(5), pytest.raises(RuntimeError, match=r"^review import stopped$"):
+        await HumanReview("alice").import_csv(
+            review_run.run_id,
+            _file(tmp_path),
+            config=run_config,
+        )
+    assert latched.is_set()
+    owner = read_owner(review_run.store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))

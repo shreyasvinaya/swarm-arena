@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
 import pytest
@@ -1108,8 +1108,8 @@ async def test_waiting_continued_goal_converges_on_early_end(
 
     closed = anyio.Event()
 
-    def signalling_close(self: Inflight) -> None:
-        real_close(self)
+    def signalling_close(self: Inflight, *, budget: bool = False) -> None:
+        real_close(self, budget=budget)
         closed.set()
 
     monkeypatch.setattr(GoalRunner, "run", counted_goal)
@@ -1372,6 +1372,32 @@ async def test_preparation_failure_closes_and_sanitizes(
     assert owner[0].expires_at < utc_now()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_orphan_recovery_exit_terminal(
+    crashed: Crashed, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+    spy = _SpyExecutor(Path(crashed.config.run_root) / "spy")
+
+    async def fail(started: Job.Started) -> bool:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("resume", [BaseExceptionGroup("orphan", [error])])
+        raise error
+
+    monkeypatch.setattr(spy, "kill_orphan", fail)
+    config = crashed.config_with(spy, monkeypatch)
+    with pytest.raises(RuntimeError) as caught:
+        await resume_run(config, crashed.run_id, force=True, replanner=None)
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert spy.closed_count == 1
+    assert not _events(crashed, "run_lost")
+
+
 async def test_post_takeover_limit_recheck_is_auditable(
     crashed: Crashed, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1573,7 +1599,8 @@ async def test_resume_shutdown_bound_and_primary_failure(
         await release.wait()
 
     monkeypatch.setattr(spy, "aclose", close)
-    config = crashed.config_with(spy, monkeypatch).model_copy(update={"settle_timeout_s": 0.05})
+    # Normal writer/lease cleanup must finish before the executor is observed.
+    config = crashed.config_with(spy, monkeypatch).model_copy(update={"settle_timeout_s": 2.0})
     runner = await resume_run(config, crashed.run_id, force=True, replanner=None)
     assert runner.resumed is not None
     expected = {"g": [runner.resumed.state.candidates["c1"]]}
@@ -1588,7 +1615,7 @@ async def test_resume_shutdown_bound_and_primary_failure(
     try:
         with anyio.fail_after(10):
             await closing.wait()
-        done, _ = await asyncio.wait({task}, timeout=1)
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert task in done, "executor shutdown exceeded its configured bound"
         if fenced:
             with pytest.raises(Fenced) as error:
@@ -1603,6 +1630,10 @@ async def test_resume_shutdown_bound_and_primary_failure(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+        services = runner.resumed._services
+        assert services.task is not None
+        with anyio.fail_after(10):
+            await asyncio.shield(services.task)
 
 
 class _CrashBoundary(BaseException):
@@ -2509,3 +2540,441 @@ async def test_resume_segment_failure_is_contained(
     assert _is_core_signal(caught.value)
     assert marker not in "".join(traceback.format_exception(caught.value))
     assert store.read("control/owner.json") == owner
+
+
+@pytest.fixture
+async def model_resume_run(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> tuple[RunConfig, LocalStore]:
+    """Cancel a public three-round run during round two, as in the resume probe."""
+    import asyncio
+
+    from _fakes.run import plan
+
+    config = with_limits(run_config, max_tokens=1_000_000_000, max_usd=1_000_000)
+    ready = anyio.Event()
+
+    async def pause(self: ScriptedManager, ctx: AgentContext) -> RoundReport:
+        if ctx.round == 2:
+            ready.set()
+            await anyio.sleep_forever()
+        return RoundReport()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ScriptedManager, "run_round", pause)
+        current = Plan.loads(plan(rounds=3).dumps(), base_dir=Path(config.run_root).parent)
+        task = asyncio.create_task(Swarm(config).run(current, run_id="model-resume"))
+        task.add_done_callback(lambda _: ready.set())
+        try:
+            with anyio.fail_after(10):
+                await ready.wait()
+            if task.done():
+                await task
+                pytest.fail("seed finished before the round-two checkpoint")
+        finally:
+            task.cancel()
+            with anyio.fail_after(10):
+                await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+    return config, LocalStore(Path(config.run_root) / "model-resume")
+
+
+def _resume_bytes(store: LocalStore) -> dict[str, bytes]:
+    """Snapshot ownership, lease, journal and published files before takeover."""
+    return {key: store.read(key).data for key in store.list("")}
+
+
+@pytest.mark.parametrize("role", ["planner", "curator"])
+@pytest.mark.parametrize("invalid", ["unknown", "token_cap", "role", "price", "capability"])
+async def test_resume_startup_models_refused_before_takeover(
+    model_resume_run: tuple[RunConfig, LocalStore],
+    monkeypatch: pytest.MonkeyPatch,
+    role: Literal["planner", "curator"],
+    invalid: str,
+) -> None:
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    from swarm_arena._planning import validate as validation
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    config, store = model_resume_run
+    calls: list[str] = []
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            calls.append("models")
+            return ("nope",)
+
+        async def plan(self, goal: Goal, config: RunConfig, history: Any) -> Plan:
+            calls.append("plan")
+            return await super().plan(goal, config, history)
+
+    if role == "curator":
+        pytest.importorskip("litellm")
+        from _fakes.llm_components import AliasCurator
+
+        def models(self: AliasCurator) -> tuple[str, ...]:
+            calls.append("models")
+            return ("nope",)
+
+        monkeypatch.setattr(AliasCurator, "models", models)
+        config = config.model_copy(
+            update={
+                "curator": Ref(path="_fakes.llm_components:AliasCurator", config={"model": "nope"})
+            }
+        )
+    expected = {
+        "unknown": "alias 'nope' is not allowed",
+        "token_cap": "limits.max_tokens is required",
+        "role": "alias 'nope' is not allowed",
+        "price": "alias 'nope' has no known price",
+        "capability": "startup capability refused",
+    }[invalid]
+    if invalid != "unknown":
+        config = config.model_copy(
+            update={
+                "models": ModelCatalog(
+                    {
+                        "nope": ModelSpec(
+                            model="fake/unpriced",
+                            roles=["manager"] if invalid == "role" else [role],
+                            prices=None
+                            if invalid == "price"
+                            else ModelSpec.Prices(input=1, output=1),
+                        )
+                    }
+                )
+            }
+        )
+    if invalid in {"unknown", "token_cap"}:
+        config = with_limits(config, max_tokens=None)
+    if invalid == "capability":
+        monkeypatch.setattr(
+            validation,
+            "_MODEL_CHECKS",
+            [lambda uses, cfg: (["startup capability refused"] if uses.get(role) else [], [])],
+        )
+    before = _resume_bytes(store)
+    owner = read_owner(store)
+    replanner = AliasPlanner([plan(rounds=3)]) if role == "planner" else None
+    with pytest.raises(ValueError, match=expected) as caught:
+        await Swarm(config, replanner=replanner).resume("model-resume", force=True)
+    if invalid == "unknown":
+        assert "limits.max_tokens is required" in str(caught.value)
+    assert calls == ["models"]
+    assert read_owner(store) == owner
+    assert _resume_bytes(store) == before
+
+
+@pytest.mark.parametrize("role", ["planner", "curator"])
+async def test_resume_startup_models_preserve_structured_warnings(
+    model_resume_run: tuple[RunConfig, LocalStore],
+    monkeypatch: pytest.MonkeyPatch,
+    role: Literal["planner", "curator"],
+) -> None:
+    pytest.importorskip("litellm")
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    from swarm_arena.config import ModelCatalog, ModelSpec
+    from swarm_arena.llm import _catalog
+
+    class AliasPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            return ("p",)
+
+    config, store = model_resume_run
+    config = config.model_copy(
+        update={
+            "models": ModelCatalog(
+                {
+                    "p": ModelSpec(
+                        model="fake/p", roles=[role], prices=ModelSpec.Prices(input=1, output=1)
+                    )
+                }
+            )
+        }
+    )
+    if role == "curator":
+        config = config.model_copy(
+            update={
+                "curator": Ref(path="_fakes.llm_components:AliasCurator", config={"model": "p"})
+            }
+        )
+    monkeypatch.setattr(_catalog, "supports", lambda spec, feature: False)
+    replanner = AliasPlanner([plan(rounds=3)]) if role == "planner" else None
+    await Swarm(config, replanner=replanner).resume("model-resume", force=True)
+    committed = read_committed(store)
+    assert committed is not None
+    takeovers = [e for e in committed[1] if e.type == "takeover"]
+    assert len(takeovers) == 1
+    assert takeovers[0].payload["warnings"] == [
+        f"alias 'p' for role '{role}' uses the two-stage fallback"
+    ]
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel", "held"])
+async def test_resume_startup_models_contain_hooks_before_takeover(
+    model_resume_run: tuple[RunConfig, LocalStore], failure: str
+) -> None:
+    import asyncio
+    import traceback
+
+    from _fakes.planners import SequencePlanner
+    from _fakes.run import plan
+
+    config, store = model_resume_run
+    before = _resume_bytes(store)
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    secret = "private-model-hook-value"
+
+    class HookPlanner(SequencePlanner):
+        def models(self) -> tuple[str, ...]:
+            if failure == "error":
+                raise RuntimeError(secret)
+            if failure == "cancel":
+                raise asyncio.CancelledError(secret)
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(20)
+            return ()
+
+    task = asyncio.create_task(
+        Swarm(config, replanner=HookPlanner([plan(rounds=3)])).resume("model-resume", force=True)
+    )
+    try:
+        with anyio.fail_after(8):
+            if failure == "held":
+                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert _resume_bytes(store) == before
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not release.is_set()
+            else:
+                with pytest.raises(ValueError, match="model checks failed") as caught:
+                    await task
+                assert secret not in "".join(traceback.format_exception(caught.value))
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(8):
+            await asyncio.gather(task, return_exceptions=True)
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 5)
+                assert not worker.is_alive()
+    assert _resume_bytes(store) == before
+
+
+async def test_resume_startup_models_restore_recorded_import_base(
+    model_resume_run: tuple[RunConfig, LocalStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    pytest.importorskip("litellm")
+    from swarm_arena.config import ModelCatalog, ModelSpec
+
+    config, _ = model_resume_run
+    base = Path(config.run_root).parent
+    (base / "local_resume_curator.py").write_text(
+        "from _fakes.llm_components import AliasCurator\n", encoding="utf-8"
+    )
+    config = config.model_copy(
+        update={
+            "curator": Ref(path="local_resume_curator:AliasCurator", config={"model": "c"}),
+            "models": ModelCatalog(
+                {
+                    "c": ModelSpec(
+                        model="fake/c",
+                        roles=["curator"],
+                        prices=ModelSpec.Prices(input=1, output=1),
+                    )
+                }
+            ),
+        }
+    )
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry != str(base)])
+    try:
+        result = await Swarm(config).resume("model-resume", force=True)
+        assert set(result) == {"g"}
+    finally:
+        sys.modules.pop("local_resume_curator", None)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_public_resume_refuses_planning_session_without_mutation(
+    run_config: RunConfig, tmp_path: Path, capsys: pytest.CaptureFixture[str], completed: bool
+) -> None:
+    from swarm_arena._cli.main import main
+
+    config = run_config
+    run_id = "planning-session"
+    store = LocalStore(Path(config.run_root) / run_id)
+    lease = Lease.acquire_new(store, owner_id="previous", host="local", ttl_s=60)
+    async with JournalWriter(
+        store,
+        lease,
+        run_id=run_id,
+        next_seq=1,
+        local_path=tmp_path / "planning.jsonl",
+        sync_interval_s=60,
+        settle_timeout_s=2,
+    ) as journal:
+        journal.append(
+            EventDraft(type="run_config", payload={"config": config.model_dump(mode="json")})
+        )
+        journal.append(
+            EventDraft(
+                type="run_started",
+                payload={"planning": True, "final_slices": {"g": Amount().model_dump()}},
+            )
+        )
+        journal.append(EventDraft(type="goal_started", goal_id="g"))
+        if completed:
+            journal.append(
+                EventDraft(
+                    type="goal_finished", goal_id="g", payload={"reason": "planning complete"}
+                )
+            )
+        await journal.commit()
+    # The unfinished variant is the durable prefix left by a crashed session.
+    before = read_committed(store)
+    assert before is not None
+    owner = read_owner(store)
+    assert RunState.from_events(before[1]).goals["g"].finished is completed
+    message = "run is a planning session; it cannot be resumed"
+    with pytest.raises(ValueError, match=message):
+        await Swarm(config).resume(run_id, force=True)
+    assert read_committed(store) == before
+    assert read_owner(store) == owner
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(config.dumps())
+    code = await anyio.to_thread.run_sync(
+        main,
+        ["resume", str(Path(config.run_root) / run_id), "--config", str(config_path), "--force"],
+    )
+    assert code == 1
+    assert message in capsys.readouterr().err
+    assert read_committed(store) == before
+    assert read_owner(store) == owner
+
+
+@pytest.mark.parametrize("healthy", [True, False, "ordinary", "budget"])
+async def test_provider_causes_survive_takeover_and_only_fresh_round_probes(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    healthy: bool | str,
+) -> None:
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    c = await _crash(tmp_path, run_config, recorders, lost=(), completed=())
+    await _append(
+        c,
+        EventDraft(
+            type="provider_failed",
+            payload={
+                "variant": "transition",
+                "transition": "failed",
+                "provider": "retired-provider",
+                "generation": 1,
+                "source": "manager",
+                "stopped": ["g/t/a"],
+            },
+        ),
+    )
+    seen: list[tuple[str, int]] = []
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        seen.append((provider, scope.round))
+        if healthy == "ordinary":
+            raise KeyError("private-probe-message")
+        if healthy == "budget":
+            from swarm_arena._budget.amount import Amount
+
+            await scope.tranche.reserve_call(Amount(usd=1_000_000))
+        return healthy is True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+    await Swarm(c.config).resume(c.run_id, force=True)
+    assert seen == [("retired-provider", 2)]
+    paused = next(e for e in _events(c, "agent_status") if e.agent == "a" and e.round == 1)
+    assert (paused.payload["status"], paused.payload["reason"]) == (
+        "stopped",
+        "provider unavailable",
+    )
+    starts = [e for e in _events(c, "tool_start") if e.agent == "a"]
+    assert [e.round for e in starts] == ([2] if healthy is True else [])
+    transitions = [e.payload for e in _events(c, "provider_failed")]
+    assert any(p.get("transition") == "recovered" for p in transitions) is (healthy is True)
+    assert not RunState.from_events(_events(c)).provider_causes
+    if healthy == "budget":
+        assert (
+            next(e for e in _events(c, "goal_finished") if e.goal_id == "g").payload["reason"]
+            == "goal budget"
+        )
+    assert "private-probe-message" not in str([e.payload for e in _events(c)])
+
+
+async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._budget.llm_scope import LLMScope
+    from swarm_arena._engine import stops as stops_module
+
+    config = with_limits(run_config, max_agents_total=1, max_concurrent_goals=2)
+    c = await _crash(
+        tmp_path,
+        config,
+        recorders,
+        plans=[_plan("g", agents=("a",)), _plan("h", agents=("b",))],
+        queued=("h",),
+        lost=(),
+        completed=(),
+    )
+    await _append(
+        c,
+        EventDraft(
+            type="provider_failed",
+            payload={
+                "variant": "transition",
+                "transition": "failed",
+                "provider": "retired-provider",
+                "generation": 1,
+                "source": "manager",
+                "stopped": ["g/t/a"],
+            },
+        ),
+    )
+    entered, release = anyio.Event(), anyio.Event()
+
+    async def probe(provider: str, scope: LLMScope) -> bool:
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(stops_module, "_probe", probe)
+
+    async def resume() -> None:
+        await Swarm(c.config).resume(c.run_id, force=True)
+
+    with anyio.fail_after(25):
+        async with anyio.create_task_group() as group:
+            group.start_soon(resume)
+            try:
+                await entered.wait()
+                assert not any(e.goal_id == "h" for e in _events(c, "goal_started"))
+            finally:
+                release.set()
+    events = _events(c)
+    g_done = next(e.seq for e in events if e.type == "goal_finished" and e.goal_id == "g")
+    h_start = next(e.seq for e in events if e.type == "goal_started" and e.goal_id == "h")
+    assert g_done < h_start

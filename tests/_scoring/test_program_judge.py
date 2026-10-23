@@ -22,6 +22,29 @@ SECRET = "6dca447c8d41f358f1c5dcc3d2e651cb"
 _REQUEST: contextvars.ContextVar[str] = contextvars.ContextVar("request", default="unset")
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_program_judge_exit_terminal(
+    judge_ctx: JudgeContext, monkeypatch: pytest.MonkeyPatch, nested: bool
+) -> None:
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[bool] = []
+
+    def fail(*args: Any) -> None:
+        reached.append(True)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("judge", [BaseExceptionGroup("score", [error])])
+        raise error
+
+    monkeypatch.setattr(program_judge, "_score_copy", fail)
+    with pytest.raises(RuntimeError) as caught:
+        await ProgramJudge(rosen_score).judge(GOAL, [cand(id="c1")], judge_ctx)
+    assert reached == [True]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert not judge_ctx.errors
+
+
 async def test_scores_each_candidate(judge_ctx: JudgeContext) -> None:
     c1, c2 = cand(id="c1", data={"f": 2.0}), cand(id="c2", data={"f": 0.5})
     scores = await ProgramJudge(rosen_score).judge(GOAL, [c1, c2], judge_ctx)

@@ -35,6 +35,42 @@ from swarm_arena._model.ref import (
 )
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_validate_config_control_disposition(kind: str, nested: bool) -> None:
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena._model.ref import _validate_config
+    from swarm_arena.manager import LimitReached
+
+    class Input(BaseModel):
+        @model_validator(mode="before")
+        @classmethod
+        def terminal(cls, value: Any) -> Any:
+            error: BaseException = (
+                _stop_cleanup_error()
+                if kind == "terminal"
+                else _core_signal(LimitReached("stop", "the round is stopping"))
+                if kind == "limit"
+                else _core_error(ProviderFailed, "provider")
+            )
+            if nested:
+                raise BaseExceptionGroup("config", [BaseExceptionGroup("validator", [error])])
+            raise error
+
+    with pytest.raises(RuntimeError if kind == "terminal" else ConfigError) as caught:
+        _validate_config(Input, {}, where="component")
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )
+
+
 def test_path_format() -> None:
     assert Ref(path="a.b:C.D").path == "a.b:C.D"
     with pytest.raises(ValidationError):
@@ -563,6 +599,23 @@ def test_reference_of_omits_absent_typed_defaults() -> None:
 
     ref = Ref.of(LocalExecutor())
     assert ref.build(LocalExecutor).config == LocalExecutor().config
+
+
+def test_untrusted_missing_llm_import_keeps_values_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "untrusted-module-secret-sentinel"
+
+    def fail(name: str) -> object:
+        raise ModuleNotFoundError(secret, name="agents")
+
+    # An earlier test in the same process may have cached the real lookup.
+    load_object.cache_clear()
+    monkeypatch.setattr(importlib, "import_module", fail)
+    try:
+        with pytest.raises(ValueError, match=r"cannot import swarm_arena\.llm:LLMJudge") as caught:
+            load_object("swarm_arena.llm:LLMJudge")
+    finally:
+        load_object.cache_clear()
+    assert_secret_absent(caught.value, secret, sanitized=True)
 
 
 def test_reference_of_never_drops_explicit_null_with_nonnull_default(

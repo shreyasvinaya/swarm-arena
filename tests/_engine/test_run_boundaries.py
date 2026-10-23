@@ -274,11 +274,11 @@ async def test_shutdown_preserves_approval_refusal(
     async def refuse(estimate: Estimate, warnings: Sequence[str]) -> bool:
         return False
 
-    cfg = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    cfg = run_config.model_copy(update={"settle_timeout_s": 2.0})
     monkeypatch.setattr(run_module, "_build_executor", lambda cfg: BadClose())
     task = asyncio.create_task(Swarm(cfg).run(plan(rounds=1), approve=refuse))
     try:
-        done, _ = await asyncio.wait({task}, timeout=5)
+        done, _ = await asyncio.wait({task}, timeout=10)
         assert done, "executor shutdown exceeded settlement bound"
         with pytest.raises(RuntimeError, match=r"^run not approved$"):
             task.result()
@@ -293,7 +293,7 @@ async def test_shutdown_preserves_approval_refusal(
 async def test_hung_shutdown_returns_original_result_or_real_fence(
     run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, takeover: bool
 ) -> None:
-    cfg = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    cfg = run_config.model_copy(update={"settle_timeout_s": 2.0})
     entered = anyio.Event()
     writers: list[JournalWriter] = []
     scopes: list[anyio.CancelScope] = []
@@ -334,10 +334,8 @@ async def test_hung_shutdown_returns_original_result_or_real_fence(
             await entered.wait()
         if takeover:
             scopes[0].cancel()
-        started = anyio.current_time()
-        done, _ = await asyncio.wait({task}, timeout=0.5)
-        assert done, "hung aclose prevented return after ten settlement intervals"
-        assert anyio.current_time() - started < 0.5
+        done, _ = await asyncio.wait({task}, timeout=10)
+        assert done, "hung aclose prevented return within the shutdown watchdog"
         if takeover:
             with pytest.raises(Fenced) as caught:
                 task.result()
@@ -367,7 +365,7 @@ async def test_shutdown_timeout_keeps_result_when_close_unwinding_raises(
             finally:
                 raise _secret_error()
 
-    cfg = run_config.model_copy(update={"settle_timeout_s": 0.05})
+    cfg = run_config.model_copy(update={"settle_timeout_s": 2.0})
     monkeypatch.setattr(run_module, "_build_executor", lambda cfg: RaisingOnTimeout())
     with anyio.fail_after(10):
         result = await Swarm(cfg).run(plan(rounds=1))

@@ -3,8 +3,11 @@
 import csv
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context, ContextVar
 from dataclasses import replace
 from pathlib import Path
+from threading import current_thread
 from unittest.mock import Mock
 
 import pytest
@@ -23,7 +26,33 @@ async def arena_run(finished_run: FinishedRun) -> FinishedRun:
 
 
 def _call(run: FinishedRun, *args: str) -> int:
-    return main([*args, "--config", str(run.config_path)])
+    def invoke() -> int:
+        return Context().run(main, [*args, "--config", str(run.config_path)])
+
+    # Async fixtures can leave sniffio state in the test thread; the CLI owns its loop.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(invoke).result()
+
+
+def test_call_uses_a_fresh_thread_and_context(
+    review_cli_run: FinishedRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_thread = current_thread()
+    marker: ContextVar[str | None] = ContextVar("cli_test_context", default=None)
+
+    def entry(argv: list[str]) -> int:
+        assert current_thread() is not parent_thread
+        assert marker.get() is None
+        assert argv == ["leaderboard", "toy", "--config", str(review_cli_run.config_path)]
+        return 7
+
+    monkeypatch.setitem(globals(), "main", entry)
+    token = marker.set("parent")
+    try:
+        assert _call(review_cli_run, "leaderboard", "toy") == 7
+        assert marker.get() == "parent"
+    finally:
+        marker.reset(token)
 
 
 def _rows(output: str) -> list[list[str]]:

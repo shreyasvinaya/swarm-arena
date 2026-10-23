@@ -165,10 +165,132 @@ def test_terminal_prompt_subprocess(
         else:
             assert master is not None
             os.write(master, b"n\n")
-        # Include parent scheduling and interpreter shutdown on loaded CI hosts.
-        stdout, stderr = process.communicate(timeout=60)
+        # Allow scheduling noise, but keep prompt cancellation a behavior bound.
+        stdout, stderr = process.communicate(timeout=20)
         assert process.returncode == (130 if interrupt else 1), (output + stdout, stderr)
         assert stderr == (b"interrupted\n" if interrupt else b"run not approved\n")
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_sigint_during_handler_registration(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, os, signal
+from collections.abc import Callable
+from swarm_arena._cli.main import main
+before = signal.getsignal(signal.SIGINT)
+original = asyncio.SelectorEventLoop.add_signal_handler
+def register(
+    loop: asyncio.AbstractEventLoop, sig: int, callback: Callable[..., object], *args: object
+) -> None:
+    original(loop, sig, callback, *args)
+    # Exercise signal delivery before registration returns to _sigint_wakeup.
+    signal.raise_signal(signal.SIGINT)
+asyncio.SelectorEventLoop.add_signal_handler = register
+assert main() == 130
+assert os.get_blocking(0)
+assert signal.getsignal(signal.SIGINT) is before
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_double_sigint_restores_caller_handler(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, os, signal
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+before = signal.getsignal(signal.SIGINT)
+original = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    loop = asyncio.get_running_loop()
+    loop.call_soon(signal.raise_signal, signal.SIGINT)
+    loop.call_soon(signal.raise_signal, signal.SIGINT)
+    await original(fd)
+run_cmds.wait_readable = wait
+assert main() == 130
+assert os.get_blocking(0)
+assert signal.getsignal(signal.SIGINT) is before
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+def test_prompt_sigint_delivered_to_blocked_stdin_reader(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig
+) -> None:
+    code = """
+import asyncio, atexit, os, signal, sys, threading, time
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+reader_ready = threading.Event()
+deliver = threading.Event()
+sent = None
+def read_stdin() -> None:
+    # Open a separate file description: _prompt makes fd 0 nonblocking.
+    fd = os.open(os.ttyname(0), os.O_RDONLY)
+    reader_ready.set()
+    try:
+        os.read(fd, 1)
+    finally:
+        os.close(fd)
+reader = threading.Thread(target=read_stdin, daemon=True)
+reader.start()
+assert reader_ready.wait(5)
+def send() -> None:
+    global sent
+    assert deliver.wait(5)
+    sent = time.monotonic()
+    # Model process-directed SIGINT being delivered to a non-main thread.
+    # The reader remains blocked; it must not be joined to exit the process.
+    signal.pthread_kill(reader.ident, signal.SIGINT)
+sender = threading.Thread(target=send, daemon=True)
+sender.start()
+original_wait = run_cmds.wait_readable
+async def wait(fd: int) -> None:
+    # Dispatch only after the prompt has registered stdin and yielded. Keep
+    # the GIL until the loop blocks in its native selector, then wake sender.
+    asyncio.get_running_loop().call_soon(deliver.set)
+    await original_wait(fd)
+run_cmds.wait_readable = wait
+sys.setswitchinterval(1)
+def exiting() -> None:
+    assert sent is not None
+    assert reader.is_alive()
+    print(f"sigint-to-exit {time.monotonic() - sent}", flush=True)
+atexit.register(exiting)
+handler = signal.getsignal(signal.SIGINT)
+status = main()
+assert signal.getsignal(signal.SIGINT) is handler
+assert os.get_blocking(0)
+raise SystemExit(status)
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 130, (stdout, stderr)
+        assert stderr == b"interrupted\n"
+        assert float(stdout.split(b"sigint-to-exit ")[1]) < 5, (stdout, stderr)
     assert not Path(run_config.run_root).exists()
     assert not Path(run_config.artifact_root).exists()
 
@@ -301,19 +423,57 @@ def test_prompt_sigint_when_terminal_input_is_flushed(
     inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig, blocking: bool
 ) -> None:
     code = f"""
-import os, signal, termios
+import asyncio, os, signal, termios
 from swarm_arena._cli import run_cmds
 from swarm_arena._cli.main import main
 os.set_blocking(0, {blocking!r})
 original_wait = run_cmds.wait_readable
 async def wait(fd: int) -> None:
+    def interrupt() -> None:
+        # No parent input is queued: model Ctrl-C flushing the terminal input.
+        termios.tcflush(fd, termios.TCIFLUSH)
+        os.kill(os.getpid(), signal.SIGINT)
+    asyncio.get_running_loop().call_soon(interrupt)
     await original_wait(fd)
-    # Terminal Ctrl-C can discard the input that made the fd readable.
-    termios.tcflush(fd, termios.TCIFLUSH)
-    os.kill(os.getpid(), signal.SIGINT)
 from pytest import MonkeyPatch
 with MonkeyPatch.context() as patch:
     patch.setattr(run_cmds, "wait_readable", wait)
+    status = main()
+    assert os.get_blocking(0) is {blocking!r}
+    raise SystemExit(status)
+"""
+    with _child(["run", *map(str, inputs)], cli_env, terminal=True, code=code) as (
+        process,
+        _,
+    ):
+        output = _wait_prompt(process)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 130, (output + stdout, stderr)
+        assert stderr == b"interrupted\n"
+    assert not Path(run_config.run_root).exists()
+    assert not Path(run_config.artifact_root).exists()
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+def test_prompt_sigint_with_complete_line_queued(
+    inputs: tuple[Path, Path], cli_env: dict[str, str], run_config: RunConfig, blocking: bool
+) -> None:
+    code = f"""
+import os, select, signal
+from swarm_arena._cli import run_cmds
+from swarm_arena._cli.main import main
+os.set_blocking(0, {blocking!r})
+original_print = print
+def prompt_print(*args: object, **kwargs: object) -> None:
+    original_print(*args, **kwargs)
+    if args and args[0] == "Start the run? [y/N] ":
+        # Canonical tty readiness proves the parent's complete line is queued.
+        # Hold prompt consumption until SIGINT has actually been delivered.
+        assert select.select([0], [], [], 5)[0] == [0]
+        os.kill(os.getpid(), signal.SIGINT)
+from pytest import MonkeyPatch
+with MonkeyPatch.context() as patch:
+    patch.setattr(run_cmds, "print", prompt_print, raising=False)
     status = main()
     assert os.get_blocking(0) is {blocking!r}
     raise SystemExit(status)
@@ -325,7 +485,7 @@ with MonkeyPatch.context() as patch:
         output = _wait_prompt(process)
         assert master is not None
         os.write(master, b"y\n")
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 130, (output + stdout, stderr)
         assert stderr == b"interrupted\n"
     assert not Path(run_config.run_root).exists()

@@ -578,7 +578,11 @@ class HumanReview:
         ...     "r", Path("review.csv"), config=config)
         """
         from swarm_arena._engine.resume import _take_over
-        from swarm_arena._engine.run import _supervise_initialization, _supervise_writer
+        from swarm_arena._engine.run import (
+            _close_stop_watcher,
+            _supervise_initialization,
+            _supervise_writer,
+        )
         from swarm_arena._engine.stops import StopState
 
         config = config.model_copy(
@@ -598,9 +602,16 @@ class HumanReview:
             current = _read_state(store, run_id, doc)
             _review_keys(current, self._reviewer, config.arena_root, utc_now(), initial_scores)
 
+        stops = StopState()
         try:
             lease = await _take_over(
-                config, run_id, store, force=False, review=True, validate=validate_locations
+                config,
+                run_id,
+                store,
+                force=False,
+                review=True,
+                validate=validate_locations,
+                stops=stops,
             )
         except LeaseHeld:
             raise _core_error(
@@ -618,7 +629,7 @@ class HumanReview:
             )
             completed = False
             async with (
-                _supervise_initialization(store, lease.doc.epoch, StopState(), None, config),
+                _supervise_initialization(store, lease.doc.epoch, stops, None, config),
                 JournalWriter(
                     store,
                     lease,
@@ -670,6 +681,7 @@ class HumanReview:
                 raise _core_error(RuntimeError, "review import stopped")
             return scores
         finally:
+            await _close_stop_watcher(stops)
             if not entered:
                 with anyio.move_on_after(config.settle_timeout_s, shield=True):
                     with suppress(Fenced):

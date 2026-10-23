@@ -1,0 +1,1244 @@
+"""Record and settle calls within the lifetime of their entered run services.
+
+The core knows no provider SDK. A cache identity is a SHA-256 of the adapter's
+effective cache key, namespace and generating response identity, not a prompt
+hash. An adapter without proof of that identity must omit it.
+"""
+
+import asyncio
+import math
+import re
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Any, Literal, TypeVar
+
+import anyio
+from pydantic import JsonValue
+
+from swarm_arena._agent.manager import LimitReached
+from swarm_arena._budget.amount import USD_LIMIT, Amount
+from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
+from swarm_arena._engine.stops import RunClock, StopState
+from swarm_arena._errors import Fenced, StorageError, _core_error, _stop_cleanup_error
+from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._journal.a2a import agent_task_id
+from swarm_arena._journal.event import EventDraft
+from swarm_arena._journal.replay import RunState
+from swarm_arena._journal.writer import JournalWriter
+from swarm_arena._model.canonical import canonical_json, sha256_hex
+from swarm_arena._model.context_strings import _context_string
+from swarm_arena._model.detach import _detach_model, _plain
+from swarm_arena._model.ids import IdGen, run_tag
+from swarm_arena._model.limits import Limits
+from swarm_arena._model.results import LLMCall
+from swarm_arena._model.run_config import RunConfig
+from swarm_arena._model.settings import TracingConfig
+from swarm_arena._model.tooling import Usage
+from swarm_arena._outcomes import _has_core_fenced, _Outcome
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.io import _storage_io
+
+_T = TypeVar("_T")
+_NO_REPORT = "estimated: no LiteLLM record within settle_timeout_s; charged in full"
+_UNKNOWN_SPEND = "estimated: provider spend unknown; charged in full"
+_OVERFLOW = "usage_overflow: charged at the supported USD limit"
+
+
+@dataclass
+class _Pending:
+    scope: LLMScope
+    call_id: str
+    reservation_id: str
+    estimate: Amount
+    model_alias: str
+    model: str
+    provider: str
+    state: Literal["open", "claimed", "abandoned", "done"] = "open"
+    event: anyio.Event = field(default_factory=anyio.Event)
+    workers: set[anyio.CancelScope] = field(default_factory=set)
+    journaled: bool = False
+    actual: Amount | None = None
+    overflow: bool = False
+    settled: bool = False
+    error: Exception | None = None
+    cleanup_at: float = float("inf")
+
+
+@dataclass
+class _Binding:
+    journal: JournalWriter
+    ids: IdGen
+    artifacts: ArtifactStore
+    tracing: TracingConfig
+    loop: asyncio.AbstractEventLoop
+    stops: StopState
+    clock: RunClock
+    limits: Limits
+    settle_timeout_s: float
+    seen_litellm: dict[str, str] = field(default_factory=dict)
+    recorded: set[str] = field(default_factory=set)
+    originals: dict[str, str | None] = field(default_factory=dict)
+    pending: dict[str, _Pending] = field(default_factory=dict)
+    call_reservations: dict[str, str] = field(default_factory=dict)
+    scopes: dict[int, LLMScope] = field(default_factory=dict)
+    drained: set[int] = field(default_factory=set)
+    finished_scopes: set[int] = field(default_factory=set)
+    undrained_scopes: dict[int, int] = field(default_factory=dict)
+    workers: set[anyio.CancelScope] = field(default_factory=set)
+    active: bool = True
+    closing: bool = False
+    terminal: Exception | None = None
+    overflow_notified: set[int] = field(default_factory=set)
+    cleanup_at: float = float("inf")
+
+    def begin_cleanup(self) -> None:
+        """Start the owner's allowance once, only upon actual interruption."""
+        if math.isinf(self.cleanup_at):
+            self.cleanup_at = anyio.current_time() + self.settle_timeout_s
+            self.journal._stop_storage()
+
+    def track_scope(self, scope: LLMScope) -> None:
+        """Count each funded scope once until all its accounting has drained."""
+        if id(scope) not in self.scopes:
+            self.scopes[id(scope)] = scope
+            tranche = id(scope.tranche)
+            self.undrained_scopes[tranche] = self.undrained_scopes.get(tranche, 0) + 1
+
+    def finish_scope(self, scope: LLMScope) -> None:
+        """Release one scope's ownership without closing its shared tranche."""
+        if id(scope) not in self.finished_scopes:
+            self.finished_scopes.add(id(scope))
+            self.undrained_scopes[id(scope.tranche)] -= 1
+
+    def check(self) -> None:
+        """Preserve the writer's actual terminal cause, including cleanup expiry."""
+        if not self.active:
+            raise _core_error(Fenced, "run ownership lost")
+        self.journal._raise_if_fenced()
+        if self.terminal is not None:
+            raise self.terminal from None
+
+    def original(self, identity: str, call_id: str) -> None:
+        """Keep ambiguous producer identities unlinked, regardless of callback order."""
+        if identity not in self.originals:
+            self.originals[identity] = call_id
+        elif self.originals[identity] != call_id:
+            self.originals[identity] = None
+
+
+_bindings: dict[str, _Binding] = {}
+
+
+def bind_run(
+    run_id: str,
+    *,
+    journal: JournalWriter,
+    ids: IdGen,
+    artifacts: ArtifactStore,
+    tracing: TracingConfig,
+    committed: Sequence[LLMCall],
+    request_sha256: Mapping[str, str],
+    cache_identity: Mapping[str, str] | None = None,
+    stops: StopState | None = None,
+    clock: RunClock | None = None,
+    limits: Limits | None = None,
+    settle_timeout_s: float = 60,
+) -> None:
+    """Bind entered services and restore committed deduplication and cache indexes.
+
+    Parameters
+    ----------
+    run_id : str
+        Owned run identifier. A strictly newer writer epoch replaces its predecessor.
+    journal : JournalWriter
+        Entered writer on the current asyncio loop.
+    ids : IdGen
+        Run's shared identifier generator.
+    artifacts : ArtifactStore
+        Run payload store.
+    tracing : TracingConfig
+        Payload storage policy.
+    committed : Sequence[LLMCall]
+        Core-owned committed calls, in journal order.
+    request_sha256 : Mapping[str, str]
+        Replayed request digests; these do not establish cache provenance.
+    cache_identity : Mapping[str, str] or None, optional
+        Call ID to opaque generating-response digest, restored from replay.
+    stops : StopState or None, optional
+        The owner's live stop state. Standalone bindings get an empty state.
+    clock : RunClock or None, optional
+        The owner's existing active clock, never reset by fresh/resume owners.
+    limits : Limits or None, optional
+        The owner's run limits, or standalone defaults.
+    settle_timeout_s : float, default=60
+        Report and post-stop accounting allowance.
+
+    Notes
+    -----
+    Engine/session owners supply their existing stops, clock, limits and timeout
+    and use ``_bound_run`` for drain/close/unbind ordering. A low-level caller
+    assumes that same cleanup responsibility. No registry entry is installed
+    until every replay index has been validated.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> async def example() -> None:
+    ...     bind_run("demo", journal=Mock(spec=JournalWriter, epoch=1), ids=IdGen("demo", 1),
+    ...              artifacts=Mock(spec=ArtifactStore), tracing=TracingConfig(),
+    ...              committed=[], request_sha256={})
+    ...     unbind_run("demo")
+    >>> anyio.run(example)
+    """
+    run_id = _context_string(run_id, "run_id")
+    previous = _bindings.get(run_id)
+    if previous is not None and journal.epoch <= previous.journal.epoch:
+        raise _core_error(ValueError, f"run {run_id} is already bound")
+    if not math.isfinite(settle_timeout_s) or settle_timeout_s <= 0:
+        raise _core_error(ValueError, "invalid settle_timeout_s")
+    journal._check_open()
+    binding = _Binding(
+        journal,
+        ids,
+        artifacts,
+        tracing,
+        asyncio.get_running_loop(),
+        stops if stops is not None else StopState(),
+        clock if clock is not None else RunClock(0),
+        limits if limits is not None else Limits(),
+        settle_timeout_s,
+    )
+    identities = cache_identity or {}
+    for call in committed:
+        if call.run_id != run_id or call.id in binding.recorded:
+            raise _core_error(ValueError, "invalid committed LLM call identity")
+        binding.recorded.add(call.id)
+        if call.reservation_id is not None:
+            binding.call_reservations[call.id] = call.reservation_id
+        if call.litellm_call_id is not None:
+            binding.seen_litellm[call.litellm_call_id] = call.id
+        _digest(request_sha256.get(call.id))
+        identity = _digest(identities.get(call.id))
+        if identity is not None and call.status == "ok" and not call.cache_hit:
+            binding.original(identity, call.id)
+    if previous is not None:
+        _invalidate(previous)
+    _bindings[run_id] = binding
+
+
+def _invalidate(binding: _Binding) -> None:
+    """Retire adoption immediately and wake abandoned work on its owning loop."""
+    binding.active = False
+
+    def abandon() -> None:
+        for worker in tuple(binding.workers):
+            worker.cancel()
+        for entry in binding.pending.values():
+            entry.event.set()
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is binding.loop:
+        abandon()
+    elif not binding.loop.is_closed():
+        binding.loop.call_soon_threadsafe(abandon)
+
+
+def unbind_run(run_id: str, *, journal: JournalWriter | None = None) -> None:
+    """Invalidate the binding and abandon callbacks before services close.
+
+    Parameters
+    ----------
+    run_id : str
+        Run to forget. Repeated calls are harmless.
+    journal : JournalWriter or None, optional
+        Owner identity. A stale owner cannot remove a successor. Omit only to
+        explicitly remove whichever binding is current.
+
+    Examples
+    --------
+    >>> unbind_run("not-bound")
+    """
+    run_id = _context_string(run_id, "run_id")
+    binding = _bindings.get(run_id)
+    if binding is not None and (journal is None or journal is binding.journal):
+        del _bindings[run_id]
+        _invalidate(binding)
+
+
+def open_call(
+    scope: LLMScope,
+    *,
+    reservation_id: str,
+    estimate: Amount,
+    model_alias: str,
+    model: str,
+    provider: str,
+) -> str:
+    """Register an admitted reservation and allocate its stable call identifier.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Live component scope on the bound owner's loop.
+    reservation_id : str
+        Returned durable call reservation.
+    estimate : Amount
+        Full conservative charge when authoritative usage never arrives.
+    model_alias : str
+        Approved catalog alias.
+    model : str
+        Selected model identifier.
+    provider : str
+        Selected provider identifier.
+
+    Returns
+    -------
+    str
+        Preallocated call identifier, retained even by an estimated placeholder.
+
+    Examples
+    --------
+    This runs after ``await scope.tranche.reserve_call(estimate)``. The
+    returned identifier is included as ``metadata['call_id']`` in the request.
+    >>> IdGen("demo", 1).next("llm").startswith("llm-")
+    True
+    """
+    run_id = _context_string(scope.run_id, "run_id")
+    binding = _bindings.get(run_id)
+    if binding is None:
+        raise _core_error(ValueError, f"run {run_id} is not bound")
+    if asyncio.get_running_loop() is not binding.loop:
+        raise _core_error(ValueError, "open_call requires the bound owner loop")
+    binding.check()
+    if binding.closing or any(id(owner) in binding.drained for owner in scope.lineage()):
+        raise _core_error(ValueError, "LLM scope is drained")
+    if scope.journal is not binding.journal or scope.artifacts is not binding.artifacts:
+        raise _core_error(ValueError, "LLM scope does not belong to the bound run")
+    rid = _context_string(reservation_id, "reservation_id")
+    alias = _context_string(model_alias, "model_alias")
+    model = _context_string(model, "model")
+    provider = _context_string(provider, "provider")
+    if rid in binding.pending:
+        raise _core_error(ValueError, "LLM reservation is already open")
+    # Amount is core-owned at reservation admission; no model hooks run here.
+    if type(estimate) is not Amount or estimate.tokens < 0 or estimate.usd < 0:
+        raise _core_error(ValueError, "invalid call estimate")
+    cid = binding.ids.next("llm")
+    binding.pending[rid] = _Pending(scope, cid, rid, estimate, alias, model, provider)
+    binding.call_reservations[cid] = rid
+    for owner in scope.lineage():
+        binding.track_scope(owner)
+    return cid
+
+
+def pending_scope(metadata: Mapping[str, Any]) -> LLMScope | None:
+    """Find a live reservation's scope without relying on a task-local context.
+
+    Parameters
+    ----------
+    metadata : Mapping[str, Any]
+        Run and reservation identifiers from the adapter.
+
+    Returns
+    -------
+    LLMScope or None
+        Original scope, or None for absent, drained or unbound reservations.
+
+    Examples
+    --------
+    >>> pending_scope({"run_id": "absent", "reservation_id": "r"}) is None
+    True
+    """
+    run_id = _context_string(metadata.get("run_id", ""), "run_id")
+    rid = _context_string(metadata.get("reservation_id", ""), "reservation_id")
+    binding = _bindings.get(run_id)
+    entry = binding.pending.get(rid) if binding is not None else None
+    return (
+        entry.scope
+        if binding is not None and entry is not None and id(entry.scope) not in binding.drained
+        else None
+    )
+
+
+def _digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = _context_string(value, "cache/request digest")
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise _core_error(ValueError, "invalid LLM call digest")
+    return value
+
+
+async def _watch_owner(
+    binding: _Binding, scope: anyio.CancelScope, interrupt_reports: bool = False
+) -> None:
+    """Bound foreign callback tasks by the same stop state and active clock."""
+    cleanup_at = float("inf")
+    while True:
+        if not binding.active:
+            scope.cancel()
+            return
+        if interrupt_reports:
+            try:
+                binding.check()
+            except Exception:
+                scope.cancel()
+                return
+        left = binding.clock.left(binding.limits.run_timeout_s)
+        if binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
+            binding.begin_cleanup()
+            if interrupt_reports:
+                scope.cancel()
+                return
+        elif binding.stops.stop and not interrupt_reports and math.isinf(cleanup_at):
+            # Graceful judging retains its own limits. Bound this storage wait
+            # without spending later invocations' or teardown's allowance.
+            # Report arrival has its caller's timer, separate from storage.
+            cleanup_at = anyio.current_time() + binding.settle_timeout_s
+            binding.journal._stop_storage()
+        deadline = min(cleanup_at, binding.cleanup_at)
+        if not math.isinf(deadline):
+            left = deadline - anyio.current_time()
+        if left <= 0:
+            binding.terminal = _stop_cleanup_error()
+            scope.cancel()
+            return
+        await anyio.sleep(min(0.05, max(0.001, left)))
+
+
+def _caller_cancelled() -> bool:
+    """Observe actual caller state before entering a cleanup shield."""
+    task = asyncio.current_task()
+    return anyio.get_current_task().has_pending_cancellation() or (
+        task is not None and task.cancelling() > 0
+    )
+
+
+async def _watch_writer(binding: _Binding, scope: anyio.CancelScope) -> None:
+    await binding.journal.fenced.wait()
+    scope.cancel()
+
+
+async def _accounting_wait(binding: _Binding, operation: Callable[[], Awaitable[_T]]) -> _T:
+    """Cancel a waiter across inner accounting shields without undoing admission."""
+    task = asyncio.ensure_future(operation())
+    try:
+        # Keep the cancelling owner's original scope marker; the child may
+        # rebuild its own cancellation through a storage containment boundary.
+        return await asyncio.shield(task)
+    finally:
+        if not task.done():
+            task.cancel()
+            with anyio.move_on_after(binding.settle_timeout_s, shield=True):
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+async def _owned(
+    binding: _Binding,
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    entry: _Pending | None = None,
+    accounting: bool = False,
+    interrupt_reports: bool = False,
+) -> tuple[bool, _T | None]:
+    """Await one operation with owner supervision and no adoption after abandonment."""
+    if not binding.active:
+        return False, None
+    binding.check()
+    outcome = _Outcome()
+    completed = False
+    result: _T | None = None
+    error: BaseException | None = None
+    with anyio.CancelScope() as scope:
+        binding.workers.add(scope)
+        if entry is not None:
+            entry.workers.add(scope)
+        try:
+            async with anyio.create_task_group() as watchers:
+                watchers.start_soon(_watch_owner, binding, scope, interrupt_reports)
+                watchers.start_soon(_watch_writer, binding, scope)
+                try:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    result = (
+                        await _accounting_wait(binding, operation)
+                        if accounting
+                        else await operation()
+                    )
+                    completed = True
+                except BaseException as caught:
+                    error = caught
+                finally:
+                    watchers.cancel_scope.cancel()
+        finally:
+            binding.workers.discard(scope)
+            if entry is not None:
+                entry.workers.discard(scope)
+    # Preserve an enclosing timeout's marker so its owner can classify expiry.
+    if isinstance(error, anyio.get_cancelled_exc_class()) and not scope.cancel_called:
+        raise error
+    # A concurrent native caller cancellation wins over our watcher cancellation.
+    outcome.propagate_control(asyncio.CancelledError())
+    if not binding.active:
+        return False, None
+    binding.check()
+    if error is not None:
+        if scope.cancel_called and isinstance(error, anyio.get_cancelled_exc_class()):
+            return False, None
+        raise error
+    return completed and not scope.cancel_called, result
+
+
+async def _prepare(operation: Callable[[], _T]) -> _T:
+    outcome = _Outcome()
+    try:
+        return await run_sync_daemon(operation)
+    except BaseException as error:
+        outcome.contain(error, ValueError, "LLM record preparation")
+
+
+def _metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Normalize only documented identifier fields in a preparation worker."""
+    fields = (
+        "run_id",
+        "owner_epoch",
+        "reservation_id",
+        "call_id",
+        "goal_id",
+        "team",
+        "agent",
+        "round",
+        "role",
+        "candidate_id",
+        "model_alias",
+        "trace_url",
+        "parent_call_id",
+    )
+    return {
+        key: _context_string(value, key)
+        for key in fields
+        if (value := metadata.get(key)) is not None
+    }
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    call: LLMCall
+    request: bytes
+    response: bytes
+    request_sha: str
+    cache_identity: str | None
+    actual: Amount
+    overflow: bool
+
+
+def _prepare_call(
+    meta: dict[str, str], cid: str, entry: _Pending | None, kwargs: dict[str, Any]
+) -> _Prepared:
+    """Detach and validate the complete record before uploads or a dedup claim."""
+    for flag in ("settle", "charge_reservation"):
+        if type(kwargs[flag]) is not bool:
+            raise ValueError(f"invalid {flag}")
+    usage = _detach_model(Usage, kwargs["usage"])
+    cost = _plain(kwargs["cost_usd"])
+    if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+        raise ValueError("invalid cost_usd")
+    cache_hit = kwargs["cache_hit"]
+    if type(cache_hit) is not bool:
+        raise ValueError("invalid cache_hit")
+    if cache_hit and kwargs["charge_reservation"]:
+        raise ValueError("cache_hit and charge_reservation are mutually exclusive")
+    estimated = kwargs["charge_reservation"] and entry is not None
+    overflow = not cache_hit and cost > USD_LIMIT and not estimated
+    if estimated:
+        usage = Usage(input_tokens=entry.estimate.tokens)
+        actual = entry.estimate
+    else:
+        actual = Amount(
+            tokens=0 if cache_hit else usage.total_tokens,
+            usd=0 if cache_hit else USD_LIMIT if overflow else cost,
+        )
+    fields: dict[str, Any] = {
+        key: meta[key]
+        for key in (
+            "run_id",
+            "goal_id",
+            "team",
+            "agent",
+            "role",
+            "candidate_id",
+            "model_alias",
+            "trace_url",
+            "parent_call_id",
+            "reservation_id",
+        )
+        if key in meta
+    }
+    fields["round"] = int(meta.get("round", "0"))
+    if entry is not None:
+        if cid != entry.call_id:
+            raise ValueError("call_id does not match reservation_id")
+        for name in ("run_id", "goal_id", "team", "agent", "round", "role", "candidate_id"):
+            expected = getattr(entry.scope, name)
+            if name in fields and fields[name] != expected:
+                raise ValueError("metadata does not match the pending scope")
+            fields[name] = expected
+        fields["model_alias"] = entry.model_alias
+    status = _context_string(kwargs["status"], "status")
+    if status not in ("ok", "error"):
+        raise ValueError("invalid status")
+    call = LLMCall(
+        **fields,
+        id=cid,
+        model=_context_string(kwargs["model"], "model"),
+        provider=_context_string(kwargs["provider"], "provider"),
+        tool_calls=[
+            {"id": _context_string(id, "tool_call_id"), "name": _context_string(name, "tool_name")}
+            for id, name in kwargs["tool_call_ids"]
+        ],
+        usage=usage,
+        cost_usd=actual.usd,
+        cache_hit=cache_hit,
+        latency_ms=_plain(kwargs["latency_ms"]),
+        status="error" if estimated or overflow else status,
+        error=_UNKNOWN_SPEND
+        if estimated
+        else _OVERFLOW
+        if overflow
+        else ("provider call failed" if status == "error" else None),
+        litellm_call_id=None
+        if kwargs["litellm_call_id"] is None
+        else _context_string(kwargs["litellm_call_id"], "litellm_call_id"),
+    )
+    request = canonical_json(_plain(kwargs["request"]))
+    response = canonical_json(_plain(kwargs["response"]))
+    return _Prepared(
+        call,
+        request,
+        response,
+        sha256_hex(request),
+        _digest(kwargs["cache_identity"]),
+        actual,
+        overflow,
+    )
+
+
+def _put_payload(artifacts: ArtifactStore, content: bytes) -> str:
+    """Validate backend-returned hashes in the worker that performed the upload."""
+    digest = _context_string(artifacts.put_bytes(content), "artifact digest")
+    if digest != sha256_hex(content):
+        raise ValueError("artifact digest mismatch")
+    return digest
+
+
+def _duplicate(binding: _Binding, cid: str, lid: str | None, entry: _Pending | None) -> bool:
+    return (
+        not binding.active
+        or binding.closing
+        or cid in binding.recorded
+        or (lid is not None and lid in binding.seen_litellm)
+        or (
+            entry is not None and (entry.state == "abandoned" or id(entry.scope) in binding.drained)
+        )
+    )
+
+
+def _append(
+    binding: _Binding, call: LLMCall, request_sha: str | None, identity: str | None
+) -> None:
+    binding.check()
+    outcome = _Outcome()
+    try:
+        binding.journal.append(
+            EventDraft(
+                type="llm_call",
+                goal_id=call.goal_id,
+                team=call.team,
+                agent=call.agent,
+                round=call.round,
+                task_id=agent_task_id(f"{call.goal_id}/{call.team}/{call.agent}", call.round)
+                if call.team and call.agent
+                else "",
+                payload={
+                    "call": call.model_dump(mode="json"),
+                    "request_sha256": request_sha,
+                    "cache_identity": identity,
+                },
+            )
+        )
+    except BaseException as error:
+        outcome.contain(error, ValueError, "LLM journal append")
+    binding.recorded.add(call.id)
+    if call.litellm_call_id is not None:
+        binding.seen_litellm[call.litellm_call_id] = call.id
+    if identity is not None and call.status == "ok" and not call.cache_hit:
+        binding.original(identity, call.id)
+
+
+async def _settle(binding: _Binding, entry: _Pending) -> None:
+    """Retry only outstanding accounting; the tranche owns admission idempotency."""
+    if entry.settled or entry.actual is None:
+        return
+    outcome = _Outcome()
+    try:
+        # Healthy acknowledgement has no report-wait deadline. A retry after
+        # cancellation retains the original cleanup allowance instead of resetting it.
+        with anyio.CancelScope(
+            deadline=entry.cleanup_at, shield=not math.isinf(entry.cleanup_at)
+        ) as cleanup:
+            completed, result = await _owned(
+                binding,
+                partial(
+                    entry.scope.tranche._settle_call,
+                    entry.reservation_id,
+                    entry.actual,
+                    overflow=True,
+                )
+                if entry.overflow
+                else partial(entry.scope.tranche.settle_call, entry.reservation_id, entry.actual),
+                accounting=True,
+            )
+        if cleanup.cancel_called:
+            binding.journal._raise_if_fenced()
+            binding.terminal = _stop_cleanup_error()
+            raise binding.terminal
+        if not completed:
+            return
+        assert result is not None
+        entry.settled = True
+        entry.cleanup_at = float("inf")
+        if result.overflow:
+            binding.overflow_notified.add(id(entry.scope.tranche))
+            entry.scope.tranche._ledger._check_usage_overflow()
+    except BaseException as error:
+        try:
+            outcome.contain(error, StorageError, "LLM settlement")
+        except asyncio.CancelledError:
+            entry.cleanup_at = min(
+                entry.cleanup_at, anyio.current_time() + binding.settle_timeout_s
+            )
+            raise
+
+
+def _owns_callback(binding: _Binding, meta: dict[str, str]) -> bool:
+    """Require owner provenance before routing a late report into a successor."""
+    if not binding.active:
+        return False
+    scope = current_llm_scope()
+    if (
+        scope is not None
+        and scope.run_id == meta.get("run_id")
+        and scope.journal is not binding.journal
+    ):
+        return False
+    epoch = str(binding.journal.epoch)
+    identified = False
+    if "owner_epoch" in meta:
+        if meta["owner_epoch"] != epoch:
+            return False
+        identified = True
+    call_id = meta.get("call_id")
+    reservation_id = meta.get("reservation_id")
+    if reservation_id:
+        # Admission, not an ID grammar, establishes reservation ownership.
+        if reservation_id in binding.pending:
+            identified = True
+        elif not call_id:
+            return False
+    if call_id:
+        tag = run_tag(meta.get("run_id", ""))
+        match = re.fullmatch(rf"llm-{tag}-e([0-9]+)-[0-9]+", call_id)
+        if match is not None:
+            if match[1] != epoch:
+                return False
+            identified = True
+    # Initial owners retain legacy unkeyed reporting. After takeover, a detached
+    # unkeyed row must carry owner_epoch; run_id alone cannot identify its owner.
+    return (
+        identified
+        or binding.journal.epoch == 1
+        or (scope is not None and scope.journal is binding.journal)
+    )
+
+
+async def record_call(
+    *,
+    metadata: Mapping[str, Any],
+    model: str,
+    provider: str,
+    usage: Usage,
+    cost_usd: float,
+    cache_hit: bool,
+    latency_ms: float | None,
+    status: Literal["ok", "error"],
+    error: str | None,
+    request: JsonValue,
+    response: JsonValue,
+    litellm_call_id: str | None,
+    tool_call_ids: Sequence[tuple[str, str]],
+    settle: bool,
+    charge_reservation: bool = False,
+    cache_identity: str | None = None,
+) -> LLMCall | None:
+    """Prepare, journal and settle one call, suppressing duplicate or late reports.
+
+    Parameters
+    ----------
+    metadata : Mapping[str, Any]
+        String tracking fields, including run_id, reservation_id and call_id.
+        Detached unkeyed reports after takeover must include owner_epoch (a
+        decimal string); epoch-bearing call IDs or an exact matching pending
+        reservation in the live binding already identify it, including batched IDs.
+    model, provider : str
+        Actual model and provider identifiers.
+    usage : Usage
+        Authoritative usage; retained for display on a zero-charge cache hit.
+    cost_usd : float
+        Reported nonnegative cost, normalized once to whole micro-dollars.
+    cache_hit : bool
+        Whether this response was served from cache.
+    latency_ms : float or None
+        Nonnegative observed latency.
+    status : {"ok", "error"}
+        Provider outcome.
+    error : str or None
+        Provider diagnostic input. Raw text is never retained or displayed.
+    request, response : JsonValue
+        Finite JSON payloads, serialized in supervised preparation workers.
+    litellm_call_id : str or None
+        Adapter deduplication identifier.
+    tool_call_ids : Sequence[tuple[str, str]]
+        Requested action identifiers and names.
+    settle : bool
+        Settle a matching pending reservation at the recorded amount.
+    charge_reservation : bool, default=False
+        Charge the complete estimate for unknown provider spend.
+    cache_identity : str or None, optional
+        SHA-256 of the namespace, effective key and generating response identity.
+        Missing/ambiguous provenance leaves cached_from_call_id unset.
+
+    Returns
+    -------
+    LLMCall or None
+        Newly journaled call, or None for a duplicate or abandoned callback.
+
+    Notes
+    -----
+    Callback tasks are marshaled to the binding's loop and retain its live stop,
+    clock and writer supervision. Each payload upload is separately awaited.
+    A journaled call is not a promise of durability after a fence or crash.
+
+    Examples
+    --------
+    The call identifier is allocated before dispatch and appears once in the
+    scope, including when ``drain`` records its conservative placeholder.
+    >>> pending_scope({"run_id": "absent", "reservation_id": "missing"}) is None
+    True
+    """
+    # Routing data is copied off-loop; all serialization and model work after
+    # routing is additionally bounded by the live owner's supervision.
+    meta = await _prepare(partial(_metadata, metadata))
+    run_id = meta.get("run_id", "")
+    binding = _bindings.get(run_id)
+    if binding is None:
+        if meta.get("call_id") or meta.get("reservation_id") or litellm_call_id is not None:
+            return None
+        raise _core_error(ValueError, f"run {run_id} is not bound")
+    if not _owns_callback(binding, meta):
+        return None
+    kwargs = dict(
+        model=model,
+        provider=provider,
+        usage=usage,
+        cost_usd=cost_usd,
+        cache_hit=cache_hit,
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+        request=request,
+        response=response,
+        litellm_call_id=litellm_call_id,
+        tool_call_ids=tool_call_ids,
+        settle=settle,
+        charge_reservation=charge_reservation,
+        cache_identity=cache_identity,
+    )
+    if asyncio.get_running_loop() is not binding.loop:
+        future = asyncio.run_coroutine_threadsafe(_record(binding, meta, kwargs), binding.loop)
+        return await asyncio.wrap_future(future)
+    return await _record(binding, meta, kwargs)
+
+
+async def _record(
+    binding: _Binding, meta: dict[str, str], kwargs: dict[str, Any]
+) -> LLMCall | None:
+    if not _owns_callback(binding, meta):
+        return None
+    entry = binding.pending.get(meta.get("reservation_id", ""))
+    cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
+    reservation = binding.call_reservations.get(cid)
+    if reservation is not None and meta.get("reservation_id") != reservation:
+        raise _core_error(ValueError, "LLM call requires its matching reservation")
+    lid = kwargs["litellm_call_id"]
+    if lid is not None:
+        lid = _context_string(lid, "litellm_call_id")
+    if _duplicate(binding, cid, lid, entry):
+        return None
+    binding.check()
+    try:
+        ready, prepared = await _owned(
+            binding,
+            partial(_prepare, partial(_prepare_call, meta, cid, entry, kwargs)),
+            entry=entry,
+        )
+        if not ready or _duplicate(binding, cid, lid, entry):
+            return None
+        assert prepared is not None
+        call = prepared.call
+        if binding.tracing.store_payloads:
+            refs: list[str] = []
+            for content in (prepared.request, prepared.response):
+                ready, digest = await _owned(
+                    binding,
+                    partial(
+                        _storage_io, _put_payload, binding.artifacts, content, site="LLM payload"
+                    ),
+                    entry=entry,
+                )
+                if not ready or _duplicate(binding, cid, lid, entry):
+                    return None
+                assert digest is not None
+                refs.append(digest)
+            call = call.model_copy(update={"request_ref": refs[0], "response_ref": refs[1]})
+        if call.cache_hit and prepared.cache_identity is not None:
+            call = call.model_copy(
+                update={"cached_from_call_id": binding.originals.get(prepared.cache_identity)}
+            )
+        # No await from the final duplicate check through journal admission.
+        if entry is not None:
+            entry.state = "claimed"
+        _append(binding, call, prepared.request_sha, prepared.cache_identity)
+        scope = entry.scope if entry is not None else current_llm_scope()
+        if scope is not None and scope.run_id == call.run_id:
+            for owner in scope.lineage():
+                if call.id not in owner.call_ids:
+                    owner.call_ids.append(call.id)
+        if entry is not None:
+            entry.journaled = True
+            entry.actual = prepared.actual
+            entry.overflow = prepared.overflow
+            if kwargs["settle"]:
+                await _settle(binding, entry)
+        return call
+    except BaseException as caught:
+        # Every boundary above already contains untrusted failures. Cancellation
+        # never becomes an error-bearing placeholder or a terminal-control forgery.
+        if _has_core_fenced(caught):
+            binding.terminal = _core_error(Fenced, "run ownership lost")
+        if entry is not None and isinstance(caught, asyncio.CancelledError) and _caller_cancelled():
+            entry.cleanup_at = min(
+                entry.cleanup_at, anyio.current_time() + binding.settle_timeout_s
+            )
+        if (
+            entry is not None
+            and isinstance(caught, Exception)
+            and not (isinstance(caught, LimitReached) and entry.settled)
+        ):
+            entry.error = caught
+        raise
+    finally:
+        if entry is not None:
+            if entry.state == "claimed":
+                entry.state = "done"
+            entry.event.set()
+
+
+def abandon_call(scope: LLMScope, reservation_id: str) -> None:
+    """Mark a cancelled call for immediate conservative drain without I/O.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Exact originating scope, not an equivalent replacement.
+    reservation_id : str
+        Reservation whose callback will not arrive.
+
+    Examples
+    --------
+    Cancellation calls this before ``await drain(scope, wait=False)``. It does
+    not allocate another call identifier or perform any settlement itself.
+    >>> pending_scope({"run_id": "absent"}) is None
+    True
+    """
+    binding = _bindings.get(_context_string(scope.run_id, "run_id"))
+    rid = _context_string(reservation_id, "reservation_id")
+    entry = binding.pending.get(rid) if binding is not None else None
+    if entry is not None and entry.scope is scope and not entry.journaled:
+        entry.state = "abandoned"
+        for worker in tuple(entry.workers):
+            worker.cancel()
+        entry.event.set()
+
+
+def _placeholder(binding: _Binding, entry: _Pending) -> None:
+    if entry.call_id in binding.recorded:
+        raise _core_error(ValueError, "LLM call is already journaled")
+    scope = entry.scope
+    call = LLMCall(
+        id=entry.call_id,
+        run_id=scope.run_id,
+        goal_id=scope.goal_id,
+        team=scope.team,
+        agent=scope.agent,
+        round=scope.round,
+        role=scope.role,
+        candidate_id=scope.candidate_id,
+        model_alias=entry.model_alias,
+        model=entry.model,
+        provider=entry.provider,
+        reservation_id=entry.reservation_id,
+        usage=Usage(input_tokens=entry.estimate.tokens),
+        cost_usd=entry.estimate.usd,
+        status="error",
+        error=_NO_REPORT,
+    )
+    _append(binding, call, None, None)
+    entry.journaled = True
+    entry.actual = entry.estimate
+    for owner in scope.lineage():
+        if call.id not in owner.call_ids:
+            owner.call_ids.append(call.id)
+
+
+async def await_reports(scope: LLMScope) -> None:
+    """Await descendant call reports under the recorder's live owner supervision.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Scope whose calls and descendant calls have finished dispatching.
+
+    Raises
+    ------
+    RuntimeError
+        If the caller has no finite effective deadline.
+
+    Notes
+    -----
+    The caller supplies the single ``settle_timeout_s`` report timer, separate
+    from durable settlement. Abandoned entries never wait. Stop-now or the run
+    deadline ends this optional wait and starts the existing cleanup allowance;
+    ownership loss and writer failures propagate unchanged. A graceful stop
+    retains its normal report allowance.
+
+    Examples
+    --------
+    >>> from types import SimpleNamespace
+    >>> async def example():
+    ...     with anyio.move_on_after(1):
+    ...         await await_reports(SimpleNamespace(run_id="absent"))
+    >>> anyio.run(example)
+    """
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    if not math.isfinite(anyio.current_effective_deadline()):
+        raise _core_error(RuntimeError, "report wait requires a finite deadline") from None
+    binding = _bindings.get(_context_string(scope.run_id, "run_id"))
+    if binding is None or scope.journal is not binding.journal:
+        return
+    binding.check()
+    entries = [
+        entry
+        for entry in binding.pending.values()
+        if any(owner is scope for owner in entry.scope.lineage()) and entry.state != "abandoned"
+    ]
+    for entry in entries:
+        completed, _ = await _owned(binding, entry.event.wait, interrupt_reports=True)
+        binding.check()
+        if not completed:
+            return
+
+
+async def drain(scope: LLMScope, *, wait: bool) -> list[str]:
+    """Finish a scope, conservatively recording missing calls within owned bounds.
+
+    Parameters
+    ----------
+    scope : LLMScope
+        Scope whose own and descendant calls are complete. Neither it nor its
+        descendants can open more calls after drain.
+    wait : bool
+        Wait up to settle_timeout_s for reports; abandoned calls never wait.
+
+    Returns
+    -------
+    list[str]
+        Identifiers of placeholders actually appended by this drain.
+
+    Notes
+    -----
+    Claims without a journaled call can be recovered only while the writer is
+    usable. Journaled calls retry their recorded accounting idempotently.
+    The first safe recorder error is raised after all recoverable calls settle.
+    Terminal publication failure retains conservative reservations and its cause.
+
+    Examples
+    --------
+    >>> from types import SimpleNamespace
+    >>> async def example() -> list[str]:
+    ...     return await drain(SimpleNamespace(run_id="absent"), wait=False)
+    >>> anyio.run(example)
+    []
+    """
+    binding = _bindings.get(_context_string(scope.run_id, "run_id"))
+    if binding is None or scope.journal is not binding.journal:
+        return []
+    entries = [
+        entry
+        for entry in binding.pending.values()
+        if any(owner is scope for owner in entry.scope.lineage())
+    ]
+    binding.track_scope(scope)
+    if not entries:
+        binding.drained.add(id(scope))
+        binding.finish_scope(scope)
+        return []
+    binding.check()
+    if wait:
+        with anyio.move_on_after(scope.settle_timeout_s):
+            await await_reports(scope)
+    for entry in entries:
+        binding.drained.add(id(entry.scope))
+    binding.drained.add(id(scope))
+    placeholders: list[str] = []
+    failure: Exception | None = None
+    cleanup_at = min(entry.cleanup_at for entry in entries)
+    if _caller_cancelled():
+        cleanup_at = min(cleanup_at, anyio.current_time() + scope.settle_timeout_s)
+    with anyio.CancelScope(deadline=cleanup_at, shield=not math.isinf(cleanup_at)) as cleanup:
+        for entry in entries:
+            binding.check()
+            for worker in tuple(entry.workers):
+                worker.cancel()
+            try:
+                if not entry.journaled:
+                    entry.state = "claimed"
+                    _placeholder(binding, entry)
+                    placeholders.append(entry.call_id)
+                await _settle(binding, entry)
+            except Exception as error:
+                failure = failure or error
+            finally:
+                entry.state = "done"
+                entry.event.set()
+            failure = failure or entry.error
+            entry.error = None
+    if cleanup.cancel_called:
+        binding.terminal = _stop_cleanup_error()
+    binding.check()
+    if all(entry.settled for entry in entries):
+        for tracked in tuple(binding.scopes.values()):
+            if any(owner is scope for owner in tracked.lineage()):
+                binding.drained.add(id(tracked))
+                binding.finish_scope(tracked)
+    if failure is not None:
+        raise failure from None
+    return placeholders
+
+
+@asynccontextmanager
+async def _bound_run(
+    run_id: str,
+    *,
+    journal: JournalWriter,
+    ids: IdGen,
+    artifacts: ArtifactStore,
+    config: RunConfig,
+    stops: StopState,
+    clock: RunClock,
+    state: RunState,
+) -> AsyncGenerator[None]:
+    """Bind once, then drain/close within usable services and unbind on every exit."""
+    bind_run(
+        run_id,
+        journal=journal,
+        ids=ids,
+        artifacts=artifacts,
+        tracing=config.tracing,
+        committed=list(state.llm_calls.values()),
+        request_sha256=state.llm_request_sha256,
+        cache_identity=state.llm_cache_identity,
+        stops=stops,
+        clock=clock,
+        limits=config.limits,
+        settle_timeout_s=config.settle_timeout_s,
+    )
+    binding = _bindings[run_id]
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        binding.closing = True
+        if (
+            _caller_cancelled()
+            or binding.stops.stop
+            or binding.stops.stop_now
+            or binding.stops.run_timeout
+            or binding.clock.left(binding.limits.run_timeout_s) <= 0
+        ):
+            binding.begin_cleanup()
+        failure: BaseException | None = None
+        cleanup: anyio.CancelScope | None = None
+        try:
+            if binding.active:
+                with anyio.CancelScope(
+                    deadline=binding.cleanup_at, shield=not math.isinf(binding.cleanup_at)
+                ) as cleanup:
+                    for scope in binding.scopes.values():
+                        try:
+                            await drain(scope, wait=False)
+                        except BaseException as error:
+                            failure = failure or error
+                    tranches = {
+                        id(scope.tranche): scope.tranche for scope in binding.scopes.values()
+                    }
+                    for key, tranche in tranches.items():
+                        if binding.undrained_scopes[key]:
+                            continue
+                        try:
+                            completed, result = await _owned(
+                                binding, tranche.close, accounting=True
+                            )
+                            if (
+                                completed
+                                and result is not None
+                                and result.overflow
+                                and key not in binding.overflow_notified
+                            ):
+                                binding.overflow_notified.add(key)
+                                tranche._ledger._check_usage_overflow()
+                        except BaseException as error:
+                            failure = failure or error
+                    binding.check()
+        except BaseException as error:
+            failure = failure or error
+        finally:
+            # A terminal check can escape before the with-body completes,
+            # after an inner handler captured this deadline's cancellation.
+            if (
+                cleanup is not None
+                and cleanup.cancel_called
+                and (failure is None or not _has_core_fenced(failure))
+            ):
+                failure = _stop_cleanup_error()
+            if _bindings.get(run_id) is binding:
+                unbind_run(run_id, journal=journal)
+        if failure is not None and not failed:
+            raise failure from None

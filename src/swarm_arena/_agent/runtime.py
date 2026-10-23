@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from swarm_arena._board.base import Board, BoardView
     from swarm_arena._budget.ledger import Ledger
     from swarm_arena._budget.tranche import Tranche
+    from swarm_arena._engine.stops import ProviderStops
     from swarm_arena._exec.executor import Executor
     from swarm_arena._journal.writer import JournalWriter
     from swarm_arena._model.catalog import CatalogEntry
@@ -71,6 +72,8 @@ class AgentRuntime:
 
     Parameters
     ----------
+    stops : ProviderStops
+        Run-wide provider latch, shared with every goal and component scope.
     address : str
         Full goal/team/agent address.
     holder : str
@@ -160,13 +163,14 @@ class AgentRuntime:
     >>> from dataclasses import fields, MISSING
     >>> from unittest.mock import Mock
     >>> services = {f.name: Mock(name=f.name) for f in fields(AgentRuntime)
-    ...             if f.default is MISSING and f.default_factory is MISSING}
+    ...             if f.init and f.default is MISSING and f.default_factory is MISSING}
     >>> services.update(address="g/t/a", holder="g/:final")
     >>> rt = AgentRuntime(**services)
     >>> rt.holder, rt.private_paths
     ('g/:final', frozenset())
     """
 
+    stops: ProviderStops = field(init=False)
     address: str
     holder: str
     goal_id: str
@@ -206,3 +210,9 @@ class AgentRuntime:
     private_paths: frozenset[str] = frozenset()
     rankings: Mapping[str, str] = field(default_factory=dict)
     sibling_views: Mapping[str, BoardView] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Share the journal owner's provider service with the manager path."""
+        from swarm_arena._engine.stops import provider_stops
+
+        self.stops = provider_stops(self.journal)

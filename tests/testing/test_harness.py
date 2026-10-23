@@ -346,7 +346,8 @@ async def test_harness_uses_a_temp_arena_board(
     )
     assert all("preflight_complete" not in e.payload for e in _events(h, "plan_revision"))
     root = Path(h.store.url).parent.parent
-    assert (root / "arena" / GOAL.namespace / "runs" / "local.json").exists()
+    run_id = h.candidates[0].run_id
+    assert (root / "arena" / GOAL.namespace / "runs" / f"{run_id}.json").exists()
     assert (root / "cache" / f"{GOAL.namespace}.sqlite").exists()
     assert not (tmp_path / "real-arena").exists()
     assert not (tmp_path / "xdg").exists()
@@ -461,3 +462,114 @@ def test_harness_documents_run_deadline() -> None:
     assert "Notes" in doc
     assert "run_timeout_s" in doc
     assert "offline harness stopped" in doc
+
+
+@pytest.mark.parametrize("registered", [False, True])
+async def test_harness_distinguishes_user_limit_from_nested_core_limit(
+    registered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena.manager import LimitReached
+
+    async def fail(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if registered:
+            raise ExceptionGroup(
+                "outer", [ExceptionGroup("inner", [_core_error(LimitReached, "budget", "private")])]
+            )
+        raise LimitReached("budget", "private")
+
+    monkeypatch.setattr(NoopManager, "run_round", fail)
+    harness = OfflineHarness()
+    reports = await harness.run_rounds(
+        NoopManager(), goal=GOAL, tool=SQUARE, rounds=2, limits=Limits(), config=RunConfig()
+    )
+    assert reports == [RoundReport(), RoundReport()]
+    if registered:
+        assert harness.manager_errors == []
+        assert not _events(harness, "agent_status")
+    else:
+        assert len(harness.manager_errors) == 2
+        assert all(isinstance(error, RuntimeError) for error in harness.manager_errors)
+        statuses = _events(harness, "agent_status")
+        assert len(statuses) == 2
+        assert all(event.payload["reason"] == "manager error: LimitReached" for event in statuses)
+        assert all("private" not in str(error) for error in harness.manager_errors)
+
+
+@pytest.mark.parametrize("escaping", [False, True])
+async def test_board_cleanup_uses_local_failure_inside_a_caller_exception_handler(
+    escaping: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anyio
+
+    from swarm_arena._board.arena import ArenaBoard
+
+    secret = "board-cleanup-failure-sentinel"
+    close = ArenaBoard.close
+    caller_error = KeyError("handled caller failure")
+    failure = _core_error(Fenced, "run ownership lost")
+
+    def fail_close(board: ArenaBoard) -> None:
+        close(board)
+        raise ValueError(secret)
+
+    async def manager(self: NoopManager, ctx: AgentContext) -> RoundReport:
+        if escaping:
+            raise failure
+        return RoundReport()
+
+    monkeypatch.setattr(ArenaBoard, "close", fail_close)
+    monkeypatch.setattr(NoopManager, "run_round", manager)
+    with anyio.fail_after(15):
+        try:
+            raise caller_error
+        except KeyError:
+            with pytest.raises(
+                Fenced if escaping else RuntimeError,
+                match=r"^run ownership lost$" if escaping else r"^board close failed: ValueError$",
+            ) as caught:
+                await OfflineHarness().run_rounds(
+                    NoopManager(),
+                    goal=GOAL,
+                    tool=SQUARE,
+                    rounds=1,
+                    limits=Limits(),
+                    config=RunConfig(),
+                )
+    assert_secret_absent(caught.value, secret)
+    assert not getattr(caller_error, "__notes__", ())
+
+
+async def test_manager_writer_entry_transfers_release_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import AsyncGenerator
+    from contextlib import asynccontextmanager
+
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena.testing import _harness
+
+    releases: list[Lease] = []
+    release = Lease.release
+
+    def released(lease: Lease) -> None:
+        releases.append(lease)
+        release(lease)
+
+    @asynccontextmanager
+    async def fail_binding(*args: object, **kwargs: object) -> AsyncGenerator[None]:
+        raise _core_error(RuntimeError, "binding entry failed")
+        yield
+
+    monkeypatch.setattr(Lease, "release", released)
+    monkeypatch.setattr(_harness, "_bound_run", fail_binding)
+    with pytest.raises(RuntimeError, match=r"^binding entry failed$"):
+        await OfflineHarness().run_rounds(
+            NoopManager(),
+            goal=GOAL,
+            tool=SQUARE,
+            rounds=1,
+            limits=Limits(),
+            config=RunConfig(),
+        )
+    assert len(releases) == 1

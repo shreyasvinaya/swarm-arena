@@ -3,6 +3,8 @@
 import json
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -12,7 +14,7 @@ from _fakes.engine import EngineEnv
 from _fakes.planners import SequencePlanner
 from _fakes.tools import ProviderJudge
 
-from swarm_arena import Goal, Plan, ProgramJudge, Ref, RunConfig
+from swarm_arena import Goal, Limits, Plan, ProgramJudge, Ref, RunConfig
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._budget.amount import USD_LIMIT, Amount
 from swarm_arena._budget.ledger import Ledger, Reservation
@@ -20,7 +22,13 @@ from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope
 from swarm_arena._engine import goal as goal_module
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner
 from swarm_arena._engine.stops import RunClock
-from swarm_arena._errors import Fenced, _core_error, _is_core_signal, _stop_cleanup_error
+from swarm_arena._errors import (
+    Fenced,
+    _core_error,
+    _is_core_signal,
+    _SignalCategory,
+    _stop_cleanup_error,
+)
 from swarm_arena._exec.executor import Job
 from swarm_arena._journal.event import Event, EventDraft
 from swarm_arena._journal.reader import read_committed
@@ -780,6 +788,257 @@ async def test_writer_timeout_bypasses_component_error_handlers(
     operation = runner._replan() if site == "replan" else runner._round_decision(1)
     with pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught:
         await operation
+    assert caught.value is not error
+    assert _is_core_signal(caught.value)
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")
+
+
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+@pytest.mark.parametrize(
+    "kind",
+    ["cleanup", "overflow", "fence", "limit", "misleading_limit", "validation", "cancel", "group"],
+)
+@pytest.mark.parametrize("nested", [False, True])
+async def test_goal_handlers_use_registered_categories(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    kind: str,
+    nested: bool,
+) -> None:
+    import asyncio
+
+    from _fakes.board import candidate
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._outcomes import _classify_outcome
+
+    secret = "private-goal-outcome"
+    errors: dict[str, BaseException] = {
+        "cleanup": _stop_cleanup_error(),
+        "overflow": _core_error(
+            LimitReached,
+            "usage_overflow",
+            "budget exhausted by usage overflow",
+            _category=_SignalCategory.TERMINAL,
+        ),
+        "fence": _core_error(Fenced, "run ownership lost"),
+        "limit": _core_error(LimitReached, "budget", "budget used up"),
+        "misleading_limit": _core_error(LimitReached, "usage_overflow", "local refusal"),
+        "validation": _core_error(ValueError, "invalid field"),
+        "cancel": _classify_outcome(asyncio.CancelledError(secret)),
+        "group": _classify_outcome(BaseExceptionGroup(secret, [asyncio.CancelledError(secret)])),
+    }
+    error = errors[kind]
+    error.args = (secret,)
+    error.add_note(secret)
+    error.__dict__.update(category="control", limit=secret)
+    if nested:
+        error = BaseExceptionGroup(secret, [asyncio.CancelledError(secret), error])
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    invocations: list[str] = []
+
+    supervised = runner._supervised_step
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("settle_on_stop"):
+            return await supervised(*args, **kwargs)
+        invocations.append(site)
+        raise error
+
+    monkeypatch.setattr(runner, "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    if kind == "overflow" and site == "final":
+        assert await operation == []
+        assert env.deps.stops.run_budget
+        assert (runner.status, runner.reason) == ("no_result", "run budget")
+        assert not env.events("judge_error")
+    elif kind in {"cleanup", "overflow", "fence"}:
+        with pytest.raises(Exception, match=r"timed out|overflow|ownership lost") as caught:
+            await operation
+        assert_secret_absent(caught.value, secret)
+        if kind == "overflow":
+            assert isinstance(caught.value, LimitReached)
+            assert caught.value.limit == "usage_overflow"
+        elif kind == "fence":
+            assert isinstance(caught.value, Fenced)
+        else:
+            assert str(caught.value) == "stop cleanup timed out"
+        assert not env.events("plan_rejected")
+        assert not env.events("decision")
+        assert not env.events("judge_error")
+    elif kind in {"limit", "misleading_limit"} and site == "final":
+        assert await operation == []
+        assert (runner.status, runner.reason) == ("no_result", "reserve_exhausted")
+        assert not env.events("judge_error")
+    else:
+        await operation
+        await env.deps.journal.commit()
+        event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
+        assert env.events(event_kind)
+        if kind in {"limit", "misleading_limit"}:
+            payload = env.events(event_kind)[-1].payload
+            if site == "replan":
+                assert payload["errors"] == ["planner error: LimitReached"]
+            else:
+                assert payload["decision"]["policy"] == "policy error: LimitReached"
+        assert secret not in str([event.payload for event in env.events(event_kind)])
+    assert invocations == [site]
+
+
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+async def test_goal_handler_caller_cancellation_wins_terminal_outcome(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+) -> None:
+    import asyncio
+
+    from _fakes.board import candidate
+
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    task = asyncio.current_task()
+    assert task is not None
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        task.cancel()
+        raise ExceptionGroup(
+            "private", [_stop_cleanup_error(), _core_error(Fenced, "run ownership lost")]
+        )
+
+    monkeypatch.setattr(runner, "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    finally:
+        task.uncancel()
+        # Cleanup may or may not have consumed the native cancellation delivery.
+        with suppress(asyncio.CancelledError):
+            await anyio.lowlevel.checkpoint()
+    assert not env.events("plan_rejected")
+    assert not env.events("decision")
+    assert not env.events("judge_error")
+
+
+class TestPlannerBudgetRefusal:
+    @pytest.fixture
+    def run_config(self, tmp_path: Path, artifact_root: str) -> RunConfig:
+        return RunConfig(
+            run_root=str(tmp_path / "runs"),
+            arena_root=str(tmp_path / "arena"),
+            artifact_root=artifact_root,
+            lease_ttl_s=60,
+            limits=Limits(max_usd=1, max_tokens=1_000_000),
+        )
+
+    async def test_refused_planner_still_finishes_goal(self, env: EngineEnv) -> None:
+        class BudgetPlanner(SequencePlanner):
+            async def plan(self, goal: Goal, config: RunConfig, history: History | None) -> Plan:
+                scope = current_llm_scope()
+                assert scope is not None
+                await scope.tranche.reserve_call(Amount(usd=50, tokens=10))
+                raise AssertionError("reservation unexpectedly succeeded")
+
+        plan = _plan(teams=1, rounds=2)
+        runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=BudgetPlanner([plan]))
+        with anyio.fail_after(30):
+            outcome = await runner.run()
+        assert outcome.status == "no_result"
+        assert len(env.events("goal_finished")) == 1
+        assert env.events("plan_rejected")[-1].payload["errors"] == ["planner error: LimitReached"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    ("site", "origin"),
+    [
+        ("final", "close"),
+        ("replan", "close"),
+        ("final", "supervisor"),
+        ("replan", "supervisor"),
+        ("policy", "supervisor"),
+    ],
+)
+async def test_core_interrupt_bypasses_goal_handler_classification(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: type[BaseException],
+    site: str,
+    origin: str,
+) -> None:
+    from _fakes.board import candidate
+
+    error = interrupt()
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(runner, "_close" if origin == "close" else "_supervised_step", fail)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    with pytest.raises(interrupt) as caught:
+        await operation
     assert caught.value is error
     assert not env.events("plan_rejected")
     assert not env.events("decision")
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("site", ["final", "replan", "policy"])
+async def test_user_hook_interrupt_stays_contained_at_goal_handlers(
+    env: EngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: type[BaseException],
+    site: str,
+) -> None:
+    from _fakes.board import candidate
+
+    secret = "private-hook-interrupt"
+    plan = _plan(teams=1, rounds=1)
+    runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=SequencePlanner([plan]))
+    supervised = runner._supervised_step
+
+    async def hook() -> Any:
+        raise interrupt(secret)
+
+    async def invoke(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("settle_on_stop"):
+            return await supervised(*args, **kwargs)
+        return await supervised(hook, **kwargs)
+
+    monkeypatch.setattr(runner, "_supervised_step", invoke)
+    operation = (
+        runner._final([candidate("c", goal_id="g")])
+        if site == "final"
+        else runner._replan()
+        if site == "replan"
+        else runner._round_decision(1)
+    )
+    await operation
+    await env.deps.journal.commit()
+    event_kind = {"final": "judge_error", "replan": "plan_rejected", "policy": "decision"}[site]
+    assert env.events(event_kind)
+    assert secret not in str([event.payload for event in env.events(event_kind)])

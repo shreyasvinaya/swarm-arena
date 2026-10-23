@@ -117,7 +117,7 @@ Every milestone also updates: the `__all__` snapshot test (`tests/test_public_ap
 - **Scope:** §4.5 `AgentsSDKManager`, §4.4 `LLMJudge` and panels, §4.6 (`LLMPlanner`, `CollaborativePlanner`, the autonomous replanner, the planner-catalog boundary for LLM output, core-assigned provenance), §4.13, §6.3 `LLMCurator`, §6.4 provider rules, §7.3 items 1 and 3, §7.3 item 4 (LLM steps), §9 rule 4 (fake model).
 - **Deliverables:**
   1. **[verify] task 1:** re-check the facts in `api-agents-sdk-litellm.md` and `api-litellm-caching.md` against the locked versions: the `CustomLogger` hook names and their `kwargs` and `response_obj` fields, `litellm.utils.supports_prompt_caching`, `supports_function_calling`, `supports_response_schema`, `extra_args` pass-through, and `ModelSettings.metadata`.
-  2. Extras: `llm = ["openai-agents[litellm]>=0.24,<0.25", "litellm>=1.105.1,<1.106"]`, `cache = ["litellm[caching,proxy]>=1.105.1,<1.106"]`, `langfuse = ["langfuse>=5,<6", "openinference-instrumentation-openai-agents"]`. ruff `TID251` bans these imports outside `swarm_arena/llm/` (R5.3).
+  2. Extras: `llm = ["openai-agents[litellm]>=0.24,<0.25", "litellm>=1.107.0rc2,<1.108"]`, `cache = ["litellm[caching,proxy]>=1.107.0rc2,<1.108"]`, `langfuse = ["langfuse>=5,<6", "openinference-instrumentation-openai-agents>=1.0.0"]`. ruff `TID251` bans these imports outside `swarm_arena/llm/` (R5.3).
   3. Model catalog: aliases only, roles, capability validation through the `validate_plan` hook, the price requirement when `max_usd` is set, `max_tokens` required when any LLM component is used, `LITELLM_LOCAL_MODEL_COST_MAP=True` set by `swarm_arena.llm` before it imports `litellm`, catalog `prices` overrides, and the estimate step extended with manager tokens times price and the LLM judge amounts: `LLMJudge.models()` lists one alias per panel member, so `judge_amount` and `final_slice_estimate` (R4.13.6) price the final judge and converge-team managers. `swarm_arena.llm` calls `register_price_source` at import (R4.13.6).
   4. `LitellmModel` wiring: one `ModelSettings` per call (`max_tokens`, `include_usage=True`, `metadata` with `reservation_id`), the Claude-only `cache_control_injection_points` with the TTL from the catalog, and the prompt layout (stable part first).
   5. `CallLogger` (LiteLLM `CustomLogger`), which only maps LiteLLM's `kwargs` and `response_obj` to the core `record_call(..., settle=True)` (`_journal/llm_record.py`, R4.13.19), and `record_call` itself: every success or failure becomes an `LLMCall` event, payloads are stored by sha256 when `tracing.store_payloads` is true, the reservation settles by `reservation_id`, and a cache hit costs 0 and records `cached_from_call_id`.
@@ -312,7 +312,7 @@ Rules [plan]:
 | `_board/base.py` | `Board`, `BoardView` ABCs | M1b +M2 | `tests/_board/test_base.py` |
 | `_board/run_board.py` | `RunBoard`: this run only, in memory (deleted in M2) | M1b | `tests/_board/test_run_board.py` |
 | `_board/frontier.py` | Build frontiers (this run's mark in M1b, every run read in M2). It does not commit: `_engine/round.py` journals them | M1b +M2 | `tests/_board/test_frontier.py` |
-| `_board/digest.py` | Digest builder with the token cap | M1b +M2 | `tests/_board/test_digest.py` |
+| `_board/digest.py` | Digest builder with the token cap | M1b +M2 +M3 | `tests/_board/test_digest.py` |
 | `_board/curator.py` | `Curator` ABC and the round-end hook | M2 | `tests/_board/test_curator.py` |
 | `_board/arena.py` | `ArenaBoard` | M2 | `tests/_board/test_arena.py` |
 | `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier | M2 | `tests/_board/test_cache.py` |
@@ -357,7 +357,7 @@ Rules [plan]:
 | `llm/_settings.py` | `ModelSettings` per call: caching, metadata, cache args | M3 | `tests/llm/test_settings.py` |
 | `llm/_logger.py` | `CallLogger`: maps LiteLLM `kwargs` and `response_obj` to the core `record_call` | M3 | `tests/llm/test_logger.py` |
 | `llm/_cache.py` | Response-cache setup from `CachePolicy` | M3 | `tests/llm/test_cache.py` |
-| `llm/_prompts.py` | Prompt layout and untrusted markers | M3 | `tests/llm/test_prompts.py` |
+| `llm/_prompts.py` | Prompt layout | M3 | `tests/llm/test_prompts.py` |
 | `llm/_structured.py` | Structured output and the two-stage fallback | M3 | `tests/llm/test_structured.py` |
 | `llm/_hooks.py` | `RunHooks` pre-check, `BudgetExceeded` | M3 | `tests/llm/test_hooks.py` |
 | `llm/_actions.py` | `@function_tool` wrappers for `AgentContext` actions | M3 | `tests/llm/test_actions.py` |
@@ -387,6 +387,28 @@ Rules [plan]:
 | `testing/_harness.py` | Offline `AgentContext` harness for `check_manager` | M1b +M2 | `tests/testing/test_harness.py` |
 | `testing/_fake_model.py` | `FakeModel`, `FakeTurn` (imports `agents` lazily) | M3 | `tests/testing/test_fake_model.py` |
 
+M3 core recording additions to R3.1 (these extend the existing module rows):
+
+| Path | Added responsibility | M | Tests |
+|---|---|---|---|
+| `_journal/llm_record.py` | Owned callback supervision, drain/close/unbind, safe normalized records and cache provenance | M3 | `tests/_journal/test_llm_record.py` |
+| `_journal/replay.py` | Committed call, request digest and cache identity indexes | +M3 | `tests/_journal/test_replay.py` |
+| `_budget/llm_scope.py`, `_budget/tranche.py` | Required limits/settlement timeout; normalized overflow settlement seam | +M3 | `tests/_budget/test_llm_scope.py`, `tests/_budget/test_tranche.py` |
+| `_engine/run.py`, `_engine/resume.py` | Authorized registration bootstrap and bindings inside entered service owners | +M3 | `tests/_engine/test_run.py`, `tests/_engine/test_initialization_stop.py` |
+
+M3 invocation and integration additions to R3.1 (these extend the existing module rows):
+
+| Path | Added responsibility | M | Tests |
+|---|---|---|---|
+| `llm/_invocation.py` | Shared child-invocation and accounting helper used by planner, judge, curator and provider probes | M3 | `tests/llm/test_invocation.py` |
+| `_agent/runtime.py` | Share the journal owner's run-wide `ProviderStops` service with managers | +M3 | `tests/_agent/test_runtime.py` |
+| `_agent/tool_run.py` | Report provider-failed tool candidates to the shared `ProviderStops`; let already reserved starts drain through budget closure | +M3 | `tests/_agent/test_tool_run.py` |
+| `_engine/goal.py` | Supply limits and settlement timeouts to component LLM scopes, supervise curator accounting and publish recoverable provider-failure receipts | +M3 | `tests/_engine/test_goal.py` |
+| `_engine/round.py` | Supply limits and settlement timeouts to manager LLM scopes, enforce provider stops and recovery probes, and bind call admission to the round deadline | +M3 | `tests/_engine/test_round.py` |
+| `_board/curator.py` | Drain invocation calls before validating summary call provenance and preserve registered provider/control outcomes | +M3 | `tests/_board/test_curator.py` |
+| `_cli/main.py` | Register the `plan` command with its LLM and collaborative planning handlers | +M3 | `tests/_cli/test_main.py` |
+| `testing/_harness.py` | Bind offline manager/judge LLM scopes, run registered setups, verify self-drain and exact accounting, and check requesting-call provenance | +M3 | `tests/testing/test_harness.py` |
+
 ### R3.2 Other test files (not 1:1 with a module)
 
 | Path | Responsibility | M |
@@ -401,9 +423,14 @@ Rules [plan]:
 | `tests/_fakes/finished.py` | Importable `FinishedRun` and `run_again` for arena, CLI, and viewer integration tests | M2 |
 | `tests/_fakes/board.py` | Committed board records for digest and migration regressions | M2 |
 | `tests/_fakes/planners.py` | Test-only `Planner` subclasses for replanner tests | M1b |
+| `tests/_fakes/llm_components.py` | Import-triggered alias manager, judge and curator fixtures for model admission and startup checks | M3 |
+| `tests/_fakes/llm_run.py` | `open_llm_run`, real owned writer/ledger fixture, committed calls/charges and held-worker readiness/release controls | M3 |
+| `tests/_fakes/agent_ctx.py` | In-memory `FakeAgentContext` fields, actions, failure injection and requesting-call records | M3 |
+| `tests/test_lease_io_boundary.py` | Includes core LLM recorder and future `llm/*.py` modules in the lease-held storage guard | +M3 |
 | `tests/_fakes/import_canary.py` | A module that, on import, writes the file named by env `SWARM_ARENA_TEST_CANARY` (when set) and defines `Tool`; proves that a rejected non-catalog ref is never imported | M1b |
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
 | `tests/_fakes/tools.py` | Small module-level tool functions and scripts used across tests; refs name them `_fakes.tools:<name>` (importable through `pythonpath = ["tests"]`, R5.3) | M1a |
+| `tests/llm/test_upstream_facts.py` | Offline pinned SDK, LiteLLM callbacks, pricing, cache identity, retry and tracing facts | M3 |
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
 | `tests/test_import_isolation.py` | `import swarm_arena` (and each core facade) loads no optional dependency | M1a |
@@ -420,6 +447,7 @@ Rules [plan]:
 | `pyproject.toml`, `uv.lock`, `.python-version` (`3.11`), `LICENSE`, `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `.gitignore`, `.github/workflows/ci.yml` | M1a |
 | `docs/conf.py`, `docs/index.md`, `docs/<page>.md` (12 pages of §11), `docs/api/<module>.md` | M1a (filled per milestone, complete in M5) |
 | `examples/rosenbrock/{rosen.py,plan.toml,run.toml,README.md}` (refs `rosen:<name>`, importable through `Plan.base_dir`, R4.1) | M1b (+M3: `plan_llm.toml`) |
+| `examples/rosenbrock/run_llm.toml` (priced manager/judge aliases and capped LLM run settings) | M3 |
 | `examples/own_script/{problem/model_a.txt,problem/model_b.txt,problem/points.txt,problem/run.py,checks/check.py,judge/score.py,judge/hidden/points.csv,plan.toml,run.toml,README.md}` | M1b |
 | `.readthedocs.yaml`, `.github/workflows/release.yml`, `.github/workflows/upstream.yml`, `upstream-overrides.txt`, `RELEASING.md` | M5 |
 
@@ -439,6 +467,10 @@ Signatures only; bodies are `...`. The comment above each block names the privat
 - **Errors visible to users** are subclasses of built-in exceptions, so the public surface stays as in §9 [plan]: plan and config errors are `ValueError`; soft action errors are `ValueError`; storage errors are `RuntimeError`; `LimitReached` is public.
 
 ### R4.1 `swarm_arena` (top level)
+
+Planner provenance validation: private session and call IDs are normalized safe
+identifier components. Detachment, stamping, admission and replay retain them;
+TOML preserves only the validated first-line session link and its source directory.
 
 ```python
 # _model/ref.py — M1a
@@ -1536,6 +1568,8 @@ async def check_judge(judge: Judge | Ref, goal: Goal, candidates: Sequence[Candi
                       executor: Executor | None = None, config: RunConfig | None = None) -> list[Score]: ...   # M1a (+M3 config)
     # [plan] M3 adds config (additive; §9 rule 4): an LLMJudge needs a model catalog and an LLMScope to run offline.
     # None → RunConfig defaults.
+    # Implemented: config supplies models/cache/tracing/limits to a bound temporary judge run;
+    # registered setups run after construction, and self-drain is checked before tranche closure.
 async def check_manager(manager: Manager | Ref, *, goal: Goal, tool: Tool | Ref, rounds: int = 1,
                         limits: Limits | None = None, config: RunConfig | None = None) -> list[RoundReport]: ...  # M1b (+M3 parallel calls)
 # testing/_candidates.py — M1a
@@ -1557,6 +1591,9 @@ class FakeTurn:
 class FakeModel:                                # implements agents.models.interface.Model
     def __init__(self, turns: Sequence[FakeTurn], *, provider: str = "fake") -> None: ...
     def register(self, name: str) -> None: ...  # makes ModelSpec(model="fake/<name>") resolve to this model
+    calls: list[dict[str, Any]]                  # received system, input, model_settings, tools, output_schema, tracing
+    # Independent replay queues per scoped conversation (run/goal/team/agent/round/role/candidate)
+    # or explicit SDK conversation_id; fresh model factories restore registrations between tests/runs.
 ```
 
 `testing.__all__` [plan] = `check_tool`, `check_check`, `check_judge`, `check_manager`, `make_candidate`, `read_output_file`, `read_logs`, `FakeModel`, `FakeTurn`. `FakeModel` calls emit `LLMCall` records through the same core `record_call` function as the LiteLLM logger (R4.13.19), so the ledger and journal path is the same below the LiteLLM boundary.
@@ -1599,6 +1636,9 @@ class ConditionalWritesUnsupported(StorageError): ...
 class ChainError(StorageError): ...                  # M1b: chain check failed
 class Fenced(RuntimeError): ...                      # M1b: this owner lost the run
 class LeaseHeld(RuntimeError): ...                   # M1b: a live owner holds the lease
+class ProviderFailed(RuntimeError):
+    def __init__(self, provider: str) -> None: ...   # safe identifier; core registration grants authority
+    provider: str
 ```
 
 #### R4.13.2 Store and artifacts — M1a (`replace` M1b, `S3Store` M2)
@@ -1813,6 +1853,14 @@ checkpoint; replay folds the maximum over all events and excludes downtime.
 produced it (derived from revision and `tool_end` order, no new stored field); part
 rankings, snapshots and join parents use only candidates of the current part key.
 
+M3 recording extension: `RunState.llm_calls: dict[str, LLMCall]` holds committed
+records by call ID. `llm_request_sha256: dict[str, str]` holds request digests;
+`llm_cache_identity: dict[str, str]` holds optional opaque cache provenance digests.
+The `llm_call` payload is `{call, request_sha256, cache_identity}`. Null digests
+are omitted from indexes; non-null digests must be lowercase SHA-256 hex.
+Request hashes alone never establish a cache origin. Duplicate call IDs and
+cross-run call identities are invalid replay input.
+
 #### R4.13.5 Ids — M1a (R2.7 item 7)
 
 ```python
@@ -1926,6 +1974,11 @@ def judge_amount(judge: Judge, n: int, config: RunConfig, price_of: Callable[[st
     # alias only when its input and output prices are each <= the member's (else the same alias formats) —; a judge with
     # non-empty providers() -> n x default_run_reservation (settled estimated at the barrier); any other judge -> Amount() (no
     # paid call, R5.4). The barrier's up-front batch reservation passes llm=False; estimates pass llm=True.
+    # Formatting calls retain the member's first output cap (also capped by the formatter's own spec).
+    # A different formatter has no higher input/output or effective cache-write tariff; otherwise the same
+    # alias formats with the schema in its prompt. This preserves the per-member output terms above.
+    # Final slices hold output terms only: MeteredModel separately reserves serialized inputs at call time.
+    # Refused input funding raises BudgetExceeded before provider dispatch; the formula is unchanged.
 def final_slice_estimate(plan: Plan, config: RunConfig, tools: Mapping[str, Tool | Sequence[tuple[Tool, ToolRequest]]],
                          price_of: Callable[[str], ModelSpec.Prices | None]) -> Amount: ...
     # [plan] _budget/estimate.py; M1b, +M3 for LLM terms. (1 + max_join_attempts) x sum over converge-team agents of
@@ -1958,6 +2011,9 @@ class LLMScope:
     cache: CachePolicy | None
     force_no_cache_read: bool = False                # anchors and the final judge
     call_ids: list[str] = field(default_factory=list)   # [plan] record_call appends the id of every LLMCall made in this scope
+    parent: LLMScope | None = field(default=None, repr=False, compare=False)
+    def child(self) -> LLMScope: ...
+    def lineage(self) -> Generator[LLMScope]: ...
 def current_llm_scope() -> LLMScope | None: ...
 @contextmanager
 def llm_scope(scope: LLMScope) -> Iterator[None]: ...
@@ -1974,6 +2030,18 @@ def current_requesting_call() -> str | None: ...
 # around ctx.run_tool and ctx.post_learning, so parallel tool calls never mix. execute_tool_run reads it into
 # Candidate.requested_by_call, and post_learning reads it into Learning.posted_by_call. Outside it, both stay None.
 ```
+
+M3 scope extension: `limits: Limits` and `settle_timeout_s: float` are required
+fields immediately after `cache`, with no defaults. Every engine and standalone
+session constructor passes its `RunConfig` values. Report waiting and owned
+post-stop settlement/publication cleanup both use `settle_timeout_s`; it is not
+solely a grace period for receiving usage.
+
+`child()` shares funding and services with its parent while allocating an
+independent call-id list and drain lifetime. `lineage()` yields the current
+scope followed by its ancestors. Recording propagates call links through that
+lineage; draining a child leaves its owner open, while an owner's drain includes
+its descendants.
 
 #### R4.13.8 Process supervision — M1a
 
@@ -2196,6 +2264,18 @@ def ranked(candidates: Iterable[Candidate], scores: Iterable[Score], *, identity
 
 #### R4.13.12 Planning internals — M1b
 
+Generated-draft boundary in `_planning/validate.py`:
+`async _freeze_draft_goal(goal: Goal, *, base_dir: Path, artifacts: ArtifactStore) -> Goal`
+freezes the human identity before generation. `async _admit_draft(plan: Plan,
+config: RunConfig, artifacts: ArtifactStore, *, frozen_goal: Goal, base_dir: Path,
+history: Sequence[Plan] = (), origin: Origin = "llm",
+admit: Callable[..., tuple[Plan, list[str]]] = admit_revision) -> Plan` stamps and
+compares the main GoalKey before and after shared admission. The admission
+callable preserves the engine's existing supervised admission seam. File bytes
+are staged in the daemon, then uploaded one object at a time through owned
+storage boundaries. Direct initial Python generation uses cwd; history uses
+r0's base_dir; file-based callers supply their loaded directory explicitly.
+
 ```python
 class RefSite(FrozenModel):
     pointer: str                                     # JSON pointer in the plan, e.g. "/teams/0/agents/1/tool"
@@ -2256,6 +2336,9 @@ ModelCheck = Callable[[Mapping[LLMRole, Sequence[str]], RunConfig], tuple[list[s
     # [plan] a role → aliases map, not a Plan: the replanner, the curator, and a planning session have no plan. M1b
     # ships Callable[[Plan, RunConfig], tuple[list[str], list[str]]]; M3 Task 3 changes it to this form.
 def register_model_check(check: ModelCheck) -> None: ...                 # swarm_arena.llm registers at import (M3)
+def check_llm_aliases(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> list[str]: ...
+    # Core alias/role, max_tokens and known-price rules. Hooks and returned strings/prices are normalized
+    # in synchronous preparation; asynchronous owners use the supervised abandonable daemon boundary.
 def check_models(uses: Mapping[LLMRole, Sequence[str]], config: RunConfig) -> tuple[list[str], list[str]]: ...
     # M3, _planning/validate.py: alias, max_tokens, and price errors, then every registered ModelCheck. The one entry
     # point for validate_plan, _engine/run.py (replanner, curator), and planning_session (R4.13.13).
@@ -2299,6 +2382,7 @@ class RunAdmission:                                 # _engine/admission.py
     async def release(self, goal_id: str) -> None: ...
 class RoundRunner:                                   # _engine/round.py
     async def run(self, round: int) -> RoundOutcome: ...
+    # A new round probes providers before board.frontier(); the frontier publication window stays intact.
 async def converge(goal: GoalRunner, *, select_only: bool) -> list[Candidate]: ...   # _engine/converge.py
     # Converge outputs receive ordinary judges before the uncached final ranking. An unfunded barrier
     # records reserve_exhausted and selects previously judged survivors or unjoined parts, not its new outputs.
@@ -2350,11 +2434,32 @@ def mark_planning_session(plan: Plan, scope: LLMScope) -> Plan: ...
     # a copy with planning_session = scope.run_id and planner_call_ids = tuple(scope.call_ids) (R4.1)
 ```
 
+M3 run registration extension: `_engine/run.py` exposes
+`register_run_setup(fn: Callable[[RunConfig], None]) -> None`, idempotent by
+callable identity. `_setup_run(plans, config)` imports only admitted manager/judge
+modules and the human curator module, then invokes registered setups in supervised
+daemon workers. It does not construct managers. Fresh `_execute` binds inside the
+entered journal/initialization owner; `_ResumeServices._serve_owned` binds after
+authoritative acquired-head replay. Both pass the existing stop state and clock,
+preserve the prepared handoff, drain/close before unbinding, and clean up failed
+setup. A completed resume never constructs a manager merely for registration.
+The private `_bound_run` context is also the ownership seam for planning sessions;
+the standalone planning-session API remains a separate implementation.
+
+Standalone planning uses the initialization and writer supervisors, a real
+clock, one setup/bind lifetime and a registered goal before its planner tranche.
+It validates models before writes, honors tracing consent, and drains/closes on
+all exits. A stopped setup cannot yield. `LLMPlanner._draft_at(..., base_dir: Path)`
+is the explicit-directory internal generation entry point.
+
 #### R4.13.14 Board internals — M1b (`RunBoard`, frontier, digest), M2 (rest)
 
 ```python
 def build_frontier(board_reads: Sequence[tuple[str, str, Head]], reviews: Sequence[str],
                    curation: Sequence[str]) -> Frontier: ...
+def untrusted(text: str) -> str: ...             # M3
+    # Wrap with the shared untrusted markers after replacing embedded markers with "[marker removed]".
+    # build_digest wraps its board block with this helper before checking the final byte cap.
 def build_digest(view: BoardView, *, goal: GoalKey, run_id: str, round: int,
                  ranking: str | Mapping[str | None, str], cap_tokens: int, k: int = 5) -> str: ...
     # A str ranks every group under one judge; a mapping selects each group's judge (None is the main group),
@@ -2394,6 +2499,33 @@ class HumanObject(StoredModel):                      # reviews/ and curation/ ob
 def human_object_order(name: str) -> tuple[str, str]: ...   # (timestamp in the name, full name)
 def human_object_name(now: datetime) -> str: ...            # "<YYYYMMDDTHHMMSS.mmmZ>-<random 8 hex>.jsonl" [plan]
 ```
+
+LLM trace and viewer projections extend these internals without a public facade
+addition or SQL schema change (schema 4). The published generation retains calls,
+restored revision provenance and standalone session heads before any composite read.
+
+```python
+# _board/trace.py
+class CacheStats(FrozenModel):
+    calls: int; input_tokens: int; cache_read_tokens: int; cache_write_tokens: int; response_hits: int
+    @property
+    def hit_rate(self) -> float: ...  # reads / (ordinary input + reads + writes), or 0.0
+
+def format_llm_step(call: LLMCall) -> str: ...
+def cache_stats(calls: Iterable[LLMCall]) -> dict[str, CacheStats]: ...  # team/agent, else :role
+# ArenaCache publication seam; never called by a pinned composite reader:
+# _committed_state(mark: Frontier.Mark) -> RunState
+# _ArenaReader.llm_calls(run_id: str) -> list[LLMCall] returns detached committed calls.
+```
+
+Memo identity includes the normalized producing root, run ID and full committed
+head. Calls are counted once across namespace caches; candidate-less calls remain
+included. Standalone sessions resolve only beneath the producing root and keep
+recorded completion reasons. Trace preserves round-applicable plans, recorded
+base_dir, producing-run score links, parent-linked child IDs and recorded cache
+origins; it performs no reader-time refresh or replay. The viewer adds
+`/run/<run-id>/llm` under its existing Host and escaped-HTML rules. Round pages
+remain immutable.
 
 #### R4.13.15 Gateway — M4
 
@@ -2444,6 +2576,64 @@ class CallLogger("litellm.integrations.custom_logger.CustomLogger"):        # on
     async def async_log_failure_event(self, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any) -> None: ...
 def install(config: RunConfig) -> None: ...          # idempotent: logger, cost map env, response cache
 ```
+
+The expanded per-call settings contract supersedes the abbreviated signature above.
+`ModelSpec` has no alias; call provenance and the cache namespace are supplied by
+the metered adapter. `install` belongs to `llm/_logger.py`.
+
+```python
+# llm/_settings.py
+def model_settings(spec: ModelSpec, *, alias: str, scope: LLMScope, reservation_id: str,
+                   call_id: str, namespace: str, read: bool, write: bool,
+                   max_tokens: int | None = None,
+                   temperature: float | None = None) -> "agents.ModelSettings": ...
+    # metadata adds call_id and model_alias; every value is str (including round).
+    # include_usage=True; output override capped by spec.max_tokens.
+    # An explicit temperature carries drop_params=True.
+def injection_points(spec: ModelSpec) -> list[dict[str, Any]] | None: ...
+def merge_model_settings(caller: "agents.ModelSettings", per_call: "agents.ModelSettings", *,
+                         streamed: bool = False, thinking: bool = False) -> "agents.ModelSettings": ...
+    # Final merge before delegation: protect metadata and remove caller cache/preset controls.
+    # Detect SDK reasoning and thinking/reasoning through extra_args and extra_body.
+
+# llm/_cache.py
+def cache_switches(policy: CachePolicy | None, role: LLMRole, *, force_no_read: bool,
+                   streamed: bool, thinking: bool) -> tuple[bool, bool]: ...
+def cache_namespace(policy: CachePolicy | None, goal_namespace: str) -> str: ...
+def require_cache_extra(policy: CachePolicy) -> None: ...
+def response_cache(policy: CachePolicy) -> "litellm.caching.caching.Cache": ...
+def bypass_response_cache() -> "ContextManager[None]": ...
+    # Internal task-local complete bypass for provider probes; anchors/final only suppress reads.
+def cache_identity(kwargs: Mapping[str, Any], response: Any, *,
+                   effective_key: str | None = None) -> str | None: ...
+    # Hash verified namespace-bearing effective key + generating response id.
+    # The callback adapter passes this to record_call(cache_identity=...) under supervised preparation.
+    # Miss callbacks can omit the key: use an exact outbound/write key capture, never a reconstructed key.
+    # Missing/conflicting evidence returns None; the core restores its index on resume.
+```
+
+M3 metering and control bridge extension:
+
+- `llm/_hooks.py::MeteredModel` reserves against the current scope before each
+  request, applies `merge_model_settings` as the final settings merge, disables
+  hidden provider retries and links detached responses through `CallLinks`.
+  `BudgetHooks` uses `Tranche.can_cover`; it never substitutes ledger remaining
+  for credit in a committed tranche. Closed or overflowed tranches cannot cover
+  calls; smaller next batches and independent reservations use the same funding
+  rules as actual admission.
+- `llm/_hooks.py::_sdk_control(error) -> AgentsException | None` issues private
+  SDK carriers only for registered core controls. `_unwrap_control(error)`
+  restores saved core snapshots, including nested groups, before the consumer's
+  captured `_Outcome` classifies the result after owned cleanup. SDK function
+  tools use `failure_error_function=None`; plain caller-created
+  `BudgetExceeded` instances and copied carrier attributes confer no authority.
+- `_errors.py` stores an immutable category alongside each vetted snapshot:
+  diagnostic, ordinary limit, terminal failure or fencing. Registration alone
+  proves safe provenance, not control meaning. `_is_core_control` consults only
+  that snapshot; `_outcomes.py` retains caller cancellation before nested
+  fencing, then terminal cleanup/overflow, limits and contained diagnostics.
+  Final judging, replanning and policy consume this one mechanism and preserve
+  the actual writer cause. The core never imports the optional SDK.
 
 #### R4.13.18 CLI — M1a (root) and later
 
@@ -2506,7 +2696,112 @@ def abandon_call(scope: LLMScope, reservation_id: str) -> None: ...  # [plan] M3
     # abandoned; drain does not wait for an abandoned call
 ```
 
+M3 implemented recording contract (supersedes the earlier sketch where different):
+
+- `bind_run` additionally accepts `cache_identity: Mapping[str, str] | None`,
+  `stops: StopState | None`, `clock: RunClock | None`, `limits: Limits | None`
+  and `settle_timeout_s: float = 60`. Engine/session owners supply their live
+  services through `_bound_run(..., config, stops, clock, state)`; low-level
+  callers own equivalent cleanup. Binding validates indexes before installation.
+  The active binding includes the writer's owner epoch and identity. A strictly
+  newer epoch replaces its stale predecessor and abandons the predecessor's
+  pending callback work; equal/older epochs cannot replace it. Owner cleanup uses
+  `unbind_run(run_id, journal=journal)` so stale cleanup cannot remove a successor.
+  Reservation-only reports establish ownership by exact identity in the live
+  binding's pending reservations, independent of ID grammar (including batched
+  `/call-N` suffixes). Unknown or predecessor reservation-only IDs are ignored;
+  they cannot be adopted as unkeyed reports. Callbacks carrying a preallocated
+  call ID must still supply its matching reservation (T2-I1).
+  Callback call/reservation IDs carry their dispatch epoch. Detached unkeyed
+  callbacks after takeover must supply `metadata["owner_epoch"]` as a decimal
+  string (for example, `str(scope.journal.epoch)` captured at dispatch), or run in
+  the matching live `LLMScope`. A run ID alone cannot attribute an unkeyed report
+  after takeover and is ignored. Reports with stale epoch or scope identity are
+  ignored before payload uploads, journal append or settlement.
+- `record_call` additionally accepts `cache_identity: str | None = None`: an
+  adapter-proven SHA-256 over namespace, effective cache key and generating
+  response identity. It is journaled independently of request payload storage.
+  Resume restores it; missing or ambiguous origins leave `cached_from_call_id`
+  unset. The core never guesses provenance from a request hash.
+- Complete model/JSON preparation precedes claiming. Request and response uploads
+  are separately supervised; an abandoned request cannot start a response upload.
+  Call IDs enter dedup indexes only after append. A claim without an appended
+  record remains recoverable while the writer is usable. Journaled and settled
+  states are separate; drain retries only outstanding accounting.
+- One normalized `Amount` supplies the journaled cost and ledger charge. Cache
+  hits cost zero; unknown spend charges the full estimate with fixed safe text.
+  Finite cost beyond `USD_LIMIT` records the supported maximum and explicitly
+  marks terminal usage overflow through `Tranche._settle_call(..., overflow=True)`.
+  This private seam requires a normalized maximum `Amount`, preserves admission
+  idempotency/close retries, and never constructs an invalid model. Non-finite
+  costs fail before append; raw provider diagnostics are never retained.
+- Callbacks outside the caller's scope still use the bound owner loop, live stop
+  state, active clock and writer terminal cause. Drain seals the scope and bounds
+  both report waiting and shielded accounting; unbind invalidates all workers.
+  Late callbacks with call/reservation/LiteLLM identity return `None`, while an
+  explicit unknown-run-only call raises `ValueError`. `pending_scope` returns
+  `None` once a scope is drained. Cleanup expiry is not ownership fencing;
+  uncommitted reservations remain conservative after terminal publication failure.
+- Gateway/unkeyed reports use `settle=False` without opening a pending call.
+  With a pending call, `settle=False` defers its recorded amount until drain.
+  Cancellation wakes waiters, and safe contained failures are reported only after
+  recoverable accounting. Fresh/resumed owners always drain/close/unbind inside
+  the entered writer lifetime. Category-aware control-registry migration remains
+  separate from this recorder contract.
+
+Example adapter sequence: reserve with `await scope.tranche.reserve_call(estimate)`,
+allocate with `open_call(scope, reservation_id=rid, estimate=estimate, ...)`, include
+the returned call ID and reservation ID in string metadata, then call
+`await record_call(..., settle=True, cache_identity=proven_identity_or_none)`.
+Before closing a component tranche, use `await drain(scope, wait=True)`; cancelled
+calls first use `abandon_call(scope, rid)` and drain without report waiting.
+
+A report carrying a preallocated call ID must also carry its matching reservation
+ID. Missing or mismatched pairs fail value-free before payload upload or adoption,
+including against replayed identities. Drain refuses a duplicate placeholder for
+an already journaled ID even if pending bookkeeping is inconsistent.
+
+The binding counts undrained scopes per tranche. A scope drain handles only its
+own calls; it never closes the tranche. Owned exit drains every scope before
+closing each distinct tranche once, and closes only when that tranche's count
+reaches zero. Direct and batched reservations follow the same ownership rule.
+
+`cache_hit=True` together with `charge_reservation=True` is malformed input:
+reject it value-free during preparation, before adoption. Unknown-spend fallback
+must never turn a cache hit into a paid call.
+
+Healthy live acknowledgement, scope drain and tranche close have no fixed
+`settle_timeout_s` deadline: they remain supervised by the owner's run clock,
+stop state and fencing. The cleanup allowance begins only after stop, run
+deadline or actual cancellation. Owner interruption shares one deadline across
+remaining accounting; cancelled-call retries retain their allowance until settled,
+then retire it so later healthy work is unaffected. Pending-report waiting still
+uses its separate `settle_timeout_s` bound.
+
+`CallLogger` adapts successful and failed LiteLLM callbacks through the bound
+recorder's owner loop and supervised preparation boundary. `charge_reservation`
+keeps unknown spend charged, including success reports without usage, regardless
+of exception class; authoritative
+usage (including five-minute and one-hour cache writes) is priced by the pending
+run's catalog. Response-cache hits retain display usage and charge zero. Callback
+errors contain only operation/type identifiers, and terminal writer cleanup or
+usage-overflow failures remain observable through the owner's drain.
+
+The installed cache captures effective keys at LiteLLM's actual key-generation
+route. Together with the generating response ID, this feeds the replayable
+cache-origin index; missing or conflicting evidence leaves the origin unset.
+`install(config)` registers one stateless logger, requires the cache extra before
+constructing a backend, and rejects a second different non-null cache policy
+with `one response-cache policy per process`. A run without a cache policy leaves
+the process installation alone and relies on its per-call cache controls.
+
 ### R4.14 Journal event types — M1b (additions noted)
+
+Planning provenance payload extension: every `plan_revision`, including an
+autonomous revision, carries `planning_session` and validated `planner_call_ids`.
+The r0 builder includes these for queued goals. Replay restores both private
+attributes and keeps the original base_dir. A standalone `run_started` sets
+`planning: true`, warnings and zero final slices before registering its goal.
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
 
@@ -2556,7 +2851,7 @@ These artifact models are distinct from
 - **Python:** 3.11 or newer, **POSIX** only (no Windows). `requires-python = ">=3.11"`.
 - **Async:** the anyio API on the **asyncio backend only** (§4.8). Tests pin `anyio_backend = "asyncio"`. `Swarm` raises on another backend. The CLI uses `anyio.run(..., backend="asyncio")`.
 - **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. [plan] lower bounds: `pydantic>=2.11,<3`, `typing-extensions>=4.12`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
-- **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.105.1,<1.106` (with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=2023.12.1`, `aiobotocore>=2.16.0` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
+- **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.107.0rc2,<1.108` (Ruling P39; R5.4 item 20; with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]>=1.107.0rc2,<1.108`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=2023.12.1`, `aiobotocore>=2.16.0` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
 - **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=4`.
 - **Tooling:** uv (`uv init --lib`, src layout, `py.typed`, build backend `uv_build>=0.13.1,<0.14`), ruff with numpy docstring rules, ty pinned exactly, pytest 9 with anyio's plugin and `anyio_mode = "auto"`, `-W error::DeprecationWarning`, an `__all__` snapshot test per public module.
 - **The core never imports** `agents`, `litellm`, `ray`, `s3fs`, `langfuse`, or `a2a`. A tool program is never imported by the core or the driver, except a `FunctionTool` function (R5.4 item 12). Managers, judges, planners, and the board run in the driver; only tool runs and `ctx.execute` go to the executor.
@@ -2670,3 +2965,84 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses only the allowlist that the driver can read before dispatch (a `ScriptTool` `Config.env`). A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
 
 19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.
+
+20. **Deviation from §11 (LLM dependency versions), Ruling P39:** use `openai-agents[litellm]>=0.24,<0.25` with `litellm>=1.107.0rc2,<1.108` for `llm` and `litellm[caching,proxy]>=1.107.0rc2,<1.108` for `cache`. The spec's 1.105 range cannot resolve with openai-agents 0.24; M3's upstream facts were re-checked at the pinned 1.107 release candidate. M5 release gate: move the lower bound to 1.107.0 final and re-run the upstream facts before the first release.
+
+
+### Delivered provider-state interface additions
+
+These rows supplement R4.13.1, R4.13.4, R4.13.10, R4.13.13 and R4.13.17.
+
+| Registry | Delivered interface and semantics |
+|---|---|
+| R4.13.1 | `ProviderFailed(provider: str)`: fixed safe message and normalized identifier; constructor alone grants no authority. Shared registry snapshots and rebuilds the PROVIDER category; FENCED, caller cancellation and TERMINAL precede it. |
+| R4.13.4 | `RunState.provider_generations: dict[str, int]`, `provider_failed: dict[str, int]`, `provider_causes: dict[str, dict[str, int]]`. Empty address causes retain capacity until fresh-round activation or permanent release. |
+| R4.13.10 | `ProviderStops(journal, *, state: RunState \| None = None, standalone=False)` binds one service to an entered writer. `AgentRuntime.stops` and `EngineDeps.provider_stops` resolve this same service. |
+| R4.13.10 | `register(address, providers, cancel)` observes outstanding generations; `unregister(address)` drops only the active callback. `fail(provider, *, source) -> list[str]` journals and latches before cancelling with shared timer provenance. |
+| R4.13.10 | `stopped() -> dict[str, frozenset[str]]`; `generations() -> dict[str, int]`; `await recover(provider, *, generation) -> list[str]` clears only the matching generation. `activate(address)` removes a recovered cause entry; `release(address)` permanently drops address identity. |
+| R4.13.10 | `provider_stops(journal) -> ProviderStops`; `await report_provider_failure(scope, error, *, source) -> list[str]` accepts only a registered provider signal and reaches the service through the scope's inherited journal, including child scopes. |
+| R4.13.10 | `register_probe(fn \| None)`, `agent_providers(manager, tool, models) -> frozenset[str]`, `failed_providers(output, tool) -> frozenset[str]`; provider/build hooks use supervised preparation. |
+| R4.13.13 | New run and standalone planning bind a service; resume restores it from committed state. `GoalRunner.active_agents()` counts provider-paused slots before and after runtime reconstruction. |
+| R4.13.13 | `RoundRunner.run`: a new round runs provider probes first, before active selection and `board.frontier()`; the existing frontier publication window stays intact. Restarted rounds do not probe. |
+| R4.13.17 | `is_provider_failure(exc) -> bool` uses structured evidence before the permitted credit-message fallback. `await probe_provider(provider, scope) -> bool` uses the shared child-invocation helper, one token and complete cache bypass; only registered provider failure returns False. |
+
+The `provider_failed` event's `variant` distinguishes `transition`,
+address-free `standalone` transitions, and `receipt` operation records. Replay
+ignores receipts. Transition payloads contain only identifiers and generations:
+
+- `failed`: `provider`, `generation`, `source`, `stopped: list[str]`.
+- `recovered`: `provider`, `generation`, `recovered: list[str]`.
+- `observed`: `address`, `causes: dict[str, int]`.
+- `activated` or `released`: `address`.
+
+The transition name is stored in `transition`. Allowed failure sources are
+`manager`, `tool`, `judge`, `planner`, and `curator`. Goal completion clears
+its address causes. Recovery is run-wide; activation waits for each address's
+own fresh round.
+
+
+### Delivered non-agent failure and receipt interfaces
+
+These additions supplement R3, R4.13.4, R4.13.11, R4.13.13 and the R4.14 event
+registry. They refine the earlier provider-state note: receipt variants do not
+change provider latch state, but their operation dispositions are now folded.
+
+| Registry | Delivered interface and semantics |
+|---|---|
+| R3 / R4.13.11 | `_scoring/runner.py`, `_scoring/lexicographic.py`: category-aware inner and recursive preparation boundaries preserve validated PROVIDER, LIMIT, TERMINAL and FENCED signals, with genuine caller cancellation precedence. |
+| R4.13.11 | `JudgeOutcome.provider_failed: dict[str, str] = {}` identifies judge names and providers within one main/part context. The engine aggregates separate batch receipts by part and ref; a failed ranking group skips policy, while a non-ranking failure does not. `final_judge` re-raises validated provider signals and registered limits. |
+| R4.13.4 | `GoalState.provider_batches: dict[str, dict[str, Any]]` folds completed failed barrier/final identities; `skipped_policies: dict[int, dict[str, Any]]` folds round policy skips. Failed curation adds its `decision_seq` to `curated_decisions`. |
+| R4.13.13 | Barrier identity adds lifecycle to goal/revision/round/part/ref/input membership. Completion carries that identity plus `key`, `members`, `anchors`, `ranking`, `managers_complete`. Recovery reads completed batches before judge preparation or funding and does not repeat managers once a barrier completion proves they finished. |
+| R4.13.13 | Final provider-failure receipts retain the existing pre-final `key`, goal/lifecycle/revision/ref/members/candidates, order, status and reason. Recovery restores `no_result/provider_failed` before convergence can reselect from final scores. |
+| R4.13.13 | A state-free registered manager TERMINAL propagates; it is never recorded as a manager error followed by another round. |
+
+`provider_failed` operation records use `variant="receipt"`, `source`,
+and `disposition`. Completed failed batches, policy skips and curator skips
+also carry `complete=true`:
+
+- `provider_failed` (source `judge`): `accounting="settled"`,
+  `provider_failed: {judge_name: provider}` and exactly one `barrier_batch` or
+  `final_batch` completion identity. There are zero SCORE/JUDGE_ERROR events for
+  that failed batch. Publication follows its accounting disposition.
+- `panel_drop` (source `judge`): `provider`, `dropped_member`, `member_index`,
+  survivor `panel_hash`, and invocation `batch_id`. This records a member drop,
+  with no `complete` field; survivor SCORE events carry batch completion.
+  Repeated members and the whole-invocation survivor set are retained.
+- `policy_skipped` (source `judge`): `round`, `revision`, `lifecycle`, failed
+  ranking `batches`, `paused=true`, `managers_complete=true`,
+  `barrier_complete=true`, `policy="skipped"`, `curation="ineligible"`.
+  No DECISION is fabricated. Closure, replan boundaries and page repair continue.
+- `curator_skipped` (source `curator`): `provider`, `round`, `revision`,
+  `decision_seq`, `accounting="settled"`. No CURATED event is fabricated.
+
+A provider-failed planner uses a normal PLAN_REJECTED receipt with added
+`provider` and `disposition="provider_failed"`, beside its shared-service
+transition. `first_round`, optional `join_retry` and safe type-only errors retain
+their existing meanings. All source transitions use the shared ProviderStops
+service; receipts do not invent extra generations or agent stops.
+
+An ordinary final judge error may still produce reason `provider_failed`, meaning
+no final order, without any provider transition or provider receipt. Barrier
+LIMIT becomes `reserve_exhausted`; final LIMIT becomes `no_result` with that same
+reason. Replan/policy LIMIT containment is unchanged. Storage/accounting terminal
+failures, fencing and genuine caller cancellation never become provider receipts.

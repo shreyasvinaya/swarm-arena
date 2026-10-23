@@ -24,6 +24,90 @@ from swarm_arena.executor import Executor, Job
 from swarm_arena.manager import LimitReached
 
 
+@pytest.mark.parametrize("kind", ["terminal", "limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_request_hook_control_disposition(kind: str, nested: bool) -> None:
+    from swarm_arena._agent.tool_run import _request_hook
+    from swarm_arena._errors import (
+        ProviderFailed,
+        _core_category,
+        _core_error,
+        _core_signal,
+        _SignalCategory,
+        _stop_cleanup_error,
+    )
+    from swarm_arena.manager import LimitReached
+
+    def fail() -> None:
+        error: BaseException = (
+            _stop_cleanup_error()
+            if kind == "terminal"
+            else _core_signal(LimitReached("stop", "the round is stopping"))
+            if kind == "limit"
+            else _core_error(ProviderFailed, "provider")
+        )
+        if nested:
+            raise BaseExceptionGroup("request", [BaseExceptionGroup("hook", [error])])
+        raise error
+
+    with pytest.raises(RuntimeError if kind == "terminal" else SoftError) as caught:
+        _request_hook(fail)
+    assert _core_category(caught.value) is (
+        _SignalCategory.TERMINAL if kind == "terminal" else _SignalCategory.DIAGNOSTIC
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "site", ["request", "stage_settings", "stage", "estimate", "dispatch", "usage", "fingerprint"]
+)
+async def test_tool_conversion_preserves_terminal(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, site: str, nested: bool
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._agent import tool_run as module
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    reached: list[str] = []
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        reached.append(site)
+        error = _stop_cleanup_error()
+        if nested:
+            raise BaseExceptionGroup("tool", [BaseExceptionGroup("boundary", [error])])
+        raise error
+
+    executor = Mock(spec=Executor, submit=AsyncMock(return_value=ToolOutput(status=RunStatus.OK)))
+    rt = dataclasses.replace(rt_env.rt, executor=executor)
+    if site == "request":
+        monkeypatch.setattr(module, "_validate_config", fail)
+    elif site == "stage_settings":
+        monkeypatch.setattr(rt.tool, "_own_files", fail)
+    elif site == "stage":
+        monkeypatch.setattr(module, "plan_tool_stage", fail)
+    elif site == "estimate":
+        monkeypatch.setattr(rt.tool, "estimate", fail)
+    elif site == "dispatch":
+        executor.submit.side_effect = fail
+    elif site == "usage":
+
+        def amount(*args: Any, **kwargs: Any) -> Amount:
+            if "tokens" in kwargs:
+                fail()
+            return Amount(*args, **kwargs)
+
+        monkeypatch.setattr(module, "Amount", Mock(wraps=Amount, side_effect=amount))
+    else:
+        monkeypatch.setattr(rt.tool, "fingerprint", fail)
+
+    with pytest.raises(RuntimeError) as caught:
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert reached == [site]
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    assert not rt_env.events("tool_end")
+
+
 class _QueuedExecutor(Executor):
     def __init__(self, delegate: Executor) -> None:
         super().__init__()
@@ -162,6 +246,35 @@ async def test_closed_admission_refuses_dispatch(rt_env: RtEnv) -> None:
     res = rt_env.events("reserve")[-1].payload["reservation"]["id"]
     assert rt_env.reservation_state(res) == "settled"
     assert rt_env.charged(res) == Amount()
+
+
+@pytest.mark.parametrize("escalation", ["stop", "cancel"])
+async def test_budget_close_after_reservation_preserves_only_admitted_work(
+    rt_env: RtEnv, escalation: str
+) -> None:
+    rt = rt_env.with_tool(FunctionTool("_fakes.tools:touch"))
+
+    def close() -> None:
+        rt_env.inflight.close(budget=True)
+        if escalation == "stop":
+            rt_env.inflight.close()
+            rt_env.inflight.close(budget=True)  # a budget latch cannot reopen hard closure
+        elif escalation == "cancel":
+            rt_env.inflight.cancel_all()
+
+    rt_env.after_append(EventType.RESERVE, close)
+    with pytest.raises(LimitReached):
+        await execute_tool_run(
+            rt, {"marker": str(rt_env.marker)}, parents=(), replicate=None, edits=None
+        )
+    assert not rt_env.marker.exists()
+    assert "tool_start" not in rt_env.committed_types()
+    res = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert rt_env.reservation_state(res) == "settled"
+    assert rt_env.charged(res) == Amount()
+    with pytest.raises(LimitReached):
+        await execute_tool_run(rt, {"marker": "new"}, parents=(), replicate=None, edits=None)
+    assert len(rt_env.events("reserve")) == 1
 
 
 async def test_admission_closed_while_queued_refuses_start(rt_env: RtEnv) -> None:
@@ -312,6 +425,42 @@ class _OutputExecutor(_QueuedExecutor):
         if isinstance(self.output, Exception):
             raise self.output
         return self.output
+
+
+@pytest.mark.parametrize("kind", ["limit", "provider"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_started_tool_check_control_disposition(
+    rt_env: RtEnv, kind: str, nested: bool
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._errors import ProviderFailed, _core_signal
+    from swarm_arena._scoring.check import Check
+
+    error: BaseException = (
+        _core_signal(LimitReached("stop", "the round is stopping"))
+        if kind == "limit"
+        else _core_error(ProviderFailed, "provider")
+    )
+    if nested:
+        error = BaseExceptionGroup("check", [BaseExceptionGroup("hook", [error])])
+    check = Mock(spec=Check, check=AsyncMock(side_effect=error))
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK)),
+        checks=[("check", check)],
+    )
+    candidate = await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert len(rt_env.events("tool_start")) == len(rt_env.events("tool_end")) == 1
+    assert candidate.output.status is RunStatus.OK
+    assert len(candidate.checks) == 1
+    assert not candidate.checks[0].passed
+    assert candidate.checks[0].reasons == [
+        f"check error: {'LimitReached' if kind == 'limit' else 'ProviderFailed'}"
+    ]
+    assert rt_env.reservation_state(candidate) == "settled"
+    assert rt.board.get_candidate(candidate.id) == candidate
+    assert candidate in rt.own
 
 
 async def test_final_request_matches_stage_job_candidate_and_repeat_key(rt_env: RtEnv) -> None:
@@ -1623,7 +1772,9 @@ async def test_core_tool_limits_survive_extra_actions_and_round_classification(
     runner.agents[0].manager = RaisesControl()
     runner.converge = True
     result = await runner.run(2)
-    assert result.reasons["t/a"] == "limit reached"
+    assert result.reasons["t/a"] == ("run budget" if case == "usage_overflow" else "limit reached")
+    if case == "usage_overflow":
+        assert runner.deps.stops.run_budget
 
 
 async def test_stage_soft_error_keeps_safe_diagnostic_through_extra_action(rt_env: RtEnv) -> None:
@@ -2004,3 +2155,40 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
     assert len(writes) == 1, "abandoned log write published another file"
+
+
+@pytest.mark.parametrize("failure", ["estimate", "providers", "put_edits"])
+async def test_predispatch_error_retains_candidate_after_completion_cancel(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from swarm_arena._agent import tool_run
+    from swarm_arena._errors import ConfigError
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise ConfigError("pre-dispatch failure")
+
+    monkeypatch.setattr(tool_run if failure == "put_edits" else rt_env.rt.tool, failure, fail)
+    real = tool_run.run_sync_daemon
+    observed: list[int] = []
+
+    async def wrapped(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if fn is tool_run._prepare_output:
+            observed.append(len(rt_env.inflight._scopes))
+            rt_env.inflight.cancel_all()
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tool_run, "run_sync_daemon", wrapped)
+    candidate = await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert observed == [1]  # only the bounded output scope remains registered
+    assert not rt_env.events("tool_start")
+    assert len(rt_env.events("tool_end")) == 1
+    reserves = rt_env.events("reserve")
+    assert len(reserves) == 1
+    reservation = reserves[0].payload["reservation"]["id"]
+    settles = rt_env.events("settle")
+    assert len(settles) == 1
+    assert settles[0].payload["id"] == reservation
+    assert rt_env.reservation_state(reservation) == "settled"
+    assert rt_env.charged(reservation) == Amount()
+    assert not rt_env.inflight._scopes

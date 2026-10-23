@@ -17,7 +17,7 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.planning_types import Decision
-from swarm_arena._model.results import AgentStatus, Candidate, Learning, Score
+from swarm_arena._model.results import AgentStatus, Candidate, Learning, LLMCall, Score
 from swarm_arena._model.run_config import RunConfig
 
 STOP_REASONS = frozenset(
@@ -64,6 +64,10 @@ class GoalState(FrozenModel):
         Policy decisions with their round numbers.
     curated_decisions : list[int], default=[]
         Committed policy event sequences with a completed curation batch.
+    provider_batches : dict[str, dict], default={}
+        Completed provider-failed judging identities, keyed by batch digest.
+    skipped_policies : dict[int, dict], default={}
+        Provider-paused rounds with managers/barrier complete and curation ineligible.
     frontiers : dict[int, Frontier], default={}
         Snapshots for ordinary and converge rounds.
     end_reason : str or None, default=None
@@ -122,6 +126,8 @@ class GoalState(FrozenModel):
     agents: dict[str, AgentStatus] = {}
     decisions: list[tuple[int, Decision]] = []
     curated_decisions: list[int] = []
+    provider_batches: dict[str, dict[str, Any]] = {}
+    skipped_policies: dict[int, dict[str, Any]] = {}
     frontiers: dict[int, Frontier] = {}
     end_reason: str | None = None
     no_result_reason: str | None = None
@@ -181,7 +187,9 @@ class RunState:
     evidence is never relabeled by a later same-name part revision.
     Private event history retains the complete prefixes used by immutable round
     pages, including historical limits and revision activation.
-    ``llm_request_sha256`` is reserved for the later LLM event fold.
+    ``llm_calls`` retains recorded calls, ``llm_request_sha256`` their request
+    hashes, and ``llm_cache_identity`` the opaque generating-response identities
+    used for proven cache-origin links. Payload storage is not required.
 
     Examples
     --------
@@ -209,6 +217,11 @@ class RunState:
     id_counters: dict[str, int] = field(default_factory=dict)
     stop: Literal["none", "stop", "stop-now"] = "none"
     llm_request_sha256: dict[str, str] = field(default_factory=dict)
+    llm_calls: dict[str, LLMCall] = field(default_factory=dict)
+    llm_cache_identity: dict[str, str] = field(default_factory=dict)
+    provider_generations: dict[str, int] = field(default_factory=dict)
+    provider_failed: dict[str, int] = field(default_factory=dict)
+    provider_causes: dict[str, dict[str, int]] = field(default_factory=dict)
     run_elapsed_s: float = 0.0
     epoch: int = 0
     lost: set[str] = field(default_factory=set)
@@ -306,6 +319,28 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.PROVIDER_FAILED:
+                self._provider_event(payload)
+            case EventType.GOAL_FINISHED:
+                self.provider_causes = {
+                    a: cs
+                    for a, cs in self.provider_causes.items()
+                    if a.split("/", 1)[0] != event.goal_id
+                }
+            case EventType.LLM_CALL:
+                call = LLMCall.model_validate(payload["call"])
+                if call.id in self.llm_calls or call.run_id != event.run_id:
+                    raise ValueError("invalid LLM call identity")
+                self.llm_calls[call.id] = call
+                for key, index in (
+                    ("request_sha256", self.llm_request_sha256),
+                    ("cache_identity", self.llm_cache_identity),
+                ):
+                    digest = payload.get(key)
+                    if digest is not None:
+                        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                            raise ValueError("invalid LLM call digest")
+                        index[call.id] = digest
             case EventType.REVIEW_IMPORTED:
                 # Arena review objects own scores; the receipt only retains IDs for recovery.
                 pass
@@ -327,6 +362,9 @@ class RunState:
                     plan = Plan._from_data(payload["plan"], base_dir=Path(payload["base_dir"]))
                 else:
                     plan = Plan.model_validate(payload["plan"])
+                plan._set_planner_provenance(
+                    payload.get("planning_session"), payload.get("planner_call_ids", ())
+                )
                 if revisions and revisions[-1][0].parts != plan.parts:
                     self.goals[event.goal_id] = self.goals[event.goal_id].model_copy(
                         update={"kept_parts": {}, "join_attempts": 0, "join_failures": []}
@@ -398,6 +436,77 @@ class RunState:
                     self.stop = "stop"
             case EventType.TAKEOVER:
                 self.stop = "none"
+
+    def _provider_event(self, payload: dict[str, Any]) -> None:
+        """Fold explicit latch transitions; operation receipts have no latch effect."""
+        variant = payload.get("variant")
+        if variant == "receipt":
+            return
+        if variant not in {"transition", "standalone"}:
+            raise _core_error(ValueError, "invalid provider event variant")
+        transition = payload.get("transition")
+        if transition in {"failed", "recovered"}:
+            provider, generation = payload.get("provider"), payload.get("generation")
+            addresses = payload.get("stopped" if transition == "failed" else "recovered")
+            if (
+                type(provider) is not str
+                or type(generation) is not int
+                or generation < 1
+                or type(addresses) is not list
+                or any(type(a) is not str for a in addresses)
+                or (variant == "standalone" and addresses)
+            ):
+                raise _core_error(ValueError, "invalid provider transition")
+            if transition == "failed":
+                if generation != self.provider_generations.get(provider, 0) + 1:
+                    raise _core_error(ValueError, "invalid provider generation")
+                self.provider_generations[provider] = self.provider_failed[provider] = generation
+                for address in addresses:
+                    self.provider_causes.setdefault(address, {})[provider] = generation
+                    self._provider_status(address, AgentStatus.STOPPED)
+            elif self.provider_failed.get(provider) == generation:
+                self.provider_failed.pop(provider)
+                for address in addresses:
+                    causes = self.provider_causes.get(address, {})
+                    if causes.get(provider) == generation:
+                        causes.pop(provider)
+        elif transition == "observed":
+            address, causes = payload.get("address"), payload.get("causes")
+            if (
+                type(address) is not str
+                or type(causes) is not dict
+                or any(
+                    type(p) is not str or type(g) is not int or self.provider_failed.get(p) != g
+                    for p, g in causes.items()
+                )
+            ):
+                raise _core_error(ValueError, "invalid provider observation")
+            self.provider_causes.setdefault(address, {}).update(causes)
+            self._provider_status(address, AgentStatus.STOPPED)
+        elif transition in {"activated", "released"}:
+            address = payload.get("address")
+            if type(address) is not str:
+                raise _core_error(ValueError, "invalid provider address")
+            if transition == "activated":
+                if address not in self.provider_causes or self.provider_causes[address]:
+                    raise _core_error(ValueError, "invalid provider activation")
+                self._provider_status(address, AgentStatus.ACTIVE)
+            self.provider_causes.pop(address, None)
+        else:
+            raise _core_error(ValueError, "invalid provider transition")
+
+    def _provider_status(self, address: str, status: AgentStatus) -> None:
+        """Preserve permanent slot outcomes while restoring provider dispositions."""
+        goal_id, _, key = address.partition("/")
+        goal = self.goals.get(goal_id)
+        if goal is None or goal.agents.get(key) in {
+            AgentStatus.PRUNED,
+            AgentStatus.WATCHDOG_STOPPED,
+        }:
+            return
+        agents = dict(goal.agents)
+        agents[key] = status
+        self.goals[goal_id] = goal.model_copy(update={"agents": agents})
 
     def _goal_event(self, event: Event) -> None:
         """Fold goal progress while keeping converge rounds distinct from main rounds."""
@@ -495,6 +604,32 @@ class RunState:
                     *goal.decisions,
                     (payload["round"], Decision.model_validate(payload["decision"])),
                 ]
+            case EventType.PROVIDER_FAILED:
+                if payload.get("variant") == "receipt" and payload.get("complete") is True:
+                    disposition = payload.get("disposition")
+                    if disposition == "provider_failed":
+                        record = payload.get("barrier_batch") or payload.get("final_batch")
+                        if not isinstance(record, dict) or type(record.get("key")) is not str:
+                            raise _core_error(ValueError, "invalid provider batch receipt")
+                        updates["provider_batches"] = {
+                            **goal.provider_batches,
+                            record["key"]: record,
+                        }
+                    elif disposition == "policy_skipped":
+                        if (
+                            payload.get("policy") != "skipped"
+                            or payload.get("curation") != "ineligible"
+                        ):
+                            raise _core_error(ValueError, "invalid skipped policy receipt")
+                        updates["skipped_policies"] = {
+                            **goal.skipped_policies,
+                            event.round: payload,
+                        }
+                    elif disposition == "curator_skipped":
+                        decision_seq = payload.get("decision_seq")
+                        if type(decision_seq) is not int or decision_seq < 1:
+                            raise _core_error(ValueError, "invalid curation decision_seq")
+                        updates["curated_decisions"] = [*goal.curated_decisions, decision_seq]
             case EventType.CURATED:
                 # Summary learning events own indexing; this receipt only closes a phase.
                 decision_seq = payload.get("decision_seq")

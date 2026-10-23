@@ -3,17 +3,26 @@
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 
-from swarm_arena._errors import _exception_type_name
+from swarm_arena._errors import (
+    ProviderFailed,
+    StorageError,
+    _core_category,
+    _exception_type_name,
+    _is_core_signal,
+    _SignalCategory,
+)
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.ref import Ref
 from swarm_arena._model.results import Candidate, CheckResult, Score
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena._scoring.check import Check, CheckContext
 from swarm_arena._scoring.judge import (
     Judge,
     JudgeContext,
+    _panel_drops,
+    _PanelDrop,
     _prepare_score_stamps,
     _stamp_score_ids,
     is_finite_score,
@@ -54,15 +63,22 @@ class JudgeOutcome(FrozenModel):
         Finite scores stamped with the judging context's id source.
     errors : list[JudgeError]
         At most one error per candidate per judge, in batch order.
+    provider_failed : dict[str, str], optional
+        Judge names mapped to validated providers for this context's main/part group.
+        Failed batches contain no scores or fabricated candidate errors.
+    panel_drops : list, optional
+        Settled panel-member losses to publish atomically with survivor scores.
 
     Examples
     --------
     >>> JudgeOutcome(scores=[], errors=[]).model_dump()
-    {'scores': [], 'errors': []}
+    {'scores': [], 'errors': [], 'provider_failed': {}, 'panel_drops': []}
     """
 
     scores: list[Score]
     errors: list[JudgeError]
+    provider_failed: dict[str, str] = {}
+    panel_drops: list[_PanelDrop] = []
 
 
 def _prepare_check_result(result: object) -> CheckResult:
@@ -80,7 +96,9 @@ async def run_checks(
 
     Each check receives its own shallow context copy, sharing the executor and
     id source. Invalid results fail closed after lax model revalidation. Check
-    exceptions expose only their types, while fencing always propagates.
+    exceptions expose only their types. Registered TERMINAL and FENCED failures
+    and genuine caller cancellation propagate; ordinary LIMIT/provider signals
+    remain failed check results so started tool work can finish settlement.
     Returned-model serializers and validation run in a cancellable daemon;
     callers retain control of the check's deadline and interruption result.
 
@@ -123,6 +141,7 @@ async def run_checks(
             result = await check.check(candidate, copy(ctx))
         except BaseException as error:
             error = outcome.classify(error)
+            _raise_terminal(error)
             results.append(
                 CheckResult(
                     check=name,
@@ -134,7 +153,8 @@ async def run_checks(
         try:
             valid = await run_sync_daemon(_prepare_check_result, result)
         except BaseException as error:
-            outcome.propagate_control(error)
+            error = outcome.classify(error)
+            _raise_terminal(error)
             valid = CheckResult(check=name, passed=False, reasons=["check error: invalid result"])
         results.append(valid.model_copy(update={"check": name}))
     return results
@@ -233,6 +253,8 @@ async def _judge_batch(
     seen: set[str] = set()
     nonfinite: set[str] = set()
     outcome = _Outcome()
+    drops: list[_PanelDrop] = []
+    token = _panel_drops.set(drops)
     try:
         if leaders is not None:
             batch, ctx.anchors = await run_sync_daemon(prepare_judge_batch, judge, batch, leaders)
@@ -249,8 +271,16 @@ async def _judge_batch(
         stamped = _stamp_score_ids(prepared, ctx.ids)
     except BaseException as error:
         error = outcome.classify(error)
+        if isinstance(error, StorageError) and _is_core_signal(error):
+            raise error from None
+        if _core_category(error) is _SignalCategory.PROVIDER and not ctx.final:
+            assert isinstance(error, ProviderFailed)  # noqa: PT017 - category narrows core type
+            return JudgeOutcome(scores=[], errors=[], provider_failed={name: error.provider})
+        outcome.propagate_control(error)
         stamped = []
         raised = f"{_exception_type_name(error)}: judge raised"
+    finally:
+        _panel_drops.reset(token)
 
     errors: list[JudgeError] = []
     for candidate in batch:
@@ -265,7 +295,7 @@ async def _judge_batch(
         else:
             continue
         errors.append(JudgeError(candidate_id=candidate.id, judge=name, reason=reason))
-    return JudgeOutcome(scores=stamped, errors=errors)
+    return JudgeOutcome(scores=stamped, errors=errors, panel_drops=drops if stamped else [])
 
 
 async def judge_round(
@@ -283,8 +313,11 @@ async def judge_round(
     Empty gated-in batches skip all judges. Foreign scores and later duplicate
     scores are discarded before finite-key validation and stamping. Each judge
     gets one fresh context from ``ctx_for``; its batch and anchor ids are set on
-    that supplied context. Hook failures and malformed returns fail the whole
-    invocation with type-only errors; fencing and cancellation propagate.
+    that supplied context. Ordinary hook failures and malformed returns produce
+    type-only candidate errors. Validated provider failures produce a zero-score
+    ``provider_failed`` outcome; settled member drops accompany survivor scores.
+    Registered limits, terminal errors, storage failures, fencing and genuine
+    caller cancellation propagate.
     Complete scores are validated from Python data before publication. Synchronous
     metadata and serialization run in abandonable daemon threads; ids stay on the loop.
 
@@ -313,17 +346,25 @@ async def judge_round(
     Raises
     ------
     Fenced
-        If a command's start callback reports lost ownership.
+        If a registered signal reports lost ownership.
+    LimitReached
+        For a registered admission refusal or terminal usage overflow.
+    StorageError
+        If owned accounting or storage fails.
+    Exception
+        Other registered terminal errors and genuine caller cancellation propagate.
 
     Examples
     --------
     >>> import asyncio
     >>> asyncio.run(judge_round('g', [], [], [], lambda judge: None)).model_dump()
-    {'scores': [], 'errors': []}
+    {'scores': [], 'errors': [], 'provider_failed': {}, 'panel_drops': []}
     """
     eligible = [candidate for candidate in candidates if not candidate.gated_out]
     scores: list[Score] = []
     errors: list[JudgeError] = []
+    provider_failed: dict[str, str] = {}
+    drops: list[_PanelDrop] = []
     if not eligible:
         return JudgeOutcome(scores=scores, errors=errors)
     for ref, judge in judges:
@@ -339,7 +380,11 @@ async def judge_round(
         )
         scores.extend(outcome.scores)
         errors.extend(outcome.errors)
-    return JudgeOutcome(scores=scores, errors=errors)
+        provider_failed.update(outcome.provider_failed)
+        drops.extend(outcome.panel_drops)
+    return JudgeOutcome(
+        scores=scores, errors=errors, provider_failed=provider_failed, panel_drops=drops
+    )
 
 
 async def final_judge(
@@ -355,6 +400,8 @@ async def final_judge(
     across every finalist's round and fidelity. The supplied context is marked
     final, cache reads are disabled, and anchors are cleared. Judge and metadata
     hook failures or malformed returns produce an empty order and safe errors.
+    Validated provider failures, registered limits, terminal errors, storage
+    failures, fencing and genuine caller cancellation propagate to the engine.
 
     Parameters
     ----------
@@ -375,7 +422,15 @@ async def final_judge(
     Raises
     ------
     Fenced
-        If a command's start callback reports lost ownership.
+        If a registered signal reports lost ownership.
+    LimitReached
+        For a registered admission refusal or terminal usage overflow.
+    StorageError
+        If owned accounting or storage fails.
+    Exception
+        Other registered terminal errors and genuine caller cancellation propagate.
+    ProviderFailed
+        If final judging reports a validated provider failure.
 
     Examples
     --------
@@ -387,7 +442,7 @@ async def final_judge(
     ...     executor=Mock(), artifact_root='/artifacts')
     >>> order, outcome = asyncio.run(final_judge('g', (Ref.of(judge), judge), [], context))
     >>> (order, outcome.model_dump(), context.final, context.read_cache)
-    ([], {'scores': [], 'errors': []}, True, False)
+    ([], {'scores': [], 'errors': [], 'provider_failed': {}, 'panel_drops': []}, True, False)
     """
     ctx.final = True
     ctx.read_cache = False

@@ -3,7 +3,7 @@
 import asyncio
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -20,7 +20,7 @@ from swarm_arena._engine.admission import RunAdmission
 from swarm_arena._engine.goal import _repair_round_pages
 from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
-from swarm_arena._engine.stops import RunClock, StopState
+from swarm_arena._engine.stops import ProviderStops, RunClock, StopState
 from swarm_arena._errors import (
     Fenced,
     PlanError,
@@ -38,7 +38,7 @@ from swarm_arena._journal.replay import RunState, continues_on_resume
 from swarm_arena._journal.views import ViewWriter
 from swarm_arena._model.ids import IdGen
 from swarm_arena._model.run_config import RunConfig
-from swarm_arena._outcomes import _Outcome
+from swarm_arena._outcomes import _Outcome, _raise_terminal
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.validate import _rule_max_agents_total
 from swarm_arena._store.artifacts import ArtifactStore
@@ -87,6 +87,10 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
         for _, batch in read_chain(store, doc.head, _read=partial(_read_segment, store))
         for event in batch
     ]
+    if any(
+        event.type == EventType.RUN_STARTED and event.payload.get("planning") for event in events
+    ):
+        raise _core_error(ValueError, "run is a planning session; it cannot be resumed")
     return events, RunState.from_events(events)
 
 
@@ -113,6 +117,14 @@ def _check(state: RunState, config: RunConfig) -> list[str]:
     return continued
 
 
+def _restore_import_paths(state: RunState) -> None:
+    """Make recorded component locations available before invoking their hooks."""
+    for revisions in state.plans.values():
+        directory = str(revisions[0][0].base_dir)
+        if directory not in sys.path:
+            sys.path.append(directory)
+
+
 class _ResumeServices:
     """Keep the AnyIO writer context in one task across preparation and execution."""
 
@@ -126,11 +138,15 @@ class _ResumeServices:
         force: bool,
         clock: RunClock,
         validated_head: Head,
+        model_warnings: list[str],
+        stops: StopState,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
+        self.stops = stops
         self.validated_head = validated_head
+        self.model_warnings = model_warnings
         self.ready, self.close = anyio.Event(), anyio.Event()
         self.failure: BaseException | None = None
         self.resumed: ResumeState | None = None
@@ -141,6 +157,7 @@ class _ResumeServices:
         self.run_failed = False
         self.preparation_scope: anyio.CancelScope | None = None
         self.cancel_preparation = False
+        self._journal: run_module._RunJournal | None = None
 
     async def _serve(self) -> None:
         """Let a cancelled preparing caller interrupt abandonable user hooks."""
@@ -160,7 +177,7 @@ class _ResumeServices:
         assert head is not None
         try:
             path = run_module._local_journal_path(self.run_id, lease.doc.epoch)
-            stops = StopState()
+            stops = self.stops
             clock = self.clock
             journal = run_module._RunJournal(
                 self.store,
@@ -171,6 +188,7 @@ class _ResumeServices:
                 sync_interval_s=config.sync_interval_s,
                 settle_timeout_s=config.settle_timeout_s,
             )
+            self._journal = journal
             if head != self.validated_head:
                 validated = False
                 async with run_module._supervise_initialization(
@@ -196,10 +214,14 @@ class _ResumeServices:
                 journal.clock = clock
                 # The journal owns release even if supervision entry is cancelled.
                 async with run_module._supervise_writer(journal):
+                    board_failed = False
                     try:
                         # A successful force CAS must be auditable even if replay now refuses.
                         await journal.append_durable(
-                            EventDraft(type=EventType.TAKEOVER, payload={"force": self.force})
+                            EventDraft(
+                                type=EventType.TAKEOVER,
+                                payload={"force": self.force, "warnings": self.model_warnings},
+                            )
                         )
                         events, state = await _validated_io(_read, self.store, lease.doc)
                         replay_prepared()
@@ -221,149 +243,165 @@ class _ResumeServices:
                             self.order.extend(
                                 g for g in state.plans if state.goals[g].status == "queued"
                             )
-                            for revisions in state.plans.values():
-                                directory = str(revisions[0][0].base_dir)
-                                if directory not in sys.path:
-                                    sys.path.append(directory)
+                            _restore_import_paths(state)
                             ids = IdGen(self.run_id, lease.doc.epoch, counters=state.id_counters)
                             ledger = Ledger.replay(state, journal=journal, ids=ids)
-                            executor = await run_module._start_executor(config)
-                            killed: list[str] = []
-                            starts = {
-                                e.payload["candidate_id"]: e
-                                for e in events
-                                if e.type == EventType.TOOL_START
-                            }
-                            commands = {
-                                e.payload["job_id"]: e
-                                for e in events
-                                if e.type == EventType.COMMAND_START
-                            }
-                            for jobs, index, event_type in (
-                                (state.started, starts, EventType.RUN_LOST),
-                                (state.started_commands, commands, EventType.COMMAND_END),
+                            artifacts = ArtifactStore(
+                                await _storage_io(open_store, config.artifact_root)
+                            )
+                            async with run_module._bound_run(
+                                self.run_id,
+                                journal=journal,
+                                ids=ids,
+                                artifacts=artifacts,
+                                config=config,
+                                stops=stops,
+                                clock=clock,
+                                state=state,
                             ):
-                                for id, started in jobs.items():
-                                    outcome = _Outcome()
-                                    try:
-                                        with anyio.move_on_after(config.settle_timeout_s):
-                                            if await executor.kill_orphan(started):
-                                                killed.append(id)
-                                    except BaseException as error:
-                                        error = outcome.classify(error)
-                                        name = _exception_type_name(error)
-                                        raise _core_error(
-                                            RuntimeError,
-                                            f"orphan recovery failed: {name}",
-                                        ) from None
-                                    source = index[id]
-                                    payload = (
-                                        {
-                                            "candidate_id": id,
-                                            "reservation_id": source.payload["reservation_id"],
-                                        }
-                                        if event_type == EventType.RUN_LOST
-                                        else {"job_id": id, "status": "lost"}
-                                    )
+                                executor = await run_module._start_executor(config)
+                                killed: list[str] = []
+                                starts = {
+                                    e.payload["candidate_id"]: e
+                                    for e in events
+                                    if e.type == EventType.TOOL_START
+                                }
+                                commands = {
+                                    e.payload["job_id"]: e
+                                    for e in events
+                                    if e.type == EventType.COMMAND_START
+                                }
+                                for jobs, index, event_type in (
+                                    (state.started, starts, EventType.RUN_LOST),
+                                    (state.started_commands, commands, EventType.COMMAND_END),
+                                ):
+                                    for id, started in jobs.items():
+                                        outcome = _Outcome()
+                                        try:
+                                            with anyio.move_on_after(config.settle_timeout_s):
+                                                if await executor.kill_orphan(started):
+                                                    killed.append(id)
+                                        except BaseException as error:
+                                            error = outcome.classify(error)
+                                            _raise_terminal(error)
+                                            name = _exception_type_name(error)
+                                            raise _core_error(
+                                                RuntimeError,
+                                                f"orphan recovery failed: {name}",
+                                            ) from None
+                                        source = index[id]
+                                        payload = (
+                                            {
+                                                "candidate_id": id,
+                                                "reservation_id": source.payload["reservation_id"],
+                                            }
+                                            if event_type == EventType.RUN_LOST
+                                            else {"job_id": id, "status": "lost"}
+                                        )
+                                        journal.append(
+                                            EventDraft(
+                                                type=event_type,
+                                                task_id=source.task_id,
+                                                goal_id=source.goal_id,
+                                                team=source.team,
+                                                agent=source.agent,
+                                                round=source.round,
+                                                payload=payload,
+                                            )
+                                        )
+                                shares = weighted_shares(
+                                    ledger.free(),
+                                    {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
+                                )
+                                for g in continued:
+                                    ledger.open_goal(g, pool=shares[g])
                                     journal.append(
                                         EventDraft(
-                                            type=event_type,
-                                            task_id=source.task_id,
-                                            goal_id=source.goal_id,
-                                            team=source.team,
-                                            agent=source.agent,
-                                            round=source.round,
-                                            payload=payload,
+                                            type=EventType.GOAL_STARTED,
+                                            goal_id=g,
+                                            payload={"pool": shares[g].model_dump()},
                                         )
                                     )
-                            shares = weighted_shares(
-                                ledger.free(),
-                                {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
-                            )
-                            for g in continued:
-                                ledger.open_goal(g, pool=shares[g])
-                                journal.append(
-                                    EventDraft(
-                                        type=EventType.GOAL_STARTED,
-                                        goal_id=g,
-                                        payload={"pool": shares[g].model_dump()},
+                                if config.limits != state.config.limits:
+                                    ledger.change_limits(config.limits)
+                                    journal.append(
+                                        EventDraft(
+                                            type=EventType.LIMITS_CHANGED,
+                                            payload={
+                                                "old": state.config.limits.model_dump(mode="json"),
+                                                "new": config.limits.model_dump(mode="json"),
+                                            },
+                                        )
                                     )
+                                await journal.commit()
+                                _, state = await _validated_io(_read, self.store, lease.doc)
+                                await run_module._setup_run(
+                                    [revisions[-1][0] for revisions in state.plans.values()], config
                                 )
-                            if config.limits != state.config.limits:
-                                ledger.change_limits(config.limits)
-                                journal.append(
-                                    EventDraft(
-                                        type=EventType.LIMITS_CHANGED,
-                                        payload={
-                                            "old": state.config.limits.model_dump(mode="json"),
-                                            "new": config.limits.model_dump(mode="json"),
-                                        },
-                                    )
+                                board = await run_module._start_board(config)
+                                await run_module._open_board(
+                                    board,
+                                    config,
+                                    self.run_id,
+                                    sorted(
+                                        {
+                                            goal.namespace
+                                            for revisions in state.plans.values()
+                                            for plan, _ in revisions
+                                            for goal in [
+                                                plan.goal,
+                                                *(part.goal for part in plan.parts),
+                                            ]
+                                        }
+                                    ),
                                 )
-                            await journal.commit()
-                            _, state = await _validated_io(_read, self.store, lease.doc)
-                            board = await run_module._start_board(config)
-                            await run_module._open_board(
-                                board,
-                                config,
-                                self.run_id,
-                                sorted(
-                                    {
+                                ProviderStops(journal, state=state)
+                                self.deps = EngineDeps(
+                                    run_id=self.run_id,
+                                    config=config,
+                                    store=self.store,
+                                    journal=journal,
+                                    ledger=ledger,
+                                    board=board,
+                                    executor=executor,
+                                    artifacts=artifacts,
+                                    ids=ids,
+                                    views=ViewWriter(self.store, journal),
+                                    board_namespaces={
                                         goal.namespace
                                         for revisions in state.plans.values()
                                         for plan, _ in revisions
-                                        for goal in [
-                                            plan.goal,
-                                            *(part.goal for part in plan.parts),
-                                        ]
-                                    }
-                                ),
-                            )
-                            self.deps = EngineDeps(
-                                run_id=self.run_id,
-                                config=config,
-                                store=self.store,
-                                journal=journal,
-                                ledger=ledger,
-                                board=board,
-                                executor=executor,
-                                artifacts=ArtifactStore(
-                                    await _storage_io(open_store, config.artifact_root)
-                                ),
-                                ids=ids,
-                                views=ViewWriter(self.store, journal),
-                                board_namespaces={
-                                    goal.namespace
-                                    for revisions in state.plans.values()
-                                    for plan, _ in revisions
-                                    for goal in [plan.goal, *(part.goal for part in plan.parts)]
-                                },
-                                stops=stops,
-                                clock=clock,
-                                admission=RunAdmission(
-                                    config.limits.max_agents_total,
-                                    [
-                                        plan
-                                        for revisions in state.plans.values()
-                                        for plan, _ in revisions
-                                    ],
-                                ),
-                            )
-                            await _repair_round_pages(self.deps, state)
-                            self.resumed = ResumeState(
-                                state, lease, lease.doc.epoch, ledger, killed, self
-                            )
-                            prepared()
-                            self.ready.set()
-                            await self.close.wait()
+                                        for goal in [plan.goal, *(part.goal for part in plan.parts)]
+                                    },
+                                    stops=stops,
+                                    clock=clock,
+                                    admission=RunAdmission(
+                                        config.limits.max_agents_total,
+                                        [
+                                            plan
+                                            for revisions in state.plans.values()
+                                            for plan, _ in revisions
+                                        ],
+                                    ),
+                                )
+                                await _repair_round_pages(self.deps, state)
+                                self.resumed = ResumeState(
+                                    state, lease, lease.doc.epoch, ledger, killed, self
+                                )
+                                prepared()
+                                self.ready.set()
+                                await self.close.wait()
                         if self.resumed is None:
                             raise _core_error(RuntimeError, "resume initialization stopped")
+                    except BaseException:
+                        board_failed = True
+                        raise
                     finally:
                         if board is not None:
                             await run_module._close_board(
                                 board,
                                 config,
-                                failed=sys.exc_info()[0] is not None or self.run_failed,
+                                failed=board_failed or self.run_failed,
                             )
             if self.resumed is None:
                 raise _core_error(RuntimeError, "resume initialization stopped")
@@ -389,6 +427,7 @@ class _ResumeServices:
                     except BaseException as error:
                         if self.failure is None:
                             self.failure = error
+            await run_module._close_stop_watcher(self.stops)
             self.closed = True
             self.ready.set()
 
@@ -406,6 +445,8 @@ class _ResumeServices:
                 await asyncio.shield(self.task)
         if self.failure is not None and not failed:
             if run_module._has_fenced(self.failure):
+                if self._journal is not None and self._journal._stopped:
+                    raise anyio.get_cancelled_exc_class()() from None
                 raise _core_error(Fenced) from None
             raise self.failure
 
@@ -444,6 +485,40 @@ async def _acquire_lease(acquire: Callable[[], Lease], *, settle_timeout_s: floa
         outcome.contain(error, StorageError, "lease acquisition")
 
 
+async def _supervised_acquire(
+    store: Store,
+    epoch: int,
+    stops: StopState,
+    clock: RunClock | None,
+    config: RunConfig,
+    acquire: Callable[[], Lease],
+    *,
+    stopped: str,
+    retain: bool = True,
+) -> Lease:
+    """Deliver acquisition under the owner's supervisor or release undelivered ownership."""
+    lease: Lease | None = None
+    try:
+        if stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, stopped)
+        async with run_module._supervise_initialization(
+            store, epoch, stops, clock, config, retain=retain
+        ):
+            lease = await _acquire_lease(acquire, settle_timeout_s=config.settle_timeout_s)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        if lease is None or stops.stop or stops.stop_now or stops.run_timeout:
+            raise _core_error(RuntimeError, stopped)
+        return lease
+    except BaseException:
+        if not retain:
+            await run_module._close_stop_watcher(stops)
+        if lease is not None:
+            with anyio.move_on_after(config.settle_timeout_s, shield=True):
+                with suppress(BaseException):
+                    await _storage_io(lease.release)
+        raise
+
+
 _T = TypeVar("_T")
 
 
@@ -459,43 +534,60 @@ async def _take_over(
     *,
     force: bool,
     validate: Callable[[OwnerDoc], None] | None = None,
+    before_acquire: Callable[[], Awaitable[None]] | None = None,
     review: bool = False,
+    clock: Callable[[], RunClock | None] | None = None,
+    stops: StopState | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
-    while True:
-        owner = await _lease_io(read_owner, store)
-        if owner is None:
-            if review:
-                raise FileNotFoundError(f"run {run_id} has no control/owner.json")
-            raise _core_error(ValueError, "run has no committed owner")
-        doc, _ = owner
-        if doc.head is None:
-            raise _core_error(ValueError, f"run {run_id} has no committed events")
-        if validate is not None:
-            await _validated_io(validate, doc)
-        try:
-            return await _acquire_lease(
-                partial(
-                    Lease.take_over,
+    retain = stops is not None
+    stops = StopState() if stops is None else stops
+    try:
+        while True:
+            owner = await _lease_io(read_owner, store)
+            if owner is None:
+                if review:
+                    raise FileNotFoundError(f"run {run_id} has no control/owner.json")
+                raise _core_error(ValueError, "run has no committed owner")
+            doc, _ = owner
+            if doc.head is None:
+                raise _core_error(ValueError, f"run {run_id} has no committed events")
+            if validate is not None:
+                await _validated_io(validate, doc)
+            if before_acquire is not None:
+                await before_acquire()
+            try:
+                return await _supervised_acquire(
                     store,
-                    owner_id=uuid4().hex,
-                    host=host_id(),
-                    ttl_s=config.lease_ttl_s,
-                    force=force,
-                    expect_epoch=doc.epoch,
-                ),
-                settle_timeout_s=config.settle_timeout_s,
-            )
-        except Fenced:
-            current = await _lease_io(read_owner, store)
-            if current is None or current[0].epoch != doc.epoch:
-                epoch = current[0].epoch if current else "missing"
-                message = (
-                    f"another owner took the run (epoch {epoch})"
-                    if review
-                    else "a concurrent resume took the run"
+                    doc.epoch + 1,
+                    stops,
+                    clock() if clock is not None else None,
+                    config,
+                    partial(
+                        Lease.take_over,
+                        store,
+                        owner_id=uuid4().hex,
+                        host=host_id(),
+                        ttl_s=config.lease_ttl_s,
+                        force=force,
+                        expect_epoch=doc.epoch,
+                    ),
+                    stopped="review import stopped" if review else "resume initialization stopped",
+                    retain=retain,
                 )
-                raise _core_error(Fenced, f"run {run_id}: {message}") from None
+            except Fenced:
+                current = await _lease_io(read_owner, store)
+                if current is None or current[0].epoch != doc.epoch:
+                    epoch = current[0].epoch if current else "missing"
+                    message = (
+                        f"another owner took the run (epoch {epoch})"
+                        if review
+                        else "a concurrent resume took the run"
+                    )
+                    raise _core_error(Fenced, f"run {run_id}: {message}") from None
+    except BaseException:
+        await run_module._close_stop_watcher(stops)
+        raise
 
 
 async def resume_run(
@@ -525,7 +617,9 @@ async def resume_run(
     ------
     ValueError
         A goal's agent peak exceeds the run-wide limit, no committed state
-        exists, a replay payload is invalid, or a budget cap decreases.
+        exists, a replay payload is invalid, a budget cap decreases, or startup
+        model validation refuses the replanner or curator before takeover, or
+        the journal belongs to a standalone planning session.
     ChainError
         The committed journal chain is broken or a segment is missing.
     RuntimeError
@@ -542,23 +636,47 @@ async def resume_run(
     store = open_store(config.run_root).child(run_id)
 
     clock: RunClock | None = None
+    stops = StopState()
     validated_head: Head | None = None
+    model_warnings: list[str] = []
 
     def validate(doc: OwnerDoc) -> None:
         nonlocal clock, validated_head
         _, state = _read(store, doc)
         _check(state, config)
+        _restore_import_paths(state)
         if clock is None:
             clock = RunClock(state.run_elapsed_s)
         else:
             clock._rebase(state.run_elapsed_s)
         validated_head = doc.head
 
-    lease = await _take_over(config, run_id, store, force=force, validate=validate)
+    async def check_startup_models() -> None:
+        nonlocal model_warnings
+        model_warnings = await run_module._check_startup_models(config, replanner)
+
+    lease = await _take_over(
+        config,
+        run_id,
+        store,
+        force=force,
+        validate=validate,
+        before_acquire=check_startup_models,
+        clock=lambda: clock,
+        stops=stops,
+    )
     assert clock is not None
     assert validated_head is not None
     services = _ResumeServices(
-        config, run_id, store, lease, force=force, clock=clock, validated_head=validated_head
+        config,
+        run_id,
+        store,
+        lease,
+        force=force,
+        clock=clock,
+        validated_head=validated_head,
+        model_warnings=model_warnings,
+        stops=stops,
     )
     services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
     try:
