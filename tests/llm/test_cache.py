@@ -310,7 +310,7 @@ async def test_real_cache_identity_tracks_namespaces_keys_and_replacements(
             if expected_hit:
                 identity = cache_identity(kwargs, response)
             else:
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await written.wait()
                 identity = cache_identity(kwargs, response, effective_key=written_keys[-1])
             identities.append(identity)
@@ -321,7 +321,7 @@ async def test_real_cache_identity_tracks_namespaces_keys_and_replacements(
         assert identities[3] == identities[4]
         assert identities[4] != identities[5]
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()

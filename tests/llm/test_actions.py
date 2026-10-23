@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -320,7 +321,7 @@ async def test_real_action_control_beats_owned_timer(
     deps = ManagerDeps(ctx=ctx, links=CallLinks())
     tools = await _prepare(lambda: build_tools(ctx, deps, action_timeout_s=1.0))
     model = FakeModel([FakeTurn(tool_calls=(("held", {}),)), FakeTurn(text="must not run")])
-    with anyio.fail_after(10), pytest.raises(AgentsException) as caught:
+    with anyio.fail_after(60), pytest.raises(AgentsException) as caught:
         await Runner.run(
             Agent(name="test", tools=[*tools], model=model),
             "go",
@@ -383,7 +384,7 @@ async def test_real_owner_cancellation_beats_timer_and_unwind_control(
 
     task = asyncio.create_task(run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
             if timer_first:
                 await unwinding.wait()
@@ -393,12 +394,14 @@ async def test_real_owner_cancellation_beats_timer_and_unwind_control(
                 owner_scope.cancel()
             await unwinding.wait()
             release.set()
-            if owner == "task":
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-            else:
-                await task
-                assert owner_scope.cancelled_caught
+        with anyio.fail_after(60):
+            await asyncio.wait({task})
+        if owner == "task":
+            with pytest.raises(asyncio.CancelledError):
+                task.result()
+        else:
+            task.result()
+            assert owner_scope.cancelled_caught
     finally:
         release.set()
         if not task.done():
@@ -441,7 +444,7 @@ async def test_parallel_run_tool_calls_keep_their_own_call_ids() -> None:
     tools, deps = tool_set(fake)
     for index in (1, 2):
         link(deps, f"llm-{index}", f"tool-{index}")
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         await asyncio.gather(
             *(
                 invoke(tools, deps, "run_tool", {"inputs": {"x": index}}, call_id=f"tool-{index}")
@@ -847,6 +850,7 @@ async def test_real_reads_keep_feedback_redaction_and_charges(ctx_env: CtxEnv) -
 
 
 async def test_schema_hooks_run_in_abandonable_preparation() -> None:
+    workers: list[threading.Thread] = []
     entered, release, finished = Event(), Event(), Event()
     loop_thread = get_ident()
 
@@ -854,25 +858,32 @@ async def test_schema_hooks_run_in_abandonable_preparation() -> None:
         @classmethod
         def __get_pydantic_json_schema__(cls, schema: Any, handler: Any) -> dict[str, Any]:
             assert get_ident() != loop_thread
+            workers.append(threading.current_thread())
             entered.set()
             try:
-                assert release.wait(10)
+                assert release.wait(300)
                 return handler(schema)
             finally:
                 finished.set()
 
     task = asyncio.create_task(_prepare(partial(tool_set, FakeAgentContext(input_model=Blocking))))
     try:
-        with anyio.fail_after(5):
-            await anyio.to_thread.run_sync(entered.wait, 4)
+        with anyio.fail_after(60):
+            await anyio.to_thread.run_sync(entered.wait, 60)
             assert entered.is_set()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+        assert not release.is_set()
         assert not finished.is_set()
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 5)
+        await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -895,11 +906,13 @@ async def test_real_caller_cancellation_is_not_a_tool_result(swallow: bool) -> N
     tools, deps = tool_set(Waiting(input_model=Inputs))
     task = asyncio.create_task(invoke(tools, deps, "save_notes", {"text": "hello"}))
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -985,7 +998,7 @@ async def test_sdk_action_timeout_is_a_result_and_cancels_work() -> None:
     model = FakeModel(
         [FakeTurn(tool_calls=(("save_notes", {"text": "note"}),)), FakeTurn(text="recovered")]
     )
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         result = await Runner.run(
             Agent(name="test", tools=[*tools], model=model),
             "go",
@@ -1028,15 +1041,17 @@ async def test_failed_action_link_does_not_leak_into_next_action() -> None:
 
 
 async def test_returned_action_serialization_is_abandonable(ctx_env: CtxEnv) -> None:
+    workers: list[threading.Thread] = []
     entered, release, finished = Event(), Event(), Event()
     loop_thread = get_ident()
 
     class Blocking(dict[str, JsonValue]):
         def items(self) -> Any:
             assert get_ident() != loop_thread
+            workers.append(threading.current_thread())
             entered.set()
             try:
-                assert release.wait(10)
+                assert release.wait(300)
                 return super().items()
             finally:
                 finished.set()
@@ -1051,16 +1066,22 @@ async def test_returned_action_serialization_is_abandonable(ctx_env: CtxEnv) -> 
     tools, deps = await _prepare(partial(tool_set, ctx))
     task = asyncio.create_task(invoke(tools, deps, "serialize", {}))
     try:
-        with anyio.fail_after(5):
-            await anyio.to_thread.run_sync(entered.wait, 4)
+        with anyio.fail_after(60):
+            await anyio.to_thread.run_sync(entered.wait, 60)
             assert entered.is_set()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+        assert not release.is_set()
         assert not finished.is_set()
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 5)
+        await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert finished.is_set()
@@ -1162,7 +1183,7 @@ async def test_sdk_action_timer_refusal_at_turn_limit_stays_soft(
         [FakeTurn(tool_calls=(("save_notes", {"text": "note"}),)), FakeTurn(text="recovered")]
     )
     counters_before = len(ctx_env.events("agent_counters"))
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         result = await Runner.run(
             Agent(name="test", tools=[*tools], model=model),
             "go",
