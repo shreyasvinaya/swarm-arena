@@ -106,6 +106,8 @@ class FakeGateway:
         returns 404; only the separate key-info reply establishes absence.
     fail, delay, malformed : dict, dict, set
         Per-route HTTP status, response delay and malformed-JSON injection.
+    failure_bodies, raw_responses : dict, dict
+        Error JSON overrides and exact response bytes, including ingress 404s.
     entered, hold : dict
         Per-route events set after handling and gates held before responding.
     page_overrides, row_overrides : dict
@@ -137,6 +139,8 @@ class FakeGateway:
         self.authorizations: list[str | None] = []
         self.keys: dict[str, dict[str, Any]] = {}
         self.fail: dict[str, int] = {}
+        self.failure_bodies: dict[str, Any] = {}
+        self.raw_responses: dict[str, bytes] = {}
         self.delay: dict[str, float] = {}
         self.malformed: set[str] = set()
         self.entered: dict[str, threading.Event] = {}
@@ -191,6 +195,7 @@ class FakeGateway:
                         pass
                 gateway._stopping.wait(gateway.delay.get(path, 0.0))
                 raw = b"{not json" if path in gateway.malformed else json.dumps(data).encode()
+                raw = gateway.raw_responses.get(path, raw)
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -307,12 +312,17 @@ class FakeGateway:
         authorization: str,
     ) -> tuple[int, Any, dict[str, str]]:
         if path in self.fail:
-            return self.fail[path], {"error": self.master_key}, {}
+            return self.fail[path], self.failure_bodies.get(path, {"error": self.master_key}), {}
         if path == "/v1/chat/completions" and method == "POST":
             key_id = next(
                 (k for k, v in self.keys.items() if authorization == f"Bearer {v['secret']}"), None
             )
-            if key_id is None or self.keys[key_id]["blocked"] or self.keys[key_id]["deleted"]:
+            if (
+                key_id is None
+                or self.keys[key_id]["blocked"]
+                or self.keys[key_id]["deleted"]
+                or self.keys[key_id].get("status") in {"expired", "revoked"}
+            ):
                 return 401, {"error": "unauthorized"}, {}
             call_id = uuid4().hex
             model = body.get("model", "chat-model")
@@ -371,6 +381,19 @@ class FakeGateway:
             key_id = body.get("key")
             row = self.keys.get(key_id)
             if row is None:
+                if path == "/key/info" and method == "GET":
+                    return (
+                        404,
+                        {
+                            "error": {
+                                "message": "Key not found in database",
+                                "type": "not_found_error",
+                                "param": "key",
+                                "code": "404",
+                            }
+                        },
+                        {},
+                    )
                 return 404, {"error": "missing"}, {}
             if path == "/key/block" and method == "POST":
                 if row["deleted"]:
@@ -388,7 +411,7 @@ class FakeGateway:
                             if row["deleted"]
                             else "revoked"
                             if row["blocked"]
-                            else "active",
+                            else row.get("status", "active"),
                         },
                     },
                     {},
@@ -423,4 +446,4 @@ class FakeGateway:
             }
             data.update(self.page_overrides.get(page, {}))
             return 200, data, {}
-        return 404, {"error": "missing"}, {}
+        return 404, {"detail": "Not Found"}, {}
