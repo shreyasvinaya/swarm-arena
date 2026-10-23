@@ -345,11 +345,16 @@ def test_report_line_limit_skips_without_decoding(monkeypatch: pytest.MonkeyPatc
     assert len(warnings) == 1
 
 
-async def test_valid_full_report_has_bounded_memory_and_loop_progress() -> None:
+async def test_valid_full_report_has_bounded_memory_and_loop_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
-    import time
+    import json
+    import threading
     import tracemalloc
     from collections.abc import Iterator
+
+    import anyio
 
     from swarm_arena._exec.threads import run_sync_daemon
 
@@ -358,22 +363,33 @@ async def test_valid_full_report_has_bounded_memory_and_loop_progress() -> None:
     prefix = b'{"model":"a/b","request":['
     line = prefix + b"{}," * 21000 + b"{}]}"
     line = line.ljust(65535, b" ") + b"\n"
-    ticks = 0
-    largest_gap = 0.0
-    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    parsing = asyncio.Event()
+    release = threading.Event()
+    order: list[str] = []
+    workers: list[threading.Thread] = []
+    loads = json.loads
 
-    async def tick() -> None:
-        nonlocal ticks, largest_gap
-        previous = time.monotonic()
-        while not done.is_set():
-            now = time.monotonic()
-            largest_gap = max(largest_gap, now - previous)
-            previous = now
-            ticks += 1
-            await asyncio.sleep(0)
+    def gated_loads(data: Any, *args: Any, **kwargs: Any) -> Any:
+        if not workers:
+            assert threading.get_ident() != loop_thread, "JSON decoding must run off-loop"
+            workers.append(threading.current_thread())
+            order.append("parsing")
+            loop.call_soon_threadsafe(parsing.set)
+            assert release.wait(30), "event loop did not release the parser"
+            order.append("released")
+        return loads(data, *args, **kwargs)
 
+    async def progress() -> None:
+        with anyio.fail_after(10):
+            await parsing.wait()
+        order.append("loop progressed")
+        release.set()
+
+    monkeypatch.setattr(json, "loads", gated_loads)
     tracemalloc.start()
-    ticker = asyncio.create_task(tick())
+    observer = asyncio.create_task(progress())
     try:
         data = line * 256
         assert len(data) == 16 * 1024 * 1024
@@ -386,12 +402,15 @@ async def test_valid_full_report_has_bounded_memory_and_loop_progress() -> None:
         assert count == 256
         assert warnings == []
         assert peak < 64 * 1024 * 1024, peak
+        await observer
+        assert order == ["parsing", "loop progressed", "released"]
     finally:
-        done.set()
-        await ticker
+        release.set()
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
+        for worker in workers:
+            await asyncio.to_thread(worker.join)
         tracemalloc.stop()
-    assert ticks > 256
-    assert largest_gap < 0.5
 
 
 def test_growing_report_read_stops_at_pinned_size(
