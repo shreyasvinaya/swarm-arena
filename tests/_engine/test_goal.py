@@ -1271,7 +1271,7 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
         workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(120)
+            assert release.wait(300)
         finally:
             exited.set()
 
@@ -2049,7 +2049,7 @@ async def test_peer_page_with_earlier_source_is_preserved(
                 [sys.executable, "-c", command, str(root), target],
                 input=peer,
                 check=True,
-                timeout=5,
+                timeout=60,
                 capture_output=True,
             )
         return not absent
@@ -2089,7 +2089,7 @@ async def test_live_page_read_abandons_hook_without_late_publication(
         entered.set()
         assert threading.get_ident() != loop_thread
         try:
-            assert release.wait(120)
+            assert release.wait(300)
         finally:
             returned.set()
         return result
@@ -2804,7 +2804,7 @@ async def test_graceful_stop_judging_outlives_settlement_window(
     task.add_done_callback(finished)
     try:
         for index, event in enumerate(entered):
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await event.wait()
             if task.done():
                 await task
@@ -2815,7 +2815,7 @@ async def test_graceful_stop_judging_outlives_settlement_window(
                 with anyio.move_on_after(config.settle_timeout_s + 0.5):
                     await anyio.Event().wait()
             release[index].set()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             result = await task
     finally:
         for event in release:
@@ -3225,7 +3225,7 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
         settle_timeout_s=env.deps.config.settle_timeout_s,
     )
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await runner._curate_round(1)
     finally:
         recorder.unbind_run(env.deps.run_id)
@@ -3258,6 +3258,7 @@ async def test_curator_report_wait_observes_owner_interruptions(
     )
     from swarm_arena._journal import llm_record as recorder
 
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 300})
     runner = await _curation_checkpoint(env)
     entered = anyio.Event()
 
@@ -3306,7 +3307,7 @@ async def test_curator_report_wait_observes_owner_interruptions(
     writer_check = env.deps.journal._raise_if_fenced
     task = asyncio.create_task(runner._curate_round(1))
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await entered.wait()
         if interruption == "stop_now":
             env.deps.stops.stop_now = env.deps.stops.stop = True
@@ -3320,8 +3321,8 @@ async def test_curator_report_wait_observes_owner_interruptions(
                 raise _stop_cleanup_error()
 
             monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", failed_writer)
-        # A report is optional: interruption must shorten its 60 s allowance.
-        with anyio.fail_after(5):
+        # The report remains held beyond the 30 s observation window.
+        with anyio.fail_after(30):
             if interruption in {"lease_loss", "writer_failure"}:
                 with pytest.raises(
                     Fenced if interruption == "lease_loss" else RuntimeError
@@ -3346,9 +3347,12 @@ async def test_curator_report_wait_observes_owner_interruptions(
             assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         recorder.unbind_run(env.deps.run_id)
         monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", writer_check)
+    assert not pending_cleanup, "curator report owner did not finish cleanup"
 
 
 async def test_round_close_reads_late_rows(

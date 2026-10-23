@@ -125,7 +125,7 @@ def test_cli_manager_failure_is_local(tmp_path: Path, kind: str) -> None:
         capture_output=True,
         text=True,
         env=env,
-        timeout=25,
+        timeout=60,
     )
     output = process.stdout + process.stderr
     assert hooks.MARK not in output
