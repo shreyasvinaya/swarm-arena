@@ -759,7 +759,8 @@ uv run pytest tests/e2e/test_own_script.py -v
 ## Reporting LLM calls: `swarm/llm_calls.jsonl`
 
 A cooperating tool can write one UTF-8 JSON object per line in
-`swarm/llm_calls.jsonl`, relative to its workspace. For example:
+`swarm/llm_calls.jsonl`, relative to its workspace. Only tool jobs collect this
+file; command jobs, checks and judges do not inspect or upload it. For example:
 
 ```json
 {"model":"openai/gpt-6","usage":{"input_tokens":100,"output_tokens":20},"cost_usd":0.002,"latency_ms":120,"status":"ok","litellm_call_id":"my-call-1"}
@@ -771,14 +772,14 @@ Only `model` is required. The supported fields are:
 | Field | Default and meaning |
 | --- | --- |
 | `schema_version` | `1`; optional, newer versions are refused per line. |
-| `model` | Required model identifier. |
-| `provider` | Prefix before the first `/` in `model`, or `unknown` when there is no prefix. |
+| `model` | Required printable model identifier, at most 256 characters. |
+| `provider` | Printable identifier, at most 64 characters; defaults to the prefix before the first `/` in `model`, or `unknown` when there is no prefix. |
 | `usage` | Empty usage: nonnegative `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cache_write_5m_tokens`, `cache_write_1h_tokens`; optional nonnegative `usd`. Cache-write subsets are not counted twice. |
 | `cost_usd` | `0`; finite nonnegative cost for this observation. |
 | `latency_ms` | `null`; otherwise finite and nonnegative. |
 | `status` | `ok`, or `error`. |
 | `error` | `null`; the recorded event uses a fixed diagnostic rather than the supplied text. |
-| `litellm_call_id` | `null`; a supplied ID deduplicates reports across the run. |
+| `litellm_call_id` | `null`; otherwise printable and at most 128 characters. Deduplicates tool-origin observations within the run, independently of funded manager/judge/planner/curator calls. |
 | `request`, `response` | `null`; finite JSON payloads. Missing payloads produce no artifact. Present payloads are stored only when `tracing.store_payloads` is enabled. |
 
 Unknown fields are ignored. Run, candidate, role and ownership metadata always
@@ -786,12 +787,21 @@ come from the core. Rows are informational `LLMCall` events with role `tool`;
 they do not reserve or settle money and do not join a manager's funded call
 list. Continue reporting the tool's aggregate usage in `swarm/result.json`:
 that usage drives ordinary tool settlement. Reported rows alone do not establish
-complete spend or a hard spending cap.
+complete spend or a hard spending cap. An informational cost or `usage.usd`
+above the supported USD range is recorded with `status="error"`, zero
+`cost_usd`, absent `usage.usd`, and the fixed diagnostic
+`usage_overflow: unsupported informational amount`. It never claims a charge.
+Each admitted row is linked immediately, so an interrupted report retains its
+already recorded call IDs on the candidate.
 
 Collection parses and uploads at most **16 MiB** and reads at most **10,000
-nonempty rows**, counting invalid rows too. Blank lines are ignored. Invalid
-JSON, unsupported schemas, negative counts, nonfinite numbers and invalid
-payloads are skipped with value-free candidate warnings. At most 20 individual
+nonempty rows**, counting invalid rows too. Parsing and recording stream one
+line at a time. Each line is at most **64 KiB**, excluding its newline; a
+longer line is skipped before JSON decoding. Blank lines within that limit are
+ignored. Numbers are strict: booleans and numeric strings are not numbers,
+and token counts require integers. Invalid JSON, unsupported schemas,
+negative counts, nonfinite numbers and invalid payloads or identifiers are
+skipped with value-free candidate warnings. At most 20 individual
 bad-line warnings are retained, followed by one omitted-warning count and an
 optional row-limit warning.
 
@@ -801,7 +811,12 @@ collection refuses the file before reading it and returns no reference. Files
 with symlink components, nonregular files, unreadable files and files observed
 to change during their pinned read also warn without discarding the valid tool
 result. An absent file is normal. Core storage failures and ownership loss
-still propagate. `ToolOutput.llm_calls_file`, when present, uses
+still propagate. Invalid private collection diagnostics add one fixed warning
+without discarding valid output; diagnostics do not affect output equality.
+The driver verifies the declared report size and digest before parsing. Local
+reads are bounded before allocation; S3 checks metadata and bounds its body
+read. A custom byte-only store can be checked only after its read returns.
+`ToolOutput.llm_calls_file`, when present, uses
 `path="llm_calls.jsonl"` with its real SHA-256 and size; the reserved `swarm/`
 prefix describes the workspace location, not the artifact reference path.
 

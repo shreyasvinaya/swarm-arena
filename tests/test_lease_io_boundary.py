@@ -351,8 +351,8 @@ def test_guard_scans_shared_job_publication(monkeypatch: pytest.MonkeyPatch) -> 
     [
         (
             "_agent/tool_run.py",
-            "_storage_io(\n                        _reported_rows,",
-            "anyio.to_thread.run_sync(\n                        _reported_rows,",
+            "_storage_io(_reported_rows,",
+            "anyio.to_thread.run_sync(_reported_rows,",
         ),
         (
             "_exec/job_steps.py",

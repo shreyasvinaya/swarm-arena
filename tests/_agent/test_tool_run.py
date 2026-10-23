@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import os
 from pathlib import Path
 from typing import Any
 
@@ -2194,13 +2195,27 @@ async def test_predispatch_error_retains_candidate_after_completion_cancel(
     assert not rt_env.inflight._scopes
 
 
-async def test_reported_rows_recorded_as_tool_calls(rt_env: RtEnv) -> None:
+async def test_reported_rows_recorded_as_tool_calls(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import json
+    import threading
 
     from swarm_arena._engine.stops import RunClock, StopState
     from swarm_arena._journal.llm_record import _bound_run
     from swarm_arena._journal.replay import RunState
+    from swarm_arena._tooling.llm_calls import LLMCallRow
 
+    loop_thread = threading.get_ident()
+    parsed: list[bool] = []
+    validate = LLMCallRow.model_validate
+
+    def validate_off_loop(cls: type[LLMCallRow], value: Any, **kwargs: Any) -> LLMCallRow:
+        assert threading.get_ident() != loop_thread
+        parsed.append(True)
+        return validate(value, **kwargs)
+
+    monkeypatch.setattr(LLMCallRow, "model_validate", classmethod(validate_off_loop))
     report = "\n".join(
         json.dumps(row)
         for row in [
@@ -2234,6 +2249,7 @@ async def test_reported_rows_recorded_as_tool_calls(rt_env: RtEnv) -> None:
     assert len(candidate.llm_call_ids) == 2
     assert set(candidate.llm_call_ids) == {call["id"] for call in calls}
     assert rt_env.charged(candidate).usd == 0.04
+    assert parsed == [True, True]
 
 
 @pytest.mark.parametrize("kind", ["oversize", "hash_limit", "symlink", "malformed"])
@@ -2334,8 +2350,122 @@ async def test_report_backend_failure_propagates(
         def fail_read(digest: str) -> bytes:
             raise RuntimeError("SECRET")
 
-        monkeypatch.setattr(rt.artifacts, "get_bytes", fail_read)
+        from swarm_arena._store.base import Store
+
+        store = Mock(spec=Store)
+        store.read.side_effect = fail_read
+        monkeypatch.setattr(rt.artifacts, "_store", store)
     with pytest.raises(StorageError) as caught:
         await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
     assert_secret_absent(caught.value, "SECRET")
     assert not rt_env.events("tool_end")
+
+
+async def test_interrupted_recording_preserves_candidate_links(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._tooling import llm_calls
+
+    rt = rt_env.with_tool(
+        PyTool(
+            {
+                "code": "from pathlib import Path; "
+                'Path(\'swarm/llm_calls.jsonl\').write_text(\'{"model":"a/b"}\\n{"model":"a/c"}\')'
+            }
+        )
+    )
+    entered = asyncio.Event()
+    real = llm_calls.record_call
+    count = 0
+
+    async def hold(**kwargs: Any) -> Any:
+        nonlocal count
+        count += 1
+        if count == 2:
+            entered.set()
+            await asyncio.Future()
+        return await real(**kwargs)
+
+    monkeypatch.setattr(llm_calls, "record_call", hold)
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=rt.config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState(),
+    ):
+        task = asyncio.create_task(execute_tool_run(rt, {}, parents=(), replicate=None, edits=None))
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+                rt_env.cancel_inflight()
+                candidate = await task
+            calls = [event.payload["call"] for event in rt_env.events("llm_call")]
+            assert len(calls) == 1
+            assert candidate.llm_call_ids == [calls[0]["id"]]
+            assert candidate.llm_calls_source == "reported"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("claimed_size", [1, 3])
+async def test_report_fetch_rejects_mismatched_size(rt_env: RtEnv, claimed_size: int) -> None:
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    digest = rt_env.rt.artifacts.put_bytes(b"{}")
+    ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256=digest, size=claimed_size)
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+    )
+    with pytest.raises(StorageError):
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+
+
+async def test_report_fetch_refuses_large_local_blob_before_read(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    artifacts = rt_env.rt.artifacts
+    ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256="0" * 64, size=10)
+    from swarm_arena._store.local import LocalStore
+
+    assert isinstance(artifacts._store, LocalStore)
+    path = artifacts._store._root / ref.sha256
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.truncate(17 * 1024 * 1024)
+    reads: list[int] = []
+    real = os.read
+
+    def read(fd: int, size: int) -> bytes:
+        reads.append(size)
+        return real(fd, size)
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(file: Path) -> bytes:
+        data = original_read_bytes(file)
+        if file == path:
+            reads.append(len(data))
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(os, "read", read)
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+    )
+    with pytest.raises(StorageError):
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert reads == []

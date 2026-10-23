@@ -560,16 +560,18 @@ class _JobRun:
         for rel in (_STDOUT, _STDERR):
             hashes.append(await self._workspace_io(self._upload_log, rel))
         update["logs_ref"] = format_logs_ref(hashes[0], hashes[1])
-        ref, report, diagnostics = await self._workspace_io(
-            collect_llm_calls, self._workspace, validation=True
-        )
-        if report is not None:
-            assert ref is not None
-            await self._workspace_io(self._upload_report, report, ref.sha256)
-        update["llm_calls_file"] = ref
-        output = with_collection_diagnostics(
-            output, (*output._collection_diagnostics, *diagnostics)
-        )
+        update["llm_calls_file"] = None
+        if self._job.kind == "tool":
+            ref, report, diagnostics = await self._workspace_io(
+                collect_llm_calls, self._workspace, validation=True
+            )
+            if report is not None:
+                assert ref is not None
+                await self._workspace_io(self._upload_report, report, ref.sha256)
+            update["llm_calls_file"] = ref
+            output = with_collection_diagnostics(
+                output, (*output._collection_diagnostics, *diagnostics)
+            )
         if times is not None:
             update["started_at"], update["ended_at"] = times
         return output.model_copy(update=update)
