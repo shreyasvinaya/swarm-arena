@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._tooling.llm_calls import (
@@ -402,15 +403,20 @@ async def test_valid_full_report_has_bounded_memory_and_loop_progress(
         assert count == 256
         assert warnings == []
         assert peak < 64 * 1024 * 1024, peak
-        await observer
+        await observe_task(observer)
         assert order == ["parsing", "loop progressed", "released"]
     finally:
         release.set()
-        observer.cancel()
-        await asyncio.gather(observer, return_exceptions=True)
-        for worker in workers:
-            await asyncio.to_thread(worker.join)
-        tracemalloc.stop()
+        try:
+            await settle_tasks(observer)
+        finally:
+            try:
+                with anyio.CancelScope(shield=True):
+                    for worker in workers:
+                        await asyncio.to_thread(worker.join, 60)
+                    assert all(not worker.is_alive() for worker in workers)
+            finally:
+                tracemalloc.stop()
 
 
 def test_growing_report_read_stops_at_pinned_size(

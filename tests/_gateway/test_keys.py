@@ -1,11 +1,13 @@
 """Per-tool key ownership and informational recording, without network I/O."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.llm_run import LLMRun, open_llm_run
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
@@ -894,14 +896,22 @@ async def test_read_timer_does_not_bound_healthy_recording(
                 await anyio.sleep_forever()
             release.set()
 
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(release_after_report_deadline)
+        async def read() -> Any:
             with anyio.fail_after(30):
                 token = keys._read_deadline.set(anyio.current_time() + 0.1)
                 try:
-                    calls = await manager.read([record], wait_first=not boundary)
+                    return await manager.read([record], wait_first=not boundary)
                 finally:
                     keys._read_deadline.reset(token)
+
+        releaser = asyncio.create_task(release_after_report_deadline())
+        reader = asyncio.create_task(read())
+        try:
+            calls = await observe_task(reader)
+            await observe_task(releaser)
+        finally:
+            release.set()
+            await settle_tasks(reader, releaser)
         assert len(calls) == 1
 
 

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import CtxEnv
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import AlwaysFailCheck
@@ -1103,17 +1104,14 @@ async def test_escaped_action_lifetime_is_revoked(
         if cancelled:
             parent.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await parent
+                await observe_task(parent)
         else:
-            await parent
+            await observe_task(parent)
         release.set()
-        await children[0]
+        await observe_task(children[0])
     finally:
         release.set()
-        for task in [parent, *children]:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(parent, *children, return_exceptions=True)
+        await settle_tasks(parent, *children)
     assert sum(isinstance(result, LimitReached) for result in results) == (1 if available else 2)
     assert all(
         result.limit == "max_turns_per_round"
