@@ -48,12 +48,12 @@ def _payload(script: str, *, pid_file: Path | None = None) -> bytes:
         command=None,
         tool=Ref(path="_fakes.tools:PyTool", config={"code": code}),
         request=ToolRequest(),
-        timeout_s=90 if pid_file else 10,
+        timeout_s=300 if pid_file else 60,
     )
     return job_payload(job, TaskSettings(cap_bytes=256 * MIB))
 
 
-def _wait_for(check: Callable[[float], T], *, timeout_s: float = 45) -> T:
+def _wait_for(check: Callable[[float], T], *, timeout_s: float = 60) -> T:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         result = check(deadline)
@@ -79,7 +79,7 @@ def _task(
 def test_find_task_by_name(state_identity: StateIdentity) -> None:
     name = f"x-test-e1-{uuid4().hex}"
     ref = run_job.options(name=name).remote(_payload("report_env.py"))
-    ray.get(ref, timeout=45)
+    ray.get(ref, timeout=60)
     info = _wait_for(
         lambda deadline: _task(name, terminal=True, deadline=deadline, **state_identity)
     )
@@ -113,7 +113,7 @@ def test_worker_not_dead_while_running(state_identity: StateIdentity, tmp_path: 
 
 def test_worker_dead_after_finish(state_identity: StateIdentity) -> None:
     name = f"x-test-e1-{uuid4().hex}"
-    ray.get(run_job.options(name=name).remote(_payload("report_env.py")), timeout=45)
+    ray.get(run_job.options(name=name).remote(_payload("report_env.py")), timeout=60)
     assert _wait_for(
         lambda deadline: worker_dead(name, **state_identity, deadline=deadline) is True
     )

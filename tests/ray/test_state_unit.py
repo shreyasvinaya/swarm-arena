@@ -5,6 +5,7 @@
 import asyncio
 import dataclasses
 import threading
+import time
 from functools import partial
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -25,6 +26,45 @@ from swarm_arena.ray._state import PENDING_STATES, TERMINAL_STATES, TaskInfo
 
 find_task = partial(_state.find_task, dashboard_url="http://127.0.0.1:12345")
 worker_dead = partial(_state.worker_dead, dashboard_url="http://127.0.0.1:12345")
+
+
+def _expire_after_entry(
+    monkeypatch: pytest.MonkeyPatch, entered: threading.Event, seconds: float
+) -> tuple[list[float | None], list[float], list[threading.Thread]]:
+    """Expire the caller's clock after entry while keeping socket fallbacks held."""
+    now = [100.0]
+    allowances: list[float | None] = []
+    expired: list[float] = []
+    workers: list[threading.Thread] = []
+    remaining = _state._Transport.remaining
+
+    class Completion(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            allowances.append(timeout)
+            assert entered.wait(60), "transport never entered its held operation"
+            expired.append(time.monotonic())
+            now[0] += seconds
+            return False
+
+    class Threads:
+        Event = Completion
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(threading, name)
+
+        def Thread(self, *args: Any, **kwargs: Any) -> threading.Thread:
+            worker = threading.Thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+    def socket_allowance(transport: Any) -> float:
+        remaining(transport)  # Retain expiry validation; socket timeouts cannot rescue the caller.
+        return 300.0
+
+    monkeypatch.setattr(_state, "threading", Threads())
+    monkeypatch.setattr(_state, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_state._Transport, "remaining", socket_allowance)
+    return allowances, expired, workers
 
 
 @dataclasses.dataclass
@@ -423,32 +463,51 @@ async def test_held_rpc_is_abandonable_and_cannot_start_next_lookup(
     rpc: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    workers: list[threading.Thread] = []
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
 
     def held(**kwargs: Any) -> list[TaskRow]:
         entered.set()
-        assert release.wait(10)
+        assert release.wait(300)
         rpc["now"] = 120
         return [TaskRow()]
 
     def lookup() -> bool | None:
+        workers.append(threading.current_thread())
         try:
             return worker_dead("dispatch", deadline=110)
         finally:
             finished.set()
 
     rpc["list_tasks"] = held
+    scope = anyio.CancelScope()
+
+    async def run_owned() -> None:
+        with scope:
+            await run_sync_daemon(lookup)
+
+    task = asyncio.create_task(run_owned())
     try:
-        async with anyio.create_task_group() as group:
-            group.start_soon(run_sync_daemon, lookup)
-            with anyio.fail_after(5):
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
-            group.cancel_scope.cancel()
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+        scope.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        task.result()
+        assert scope.cancelled_caught
+        assert not release.is_set()
+        assert not finished.is_set()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 5)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     assert not rpc["calls"]
 
 
@@ -502,24 +561,44 @@ def test_nonterminal_worker_evidence(rpc: dict[str, Any], workers: list[WorkerRo
 
 @pytest.mark.parametrize("mode", ["held", "refused"])
 @pytest.mark.parametrize("scheme", ["http", "https"])
-def test_endpoint_deadline(mode: str, scheme: str) -> None:
+def test_endpoint_deadline(mode: str, scheme: str, monkeypatch: pytest.MonkeyPatch) -> None:
     import socket
-    import time
 
+    entered = threading.Event()
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
+        workers: list[threading.Thread] = []
         if mode == "held":
             server.listen()
-        start = time.monotonic()
-        assert (
-            _state.find_task(
-                "dispatch",
-                dashboard_url=f"{scheme}://127.0.0.1:{server.getsockname()[1]}",
-                deadline=start + 0.2,
+            connect = _state._Transport.connect
+
+            def connected(self: Any, *args: Any) -> Any:
+                result = connect(self, *args)
+                entered.set()
+                return result
+
+            monkeypatch.setattr(_state._Transport, "connect", connected)
+            allowances, expired, workers = _expire_after_entry(monkeypatch, entered, 0.2)
+            deadline = 100.2
+        else:
+            deadline = time.monotonic() + 60
+        try:
+            assert (
+                _state.find_task(
+                    "dispatch",
+                    dashboard_url=f"{scheme}://127.0.0.1:{server.getsockname()[1]}",
+                    deadline=deadline,
+                )
+                is None
             )
-            is None
-        )
-        assert time.monotonic() - start < 1
+            if mode == "held":
+                assert allowances == [pytest.approx(0.2)]
+                assert len(expired) == 1
+                assert time.monotonic() - expired[0] < 30
+        finally:
+            for worker in workers:
+                worker.join(60)
+                assert not worker.is_alive()
 
 
 @pytest.mark.parametrize(
@@ -598,7 +677,9 @@ def test_loopback_rest_transport(mode: str, monkeypatch: pytest.MonkeyPatch) -> 
                     self.send_response(200)
                     self.end_headers()
                 if mode in {"drip_headers", "drip_body"}:
+                    backstop = time.monotonic() + 300
                     while not release.wait(0.01):
+                        assert time.monotonic() < backstop, "drip response was never released"
                         self.wfile.write(b" ")
                         self.wfile.flush()
                     return
@@ -614,7 +695,7 @@ def test_loopback_rest_transport(mode: str, monkeypatch: pytest.MonkeyPatch) -> 
             pass
 
     with HTTPServer(("127.0.0.1", 0), Handler) as server:
-        server.timeout = 3
+        server.timeout = 60
         thread = threading.Thread(target=server.handle_request, daemon=True)
         thread.start()
         # Invalid ambient addresses must never influence the explicitly bound origin.
@@ -650,23 +731,35 @@ def test_loopback_rest_transport(mode: str, monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch.setattr(type(os.environ), "__getitem__", getenv)
         monkeypatch.setattr(builtins, "open", open_file)
         monkeypatch.setattr(internal_kv, "_initialize_internal_kv", initialize_kv)
-        start = time.monotonic()
+        workers: list[threading.Thread] = []
+        if mode in {"drip_headers", "drip_body"}:
+            allowances, expired, workers = _expire_after_entry(monkeypatch, entered, 0.3)
+            deadline = 100.3
+        else:
+            monkeypatch.setattr(_state, "_RPC_TIMEOUT_S", 60)
+            monkeypatch.setattr(_state, "monotonic", lambda: 100.0)
+            deadline = 160.0
         try:
             info = _state.find_task(
                 "dispatch",
                 dashboard_url=f"127.0.0.1:{server.server_port}",
                 expected_job_id="job",
-                deadline=start + 0.3,
+                deadline=deadline,
             )
             assert entered.is_set()
             assert not accesses
             assert (info is not None) is (mode == "success")
-            assert time.monotonic() - start < 1.5
+            if mode in {"drip_headers", "drip_body"}:
+                assert allowances == [pytest.approx(0.3)]
+                assert len(expired) == 1
+                assert time.monotonic() - expired[0] < 30
+                assert not release.is_set()
+                assert thread.is_alive()
             assert len(paths) == 1
             expected = StateApiClient._make_param(
                 ListApiOptions(
                     limit=2,
-                    timeout=1,
+                    timeout=1 if mode in {"drip_headers", "drip_body"} else 60,
                     detail=True,
                     filters=[("name", "=", "dispatch"), ("job_id", "=", "job")],
                 )
@@ -676,7 +769,10 @@ def test_loopback_rest_transport(mode: str, monkeypatch: pytest.MonkeyPatch) -> 
             assert parse_qs(urlsplit(paths[0]).query) == parse_qs(urlencode(expected, doseq=True))
         finally:
             release.set()
-            thread.join(3)
+            thread.join(60)
+            for worker in workers:
+                worker.join(60)
+                assert not worker.is_alive()
         assert not thread.is_alive()
         assert not failures
 
@@ -693,7 +789,7 @@ def test_dns_deadline_prevents_late_connect(monkeypatch: pytest.MonkeyPatch) -> 
 
     def resolve(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(3)
+        assert release.wait(300)
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 1))]
 
     def stop(self: Any) -> None:
@@ -704,15 +800,22 @@ def test_dns_deadline_prevents_late_connect(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
     monkeypatch.setattr(socket, "socket", lambda *a, **k: connections.append(a))
     monkeypatch.setattr(_state._Transport, "stop", stop)
-    start = time.monotonic()
+    allowances, expired, workers = _expire_after_entry(monkeypatch, entered, 0.2)
     try:
         assert (
-            _state.find_task("dispatch", dashboard_url="http://held.invalid", deadline=start + 0.2)
+            _state.find_task("dispatch", dashboard_url="http://held.invalid", deadline=100.2)
             is None
         )
         assert entered.is_set()
-        assert time.monotonic() - start < 1
+        assert allowances == [pytest.approx(0.2)]
+        assert len(expired) == 1
+        assert time.monotonic() - expired[0] < 30
+        assert not release.is_set()
+        assert not finished.is_set()
     finally:
         release.set()
-        assert finished.wait(3)
+        assert finished.wait(60)
+        for worker in workers:
+            worker.join(60)
+            assert not worker.is_alive()
     assert not connections

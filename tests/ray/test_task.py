@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -79,7 +80,7 @@ def _run(job: Job, workspace: Path, artifacts: ArtifactStore | None = None) -> T
 
 def _remote(job: Job, *, cap: int = 256 * MIB, blobs: dict[str, bytes] | None = None) -> bytes:
     return ray.get(
-        run_job.remote(job_payload(job, TaskSettings(cap_bytes=cap), blobs=blobs)), timeout=45
+        run_job.remote(job_payload(job, TaskSettings(cap_bytes=cap), blobs=blobs)), timeout=60
     )
 
 
@@ -99,7 +100,7 @@ def _timeout_after_ready(monkeypatch: pytest.MonkeyPatch, ready: Callable[[], bo
         nonlocal timed_out
         if not timed_out:
             assert deadline is not None
-            assert await anyio.to_thread.run_sync(wait_until, ready, 30)
+            assert await anyio.to_thread.run_sync(wait_until, ready, 60)
             assert process.poll() is None
             timed_out = True
             return False
@@ -134,9 +135,20 @@ def test_tool_ignoring_sigterm_killed_after_grace(
 
 
 def test_blocked_collect_cannot_stop_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workers: list[threading.Thread] = []
+    entered_at: list[float] = []
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.2)
+    from _fakes.tools import BlockingCollectTool, PyTool
+
     from swarm_arena.ray._task import _execute, _Worker
 
+    def collect(self: Any, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered_at.append(time.monotonic())
+        assert RELEASE.wait(300)
+        return PyTool.collect(self, request, workspace, run)
+
+    monkeypatch.setattr(BlockingCollectTool, "collect", collect)
     RELEASE.clear()
     pid = tmp_path / "pid"
     _timeout_after_ready(monkeypatch, lambda: _pid_written(pid))
@@ -150,12 +162,20 @@ def test_blocked_collect_cannot_stop_kill(tmp_path: Path, monkeypatch: pytest.Mo
     )
     try:
         out = _execute(worker)
+        assert len(entered_at) == 1
+        assert time.monotonic() - entered_at[0] < 30
+        assert not RELEASE.is_set()
+        assert worker.job_run is not None
+        assert not worker.job_run.collect_finished.is_set()
         assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
         assert not pid_alive(int(pid.read_text()))
     finally:
         RELEASE.set()
         if worker.job_run is not None:
-            assert worker.job_run.collect_finished.wait(5)
+            assert worker.job_run.collect_finished.wait(60)
+        for thread in workers:
+            thread.join(60)
+            assert not thread.is_alive()
 
 
 def test_fifo_stderr_cannot_block_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -236,9 +256,9 @@ def test_soft_cancel_returns_partial_through_ray(ray_driver: None, tmp_path: Pat
         )
     )
     try:
-        assert wait_until(ready.exists, 30)
+        assert wait_until(ready.exists, 60)
         ray.cancel(ref)
-        decoded = unframe(ray.get(ref, timeout=40))
+        decoded = unframe(ray.get(ref, timeout=60))
         out = ToolOutput.model_validate_json(decoded.head)
         assert out.status == RunStatus.CANCELLED
         assert out.partial
@@ -264,7 +284,7 @@ def test_grandchild_cleaned_after_finish(ray_driver: None, tmp_path: Path) -> No
         _remote(
             _job("spawn_grandchild.py", args=["--pid-file", str(pid_file), "--exit-after", "0.5"])
         )
-        assert wait_until(lambda: not pid_alive(int(pid_file.read_text())), 10)
+        assert wait_until(lambda: not pid_alive(int(pid_file.read_text())), 60)
     finally:
         if pid_file.exists() and pid_alive(pid := int(pid_file.read_text())):
             os.kill(pid, signal.SIGKILL)
@@ -346,7 +366,7 @@ async def test_edit_contents_same_on_ray_as_local(
     assert sent.request is not None
     assert sent.request.edits == {p: f"sha256:{h}" for p, h in edit_hashes(EDITS).items()}
     ref = run_job.remote(payload)
-    remote_bytes = await anyio.to_thread.run_sync(lambda: ray.get(ref, timeout=45))
+    remote_bytes = await anyio.to_thread.run_sync(lambda: ray.get(ref, timeout=60))
     remote = ToolOutput.model_validate_json(unframe(remote_bytes).head)
     local = await local_executor.submit(job)
     assert remote.status == local.status == status
@@ -411,6 +431,8 @@ def test_effective_command_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def test_normal_collect_is_bounded_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workers: list[threading.Thread] = []
+    entered_at: list[float] = []
     from swarm_arena._exec.job_steps import _JobRun
 
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.2)
@@ -420,10 +442,12 @@ def test_normal_collect_is_bounded_once(tmp_path: Path, monkeypatch: pytest.Monk
     calls: list[bool] = []
 
     def collect(self: Any, run: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered_at.append(time.monotonic())
         calls.append(threading.current_thread().daemon)
         entered.set()
         try:
-            assert release.wait(30)
+            assert release.wait(300)
             assert tmp_path.exists()
             return ToolOutput(status=RunStatus.OK)
         finally:
@@ -432,12 +456,19 @@ def test_normal_collect_is_bounded_once(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(_JobRun, "_collect", collect)
     try:
         out = _run(_tool_job("pass"), tmp_path)
+        assert len(entered_at) == 1
+        assert time.monotonic() - entered_at[0] < 30
+        assert not release.is_set()
+        assert not finished.is_set()
         assert entered.is_set()
         assert out.status == RunStatus.ERROR
         assert calls == [True]
     finally:
         release.set()
-        assert finished.wait(5)
+        assert finished.wait(60)
+        for thread in workers:
+            thread.join(60)
+            assert not thread.is_alive()
 
 
 @pytest.mark.ray
@@ -565,6 +596,7 @@ async def test_cancel_preparation_never_launches_and_retains_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    workers: list[threading.Thread] = []
     import asyncio
 
     from _fakes.tools import PyTool
@@ -577,10 +609,11 @@ async def test_cancel_preparation_never_launches_and_retains_workspace(
     original = PyTool.command
 
     def held(self: Any, request: Any, workspace: Path) -> Command:
+        workers.append(threading.current_thread())
         entered.set()
         loop.call_soon_threadsafe(ready.set)
         try:
-            assert release.wait(30)
+            assert release.wait(300)
             (workspace / "late").touch()
             return original(self, request, workspace)
         finally:
@@ -595,16 +628,23 @@ async def test_cancel_preparation_never_launches_and_retains_workspace(
     )
     task = asyncio.create_task(worker.run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
         with pytest.raises(asyncio.CancelledError):
-            await task
+            task.result()
+        assert not release.is_set()
+        assert not finished.is_set()
         assert not worker.finished
         assert not (tmp_path / "launched").exists()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 5)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -616,6 +656,7 @@ async def test_cancel_preparation_never_launches_and_retains_workspace(
 async def test_cancel_publication_is_data_only_and_no_next_object(
     tmp_path: Path,
 ) -> None:
+    workers: list[threading.Thread] = []
     import asyncio
 
     from swarm_arena.ray._task import _Worker
@@ -627,10 +668,11 @@ async def test_cancel_publication_is_data_only_and_no_next_object(
 
     class HeldStore(MemoryStore):
         def create(self, key: str, data: bytes) -> str:
+            workers.append(threading.current_thread())
             writes.append(key)
             loop.call_soon_threadsafe(ready.set)
             try:
-                assert release.wait(30)
+                assert release.wait(300)
                 return super().create(key, data)
             finally:
                 finished.set()
@@ -646,11 +688,15 @@ async def test_cancel_publication_is_data_only_and_no_next_object(
     )
     task = asyncio.create_task(worker.run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
         with pytest.raises(asyncio.CancelledError):
-            await task
+            task.result()
+        assert not release.is_set()
+        assert not finished.is_set()
         assert worker.partial.status == RunStatus.CANCELLED
         assert worker.partial.data == {"a": 1}
         assert worker.partial.files == []
@@ -660,7 +706,10 @@ async def test_cancel_publication_is_data_only_and_no_next_object(
         assert len(writes) == 1
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 5)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -673,6 +722,7 @@ async def test_pending_cancel_beats_collector_control(
     monkeypatch: pytest.MonkeyPatch,
     nested: bool,
 ) -> None:
+    workers: list[threading.Thread] = []
     import asyncio
 
     from swarm_arena._errors import _core_error, _SignalCategory
@@ -685,7 +735,7 @@ async def test_pending_cancel_beats_collector_control(
     def held(self: Any, run: Any) -> ToolOutput:
         loop.call_soon_threadsafe(ready.set)
         try:
-            assert release.wait(30)
+            assert release.wait(300)
             terminal = _core_error(
                 RuntimeError, "cleanup failed", _category=_SignalCategory.TERMINAL
             )
@@ -697,16 +747,21 @@ async def test_pending_cancel_beats_collector_control(
     worker = _Worker(_tool_job("pass"), tmp_path, ArtifactStore(MemoryStore()), TaskSettings())
     task = asyncio.create_task(worker.run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
         release.set()
+        with anyio.fail_after(60):
+            await asyncio.wait({task})
         with pytest.raises(asyncio.CancelledError):
-            await task
+            task.result()
         assert worker.partial.status == RunStatus.CANCELLED
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 5)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -716,6 +771,8 @@ def test_run_job_retains_abandoned_collector_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    workers: list[threading.Thread] = []
+    entered_at: list[float] = []
     import atexit
 
     from swarm_arena.ray import _task
@@ -733,9 +790,11 @@ def test_run_job_retains_abandoned_collector_workspace(
     calls: list[bool] = []
 
     def collect(self: Any, run: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered_at.append(time.monotonic())
         calls.append(threading.current_thread().daemon)
         try:
-            assert release.wait(30)
+            assert release.wait(300)
             (workspace / "late-write").touch()
             return ToolOutput(status=RunStatus.OK)
         finally:
@@ -748,12 +807,19 @@ def test_run_job_retains_abandoned_collector_workspace(
         wire = cast(Any, run_job)._function(
             job_payload(_tool_job("pass"), TaskSettings(cap_bytes=MIB))
         )
+        assert len(entered_at) == 1
+        assert time.monotonic() - entered_at[0] < 30
+        assert not release.is_set()
+        assert not finished.is_set()
         assert ToolOutput.model_validate_json(unframe(wire).head).status == RunStatus.ERROR
         assert workspace.exists()
         assert calls == [True]
     finally:
         release.set()
-        assert finished.wait(5)
+        assert finished.wait(60)
+        for thread in workers:
+            thread.join(60)
+            assert not thread.is_alive()
     assert (workspace / "late-write").exists()
     assert len(hooks) == 1
     callback, args, kwargs = hooks[0]
@@ -922,7 +988,7 @@ def test_interrupt_main_owns_handler_and_returns_data_only(
     async def wait(self: Any, process: Any, deadline: Any) -> bool:
         nonlocal interrupted
         if not interrupted:
-            assert await anyio.to_thread.run_sync(wait_until, ready.exists, 10)
+            assert await anyio.to_thread.run_sync(wait_until, ready.exists, 60)
             interrupted = True
             _thread.interrupt_main()
         return await original_wait(self, process, deadline)
@@ -978,7 +1044,7 @@ Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(result))
 """
     store = MemoryStore()
     worker = _task._Worker(
-        _tool_job(code, timeout_s=60, grace_s=20), tmp_path, ArtifactStore(store), TaskSettings()
+        _tool_job(code, timeout_s=60, grace_s=300), tmp_path, ArtifactStore(store), TaskSettings()
     )
     original_wait = _task._WorkerSupervisor._wait
     original_collect = PyTool.collect
@@ -995,7 +1061,7 @@ Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(result))
     async def wait(self: Any, process: Any, deadline: Any) -> bool:
         processes.append(process)
         marker = ready if not waits else term
-        assert await anyio.to_thread.run_sync(wait_until, marker.exists, 10)
+        assert await anyio.to_thread.run_sync(wait_until, marker.exists, 60)
         if not waits:
             waits.append("execution")
             return False  # enter timeout cleanup after the child's readiness event

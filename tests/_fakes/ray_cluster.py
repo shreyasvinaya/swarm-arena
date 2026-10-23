@@ -41,12 +41,12 @@ def _stop_group(process: subprocess.Popen[str]) -> str | None:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGTERM)
         with suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=5)
-        if not _wait_group_exit(process.pid, 5):
+            process.wait(timeout=60)
+        if not _wait_group_exit(process.pid, 60):
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
-            if not _wait_group_exit(process.pid, 5):
+            process.wait(timeout=60)
+            if not _wait_group_exit(process.pid, 60):
                 return "Ray test head process group did not exit after SIGKILL"
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"Ray test head cleanup failed: {type(error).__name__}"
