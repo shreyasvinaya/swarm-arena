@@ -212,3 +212,14 @@ def no_cwd_disk_cache() -> Iterator[None]:
     assert existed or not cache.exists(), (
         "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
     )
+
+
+@pytest.fixture(scope="session")
+def ray_cluster() -> Iterator[str]:
+    """Start a two-CPU head only when a selected Ray test requests it."""
+    if _missing("ray"):
+        pytest.skip("Ray cluster tests require the ray extra")
+    from _fakes.ray_cluster import local_ray_cluster
+
+    with local_ray_cluster() as address:
+        yield address

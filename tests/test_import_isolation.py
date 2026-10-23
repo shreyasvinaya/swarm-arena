@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -125,3 +126,86 @@ assert dir(testing) == sorted(set(dir(testing)))
     subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
     )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BLOCK_RAY = "import sys; sys.modules['ray'] = None\n"
+FAKE_RAY_DIST = """
+import importlib.metadata
+_original_version = importlib.metadata.version
+def version(name):
+    return '2.59.0' if name == 'ray' else _original_version(name)
+importlib.metadata.version = version
+"""
+HIDE_RAY_DIST = (
+    FAKE_RAY_DIST
+    + """
+def version(name):
+    if name == 'ray':
+        raise importlib.metadata.PackageNotFoundError('ray-secret-sentinel')
+    return _original_version(name)
+importlib.metadata.version = version
+"""
+)
+BOOM_FINDER = """
+import sys
+class Finder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'ray':
+            raise ImportError('boom inside ray')
+sys.meta_path.insert(0, Finder())
+"""
+MISSING_SUB_FINDER = BOOM_FINDER.replace(
+    "ImportError('boom inside ray')",
+    """ModuleNotFoundError("No module named 'ray._private'", name='ray._private')""",
+)
+
+
+def test_ray_facade_error_without_extra() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + BLOCK_RAY + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "pip install 'swarm-arena[ray]'" in result.stderr
+
+
+def test_ray_facade_error_with_tests_dir_on_path() -> None:
+    code = HIDE_RAY_DIST + "import sys; sys.path.insert(0, 'tests'); import swarm_arena.ray"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "pip install 'swarm-arena[ray]'" in result.stderr
+    assert "ModuleNotFoundError" in result.stderr
+    assert "ray-secret-sentinel" not in result.stderr
+
+
+def test_ray_facade_keeps_other_import_errors() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + BOOM_FINDER + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "boom inside ray" in result.stderr
+    assert "pip install" not in result.stderr
+
+
+def test_ray_facade_keeps_missing_vendor_submodule() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + MISSING_SUB_FINDER + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "No module named 'ray._private'" in result.stderr
+    assert "swarm-arena[" not in result.stderr
