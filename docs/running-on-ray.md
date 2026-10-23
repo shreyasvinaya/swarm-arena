@@ -406,7 +406,11 @@ Run directories and run roots are **trusted operator data**: anyone who can
 write them can make resume/reconcile run tools and send the master key named
 by `master_key_env` to the gateway URL in the recorded configuration. Keep run
 roots writable only by the operator; on shared storage pass `--config` from a
-trusted copy (the continuity check then refuses a changed gateway URL).
+trusted copy (the continuity check then refuses a changed gateway URL). That
+override does not authenticate the journal or recorded plan. Before mutating a
+key, reconcile checks the addressed history and the key hash, creation run ID
+and alias returned by `/key/info`. Missing or mismatched identity keeps the key
+estimated without mutation; these checks do not make writable run storage trusted.
 
 Reconcile takes the run lease and refuses a live owner. It reports each key's
 reserved amount and confidence label without changing the ledger. The pinned
@@ -416,7 +420,11 @@ does not delete keys through an observed transition. Recorded calls still
 provide informational spend. Other capability-bearing adapters can report
 `observed (completeness unverified)`, or `observed` with terminal accounting,
 only after confirming tool death, key closure and the required elapsed window.
+Deletion also waits for durable observations and closure evidence. Deleted keys
+reuse committed observations without another gateway read, so rows arriving
+after deletion are not discovered. Unsupported key totals remain estimated;
+an aggregate may remain estimated or be unavailable instead of losing precision.
 A key created but never journaled is not swept or counted in reports: its bearer
 never left the driver, and it expires after `key_duration_s`. See
 [After the run: reconcile](limits-and-safety.md#after-the-run-reconcile) for
-recovery and accounting details.
+ownership, timing and accounting limits.

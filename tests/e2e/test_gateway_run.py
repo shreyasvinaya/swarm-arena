@@ -572,13 +572,29 @@ async def test_capability_stub_observed_labels_and_repeated_totals(
     from _fakes.reconcile import CapableGateway
 
     from swarm_arena._gateway import litellm_proxy, reconcile
-    from swarm_arena._gateway.adapter import SpendRow
+    from swarm_arena._gateway.adapter import SpendRow, VirtualKey
     from swarm_arena._model.canonical import utc_now
     from swarm_arena.tool import Usage
 
+    # Leave the original keys unclosed so the identity gate protects both
+    # blocking and deletion, rather than only the latter.
+    fake_gateway.fail["/key/block"] = 500
     await _run_swarm(fake_gateway, tmp_path, monkeypatch)
+    fake_gateway.fail.clear()
+    assert all(not key["blocked"] for key in fake_gateway.keys.values())
     adapter = CapableGateway()
     adapter.terminal_accounting = terminal
+    verifier = litellm_proxy.LiteLLMProxy(
+        url=fake_gateway.url, master_key=fake_gateway.master_key, request_timeout_s=600
+    )
+    identity_checks: list[tuple[str, bool | None]] = []
+
+    async def key_matches(key: VirtualKey, *, run_id: str) -> bool | None:
+        result = await verifier.key_matches(key, run_id=run_id)
+        identity_checks.append((key.key_id, result))
+        return result
+
+    monkeypatch.setattr(adapter, "key_matches", key_matches)
     from swarm_arena._engine.preflight import gateway_preflight
 
     cap, profile = await gateway_preflight(
@@ -629,20 +645,53 @@ async def test_capability_stub_observed_labels_and_repeated_totals(
     config = _config(fake_gateway, tmp_path)
     settlements = _events(tmp_path, "settle")
     expected = "observed" if terminal else "observed (completeness unverified)"
+    # The real /key/info route must bind both metadata.run_id and key_alias.
+    key_ids = list(fake_gateway.keys)
+    assert len(key_ids) == 2
+    first, second = (fake_gateway.keys[key_id] for key_id in key_ids)
+    old_run_id, old_alias = first["metadata"]["run_id"], second["alias"]
+    first["metadata"]["run_id"] = "unrelated-run"
+    second["alias"] = "cand-unrelated"
+    await _reconcile_cli(config, tmp_path)
+    refused = _last_reconcile(tmp_path)["keys"]
+    assert {key["key_id"] for key in refused} == set(key_ids)
+    assert {key["label"] for key in refused} == {"estimated"}
+    assert all(key["observed_usd"] is None and not key["deleted"] for key in refused)
+    assert set(identity_checks) == {(key_id, False) for key_id in key_ids}
+    assert not adapter.blocked
+    assert not adapter.deleted
+    assert not adapter.windows
+    assert _total_micro(tmp_path) == 20_000
+    first["metadata"]["run_id"], second["alias"] = old_run_id, old_alias
+    identity_checks.clear()
     await _reconcile_cli(config, tmp_path)
     keys = _last_reconcile(tmp_path)["keys"]
     assert len(keys) == 2
     assert {k["label"] for k in keys} == {expected}
     assert all(k["observed_usd"] == 0.31 and k["deleted"] for k in keys)
+    assert _last_reconcile(tmp_path)["total_usd"] == 0.62
+    assert _last_reconcile(tmp_path)["total_label"] == expected
+    assert not _last_reconcile(tmp_path)["total_reasons"]
     assert _total_micro(tmp_path) == 620_000
+    assert set(identity_checks) == {(key_id, True) for key_id in key_ids}
+    assert set(adapter.blocked) == set(key_ids)
     assert set(adapter.deleted) == set(fake_gateway.keys)
-    # Retention after deletion cannot erase committed rows on a repeated read.
+    assert len(adapter.windows) == len(identity_checks) == 2
+    windows = list(adapter.windows)
+    info_reads = len(_calls(fake_gateway, "/key/info"))
+    # Retention after deletion cannot erase committed rows. Deleted keys must
+    # not cause another identity lookup, spend read, block or delete attempt.
     adapter.rows.clear()
     await _reconcile_cli(config, tmp_path)
     repeated = _last_reconcile(tmp_path)["keys"]
     assert {k["key_id"] for k in repeated} == {k["key_id"] for k in keys}
     assert {k["label"] for k in repeated} == {expected}
     assert all(k["observed_usd"] == 0.31 and k["deleted"] for k in repeated)
+    assert adapter.windows == windows
+    assert len(identity_checks) == len(adapter.blocked) == len(adapter.deleted) == 2
+    assert len(_calls(fake_gateway, "/key/info")) == info_reads
+    assert _last_reconcile(tmp_path)["total_usd"] == 0.62
+    assert _last_reconcile(tmp_path)["total_label"] == expected
     assert _total_micro(tmp_path) == 620_000
     assert len(_observed_calls(tmp_path)) == 6
     assert _events(tmp_path, "settle") == settlements
