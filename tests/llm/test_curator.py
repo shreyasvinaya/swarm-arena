@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -306,7 +307,7 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -314,10 +315,12 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 async def test_engine_publishes_drained_call_link_atomically(

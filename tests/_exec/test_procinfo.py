@@ -15,6 +15,7 @@ import anyio
 import pytest
 from _fakes import proc as shared_proc
 from _fakes.proc import THREADED, main_thread_state, pid_alive, require_visible_proc, wait_until
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Job
@@ -25,6 +26,8 @@ from swarm_arena._exec.procinfo import (
     kill_orphan,
     process_start_time,
 )
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 def test_host_id_format_and_stable() -> None:
@@ -48,7 +51,7 @@ def test_process_start_time_and_group_liveness() -> None:
     assert st == process_start_time(p.pid)
     assert group_has_live_member(p.pid)
     os.killpg(p.pid, signal.SIGKILL)
-    p.wait()
+    p.wait(timeout=60)
     assert process_start_time(p.pid) is None
     assert wait_until(lambda: not group_has_live_member(p.pid), 60)
 
@@ -101,7 +104,7 @@ def test_kill_orphan_refuses_incomplete_records(update: dict[str, Any]) -> None:
         assert p.poll() is None
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def test_kill_orphan_refuses_unknown_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -121,7 +124,7 @@ def test_kill_orphan_refuses_unknown_host(monkeypatch: pytest.MonkeyPatch, tmp_p
         assert p.poll() is None
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def _is_zombie(pid: int) -> bool:

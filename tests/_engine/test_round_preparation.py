@@ -6,6 +6,7 @@ import threading
 import anyio
 import pytest
 from _engine.test_round import _round, _RoundTime, _scripted
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import EngineEnv
 
 from swarm_arena._engine import round as round_module
@@ -43,7 +44,7 @@ async def test_round_deadline_starts_after_slow_preparation(
         prepared_at = clock.current_time()
         release.set()
         with anyio.fail_after(60):
-            result = await task
+            result = await observe_task(task)
         assert starts
         assert starts[0] >= prepared_at
         assert result.reasons == {"t/a": ""}
@@ -52,7 +53,9 @@ async def test_round_deadline_starts_after_slow_preparation(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()

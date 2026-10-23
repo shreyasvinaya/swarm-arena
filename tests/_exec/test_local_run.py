@@ -6,12 +6,16 @@ from pathlib import Path
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import all_events, plan
 
 from swarm_arena import FunctionTool, RunConfig, Swarm
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex, utc_now
 from swarm_arena._store.local import LocalStore
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 async def test_cancel_abandons_executor_log_storage(
@@ -56,8 +60,9 @@ async def test_cancel_abandons_executor_log_storage(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
                     await anyio.to_thread.run_sync(worker.join, 60)
@@ -156,13 +161,14 @@ async def test_upload_cancellation_never_starts_another_object(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
                     await anyio.to_thread.run_sync(worker.join, 60)
                     assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert publications == before
 
 
@@ -270,12 +276,13 @@ async def test_cancel_before_upload_keeps_data_without_publication(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert publications == []
 
 
@@ -345,13 +352,14 @@ async def test_public_run_abandons_partial_uploads(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        if successor is not None:
-            successor.release()
+            if successor is not None:
+                successor.release()
     assert publications == [], "an upload started after cancellation or confirmed fencing"
     owner = read_owner(store)
     assert owner is not None

@@ -1,12 +1,13 @@
 """Immediate stop and round deadline abandon unpaid request estimates."""
 
 import asyncio
-from contextlib import suppress
 from pathlib import Path
 
 import anyio
 import pytest
 from _fakes import pr1_fm as hooks
+from _fakes.cleanup import settle_tasks
+from _fakes.pr1_fm_stop import WORKERS
 
 from swarm_arena import Swarm
 from swarm_arena._engine import round as round_module
@@ -19,6 +20,7 @@ from tests._engine.test_pr1_fm_outcomes import config, events, plan
 async def test_unpaid_request_hook_stops_promptly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook: str, stop: str
 ) -> None:
+    WORKERS.clear()
     hooks.ENTERED.clear()
     hooks.RELEASE.clear()
     hooks.EXITED.clear()
@@ -49,9 +51,12 @@ async def test_unpaid_request_hook_stops_promptly(
         hooks.RELEASE.set()
         if not task.done():
             task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-        assert await anyio.to_thread.run_sync(hooks.EXITED.wait, 60)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in WORKERS:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     journal = events(tmp_path)
     assert not [e for e in journal if e["type"] in {"reserve", "tool_start"}]
     assert any(e["type"] == "goal_finished" for e in journal)

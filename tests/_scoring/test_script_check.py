@@ -4,6 +4,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import GOAL, WRITE, RecordingExecutor, cand
 from pydantic import ValidationError
@@ -19,6 +20,8 @@ from swarm_arena._scoring.script_check import ScriptCheck, _CheckResultFile
 from swarm_arena._scoring.script_judge import ScriptJudge, _JudgeResultFile
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import snapshot_fileset
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 SECRET = "ad25cd43a1711e358861c29d157cf8df"
 

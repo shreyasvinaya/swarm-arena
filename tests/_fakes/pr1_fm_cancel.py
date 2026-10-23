@@ -1,11 +1,11 @@
 """Readiness-gated native cancellation of a public tool action."""
 
 import asyncio
-from contextlib import suppress
 from pathlib import Path
 from threading import Thread, current_thread
 
 import anyio
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.pr1_fm import BUDGETS, ENTERED, EXITED, RELEASE, PaidTool
 
 from swarm_arena.manager import AgentContext, Manager, RoundReport
@@ -36,22 +36,22 @@ class CancelPreparation(Manager):
             task.cancel("caller cancellation")
             try:
                 with anyio.fail_after(30):
-                    await task
+                    await observe_task(task)
             except asyncio.CancelledError as error:
                 assert error.args in ((), ("caller cancellation",))  # noqa: PT017
             else:
                 raise AssertionError("native cancellation was swallowed")
         finally:
             RELEASE.set()
-            if not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-            assert await anyio.to_thread.run_sync(EXITED.wait, 60)
-            for worker in WORKERS:
-                await anyio.to_thread.run_sync(worker.join, 60)
-                assert not worker.is_alive()
-            WORKERS.clear()
+            try:
+                if not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                for worker in WORKERS:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
+                WORKERS.clear()
         BUDGETS.append(ctx.budget.usd)
         await ctx.run_tool({"n": 4})
         return RoundReport()

@@ -8,6 +8,7 @@ from typing import Any, NoReturn
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.run import all_events, plan
 
 from swarm_arena import RunConfig, Swarm
@@ -131,13 +132,15 @@ async def test_initialization_stops_before_worker_release(
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
     finally:
+        release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        release.set()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
     assert not store.exists("goals/g/rounds/round-01.md")
     if site == "run.toml":
         assert not store.exists("manifest.json")
@@ -199,8 +202,9 @@ async def test_initialization_stop_cleanup_is_bounded(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -323,8 +327,9 @@ async def test_resume_initialization_stops_before_worker_release(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -397,8 +402,9 @@ async def test_stopped_initialization_contains_segment_failure(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
@@ -471,8 +477,9 @@ async def test_driver_stop_cleanup_timeout_is_a_core_error(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()

@@ -186,7 +186,7 @@ async def test_pending_replan_is_abandoned(
         entered.set()
         # Keep the pre-fix repro bounded even if the hook runs on the event loop.
         if threading.current_thread() is not threading.main_thread():
-            release.wait()
+            assert release.wait(300), "test did not release replanner"
         return plan
 
     monkeypatch.setattr(planner, "plan", hanging_sync if synchronous else hanging_async)
@@ -223,6 +223,10 @@ async def test_pending_replan_is_abandoned(
         assert all(r.state != "open" for r in runner.recorded.reservations.values())
     finally:
         release.set()
+        for worker in threads:
+            if worker is not threading.main_thread():
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("flag", ["stop_now", "deadline"])

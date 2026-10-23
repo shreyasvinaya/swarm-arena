@@ -12,7 +12,9 @@ from typing import Any, Literal, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.dependencies import ray_dependency
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.ray_transport import isolated_ray_filesystem  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
@@ -90,6 +92,8 @@ from swarm_arena.tool import (
     ToolOutput,
     ToolRequest,
 )
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 SECRET = "d9be8c92-4d1c-4b85-a2c7-632b17d8499f"
 INVALID_COLLECT_NOTE = NOTE_PREFIX + _NOT_AN_OUTPUT
@@ -2233,11 +2237,11 @@ async def test_conformance_preserves_native_caller_cancellation(
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
         assert task.cancelled()
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
@@ -2477,22 +2481,22 @@ async def test_conformance_keeps_owner_interruption_with_a_drain_note(
             if stop == "native":
                 timers[0].reschedule(asyncio.get_running_loop().time())
                 with pytest.raises(TimeoutError) as caught:
-                    await task
+                    await observe_task(task)
                 assert _has_drain_note(caught.value)
             elif stop == "anyio":
                 owner.cancel()
-                await task
+                await observe_task(task)
                 assert len(cancellations) == 1
                 assert _has_drain_note(cancellations[0])
             else:
                 with pytest.raises(RuntimeError, match="offline harness stopped") as caught:
-                    await task
+                    await observe_task(task)
                 assert _has_drain_note(caught.value)
         assert scopes[0].tranche._closed
         assert llm_record._bindings == baseline
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
@@ -2644,7 +2648,7 @@ async def test_conformance_rejects_reservation_admitted_during_close(
     finally:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await settle_tasks(*tasks)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])

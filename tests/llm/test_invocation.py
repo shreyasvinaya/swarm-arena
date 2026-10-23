@@ -6,6 +6,9 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+
+pytest.importorskip("agents")
 
 from swarm_arena import Limits
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope, llm_scope
@@ -176,7 +179,7 @@ async def test_real_cancellation_wins_and_drains_without_wait(
     finally:
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 async def test_forged_cancellation_is_not_real_caller_cancellation(

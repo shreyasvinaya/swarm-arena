@@ -3,13 +3,13 @@
 import asyncio
 import json
 import traceback
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
 from _fakes import pr1_fm as hooks
+from _fakes.cleanup import settle_tasks
 
 from swarm_arena import Swarm
 from swarm_arena._errors import Fenced, _core_error
@@ -104,5 +104,4 @@ async def test_caller_cancel_wins_over_replacement_fence(
     finally:
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+            await settle_tasks(task)

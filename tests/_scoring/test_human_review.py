@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.finished import FinishedRun
 from _fakes.journals import FakeRun
 from _fakes.leases import force_take_over
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 
 import swarm_arena._scoring.human_review as human_review
@@ -29,6 +31,8 @@ from swarm_arena._scoring.human_review import (
     render_review,
 )
 from swarm_arena._store.base import Store, open_store
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 @pytest.fixture
@@ -697,12 +701,14 @@ async def test_stalled_receipt_io_ends_owner_before_worker_returns(
         assert not any(e.payload.get("reviewer") == "bob" for e in _events(review_run.store))
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 60)
-        for worker in workers:
-            await run_sync_daemon(worker.join, 60)
-            assert not worker.is_alive()
-        if successor is not None:
-            successor.release()
+        try:
+            await settle_tasks(task, *services)
+        finally:
+            for worker in workers:
+                await run_sync_daemon(worker.join, 60)
+                assert not worker.is_alive()
+            if successor is not None:
+                successor.release()
 
 
 @pytest.mark.parametrize("operation", ["resume", "import"])
@@ -730,9 +736,11 @@ async def test_cancelled_takeover_releases_undelivered_lease(
     before = _events(review_run.store)
     scopes: list[anyio.CancelScope] = []
     leases: list[Lease] = []
+    workers: list[threading.Thread] = []
     path = _file(tmp_path)
 
     def take_over(cls: type[Lease], *args: Any, **kwargs: Any) -> Lease:
+        workers.append(threading.current_thread())
         lease = original(cls, *args, **kwargs)
         leases.append(lease)
         acquired.set()
@@ -768,7 +776,7 @@ async def test_cancelled_takeover_releases_undelivered_lease(
         else:
             scopes[0].cancel()
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await settle_tasks(task, cancel=False)
         assert await run_sync_daemon(returned.wait, 60)
         assert await run_sync_daemon(cleaned.wait, 60), "undelivered lease was not released"
         owner = read_owner(review_run.store)
@@ -780,12 +788,18 @@ async def test_cancelled_takeover_releases_undelivered_lease(
         await HumanReview("bob").import_csv(review_run.run_id, path, config=run_config)
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
-        assert await run_sync_daemon(returned.wait, 60)
-        for lease in leases:
-            with anyio.CancelScope(shield=True):
-                with suppress(Fenced):
-                    await run_sync_daemon(lease.release)
+        try:
+            await settle_tasks(task)
+        finally:
+            try:
+                for worker in workers:
+                    await run_sync_daemon(worker.join, 60)
+                    assert not worker.is_alive()
+            finally:
+                for lease in leases:
+                    with anyio.CancelScope(shield=True):
+                        with suppress(Fenced):
+                            await run_sync_daemon(lease.release)
 
 
 @pytest.mark.parametrize("operation", ["import", "resume"])
@@ -874,16 +888,20 @@ async def test_cancelled_writer_entry_releases_lease_once(
         assert all(service.task is not None and service.task.done() for service in services)
     finally:
         unblock.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
-        for service in services:
-            assert service.task is not None
-            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 60)
-        # AnyIO pool threads are reused, so drain their call via the owner task;
-        # daemon cleanup threads can additionally be joined.
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await run_sync_daemon(worker.join, 60)
-                assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            try:
+                for service in services:
+                    assert service.task is not None
+                    await settle_tasks(service.task)
+            finally:
+                # AnyIO pool threads are reused, so drain their call via the owner task;
+                # daemon cleanup threads can additionally be joined.
+                for worker in workers:
+                    if worker.name.startswith("swarm-arena-daemon-"):
+                        await run_sync_daemon(worker.join, 60)
+                        assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("operation", ["import", "resume"])
@@ -989,13 +1007,17 @@ async def test_cancelled_pre_entry_cleanup_has_deadline(
         assert _events(review_run.store) == before
     finally:
         unblock.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
-        for service in services:
-            assert service.task is not None
-            await asyncio.wait_for(asyncio.gather(service.task, return_exceptions=True), 60)
-        for worker in workers:
-            await run_sync_daemon(worker.join, 60)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            try:
+                for service in services:
+                    assert service.task is not None
+                    await settle_tasks(service.task)
+            finally:
+                for worker in workers:
+                    await run_sync_daemon(worker.join, 60)
+                    assert not worker.is_alive()
     assert len(releases) == 1, "late cleanup attempted another release"
     owner = read_owner(review_run.store)
     assert owner is not None
@@ -1373,8 +1395,9 @@ async def test_stop_during_import(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()

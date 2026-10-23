@@ -53,7 +53,7 @@ def reap(proc: subprocess.Popen[bytes]) -> None:
     """Kill ``proc`` if it still runs, then reap it, so it is not left as a zombie."""
     if proc.poll() is None:
         proc.kill()
-    proc.wait()
+    proc.wait(timeout=60)
 
 
 # A child whose main thread calls pthread_exit while a worker thread keeps running: Linux then

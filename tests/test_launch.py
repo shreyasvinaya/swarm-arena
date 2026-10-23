@@ -5,8 +5,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 from swarm_arena import _launch
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 # A workspace swarm_arena/__init__.py; -I keeps the cwd and PYTHONPATH off sys.path.
 SHADOW = "open('shadow', 'w')"

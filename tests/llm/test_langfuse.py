@@ -11,6 +11,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -605,13 +606,13 @@ async def test_failing_trace_exit_preserves_control(
                 with pytest.raises(
                     asyncio.CancelledError if kind == "caller" else type(error)
                 ) as caught:
-                    await task
+                    await observe_task(task)
                 assert_secret_absent(caught.value, "SENTINEL_SECRET")
                 if kind != "caller":
                     assert caught.value is error
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 def test_registers_one_bounded_exit_owner(exported: Any, monkeypatch: pytest.MonkeyPatch) -> None:

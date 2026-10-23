@@ -8,6 +8,7 @@ from weakref import ref
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import EngineEnv
 from _fakes.secrecy import assert_secret_absent
 
@@ -132,8 +133,9 @@ async def test_cancelled_poll_discards_late_true(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             assert await anyio.to_thread.run_sync(exited.wait, 60)
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):

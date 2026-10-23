@@ -11,6 +11,7 @@ from threading import current_thread
 from unittest.mock import Mock
 
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.finished import FinishedRun, run_again
 
 from swarm_arena._board.cache import LearningFilter
@@ -323,20 +324,20 @@ async def test_cancelled_validation_never_publishes(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         scope.cancel()
         with anyio.fail_after(30):
-            await task
+            await observe_task(task)
         assert scope.cancelled_caught
         assert not exited.is_set()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(exited.wait, 60)
         if not task.done():
             task.cancel()
-        with anyio.fail_after(60):
-            await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 60)
-            assert not worker.is_alive()
-        await anyio.to_thread.run_sync(board.close)
+        try:
+            await settle_tasks(task)
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
+            await anyio.to_thread.run_sync(board.close)
     folder = Path(finished_run.config.arena_root) / finished_run.namespace / "curation"
     assert not list(folder.glob("*.jsonl"))
 

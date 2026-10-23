@@ -9,6 +9,8 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 pytest.importorskip("agents")
 
@@ -59,9 +61,13 @@ from swarm_arena.llm._linking import CallLinks, ManagerDeps, tool_calls_of
 from swarm_arena.manager import AgentContext, LimitReached
 from swarm_arena.testing import FakeModel, FakeTurn
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:pydantic._internal._generate_schema"
-)
+pytestmark = [
+    pytest.mark.usefixtures("owned_processes"),
+    pytest.mark.filterwarnings(
+        "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:"
+        "pydantic._internal._generate_schema"
+    ),
+]
 
 SPEC = ModelSpec(
     model="fake/m",
@@ -857,8 +863,11 @@ async def test_overflow_advice_and_hook_match_reservation_while_settlement_waits
             assert _core_category(_unwrap_control(hooked.value)) is _SignalCategory.TERMINAL
         finally:
             entry.lock.release()
-            await task
-            await other.close()
+            try:
+                await settle_tasks(task, cancel=False)
+                task.result()
+            finally:
+                await other.close()
 
 
 @pytest.mark.parametrize("form", ["forged", "copy", "deepcopy", "pickle", "subclass"])

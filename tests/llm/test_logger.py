@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -657,7 +658,7 @@ async def test_drain_abandons_blocked_adapter_before_upload(
                 assert await drain(scope, wait=False) == [
                     kw["litellm_params"]["metadata"]["call_id"]
                 ]
-                await task
+                await observe_task(task)
 
             def refuse(data: bytes) -> str:
                 pytest.fail("abandoned adapter uploaded")
@@ -666,7 +667,7 @@ async def test_drain_abandons_blocked_adapter_before_upload(
         finally:
             await held.finish()
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         assert len(run.calls()) == 1
         assert run.charged(scope) == _ESTIMATE
 
@@ -843,14 +844,14 @@ async def test_terminal_cleanup_failure_propagates(
                         anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
                     ):
-                        await task
+                        await observe_task(task)
                     assert not isinstance(caught.value, Fenced)
                     assert "LLM callback failed" not in caplog.text
                     assert not run.calls()
                     assert run.charged(scope) == _ESTIMATE
                 finally:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await settle_tasks(task)
     finally:
         await held.finish()
 
@@ -903,12 +904,12 @@ async def test_cancellation_abandons_adapter(tmp_path: Path) -> None:
             await held.ready()
             task.cancel()
             with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             await drain(scope, wait=False)
         finally:
             await held.finish()
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         assert run.charged(scope) == _ESTIMATE
 
 

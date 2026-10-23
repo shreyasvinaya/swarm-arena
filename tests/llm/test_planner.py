@@ -8,6 +8,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -357,7 +358,7 @@ async def test_terminal_session_exits_without_resurrection(
                 if mode == "cancel":
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
                 else:
                     if mode == "deadline":
                         expired.set()
@@ -367,7 +368,7 @@ async def test_terminal_session_exits_without_resurrection(
                     with pytest.raises(
                         RuntimeError, match=r"terminal input ended|planning session stopped"
                     ):
-                        await task
+                        await observe_task(task)
             assert os.get_blocking(read_fd)
             assert reviewer._edit_bytes == b""
             assert reviewer._draft_text == ""
@@ -385,9 +386,11 @@ async def test_terminal_session_exits_without_resurrection(
             assert all_events(config) == events
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            if write_fd >= 0:
-                os.close(write_fd)
+            try:
+                await settle_tasks(task)
+            finally:
+                if write_fd >= 0:
+                    os.close(write_fd)
 
 
 def _keys(value: Any) -> set[str]:
@@ -649,7 +652,7 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
                     await fake.ready.wait()
                     if not never:
                         release.set()
-                    await task
+                    await observe_task(task)
                 assert len(scope.call_ids) == len(fake.calls) == 1
                 assert set(scope.call_ids) == {c.id for c in run.calls()}
                 assert (run.calls()[0].error or "").startswith("estimated:") is never
@@ -662,7 +665,7 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
             finally:
                 if not task.done():
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await settle_tasks(task)
     finally:
         await fake.aclose()
 
@@ -747,7 +750,7 @@ async def test_planner_caller_cancellation_drains_held_record(tmp_path: Path) ->
                 await fake.ready.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -755,10 +758,12 @@ async def test_planner_caller_cancellation_drains_held_record(tmp_path: Path) ->
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 def test_output_round_defaults_preserve_round_spec(tmp_path: Path) -> None:
@@ -850,10 +855,10 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
                 fenced_events = all_events(config)
                 fake.release.set()
                 with pytest.raises(Fenced):
-                    await task
+                    await observe_task(task)
             else:
                 with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
-                    await task
+                    await observe_task(task)
         assert session.name not in llm_record._bindings
         owner = read_owner(store)
         assert owner is not None
@@ -881,9 +886,11 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
         fake.release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        if replacement is not None:
-            replacement.release()
+        try:
+            await settle_tasks(task)
+        finally:
+            if replacement is not None:
+                replacement.release()
 
 
 @pytest.mark.parametrize("handled", ["budget", "fenced"])
@@ -1057,7 +1064,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
             with pytest.raises(
                 expected, match=None if cancelled else r"^review cleanup failed: ValueError$"
             ) as caught:
-                await task
+                await observe_task(task)
         assert_secret_absent(caught.value, SECRET)
         assert SECRET not in "".join(traceback.format_exception(caught.value))
         if cancelled:
@@ -1072,7 +1079,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
     finally:
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("primary", ["body", "control", "handled"])

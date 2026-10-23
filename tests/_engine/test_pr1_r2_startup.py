@@ -1,11 +1,11 @@
 """Startup and shutdown failure surfaces through public Swarm runs."""
 
 import traceback
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.pr1_r2 import SECRET, failure
 from _fakes.run import plan
 
@@ -236,5 +236,4 @@ async def test_startup_caller_cancel_wins_over_replacement(
     finally:
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+            await settle_tasks(task)

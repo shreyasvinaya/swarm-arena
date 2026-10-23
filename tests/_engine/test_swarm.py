@@ -5,6 +5,7 @@ from pathlib import Path
 import anyio
 import pytest
 from _fakes.engine import with_limits
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool
 
@@ -13,6 +14,8 @@ from swarm_arena._engine.swarm import Swarm
 from swarm_arena._errors import PlanError
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.tooling import Estimate
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 async def test_approve_false_writes_nothing(run_config: RunConfig, tmp_path: Path) -> None:
