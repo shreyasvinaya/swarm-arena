@@ -994,8 +994,10 @@ async def test_budget_drain_uses_only_inflight_job_grace(
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(latch)
             out = await _round(env, [slot, idle]).run(1)
-    assert 5.0 <= times["cancel"] - times["flag"] < 7.0
-    assert 5.0 <= times["cancel"] - times["closed"] < 7.0
+    # The clock is frozen between advances, so the drain is exactly 5 s; compare
+    # with a float tolerance because the absolute times are origin + offset.
+    assert times["cancel"] - times["flag"] == pytest.approx(5.0)
+    assert times["cancel"] - times["closed"] == pytest.approx(5.0)
     assert times["cancel"] == origin + 5.0
     assert out.candidates[0].output.partial
     assert out.candidates[0].output.status == RunStatus.CANCELLED
