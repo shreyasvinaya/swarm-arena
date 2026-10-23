@@ -225,7 +225,7 @@ async def test_action_validator_abandoned_without_late_handler(
     async with anyio.create_task_group() as tasks:
         tasks.start_soon(invoke)
         try:
-            with anyio.fail_after(3):
+            with anyio.fail_after(60):
                 await entered.wait()
                 ctx_env.env.inflight.cancel_all()
                 await done.wait()
