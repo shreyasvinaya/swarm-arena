@@ -654,8 +654,8 @@ existing handling.
 
 A connector whose subprocess calls an LLM can write
 `swarm/llm_calls.jsonl`
-with one call per line. See {ref}`Reporting LLM calls <reporting-llm-calls>`
+with one call per line, at most 64 KiB per line. See {ref}`Reporting LLM calls <reporting-llm-calls>`
 for the schema, limits, candidate source labels and trace correlation variables.
-The executor collects this optional file automatically; do not add its reserved
+The executor collects this optional file for tool jobs only; do not add its reserved
 workspace path to `ToolOutput.files`. Keep aggregate tool usage in the result
 file: individual report rows are informational and never create a second charge.

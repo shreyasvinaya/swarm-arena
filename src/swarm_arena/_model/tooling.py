@@ -456,6 +456,19 @@ class ToolOutput(FrozenModel):
     ended_at: UtcDatetime | None = None
     failed_provider: str | None = None
 
+    def __eq__(self, other: object) -> bool:
+        """Compare output values independently of transient collection diagnostics."""
+        if not isinstance(other, ToolOutput):
+            return super().__eq__(other)
+        left, right = self.model_copy(), other.model_copy()
+        for output in (left, right):
+            output.__pydantic_private__ = {
+                key: value
+                for key, value in (output.__pydantic_private__ or {}).items()
+                if key != "_collection_diagnostics"
+            }
+        return FrozenModel.__eq__(left, right)
+
 
 class Command(FrozenModel):
     """

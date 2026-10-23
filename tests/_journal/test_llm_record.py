@@ -1935,3 +1935,133 @@ async def test_one_sided_payload_upload_cancel_does_not_append(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             await held.finish()
+
+
+@pytest.mark.parametrize("external_first", [True, False])
+async def test_tool_dedup_cannot_suppress_funded_call(tmp_path: Path, external_first: bool) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        observation_meta = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "candidate_id": "c",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        rows = [LLMCallRow(model="a/b", litellm_call_id="collision")]
+        with llm_scope(scope):
+            if external_first:
+                assert len(await record_reported(rows, metadata=observation_meta)) == 1
+            funded = await record_call(**record_kwargs(meta, litellm_call_id="collision"))
+            assert funded is not None
+            if not external_first:
+                assert len(await record_reported(rows, metadata=observation_meta)) == 1
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert scope.call_ids == [funded.id]
+        assert await drain(scope, wait=False) == []
+        await _assert_accounted(scope, run.store)
+        assert await record_reported(rows, metadata=observation_meta) == []
+        assert await record_call(**record_kwargs(meta, litellm_call_id="collision")) is None
+
+
+@pytest.mark.parametrize("field", ["cost_usd", "usage"])
+async def test_unsupported_report_amount_is_informational(tmp_path: Path, field: str) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+
+    async with open_llm_run(tmp_path) as run:
+        values: dict[str, Any] = {field: 1e300 if field == "cost_usd" else Usage(usd=1e300)}
+        [call] = await record_reported(
+            [LLMCallRow(model="a/b", **values)],
+            metadata={"run_id": run.run_id, "goal_id": "g", "owner_epoch": str(run.journal.epoch)},
+        )
+        assert call.status == "error"
+        assert call.cost_usd == 0
+        assert call.usage.usd is None
+        assert call.error == "usage_overflow: unsupported informational amount"
+        assert not run.ledger._charges
+
+
+async def test_interrupted_reports_retain_each_admitted_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._tooling import llm_calls
+
+    async with open_llm_run(tmp_path) as run:
+        real = llm_calls.record_call
+        entered = asyncio.Event()
+        calls = 0
+
+        async def interrupt(**kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered.set()
+                await asyncio.Future()
+            return await real(**kwargs)
+
+        monkeypatch.setattr(llm_calls, "record_call", interrupt)
+        links: list[str] = []
+        task = asyncio.create_task(
+            llm_calls.record_reported(
+                [llm_calls.LLMCallRow(model="a/b"), llm_calls.LLMCallRow(model="a/c")],
+                metadata={
+                    "run_id": run.run_id,
+                    "goal_id": "g",
+                    "candidate_id": "c",
+                    "owner_epoch": str(run.journal.epoch),
+                },
+                call_ids=links,
+            )
+        )
+        try:
+            with anyio.fail_after(5):
+                await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await run.journal.commit()
+            assert links == [call.id for call in run.calls()]
+            assert len(links) == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_tool_dedup_namespace_rebuilds_from_committed_rows(tmp_path: Path) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        metadata = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "candidate_id": "c",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        rows = [LLMCallRow(model="a/b", litellm_call_id="replayed-collision")]
+        assert len(await record_reported(rows, metadata=metadata)) == 1
+        await run.journal.commit()
+        state = run.state()
+        unbind_run(run.run_id)
+        bind_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            tracing=run.config.tracing,
+            committed=list(state.llm_calls.values()),
+            request_sha256=state.llm_request_sha256,
+            stops=run.stops,
+            clock=run.clock,
+        )
+        scope, funded_meta = await _open(run)
+        with llm_scope(scope):
+            funded = await record_call(
+                **record_kwargs(funded_meta, litellm_call_id="replayed-collision")
+            )
+        assert funded is not None
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert await record_reported(rows, metadata=metadata) == []
+        await _assert_accounted(scope, run.store)

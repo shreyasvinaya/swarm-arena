@@ -6,9 +6,11 @@ from typing import Final
 
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.tooling import ToolOutput
+from swarm_arena._outcomes import _propagate_control
 
 COLLECTION_DIAGNOSTICS: Final = MappingProxyType(
     {
+        "llm_calls_diagnostics_invalid": "swarm/llm_calls.jsonl: invalid collection diagnostics",
         "llm_calls_unreadable": "swarm/llm_calls.jsonl could not be read; not collected",
         "llm_calls_symlink": "swarm/llm_calls.jsonl has a symlink component; not collected",
         "llm_calls_special_file": "swarm/llm_calls.jsonl is not a regular file; not collected",
@@ -23,11 +25,11 @@ MAX_COLLECTION_DIAGNOSTICS: Final = 32
 
 def _diagnostics(values: Sequence[tuple[str, int]]) -> tuple[tuple[str, int], ...]:
     """Validate transport pairs and retain only registered core diagnostic codes."""
-    if len(values) > MAX_COLLECTION_DIAGNOSTICS:
+    if type(values) not in (tuple, list) or len(values) > MAX_COLLECTION_DIAGNOSTICS:
         raise ValueError("invalid collection diagnostics")
     counts: dict[str, int] = {}
     for pair in values:
-        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+        if type(pair) not in (tuple, list) or len(pair) != 2:
             raise ValueError("invalid collection diagnostics")
         code, count = pair
         if type(code) is not str or type(count) is not int or not 1 <= count <= 10_000:
@@ -52,7 +54,8 @@ def with_collection_diagnostics(
     Returns
     -------
     ToolOutput
-        Copy whose private carrier is absent from JSON and repr.
+        Copy whose private carrier is absent from JSON and repr. Invalid or
+        extension-owned containers become one fixed diagnostic; output is retained.
 
     Examples
     --------
@@ -62,7 +65,11 @@ def with_collection_diagnostics(
     ()
     """
     copied = output.model_copy()
-    copied._collection_diagnostics = _diagnostics(diagnostics)
+    try:
+        copied._collection_diagnostics = _diagnostics(diagnostics)
+    except Exception as error:
+        _propagate_control(error)
+        copied._collection_diagnostics = (("llm_calls_diagnostics_invalid", 1),)
     return copied
 
 
@@ -86,8 +93,14 @@ def detach_tool_output(value: object) -> ToolOutput:
     {}
     """
     output = _detach_model(ToolOutput, value)
-    assert isinstance(value, ToolOutput)
-    return with_collection_diagnostics(output, value._collection_diagnostics)
+    if not isinstance(value, ToolOutput):
+        raise TypeError("invalid tool output")
+    try:
+        diagnostics = value._collection_diagnostics
+    except Exception as error:
+        _propagate_control(error)
+        diagnostics = (("llm_calls_diagnostics_invalid", 1),)
+    return with_collection_diagnostics(output, diagnostics)
 
 
 def collection_warnings(output: ToolOutput) -> list[str]:

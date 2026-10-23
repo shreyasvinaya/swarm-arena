@@ -78,6 +78,7 @@ class _Binding:
     limits: Limits
     settle_timeout_s: float
     seen_litellm: dict[str, str] = field(default_factory=dict)
+    seen_tool_litellm: dict[str, str] = field(default_factory=dict)
     recorded: set[str] = field(default_factory=set)
     originals: dict[str, str | None] = field(default_factory=dict)
     pending: dict[str, _Pending] = field(default_factory=dict)
@@ -218,7 +219,9 @@ def bind_run(
         if call.reservation_id is not None:
             binding.call_reservations[call.id] = call.reservation_id
         if call.litellm_call_id is not None:
-            binding.seen_litellm[call.litellm_call_id] = call.id
+            _dedup_index(binding, call.role == "tool" and call.reservation_id is None)[
+                call.litellm_call_id
+            ] = call.id
         _digest(request_sha256.get(call.id))
         identity = _digest(identities.get(call.id))
         if identity is not None and call.status == "ok" and not call.cache_hit:
@@ -553,6 +556,18 @@ def _prepare_call(
         raise ValueError("invalid cache_hit")
     if cache_hit and kwargs["charge_reservation"]:
         raise ValueError("cache_hit and charge_reservation are mutually exclusive")
+    external = kwargs.get("_external_observation", False) and entry is None
+    informational_overflow = external and (cost > USD_LIMIT or (usage.usd or 0) > USD_LIMIT)
+    if informational_overflow:
+        cost = 0.0
+        usage = usage.model_copy(update={"usd": None})
+    if external:
+        for name, limit in (("model", 256), ("provider", 64), ("litellm_call_id", 128)):
+            value = kwargs[name]
+            if value is not None:
+                value = _context_string(value, name)
+                if len(value) > limit or (value and not value.isprintable()):
+                    raise ValueError("invalid observation identifier")
     estimated = kwargs["charge_reservation"] and entry is not None
     overflow = not cache_hit and cost > USD_LIMIT and not estimated
     if estimated:
@@ -605,8 +620,10 @@ def _prepare_call(
         cost_usd=actual.usd,
         cache_hit=cache_hit,
         latency_ms=_plain(kwargs["latency_ms"]),
-        status="error" if estimated or overflow else status,
-        error=_UNKNOWN_SPEND
+        status="error" if estimated or overflow or informational_overflow else status,
+        error="usage_overflow: unsupported informational amount"
+        if informational_overflow
+        else _UNKNOWN_SPEND
         if estimated
         else _OVERFLOW
         if overflow
@@ -636,12 +653,19 @@ def _put_payload(artifacts: ArtifactStore, content: bytes) -> str:
     return digest
 
 
-def _duplicate(binding: _Binding, cid: str, lid: str | None, entry: _Pending | None) -> bool:
+def _dedup_index(binding: _Binding, tool: bool) -> dict[str, str]:
+    """Keep tool-origin identities separate from funded component identities."""
+    return binding.seen_tool_litellm if tool else binding.seen_litellm
+
+
+def _duplicate(
+    binding: _Binding, cid: str, lid: str | None, entry: _Pending | None, *, tool: bool = False
+) -> bool:
     return (
         not binding.active
         or binding.closing
         or cid in binding.recorded
-        or (lid is not None and lid in binding.seen_litellm)
+        or (lid is not None and lid in _dedup_index(binding, tool))
         or (
             entry is not None and (entry.state == "abandoned" or id(entry.scope) in binding.drained)
         )
@@ -675,7 +699,9 @@ def _append(
         outcome.contain(error, ValueError, "LLM journal append")
     binding.recorded.add(call.id)
     if call.litellm_call_id is not None:
-        binding.seen_litellm[call.litellm_call_id] = call.id
+        _dedup_index(binding, call.role == "tool" and call.reservation_id is None)[
+            call.litellm_call_id
+        ] = call.id
     if identity is not None and call.status == "ok" and not call.cache_hit:
         binding.original(identity, call.id)
 
@@ -825,7 +851,8 @@ async def record_call(
 
     _external_observation : bool, default=False
         Private core ingestion path for settlement-free external observations.
-        Without a pending reservation, never adopt an ambient funded scope.
+        Without a pending reservation, require tool role, never adopt an ambient
+        funded scope, and use a separate tool-observation dedup namespace.
 
     Returns
     -------
@@ -889,6 +916,9 @@ async def _record(
     if type(external) is not bool or (external and kwargs["settle"]):
         raise _core_error(ValueError, "invalid external observation")
     entry = binding.pending.get(meta.get("reservation_id", ""))
+    if external and entry is None and meta.get("role") != "tool":
+        raise _core_error(ValueError, "external observation requires tool role")
+    tool = entry is None and meta.get("role") == "tool" and not meta.get("reservation_id")
     cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
     reservation = binding.call_reservations.get(cid)
     if reservation is not None and meta.get("reservation_id") != reservation:
@@ -896,7 +926,7 @@ async def _record(
     lid = kwargs["litellm_call_id"]
     if lid is not None:
         lid = _context_string(lid, "litellm_call_id")
-    if _duplicate(binding, cid, lid, entry):
+    if _duplicate(binding, cid, lid, entry, tool=tool):
         return None
     binding.check()
     try:
@@ -905,7 +935,7 @@ async def _record(
             partial(_prepare, partial(_prepare_call, meta, cid, entry, kwargs)),
             entry=entry,
         )
-        if not ready or _duplicate(binding, cid, lid, entry):
+        if not ready or _duplicate(binding, cid, lid, entry, tool=tool):
             return None
         assert prepared is not None
         call = prepared.call
@@ -924,7 +954,7 @@ async def _record(
                     ),
                     entry=entry,
                 )
-                if not ready or _duplicate(binding, cid, lid, entry):
+                if not ready or _duplicate(binding, cid, lid, entry, tool=tool):
                     return None
                 assert digest is not None
                 refs[field] = digest

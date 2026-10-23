@@ -954,11 +954,22 @@ async def test_process_control_error_passes_through_pending_cancel(
     failure_handler.assert_not_awaited()
 
 
+def _report_job(tmp_path: Path, *, code: str = "pass") -> Job:
+    """Build a real tool job for optional report collection regressions."""
+    return _job(
+        tmp_path,
+        kind="tool",
+        tool=Ref.of(PyTool({"code": code})),
+        request=ToolRequest(),
+        command=None,
+    )
+
+
 @pytest.mark.parametrize("size", [17, 17 * 1024 * 1024, 1024 * 1024 * 1024 + 1])
 async def test_upload_outputs_sets_llm_calls_file(
     tmp_path: Path, artifacts: ArtifactStore, size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    job = _job(tmp_path)
+    job = _report_job(tmp_path)
     ws = tmp_path / "ws"
     staged = prepare_job(job, ws, artifacts)
     run = _completed(ws)
@@ -998,7 +1009,7 @@ async def test_optional_report_refusal_preserves_result(
 ) -> None:
     import os
 
-    job = _job(tmp_path)
+    job = _report_job(tmp_path)
     ws = tmp_path / "ws"
     staged = prepare_job(job, ws, artifacts)
     run = _completed(ws)
@@ -1027,7 +1038,7 @@ async def test_cancelled_report_read_never_starts_upload(
 
     from swarm_arena._exec import job_steps
 
-    job = _job(tmp_path)
+    job = _report_job(tmp_path)
     ws = tmp_path / "ws"
     staged = prepare_job(job, ws, artifacts)
     _completed(ws)
@@ -1136,7 +1147,7 @@ async def test_abandoned_report_operation_retains_workspace(
             "from pathlib import Path; Path('swarm/llm_calls.jsonl').write_text('{}')",
         ]
     )
-    task = asyncio.create_task(executor.submit(_job(tmp_path, command=command)))
+    task = asyncio.create_task(executor.submit(_report_job(tmp_path, code=command.argv[2])))
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 10)
         task.cancel()
@@ -1155,3 +1166,23 @@ async def test_abandoned_report_operation_retains_workspace(
         await executor.aclose()
     assert len(workers) == 1
     assert (workspaces[0] / "late-report").read_text() == "retained"
+
+
+async def test_command_jobs_do_not_collect_optional_llm_report(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._exec import job_steps
+
+    job = _job(tmp_path)
+    assert job.kind == "command"
+    ws = tmp_path / "ws"
+    staged = prepare_job(job, ws, artifacts)
+    _completed(ws)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("command/check jobs must not inspect an LLM report")
+
+    monkeypatch.setattr(job_steps, "collect_llm_calls", forbidden)
+    runner = _JobRun(job, staged, ws, artifacts, max_log_bytes=1024, max_output_bytes=1024)
+    output = await runner._finish(ToolOutput(status=RunStatus.OK), None)
+    assert output.llm_calls_file is None

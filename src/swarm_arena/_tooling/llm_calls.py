@@ -4,23 +4,34 @@ import hashlib
 import json
 import os
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Final, Literal
+from typing import Annotated, Any, ClassVar, Final, Literal, cast
 
-from pydantic import AfterValidator, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BeforeValidator, ConfigDict, Field, model_validator
 
+from swarm_arena._errors import StorageError
 from swarm_arena._journal.llm_record import record_call
 from swarm_arena._model.base import JsonValue, StoredModel
+from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.data import finite_json
 from swarm_arena._model.results import LLMCall
 from swarm_arena._model.tooling import FileRef, Usage
 from swarm_arena._outcomes import _propagate_control
-from swarm_arena._tooling.result_file import _chunks, _inspect_path, open_regular_file
+from swarm_arena._store.artifacts import ArtifactStore
+from swarm_arena._store.local import LocalStore
+from swarm_arena._store.s3 import S3Store
+from swarm_arena._tooling.result_file import (
+    _chunks,
+    _inspect_path,
+    open_regular_file,
+    read_regular_file,
+)
 
 LLM_CALLS_PATH: Final = "swarm/llm_calls.jsonl"
 LLM_CALLS_REF_PATH: Final = "llm_calls.jsonl"
 MAX_LLM_CALLS_BYTES: Final = 16 * 1024 * 1024
+MAX_LLM_CALL_LINE_BYTES: Final = 64 * 1024
 MAX_LLM_CALLS_HASH_BYTES: Final = 1024 * 1024 * 1024
 MAX_LLM_CALL_ROWS: Final = 10_000
 MAX_LLM_CALL_WARNINGS: Final = 20
@@ -46,15 +57,29 @@ PROVIDER_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _identifier(value: str) -> str:
+    """Reject control characters in tool-supplied identifiers."""
+    if value and not value.isprintable():
+        raise ValueError("invalid report identifier")
+    return value
+
+
+def _reported_usage(value: Any) -> Usage:
+    """Validate nested usage without coercing booleans or numeric strings."""
+    return Usage.model_validate(value, strict=True)
+
+
 class LLMCallRow(StoredModel):
     """Validate one informational report, dropping unrecognized fields.
 
     Parameters
     ----------
     model : str
-        Actual model identifier. Its prefix supplies a missing provider.
+        Printable model identifier, at most 256 characters. Its prefix supplies
+        a missing provider.
     provider : str or None, default=None
-        Provider identifier; an unprefixed model defaults to ``unknown``.
+        Printable identifier, at most 64 characters; an unprefixed model defaults
+        to ``unknown``.
     usage : Usage, default=Usage()
         Nonnegative token counts and optional reported usage cost.
     cost_usd : float, default=0
@@ -66,7 +91,8 @@ class LLMCallRow(StoredModel):
     error : str or None, default=None
         Input diagnostic; the recorder retains only a fixed error description.
     litellm_call_id : str or None, default=None
-        Optional run-wide deduplication identity.
+        Optional printable tool-observation identity, at most 128 characters.
+        Deduplication is separate from funded component calls.
     request, response : JsonValue, default=None
         Optional finite JSON payloads, stored only with tracing consent.
 
@@ -77,15 +103,17 @@ class LLMCallRow(StoredModel):
     """
 
     schema_kind: ClassVar[str] = "llm_call_row"
-    model_config = ConfigDict(extra="ignore")
-    model: str
-    provider: str | None = None
-    usage: Usage = Usage()
-    cost_usd: Annotated[float, Field(ge=0)] = 0.0
-    latency_ms: Annotated[float, Field(ge=0)] | None = None
+    model_config = ConfigDict(extra="ignore", strict=True)
+    model: Annotated[str, Field(max_length=256), AfterValidator(_identifier)]
+    provider: Annotated[str, Field(max_length=64), AfterValidator(_identifier)] | None = None
+    usage: Annotated[Usage, BeforeValidator(_reported_usage)] = Usage()
+    cost_usd: Annotated[float, Field(ge=0, strict=True)] = 0.0
+    latency_ms: Annotated[float, Field(ge=0, strict=True)] | None = None
     status: Literal["ok", "error"] = "ok"
     error: str | None = None
-    litellm_call_id: str | None = None
+    litellm_call_id: Annotated[str, Field(max_length=128), AfterValidator(_identifier)] | None = (
+        None
+    )
     request: Annotated[JsonValue, AfterValidator(finite_json)] = None
     response: Annotated[JsonValue, AfterValidator(finite_json)] = None
 
@@ -93,9 +121,10 @@ class LLMCallRow(StoredModel):
     def _provider(self) -> "LLMCallRow":
         """Fill a missing provider only after the report fields validate."""
         if self.provider is None:
-            object.__setattr__(
-                self, "provider", self.model.split("/", 1)[0] if "/" in self.model else "unknown"
-            )
+            provider = self.model.split("/", 1)[0] if "/" in self.model else "unknown"
+            if len(provider) > 64:
+                raise ValueError("invalid report provider")
+            object.__setattr__(self, "provider", provider)
         return self
 
 
@@ -120,52 +149,68 @@ def oversize_warning(size: int) -> str:
     return f"{LLM_CALLS_PATH} is {size} bytes, over the 16 MiB limit; not collected"
 
 
-def parse_llm_calls(data: bytes) -> tuple[list[LLMCallRow], list[str]]:
-    """Parse bounded JSONL, skipping invalid rows with value-free diagnostics.
+def parse_llm_calls(data: bytes) -> tuple[Iterator[LLMCallRow], list[str]]:
+    """Iterate bounded JSONL without retaining decoded rows or payloads.
 
     Parameters
     ----------
     data : bytes
-        UTF-8 report; at most 16 MiB is parsed.
+        UTF-8 report, at most 16 MiB; each line is at most 64 KiB.
 
     Returns
     -------
-    tuple[list[LLMCallRow], list[str]]
-        Valid rows and bounded warnings; blank lines do not consume the row cap.
+    tuple[Iterator[LLMCallRow], list[str]]
+        Single-pass lazy rows and a bounded warning list populated as consumed.
+        Advance the iterator in a supervised worker, then record each row before
+        advancing again. Do not accumulate decoded payloads in the driver.
 
     Examples
     --------
     >>> rows, warnings = parse_llm_calls(b'{"model":"local"}')
-    >>> rows[0].provider, warnings
-    ('unknown', [])
+    >>> [row.provider for row in rows], warnings
+    (['unknown'], [])
     """
     if len(data) > MAX_LLM_CALLS_BYTES:
-        return [], [oversize_warning(len(data))]
-    rows: list[LLMCallRow] = []
+        return iter(()), [oversize_warning(len(data))]
     warnings: list[str] = []
-    seen = bad = 0
-    for number, line in enumerate(data.split(b"\n"), 1):
-        if not line.strip():
+    return _rows(data, warnings), warnings
+
+
+def _rows(data: bytes, warnings: list[str]) -> Iterator[LLMCallRow]:
+    """Slice one bounded line at a time, never splitting the whole report."""
+    seen = bad = number = offset = 0
+    while offset < len(data):
+        end = data.find(b"\n", offset)
+        if end < 0:
+            end = len(data)
+        number += 1
+        size = end - offset
+        line = data[offset:end] if size <= MAX_LLM_CALL_LINE_BYTES else None
+        offset = end + 1
+        if line is not None and not line.strip():
             continue
         if seen == MAX_LLM_CALL_ROWS:
             warnings.append(f"{LLM_CALLS_PATH} has more than 10000 rows; rows after 10000 skipped")
             break
         seen += 1
-        reason = "invalid JSON"
+        reason = "invalid row" if line is None else "invalid JSON"
         try:
+            if line is None:
+                raise ValueError("report line too long")
             raw = json.loads(line.decode("utf-8"))
             reason = "invalid row"
             row = LLMCallRow.model_validate(raw)
+            del raw
         except Exception as error:
             _propagate_control(error)
             bad += 1
             if bad <= MAX_LLM_CALL_WARNINGS:
                 warnings.append(f"{LLM_CALLS_PATH} line {number}: {reason}; line skipped")
         else:
-            rows.append(row)
+            yield row
+            del row
     if bad > MAX_LLM_CALL_WARNINGS:
         warnings.append(f"{LLM_CALLS_PATH}: {bad - MAX_LLM_CALL_WARNINGS} more bad lines skipped")
-    return rows, warnings
 
 
 class _ReportFileError(ValueError):
@@ -193,7 +238,7 @@ def _read_report(workspace: Path, rel: str, *, retain: bool) -> tuple[str, int, 
         digest = hashlib.sha256()
         total = 0
         try:
-            for chunk in _chunks(fd, rel, max_bytes=MAX_LLM_CALLS_HASH_BYTES, step=1024 * 1024):
+            for chunk in _chunks(fd, rel, max_bytes=before.st_size, step=1024 * 1024):
                 digest.update(chunk)
                 total += len(chunk)
                 if keep and total <= MAX_LLM_CALLS_BYTES:
@@ -281,6 +326,52 @@ def collect_llm_calls(
     )
 
 
+def _read_report_artifact(artifacts: ArtifactStore, ref: FileRef) -> bytes:
+    """Read and verify one report under its declared size and the 16 MiB ceiling.
+
+    Local reads are pinned and bounded before allocation; S3 checks HEAD and a
+    bounded GET (one excess byte detects growth). Generic byte-only stores have
+    no pre-read bound in their API, so their returned object is checked before
+    copying, hashing or parsing. Call only from the owner's storage worker.
+    """
+    if ref.size > MAX_LLM_CALLS_BYTES:
+        raise StorageError("report artifact crosses the size cap")
+    store = artifacts._store
+    if isinstance(store, LocalStore):
+        data = read_regular_file(store._root, ref.sha256, max_bytes=ref.size)
+    elif isinstance(store, S3Store):
+        from fsspec.asyn import sync
+
+        key = store._key(ref.sha256)
+        with store._reading("head_object"):
+            head = store._call("head_object", Bucket=store._bucket, Key=key)
+        if head["ContentLength"] != ref.size:
+            raise StorageError("report artifact size mismatch")
+        with store._reading("get_object"):
+            response = store._call(
+                "get_object",
+                Bucket=store._bucket,
+                Key=key,
+                **({"Range": f"bytes=0-{ref.size}"} if ref.size else {}),
+            )
+
+            async def consume() -> bytes:
+                async with response["Body"] as body:
+                    return cast(bytes, await body.read(ref.size + 1))
+
+            data = cast(bytes, sync(store._filesystem().loop, consume))
+    else:
+        data = store.read(ref.sha256).data
+    if not isinstance(data, bytes):
+        raise TypeError("invalid report artifact bytes")
+    if memoryview(data).nbytes != ref.size:
+        raise StorageError("report artifact size mismatch")
+    data = data if type(data) is bytes else memoryview(data).tobytes()
+    if sha256_hex(data) != ref.sha256:
+        raise StorageError("report artifact hash mismatch")
+    return data
+
+
 def may_call_llm(providers: frozenset[str], secret_env: Sequence[str]) -> bool:
     """Recognize declared providers or known provider credential names.
 
@@ -340,7 +431,7 @@ def llm_calls_source(
 
 
 async def record_reported(
-    rows: Sequence[LLMCallRow], *, metadata: Mapping[str, Any]
+    rows: Sequence[LLMCallRow], *, metadata: Mapping[str, Any], call_ids: list[str] | None = None
 ) -> list[LLMCall]:
     """Record external observations without funding or adopting a current scope.
 
@@ -351,6 +442,10 @@ async def record_reported(
     metadata : Mapping[str, Any]
         Trusted core run/goal/team/agent/round/candidate fields and current writer
         owner_epoch. Provider reservation and call identities are never forwarded.
+
+    call_ids : list[str] or None, default=None
+        Caller-owned links appended immediately after each admitted call, so
+        cancellation preserves the already journaled prefix.
 
     Returns
     -------
@@ -389,5 +484,7 @@ async def record_reported(
             _external_observation=True,
         )
         if call is not None:
+            if call_ids is not None:
+                call_ids.append(call.id)
             calls.append(call)
     return calls

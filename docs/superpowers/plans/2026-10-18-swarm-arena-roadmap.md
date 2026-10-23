@@ -747,15 +747,23 @@ class ToolOutput(FrozenModel):
 # pinned O_NOFOLLOW/O_NONBLOCK regular-file open and bounded 1 MiB-chunk loop; no publication.
 # hash_regular_file(workspace, rel) -> (full_sha256, fstat_size): <=1 GiB, reject observed changes.
 # _JobRun._finish awaits collection, then each publication separately under its existing owner.
-# detach_tool_output(value) -> ToolOutput preserves validated private diagnostics through revalidation.
+# detach_tool_output(value) -> ToolOutput preserves bounded private diagnostics through revalidation;
+# malformed carriers produce one fixed warning, preserving valid output. Carrier is excluded from equality.
 # with_collection_diagnostics(output, pairs) restores only registered codes, <=32 pairs, counts 1..10000.
 # Codes: llm_calls_unreadable, llm_calls_symlink, llm_calls_special_file, llm_calls_changed,
-# llm_calls_hash_limit. FrameDiagnostic(code, count) transports these in the private Ray frame slot.
+# llm_calls_hash_limit, llm_calls_diagnostics_invalid. FrameDiagnostic(code, count) transports these
+# in the private Ray frame slot. Only tool jobs collect reports; command/check jobs do not.
 # effective_secret_env(tool_or_ref_or_command, *, overrides=None) -> tuple[str, ...]: shared typed,
 # alias/default-aware traversal, effective_tool_ref overrides, no worker command hook invocation.
 # record_reported(rows, *, metadata) uses current trusted owner_epoch and record_call(settle=False,
 # _external_observation=True); no ambient funded LLMScope adoption for no-pending observations.
-# parse_llm_calls reads <=16 MiB / 10000 nonempty rows with <=20 per-line warnings plus summary/cap.
+# parse_llm_calls -> (single-pass Iterator[LLMCallRow], mutable bounded warnings): consume each row
+# in the supervised worker, then record before advancing; <=16 MiB / 10000 nonempty rows, <=64 KiB/line.
+# Identifier limits: model 256, provider 64, litellm_call_id 128 printable characters; strict numbers.
+# <=20 per-line warnings plus summary/cap. Record admitted call IDs incrementally for cancellation.
+# Tool-origin call IDs use a separate dedup namespace, reconstructed from role=tool/no reservation.
+# Unsupported informational amounts record a fixed error, zero cost and absent usage.usd; never charged.
+# Driver report reads verify exact declared size/digest with bounded local/S3 reads before parsing.
 # Source order: keyed gateway > valid reported rows > may-call unknown > none; never langfuse in v1.
 
 # Private shared codec beside ToolOutput; executor and conformance kit use the same format.

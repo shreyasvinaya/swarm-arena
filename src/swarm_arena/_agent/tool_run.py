@@ -1,7 +1,7 @@
 """Validate, reserve, execute, and durably publish one agent tool request."""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -38,7 +38,7 @@ from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
-from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
+from swarm_arena._model.tooling import FileRef, RunStatus, ToolOutput, ToolRequest, parse_logs_ref
 from swarm_arena._outcomes import (
     _classify_outcome,
     _has_core_fenced,
@@ -54,6 +54,7 @@ from swarm_arena._tooling.env_names import effective_secret_env
 from swarm_arena._tooling.llm_calls import (
     MAX_LLM_CALLS_BYTES,
     LLMCallRow,
+    _read_report_artifact,
     llm_calls_source,
     may_call_llm,
     oversize_warning,
@@ -351,12 +352,11 @@ def _prepare_started(value: object) -> Job.Started:
     return _detach_model(Job.Started, value)
 
 
-def _reported_rows(artifacts: ArtifactStore, digest: str) -> tuple[list[LLMCallRow], list[str]]:
-    """Fetch verified bytes and normalize optional rows in the storage worker."""
-    data = artifacts.get_bytes(digest)
-    if type(data) is not bytes:
-        raise ValueError("invalid report artifact bytes")
-    return parse_llm_calls(data)
+def _reported_rows(
+    artifacts: ArtifactStore, ref: FileRef
+) -> tuple[Iterator[LLMCallRow], list[str]]:
+    """Fetch bounded verified bytes and prepare a lazy parser in the storage worker."""
+    return parse_llm_calls(_read_report_artifact(artifacts, ref))
 
 
 def _prepare_output(value: object) -> ToolOutput:
@@ -898,24 +898,22 @@ async def _run(
                     report_scope, grace_s=0, generation=inflight._cancel_generation
                 )
                 try:
-                    rows, report_warnings = await _storage_io(
-                        _reported_rows, rt.artifacts, ref.sha256
-                    )
-                    warnings.extend(report_warnings)
-                    reported_rows = len(rows)
-                    calls = await record_reported(
-                        rows,
-                        metadata={
-                            "run_id": rt.repeats.run_id,
-                            "goal_id": rt.goal_id,
-                            "team": rt.team.name,
-                            "agent": rt.spec.name,
-                            "round": str(rt.round),
-                            "candidate_id": id,
-                            "owner_epoch": str(rt.journal.epoch),
-                        },
-                    )
-                    call_ids = [call.id for call in calls]
+                    rows, report_warnings = await _storage_io(_reported_rows, rt.artifacts, ref)
+                    metadata = {
+                        "run_id": rt.repeats.run_id,
+                        "goal_id": rt.goal_id,
+                        "team": rt.team.name,
+                        "agent": rt.spec.name,
+                        "round": str(rt.round),
+                        "candidate_id": id,
+                        "owner_epoch": str(rt.journal.epoch),
+                    }
+                    try:
+                        while (row := await run_sync_daemon(next, rows, None)) is not None:
+                            reported_rows += 1
+                            await record_reported([row], metadata=metadata, call_ids=call_ids)
+                    finally:
+                        warnings.extend(report_warnings)
                 finally:
                     inflight.discard(report_scope)
             if report_scope.cancelled_caught:
