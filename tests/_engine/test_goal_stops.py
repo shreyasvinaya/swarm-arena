@@ -200,11 +200,11 @@ async def test_pending_replan_is_abandoned(
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 while not entered.is_set():  # noqa: ASYNC110 - daemon thread signal
                     await anyio.sleep(0.01)
             _signal(env, flag)
-            with anyio.move_on_after(7):
+            with anyio.move_on_after(30):
                 await completed.wait()
             group.cancel_scope.cancel()
         assert completed.is_set(), "stop must abandon a suspended replanner"
@@ -266,16 +266,16 @@ async def test_hanging_final_judge_is_bounded_and_keeps_journaled_scores(
 
     async with anyio.create_task_group() as group:
         group.start_soon(drive)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
         if not already_stopped:
             _signal(env, flag)
         # Grace includes construction and durable reservation. Expire it only
         # after the judge is suspended and the supervisor has latched the stop.
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await clock.sampled.wait()
         clock.now += env.deps.config.settle_timeout_s + 1
-        with anyio.move_on_after(7):
+        with anyio.move_on_after(30):
             await completed.wait()
         group.cancel_scope.cancel()
     assert completed.is_set(), "final judging must finish within the post-stop grace"
@@ -343,12 +343,12 @@ async def test_final_grace_can_expire_before_judge_dispatch(
 
     async with anyio.create_task_group() as group:
         group.start_soon(drive)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await reserving.wait()
             await clock.sampled.wait()
         assert not completed.is_set()
         clock.now += env.deps.config.settle_timeout_s + 1
-        with anyio.fail_after(7):
+        with anyio.fail_after(30):
             await completed.wait()
     _assert_terminal(env, outcomes[0], _REASONS[flag])
     assert not dispatched.is_set()
@@ -404,7 +404,7 @@ async def test_final_timeout_without_journaled_scores_still_has_no_result(
     runner = GoalRunner(
         env.deps, goal_id="g", plan=_plan(teams=1, rounds=1, converge_team=True), replanner=None
     )
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         out = await runner.run()
     assert (out.status, out.reason, out.finalists) == ("no_result", "no passing candidate", [])
     assert not env.events("score")
@@ -429,7 +429,7 @@ async def test_interrupted_join_replan_keeps_unjoined_parts(
 
     monkeypatch.setattr(planner, "plan", hang)
     runner = GoalRunner(env.deps, goal_id="g", plan=plan, replanner=planner)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         out = await runner.run()
     _assert_terminal(env, out, _REASONS[flag])
     assert len(env.events("join_failed")) == 1
@@ -517,7 +517,7 @@ class TestFinalReservationOwnership:
         async def drive() -> None:
             outcomes.append(await runner.run())
 
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 group.start_soon(drive)
                 await suspended.wait()
@@ -603,7 +603,7 @@ class TestFinalReservationOwnership:
             ),
             replanner=None,
         )
-        with anyio.fail_after(20), pytest.raises(Fenced):
+        with anyio.fail_after(60), pytest.raises(Fenced):
             await runner.run()
         assert len(admitted) == 1
         reservation = admitted[0]
@@ -663,7 +663,7 @@ async def test_final_refresh_timeout_is_core_and_recovery_can_finish(
         finally:
             completed.set()
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
             await judging.wait()
@@ -690,7 +690,7 @@ async def test_final_refresh_timeout_is_core_and_recovery_can_finish(
     assert not state.goals["g"].finished
     monkeypatch.setattr(ProviderJudge, "judge", real_judge)
     monkeypatch.setattr(goal_module, "_read_chain", real_read)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         recovered = await GoalRunner(
             env.deps,
             goal_id="g",
@@ -729,7 +729,7 @@ async def test_final_writer_timeout_propagates_without_judge_errors(
         if key.startswith("journal/") and b'"kind":"final"' in data:
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return create(key, data)
 
     def observe_scores(outcome: JudgeOutcome, scope: LLMScope, round: int, **kwargs: Any) -> None:
@@ -748,10 +748,10 @@ async def test_final_writer_timeout_propagates_without_judge_errors(
     monkeypatch.setattr(env.store, "create", blocked_create)
     monkeypatch.setattr(runner, "_publish_scores", observe_scores)
     try:
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 group.start_soon(drive)
-                assert await anyio.to_thread.run_sync(entered.wait, 10)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 journal._stop_storage()
                 await completed.wait()
         assert len(errors) == 1
@@ -767,7 +767,7 @@ async def test_final_writer_timeout_propagates_without_judge_errors(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 

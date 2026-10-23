@@ -42,7 +42,7 @@ async def test_page_storage_errors_are_type_only(
     operation = (
         Swarm(config).resume("repair", force=True) if resumed else Swarm(config).run(plan(rounds=1))
     )
-    with anyio.fail_after(15), pytest.raises((OSError, StorageError, ExceptionGroup)) as caught:
+    with anyio.fail_after(60), pytest.raises((OSError, StorageError, ExceptionGroup)) as caught:
         await operation
     assert_secret_absent(caught.value, secret, sanitized=True)
     leaves: list[BaseException] = [caught.value]

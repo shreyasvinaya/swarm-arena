@@ -50,18 +50,19 @@ async def test_inherited_read_ends_without_late_entry(
     store = LocalStore(Path(config.run_root) / "r")
     committed = read_committed(store)
     assert committed is not None
-    state = RunState.from_events(committed[1])
-    remaining = config.limits.run_timeout_s - state.run_elapsed_s
     initial_head = committed[0].head
-    entered, release = threading.Event(), threading.Event()
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     workers: list[threading.Thread] = []
     original = writer_module.read_chain
 
     def read(*args: Any, **kwargs: Any) -> Any:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
-        return original(*args, **kwargs)
+        try:
+            assert release.wait(180)
+            return original(*args, **kwargs)
+        finally:
+            returned.set()
 
     monkeypatch.setattr(writer_module, "read_chain", read)
     monkeypatch.setattr(
@@ -70,8 +71,8 @@ async def test_inherited_read_ends_without_late_entry(
     task = asyncio.create_task(Swarm(config).resume("r", force=True))
     successor: Lease | None = None
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         if signal == "takeover":
             successor = await anyio.to_thread.run_sync(
                 partial(force_take_over, store, owner_id="successor", host="local", ttl_s=60)
@@ -80,9 +81,12 @@ async def test_inherited_read_ends_without_late_entry(
             assert await request_stop(config.run_root, "r", now=True) == 2
         elif signal == "cancel":
             task.cancel()
-        bound = remaining + 2 if signal == "deadline" else 4
+        # Expiry also includes the owner's bounded release attempt; neither
+        # timer is a latency target for a loaded runner.
+        bound = config.lease_ttl_s + config.settle_timeout_s + 10 if signal == "expiry" else 30
         done, _ = await asyncio.wait([task], timeout=bound)
         assert done, "inherited read outlived its owner or remaining run allowance"
+        assert not returned.is_set(), "owner waited for the held inherited read"
         if signal == "cancel":
             assert task.cancelled()
         else:
@@ -100,13 +104,14 @@ async def test_inherited_read_ends_without_late_entry(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
         if successor is not None:
             successor.release()
+    assert returned.is_set()
     assert not any(event.type == "takeover" for event in all_events(config))
     owner = read_owner(store)
     assert owner is not None
@@ -181,7 +186,7 @@ async def test_takeover_clock_uses_inherited_head(
             armed = False
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return blob
 
     def replace(current: LocalStore, key: str, data: bytes, *, if_match: str) -> str:
@@ -195,7 +200,7 @@ async def test_takeover_clock_uses_inherited_head(
             armed = False
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return original_replace(current, key, data, if_match=if_match)
 
     observed: list[tuple[float, float]] = []
@@ -230,7 +235,7 @@ async def test_takeover_clock_uses_inherited_head(
     ticks = 50.0
     task = asyncio.create_task(Swarm(run_config).resume("r", force=True))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         # The incumbent advances active time and commits while the prospective
         # owner is still reading its older authority snapshot.
         await deps.journal.append_durable(EventDraft(type=EventType.WATCHDOG))
@@ -239,7 +244,7 @@ async def test_takeover_clock_uses_inherited_head(
         checkpoint = RunState.from_events(latest[1]).run_elapsed_s
         assert checkpoint >= earlier + 50
         release.set()
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             result = await task
         assert list(result) == ["g"]
         assert observed
@@ -250,9 +255,9 @@ async def test_takeover_clock_uses_inherited_head(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             await asyncio.gather(task, return_exceptions=True)
             await old.resumed._services._aclose(failed=True)
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()

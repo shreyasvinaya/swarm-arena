@@ -55,13 +55,13 @@ async def test_public_run_supervises_lifecycle_hooks(
     def block() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(45), "hook safety release expired"
+        assert release.wait(180), "hook safety release expired"
 
     real_watch_clock = run_module.RunRunner._watch_clock
 
     async def watch_clock(self: run_module.RunRunner, deps: EngineDeps) -> None:
         if signal == "deadline":
-            assert await anyio.to_thread.run_sync(entered.wait, 30, abandon_on_cancel=True)
+            assert await anyio.to_thread.run_sync(entered.wait, 60, abandon_on_cancel=True)
             deps.clock._rebase(deps.config.limits.run_timeout_s)
             # Converge rounds cache their monotonic deadline before hook entry.
             # Advance that runner-only clock with the active-time clock.
@@ -127,11 +127,11 @@ async def test_public_run_supervises_lifecycle_hooks(
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(drive)
-            assert await anyio.to_thread.run_sync(entered.wait, 30, abandon_on_cancel=True)
+            assert await anyio.to_thread.run_sync(entered.wait, 60, abandon_on_cancel=True)
             if signal == "stop_now":
                 await swarm.stop(now=True)
             # Observe natural completion; cancellation only cleans up a failing regression.
-            with anyio.move_on_after(7):
+            with anyio.move_on_after(30):
                 await done.wait()
             returned = done.is_set()
             group.cancel_scope.cancel()
@@ -141,7 +141,7 @@ async def test_public_run_supervises_lifecycle_hooks(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 

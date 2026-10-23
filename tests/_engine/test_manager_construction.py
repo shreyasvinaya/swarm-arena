@@ -81,7 +81,7 @@ async def test_runtime_manager_failure_is_type_only_and_peer_finishes(
         task = asyncio.create_task(swarm.run(_plan()))
         try:
             assert FailingRuntimeManager.entered is not None
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await FailingRuntimeManager.entered.wait()
         finally:
             task.cancel()

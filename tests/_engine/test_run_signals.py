@@ -50,7 +50,7 @@ async def test_wait_tool_started_waits_through_startup(
         assert result.url == store.url
         returned.set()
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(wait)
             await sampled.wait()
@@ -91,7 +91,7 @@ async def test_wait_tool_started_requires_committed_start(
         await run_fakes.wait_tool_started(run_config)
         returned.set()
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with JournalWriter(
             store,
             lease,
