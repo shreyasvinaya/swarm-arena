@@ -14,7 +14,7 @@ GatewayId = Annotated[str, Field(strict=True, min_length=1, max_length=256)]
 GatewayUsd = Annotated[float, Field(strict=True, ge=0)]
 ReportLabel = Literal["observed", "observed (completeness unverified)", "estimated"]
 GatewayKeyAction = Literal["created", "closed", "deleted", "read_failed", "close_failed"]
-GatewayReadStatus = Literal["ok", "failed", "incomplete"]
+GatewayReadStatus = Literal["ok", "no_rows", "failed", "incomplete"]
 
 
 def _report_usd(units: int) -> float:

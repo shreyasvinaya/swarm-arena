@@ -626,7 +626,12 @@ async def _read_tool_gateway(
             "later reads and reconcile retry"
         )
         return []
-    if status != "ok":
+    if status == "no_rows":
+        warnings.append(
+            "LLM gateway spend read-back: no rows observed within the first-row wait; "
+            "later reads and reconcile retry"
+        )
+    elif status != "ok":
         warnings.append(
             f"LLM gateway spend read-back failed: gateway read {status}; "
             "later reads and reconcile retry"
@@ -1155,7 +1160,7 @@ async def _run(
         requested_by_call=current_requesting_call(),
         llm_call_ids=call_ids,
         llm_calls_source=llm_calls_source(
-            keyed=keyed,
+            keyed=gateway_record is not None,
             reported_rows=reported_rows,
             may_call=providers or may_call_llm(frozenset(), secret_env),
         ),
