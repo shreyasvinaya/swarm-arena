@@ -257,7 +257,7 @@ Rules [plan]:
 | `_tooling/llm_calls.py` | Collect `swarm/llm_calls.jsonl`; set `llm_calls_source` | M4 | `tests/_tooling/test_llm_calls.py` |
 | `_exec/__init__.py` | Empty | M1a | — |
 | `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` | M1a | `tests/_exec/test_executor.py` |
-| `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (M4: the launcher argv, shared with the Ray task) | M1a +M4 | `tests/_exec/test_supervisor.py` |
+| `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (shared isolated launcher argv; local group ownership unchanged) | M1a +M4 | `tests/_exec/test_supervisor.py` |
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
@@ -372,7 +372,7 @@ Rules [plan]:
 | `llm/_langfuse.py` | Langfuse export | M3 | `tests/llm/test_langfuse.py` |
 | `ray/__init__.py` | Facade `swarm_arena.ray`; clear `ImportError` without the extra | M4 | `tests/test_public_api.py` |
 | `ray/_executor.py` | `RayExecutor` | M4 | `tests/ray/test_executor.py` (marker `ray`) |
-| `ray/_task.py` | Generic remote task | M4 | `tests/ray/test_task.py` (marker `ray`) |
+| `ray/_task.py` | Framed one-shot task; shared staged/collection/publication owner; worker-group supervisor | M4 | `tests/ray/test_task.py` (cluster cases marked `ray`) |
 | `ray/_state.py` | Task lookup by name, `confirm_dead` | M4 | `tests/ray/test_state.py` (marker `ray`) |
 | `ray/_files.py` | Object-store file transport with the 256 MiB cap | M4 | `tests/ray/test_files.py` (marker `ray`) |
 | `ray/_submit.py` | `submit` through `JobSubmissionClient` | M4 | `tests/ray/test_submit.py` |
@@ -2707,10 +2707,28 @@ separate from this LiteLLM path.
 #### R4.13.16 Ray internals — M4
 
 ```python
-def job_payload(job: Job) -> bytes: ...              # Job without on_started; Ref, not instances; holds secret_values,
-                                                     # so the payload is never logged, journaled, or put in runtime_env
+# ray/_task.py
+class TaskSettings(FrozenModel):
+    poll_s: float = 0.2
+    cap_bytes: int | None = None                    # whole MiB, 1..1024; None uses the shared artifact backend
+    import_roots: tuple[str, ...] = ()
+def job_payload(job: Job, settings: TaskSettings, *, blobs: Mapping[str, bytes] | None = None) -> bytes: ...
+    # No on_started/on_partial; refs, never connector instances. Holds driver-created secret_values only;
+    # never logged, journaled, or put in runtime_env. Node/file secrets are resolved during worker preparation.
+def read_payload(payload: bytes) -> tuple[Job, TaskSettings, dict[str, bytes]]: ...
+def driver_import_roots(job: Job) -> tuple[str, ...]: ...  # supervise tool construction/import on the driver
+
+def run_in_worker(job: Job, workspace: Path, artifacts: ArtifactStore, *, poll_s: float,
+                  import_roots: Sequence[str] = ()) -> ToolOutput: ...
+    # Sync entry with a private asyncio loop. Shared _Staged/_JobRun preserve effective Command limits,
+    # daemon preparation, bounded once-only collection and per-object publication. The direct child stays
+    # in the Ray worker group; Ray owns descendants when its max_calls=1 worker exits.
+    # The caller retains workspace ownership; run_job removes only a fully released workspace.
 @ray.remote(max_retries=0, max_calls=1)
-def run_job(payload: bytes) -> bytes: ...            # materialize, command(), Popen in the worker's group, poll, collect; → ToolOutput JSON
+def run_job(payload: bytes) -> bytes: ...
+    # Frame(ToolOutput JSON, newly-created blobs, registered FrameDiagnostic entries); incremental output
+    # cap refusal returns ERROR/no blobs. Input edits are restored before command and both collect paths.
+    # Partial data after publication abandonment has no file/log/report refs and starts no later uploads.
 def find_task(task_name: str) -> TaskInfo | None: ...    # ray.util.state
 def worker_dead(task_name: str) -> bool | None: ...
 def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes -- and files

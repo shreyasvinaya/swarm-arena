@@ -679,3 +679,22 @@ async def test_stop_timing_waits_for_slow_child_startup(tmp_path: Path) -> None:
     done = await stop_after_ready(tmp_path, code, grace_s=0.1)
     assert (tmp_path / "gc.pid").exists()
     assert done.status is RunStatus.CANCELLED
+
+
+def test_launch_argv() -> None:
+    from swarm_arena._exec.supervisor import launch_argv
+
+    assert launch_argv(["x"], go_fd=5, rlimits=RLimits(memory_bytes=1024, nofile=64)) == [
+        sys.executable,
+        "-I",
+        "-m",
+        "swarm_arena._launch",
+        "--go-fd",
+        "5",
+        "--rlimit-as=1024",
+        "--rlimit-nofile=64",
+        "--",
+        "x",
+    ]
+    assert launch_argv(["x", "--a"], go_fd=6, rlimits=None)[-3:] == ["--", "x", "--a"]
+    assert "--rlimit-cpu=2" in launch_argv(["x"], go_fd=7, rlimits=RLimits(cpu_seconds=2))

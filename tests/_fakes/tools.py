@@ -1472,3 +1472,89 @@ class ProviderPyTool(PyTool):
 
     def providers(self) -> frozenset[str]:
         return frozenset({"fake"})
+
+
+WORKER_SCRIPTS: dict[str, str] = {
+    "partial_on_sigterm.py": """
+import argparse, json, os, signal, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--ready-file')
+args = parser.parse_args()
+n = 0
+result = Path(os.environ['SWARM_ARENA_RESULT'])
+def publish():
+    pending = result.with_suffix('.tmp')
+    pending.write_text(json.dumps({'data': {'step': n}}))
+    pending.replace(result)
+def stop(signum, frame):
+    publish()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    n += 1
+    publish()
+    if args.ready_file:
+        Path(args.ready_file).touch()
+    time.sleep(0.2)
+""",
+    "ignore_sigterm.py": """
+import argparse, os, signal, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--pid-file')
+parser.add_argument('--fifo-stderr', action='store_true')
+args = parser.parse_args()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if args.fifo_stderr:
+    os.remove('swarm/stderr.log')
+    os.mkfifo('swarm/stderr.log')
+if args.pid_file:
+    Path(args.pid_file).write_text(str(os.getpid()))
+time.sleep(300)
+""",
+    "spawn_grandchild.py": """
+import argparse, signal, subprocess, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--pid-file', required=True)
+parser.add_argument('--exit-after', type=float, default=300)
+parser.add_argument('--ignore-term', action='store_true')
+args = parser.parse_args()
+if args.ignore_term:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen(['sleep', '300'])
+Path(args.pid_file).write_text(str(child.pid))
+time.sleep(args.exit_after)
+""",
+    "report_env.py": """
+import json, os
+selected = ('SWARM_ARENA_CANDIDATE_ID', 'CUDA_VISIBLE_DEVICES', 'SA_TEST_SECRET')
+with open(os.environ['SWARM_ARENA_RESULT'], 'w') as f:
+    json.dump({'data': {'env': {k: os.environ.get(k) for k in selected},
+        'pgid': os.getpgrp(), 'parent_pgid': os.getpgid(os.getppid())}}, f)
+""",
+}
+
+
+def _write_module(path: Path) -> None:
+    """Write a standalone annotated FunctionTool fixture."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('def f(a: int) -> dict[str, int]:\n    return {"a": a}\n')
+
+
+class EditSpyTool(PyTool):
+    """Expose the live edit contents seen by command and collection hooks."""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        (workspace / "edit_spy.json").write_text(json.dumps(request.edits))
+        return super().command(request, workspace)
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(
+            status=run.status,
+            data={
+                "command_edits": json.loads((workspace / "edit_spy.json").read_text()),
+                "collect_edits": dict(request.edits),
+            },
+        )
