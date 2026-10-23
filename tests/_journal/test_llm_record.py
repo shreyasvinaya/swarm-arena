@@ -1769,3 +1769,169 @@ async def test_await_reports_stops_on_real_takeover(tmp_path: Path) -> None:
     finally:
         if successor is not None:
             successor.release()
+
+
+@pytest.mark.parametrize("request_payload", [None, {"input": "hello"}])
+@pytest.mark.parametrize("response", [None, {"output": "world"}])
+async def test_none_payload_not_stored(
+    tmp_path: Path, request_payload: Any, response: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with open_llm_run(
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=True))
+    ) as run:
+        writes: list[bytes] = []
+        original = run.artifacts.put_bytes
+
+        def capture(data: bytes) -> str:
+            writes.append(data)
+            return original(data)
+
+        monkeypatch.setattr(run.artifacts, "put_bytes", capture)
+        call = await record_call(
+            **record_kwargs(
+                {"run_id": run.run_id, "goal_id": "g", "role": "tool"},
+                request=request_payload,
+                response=response,
+                settle=False,
+            )
+        )
+        assert writes == [
+            canonical_json(value) for value in (request_payload, response) if value is not None
+        ]
+        assert call is not None
+        assert call.request_ref == (
+            None if request_payload is None else sha256_hex(canonical_json(request_payload))
+        )
+        assert call.response_ref == (
+            None if response is None else sha256_hex(canonical_json(response))
+        )
+        await run.journal.commit()
+        assert run.events("llm_call")[0].payload["request_sha256"] == sha256_hex(
+            canonical_json(request_payload)
+        )
+
+
+async def test_external_report_stays_outside_manager_funding(tmp_path: Path) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        scope, funded_meta = await _open(run)
+        tool_reservation = await run.ledger.reserve(
+            ":run", Amount(usd=0.05), kind="tool", goal_id="g"
+        )
+        await run.ledger.settle(tool_reservation.id, Amount(usd=0.05))
+        metadata = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "team": "t",
+            "agent": "a",
+            "round": "1",
+            "candidate_id": "c1",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        with llm_scope(scope):
+            funded = await record_call(**record_kwargs(funded_meta))
+            assert funded is not None
+            calls = await record_reported(
+                [LLMCallRow(model="a/b", cost_usd=0.05, litellm_call_id="external")],
+                metadata=metadata,
+            )
+        assert len(calls) == 1
+        assert calls[0].role == "tool"
+        assert calls[0].candidate_id == "c1"
+        await _assert_accounted(scope, run.store)
+        assert scope.call_ids == [funded.id]
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert run.ledger._charges[tool_reservation.id] == Amount(usd=0.05)
+        assert (
+            await record_reported(
+                [LLMCallRow(model="a/b", litellm_call_id="external")], metadata=metadata
+            )
+            == []
+        )
+    assert (
+        await record_reported([LLMCallRow(model="a/b", litellm_call_id="late")], metadata=metadata)
+        == []
+    )
+
+
+async def test_external_report_after_takeover_uses_current_owner(run_config: RunConfig) -> None:
+    from _fakes.run import plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine.resume import resume_run
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+
+    await Swarm(run_config).run(plan(rounds=1), run_id="external-report")
+    resumed = await resume_run(run_config, "external-report", force=True, replanner=None)
+    try:
+        assert resumed.resumed is not None
+        deps = resumed.resumed._services.deps
+        assert deps is not None
+        assert deps.journal.epoch == 2
+        row = LLMCallRow(model="a/b", cost_usd=0.01, litellm_call_id="post-takeover")
+        metadata = {
+            "run_id": deps.run_id,
+            "goal_id": "g",
+            "candidate_id": "historical-candidate",
+            "owner_epoch": "1",
+        }
+        assert await record_reported([row], metadata=metadata) == []
+        metadata["owner_epoch"] = str(deps.journal.epoch)
+        calls = await record_reported([row], metadata=metadata)
+        assert len(calls) == 1
+        assert calls[0].candidate_id == "historical-candidate"
+        assert calls[0].id.startswith("llm-")
+        assert "-e2-" in calls[0].id
+        assert await record_reported([row], metadata=metadata) == []
+        await deps.journal.commit()
+    finally:
+        await resumed.aclose()
+
+
+@pytest.mark.parametrize("present", ["request", "response"])
+async def test_one_sided_payload_upload_cancel_does_not_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: str
+) -> None:
+    held = HeldOperation()
+    async with open_llm_run(tmp_path) as run:
+        writes: list[bytes] = []
+        put = run.artifacts.put_bytes
+
+        def upload(data: bytes) -> str:
+            writes.append(data)
+            held.wait()
+            return put(data)
+
+        monkeypatch.setattr(run.artifacts, "put_bytes", upload)
+        payloads = {"request": None, "response": None, present: {"value": "payload"}}
+        task = asyncio.create_task(
+            record_call(
+                **record_kwargs(
+                    {
+                        "run_id": run.run_id,
+                        "goal_id": "g",
+                        "role": "tool",
+                        "owner_epoch": str(run.journal.epoch),
+                    },
+                    **payloads,
+                    settle=False,
+                    _external_observation=True,
+                )
+            )
+        )
+        try:
+            await held.ready()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await held.finish()
+            await run.journal.commit()
+            assert run.calls() == []
+            assert writes == [canonical_json({"value": "payload"})]
+        finally:
+            held.release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await held.finish()

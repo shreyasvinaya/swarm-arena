@@ -20,6 +20,7 @@ from swarm_arena._errors import (
     ConfigError,
     Fenced,
     SoftError,
+    StorageError,
     _core_error,
     _core_signal,
     _exception_type_name,
@@ -46,8 +47,20 @@ from swarm_arena._outcomes import (
 )
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
+from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._store.io import _create, _storage_io
+from swarm_arena._tooling.env_names import effective_secret_env
+from swarm_arena._tooling.llm_calls import (
+    MAX_LLM_CALLS_BYTES,
+    LLMCallRow,
+    llm_calls_source,
+    may_call_llm,
+    oversize_warning,
+    parse_llm_calls,
+    record_reported,
+)
+from swarm_arena._tooling.output import collection_warnings, detach_tool_output
 from swarm_arena._tooling.result_file import request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
@@ -338,11 +351,19 @@ def _prepare_started(value: object) -> Job.Started:
     return _detach_model(Job.Started, value)
 
 
+def _reported_rows(artifacts: ArtifactStore, digest: str) -> tuple[list[LLMCallRow], list[str]]:
+    """Fetch verified bytes and normalize optional rows in the storage worker."""
+    data = artifacts.get_bytes(digest)
+    if type(data) is not bytes:
+        raise ValueError("invalid report artifact bytes")
+    return parse_llm_calls(data)
+
+
 def _prepare_output(value: object) -> ToolOutput:
     """Detach executor output serializers and validate before core completion."""
     if not isinstance(value, ToolOutput):
         raise TypeError("invalid tool output")
-    return _detach_model(ToolOutput, value)
+    return detach_tool_output(value)
 
 
 _T = TypeVar("_T")
@@ -717,17 +738,20 @@ async def _run(
     output = ToolOutput(status=RunStatus.ERROR)
     amount = Amount.from_estimate(rt.limits.default_run_reservation)
     providers = False
+    secret_env: tuple[str, ...] = ()
     failed = False
+    submitted = False
 
-    def estimate() -> tuple[Amount, bool]:
+    def estimate() -> tuple[Amount, bool, tuple[str, ...]]:
         value = rt.tool.estimate(request)
         return (
             amount if value is None else Amount.from_estimate(value),
             bool(rt.tool.providers()),
+            effective_secret_env(rt.tool),
         )
 
     try:
-        amount, providers = await _prepare_sync(estimate)
+        amount, providers, secret_env = await _prepare_sync(estimate)
     except BaseException as error:
         error = outcome.classify(error)
         _raise_terminal(error)
@@ -806,7 +830,7 @@ async def _run(
                     agent=rt.spec.name,
                     round=rt.round,
                 ),
-                secret_env=(),
+                secret_env=secret_env,
                 secrets_file=rt.config.secrets.file,
                 artifact_root=rt.config.artifact_root,
                 on_started=on_started,
@@ -820,6 +844,7 @@ async def _run(
                     admission_refusal = error
                     raise
                 try:
+                    submitted = True
                     output = await rt.executor.submit(job)
                 finally:
                     inflight.discard(run_scope)
@@ -830,6 +855,8 @@ async def _run(
         refused = error is admission_refusal
         error = outcome.classify(error)
         _raise_terminal(error)
+        if submitted and isinstance(error, StorageError) and _is_core_signal(error):
+            raise error from None
         if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -855,6 +882,44 @@ async def _run(
     if output_scope.cancelled_caught:
         warnings.append(f"tool error: {anyio.get_cancelled_exc_class().__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
+
+    warnings.extend(collection_warnings(output))
+    reported_rows = 0
+    call_ids: list[str] = []
+    ref = output.llm_calls_file
+    if ref is not None:
+        if ref.size > MAX_LLM_CALLS_BYTES:
+            warnings.append(oversize_warning(ref.size))
+        else:
+            # Reuse the output phase's remaining allowance after stop; every read
+            # and recorder payload remains under the current completion owner.
+            with anyio.CancelScope(deadline=deadline) as report_scope:
+                inflight._add_completion(
+                    report_scope, grace_s=0, generation=inflight._cancel_generation
+                )
+                try:
+                    rows, report_warnings = await _storage_io(
+                        _reported_rows, rt.artifacts, ref.sha256
+                    )
+                    warnings.extend(report_warnings)
+                    reported_rows = len(rows)
+                    calls = await record_reported(
+                        rows,
+                        metadata={
+                            "run_id": rt.repeats.run_id,
+                            "goal_id": rt.goal_id,
+                            "team": rt.team.name,
+                            "agent": rt.spec.name,
+                            "round": str(rt.round),
+                            "candidate_id": id,
+                            "owner_epoch": str(rt.journal.epoch),
+                        },
+                    )
+                    call_ids = [call.id for call in calls]
+                finally:
+                    inflight.discard(report_scope)
+            if report_scope.cancelled_caught:
+                warnings.append("swarm/llm_calls.jsonl collection interrupted")
 
     # Deliver an outer cancellation before accounting and supervised log publication.
     await anyio.lowlevel.checkpoint()
@@ -937,6 +1002,12 @@ async def _run(
         parent_ids=[parent.candidate_id for parent in request.parents],
         overlay=overlay,
         requested_by_call=current_requesting_call(),
+        llm_call_ids=call_ids,
+        llm_calls_source=llm_calls_source(
+            keyed=False,
+            reported_rows=reported_rows,
+            may_call=providers or may_call_llm(frozenset(), secret_env),
+        ),
         read_ids=list(read_ids),
         warnings=warnings,
     )

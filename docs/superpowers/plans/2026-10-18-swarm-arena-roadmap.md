@@ -160,7 +160,7 @@ Every milestone also updates: the `__all__` snapshot test (`tests/test_public_ap
   ```
   Required: `test_ray_cancel.py` (a soft cancel gives a partial output; a force cancel kills grandchildren), `test_ray_dispatch_crash.py` (driver killed after the dispatch intent, then `resume` finds the task by name, and the run is `lost`), `tests/e2e/test_rosenbrock_ray.py`, and `test_gateway_run.py` (key per LLM tool run only, full reservation held, reconcile labels). Manual check only: `uv run pytest -m gateway_live` against a real LiteLLM Proxy.
 - **Dependencies:** M2 (S3 artifacts, lease for reconcile), M3 (`record_call` in the core module `_journal/llm_record.py`, so the gateway client needs no `llm` extra).
-- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except two fields: `ToolOutput.llm_calls_file` (the reported-calls file must travel from the executor or Ray worker to the driver, §4.3) and `Job.drop_env` (`build_env` runs on the executor side and must not resolve real provider keys for a keyed run, §7.3 item 2a step 2); change the LLM layer beyond the shared recording path; add container or SSH executors.
+- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except two fields: `ToolOutput.llm_calls_file` (+M4: a bounded optional reported-calls artifact must travel from the executor or Ray worker to the driver, §4.3; collection diagnostics remain private) and `Job.drop_env` (`build_env` runs on the executor side and must not resolve real provider keys for a keyed run, §7.3 item 2a step 2); change the LLM layer beyond the shared recording path; add container or SSH executors.
 
 ### M5 Release 0.1.0
 
@@ -736,8 +736,27 @@ class ToolOutput(FrozenModel):
     ended_at: datetime | None = None
     failed_provider: str | None = None          # [plan] with status provider_failed: the provider that failed (result.json
         # key "failed_provider"). None → every provider in Tool.providers() counts as failed (§6.4).
-    llm_calls_file: FileRef | None = None       # [plan] M4: swarm/llm_calls.jsonl in artifact_root, set where the tool runs
-        # (a Ray worker too) so it reaches the driver with the output (§4.3, §7.3 item 2b); None if absent
+    llm_calls_file: FileRef | None = None       # +M4: optional swarm/llm_calls.jsonl, set where the tool runs
+        # FileRef.path="llm_calls.jsonl", real SHA-256 and size; <=16 MiB uploaded, >16 MiB..1 GiB
+        # fully hashed but never uploaded/fetched; >1 GiB refused unread with no ref. No fake digest.
+        # Missing is normal; unsafe/changing/unreadable reports warn without losing valid output.
+        # Private _collection_diagnostics code/count pairs are excluded from JSON/repr; see below.
+
+# +M4 private helpers: _tooling/llm_calls.py, _tooling/output.py, _tooling/env_names.py.
+# collect_llm_calls(workspace) -> (FileRef | None, bytes | None, tuple[(code, count), ...]):
+# pinned O_NOFOLLOW/O_NONBLOCK regular-file open and bounded 1 MiB-chunk loop; no publication.
+# hash_regular_file(workspace, rel) -> (full_sha256, fstat_size): <=1 GiB, reject observed changes.
+# _JobRun._finish awaits collection, then each publication separately under its existing owner.
+# detach_tool_output(value) -> ToolOutput preserves validated private diagnostics through revalidation.
+# with_collection_diagnostics(output, pairs) restores only registered codes, <=32 pairs, counts 1..10000.
+# Codes: llm_calls_unreadable, llm_calls_symlink, llm_calls_special_file, llm_calls_changed,
+# llm_calls_hash_limit. FrameDiagnostic(code, count) transports these in the private Ray frame slot.
+# effective_secret_env(tool_or_ref_or_command, *, overrides=None) -> tuple[str, ...]: shared typed,
+# alias/default-aware traversal, effective_tool_ref overrides, no worker command hook invocation.
+# record_reported(rows, *, metadata) uses current trusted owner_epoch and record_call(settle=False,
+# _external_observation=True); no ambient funded LLMScope adoption for no-pending observations.
+# parse_llm_calls reads <=16 MiB / 10000 nonempty rows with <=20 per-line warnings plus summary/cap.
+# Source order: keyed gateway > valid reported rows > may-call unknown > none; never langfuse in v1.
 
 # Private shared codec beside ToolOutput; executor and conformance kit use the same format.
 def format_logs_ref(stdout_sha: str, stderr_sha: str) -> str: ...
@@ -2891,7 +2910,7 @@ The current committed producer keys used by M2 readers are:
 
 ### R4.15 Stored formats and `schema_version`
 
-All start at `schema_version = 1`: journal `Event` and the segment link line, `OwnerDoc`, `RunConfig` (`run.toml`), `Plan` (`plan.rN.toml`), `manifest.json`, `solution.json`, `Candidate`, `Learning`, `LLMCall`, `Frontier`, `Job.Started`, `RunPointer`, `HumanObject`, `swarm/request.json` [plan], `candidate/request.json` and `candidate/output.json` [plan]. User-written `swarm/result.json` and `swarm/llm_calls.jsonl` may omit it (default 1). Older versions load through `_model/migrate.py`; newer versions fail with a clear `ValueError`.
+All start at `schema_version = 1`: journal `Event` and the segment link line, `OwnerDoc`, `RunConfig` (`run.toml`), `Plan` (`plan.rN.toml`), `manifest.json`, `solution.json`, `Candidate`, `Learning`, `LLMCall`, `Frontier`, `Job.Started`, `RunPointer`, `HumanObject`, `swarm/request.json` [plan], `candidate/request.json` and `candidate/output.json` [plan]. User-written `swarm/result.json` and `swarm/llm_calls.jsonl` may omit it (default 1). +M4: each report row is the private `LLMCallRow(StoredModel)`, registered as `llm_call_row: 1`, with unknown fields ignored; finite JSON payloads, nonnegative usage/cost/latency, and newer-version refusal before recording. Older versions load through `_model/migrate.py`; newer versions fail with a clear `ValueError`.
 
 `solution.json` is the canonical JSON serialization of the private
 `_engine.solution.SolutionDocument(StoredModel)`, kind `solution`, with a validated
@@ -3016,7 +3035,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 1. Public modules are pure facades; all code is in private modules (R0). Errors visible to users are `ValueError` or `RuntimeError` subclasses, so §9's lists stay exact (R4.0).
 2. `Store` is a sync ABC with conditional `create` and `replace` only and no unconditional put; async callers use `anyio.to_thread` (R4.13.2). The `Board` ABC is sync too.
 3. The core journals every item, then calls `Board.put_*(item, *, epoch, seq)` with the event's position; `put_*` only indexes, and `ArenaBoard` needs no journal handle (R4.6). **Deviation from §4.9 and §7.2** ("`ArenaBoard.put_*` appends to the run's own journal"): the same events go to the same journal, but the core appends them, not the board. Snapshot membership follows R4.6: `RunBoard` filters by position and is rebuilt from `RunState` on resume; `ArenaBoard` indexes its own run from committed chain segments only.
-4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` and `Job.drop_env` (R4.2, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
+4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` (optional report transport with real digest/size and bounded collection, +M4) and `Job.drop_env` (R4.2, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
 5. Built-in LLM accounting reaches LLM code through an `LLMScope` context variable (R4.13.7), so `Planner.plan` and `Curator.curate` keep the spec's signatures.
 6. `FakeModel` is an Agents SDK `Model` that feeds the same core `record_call` (`_journal/llm_record.py`, R4.13.19) as the LiteLLM logger, the gateway read-back, and `llm_calls.jsonl` collection (R4.12).
 7. JSON-schema subset compiler instead of a `jsonschema` dependency; a deterministic TOML writer instead of `tomli-w` (R4.13.0).
@@ -3030,7 +3049,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 15. **Part-goal files of non-human revisions [plan]:** they resolve against the main goal's snapshotted manifest, never from disk (R4.1, R4.13.12 `admit_revision`).
 16. **Judge reservations [plan]:** `Amount()` for `ProgramJudge`, for LLM judges (non-empty `models()`; their calls reserve through the `<goal>/:judges` or `<goal>/:final` tranche), and for judges without `providers()`; `n × default_run_reservation`, settled `estimated`, for judges with `providers()`. `judge_amount` (R4.13.6) holds the rule, and its `llm=True` form prices LLM judges for estimates and final slices.
 17. **Deviation from §4.9** ("the run's current `rubric_hash` and `panel_hash`"): with no score of its own yet, a run's `best`/`leaderboard` judge identity is the newest identity for that judge name in the namespace, because `ArenaBoard` sees identities only through scores (M2).
-18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses only the allowlist that the driver can read before dispatch (a `ScriptTool` `Config.env`). A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
+18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses the shared `effective_secret_env` traversal of validated effective configuration (+M4), including `ScriptTool` and `FunctionTool` env allowlists, nested typed defaults/aliases and driver-known `Command.env`. A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
 
 19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.
 

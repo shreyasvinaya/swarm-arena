@@ -2762,3 +2762,56 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+def test_providers_without_gateway_warns() -> None:
+    plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
+    warnings = validate_plan(plan, RunConfig())
+    assert warnings == [
+        "agent g/t0/a0: tool declares providers ['openai'] but there is no llm_gateway; "
+        "its LLM calls are logged only if it writes swarm/llm_calls.jsonl "
+        '(llm_calls_source = "unknown")'
+    ]
+
+
+def test_effective_secret_names_include_function_and_command_env() -> None:
+    from swarm_arena._tooling.env_names import effective_secret_env
+    from swarm_arena.tool import Command
+
+    ref = Ref.of(FunctionTool("_fakes.tools:add", env=["OPENAI_API_KEY"]))
+    assert effective_secret_env(ref) == ("OPENAI_API_KEY",)
+    assert effective_secret_env(ref, overrides={"timeout_s": 10}) == ("OPENAI_API_KEY",)
+    with pytest.raises(ValueError, match="human-only"):
+        effective_secret_env(ref, overrides={"env": ["GEMINI_API_KEY"]})
+    assert effective_secret_env(Command(argv=["python"], env=["MY_TOKEN"])) == ("MY_TOKEN",)
+
+
+def test_provider_warning_covers_converge_and_round_overrides() -> None:
+    plan = _plan(converge_agents=1, rounds=[RoundSpec(tool_overrides={"providers": ["openai"]})])
+    warnings = validate_plan(plan, RunConfig())
+    assert len(warnings) == 2
+    assert warnings[0].startswith("agent g/t0/a0:")
+    assert warnings[1].startswith("agent g/join/a0:")
+
+
+def test_provider_warning_absent_with_gateway() -> None:
+    from swarm_arena._model.settings import GatewayConfig
+
+    plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
+    config = RunConfig(llm_gateway=GatewayConfig(url="http://localhost:4000"))
+    assert validate_plan(plan, config) == []
+
+
+def test_effective_secret_names_detach_string_subclasses() -> None:
+    from swarm_arena._tooling.env_names import effective_secret_env
+    from swarm_arena.tool import Command
+
+    class ForeignName(str):
+        pass
+
+    tool = FunctionTool("_fakes.tools:add")
+    object.__setattr__(tool.config, "env", [ForeignName("OPENAI_API_KEY")])
+    names = effective_secret_env(tool)
+    assert all(type(name) is str for name in names)
+    command = Command.model_construct(argv=["python"], env=[ForeignName("OPENAI_API_KEY")])
+    assert all(type(name) is str for name in effective_secret_env(command))

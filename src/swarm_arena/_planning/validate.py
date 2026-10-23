@@ -43,6 +43,7 @@ from swarm_arena._scoring.check import Check
 from swarm_arena._scoring.judge import Judge
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.io import _storage_io
+from swarm_arena._tooling.env_names import _env_names
 from swarm_arena._tooling.files import snapshot_fileset, snapshot_plan, snapshot_ref
 from swarm_arena._tooling.paths import fold_key, matches
 from swarm_arena._tooling.staging import tool_root
@@ -448,38 +449,35 @@ def _rule_configs(
     return errors
 
 
-def _env_names(component: Configurable) -> list[tuple[str, str]]:
-    """Inspect typed nested defaults as well as explicitly written references."""
-    result: list[tuple[str, str]] = []
-
-    def visit(value: Any, pointer: str, *, tool_config: bool = False) -> None:
-        if isinstance(value, Ref):
-            cls, cfg = value._resolve_config(Configurable)
-            visit(cfg, pointer, tool_config=issubclass(cls, Tool))
-        elif isinstance(value, BaseModel):
-            if tool_config:
-                names = getattr(value, "env", ())
-                if not isinstance(names, (list, tuple)) or any(
-                    not isinstance(name, str)
-                    or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
-                    for name in names
+def _provider_warnings(
+    plan: Plan, config: RunConfig, built: Mapping[str, Configurable]
+) -> list[str]:
+    """Warn once per agent about providers from any effective tool configuration."""
+    if config.llm_gateway is not None:
+        return []
+    warnings: list[str] = []
+    for team_pointer, team in _teams(plan):
+        for index, agent in enumerate(team.agents):
+            pointer = f"{team_pointer}/agents/{index}/tool"
+            providers: set[str] = set()
+            for site, component in built.items():
+                if (site == pointer or site.endswith("@" + pointer)) and isinstance(
+                    component, Tool
                 ):
-                    raise ValueError("invalid env names")
-                result.extend((pointer + "/env", name) for name in names)
-            for field in type(value).model_fields:
-                visit(getattr(value, field), pointer + "/config/" + field)
-        elif is_nested_ref(value):
-            visit(Ref.model_validate(value), pointer)
-        elif isinstance(value, dict):
-            for child in value.values():
-                # Arbitrary mapping keys are not safe diagnostic identifiers.
-                visit(child, pointer + "/<key>")
-        elif isinstance(value, (list, tuple)):
-            for index, child in enumerate(value):
-                visit(child, pointer + f"/{index}")
 
-    visit(component.config, "", tool_config=isinstance(component, Tool))
-    return result
+                    def declared(component: Tool = component) -> set[str]:
+                        return {_context_string(name, "provider") for name in component.providers()}
+
+                    providers.update(_safe_call(pointer, declared))
+            if providers:
+                address = f"{plan.goal.id}/{team.name}/{agent.name}"
+                warnings.append(
+                    f"agent {address}: tool declares providers {sorted(providers)} "
+                    "but there is no llm_gateway; "
+                    "its LLM calls are logged only if it writes swarm/llm_calls.jsonl "
+                    '(llm_calls_source = "unknown")'
+                )
+    return warnings
 
 
 def _rule_env(
@@ -970,6 +968,7 @@ def validate_plan(
     try:
         model_errors, warnings = check_models(_model_uses(built), config)
         errors.extend(model_errors)
+        warnings.extend(_provider_warnings(plan, config, built))
     except PlanError as error:
         errors.extend(error.errors)
     if errors:

@@ -13,6 +13,7 @@ CURRENT: Final[Mapping[str, int]] = MappingProxyType(
         "candidate": 1,
         "learning": 1,
         "llm_call": 1,
+        "llm_call_row": 1,
         "plan": 1,
         "run_config": 1,
         "job_started": 1,
