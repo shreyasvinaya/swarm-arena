@@ -183,8 +183,12 @@ async def _pause_recording_run(config: RunConfig, current: Any) -> str:
             await paused.wait()
     finally:
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "recording run did not finish cleanup"
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
     assert swarm.run_id is not None
     return swarm.run_id
 
@@ -1621,11 +1625,16 @@ async def test_planning_session_stopped_setup_never_yields(
         await held.finish()
         assert all_events(config) == before
     finally:
-        await held.finish()
+        held.release.set()
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+        try:
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            if task.done() and not task.cancelled():
+                task.exception()
+        finally:
+            await held.finish()
+    assert not pending_cleanup, "planning setup did not finish cleanup"
 
 
 async def test_queued_r0_carries_planning_session(run_config: RunConfig) -> None:

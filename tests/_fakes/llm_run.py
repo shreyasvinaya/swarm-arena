@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event as ThreadEvent
+from threading import Thread, current_thread
 from typing import Any
 from uuid import uuid4
 
@@ -37,8 +38,12 @@ class HeldOperation:
     entered: ThreadEvent = field(default_factory=ThreadEvent)
     release: ThreadEvent = field(default_factory=ThreadEvent)
     exited: ThreadEvent = field(default_factory=ThreadEvent)
+    workers: list[Thread] = field(default_factory=list, init=False)
 
     def wait(self) -> None:
+        worker = current_thread()
+        if worker not in self.workers:
+            self.workers.append(worker)
         self.entered.set()
         try:
             assert self.release.wait(300), "test did not release held operation"
@@ -51,8 +56,16 @@ class HeldOperation:
 
     async def finish(self) -> None:
         self.release.set()
-        with anyio.fail_after(60):
-            assert await anyio.to_thread.run_sync(self.exited.wait, 60)
+        with anyio.CancelScope(shield=True):
+            try:
+                with anyio.fail_after(60):
+                    assert await anyio.to_thread.run_sync(self.exited.wait, 60)
+            finally:
+                # The delayed-loop probe uses wait() directly on this event-loop thread.
+                workers = [worker for worker in self.workers if worker is not current_thread()]
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+        assert all(not worker.is_alive() for worker in workers), "held worker did not exit"
 
 
 @dataclass
