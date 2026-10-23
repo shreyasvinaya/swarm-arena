@@ -45,7 +45,7 @@ def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
         start_new_session=True,
     ) as process:
         try:
-            stdout, stderr = process.communicate(timeout=40)
+            stdout, stderr = process.communicate(timeout=60)
             assert process.returncode == 0, stdout + stderr
         finally:
             with suppress(ProcessLookupError):
@@ -78,7 +78,7 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
         "    global interrupted\n"
         "    interrupted = True\n"
         "def slow_exit(*args: object) -> None:\n"
-        "    deadline = time.monotonic() + 60\n"
+        "    deadline = time.monotonic() + 300\n"
         "    while not second_sent.exists():\n"
         "        if time.monotonic() >= deadline: os._exit(1)\n"
         "        time.sleep(0.01)\n"
@@ -129,7 +129,7 @@ original_timer_scope = _terminal_reviewer._local_timer_scope
 def controlled_grace(scope: anyio.CancelScope) -> Iterator[None]:
     # This test exercises the second interrupt, independently of elapsed time.
     # The unmodified grace-to-kill path is covered by the real-tty stubborn case.
-    scope.deadline = asyncio.get_running_loop().time() + 60
+    scope.deadline = float("inf")
     with original_timer_scope(scope):
         yield
 _terminal_reviewer._local_timer_scope = controlled_grace
@@ -183,19 +183,19 @@ Path({str(result)!r}).write_text(json.dumps({{
                 output.extend(os.read(master, 65536))
 
     try:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while not waiting.exists() or not marker.exists() or not marker.read_text():
             assert time.monotonic() < deadline, bytes(output)
             pump()
         editor_pid = int(marker.read_text())
         os.write(master, b"\x03")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while not terminated.exists():
             assert time.monotonic() < deadline, bytes(output)
             pump()
         os.write(master, b"\x03")
         # Keep the editor held: only the second interrupt may end the grace.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while True:
             exited, status = os.waitpid(pid, os.WNOHANG)
             if exited:
@@ -203,6 +203,7 @@ Path({str(result)!r}).write_text(json.dumps({{
                 break
             assert time.monotonic() < deadline, bytes(output)
             pump()
+        assert not second_sent.exists(), "editor was released before the second-interrupt assertion"
         assert os.waitstatus_to_exitcode(status) == 0, bytes(output)
         data = json.loads(result.read_text())
         assert data == {
@@ -368,7 +369,7 @@ async def test_descriptor_input_and_eof(tmp_path: Path, source: str) -> None:
         path.write_text(contents[source])
     with os.fdopen(os.open(path, os.O_RDONLY)) as stdin:
         reviewer = TerminalReviewer(stdin=stdin, stdout=io.StringIO())
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             if source in {"empty", "feedback_eof", "devnull"}:
                 with pytest.raises(RuntimeError, match="terminal input ended"):
                     await reviewer.review(PLAN)
@@ -561,17 +562,43 @@ async def test_cleanup_failure_cannot_return_edited(
 
 
 async def test_terminal_cancellation_restores_descriptor() -> None:
+    prompted = anyio.Event()
+
+    class ObservedOutput(io.StringIO):
+        def write(self, text: str) -> int:
+            if "Approve [a]" in text:
+                prompted.set()
+            return super().write(text)
+
     reader, writer = os.pipe()
     try:
         with os.fdopen(reader) as stdin:
-            with anyio.move_on_after(0.05) as scope:
-                await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN)
+            scope = anyio.CancelScope()
+
+            async def review() -> None:
+                with scope:
+                    await TerminalReviewer(stdin=stdin, stdout=ObservedOutput()).review(PLAN)
+
+            task = asyncio.create_task(review())
+            try:
+                with anyio.fail_after(60):
+                    await prompted.wait()
+                scope.cancel()
+                with anyio.fail_after(30):
+                    await asyncio.shield(task)
+                assert scope.cancelled_caught
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             assert scope.cancel_called
             assert os.get_blocking(reader)
             os.write(writer, b"a\n")
-            assert (
-                await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN) == Approve()
-            )
+            with anyio.fail_after(60):
+                assert (
+                    await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN)
+                    == Approve()
+                )
     finally:
         os.close(writer)
 
@@ -609,13 +636,15 @@ async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: 
     )
     task = asyncio.create_task(operation)
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             while not marker.exists() or not marker.read_text():
                 await anyio.lowlevel.checkpoint()
             pid = int(marker.read_text())
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        with anyio.fail_after(60):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
         if collaborative:

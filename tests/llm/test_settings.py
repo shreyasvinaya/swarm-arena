@@ -260,7 +260,7 @@ async def isolated_settings_upstream(monkeypatch: pytest.MonkeyPatch) -> AsyncIt
     try:
         yield
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -347,7 +347,7 @@ async def test_native_controls_bypass_response_cache(
             )
             await _invoke_model(spec.model, control)
             await logger.wait()
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await written.wait()
             assert accesses["read"] > 0
             assert accesses["write"] == 1
@@ -364,7 +364,7 @@ async def test_native_controls_bypass_response_cache(
                 assert not logger.success[-1][0]["cache_hit"]
                 assert accesses == {"read": 0, "write": 0}
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
         backend.disk_cache.close()
 

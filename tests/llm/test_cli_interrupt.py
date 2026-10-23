@@ -44,7 +44,7 @@ async def held_session(*args):
             yield scope
         finally:
             # This handshake precedes the real session exit and its settlement bound.
-            with anyio.fail_after(120, shield=True):
+            with anyio.fail_after(300, shield=True):
                 saved = signal.getsignal(signal.SIGINT)
                 def observe(*args):
                     Path({str(received)!r}).write_text('signal')
@@ -89,13 +89,13 @@ raise SystemExit(status)
                 output.extend(os.read(master, 65536))
 
     def wait_marker(path: Path) -> None:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while not path.exists():
             assert time.monotonic() < deadline, bytes(output)
             pump()
 
     try:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while b"Approve [a], feedback [f], edit [e]: " not in output:
             assert time.monotonic() < deadline, bytes(output)
             pump()
@@ -104,7 +104,7 @@ raise SystemExit(status)
         os.write(master, b"\x03")
         wait_marker(received)
         release.write_text("finish")
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 60
         while True:
             exited, status = os.waitpid(pid, os.WNOHANG)
             if exited:

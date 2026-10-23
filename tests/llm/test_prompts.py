@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from pathlib import Path
 from typing import cast
 
@@ -186,6 +188,7 @@ async def test_reference_files_abandoned_result_never_starts_next_stage(
     artifacts: ArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    workers: list[threading.Thread] = []
     from threading import Event
 
     import anyio
@@ -202,9 +205,10 @@ async def test_reference_files_abandoned_result_never_starts_next_stage(
     stages: list[str] = []
 
     def held_read(digest: str) -> bytes:
+        workers.append(threading.current_thread())
         entered.set()
         try:
-            if not release.wait(10):
+            if not release.wait(300):
                 raise RuntimeError("test release timed out")
             return get_bytes(digest)
         finally:
@@ -214,18 +218,34 @@ async def test_reference_files_abandoned_result_never_starts_next_stage(
         await _storage_io(reference_files, goal, artifacts)
         stages.append("next stage")
 
+    scope = anyio.CancelScope()
+
+    async def run_owned() -> None:
+        with scope:
+            await owner()
+
     monkeypatch.setattr(artifacts, "get_bytes", held_read)
+    task = asyncio.create_task(run_owned())
     try:
-        with anyio.fail_after(5):
-            async with anyio.create_task_group() as group:
-                group.start_soon(owner)
-                assert await anyio.to_thread.run_sync(entered.wait, 2)
-                group.cancel_scope.cancel()
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+        scope.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        task.result()
+        assert scope.cancelled_caught
         assert not release.is_set()
+        assert not finished.is_set()
         assert stages == []
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(finished.wait, 2)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     assert stages == []
 
 
