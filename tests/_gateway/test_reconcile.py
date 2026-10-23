@@ -809,3 +809,56 @@ async def test_delete_requires_durable_observations_and_closure(
         later = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
         assert later.keys[0].observed_usd == 0.03
     assert durable == [(0.03, True)]
+
+
+@pytest.mark.parametrize("case", ["ok", "error", "occupied"])
+async def test_tool_gateway_ids_cannot_change_or_suppress_gateway_spend(
+    tmp_path: Path, case: str
+) -> None:
+    import json
+
+    from swarm_arena._tooling.llm_calls import parse_llm_calls, record_reported
+
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.03)]
+    identity = gateway_call_id("hash-1", "one") if case == "occupied" else "gw:" + "0" * 64
+    data = json.dumps(
+        {
+            "model": "openai/gpt-6",
+            "cost_usd": 5.0,
+            "status": "error" if case == "error" else "ok",
+            "litellm_call_id": identity,
+        }
+    ).encode()
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        rows, warnings = parse_llm_calls(data)
+        reported = await record_reported(
+            list(rows),
+            metadata={
+                "run_id": run.run_id,
+                "goal_id": "g",
+                "candidate_id": "c-1",
+                "owner_epoch": str(run.journal.epoch),
+            },
+        )
+        await run.journal.commit()
+        for instant in (T0, T0 + timedelta(seconds=610)):
+            await reconcile.reconcile_keys(
+                [*run.events("gateway_key"), *run.events("llm_call")],
+                run_id=run.run_id,
+                journal=run.journal,
+                adapter=adapter,
+                executor=executor(),
+                gateway=GatewayConfig(url="http://gw"),
+                profile=adapter.profile,
+                now=lambda instant=instant: instant,
+            )
+            await run.journal.commit()
+        row = run.state().gateway_reconcile[("c-1", "hash-1")]
+        assert row.observed_usd == 0.03
+        assert row.label == "observed (completeness unverified)"
+        assert row.deleted
+        assert len(run.calls()) == 1
+        assert reported == []
+        assert warnings == ["swarm/llm_calls.jsonl line 1: invalid row; line skipped"]
