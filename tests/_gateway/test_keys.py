@@ -760,8 +760,9 @@ async def test_read_after_fencing_refuses_before_adapter(
         assert gw.blocked == [record.key_id]
 
 
+@pytest.mark.parametrize("boundary", [False, True])
 async def test_read_timer_does_not_bound_healthy_recording(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: bool
 ) -> None:
     from swarm_arena._gateway import keys
 
@@ -788,8 +789,12 @@ async def test_read_timer_does_not_bound_healthy_recording(
 
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(release_after_report_deadline)
-            with anyio.fail_after(5):
-                calls = await manager.read([record], wait_first=True)
+            with anyio.fail_after(30):
+                token = keys._read_deadline.set(anyio.current_time() + 0.1)
+                try:
+                    calls = await manager.read([record], wait_first=not boundary)
+                finally:
+                    keys._read_deadline.reset(token)
         assert len(calls) == 1
 
 

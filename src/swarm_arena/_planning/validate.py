@@ -476,7 +476,8 @@ def _provider_warnings(
             address = f"{plan.goal.id}/{team.name}/{agent.name}"
             warnings.extend(
                 f"agent {address}: tool allowlists {name}, which the LLM gateway does not "
-                "replace; keyed tool runs do not get it"
+                "replace; keyed tool runs do not get it; unkeyed tool runs get the node value "
+                "and bypass the gateway"
                 for name in sorted(unreplaced)
             )
             if providers:

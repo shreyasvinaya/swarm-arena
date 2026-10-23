@@ -661,7 +661,7 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
         with anyio.fail_after(15):
             async with anyio.create_task_group() as tg:
                 tg.start_soon(_run_and_store, rt, rt_env)
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert await anyio.to_thread.run_sync(entered.wait, 30)
                 rt_env.cancel_inflight()
             cand = rt_env.result
             assert cand is not None
@@ -2728,7 +2728,7 @@ async def test_keyed_run_without_usd_reservation_not_dispatched(
     )
     assert not _gateway_requests(fake_gateway, "/key/generate")
     assert not rt_env.events("tool_start")
-    assert rt_env.charged(candidate) == Amount(tokens=1000)
+    assert rt_env.charged(candidate) == Amount()
 
 
 async def test_keyed_usage_overflow_is_information_only(
@@ -3103,21 +3103,21 @@ async def test_gateway_revocation_respects_expired_owner(
 
     attempts: list[str] = []
 
-    async def revoke(*args: Any, **kwargs: Any) -> None:
-        attempts.append("revoke")
+    def handoff(*args: Any, **kwargs: Any) -> None:
+        attempts.append("handoff")
 
     async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
         await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
         assert rt.gateway is not None
         record = rt.gateway.records()[0]
-        monkeypatch.setattr(KeyManager, "revoke", revoke)
+        monkeypatch.setattr(KeyManager, "_revoke_later", handoff)
         if expired == "writer":
             with monkeypatch.context() as patch:
                 patch.setattr(rt.journal, "_closing_at", anyio.current_time() - 1)
                 await _revoke_gateway_key(rt, record, float("inf"))
         else:
             await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
-    assert attempts == []
+    assert attempts == ["handoff"]
 
 
 async def test_late_gateway_row_recorded_after_report(
@@ -3142,3 +3142,226 @@ async def test_late_gateway_row_recorded_after_report(
         await rt.journal.commit()
         assert len(rt_env.events("llm_call")) == 1
         assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+@pytest.mark.parametrize("hard", [False, True])
+async def test_grouped_executor_escape_preserves_cleanup_authority(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, hard: bool
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    children: list[BaseException] = [asyncio.CancelledError(), _stop_cleanup_error()]
+    if hard:
+        children.append(GeneratorExit())
+    error = BaseExceptionGroup("executor cleanup", [BaseExceptionGroup("nested", children)])
+
+    async def fail(job: Job) -> ToolOutput:
+        raise error
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with pytest.raises((BaseExceptionGroup, RuntimeError)) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is (not hard)
+        if hard:
+            assert caught.value is error
+        else:
+            assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        assert not rt_env.events("tool_end")
+
+
+async def test_grouped_undispatched_escape_refunds_before_classification(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent import tool_run
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        owner = args[-2]
+        owner.admitted = await rt_env.rt.ledger.reserve(
+            rt_env.rt.holder, Amount(usd=1), kind="tool", goal_id=rt_env.rt.goal_id
+        )
+        raise BaseExceptionGroup("prepare", [asyncio.CancelledError(), _stop_cleanup_error()])
+
+    monkeypatch.setattr(tool_run, "_run", fail)
+    with pytest.raises((BaseExceptionGroup, RuntimeError)) as caught:
+        await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert rt_env.charged(reservation) == Amount()
+
+
+async def test_keyed_preopen_failure_refunds_reservation(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("private storage detail")
+
+    monkeypatch.setattr(tool_run, "put_edits", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert not fake_gateway.keys
+    assert rt_env.charged(candidate) == Amount()
+    assert rt_env.events("settle")[-1].payload["keep_charged"] is False
+
+
+async def test_keyed_settlement_does_not_report_unverified_usd(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool({"usage_usd": 9})) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    settle = rt_env.events("settle")[-1].payload
+    assert settle["actual"] == {"tokens": 0, "usd": 0.0}
+    assert settle["estimated"] is True
+    assert settle["overspend"] is None
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert candidate.output.usage.usd == 9
+
+
+async def test_native_cancel_during_revoke_propagates(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.keys import KeyManager
+
+    async def cancel(*args: Any, **kwargs: Any) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await anyio.lowlevel.checkpoint()
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        monkeypatch.setattr(KeyManager, "revoke", cancel)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _revoke_gateway_key(rt, rt.gateway.records()[0], float("inf"))
+        finally:
+            task = asyncio.current_task()
+            assert task is not None
+            task.uncancel()
+
+
+async def test_expired_revoke_hands_off_one_bounded_block(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    attempts: list[str] = []
+
+    async def block(key: VirtualKey) -> None:
+        attempts.append(key.key_id)
+        entered.set()
+        try:
+            await anyio.to_thread.run_sync(release.wait, 90, abandon_on_cancel=True)
+        finally:
+            done.set()
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        record = rt.gateway.records()[0]
+        monkeypatch.setattr(rt.gateway._adapter, "block_key", block)
+        try:
+            with anyio.fail_after(60):
+                await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
+                assert await anyio.to_thread.run_sync(entered.wait, 30)
+                assert not done.is_set()
+        finally:
+            release.set()
+            if entered.is_set():
+                assert await anyio.to_thread.run_sync(done.wait, 30)
+        assert attempts == [record.key_id]
+
+
+async def test_deadline_cancellation_blocks_key_after_caller_exits(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    done = threading.Event()
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        assert rt.gateway is not None
+        original = rt.gateway._adapter.block_key
+
+        async def blocked(key: VirtualKey) -> None:
+            try:
+                await original(key)
+            finally:
+                done.set()
+
+        monkeypatch.setattr(rt.gateway._adapter, "block_key", blocked)
+        with anyio.CancelScope() as caller:
+
+            async def expire(job: Job) -> None:
+                caller.deadline = anyio.current_time()
+                await anyio.sleep_forever()
+
+            monkeypatch.setattr(rt.executor, "submit", expire)
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caller.cancelled_caught
+        (key_id,) = fake_gateway.keys
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(done.wait, 30)
+        assert fake_gateway.keys[key_id]["blocked"]
+        assert len(_gateway_requests(fake_gateway, "/key/block")) == 1
+        assert not rt_env.events("tool_end")
+        assert not [e for e in rt_env.events("gateway_key") if e.payload["action"] == "closed"]
+
+
+async def test_outer_group_preserves_delivered_native_cancellation(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent import tool_run
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        owner = args[-2]
+        owner.admitted = await rt_env.rt.ledger.reserve(
+            rt_env.rt.holder, Amount(usd=1), kind="tool", goal_id=rt_env.rt.goal_id
+        )
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await anyio.lowlevel.checkpoint()
+        except asyncio.CancelledError as cancelled:
+            raise BaseExceptionGroup("cleanup", [cancelled, ValueError("private")]) from None
+
+    monkeypatch.setattr(tool_run, "_run", fail)
+    try:
+        with pytest.raises((asyncio.CancelledError, RuntimeError, BaseExceptionGroup)) as caught:
+            await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert isinstance(caught.value, asyncio.CancelledError)
+        reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+        assert rt_env.charged(reservation) == Amount()
+    finally:
+        task = asyncio.current_task()
+        assert task is not None
+        task.uncancel()

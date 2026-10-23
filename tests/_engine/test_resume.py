@@ -3541,7 +3541,7 @@ async def test_resume_reads_back_open_keys(
         await runner.aclose()
 
 
-async def test_resume_closes_keys_of_lost_runs(
+async def test_resume_closes_all_unconfirmed_keys(
     tmp_path: Path,
     run_config: RunConfig,
     recorders: dict[str, _Recorder],
@@ -3559,9 +3559,9 @@ async def test_resume_closes_keys_of_lost_runs(
             key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-c1"
         )
         assert fake_gateway.keys[lost_key]["blocked"] is True
-        assert fake_gateway.keys[completed_key]["blocked"] is False
+        assert fake_gateway.keys[completed_key]["blocked"] is True
         closed = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "closed"]
-        assert [event.payload["key_id"] for event in closed] == [lost_key]
+        assert {event.payload["key_id"] for event in closed} == {lost_key, completed_key}
         assert [e.payload["candidate_id"] for e in _events(crashed, "run_lost")] == ["lost-g-b"]
     finally:
         await runner.aclose()
@@ -3584,7 +3584,9 @@ async def test_resume_gateway_failure_is_value_free_and_replayable(
     failures = [
         e for e in _events(crashed, "gateway_key") if e.payload["action"].endswith("failed")
     ]
-    assert len(failures) == 1
+    assert len(failures) == 2
+    assert {e.payload["key_id"] for e in failures} == set(fake_gateway.keys)
+    assert {e.payload["candidate_id"] for e in failures} == {"c1", "lost-g-b"}
     assert failures[0].payload["action"] == (
         "close_failed" if path == "/key/block" else "read_failed"
     )
@@ -3626,3 +3628,74 @@ async def test_resume_rechecks_gateway_hard_cap_before_takeover(
     assert read_owner(crashed.store) == before
     assert not fake_gateway.keys
     assert not _events(crashed, "takeover")
+
+
+@pytest.mark.parametrize("missing", [True, False])
+async def test_resume_refuses_changed_gateway_binding(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: bool,
+) -> None:
+    from swarm_arena._errors import ConfigError
+    from swarm_arena.config import GatewayConfig
+
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    replacement = (
+        None
+        if missing
+        else GatewayConfig(url=fake_gateway.url + "/different", require_hard_cap=False)
+    )
+    config = crashed.config.model_copy(update={"llm_gateway": replacement})
+    before = len(fake_gateway.requests)
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        await resume_run(config, crashed.run_id, force=False, replanner=None)
+    assert len(fake_gateway.requests) == before
+
+
+async def test_resume_slow_gateway_read_has_own_allowance(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    fake_gateway.delay["/spend/logs/v2"] = 3
+    config = crashed.config.model_copy(update={"settle_timeout_s": 0.5})
+    with anyio.fail_after(30):
+        runner = await resume_run(config, crashed.run_id, force=False, replanner=None)
+        await runner.aclose()
+    failures = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 2
+    assert {e.payload["error"] for e in failures} == {"gateway read incomplete"}
+    assert {e.payload["key_id"] for e in failures} == set(fake_gateway.keys)
+
+
+def test_resume_gateway_identity_ignores_userinfo_but_checks_failure_events() -> None:
+    from swarm_arena._engine.resume import _check
+    from swarm_arena._errors import ConfigError
+    from swarm_arena.config import GatewayConfig
+
+    original = RunConfig(llm_gateway=GatewayConfig(url="http://first:secret@gateway"))
+    event = Event(
+        type="gateway_key",
+        payload={"action": "read_failed", "error": "gateway read failed"},
+        epoch=1,
+        seq=1,
+        ts=utc_now(),
+        run_id="r",
+        context_id="r",
+    )
+    state = RunState.from_events([event])
+    state.config = original
+    same = original.model_copy(
+        update={"llm_gateway": GatewayConfig(url="http://second:other@gateway")}
+    )
+    assert _check(state, same) == []
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        _check(state, original.model_copy(update={"llm_gateway": None}))

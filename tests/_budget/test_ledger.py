@@ -1163,3 +1163,23 @@ async def test_native_cancelled_settlement_is_final_at_admission(
     await settle()
     assert env.journal._next_seq == before
     assert await env.count("settle") == 1
+
+
+async def test_promote_keep_charged_preserves_one_booking_and_replay(env: LedgerEnv) -> None:
+    await _setup(env)
+    res = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="tool", goal_id="g1")
+    before = _balances(env.ledger)
+    promoted = await env.ledger._keep_charged(res.id)
+    assert promoted.keep_charged
+    assert _balances(env.ledger) == before
+    assert await env.ledger._keep_charged(res.id) == promoted
+    state = RunState.from_events(await env.committed())
+    assert state.reservations[res.id].reservation["keep_charged"] is True
+    replayed = Ledger.replay(state, journal=env.journal, ids=env.ids)
+    assert _balances(replayed) == before
+    await env.ledger.settle(res.id, Amount())
+    assert _balances(env.ledger) == before
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _balances(replayed) == before
