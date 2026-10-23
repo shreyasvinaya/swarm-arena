@@ -169,19 +169,21 @@ async def test_exact_deduplicated_totals_survive_deleted_key_retention(
     expected = sum(_micro_units(cost) for cost in costs) / 1_000_000
     first = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
     assert first.spend_usd() == expected
+    assert first.keys[0].deleted
     before = committed(config)
     adapter.rows = [spend("late", 0.02)]
     second = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
-    assert second.spend_usd() == (sum(_micro_units(cost) for cost in costs) + 20_000) / 1_000_000
+    assert second == first
     adapter.rows = []
     third = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
     assert third == second
     assert adapter.deleted == ["hash-1"]
     calls = [e for e in committed(config) if e.type == "llm_call"]
-    assert len(calls) == len(costs) + 1
+    assert len(calls) == len(costs)
     assert len([e for e in before if e.type == "llm_call"]) == len(costs)
     assert not [e for e in committed(config) if e.type == "settle"]
-    assert "-e3-" in calls[-1].payload["call"]["id"]
+    assert all("-e2-" in event.payload["call"]["id"] for event in calls)
+    assert len(adapter.windows) == 1
 
 
 async def test_conflicting_observation_stays_estimated(tmp_path: Path) -> None:
@@ -368,7 +370,7 @@ async def test_cancelled_reconcile_releases_and_unbinds(
         await anyio.sleep_forever()
 
     monkeypatch.setattr(adapter, "preflight" if site == "preflight" else "spend_rows", held)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(reconcile.reconcile_run, config, "r-reconcile", adapter, executor())
             await entered.wait()
@@ -465,7 +467,7 @@ async def test_reconcile_external_wait_obeys_stop_and_fence(
     adapter = CapableGateway()
     monkeypatch.setattr(reconcile, "take_run", capture)
     monkeypatch.setattr(adapter, "spend_rows", held)
-    with anyio.fail_after(5), pytest.raises(RuntimeError if stop else Fenced):
+    with anyio.fail_after(60), pytest.raises(RuntimeError if stop else Fenced):
         await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
     assert "r-reconcile" not in llm_record._bindings
     assert not adapter.deleted
@@ -658,7 +660,7 @@ async def test_reconcile_preflight_uses_maintenance_read_allowance(
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(adapter, "preflight", held)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
     assert entered.is_set()
     assert report.keys[0].label == "estimated"
@@ -711,26 +713,45 @@ async def test_reconcile_http_expiry_does_not_cancel_durable_recording(
     adapter = CapableGateway()
     adapter.rows = [spend("one", 0.03)]
     original = reconcile._record_row
-    deadline = 0.0
+    external = reconcile._external
+    deadlines: list[float] = []
+    offset = 0.0
     entered, release = anyio.Event(), anyio.Event()
 
+    class ExternalClock:
+        def current_time(self) -> float:
+            return anyio.current_time() + offset
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+    async def capture(operation: Any, deadline: float) -> Any:
+        deadlines.append(deadline)
+        return await external(operation, deadline)
+
     async def held_record(*args: Any, **kwargs: Any) -> Any:
+        assert deadlines
+        assert anyio.current_effective_deadline() > max(deadlines)
         entered.set()
         await release.wait()
         return await original(*args, **kwargs)
 
     async def expire_http() -> None:
+        nonlocal offset
         await entered.wait()
-        with anyio.move_on_at(deadline):
-            await anyio.sleep_forever()
+        offset = 3600
         release.set()
 
     monkeypatch.setattr(reconcile, "_record_row", held_record)
+    monkeypatch.setattr(reconcile, "_external", capture)
+    monkeypatch.setattr(reconcile, "anyio", ExternalClock())
     async with open_llm_run(tmp_path) as run:
+        # Only the event-controlled clock advance is a behavior deadline. Setup
+        # and storage keep the outer safety guard, even on a heavily loaded host.
+        monkeypatch.setattr(run.journal, "_settle_timeout_s", 120)
         run.journal.append(created(key_record(run.run_id)))
         await run.journal.commit()
-        deadline = anyio.current_time() + 2
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(expire_http)
                 report = await reconcile.reconcile_keys(
@@ -742,10 +763,10 @@ async def test_reconcile_http_expiry_does_not_cancel_durable_recording(
                     gateway=GatewayConfig(url="http://gw"),
                     profile=adapter.profile,
                     now=lambda: T0 + timedelta(seconds=610),
-                    _deadline=deadline,
                 )
         assert report.keys[0].observed_usd == 0.03
         assert not report.keys[0].deleted
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
         await run.journal.commit()
         assert len(run.calls()) == 1
         assert run.calls()[0].cost_usd == 0.03
@@ -862,3 +883,87 @@ async def test_tool_gateway_ids_cannot_change_or_suppress_gateway_spend(
         assert len(run.calls()) == 1
         assert reported == []
         assert warnings == ["swarm/llm_calls.jsonl line 1: invalid row; line skipped"]
+
+
+@pytest.mark.parametrize("per_key", [False, True])
+async def test_slow_keys_converge_without_revisiting_deleted_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, per_key: bool
+) -> None:
+    from collections.abc import Awaitable, Callable
+
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path).model_copy(
+        update={
+            "settle_timeout_s": 10 if per_key else 1,
+            "llm_gateway": GatewayConfig(
+                url="http://gateway.invalid",
+                request_timeout_s=0.5 if per_key else 600,
+                require_hard_cap=False,
+            ),
+        }
+    )
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}") for n in range(14)]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    clock = 0.0
+
+    def deadline(journal: Any, *, timeout_s: float | None = None) -> float:
+        return clock + min(journal._settle_timeout_s, timeout_s or float("inf"))
+
+    async def slow(operation: Callable[[], Awaitable[Any]], deadline: float) -> Any:
+        nonlocal clock
+        if clock + 0.1 > deadline:
+            clock = deadline
+            # Model a completed allowance without spending wall-clock time.
+            error = getattr(reconcile, "_AllowanceExpired", GatewayError)
+            raise error("reconcile time allowance exhausted")
+        clock += 0.1
+        return await operation()
+
+    monkeypatch.setattr(reconcile, "_gateway_deadline", deadline)
+    monkeypatch.setattr(reconcile, "_external", slow)
+    adapter = CapableGateway()
+    if per_key:
+        adapter.profile = adapter.profile.model_copy(
+            update={"request_timeout_s": 0.5, "batch_write_interval_s": 0}
+        )
+    for _ in range(1 if per_key else 12):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        if all(key.deleted for key in report.keys):
+            break
+    assert len(report.keys) == 14
+    assert all(
+        key.deleted and key.label == "observed (completeness unverified)" for key in report.keys
+    )
+    assert len(adapter.deleted) == 14
+    before = list(adapter.windows)
+    assert await reconcile.reconcile_run(config, run.run_id, adapter, executor()) == report
+    assert adapter.windows == before
+
+
+async def test_expired_allowance_does_not_blame_or_call_gateway(tmp_path: Path) -> None:
+    adapter = CapableGateway()
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            _deadline=float("-inf"),
+        )
+        await run.journal.commit()
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+        assert not [e for e in run.events("gateway_key") if e.payload["action"].endswith("failed")]

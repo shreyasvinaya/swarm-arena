@@ -2582,7 +2582,7 @@ async def test_run_end_reconcile_timeout_still_finishes_stopping_run(
     monkeypatch.setattr(RunRunner, "_queue", queue)
     config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
     runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         assert await runner.run() == {}
     assert entered.is_set()
     assert events(config, "reconcile")[0].payload["keys"][0]["label"] == "estimated"

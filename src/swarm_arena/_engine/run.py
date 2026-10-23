@@ -1178,6 +1178,37 @@ def _gateway_deadline(journal: JournalWriter, *, timeout_s: float | None = None)
     return deadline
 
 
+async def _close_gateway(journal: JournalWriter, gateway: KeyManager) -> None:
+    """Bound recovery closure as a whole, retaining unvisited keys for reconcile."""
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    overall = _gateway_deadline(journal)
+    for record in gateway.records():
+        if record.closed_at is not None:
+            continue
+        deadline = min(
+            overall,
+            _gateway_deadline(journal, timeout_s=gateway._config.request_timeout_s),
+        )
+        if anyio.current_time() >= deadline:
+            break
+        closed = record
+        with anyio.move_on_at(deadline):
+            closed = await gateway.close(record)
+        if closed.closed_at is None:
+            journal.append(
+                gateway._draft(
+                    record,
+                    GatewayKeyFailure(
+                        action="close_failed",
+                        key_id=record.key_id,
+                        candidate_id=record.candidate_id,
+                        error="gateway closure unconfirmed",
+                    ).model_dump(mode="json"),
+                )
+            )
+
+
 async def _read_gateway(
     journal: JournalWriter, gateway: KeyManager | None, *, goal_id: str | None = None
 ) -> None:

@@ -246,13 +246,19 @@ so a takeover after deletion can recover spend even after upstream log retention
 Reports deduplicate gateway requests by key and request identity, retain earlier
 committed observations even when logs age out, and sum integer micro-dollars
 before displaying USD. Totals that cannot be represented without losing a
-micro-dollar are refused. A later reconcile can add late rows and update the
-report; readers retain their captured committed snapshot until refreshed.
+micro-dollar are refused. A later reconcile can add late rows for retained keys;
+deleted keys reuse their committed observations without repeating gateway reads.
+Readers retain their captured committed snapshot until refreshed.
 Reconciliation never refunds reservations, changes a live run's budget, or
 restarts the paid-work clock. Gateway waits have a separate bounded allowance;
 healthy journal storage is not charged against that external-work timer. The
-allowance is at most `settle_timeout_s` and `request_timeout_s`, capped before
-inherited cancellation and writer closing/I/O deadlines. Run-end reads and
+overall allowance is at most `settle_timeout_s`, capped before inherited
+cancellation and writer closing/I/O deadlines. Each key has a fresh allowance
+of at most `request_timeout_s` within that overall bound. An operation whose
+allowance expired before entry reports `reconcile time allowance exhausted`,
+without claiming a gateway failure. Repeated calls skip deleted keys so later
+keys can progress. Resume's closure loop also has one bounded overall allowance;
+unclosed keys remain available for reconciliation. Run-end reads and
 reconciliation finish before the final completion allowance is armed. Failure
 events include the nonsecret key and candidate IDs for later recovery.
 
