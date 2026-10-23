@@ -134,7 +134,8 @@ def build_env(
     Build a fresh environment using the job's explicit precedence rules.
 
     Start with base node names, then resolve command and secret allowlists from
-    the node before falling back to the secrets file. Apply ``job.env``, set the
+    the node before falling back to the secrets file. Remove ``job.drop_env``
+    names from those layers, then apply ``job.env``, set the
     workspace result path, and finally apply driver-supplied ``secret_values``.
     Missing allowlisted names stay unset. Read the file at most once, only when
     an allowlisted name is absent from the node. Async callers must run this
@@ -171,6 +172,8 @@ def build_env(
                 secrets = read_secrets_file(job.secrets_file)
             if name in secrets:
                 env[name] = secrets[name]
+    for name in job.drop_env:
+        env.pop(name, None)
     env.update(job.env)
     env["SWARM_ARENA_RESULT"] = str(workspace / "swarm" / "result.json")
     env.update(job.secret_values)

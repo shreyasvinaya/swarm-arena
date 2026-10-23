@@ -62,6 +62,8 @@ class Job:
         Root holding content-addressed workspace artifacts and logs.
     secret_values : Mapping[str, str], optional
         Driver-supplied secrets overriding other environment sources.
+    drop_env : tuple[str, ...], optional
+        Names removed after node/file resolution, before explicit env and secrets.
     on_started : Callable[[Job.Started], Awaitable[None]] or None, default=None
         Await before releasing the job to run; None starts without a callback.
     on_partial : Callable[[ToolOutput], Awaitable[None]] or None, default=None
@@ -210,6 +212,7 @@ class Job:
     secrets_file: str | None
     artifact_root: str
     secret_values: Mapping[str, str] = field(default_factory=dict, repr=False)
+    drop_env: tuple[str, ...] = ()
     on_started: Callable[[Started], Awaitable[None]] | None = field(default=None, repr=False)
     on_partial: Callable[[ToolOutput], Awaitable[None]] | None = field(default=None, repr=False)
 
