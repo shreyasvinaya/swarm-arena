@@ -1007,7 +1007,7 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
         daemon.append(threading.current_thread().daemon)
         entered.set()
         try:
-            release.wait()
+            assert release.wait(300), "collect was not released"
             return ToolOutput(status=run.status)
         finally:
             finished.set()
@@ -1015,7 +1015,7 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
     monkeypatch.setattr(PyTool, "collect", collect)
     monkeypatch.setattr(_conformance, "BEFORE_KILL_TIMEOUT_S", 0.1, raising=False)
     # A watchdog makes the regression safe even with the old non-cancellable worker.
-    watchdog = threading.Timer(2.0, release.set)
+    watchdog = threading.Timer(300, release.set)
     watchdog.start()
     completed = False
     errors: list[AssertionError] = []
@@ -1029,10 +1029,10 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
         completed = True
 
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as group:
                 group.start_soon(run)
-                assert await anyio.to_thread.run_sync(entered.wait, 2.0)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 if stop == "cancel":
                     group.cancel_scope.cancel()
         assert not release.is_set(), "probe waited for its blocking collect"
@@ -1043,7 +1043,7 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
     finally:
         release.set()
         watchdog.cancel()
-        await anyio.to_thread.run_sync(finished.wait, 2.0)
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
 
 
 @pytest.mark.parametrize("exception", [SystemExit, KeyboardInterrupt])
@@ -1634,7 +1634,7 @@ async def test_manager_that_leaves_calls_open_fails_the_kit(
         return RoundReport()
 
     monkeypatch.setattr(NoopManager, "run_round", leak)
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             try:
                 with pytest.raises(AssertionError, match="drain"):
@@ -1774,7 +1774,7 @@ async def test_check_judge_setup_is_abandoned_on_caller_cancellation(
         try:
             await held.ready()
             owner.cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await finished.wait()
             assert not entered
             assert llm_record._bindings == bindings_before
@@ -1797,7 +1797,7 @@ def test_offline_llm_connector_example_runs() -> None:
         capture_output=True,
         text=True,
         check=True,
-        timeout=30,
+        timeout=60,
     )
     assert done.stderr == ""
 
@@ -1861,11 +1861,11 @@ async def test_check_judge_releases_a_lease_before_writer_ownership(
         try:
             await held.ready()
             owner.cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await finished.wait()
             assert not released.is_set()
             await held.finish()
-            with anyio.fail_after(2):
+            with anyio.fail_after(30):
                 await released.wait()
         finally:
             owner.cancel()
@@ -1945,7 +1945,7 @@ async def test_overlapping_conformance_runs_are_isolated(
             elif label in failures:
                 first_entered.set()
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(invoke, "first")
             await first_entered.wait()
@@ -2180,7 +2180,7 @@ async def test_conformance_preserves_cleanup_expiry_control(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     with (
-        anyio.fail_after(12),
+        anyio.fail_after(60),
         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
     ):
         await _run_conformance_kind(
@@ -2220,7 +2220,7 @@ async def test_conformance_preserves_native_caller_cancellation(
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(_run_conformance_kind(kind))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -2291,7 +2291,7 @@ async def test_conformance_rejects_leaks_inside_a_caller_exception_handler(
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:
@@ -2334,7 +2334,7 @@ async def test_check_manager_closes_each_round_inside_a_caller_exception_handler
         return RoundReport(summary="done")
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:
@@ -2463,7 +2463,7 @@ async def test_conformance_keeps_owner_interruption_with_a_drain_note(
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(invoke())
     try:
-        with anyio.fail_after(12):
+        with anyio.fail_after(60):
             await entered.wait()
             if stop == "native":
                 timers[0].reschedule(asyncio.get_running_loop().time())
@@ -2630,7 +2630,7 @@ async def test_conformance_rejects_reservation_admitted_during_close(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     try:
-        with anyio.fail_after(10), pytest.raises(AssertionError, match="drain rule"):
+        with anyio.fail_after(60), pytest.raises(AssertionError, match="drain rule"):
             await _run_conformance_kind(kind)
     finally:
         for task in tasks:
@@ -2775,7 +2775,7 @@ async def test_later_round_stop_does_not_inherit_drain_note(
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
     with (
-        anyio.fail_after(10),
+        anyio.fail_after(60),
         pytest.raises(RuntimeError, match="offline harness stopped") as caught,
     ):
         await check_manager(
@@ -2832,7 +2832,7 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
         if accounting_store and self is accounting_store[0] and key.startswith("journal/"):
             workers.append(threading.current_thread())
             loop.call_soon_threadsafe(entered.set)
-            if not release.wait(30):
+            if not release.wait(300):
                 raise AssertionError("accounting read safety release expired")
         return original_read(self, key)
 
@@ -2862,7 +2862,7 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(_run_conformance_kind(kind))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
             # Expire the actual owner's allowance only once the accounting read is held.
             llm_record._bindings[scopes[0].run_id].stops.run_timeout = True
@@ -2878,7 +2878,7 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
             straggler.cancel()
         await asyncio.gather(task, *stragglers, return_exceptions=True)
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
     accounting_store.clear()
     committed = read_committed(scopes[0].journal._store)

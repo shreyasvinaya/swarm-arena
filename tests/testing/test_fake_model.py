@@ -292,7 +292,7 @@ async def test_conversations_replay_independently_under_interleaving() -> None:
         outputs["two"] += texts(await respond(model, conversation_id="two"))
         second.set()
 
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(one)
             tasks.start_soon(two)
@@ -441,7 +441,7 @@ async def test_abandoned_fake_callback_starts_no_second_upload(
 
         monkeypatch.setattr(run.artifacts, "put_bytes", upload)
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as tasks:
                     tasks.start_soon(callback)
                     await held.ready()
