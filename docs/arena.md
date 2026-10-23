@@ -375,8 +375,9 @@ paid curation. Curation does not change join-retry or pending-replan state.
 
 ### LLM curator
 
-Install the optional integration with `uv add 'swarm-arena[llm]'`, then configure
-an approved model with the `curator` role:
+Install the optional integration with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`,
+then configure an approved model with the `curator` role:
 
 ```python
 from swarm_arena import Limits, Ref, RunConfig

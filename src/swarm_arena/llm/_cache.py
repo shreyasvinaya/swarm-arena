@@ -135,12 +135,15 @@ def require_cache_extra(policy: CachePolicy) -> None:
     ...     require_cache_extra(CachePolicy(backend="disk"))
     Traceback (most recent call last):
         ...
-    ImportError: missing fastapi; pip install 'swarm-arena[cache]'
+    ImportError: missing fastapi; uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
     """
     backend = {"disk": "diskcache", "s3": "boto3", "redis": "redis"}[policy.backend]
     for module in ("fastapi", "orjson", backend):
         if importlib.util.find_spec(module) is None:
-            raise ImportError(f"missing {module}; pip install 'swarm-arena[cache]'")
+            raise ImportError(
+                f"missing {module}; "
+                'uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+            )
 
 
 def response_cache(policy: CachePolicy) -> Cache:

@@ -182,7 +182,9 @@ def setup_langfuse(tracing: TracingConfig) -> None:
             from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
         except ImportError:
             raise _core_error(
-                ConfigError, "Langfuse tracing requires swarm-arena[langfuse]"
+                ConfigError,
+                "Langfuse tracing requires swarm-arena[langfuse]: "
+                'uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"',
             ) from None
 
         class ConsentSampler(Sampler):

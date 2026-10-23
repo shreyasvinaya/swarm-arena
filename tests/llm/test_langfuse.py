@@ -10,9 +10,13 @@ from typing import Any
 from unittest.mock import Mock
 from uuid import uuid4
 
+import pytest
+
+pytest.importorskip("agents")
+
+# isort: split
 import agents
 import anyio
-import pytest
 from _fakes.llm_run import open_llm_run
 from _fakes.secrecy import assert_secret_absent
 from agents.models.interface import ModelTracing
@@ -157,6 +161,10 @@ def test_missing_extra_is_actionable_and_value_free(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(builtins, "__import__", missing)
     with pytest.raises(ConfigError, match=r"swarm-arena\[langfuse\]") as caught:
         _langfuse.setup_langfuse(TracingConfig(langfuse=True))
+    assert (
+        'uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        in str(caught.value)
+    )
     assert_secret_absent(caught.value, "SENTINEL_SECRET")
 
 

@@ -27,6 +27,22 @@ def test_optional_install_examples_use_prerelease_uv() -> None:
     concepts = re.sub(r"\s+", " ", (ROOT / "docs/concepts.md").read_text())
     for extras in ("llm", "llm,cache"):
         assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
+    bare_install = re.compile(
+        r"\b(?:uv\s+add|(?:uv\s+)?pip(?:3)?\s+install)\s+[\"']?"
+        r"swarm-arena\[(?:llm|cache|langfuse)[^\]]*\](?!\s+@\s+git\+)"
+    )
+    stale: list[str] = []
+    for directory in (ROOT / "docs", ROOT / "src"):
+        for path in sorted(directory.rglob("*")):
+            if path.suffix not in {".md", ".rst", ".py"}:
+                continue
+            if ROOT / "docs/superpowers" in path.parents:
+                continue
+            text = path.read_text()
+            for match in bare_install.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                stale.append(f"{path.relative_to(ROOT)}:{line}")
+    assert not stale, "Bare optional install commands: " + ", ".join(stale)
 
 
 def test_roadmap_records_supported_llm_dependency_deviation() -> None:

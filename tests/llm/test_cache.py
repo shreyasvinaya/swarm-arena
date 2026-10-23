@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import anyio
-import litellm
 import pytest
+
+pytest.importorskip("agents")
+
+# isort: split
+import litellm
 from _fakes.llm_run import open_llm_run, record_kwargs
 from _fakes.secrecy import assert_secret_absent
 from litellm.caching.caching import CacheMode
@@ -139,9 +143,12 @@ def test_require_cache_extra_names_the_extra(monkeypatch: pytest.MonkeyPatch, mo
     policy = CachePolicy.model_validate(
         {"backend": backend, "s3_path": "s3://b/p", "redis_url_env": "REDIS_URL"}
     )
-    with pytest.raises(ImportError, match=r"swarm-arena\[cache\]") as caught:
+    with pytest.raises(ImportError, match=r"swarm-arena\[llm,cache\]") as caught:
         require_cache_extra(policy)
-    assert module in str(caught.value)
+    assert str(caught.value) == (
+        f"missing {module}; "
+        'uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+    )
 
 
 @pytest.mark.parametrize(

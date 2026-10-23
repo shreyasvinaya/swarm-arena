@@ -411,7 +411,8 @@ how a plan names it.
 
 ### Testing managers and judges offline
 
-Install the optional SDK with `uv add 'swarm-arena[llm]'`. Importing
+Install the optional SDK with
+`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. Importing
 `swarm_arena.testing` itself does not load the SDK; accessing `FakeModel` or
 `FakeTurn` loads it. No API key is needed for scripted calls:
 
