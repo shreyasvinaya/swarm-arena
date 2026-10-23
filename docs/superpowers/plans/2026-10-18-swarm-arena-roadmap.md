@@ -341,7 +341,7 @@ Rules [plan]:
 | `_engine/control.py` | Stop files (one pair per epoch, R4.13.13), status report | M1b | `tests/_engine/test_control.py` |
 | `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed` | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
 | `_cli/__init__.py` | Empty | M1a | — |
-| `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 | `tests/_cli/test_main.py` |
+| `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 +M4 | `tests/_cli/test_main.py` |
 | `_cli/run_cmds.py` | `run`, `status`, `stop`, `resume` | M1b +M2 | `tests/_cli/test_run_cmds.py` |
 | `_cli/arena_cmds.py` | `review`, `leaderboard`, `board`, `learnings`, `trace`, `reindex` | M2 | `tests/_cli/test_arena_cmds.py` |
 | `_cli/plan_cmd.py` | `plan`; imports `swarm_arena.llm` only inside the `--llm` and `--together` handlers | M3 | `tests/_cli/test_plan_cmd.py` |
@@ -2618,7 +2618,11 @@ def job_payload(job: Job) -> bytes: ...              # Job without on_started; R
 def run_job(payload: bytes) -> bytes: ...            # materialize, command(), Popen in the worker's group, poll, collect; → ToolOutput JSON
 def find_task(task_name: str) -> TaskInfo | None: ...    # ray.util.state
 def worker_dead(task_name: str) -> bool | None: ...
+def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes and files
+def submit_runtime_env(*, working_dir: str | None, pip: Sequence[str]) -> dict[str, Any] | None: ...
+    # ray/_submit.py; only nonempty working_dir/pip, never env_vars; None when both are empty
 def submit_driver(address: str | None, entrypoint: str, *, runtime_env: Mapping[str, Any] | None) -> str: ...
+    # ray/_submit.py; JobSubmissionClient(address).submit_job → submission id
     # address None → Ray reads RAY_ADDRESS, as `swarm-arena submit` does without --address
 ```
 
