@@ -216,7 +216,7 @@ class LLMJudge(Judge):
         Parameters
         ----------
         goal : Goal
-            Goal supplying the cache namespace.
+            Task description and inputs to score against, and cache namespace.
         candidates : Sequence[Candidate]
             Candidates including the context's leader anchors.
         ctx : JudgeContext
@@ -348,14 +348,24 @@ class LLMJudge(Judge):
             captured: list[str] = []
             token = _captured_call_ids.set(captured)
             try:
-                prompt = await _prepare(
-                    lambda: untrusted(
-                        json.dumps(
-                            [
-                                {"index": i, "candidate": c.model_dump(mode="json")}
-                                for i, c in enumerate(batch)
-                            ]
-                        )
+                system, prompt = await _prepare(
+                    lambda: (
+                        f"Score each candidate independently. Rubric: {config.rubric}\n"
+                        f"Scale: [{config.scale_min}, {config.scale_max}]. "
+                        "Return scores with index, value, verdict and notes.\n\nGoal:\n"
+                        + untrusted(
+                            canonical_json(
+                                {"description": goal.description, "inputs": goal.inputs}
+                            ).decode("utf-8")
+                        ),
+                        untrusted(
+                            json.dumps(
+                                [
+                                    {"index": i, "candidate": c.model_dump(mode="json")}
+                                    for i, c in enumerate(batch)
+                                ]
+                            )
+                        ),
                     )
                 )
                 output, ids = await structured_call(
@@ -363,11 +373,7 @@ class LLMJudge(Judge):
                     role="judge",
                     models=scope.models,
                     namespace=goal.namespace,
-                    system=(
-                        f"Score each candidate independently. Rubric: {config.rubric}\n"
-                        f"Scale: [{config.scale_min}, {config.scale_max}]. "
-                        "Return scores with index, value, verdict and notes."
-                    ),
+                    system=system,
                     user=prompt,
                     schema=JUDGE_SCHEMA,
                     name="judge",

@@ -105,6 +105,11 @@ member gives it a finite value inside the configured scale. If all members
 fail, no candidate receives a score. Budget refusals and core controls propagate;
 they never remove a panel member.
 
+The stable judge prompt includes the rubric and scale followed by the goal's
+description and structured inputs inside an untrusted-content boundary. The
+candidate batch follows in its own untrusted block. Changing the goal's
+description or inputs changes the dispatched prompt and its response-cache key.
+
 Ordinary batches contain at most eight candidates, including up to two earlier
 leaders requested as anchors. Every batch re-scores the anchors, leaving room
 for `batch_size - len(anchors)` other candidates. Configure these with

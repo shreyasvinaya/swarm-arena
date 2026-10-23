@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and preserves human components during autonomous replanning; standalone planning
   sessions meter and journal calls with replayable provenance links in saved plans.
 
-- LLMJudge scores fixed rubrics with mixed-provider panels, repeated anchors,
+- LLMJudge scores fixed rubrics against goal descriptions and inputs with
+  mixed-provider panels, repeated anchors,
   survivor identities and metered structured-output fallback; full-call input
   funding is checked before provider dispatch and accounting drains before return.
 
