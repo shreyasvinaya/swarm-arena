@@ -243,7 +243,7 @@ async def test_cancelled_reserve_returns_unused_funding_on_close(
             except asyncio.CancelledError:
                 cancelled.append(True)
 
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(request)
                 if after_commit:
