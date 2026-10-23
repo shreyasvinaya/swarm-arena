@@ -1164,7 +1164,7 @@ async def test_duplicate_request_ids_within_read(
         rows = await _rows(proxy, key)
         assert len(rows) == count - 1
         assert len({r.request_id for r in rows}) == count - 1
-        # Dedup state must not survive the read (Task 16 owns that state).
+        # Dedup state must not survive the read; reconciliation owns that state.
         assert await _rows(proxy, key) == rows
 
 

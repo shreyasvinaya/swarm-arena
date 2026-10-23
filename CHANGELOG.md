@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional LLM gateway keys per LLM-calling tool run, strict-profile preflight,
   full-reservation charging and recorded cap labels. The pinned LiteLLM profile
   supports soft caps and estimated spend only; requiring a hard cap fails preflight.
+  Empty first-row waits produce a neutral note; gateway call provenance requires
+  a created key.
 
 - `swarm-arena reconcile RUN_DIR` reports gateway spend under the run lease,
   with conservative death evidence, exact deduplicated totals and a bounded
