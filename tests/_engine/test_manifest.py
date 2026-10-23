@@ -415,3 +415,15 @@ def test_manifest_gateway_revalidates_copied_models(field: str, value: Any) -> N
     with pytest.raises(ValueError, match="validation") as caught:
         RunManifest.model_validate(raw)
     assert_secret_absent(caught.value, "MANIFEST_SECRET")
+
+
+async def test_manifest_gateway_failure_bounds_survive_both_builders() -> None:
+    block = {**_gateway_block(), "failures": ["unsafe\n\x1b" + "x" * 5000] * 15}
+    for raw in (
+        build_manifest(run_id="r", config=RunConfig(), plans=[], capacity=None, llm_gateway=block),
+        await build_manifest_async(
+            run_id="r", config=RunConfig(), plans=[], capacity=None, llm_gateway=block
+        ),
+    ):
+        assert raw["llm_gateway"]["failures"] == ["<unknown>"] * 10 + ["and 5 more"]
+        assert RunManifest.model_validate_json(canonical_json(raw)).model_dump(mode="json") == raw

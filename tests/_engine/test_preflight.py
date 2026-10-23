@@ -538,3 +538,75 @@ async def test_gateway_preflight_requires_gateway_config() -> None:
     with pytest.raises(ValueError, match="llm_gateway is required"):
         await gateway_preflight(RunConfig(), adapter)
     adapter.preflight.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [401, 404, 503])
+async def test_gateway_preflight_retains_core_transport_detail(
+    fake_gateway: Any, status: int
+) -> None:
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
+    config = _gateway_config(fake_gateway)
+    assert config.llm_gateway is not None
+    fake_gateway.fail["/health/liveliness"] = status
+    adapter = adapter_for(config.llm_gateway, {"LITELLM_MASTER_KEY": fake_gateway.master_key})
+    with pytest.raises(RuntimeError) as caught:
+        await gateway_preflight(config, adapter)
+    assert str(caught.value) == f"gateway preflight failed: GET /health/liveliness: HTTP {status}"
+    assert_secret_absent(caught.value, fake_gateway.master_key)
+
+
+async def test_gateway_preflight_foreign_gateway_error_is_type_only() -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError
+    from swarm_arena.config import GatewayConfig
+
+    adapter = Mock(spec=GatewayAdapter, preflight=AsyncMock(side_effect=GatewayError("SECRET")))
+    with pytest.raises(RuntimeError) as caught:
+        await gateway_preflight(
+            RunConfig(llm_gateway=GatewayConfig(url="http://example.test")), adapter
+        )
+    assert str(caught.value) == "gateway preflight failed: GatewayError"
+    assert_secret_absent(caught.value, "SECRET")
+
+
+async def test_gateway_preflight_bounds_hostile_model_diagnostics(fake_gateway: Any) -> None:
+    from swarm_arena._engine.manifest import _GatewayManifest
+    from swarm_arena._engine.preflight import gateway_preflight
+    from swarm_arena._gateway.litellm_proxy import adapter_for
+
+    hostile = "x\n\x1b[2Jfake: all checks passed" + "A" * 5000
+    fake_gateway.responses["/model/info"] = {
+        "data": [
+            {"model_name": hostile if index == 0 else f"model-{index}", "model_info": {}}
+            for index in range(12)
+        ]
+    }
+    config = _gateway_config(fake_gateway, max_usd=5)
+    assert config.llm_gateway is not None
+    adapter = adapter_for(config.llm_gateway, {"LITELLM_MASTER_KEY": fake_gateway.master_key})
+    with pytest.raises(ValueError, match="strict profile not verified") as caught:
+        await gateway_preflight(config, adapter)
+    detail = str(caught.value)
+    assert "model <unknown>: no price" in detail
+    assert "and 18 more" in detail
+    assert "model-10" not in detail
+    assert "model-11" not in detail
+    assert detail.isprintable()
+    assert len(detail) < 1500
+    cap, report = await gateway_preflight(_gateway_config(fake_gateway, require=False), adapter)
+    block = _GatewayManifest(
+        url=fake_gateway.url,
+        cap=cap,
+        verified=report.verified,
+        failures=report.failures,
+        terminal_accounting=False,
+    )
+    assert len(block.failures) == 11
+    assert block.failures[-1] == "and 18 more"
+    assert "model <unknown>: no price" in block.failures[0]
+    assert all(value.isprintable() and len(value) <= 512 for value in block.failures)
+    assert _GatewayManifest.model_validate_json(block.model_dump_json()) == block

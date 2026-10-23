@@ -140,7 +140,8 @@ terminally exhausts the whole run, even with unset caps.
 ## LLM gateway: hard and soft caps
 
 The optional `llm_gateway` checks its strict profile before run ownership,
-manifest publication, or any virtual key creation. **The pinned LiteLLM range
+manifest publication, approval, or any virtual key creation. Approval warnings
+include `LLM gateway uses a soft cap.` when soft-cap policy is accepted. **The pinned LiteLLM range
 `>=1.107.0rc2,<1.108` cannot provide a hard cap.** Its profile is always
 unverified. `require_hard_cap` defaults to true when `limits.max_usd` is set;
 that configuration therefore fails preflight. Set it explicitly to false to
@@ -159,7 +160,12 @@ require_hard_cap = false
 Keep the master key in the named environment variable. Neither it nor a virtual
 key belongs in configuration files, manifests or journal events. Gateway URLs
 must have no userinfo, query or fragment. A run retains one adapter, its checked
-profile and one key manager bound to the existing journal owner.
+profile and one key manager bound to the existing journal owner. Preflight
+retains fixed method, route and status diagnostics from the built-in transport;
+foreign adapter errors expose only their type. Gateway model identifiers must
+be printable, nonblank and at most 256 characters, otherwise they display as
+`<unknown>`. Errors and manifest evidence retain the first ten failures followed
+by `and N more` when necessary.
 
 A verified strict profile requires all of the following:
 

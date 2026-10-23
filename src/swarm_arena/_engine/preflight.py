@@ -10,7 +10,9 @@ from swarm_arena._board.arena import _effective_arena_root
 from swarm_arena._errors import ConfigError, StorageError, _core_error, _exception_type_name
 from swarm_arena._exec.executor import Executor
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.adapter import GatewayAdapter, ProfileReport
+from swarm_arena._gateway.adapter import GatewayAdapter, GatewayError, ProfileReport
+from swarm_arena._gateway.labels import _profile_failures
+from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.plan import Plan, RoundSpec
 from swarm_arena._model.ref import Ref
@@ -47,7 +49,8 @@ async def gateway_preflight(
     ValueError
         If no gateway is configured or required strict evidence is missing.
     RuntimeError
-        If preflight fails. Ordinary failures contain only the exception type;
+        If preflight fails. Built-in transport failures retain fixed route/status
+        details; foreign failures contain only the exception type;
         registered terminal controls and genuine cancellation propagate.
 
     Examples
@@ -63,13 +66,20 @@ async def gateway_preflight(
         result = await adapter.preflight()
         report = ProfileReport.model_validate(dict(vars(result)))
     except (Exception, anyio.get_cancelled_exc_class()) as error:
-        outcome.contain(error, RuntimeError, "gateway preflight")
+        classified = outcome.classify(error)
+        _raise_terminal(classified)
+        # Only the built-in transport constructs these fixed method/route details.
+        # A foreign adapter may raise the same exception class with arbitrary text.
+        if type(adapter) is LiteLLMProxy and type(classified) is GatewayError:
+            raise _core_error(RuntimeError, f"gateway preflight failed: {classified}") from None
+        outcome.contain(classified, RuntimeError, "gateway preflight")
     if report.verified:
         return "hard", report
     if config.llm_gateway.hard_cap_required(config.limits):
+        failures = "; ".join(_profile_failures(report.failures))
         raise _core_error(
             ValueError,
-            f"LLM gateway strict profile not verified: {'; '.join(report.failures)}. "
+            f"LLM gateway strict profile not verified: {failures}. "
             "Fix the gateway, or set llm_gateway.require_hard_cap = false to run with a soft cap.",
         )
     return "soft", report
