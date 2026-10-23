@@ -66,6 +66,12 @@ class MemoryGateway:
         if self.block_error is not None:
             raise self.block_error
 
+    async def key_matches(self, key: VirtualKey, *, run_id: str) -> bool | None:
+        for index, record in enumerate(self.created, 1):
+            if key.key_id == f"hash-{index}":
+                return record["alias"] == key.alias and record["metadata"]["run_id"] == run_id
+        return None
+
     async def closed_at(self, key: VirtualKey) -> datetime | None:
         self.inspected.append(key.key_id)
         return datetime.now(UTC) if self.confirmed else None

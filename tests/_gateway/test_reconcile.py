@@ -898,7 +898,7 @@ async def test_slow_keys_converge_without_revisiting_deleted_keys(
             "settle_timeout_s": 10 if per_key else 1,
             "llm_gateway": GatewayConfig(
                 url="http://gateway.invalid",
-                request_timeout_s=0.5 if per_key else 600,
+                request_timeout_s=0.6 if per_key else 600,
                 require_hard_cap=False,
             ),
         }
@@ -930,7 +930,7 @@ async def test_slow_keys_converge_without_revisiting_deleted_keys(
     adapter = CapableGateway()
     if per_key:
         adapter.profile = adapter.profile.model_copy(
-            update={"request_timeout_s": 0.5, "batch_write_interval_s": 0}
+            update={"request_timeout_s": 0.6, "batch_write_interval_s": 0}
         )
     for _ in range(1 if per_key else 12):
         report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
@@ -1008,3 +1008,119 @@ async def test_unrepresentable_spend_commits_an_estimated_report(
         assert snapshots[-1].payload == report.model_dump(mode="json")
         assert not [event for event in committed(config) if event.type == "settle"]
     assert len(snapshots) == 2
+
+
+@pytest.mark.parametrize("identity", ["foreign_run", "foreign_alias", "missing", "matching"])
+@pytest.mark.parametrize("closed", [False, True])
+async def test_reconcile_checks_authoritative_key_identity_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str, closed: bool
+) -> None:
+    from _fakes.gateway import FakeGateway, OfflineGatewayOpener
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._gateway import litellm_proxy
+
+    config = config_at(tmp_path)
+    wire = FakeGateway()
+    proxy = litellm_proxy.LiteLLMProxy(
+        url="http://gateway.invalid", master_key=wire.master_key, request_timeout_s=600
+    )
+    monkeypatch.setattr(litellm_proxy, "build_opener", lambda *args: OfflineGatewayOpener(wire))
+    key, _ = await proxy.create_key(
+        alias="PRIVATE" if identity == "foreign_alias" else "cand-c-1",
+        max_budget_usd=1,
+        duration_s=86400,
+        metadata={}
+        if identity == "missing"
+        else {"run_id": "PRIVATE" if identity == "foreign_run" else "forged-run"},
+        default_estimated_output_tokens=4096,
+    )
+    run = FakeRun(config.run_root, "forged-run")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        created(key_record(run.run_id, key_id=key.key_id)),
+        *(
+            [
+                EventDraft(
+                    type="gateway_key",
+                    payload={"action": "closed", "key_id": key.key_id, "closed_at": T0.isoformat()},
+                )
+            ]
+            if closed
+            else []
+        ),
+    )
+    run._lease.release()
+    monkeypatch.setattr(proxy, "preflight", AsyncMock(return_value=CapableGateway().profile))
+    wire.requests.clear()
+    report = await reconcile.reconcile_run(config, run.run_id, proxy, executor())
+    mutations = [path for method, path, _ in wire.requests if method == "POST"]
+    if identity == "matching":
+        assert mutations == (["/key/delete"] if closed else ["/key/block"])
+        assert report.keys[0].deleted is closed
+    else:
+        assert mutations == []
+        assert report.keys[0].label == "estimated"
+        assert report.keys[0].observed_usd is None
+        assert not report.keys[0].deleted
+        assert report.keys[0].reasons == [
+            "gateway key identity unavailable"
+            if identity == "missing"
+            else "gateway key identity mismatch"
+        ]
+        assert not wire.keys[key.key_id]["blocked"]
+        assert not wire.keys[key.key_id]["deleted"]
+    assert "PRIVATE" not in report.model_dump_json()
+    assert "PRIVATE" not in repr(committed(config, run.run_id))
+
+
+async def test_reconcile_refuses_history_from_another_address_before_takeover(
+    tmp_path: Path,
+) -> None:
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._errors import ConfigError
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "different-run")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        created(key_record(run.run_id)),
+    )
+    run._lease.release()
+    (Path(config.run_root) / run.run_id).rename(Path(config.run_root) / "r-reconcile")
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    before = store.read(OWNER_KEY)
+    adapter = CapableGateway()
+    adapter.preflight = AsyncMock(return_value=adapter.profile)
+    with pytest.raises(ConfigError, match=r"^run_id$"):
+        await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert store.read(OWNER_KEY) == before
+    adapter.preflight.assert_not_awaited()
+    assert not adapter.blocked
+
+
+async def test_reconcile_requires_writer_identity_even_with_live_manager(tmp_path: Path) -> None:
+    from swarm_arena._errors import ConfigError
+    from swarm_arena._gateway.keys import KeyManager
+
+    adapter = CapableGateway()
+    gateway = GatewayConfig(url="http://gw")
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        manager = KeyManager(
+            adapter, gateway, cap="soft", journal=run.journal, settle_timeout_s=0, run_id=run.run_id
+        )
+        with pytest.raises(ConfigError, match=r"^run_id$"):
+            await reconcile.reconcile_keys(
+                run.events("gateway_key"),
+                run_id="different-run",
+                journal=run.journal,
+                adapter=adapter,
+                executor=executor(),
+                gateway=gateway,
+                profile=adapter.profile,
+                _manager=manager,
+            )
+        assert not adapter.blocked

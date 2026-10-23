@@ -256,6 +256,30 @@ class GatewayAdapter(Protocol):
         """
         ...
 
+    async def key_matches(self, key: VirtualKey, *, run_id: str) -> bool | None:
+        """Check authoritative run metadata and alias before reconciliation mutates a key.
+
+        Parameters
+        ----------
+        key : VirtualKey
+            Journaled hash and expected alias.
+        run_id : str
+            Addressed run identity, already checked against the journal.
+
+        Returns
+        -------
+        bool or None
+            True for a matching run and alias, False for a mismatch, or None
+            when the key or authoritative metadata is unavailable.
+
+        Examples
+        --------
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(GatewayAdapter.key_matches)
+        True
+        """
+        ...
+
     async def block_key(self, key: VirtualKey) -> None:
         """
         Prevent new requests with an idempotent key operation.

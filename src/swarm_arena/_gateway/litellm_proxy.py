@@ -127,6 +127,24 @@ class _KeyInfo(FrozenModel):
     info: _Info
 
 
+class _IdentityInfo(FrozenModel):
+    """Read only creation identity from the authoritative key-info row."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    key_alias: _Text | None = None
+    metadata: FiniteJsonObject | None = Field(default=None, repr=False)
+
+
+class _KeyIdentity(FrozenModel):
+    """Require the queried hash echo before inspecting ownership metadata."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    key: _Text
+    info: _IdentityInfo
+
+
 class _NotFound(FrozenModel):
     """Recognize only the pinned key-info ProxyException, never an ingress 404."""
 
@@ -829,6 +847,43 @@ class LiteLLMProxy:
         finally:
             if not delivered:
                 owner.abandon()
+
+    async def key_matches(self, key: VirtualKey, *, run_id: str) -> bool | None:
+        """Compare stored creation metadata and alias without exporting their values.
+
+        Parameters
+        ----------
+        key : VirtualKey
+            Journaled hash and expected alias.
+        run_id : str
+            Run identity expected in key-info metadata.
+
+        Returns
+        -------
+        bool or None
+            True for a match, False for a mismatch, or None for absent identity.
+            Malformed responses raise a value-free GatewayError.
+
+        Examples
+        --------
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(LiteLLMProxy.key_matches)
+        True
+        """
+
+        def work(operation: _Operation) -> bool | None:
+            raw = self._request(operation, "GET", "/key/info", query={"key": key.key_id})
+            if raw is _MISSING:
+                return None
+            reply = _KeyIdentity.model_validate(raw)
+            if reply.key != key.key_id:
+                raise ValueError
+            identity = None if reply.info.metadata is None else reply.info.metadata.get("run_id")
+            if not isinstance(identity, str) or not identity or reply.info.key_alias is None:
+                return None
+            return identity == run_id and reply.info.key_alias == key.alias
+
+        return await self._run("GET", "/key/info", work)
 
     async def block_key(self, key: VirtualKey) -> None:
         """

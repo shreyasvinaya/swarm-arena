@@ -140,7 +140,7 @@ anyio.run(main)
 `Plan.load` captures the plan directory so `rosen:*` imports resolve both in the
 engine and function subprocesses. No `PYTHONPATH` setup is needed.
 
-## Inspect, stop, and resume
+## Inspect, stop, resume, and reconcile
 
 Replace `<run-id>` below with the run ID from the start line. For a live run,
 `stop` requests a graceful stop; `--now` requests immediate cancellation. A
@@ -152,12 +152,21 @@ uv run swarm-arena status .swarm-arena/runs/<run-id>
 uv run swarm-arena stop .swarm-arena/runs/<run-id>
 uv run swarm-arena stop --now .swarm-arena/runs/<run-id>
 uv run swarm-arena resume .swarm-arena/runs/<run-id>
+uv run swarm-arena reconcile .swarm-arena/runs/<run-id>
 ```
 
 Resume uses the run's saved `run.toml`. To supply a replacement configuration,
 use `resume RUN_DIR --config RUN_TOML`; `--force` permits an explicit ownership
 takeover. See [Limits and safety](limits-and-safety.md) before changing limits or
 forcing takeover.
+
+Reconcile uses the same saved-configuration addressing and accepts
+`reconcile RUN_DIR --config RUN_TOML`. Run directories and run roots must be
+writable only by the operator: a writer can change what resume executes and
+make resume or reconcile send the master key named by `master_key_env` to the
+gateway URL in that configuration. On shared storage, pass `--config` from a
+trusted copy; gateway continuity checks refuse a changed URL. See
+[post-run reconciliation and storage trust](limits-and-safety.md#after-the-run-reconcile).
 
 ## With an API key
 

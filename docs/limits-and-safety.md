@@ -220,6 +220,21 @@ without failing completion; storage failures and ownership loss still propagate.
 A run with no committed head returns an empty report and releases its lease
 without publishing history; it remains ineligible for resume.
 
+The run directory and run root are trusted operator data. Anyone who can write
+them can change the tools that resume executes and make resume or reconcile
+send the environment master key named by `master_key_env` to the gateway URL in
+that configuration. Keep run roots writable only by the operator. On shared
+storage, pass `--config` from an independently trusted copy; the gateway
+continuity check then refuses a changed URL. This does not authenticate a
+modified journal or recorded plan.
+
+Before reconciliation mutates a key, its journal and writer must match the
+addressed run. The adapter checks the selected hash through `/key/info` and
+compares the stored creation `metadata.run_id` and `key_alias` with the record.
+A mismatch or unavailable identity leaves the key estimated without mutation,
+using a fixed reason without external values. These checks use the pinned
+LiteLLM key-info fields; they do not make an attacker-writable run root trusted.
+
 A key's report becomes an observation only when all these conditions hold:
 
 1. The executor confirms the original tool is dead. A key with no start or
@@ -412,6 +427,11 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+Resume trusts the saved configuration, journal and recorded tools. Restrict run
+root writes to the operator and use a trusted `--config` on shared storage:
+writers can redirect the configured `master_key_env` credential to another
+gateway URL or change which tools resume runs. See the
+[run-storage trust boundary](#after-the-run-reconcile) above.
 Backend journal reads are contained and their bytes detached before chain or replay
 validation. Backend diagnostics and backend cancellation cannot impersonate core
 validation or caller cancellation.

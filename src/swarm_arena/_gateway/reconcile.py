@@ -247,6 +247,8 @@ async def reconcile_keys(
     0.0
     """
     journal._check_open()
+    if journal._run_id != run_id or any(event.run_id != run_id for event in events):
+        raise _core_error(ConfigError, "run_id")
     overall = _gateway_deadline(journal)
     if _deadline is not None:
         overall = min(overall, _deadline)
@@ -317,6 +319,34 @@ async def reconcile_keys(
             continue
         deadline = min(overall, _gateway_deadline(journal, timeout_s=gateway.request_timeout_s))
         reasons: list[str] = []
+        key = _virtual(record)
+        try:
+            matches = await _external(partial(adapter.key_matches, key, run_id=run_id), deadline)
+        except _AllowanceExpired:
+            reasons.append(_ALLOWANCE_REASON)
+        except GatewayError:
+            reasons.append("gateway key identity unavailable")
+        else:
+            if matches is not True:
+                reasons.append(
+                    "gateway key identity mismatch"
+                    if matches is False
+                    else "gateway key identity unavailable"
+                )
+        if reasons:
+            reports.append(
+                KeyReport(
+                    candidate_id=record.candidate_id,
+                    key_id=record.key_id,
+                    alias=record.alias,
+                    reserved_usd=record.max_budget_usd,
+                    observed_usd=None,
+                    label=ESTIMATED,
+                    reasons=reasons,
+                    deleted=False,
+                )
+            )
+            continue
         start = starts.get(record.candidate_id)
         dead: bool | None = True
         if start is not None:
@@ -329,7 +359,6 @@ async def reconcile_keys(
         if dead is not True:
             reasons.append("tool not confirmed dead")
         closure = closed[record.key_id]
-        key = _virtual(record)
         if closure is None and record.key_id not in deleted:
             try:
                 await _external(partial(adapter.block_key, key), deadline)
@@ -481,7 +510,10 @@ async def take_run(
                 for event in batch
             ]
         )
-        _check_gateway_binding(RunState.from_events(events), config)
+        state = RunState.from_events(events)
+        if events and state.run_id != run_id:
+            raise _core_error(ConfigError, "run_id")
+        _check_gateway_binding(state, config)
 
     stops = StopState() if _stops is None else _stops
     lease: Lease | None = None
@@ -521,6 +553,8 @@ async def take_run(
                 )
                 events = [event for _, batch in chain for event in batch]
             state = await _validated_io(RunState.from_events, events)
+            if events and state.run_id != run_id:
+                raise _core_error(ConfigError, "run_id")
             _check_gateway_binding(state, config)
             completed = True
         if not completed:
