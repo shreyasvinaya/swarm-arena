@@ -736,11 +736,13 @@ async def test_cancelled_reserve_admission_settles_undispatched_tool_at_zero(
         await wait_for(seq)
 
     monkeypatch.setattr(rt.journal, "_wait_for", cancel_at_wait)
-    with anyio.fail_after(60):
+    with anyio.fail_after(60) as watchdog:
         with anyio.CancelScope() as scope:
             with pytest.raises(asyncio.CancelledError):
                 await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
         await rt.journal.commit()
+    # The inner raises would also accept the watchdog's own cancellation.
+    assert not watchdog.cancel_called, "the cancelled run did not end promptly"
     reserves = rt_env.events("reserve")
     settlements = rt_env.events("settle")
     assert len(reserves) == len(settlements) == 1
