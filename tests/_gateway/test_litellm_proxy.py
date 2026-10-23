@@ -1134,7 +1134,17 @@ async def test_duplicate_request_ids_within_read(
 async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    import swarm_arena._gateway.litellm_proxy as module
+
     entered, release, finished = (threading.Event() for _ in range(3))
+    sockets: list[socket.socket] = []
+    original_track = module._Transport.track
+
+    def track(transport: Any, sock: socket.socket) -> socket.socket:
+        sockets.append(sock)
+        return original_track(transport, sock)
+
+    monkeypatch.setattr(module._Transport, "track", track)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -1165,12 +1175,15 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
     task = asyncio.create_task(proxy.closed_at(VirtualKey(key_id="hash", alias="alias")))
     try:
         await _wait(entered)
-        with pytest.raises(GatewayError):
-            await task
+        with anyio.fail_after(1.5):
+            with pytest.raises(GatewayError):
+                await task
         # The caller is already bounded on the old code. Assert worker exit too,
         # before the fixture releases the endless header stream.
         with anyio.fail_after(1.5):
             assert await anyio.to_thread.run_sync(finished.wait, 1.0)
+        assert sockets
+        assert all(sock.fileno() == -1 for sock in sockets)
     finally:
         release.set()
         server.shutdown()
@@ -1178,59 +1191,6 @@ async def test_header_drip_worker_exits_at_deadline(monkeypatch: pytest.MonkeyPa
         server_thread.join(5)
         await _wait(finished)
         assert not server_thread.is_alive()
-
-
-async def test_dns_stall_worker_and_resolver_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    import swarm_arena._gateway.litellm_proxy as module
-
-    # The actual stdlib resolver runs in a killable process; inject a stalled
-    # resolver program, not a sleep into the transport worker itself.
-    monkeypatch.setattr(module, "_RESOLVER_CODE", "import time; time.sleep(30)")
-    proxy = _proxy_at("http://localhost:4000", http_timeout_s=0.5)
-    original = proxy._request
-    finished = threading.Event()
-    children: list[Any] = []
-    real_popen = module.subprocess.Popen
-
-    def popen(*args: Any, **kwargs: Any) -> Any:
-        child = real_popen(*args, **kwargs)
-        children.append(child)
-        return child
-
-    def request(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original(*args, **kwargs)
-        finally:
-            finished.set()
-
-    monkeypatch.setattr(module.subprocess, "Popen", popen)
-    monkeypatch.setattr(proxy, "_request", request)
-    try:
-        with pytest.raises(GatewayError):
-            await proxy.closed_at(VirtualKey(key_id="hash", alias="alias"))
-        with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
-        assert children
-        assert all(child.poll() is not None for child in children)
-    finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-            child.wait(timeout=5)
-
-
-async def test_hostname_resolution_stays_off_worker(
-    fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _, key = await _proxy_and_key(fake_gateway)
-
-    def forbidden(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("blocking resolver on transport worker")
-
-    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
-    assert (
-        await _proxy_at(fake_gateway.url.replace("127.0.0.1", "localhost")).closed_at(key) is None
-    )
 
 
 @pytest.mark.parametrize("status", [200, 404])
@@ -1334,46 +1294,6 @@ async def test_tls_handshake_worker_exits(
         assert not thread.is_alive()
 
 
-async def test_dns_cancel_kills_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
-    import swarm_arena._gateway.litellm_proxy as module
-
-    monkeypatch.setattr(module, "_RESOLVER_CODE", "import time; time.sleep(30)")
-    proxy = _proxy_at("http://localhost:4000", http_timeout_s=5)
-    original = proxy._request
-    entered, finished = threading.Event(), threading.Event()
-    children: list[Any] = []
-    real_popen = module.subprocess.Popen
-
-    def popen(*args: Any, **kwargs: Any) -> Any:
-        child = real_popen(*args, **kwargs)
-        children.append(child)
-        entered.set()
-        return child
-
-    def request(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original(*args, **kwargs)
-        finally:
-            finished.set()
-
-    monkeypatch.setattr(module.subprocess, "Popen", popen)
-    monkeypatch.setattr(proxy, "_request", request)
-    task = asyncio.create_task(proxy.closed_at(VirtualKey(key_id="hash", alias="alias")))
-    try:
-        await _wait(entered)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
-        assert all(child.poll() is not None for child in children)
-    finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-            child.wait(timeout=5)
-
-
 async def test_missing_key_confirmation_shares_operation_byte_budget(
     fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1408,42 +1328,86 @@ async def test_duplicate_conflict_in_discarded_metadata_is_unknown(
     assert MASTER not in str(caught.value)
 
 
-async def test_cancelled_create_before_send_kills_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_hostname_resolves_in_daemon_http_worker(
+    fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, key = await _proxy_and_key(fake_gateway)
+    resolver_threads: list[threading.Thread] = []
+    original = socket.getaddrinfo
+
+    def resolve(*args: Any, **kwargs: Any) -> Any:
+        resolver_threads.append(threading.current_thread())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    proxy = _proxy_at(fake_gateway.url.replace("127.0.0.1", "localhost"))
+    assert await proxy.closed_at(key) is None
+    assert len(resolver_threads) == 1
+    assert resolver_threads[0].daemon
+    assert resolver_threads[0].name == "swarm-arena-daemon-work"
+
+
+@pytest.mark.parametrize("operation", ["closed_at", "create_key"])
+async def test_abandoned_dns_never_opens_socket(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
     import swarm_arena._gateway.litellm_proxy as module
 
-    monkeypatch.setattr(module, "_RESOLVER_CODE", "import time; time.sleep(30)")
-    proxy = _proxy_at("http://localhost:4000", http_timeout_s=5)
-    original = proxy._request
-    entered, finished = threading.Event(), threading.Event()
-    children: list[Any] = []
-    real_popen = module.subprocess.Popen
+    entered, release, finished = (threading.Event() for _ in range(3))
+    sockets: list[Any] = []
+    original_socket = socket.socket
+    proxy = _proxy_at("http://localhost:4000", http_timeout_s=0.5)
+    original_request = proxy._request
 
-    def popen(*args: Any, **kwargs: Any) -> Any:
-        child = real_popen(*args, **kwargs)
-        children.append(child)
+    def resolve(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        return child
+        assert release.wait(5)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 4000))]
+
+    def make_socket(*args: Any, **kwargs: Any) -> Any:
+        sock = original_socket(*args, **kwargs)
+        sockets.append(sock)
+        return sock
 
     def request(*args: Any, **kwargs: Any) -> Any:
         try:
-            return original(*args, **kwargs)
+            return original_request(*args, **kwargs)
         finally:
             finished.set()
 
-    monkeypatch.setattr(module.subprocess, "Popen", popen)
+    # Scope socket instrumentation to this module; AnyIO owns unrelated sockets.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        module,
+        "socket",
+        SimpleNamespace(
+            getaddrinfo=resolve,
+            socket=make_socket,
+            SOCK_STREAM=socket.SOCK_STREAM,
+            AF_INET=socket.AF_INET,
+            AF_INET6=socket.AF_INET6,
+            SHUT_RDWR=socket.SHUT_RDWR,
+        ),
+    )
     monkeypatch.setattr(proxy, "_request", request)
-    task = asyncio.create_task(proxy.create_key(**CREATE))
+    task = asyncio.create_task(_call(proxy, operation, VirtualKey(key_id="hash", alias="alias")))
     try:
         await _wait(entered)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
         with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
-        assert all(child.poll() is not None for child in children)
-    finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-            child.wait(timeout=5)
+            with pytest.raises(GatewayError):
+                await task
+        assert not finished.is_set()
+        assert not sockets
+        release.set()
         await _wait(finished)
+        assert not sockets
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        await _wait(finished)
+        for sock in sockets:
+            sock.close()
