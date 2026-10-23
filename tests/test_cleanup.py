@@ -1,7 +1,9 @@
 """Exercise failure cleanup with a task that deliberately resists cancellation."""
 
 import asyncio
+import time
 from contextlib import suppress
+from pathlib import Path
 
 import pytest
 from _fakes.cleanup import settle_tasks
@@ -311,8 +313,13 @@ def test_owned_group_cleanup_checks_identity_and_liveness(
             identity[0] = current
             patch.setattr(process_cleanup.os, "kill", check_leader)
             patch.setattr(process_cleanup.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
-            with pytest.raises(StopIteration):
-                next(owner)
+            if signal_group:
+                # A live verified group means the test left a member running.
+                with pytest.raises(AssertionError, match="left an owned child alive"):
+                    next(owner)
+            else:
+                with pytest.raises(StopIteration):
+                    next(owner)
             assert signals == ([(child.pid, signal.SIGKILL)] if signal_group else [])
         finally:
             if child is not None:
@@ -352,3 +359,56 @@ def test_unreaped_own_group_child_is_killed_when_identity_lookup_fails(
                     child.kill()
                 child.wait(timeout=60)
             owner.close()
+
+
+def test_reaped_leader_with_live_descendant_is_reported_and_killed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os
+    import signal
+    import subprocess
+    import sys
+    from collections.abc import Generator
+    from inspect import unwrap
+    from typing import cast
+
+    from _fakes import process_cleanup
+
+    pid_file = tmp_path / "descendant.pid"
+    code = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    time.sleep(300)\n"
+        "    os._exit(0)\n"
+        f"open({str(pid_file)!r}, 'w').write(str(pid))\n"
+    )
+    with monkeypatch.context() as patch:
+        owner = cast(Generator[None, None, None], unwrap(process_cleanup.owned_processes)(patch))
+        next(owner)
+        descendant = None
+        try:
+            leader = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+            assert leader.wait(timeout=60) == 0
+            descendant = int(pid_file.read_text())
+            os.kill(descendant, 0)
+            with pytest.raises(AssertionError, match="left an owned child alive"):
+                next(owner)
+            deadline = time.monotonic() + 60
+            while _alive(descendant):
+                assert time.monotonic() < deadline, "emergency cleanup left the descendant"
+                time.sleep(0.05)
+        finally:
+            if descendant is not None and _alive(descendant):
+                os.kill(descendant, signal.SIGKILL)
+            owner.close()
+
+
+def _alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

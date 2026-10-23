@@ -25,6 +25,26 @@ def _leader_missing(pid: int) -> bool:
     return False
 
 
+def _reaped_group_alive(process: subprocess.Popen[Any], start_time: str | None) -> bool:
+    """Whether a reaped leader's verified group still has a live member."""
+    current = process_start_time(process.pid)
+    same_leader = start_time is not None and current == start_time
+    leader_gone = current is None and _leader_missing(process.pid)
+    return (same_leader or leader_gone) and group_has_live_member(process.pid)
+
+
+def _left_alive(process: subprocess.Popen[Any], own_group: bool, start_time: str | None) -> bool:
+    """Whether a captured child, or a descendant in its own group, is still running."""
+    if process.poll() is None:
+        return True
+    if not own_group:
+        return False
+    try:
+        return _reaped_group_alive(process, start_time)
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def reap_children(children: list[tuple[subprocess.Popen[Any], bool, str | None]]) -> list[str]:
     """Reap captured children, checking leader identity and liveness before group kills.
 
@@ -46,12 +66,8 @@ def reap_children(children: list[tuple[subprocess.Popen[Any], bool, str | None]]
                         os.killpg(process.pid, signal.SIGKILL)
                     else:
                         process.kill()
-                elif own_group:
-                    current = process_start_time(process.pid)
-                    same_leader = start_time is not None and current == start_time
-                    leader_gone = current is None and _leader_missing(process.pid)
-                    if (same_leader or leader_gone) and group_has_live_member(process.pid):
-                        os.killpg(process.pid, signal.SIGKILL)
+                elif own_group and _reaped_group_alive(process, start_time):
+                    os.killpg(process.pid, signal.SIGKILL)
                 elif process.poll() is None:
                     process.kill()
             # Bypass per-instance wait surrogates used by supervisor failure tests.
@@ -82,7 +98,9 @@ def owned_processes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     try:
         yield
     finally:
-        leaked = [process for process, _, _ in children if process.poll() is None]
+        leaked = [
+            process for process, own, started in children if _left_alive(process, own, started)
+        ]
         errors = reap_children(children)
         assert not leaked, "test left an owned child alive; emergency cleanup ran"
         assert not errors, "; ".join(errors)
