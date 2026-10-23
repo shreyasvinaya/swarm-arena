@@ -1924,12 +1924,16 @@ async def test_provider_resolution_is_concurrent_and_bounded_per_slot(
     monkeypatch.setattr(stops_module, "_probe", probe)
     monkeypatch.setattr(round_module, "anyio", ResolutionClock())
     monkeypatch.setattr(round_module, "run_sync_daemon", observe_resolution)
+    before = anyio.current_time()
     task = asyncio.create_task(_round(e, slots).run(1))
     try:
         with anyio.fail_after(15):
             # Neither constructor is released: serial resolution cannot reach both gates.
             await entered["stuck-a"].wait()
             await entered["stuck-b"].wait()
+            after = anyio.current_time()
+            for name in entered:
+                assert before + 60.0 <= scopes[name].deadline <= after + 60.0
             assert not any(event.is_set() for event in resolved.values())
             assert scopes["stuck-a"] is not scopes["stuck-b"]
             scopes["stuck-a"].deadline = anyio.current_time()
