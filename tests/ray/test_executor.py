@@ -879,6 +879,84 @@ async def test_schedule_timeout_fails_run(ray_driver: Any, tmp_path: Path) -> No
 
 
 @pytest.mark.ray
+async def test_cancel_while_pending_never_runs_tool(
+    ray_driver: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.ray_executor import script_job, tool_job
+
+    from swarm_arena.ray._state import PENDING_STATES, TERMINAL_STATES, find_task
+
+    marker = tmp_path / "ran"
+    job = tool_job(
+        f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        resources=Resources(custom={"no_such_node": 1}),
+        artifact_root=str(tmp_path / "pending"),
+        grace_s=1,
+    )
+    executor = RayExecutor(cancel_margin_s=10)
+    cancel = Mock(wraps=ray.cancel)
+    monkeypatch.setattr(ray, "cancel", cancel)
+    scopes: list[anyio.CancelScope] = []
+    outputs: list[ToolOutput] = []
+    finished = anyio.Event()
+
+    async def submit() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            outputs.append(await executor.submit(job))
+        finished.set()
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(submit)
+        try:
+            with anyio.fail_after(60):
+                while True:
+                    pending = await anyio.to_thread.run_sync(
+                        lambda: find_task(
+                            job.id,
+                            dashboard_url=ray_driver.dashboard_url,
+                            expected_job_id=executor._driver_job_id,
+                        )
+                    )
+                    if pending is not None and pending.state in PENDING_STATES:
+                        break
+                    await anyio.sleep(0.1)
+            assert not finished.is_set()
+            assert not await anyio.Path(marker).exists()
+            # The cancel sequence proves the policy; this is a CI safety bound.
+            with anyio.fail_after(60):
+                scopes[0].cancel()
+                await finished.wait()
+        finally:
+            tasks.cancel_scope.cancel()
+
+    assert scopes[0].cancelled_caught
+    assert outputs == []
+    assert [call.kwargs.get("force", False) for call in cancel.call_args_list] == [False, True]
+    assert cancel.call_args_list[0].args == cancel.call_args_list[1].args
+    with anyio.fail_after(60):
+        while True:
+            terminal = await anyio.to_thread.run_sync(
+                lambda: find_task(
+                    job.id,
+                    dashboard_url=ray_driver.dashboard_url,
+                    expected_job_id=executor._driver_job_id,
+                )
+            )
+            if terminal is not None and terminal.state in TERMINAL_STATES:
+                break
+            await anyio.sleep(0.1)
+    assert terminal.task_id == pending.task_id
+    assert terminal.attempt_number == pending.attempt_number
+    assert not await anyio.Path(marker).exists()
+    with anyio.fail_after(60):
+        assert (
+            await executor.submit(script_job(artifact_root=str(tmp_path / "later")))
+        ).status == RunStatus.OK
+    assert not await anyio.Path(marker).exists()
+
+
+@pytest.mark.ray
 async def test_cancel_partial_matches_local_executor(ray_driver: Any, tmp_path: Path) -> None:
     from _fakes.ray_executor import cancel_and_capture, partial_job
 
