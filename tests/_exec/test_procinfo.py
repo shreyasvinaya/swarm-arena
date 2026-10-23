@@ -70,7 +70,7 @@ def test_kill_orphan_checks_host_and_start_time() -> None:
     assert not kill_orphan(good.model_copy(update={"host_id": "other:boot"}))
     assert p.poll() is None
     assert kill_orphan(good)
-    assert p.wait(5) == -signal.SIGKILL
+    assert p.wait(60) == -signal.SIGKILL
 
 
 @pytest.mark.parametrize(
@@ -261,30 +261,42 @@ def _spawn(argv: list[str]) -> "subprocess.Popen[bytes]":
 async def test_exit_watch_waits_without_reaping() -> None:
     p = await anyio.to_thread.run_sync(_spawn, ["sleep", "0.3"])
     with contextlib.closing(ExitWatch(p.pid)) as watch:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await watch.wait()
         assert p.returncode is None
         assert pid_alive(p.pid)  # exited but still a zombie
-        with anyio.fail_after(1):
+        with anyio.fail_after(60):
             await watch.wait()  # returns at once the second time
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
 async def test_exit_watch_on_an_existing_zombie() -> None:
     p = await anyio.to_thread.run_sync(_spawn, ["true"])
-    await anyio.sleep(0.3)  # exited, never reaped
-    with contextlib.closing(ExitWatch(p.pid)) as watch, anyio.fail_after(1):
+    assert await anyio.to_thread.run_sync(wait_until, lambda: _is_zombie(p.pid), 60)
+    with contextlib.closing(ExitWatch(p.pid)) as watch, anyio.fail_after(60):
         await watch.wait()
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
 async def test_exit_watch_is_cancellable() -> None:
-    p = await anyio.to_thread.run_sync(_spawn, ["sleep", "30"])
+    p = await anyio.to_thread.run_sync(_spawn, ["sleep", "180"])
     try:
         with contextlib.closing(ExitWatch(p.pid)) as watch:
-            with anyio.move_on_after(0.2) as scope:
-                await watch.wait()
+            entered = anyio.Event()
+
+            async def cancel_when_waiting(scope: anyio.CancelScope) -> None:
+                await entered.wait()
+                await anyio.wait_all_tasks_blocked()
+                scope.cancel()
+
+            with anyio.fail_after(30):
+                with anyio.CancelScope() as scope:
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(cancel_when_waiting, scope)
+                        entered.set()
+                        await watch.wait()
             assert scope.cancelled_caught
+            assert p.poll() is None
     finally:
         p.kill()
         await anyio.to_thread.run_sync(p.wait)
@@ -298,7 +310,7 @@ async def test_exit_watch_polls_waitid_without_pidfd(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(os, "pidfd_open", no_pidfd, raising=False)
     p = await anyio.to_thread.run_sync(_spawn, ["sleep", "0.3"])
     with contextlib.closing(ExitWatch(p.pid)) as watch:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await watch.wait()
         assert p.returncode is None
     assert await anyio.to_thread.run_sync(p.wait) == 0

@@ -29,39 +29,62 @@ async def test_reraises_the_exception() -> None:
 
 async def test_cancel_stops_waiting_and_drops_the_thread() -> None:
     release = threading.Event()
+    entered = threading.Event()
     finished = threading.Event()
 
     def blocked() -> None:
-        release.wait(10)
+        entered.set()
+        release.wait()
         finished.set()
 
-    with anyio.move_on_after(0.2) as scope:
-        await run_sync_daemon(blocked)
-    assert scope.cancelled_caught
-    assert not finished.is_set()  # the awaiting side returned while the thread still ran
-    release.set()
-    assert await anyio.to_thread.run_sync(finished.wait, 5)
+    async def cancel_when_entered(scope: anyio.CancelScope) -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        scope.cancel()
+
+    try:
+        with anyio.fail_after(30):
+            with anyio.CancelScope() as scope:
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(cancel_when_entered, scope)
+                    await run_sync_daemon(blocked)
+        assert scope.cancelled_caught
+        assert not finished.is_set()  # the awaiting side returned while the thread still ran
+    finally:
+        release.set()
+        assert await anyio.to_thread.run_sync(finished.wait, 60)
 
 
 def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     errors: list[BaseException | None] = []
     monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
     release = threading.Event()
+    entered = threading.Event()
     threads: list[threading.Thread] = []
 
     def blocked() -> int:
         threads.append(threading.current_thread())
-        release.wait(10)
+        entered.set()
+        release.wait()
         return 1
 
     async def main() -> None:
-        with anyio.move_on_after(0.2):
-            await run_sync_daemon(blocked)
+        async def cancel_when_entered(scope: anyio.CancelScope) -> None:
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+            scope.cancel()
 
-    anyio.run(main)  # the loop is closed when this returns
-    release.set()
+        with anyio.fail_after(30):
+            with anyio.CancelScope() as scope:
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(cancel_when_entered, scope)
+                    await run_sync_daemon(blocked)
+
+    try:
+        anyio.run(main)  # the loop is closed when this returns
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(60)
     [thread] = threads
-    thread.join(5)
     assert not thread.is_alive()
     assert errors == []
 

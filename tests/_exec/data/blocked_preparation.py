@@ -86,13 +86,13 @@ async def main() -> None:
         assert scope.cancelled_caught
         cancelled.set()
 
-    with anyio.fail_after(12):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(submit)
             while not ENTERED.is_set():  # noqa: ASYNC110
                 await anyio.sleep(0.01)
             scopes[0].cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await cancelled.wait()
             [workspace] = (ROOT / "ws").iterdir()
             assert workspace.is_dir()

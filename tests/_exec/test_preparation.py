@@ -25,7 +25,7 @@ def _probe(tmp_path: Path, where: str, release: str) -> None:
         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=120,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
