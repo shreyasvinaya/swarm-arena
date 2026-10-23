@@ -112,7 +112,9 @@ async def test_clock_checkpoint_survives_process_death(
         f"import sys,anyio; from pathlib import Path; from {_MODULE} import clock_driver; "
         "anyio.run(clock_driver,Path(sys.argv[1]),sys.argv[2])"
     )
-    with anyio.fail_after(30):
+    # A whole child swarm run up to its crash point: a generous safety bound
+    # (CI-SWEEP), not the behaviour under test.
+    with anyio.fail_after(180):
         child = await anyio.run_process(
             [sys.executable, "-c", code, str(tmp_path), phase], env=environment, check=False
         )

@@ -251,7 +251,9 @@ async def test_resume_reuses_committed_paid_barrier_batches(
         "anyio.run(crash_driver, Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), "
         "sys.argv[4] == 'True', int(sys.argv[5]))"
     )
-    with anyio.fail_after(30):
+    # A whole child swarm run up to its crash point: a generous safety bound
+    # (CI-SWEEP), not the behaviour under test.
+    with anyio.fail_after(180):
         process = await anyio.run_process(
             [
                 sys.executable,
