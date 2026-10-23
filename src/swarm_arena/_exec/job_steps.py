@@ -1,13 +1,14 @@
 """Shared staged preparation, one-shot collection and per-object publication."""
 
+import contextlib
 import os
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, Generic, TypeVar
 
 import anyio
 
@@ -17,7 +18,7 @@ from swarm_arena._exec.env import build_env
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.local_workspace import _DIR_FLAGS
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
-from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
+from swarm_arena._exec.threads import _DaemonCall
 from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.tooling import (
     Command,
@@ -186,6 +187,39 @@ def _truncated(rel: str, dropped: int) -> str:
     return f"log truncated: {rel}: dropped the first {dropped} bytes"
 
 
+_T = TypeVar("_T")
+
+
+class _WorkspaceCall(Generic[_T]):
+    """Retain a publication workspace until its worker finishes or is revoked."""
+
+    def __init__(self, operation: Callable[..., _T], args: tuple[Any, ...]) -> None:
+        self.operation = operation
+        self.args = args
+        self.finished = threading.Event()
+        self._lock = threading.Lock()
+        self._started = False
+        self._revoked = False
+
+    def run(self) -> _T:
+        """Claim workspace access unless the awaiting owner has already left."""
+        with self._lock:
+            if self._revoked:
+                raise RuntimeError("workspace operation abandoned")
+            self._started = True
+        try:
+            return self.operation(*self.args)
+        finally:
+            self.finished.set()
+
+    def abandon(self) -> None:
+        """Revoke queued work; an already-running worker retains ownership."""
+        with self._lock:
+            if not self._started:
+                self._revoked = True
+                self.finished.set()
+
+
 class _JobRun:
     """Supervise one staged job, keep its collected output, and upload its results."""
 
@@ -214,6 +248,7 @@ class _JobRun:
         self._collect_error: BaseException | None = None
         self.collect_finished = threading.Event()
         self.collect_finished.set()  # no collecting worker owns the workspace yet
+        self._publication: _WorkspaceCall[Any] | None = None
         self._run: CompletedRun | None = None  # what the supervisor returned
         self._provisional: CompletedRun | None = None  # the run a stop-path collect saw
 
@@ -242,20 +277,24 @@ class _JobRun:
                 output = await anyio.to_thread.run_sync(self._stopped_output, run.status)
             else:
                 self._collect_deadline = anyio.current_time() + supervisor.BEFORE_KILL_TIMEOUT_S
-                self.collect_finished.clear()
-                self._post_collect = _DaemonCall(self._collect_owned, run)
+                self._post_collect = self._start_collect(run)
                 await self._wait_post_collect()
                 output = self._output or ToolOutput(status=RunStatus.ERROR)
             return await self._finish(output, (run.started_at, run.ended_at))
         except anyio.get_cancelled_exc_class():
             if self._started:  # a cancel before the start handshake has no output to give
                 with anyio.CancelScope(shield=True):
-                    await self._deliver_partial()
+                    try:
+                        await self._deliver_partial()
+                    except BaseException as error:
+                        # A pending caller cancellation owns the final outcome,
+                        # including failures from the shielded collector rejoin.
+                        outcome.classify(error)
             raise
 
     async def fault_output(self, reason: str) -> ToolOutput:
         """Upload an unstarted job's diagnostics under the caller's supervision."""
-        await _validated_io(self._fault_logs, reason)
+        await self._workspace_io(self._fault_logs, reason, validation=True)
         return await self._finish(ToolOutput(status=RunStatus.ERROR), None)
 
     def _fault_logs(self, reason: str) -> None:
@@ -274,34 +313,65 @@ class _JobRun:
     async def _before_kill(self, provisional: CompletedRun) -> None:
         """Collect the partial output in a daemon thread the supervisor can stop waiting on."""
         self._provisional = provisional
+        outcome = _Outcome()
+        try:
+            call = self._start_collect(provisional)
+            self._output = await call.result()
+        except anyio.get_cancelled_exc_class():
+            raise
+        except BaseException as error:
+            # Only a hand-back actually received by this owner can survive
+            # supervisor cleanup. Abandoned workers cannot set this latch.
+            self._collect_error = error
+            # Classify cancellation first, then re-raise the original direct-call
+            # error below instead of replacing its identity with a rebuilt Fenced.
+            with contextlib.suppress(Fenced):
+                outcome.classify(error)
+            raise
+
+    def _start_collect(self, run: CompletedRun) -> _DaemonCall[ToolOutput | None]:
+        """Reserve workspace ownership, undoing it if no daemon can be started."""
         self.collect_finished.clear()
-        self._output = await run_sync_daemon(self._collect_owned, provisional)
+        try:
+            return _DaemonCall(self._collect_owned, run)
+        except BaseException:
+            self.collect_finished.set()
+            raise
 
     async def _deliver_partial(self) -> None:
         """Deliver collected data after cancellation without starting artifact uploads."""
         run = self._run
-        if run is not None and run.status not in _STOPPED and not self._collected:
-            # Rejoin the same collect, with its original deadline; never call it twice.
-            self._provisional = run.model_copy(update={"status": RunStatus.CANCELLED})
-            await self._wait_post_collect()
-        output = await anyio.to_thread.run_sync(self._stopped_output, RunStatus.CANCELLED)
-        timed = run or self._provisional
-        times = None if timed is None else (timed.started_at, timed.ended_at)
-        # Preserve collected data, but never publish refs from an abandoned upload.
-        update: dict[str, Any] = {"files": [], "logs_ref": None}
-        if times is not None:
-            update["started_at"], update["ended_at"] = times
-        partial = output.model_copy(update=update)
-        if self._job.on_partial is not None:
-            with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S):
-                await self._job.on_partial(partial)
+        try:
+            if run is not None and run.status not in _STOPPED and not self._collected:
+                # Rejoin the same collect, with its original deadline; never call it twice.
+                self._provisional = run.model_copy(update={"status": RunStatus.CANCELLED})
+                await self._wait_post_collect()
+        finally:
+            output = await anyio.to_thread.run_sync(self._stopped_output, RunStatus.CANCELLED)
+            timed = run or self._provisional
+            times = None if timed is None else (timed.started_at, timed.ended_at)
+            # Preserve collected data, but never publish refs from an abandoned upload.
+            update: dict[str, Any] = {"files": [], "logs_ref": None}
+            if times is not None:
+                update["started_at"], update["ended_at"] = times
+            partial = output.model_copy(update=update)
+            if self._job.on_partial is not None:
+                with anyio.move_on_after(supervisor.BEFORE_KILL_TIMEOUT_S):
+                    await self._job.on_partial(partial)
 
     async def _wait_post_collect(self) -> None:
         """Wait for the one post-exit collect until its original deadline."""
         assert self._post_collect is not None
         with anyio.move_on_after(max(0.0, self._collect_deadline - anyio.current_time())) as scope:
-            self._output = await self._post_collect.result()
-            self._collected = True
+            outcome = _Outcome()
+            try:
+                self._output = await self._post_collect.result()
+                self._collected = True
+            except BaseException as error:
+                # Preserve direct-call identity after giving cancellation precedence.
+                with contextlib.suppress(Fenced):
+                    outcome.classify(error)
+                raise
         if scope.cancelled_caught:
             await anyio.to_thread.run_sync(note_in_log, self._stderr, "collect timed out")
 
@@ -309,9 +379,6 @@ class _JobRun:
         """Release workspace ownership only after collection and validation finish."""
         try:
             return self._collect(run)
-        except BaseException as error:
-            self._collect_error = error
-            raise
         finally:
             self.collect_finished.set()
 
@@ -441,17 +508,35 @@ class _JobRun:
         """Read and publish exactly one bounded log in the storage worker."""
         return self._artifacts.put_bytes(self._read_log(rel))
 
+    @property
+    def publication_finished(self) -> bool:
+        """Whether every publication worker has released workspace access."""
+        return self._publication is None or self._publication.finished.is_set()
+
+    async def _workspace_io(
+        self, operation: Callable[..., _T], *args: Any, validation: bool = False
+    ) -> _T:
+        """Track one supervised workspace operation, revoking it if not yet started."""
+        call = _WorkspaceCall(operation, args)
+        self._publication = call
+        try:
+            if validation:
+                return await _validated_io(call.run)
+            return await _storage_io(call.run)
+        finally:
+            call.abandon()
+
     async def _finish(
         self, output: ToolOutput, times: tuple[datetime, datetime] | None
     ) -> ToolOutput:
         """Await each object separately so abandonment cannot publish the next one."""
         update: dict[str, Any] = {}
         try:
-            paths = await _validated_io(self._output_paths, output.files)
+            paths = await self._workspace_io(self._output_paths, output.files, validation=True)
             files: list[FileRef] = []
             left = self._max_output
             for path in paths:
-                ref = await _storage_io(self._upload_file, path, left)
+                ref = await self._workspace_io(self._upload_file, path, left)
                 if isinstance(ref, str):
                     raise ValueError(ref)
                 files.append(ref)
@@ -466,7 +551,7 @@ class _JobRun:
         # stdout first: a note about it must reach stderr before stderr is read.
         hashes = []
         for rel in (_STDOUT, _STDERR):
-            hashes.append(await _storage_io(self._upload_log, rel))
+            hashes.append(await self._workspace_io(self._upload_log, rel))
         update["logs_ref"] = format_logs_ref(hashes[0], hashes[1])
         if times is not None:
             update["started_at"], update["ended_at"] = times
