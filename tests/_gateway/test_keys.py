@@ -893,6 +893,41 @@ async def test_row_recording_preserves_registered_controls(
         assert_secret_absent(caught.value, SECRET)
 
 
+@pytest.mark.parametrize("signal", ["keyboard", "system", "generator", "cancellation"])
+async def test_row_recording_preserves_base_exceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    signal: str,
+) -> None:
+    from swarm_arena._gateway import keys
+
+    error_type = {
+        "keyboard": KeyboardInterrupt,
+        "system": SystemExit,
+        "generator": GeneratorExit,
+        "cancellation": anyio.get_cancelled_exc_class(),
+    }[signal]
+    error = error_type("row interrupted")
+    attempted: list[str] = []
+    gw = MemoryGateway()
+    async with open_llm_run(tmp_path) as run:
+        manager = _manager(gw, run)
+        record, _ = await _open(manager, run)
+        gw.rows = [_row(request_id=name) for name in ("interrupted", "late")]
+
+        async def interrupt(**kwargs: Any) -> Any:
+            attempted.append(kwargs["litellm_call_id"])
+            raise error
+
+        monkeypatch.setattr(keys, "record_call", interrupt)
+        with pytest.raises(error_type) as caught:
+            await manager.read([record], wait_first=False)
+        assert caught.value is error
+        assert attempted == [gateway_call_id(record.key_id, "interrupted")]
+        assert "gateway spend row recording failed" not in caplog.messages
+
+
 async def test_row_recording_preserves_caller_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
