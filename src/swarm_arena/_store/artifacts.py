@@ -2,7 +2,7 @@
 
 import contextlib
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Final
 
@@ -65,7 +65,8 @@ class ArtifactStore:
         basename must satisfy ``FileRef.path`` rules, including reserved names.
         Reads refuse symlinks in every component and nonregular sources, and
         cap each file at 1 GiB before reading. Hashing and publication use
-        1 MiB chunks and atomic, write-once local storage.
+        1 MiB chunks. Local storage streams atomically; other backends accumulate
+        at most the byte cap before a write-once byte publication.
 
         Parameters
         ----------
@@ -117,11 +118,25 @@ class ArtifactStore:
             raise StorageError("artifact source read failed") from None
         return FileRef(name=path.name, path=path.name, sha256=digest, size=size)
 
-    def _put_chunks(self, chunks: Iterable[bytes]) -> tuple[str, int]:
-        """Publish local artifact chunks without adding a streaming Store API."""
-        if not isinstance(self._store, LocalStore):
-            raise StorageError("streamed artifacts require local storage")
-        return self._store._create_artifact(chunks)
+    def _put_chunks(
+        self, chunks: Iterable[bytes], *, max_bytes: int = _MAX_ARTIFACT_BYTES
+    ) -> tuple[str, int]:
+        """Publish capped chunks, streaming locally or buffering one remote object."""
+
+        def bounded() -> Iterator[bytes]:
+            size = 0
+            for chunk in chunks:
+                size += len(chunk)
+                if size > max_bytes:
+                    raise StorageError("artifact crosses the size cap")
+                yield chunk
+
+        if isinstance(self._store, LocalStore):
+            return self._store._create_artifact(bounded())
+        data = bytearray()
+        for chunk in bounded():
+            data.extend(chunk)
+        return self.put_bytes(bytes(data)), len(data)
 
     def get_bytes(self, sha256: str) -> bytes:
         """Read artifact contents and verify their digest.
@@ -156,8 +171,10 @@ class ArtifactStore:
     def fetch(self, sha256: str, dest: Path, *, read_only: bool = True) -> None:
         """Write verified contents to a destination with explicit permissions.
 
-        Reads are capped at 1 GiB and refuse symlinks or special files. A
-        destination is published atomically through pinned directories; no
+        Sources over 1 GiB are refused. Local reads check size before reading
+        and refuse symlinks or special files. Other backends return a complete
+        byte object, checked before writing. A destination is published
+        atomically through pinned directories; no
         symlinked directory or leaf is followed and hardlinks are replaced.
 
         Parameters
@@ -189,10 +206,15 @@ class ArtifactStore:
         from swarm_arena._tooling.materialize import _directory, _write
         from swarm_arena._tooling.result_file import read_regular_file
 
-        if not isinstance(self._store, LocalStore):
-            raise StorageError("artifact fetch requires local storage")
         try:
-            data = read_regular_file(Path(self._store.url), sha256, max_bytes=_MAX_ARTIFACT_BYTES)
+            if isinstance(self._store, LocalStore):
+                data = read_regular_file(
+                    Path(self._store.url), sha256, max_bytes=_MAX_ARTIFACT_BYTES
+                )
+            else:
+                data = _read_blob(self._store, sha256).data
+                if len(data) > _MAX_ARTIFACT_BYTES:
+                    raise StorageError("artifact crosses the size cap")
             if sha256_hex(data) != sha256:
                 raise StorageError("artifact failed its hash check")
             absolute = dest.absolute()

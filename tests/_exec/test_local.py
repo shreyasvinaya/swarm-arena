@@ -1400,7 +1400,9 @@ def test_user_keyboard_interrupt_still_propagates(
             started_at=utc_now(),
             ended_at=utc_now(),
         )
-        runner = local_run._JobRun(job, staged, workspace, artifacts, LocalExecutor.Config())
+        runner = local_run._JobRun(
+            job, staged, workspace, artifacts, max_log_bytes=1024, max_output_bytes=1024
+        )
         with pytest.raises(KeyboardInterrupt):
             runner._collect(run)
 
