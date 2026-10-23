@@ -111,19 +111,31 @@ object_store_cap_mib = 256
 
 `RayExecutor()` validates settings without I/O. Its first operation connects to
 an existing cluster in a worker thread. `address` chooses the cluster;
-`ray://` addresses are refused. `poll_s` controls worker subprocess polling.
+`ray://` addresses are refused. If `address` is not `"auto"`, it must match the
+connected runtime's GCS address; a mismatch fails with a value-free error.
+This check prevents Ray's process-wide existing connection from silently
+overriding an explicit address. `poll_s` controls worker subprocess polling.
 `cancel_margin_s` adds time after the job's grace period for soft cancellation
 and bounds recovery operations, including connection and lock waits. Both
-intervals must be finite and positive. An abandoned connection attempt is not
-retried by that executor; create a new executor if a connection failed or its
-caller stopped waiting. `aclose()` leaves the shared Ray connection open and
-never calls `ray.shutdown()`.
+intervals must be finite and positive. Initialization is single-flight per
+executor: if a caller stops waiting, the next caller rejoins the same attempt
+under its own allowance and can adopt a successful connection. A failed attempt
+can be retried by a later caller, after the previous attempt has finished.
+The abandoned caller cannot dispatch work after its lifetime ends. `aclose()`
+leaves the shared Ray connection open and never calls `ray.shutdown()`.
+
+Ray may log `SIGTERM handler is not set because current thread is not the main
+thread.` during this initialization. The warning is retained: initialization
+stays off the event loop so it cannot block lease renewal or cancellation.
 
 Each job gets one task named with its job ID. When provided, `on_started`
 receives the dispatch intent and original Ray driver job ID before submission.
-A failed callback prevents submission. Tasks are not resubmitted after a Ray
+A failed callback prevents submission. Payload serialization and `ray.put`
+finish in an abandonable preparation worker before that intent; the event loop
+submits the resulting object reference. Tasks are not resubmitted after a Ray
 error. Out-of-memory failures become `oom`; other Ray failures become `error`
-with type-only diagnostics.
+with type-only diagnostics. Core artifact-storage failures propagate to the
+owner rather than becoming ordinary candidate errors.
 
 Resources map directly to logical Ray requests: `cpus` to `num_cpus`, `gpus`
 to `num_gpus`, `memory_gib` to integer bytes, and `custom` to named resources.
@@ -152,18 +164,24 @@ it for the whole allowance, the job returns an error and is cancelled. The
 clock resets when a fitting node joins or becomes visible. A feasible request
 waiting for busy resources keeps its queue position; this schedule limit does
 not expire it. Queue time still counts toward the enclosing round timeout.
-Unavailable resource/state evidence is handled conservatively. Outside a run,
-the executor uses 600 seconds.
+Unavailable resource/state evidence is handled conservatively. Pending jobs
+share one resource snapshot per executor per second, and a stalled resource RPC
+is rejoined rather than duplicated. The scheduling watch stops polling once
+the task is no longer pending. Outside a run, the executor uses 600 seconds.
 
 Cancellation is shielded: request `ray.cancel(ref)`, wait up to
 `grace_s + cancel_margin_s`, then request `ray.cancel(ref, force=True)` even if
-the soft step failed. The force request has its own bounded margin. Pending
+the soft step failed. The soft wait, force request and partial callback share
+that single deadline; the latter steps get only its remaining time. Pending
 work is cancelled before it can later start. A soft-cancelled worker may return
 a collected partial; only `Job.on_partial` receives it. As with LocalExecutor,
 that result retains data and drops file, log and report references, and starts
 no new artifact upload. A timed-out or failed partial wait gives an empty
-`cancelled` result. A schedule timeout has no partial callback. Hard process
-controls propagate unchanged.
+`cancelled` result. As with LocalExecutor, pending caller cancellation wins over
+any callback failure, including a registered control; a successful callback
+receives the data-only partial exactly once. A schedule timeout has no partial
+callback. Hard process controls synchronously request force cancellation and
+then propagate unchanged, without awaited cleanup.
 
 Ray preserves its assigned `CUDA_VISIBLE_DEVICES` in the tool subprocess.
 Ray resources are logical scheduling quantities, so subprocess resource limits
