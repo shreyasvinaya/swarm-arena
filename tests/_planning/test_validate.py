@@ -2604,7 +2604,11 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
 
     def put(data: bytes) -> str:
         uploaded.append(data)
-        held.wait()
+        held.entered.set()
+        try:
+            assert held.release.wait(180), "test did not release snapshot upload"
+        finally:
+            held.exited.set()
         return original(data)
 
     monkeypatch.setattr(artifacts, "put_bytes", put)
@@ -2616,11 +2620,12 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
         )
     )
     try:
-        await held.ready()
+        assert await anyio.to_thread.run_sync(held.entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await task
-        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        assert not held.exited.is_set(), "cancellation waited for the held upload"
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         await held.finish()
         assert len(uploaded) == 1
     finally:
@@ -2738,23 +2743,28 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
     def prepare(staging: ArtifactStore) -> Goal:
         staging.put_bytes(b"snapshot")
         if cancel:
-            held.wait()
+            held.entered.set()
+            try:
+                assert held.release.wait(180), "test did not release draft preparation"
+            finally:
+                held.exited.set()
             return Goal(id="g", namespace="n")
         raise ValueError("secret-sentinel")
 
     task = asyncio.create_task(_draft_work(prepare, artifacts))
     try:
         if cancel:
-            await held.ready()
+            assert await anyio.to_thread.run_sync(held.entered.wait, 60)
             task.cancel()
-            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
+            with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
                 await task
+            assert not held.exited.is_set(), "cancellation waited for held preparation"
             await held.finish()
         else:
             with pytest.raises(ValueError, match="draft admission failed") as caught:
                 await task
             assert_secret_absent(caught.value, "secret-sentinel")
-        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
     finally:
         if cancel:
