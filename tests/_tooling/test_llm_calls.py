@@ -507,6 +507,9 @@ def test_report_artifact_s3_fetch_is_bounded(monkeypatch: pytest.MonkeyPatch, ca
     gets: list[dict[str, Any]] = []
 
     class Body:
+        def __init__(self) -> None:
+            self.remaining = data + b"x" if case == "growth" else data
+
         async def __aenter__(self) -> "Body":
             return self
 
@@ -515,7 +518,8 @@ def test_report_artifact_s3_fetch_is_bounded(monkeypatch: pytest.MonkeyPatch, ca
 
         async def read(self, size: int) -> bytes:
             reads.append(size)
-            return (data + b"x" if case == "growth" else data)[:size]
+            chunk, self.remaining = self.remaining[:size], self.remaining[size:]
+            return chunk
 
     def call(method: str, **kwargs: Any) -> Any:
         if method == "head_object":
@@ -542,7 +546,7 @@ def test_report_artifact_s3_fetch_is_bounded(monkeypatch: pytest.MonkeyPatch, ca
     if case == "head_oversize":
         assert gets == reads == []
     else:
-        assert reads == [ref.size + 1]
+        assert reads == ([ref.size + 1, 1] if case == "valid" else [ref.size + 1])
         assert gets[0].get("Range") == (f"bytes=0-{ref.size}" if ref.size else None)
 
 
