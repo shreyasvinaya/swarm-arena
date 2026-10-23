@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Named task and worker evidence on the shared, two-CPU Ray head."""
 
 import time
@@ -7,9 +9,10 @@ from typing import Any, TypedDict, TypeVar
 from uuid import uuid4
 
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.tools import WORKER_SCRIPTS, make_job
 
-pytest.importorskip("swarm_arena.ray")
+ray_dependency()
 
 # isort: split
 import ray

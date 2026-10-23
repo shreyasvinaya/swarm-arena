@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 """Recover an actual Ray task after its dispatching CLI driver dies."""
 
 import json
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.tools import WORKER_SCRIPTS
 from e2e.test_crash_resume import _committed_events, _wait_for, _wait_run_dir
 
@@ -26,7 +29,7 @@ from swarm_arena import (
 )
 from tests.ray.conftest import ray_driver as ray_driver
 
-pytest.importorskip("swarm_arena.ray")
+ray_dependency()
 
 # isort: split
 from swarm_arena.ray import RayExecutor

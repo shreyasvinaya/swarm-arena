@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 
 import anyio
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.ray_transport import isolated_ray_filesystem  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
@@ -146,7 +147,7 @@ async def test_function_tool(local_executor: LocalExecutor) -> None:
 async def test_check_tool_on_ray_matches_local(
     ray_cluster: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import RayExecutor
 
     examples = (await anyio.to_thread.run_sync(Path(__file__).resolve)).parents[2] / "examples"
@@ -167,7 +168,7 @@ async def test_check_tool_on_ray_matches_local(
 @pytest.mark.ray
 @pytest.mark.usefixtures("isolated_ray_filesystem")
 async def test_check_tool_on_ray_transports_files_and_edits(ws: Path) -> None:
-    pytest.importorskip("swarm_arena.ray")
+    ray_dependency()
     from swarm_arena.ray import RayExecutor
     from swarm_arena.testing import read_logs, read_output_file
 
@@ -179,6 +180,9 @@ async def test_check_tool_on_ray_transports_files_and_edits(ws: Path) -> None:
         "data = {name: Path(f'problem/{name}.txt').read_text() for name in ('a', 'b')}\n"
         "data['helper'] = Path('tool/helper.txt').read_text()\n"
         "request = json.loads(Path('swarm/request.json').read_text())\n"
+        f"forbidden = {str(ws)!r}\n"
+        "assert forbidden not in json.dumps(request)\n"
+        "assert all(forbidden not in value for value in os.environ.values())\n"
         "data['inputs'] = request['params']\n"
         "data['parents'] = []\n"
         "for root in sorted(Path('parents').glob('*')):\n"

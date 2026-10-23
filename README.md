@@ -85,7 +85,8 @@ Install the current development source and select the executor in `run.toml`:
 uv add 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena'
 # run.toml: executor = { path = "swarm_arena.ray:RayExecutor" }
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-uv run swarm-arena submit --address http://<head>:8265 --working-dir . --yes run.toml plan.toml
+# In another terminal: ssh -N -L 8265:127.0.0.1:8265 <head>
+uv run swarm-arena submit --address http://127.0.0.1:8265 --working-dir . --yes run.toml plan.toml
 ```
 
 Provision workers, module paths and authentication as described in

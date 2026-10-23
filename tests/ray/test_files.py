@@ -1,9 +1,11 @@
-import importlib.metadata
+# ruff: noqa: E402
+# Check the optional runtime before importing its modules.
 import struct
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.dependencies import ray_dependency
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed
@@ -13,10 +15,7 @@ from swarm_arena._store.local import LocalStore
 from swarm_arena.executor import Job
 from swarm_arena.tool import FileRef, ParentRef
 
-try:
-    importlib.metadata.version("ray")
-except importlib.metadata.PackageNotFoundError:
-    pytest.skip("Ray transport tests require the ray extra", allow_module_level=True)
+ray_dependency()
 
 # isort: split
 from swarm_arena.ray._files import (

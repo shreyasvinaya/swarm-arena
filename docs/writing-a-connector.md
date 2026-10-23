@@ -433,7 +433,8 @@ jobs:
       - run: uv run pytest -n 0 tests/testing/test_conformance.py tests/e2e/test_rosenbrock_ray.py -m "not s3" -v
 ```
 
-The repository's shared `ray_cluster` fixture owns the head. It launches the
+The repository's shared `ray_cluster` fixture owns the head. Its **CI-only
+two-CPU limit** keeps test load bounded. It launches the
 equivalent of `uv run ray start --head --num-cpus=2 --include-dashboard=true
 --disable-usage-stats --block` using the current Python interpreter, with
 isolated ports and a short temporary directory. Readiness includes a successful
@@ -455,14 +456,19 @@ using the `RouteTool` from this guide:
 import pytest
 
 from my_connector.tools import RouteTool
+from swarm_arena.ray import RayExecutor
 from swarm_arena.testing import check_tool, read_logs
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 @pytest.mark.ray
 async def test_tool_on_ray(ray_cluster: str) -> None:
-    pytest.importorskip("swarm_arena.ray")
-    from swarm_arena.ray import RayExecutor
-
     executor = RayExecutor()
     try:
         output = await check_tool(RouteTool(), {"target": "CCO"}, executor=executor)
@@ -472,6 +478,16 @@ async def test_tool_on_ray(ray_cluster: str) -> None:
     finally:
         await executor.aclose()
 ```
+
+Register `ray` under `[tool.pytest.ini_options]` in `pyproject.toml`, for
+example `markers = ["ray: requires a Ray cluster"]`, including when using
+`--strict-markers`. The AnyIO marker and backend fixture make the async test
+runnable without `anyio_mode = "auto"`. This dedicated Ray job imports the
+runtime directly: a missing extra or broken installation fails the job.
+For mixed core/extras suites, skip only when the `ray` **distribution** is
+absent; when installed, any failure to import `swarm_arena.ray` must fail.
+The repository uses one shared `ray_dependency()` test helper for that rule;
+`CI` does not change the decision.
 
 Keep tests for `check_check` and `check_judge` alongside this tool case, and
 use `check_manager` with the registered `FakeModel` catalog shown below for
