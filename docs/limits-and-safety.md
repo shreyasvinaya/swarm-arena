@@ -295,8 +295,10 @@ events include the nonsecret key and candidate IDs for later recovery.
 The KeyManager and reconciliation exception handlers do not convert
 `KeyboardInterrupt`, `SystemExit`, `GeneratorExit`, or groups containing them
 into gateway failures, or start compensating cleanup for those controls.
-This statement applies to controls that reach these handlers. Caller cancellation
-and registered ownership/terminal controls retain their existing handling.
+This applies to controls that reach those handlers in the awaiting task;
+controls raised inside adapter worker threads are contained as type-only
+failures like other worker-thread work. Caller cancellation and registered
+ownership/terminal controls retain their existing handling.
 
 A key created just before the open deadline but never journaled is unusable
 (its bearer never left the driver), expires after `key_duration_s`, and is not
@@ -530,6 +532,14 @@ that produces an error output. Collection converts ordinary exceptions and
 interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
 The engine classifies those transported outcomes at its supervised boundary,
 where it can distinguish caller cancellation from a hook-raised failure.
+
+At supervised outcome boundaries, hard controls raised by user code or worker
+thread work are contained as type-only failures. Hard controls raised by the
+awaiting run/resume body retain their identity through cleanup. In library mode,
+a raw `KeyboardInterrupt` delivered while a gateway, executor, or report call's
+coroutine frame is running may be recorded as that call's failure: the frame
+cannot distinguish it from a worker outcome. The CLI's owned SIGINT handling,
+or a library SIGINT handler that cancels the task, avoids this ambiguity.
 
 A hook-created `Fenced` exception does not establish ownership loss, whether
 raised directly or nested in an exception group. Only the journal's fenced
