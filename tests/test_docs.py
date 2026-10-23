@@ -29,6 +29,18 @@ def test_optional_install_examples_use_prerelease_uv() -> None:
         assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
 
 
+def test_roadmap_records_supported_llm_dependency_deviation() -> None:
+    text = (ROOT / ROADMAP).read_text()
+    constraints = text.split("### R5.1 ", 1)[1].split("### R5.2 ", 1)[0]
+    decisions = text.split("### R5.4 ", 1)[1]
+    for section in (constraints, decisions):
+        assert "openai-agents[litellm]>=0.24,<0.25" in section
+        assert "litellm>=1.107.0rc2,<1.108" in section
+    assert "Ruling P39" in decisions
+    assert "M5" in decisions
+    assert "1.107.0 final" in decisions
+
+
 @pytest.mark.parametrize(
     ("module", "name"),
     [
