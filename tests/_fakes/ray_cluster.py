@@ -10,6 +10,7 @@ import tempfile
 import time
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
+from http.client import HTTPException
 from pathlib import Path
 from typing import TextIO
 from urllib.request import urlopen
@@ -71,7 +72,7 @@ def _state_ready(port: int, timeout: float) -> bool:
         data = body.get("data")
         result = data.get("result") if isinstance(data, dict) else None
         return isinstance(result, dict) and isinstance(result.get("result"), list)
-    except (OSError, ValueError):
+    except (OSError, ValueError, HTTPException):
         return False
 
 
