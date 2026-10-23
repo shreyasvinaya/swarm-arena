@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+_RAY_HINT = 'uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+
 # The module list of test_public_api.PUBLIC, repeated so this test stands alone.
 PUBLIC = (
     "swarm_arena",
@@ -169,7 +171,7 @@ def test_ray_facade_error_without_extra() -> None:
         timeout=30,
     )
     assert result.returncode != 0
-    assert "pip install 'swarm-arena[ray]'" in result.stderr
+    assert _RAY_HINT in result.stderr
 
 
 def test_ray_facade_error_with_tests_dir_on_path() -> None:
@@ -182,7 +184,7 @@ def test_ray_facade_error_with_tests_dir_on_path() -> None:
         timeout=30,
     )
     assert result.returncode != 0
-    assert "pip install 'swarm-arena[ray]'" in result.stderr
+    assert _RAY_HINT in result.stderr
     assert "ModuleNotFoundError" in result.stderr
     assert "ray-secret-sentinel" not in result.stderr
 
@@ -231,4 +233,4 @@ import swarm_arena.ray
         [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO_ROOT, timeout=30
     )
     assert result.returncode != 0
-    assert "pip install 'swarm-arena[ray]'" in result.stderr
+    assert _RAY_HINT in result.stderr
