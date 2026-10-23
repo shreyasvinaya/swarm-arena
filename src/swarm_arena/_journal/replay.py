@@ -413,7 +413,18 @@ class RunState:
                 self.plan_first_rounds.setdefault(event.goal_id, []).append(first_round)
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
-                self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
+                if payload.get("action") == "keep_charged":
+                    old = self.reservations[reservation["id"]]
+                    if old.state != "open" or reservation != {
+                        **old.reservation,
+                        "keep_charged": True,
+                    }:
+                        raise ValueError("invalid reservation promotion")
+                    self.reservations[reservation["id"]] = old.model_copy(
+                        update={"reservation": reservation}
+                    )
+                else:
+                    self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
             case EventType.SETTLE:
                 id = payload["id"]
                 self.reservations[id] = self.reservations[id].model_copy(

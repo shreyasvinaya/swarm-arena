@@ -2322,18 +2322,26 @@ async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, paren
     # Replicate allocation hooks have type-only diagnostics; release uses retained allocation data without hooks.
     # AgentContext.run_tool applies the gate and counts the turn, then calls execute_tool_run, which owns every other check.
     # With a gateway, needs_key(tool.providers(), effective_secret_env(tool)) controls keying (R5.4 item 18).
-    # Reserve with keep_charged=keyed. Keyed zero-USD reservations fail without key creation or dispatch;
-    # all keyed reservations stay fully charged, including failed creation, cancellation and dispatch refusal.
+    # Reserve refundable during preparation. Immediately before open, durably promote keep_charged;
+    # reserve action=keep_charged updates the existing reservation without another debit.
+    # Pre-open failures (including zero-USD refusal) refund; attempted creation and later failures retain the charge.
+    # Keyed settlement reports tokens only as actual, estimated=True; self-reported USD stays informational.
     # Gateway URLs use Job.env; the virtual key uses Job.secret_values. Unkeyed jobs drop REPLACED_KEYS (R4.7).
     # Open before submit; close after collection. Outer cancellation/fencing uses bounded no-journal revoke.
-    # Cleanup inherits caller/writer limits; no new shield extends an expired owner. Hard process controls pass through.
+    # Cleanup inherits caller/writer limits; an expired owner hands off one bounded external-only block.
+    # Hard process controls, including nested groups containing them, escape without awaited cleanup;
+    # other groups retain revocation, refund, and shared classification.
     # Keyed spend readback stays registered with round completion, under the existing recorder owner.
     # read_with_status returns (observations, 'ok' | 'failed' | 'incomplete'); read remains a list-only wrapper.
     # Failed/unconfirmed closure and failed/incomplete readback retain the result with value-free warnings.
     # Only gateway rows become keyed LLMCall events; reported JSONL is retained with parse warnings for information.
     # Candidate source is 'gateway'; its call IDs contain only observations available at that completion.
-    # Later reads after durable round close, before run completion, and at resume are informational and deduplicated.
-    # Resume preflights final limits before takeover, binds/restores once, and closes keys lacking committed tool_end.
+    # Boundary HTTP reads have their own bounded allowance before completion; expiry journals read_failed.
+    # Round close reads open keys and keys not successfully boundary-read since closure; run end/resume read all.
+    # Resume preflights final limits, rejects missing/changed gateway URLs for gateway_key history, and
+    # binds/restores once, closing every key without confirmed closed_at even when its candidate finished.
+    # Failure payloads carry key_id/candidate_id with value-free errors; gateway URL comparisons omit userinfo.
+    # Unreplaced-key warnings state that unkeyed runs get the node value and bypass the gateway.
     # The shared GatewayKeyAction vocabulary is created/closed/read_failed/close_failed; only created/closed restore state.
 
 class Inflight:

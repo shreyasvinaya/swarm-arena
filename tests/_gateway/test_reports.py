@@ -52,3 +52,18 @@ def test_producer_and_replay_reject_the_same_bad_row(patch: dict[str, Any]) -> N
     with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
         RunState.from_events([event])
     assert_secret_absent(caught.value, "SECRET")
+
+
+@pytest.mark.parametrize("action", ["read_failed", "close_failed"])
+def test_key_failure_requires_nonsecret_identity(action: str) -> None:
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    payload = dict(
+        action=action, key_id="hash", candidate_id="candidate", error="gateway read failed"
+    )
+    assert GatewayKeyFailure.model_validate(payload).model_dump() == payload
+    for field in ("key_id", "candidate_id"):
+        with pytest.raises(ValueError, match="missing"):
+            GatewayKeyFailure.model_validate({k: v for k, v in payload.items() if k != field})
+    with pytest.raises(ValueError, match="literal_error"):
+        GatewayKeyFailure.model_validate({**payload, "error": "external secret detail"})

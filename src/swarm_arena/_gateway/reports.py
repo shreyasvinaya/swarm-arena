@@ -13,6 +13,31 @@ GatewayKeyAction = Literal["created", "closed", "read_failed", "close_failed"]
 GatewayReadStatus = Literal["ok", "failed", "incomplete"]
 
 
+class GatewayKeyFailure(FrozenModel):
+    """Identify a value-free failed key operation for later reconciliation.
+
+    Parameters
+    ----------
+    action : {'read_failed', 'close_failed'}
+        Lifecycle operation that remains unconfirmed.
+    key_id, candidate_id : str
+        Nonsecret key and invocation identities.
+    error : str
+        Fixed diagnostic without external values.
+
+    Examples
+    --------
+    >>> GatewayKeyFailure(action="read_failed", key_id="k", candidate_id="c",
+    ...     error="gateway read failed").action
+    'read_failed'
+    """
+
+    action: Literal["read_failed", "close_failed"]
+    key_id: GatewayId
+    candidate_id: GatewayId
+    error: Literal["gateway read failed", "gateway read incomplete", "gateway closure unconfirmed"]
+
+
 class KeyReport(FrozenModel):
     """Validate one key's report without changing ledger settlement.
 

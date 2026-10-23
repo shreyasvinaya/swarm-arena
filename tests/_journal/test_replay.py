@@ -1155,3 +1155,36 @@ def test_gateway_shared_report_round_trips_every_label(label: str) -> None:
     assert projection.observed_usd == report.keys[0].observed_usd
     assert projection == report.keys[0]
     assert report.spend_usd() == (1.0 if label == "estimated" else 0.25)
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_reservation_promotion_preserves_identity_and_state(settled: bool) -> None:
+    initial = _reserve(3, "r-1")
+    promotion = _ev(
+        5,
+        "reserve",
+        {
+            "action": "keep_charged",
+            "reservation": {**initial.payload["reservation"], "keep_charged": True},
+        },
+    )
+    prior = [*_PRE, initial, *([_settle(4, "r-1")] if settled else [])]
+    if settled:
+        with pytest.raises(ValueError, match="invalid journal replay payload"):
+            RunState.from_events([*prior, promotion])
+    else:
+        state = RunState.from_events([*prior, promotion])
+        assert state.reservations["r-1"].state == "open"
+        assert state.reservations["r-1"].reservation["keep_charged"] is True
+        assert len(state.reservations) == 1
+    for field, value in (("holder", "other"), ("amount", {"tokens": 0, "usd": 2.0})):
+        corrupt = promotion.model_copy(
+            update={
+                "payload": {
+                    "action": "keep_charged",
+                    "reservation": {**promotion.payload["reservation"], field: value},
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="invalid journal replay payload"):
+            RunState.from_events([*prior, corrupt])

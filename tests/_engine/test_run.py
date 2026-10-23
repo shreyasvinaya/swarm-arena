@@ -2406,7 +2406,7 @@ async def test_run_end_reads_late_rows_and_shares_gateway_across_rounds(
     await Swarm(config).run(gateway_plan(rounds=2, converge_team=True))
     assert len(managers) == 1
     assert len(fake_gateway.keys) == 3
-    assert len(boundary_reads) >= 3
+    assert boundary_reads == [1, 1, 3]
     calls = events(config, "llm_call")
     late = next(row for _, row in fake_gateway._spend if row["litellm_call_id"] == "late-run-end")
     late_id = gateway_call_id(late["api_key"], late["request_id"])
@@ -2456,5 +2456,63 @@ async def test_gateway_boundary_read_failure_is_journaled_and_run_continues(
     assert {k: v for k, v in failures[0].payload.items() if k != "run_elapsed_s"} == {
         "action": "read_failed",
         "error": "gateway read failed",
+        "key_id": next(iter(fake_gateway.keys)),
+        "candidate_id": result["g"][0].id,
     }
     assert fake_gateway.master_key not in repr(failures)
+
+
+@pytest.mark.parametrize("boundary", ["round", "end"])
+async def test_stopping_run_slow_gateway_read_finishes(
+    run_config: RunConfig,
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "settle_timeout_s": 0.5,
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original_read = KeyManager.read_with_status
+    original_queue = module.RunRunner._queue
+
+    async def queue(self: Any, deps: Any) -> Any:
+        result = await original_queue(self, deps)
+        deps.stops.stop = True
+        return result
+
+    calls = 0
+
+    async def slow(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        nonlocal calls
+        if not wait_first:
+            calls += 1
+        selected = not wait_first and calls == (1 if boundary == "round" else 2)
+        if selected:
+            fake_gateway.delay["/spend/logs/v2"] = 3
+        try:
+            return await original_read(self, records, wait_first=wait_first)
+        finally:
+            fake_gateway.delay.pop("/spend/logs/v2", None)
+
+    monkeypatch.setattr(module.RunRunner, "_queue", queue)
+    monkeypatch.setattr(KeyManager, "read_with_status", slow)
+    with anyio.fail_after(30):
+        result = await Swarm(config).run(gateway_plan())
+    assert result["g"]
+    failures = [e for e in events(config, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 1
+    assert failures[0].payload["error"] == "gateway read incomplete"
+    assert failures[0].payload["key_id"] in fake_gateway.keys
