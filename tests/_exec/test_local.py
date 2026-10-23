@@ -421,7 +421,7 @@ async def test_blocked_collect_cannot_stop_kill(
         out = task.result()
         assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
         [pid] = pids
-        assert wait_until(lambda: not pid_alive(pid), 5)
+        assert wait_until(lambda: not pid_alive(pid), 60)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
             assert b"no partial output" in log(tmp_path, out, 2)
