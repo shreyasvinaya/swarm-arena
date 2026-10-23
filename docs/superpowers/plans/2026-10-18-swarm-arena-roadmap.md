@@ -160,7 +160,7 @@ Every milestone also updates: the `__all__` snapshot test (`tests/test_public_ap
   ```
   Required: `test_ray_cancel.py` (a soft cancel gives a partial output; a force cancel kills grandchildren), `test_ray_dispatch_crash.py` (driver killed after the dispatch intent, then `resume` finds the task by name, and the run is `lost`), `tests/e2e/test_rosenbrock_ray.py`, and `test_gateway_run.py` (key per LLM tool run only, full reservation held, reconcile labels). Manual check only: `uv run pytest -m gateway_live` against a real LiteLLM Proxy.
 - **Dependencies:** M2 (S3 artifacts, lease for reconcile), M3 (`record_call` in the core module `_journal/llm_record.py`, so the gateway client needs no `llm` extra).
-- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except two fields: `ToolOutput.llm_calls_file` (+M4: a bounded optional reported-calls artifact must travel from the executor or Ray worker to the driver, §4.3; collection diagnostics remain private) and `Job.drop_env` (`build_env` runs on the executor side and must not resolve real provider keys for a keyed run, §7.3 item 2a step 2); change the LLM layer beyond the shared recording path; add container or SSH executors.
+- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except two fields: `ToolOutput.llm_calls_file` (+M4: a bounded optional reported-calls artifact must travel from the executor or Ray worker to the driver, §4.3; collection diagnostics remain private) and `Job.drop_env` (+M4: executor-side allowlists discard real provider keys before explicit gateway overlays, including after Ray payload transport, §7.3 item 2a step 2); change the LLM layer beyond the shared recording path; add container or SSH executors.
 
 ### M5 Release 0.1.0
 
@@ -256,10 +256,10 @@ Rules [plan]:
 | `_tooling/result_file.py` | Parse and validate `swarm/result.json`; write `swarm/request.json`; `NOTE_PREFIX`, `MAX_DECLARED_FILES`, collection byte-budget context | M1a | `tests/_tooling/test_result_file.py` |
 | `_tooling/llm_calls.py` | Collect `swarm/llm_calls.jsonl`; set `llm_calls_source` | M4 | `tests/_tooling/test_llm_calls.py` |
 | `_exec/__init__.py` | Empty | M1a | — |
-| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` | M1a | `tests/_exec/test_executor.py` |
+| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started`; `Job.drop_env` excludes node/file values before driver overlays | M1a +M4 | `tests/_exec/test_executor.py` |
 | `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (shared isolated launcher argv; local group ownership unchanged) | M1a +M4 | `tests/_exec/test_supervisor.py` |
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
-| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
+| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are removed after node/file allowlists, before explicit environment, result-path and secret-value overlays (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/threads.py` | `run_sync_daemon` and the daemon-call holder: run blocking user code on a daemon thread that never blocks interpreter exit | M1a | `tests/_exec/test_threads.py` |
 | `_exec/job_steps.py` | Shared staged carrier, preparation, one-shot daemon collection, bounded per-object publication and transported edit restoration | M4 | `tests/_exec/test_job_steps.py`, `tests/_exec/test_local_run.py`, `tests/_exec/test_output_bounds.py` |
@@ -1364,8 +1364,18 @@ class ArenaBoard(Board):
 
 ### R4.7 `swarm_arena.executor`
 
+The private `_gateway.keys.KeyManager(adapter, config, *, cap, journal, settle_timeout_s, run_id)`
+retains the entered writer and explicit run binding. `KeyRecord` stores `run_id`, creation
+`owner_epoch`, and `created_at` before create; resumed reads use the live journal epoch.
+`gateway_call_id(key_id, request_id)` is `"gw:" + sha256_hex(canonical_json([key_id, request_id]))`.
+Gateway rows use the recorder's external-observation path with `settle=False`, never funded scope
+lineage. First-row polling is separately bounded; it never puts a report timer around durable
+recording. Unknown closure/read outcomes retain estimates. The caller owns stop/deadline
+supervision and post-open cleanup; pre-return compensation is bounded by the original
+open allowance and remaining inherited/writer deadline, with no compensating journal write.
+
 ```python
-# _exec/executor.py — M1a
+# _exec/executor.py — M1a +M4
 @dataclass(frozen=True, kw_only=True)
 class Job:
     class Stage(FrozenModel):                   # what the workspace holds; computed in the driver (R4.13.9)
@@ -1402,7 +1412,9 @@ class Job:
         # (gateway virtual keys as OPENAI_API_KEY and ANTHROPIC_API_KEY, M4); they win over env and secret_env. Never
         # journaled, logged, or put in Ray runtime_env; sent to Ray only inside the task payload (R4.13.16). On Ray the
         # payload can sit in the object store, which can spill to worker-local disk (documented in M4 item 9).
-    drop_env: tuple[str, ...] = ()              # [plan] M4: names build_env never takes from the node or the secrets file.
+    drop_env: tuple[str, ...] = ()              # [plan] +M4: remove names after node/file allowlist resolution.
+        # job.env, SWARM_ARENA_RESULT, then job.secret_values still override. The Job dataclass payload carries
+        # this tuple to the Ray worker; LocalExecutor uses the same build_env precedence.
         # gateway_job sets every PROVIDER_KEYS name on a keyed run. With a gateway, every unkeyed tool job gets
         # REPLACED_KEYS. So no tool run gets a real OpenAI or Anthropic key from the node (spec 7.3 item 2a).
     on_started: Callable[["Job.Started"], Awaitable[None]] | None = None   # never serialized; None -> the executor starts
@@ -3127,7 +3139,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 1. Public modules are pure facades; all code is in private modules (R0). Errors visible to users are `ValueError` or `RuntimeError` subclasses, so §9's lists stay exact (R4.0).
 2. `Store` is a sync ABC with conditional `create` and `replace` only and no unconditional put; async callers use `anyio.to_thread` (R4.13.2). The `Board` ABC is sync too.
 3. The core journals every item, then calls `Board.put_*(item, *, epoch, seq)` with the event's position; `put_*` only indexes, and `ArenaBoard` needs no journal handle (R4.6). **Deviation from §4.9 and §7.2** ("`ArenaBoard.put_*` appends to the run's own journal"): the same events go to the same journal, but the core appends them, not the board. Snapshot membership follows R4.6: `RunBoard` filters by position and is rebuilt from `RunState` on resume; `ArenaBoard` indexes its own run from committed chain segments only.
-4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` (optional report transport with real digest/size and bounded collection, +M4) and `Job.drop_env` (R4.2, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
+4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` (optional report transport with real digest/size and bounded collection, +M4) and `Job.drop_env` (executor-side provider-name exclusion before driver overlays, preserved by Ray transport; R4.2, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
 5. Built-in LLM accounting reaches LLM code through an `LLMScope` context variable (R4.13.7), so `Planner.plan` and `Curator.curate` keep the spec's signatures.
 6. `FakeModel` is an Agents SDK `Model` that feeds the same core `record_call` (`_journal/llm_record.py`, R4.13.19) as the LiteLLM logger, the gateway read-back, and `llm_calls.jsonl` collection (R4.12).
 7. JSON-schema subset compiler instead of a `jsonschema` dependency; a deterministic TOML writer instead of `tomli-w` (R4.13.0).

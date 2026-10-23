@@ -815,3 +815,28 @@ def test_remote_boundary_keeps_control_authority(
         ) as caught:
             cast(Any, run_job)._function(payload)
         assert_secret_absent(caught.value, "SENTINEL")
+
+
+def test_drop_env_payload_roundtrip_and_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "real-provider-SENTINEL")
+    monkeypatch.setenv("OPENAI_API_KEY", "real-openai-SENTINEL")
+    job = make_job(
+        command=Command(
+            argv=[
+                sys.executable,
+                "-c",
+                "import os; assert 'GEMINI_API_KEY' not in os.environ; "
+                "assert os.environ['OPENAI_API_KEY'] == 'sk-v'; "
+                "open(os.environ['SWARM_ARENA_RESULT'], 'w').write('{\"data\": {}}')",
+            ],
+            env=["GEMINI_API_KEY", "OPENAI_API_KEY"],
+        ),
+        artifact_root=str(tmp_path / "artifacts"),
+        drop_env=("GEMINI_API_KEY", "OPENAI_API_KEY"),
+        secret_values={"OPENAI_API_KEY": "sk-v"},
+    )
+    restored, _, _ = read_payload(job_payload(job, TaskSettings()))
+    assert restored.drop_env == job.drop_env
+    assert _run(restored, tmp_path).status == RunStatus.OK
