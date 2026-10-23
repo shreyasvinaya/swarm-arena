@@ -9,19 +9,44 @@ from typing import Any
 
 import pytest
 
+from swarm_arena._exec.procinfo import group_has_live_member, process_start_time
+
 _WAIT_PROCESS = subprocess.Popen.wait
 
 
-def reap_children(children: list[tuple[subprocess.Popen[Any], bool]]) -> list[str]:
-    """Kill retained child groups or individual children and bound every reap."""
+def _leader_missing(pid: int) -> bool:
+    """Distinguish a missing leader from an unreadable start-time identity."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def reap_children(children: list[tuple[subprocess.Popen[Any], bool, str | None]]) -> list[str]:
+    """Reap captured children, checking leader identity and liveness before group kills.
+
+    A reaped leader with no current identity can still have live descendants;
+    their group retains its id until its last member exits. A replacement
+    leader or an empty group is never signalled. An unavailable start-time
+    lookup alone is not evidence that the leader is missing.
+    """
     errors: list[str] = []
-    for process, own_group in children:
+    for process, own_group, start_time in children:
         try:
-            # A leader may already be reaped while its held descendants remain.
-            # Only a group created by this test is eligible for group signalling.
             with suppress(ProcessLookupError, PermissionError):
                 if own_group:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    current = process_start_time(process.pid)
+                    same_leader = start_time is not None and current == start_time
+                    leader_gone = (
+                        current is None
+                        and process.poll() is not None
+                        and _leader_missing(process.pid)
+                    )
+                    if (same_leader or leader_gone) and group_has_live_member(process.pid):
+                        os.killpg(process.pid, signal.SIGKILL)
                 elif process.poll() is None:
                     process.kill()
             # Bypass per-instance wait surrogates used by supervisor failure tests.
@@ -34,19 +59,25 @@ def reap_children(children: list[tuple[subprocess.Popen[Any], bool]]) -> list[st
 @pytest.fixture
 def owned_processes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Retain children at creation so entry failures cannot skip their emergency reap."""
-    children: list[tuple[subprocess.Popen[Any], bool]] = []
+    children: list[tuple[subprocess.Popen[Any], bool, str | None]] = []
     original = subprocess.Popen
 
     class OwnedProcess(original):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            children.append((self, bool(kwargs.get("start_new_session"))))
+            own_group = bool(kwargs.get("start_new_session"))
+            index = len(children)
+            children.append((self, own_group, None))
+            # Identity probes spawn ordinary children; only group leaders need
+            # an identity, so capturing the probes cannot recurse.
+            if own_group:
+                children[index] = (self, own_group, process_start_time(self.pid))
 
     monkeypatch.setattr(subprocess, "Popen", OwnedProcess)
     try:
         yield
     finally:
-        leaked = [process for process, _ in children if process.poll() is None]
+        leaked = [process for process, _, _ in children if process.poll() is None]
         errors = reap_children(children)
         assert not leaked, "test left an owned child alive; emergency cleanup ran"
         assert not errors, "; ".join(errors)
