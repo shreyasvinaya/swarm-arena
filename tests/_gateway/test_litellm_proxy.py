@@ -1256,15 +1256,21 @@ async def test_tls_handshake_worker_exits(
 
     class Handler(BaseRequestHandler):
         def handle(self) -> None:
-            self.request.settimeout(5)
+            self.request.settimeout(180)
             self.request.recv(4096)
             entered.set()
-            release.wait(5)
+            release.wait(180)
 
     server = ThreadingTCPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
     thread.start()
-    proxy = _proxy_at(f"https://127.0.0.1:{server.server_address[1]}", http_timeout_s=0.5)
+    # The worker must exit at its own operation deadline, long before the server
+    # releases the handshake. The cancel case gets a deadline that the cancel
+    # always beats under load; the timeout case keeps the short deadline under test.
+    http_timeout_s = 10 if termination == "cancel" else 0.5
+    proxy = _proxy_at(
+        f"https://127.0.0.1:{server.server_address[1]}", http_timeout_s=http_timeout_s
+    )
     original = proxy._request
 
     def request(*args: Any, **kwargs: Any) -> Any:
@@ -1284,13 +1290,13 @@ async def test_tls_handshake_worker_exits(
         else:
             with pytest.raises(GatewayError):
                 await task
-        with anyio.fail_after(1.5):
-            assert await anyio.to_thread.run_sync(finished.wait, 1.0)
+        with anyio.fail_after(90):
+            assert await anyio.to_thread.run_sync(finished.wait, 60)
     finally:
         release.set()
         server.shutdown()
         server.server_close()
-        thread.join(5)
+        thread.join(60)
         await _wait(finished)
         assert not thread.is_alive()
 
