@@ -431,3 +431,75 @@ def test_inline_inputs_supports_immutable_memory_store() -> None:
     artifacts = ArtifactStore(MemoryStore())
     digest = artifacts.put_bytes(b"x")
     assert inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB) == {digest: b"x"}
+
+
+@pytest.mark.parametrize("after_preflight", [False, True])
+def test_inline_inputs_missing_artifact_keeps_not_found_without_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_preflight: bool
+) -> None:
+    from swarm_arena.ray import _files
+
+    artifacts = ArtifactStore(LocalStore(tmp_path))
+    digest = artifacts.put_bytes(b"x")
+    original_size = _files._input_size
+    reads: list[int] = []
+
+    def size_then_remove(store: Any, key: str) -> int:
+        size = original_size(store, key)
+        (tmp_path / key).unlink()
+        return size
+
+    def read(fd: int, count: int) -> bytes:
+        reads.append(count)
+        raise AssertionError("missing artifact caused a byte read")
+
+    if after_preflight:
+        monkeypatch.setattr(_files, "_input_size", size_then_remove)
+    else:
+        (tmp_path / digest).unlink()
+    monkeypatch.setattr(_files.os, "read", read)
+    with pytest.raises(NotFound, match="store key not found"):
+        inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB)
+    assert reads == []
+
+
+@pytest.mark.parametrize("after_preflight", [False, True])
+@pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])
+def test_inline_inputs_nonregular_artifact_keeps_storage_error_without_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_preflight: bool, kind: str
+) -> None:
+    from swarm_arena._errors import StorageError
+    from swarm_arena.ray import _files
+
+    artifacts = ArtifactStore(LocalStore(tmp_path))
+    digest = artifacts.put_bytes(b"x")
+    original_size = _files._input_size
+    reads: list[int] = []
+
+    def replace_object() -> None:
+        path = tmp_path / digest
+        path.unlink()
+        if kind == "directory":
+            path.mkdir()
+        elif kind == "symlink":
+            path.symlink_to(tmp_path / "absent")
+        else:
+            _files.os.mkfifo(path)
+
+    def size_then_replace(store: Any, key: str) -> int:
+        size = original_size(store, key)
+        replace_object()
+        return size
+
+    def read(fd: int, count: int) -> bytes:
+        reads.append(count)
+        raise AssertionError("nonregular artifact caused a byte read")
+
+    if after_preflight:
+        monkeypatch.setattr(_files, "_input_size", size_then_replace)
+    else:
+        replace_object()
+    monkeypatch.setattr(_files.os, "read", read)
+    with pytest.raises(StorageError, match="artifact input read failed"):
+        inline_inputs(Job.Stage(root={"a": digest}), artifacts, cap_bytes=MIB)
+    assert reads == []

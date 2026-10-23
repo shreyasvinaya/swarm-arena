@@ -1,6 +1,5 @@
 import contextlib
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -33,17 +32,11 @@ def fake_launch(
             kwargs["stderr"].flush()
         return Head(failed=failed)
 
-    def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if failed:
-            raise subprocess.CalledProcessError(1, args, stderr="startup diagnostic marker")
-        return subprocess.CompletedProcess(args, 0)
-
     monkeypatch.setattr(helper.subprocess, "Popen", popen)
-    monkeypatch.setattr(helper.subprocess, "run", run)
     monkeypatch.setattr(
         helper.socket, "create_connection", lambda *a, **k: contextlib.nullcontext()
     )
-    monkeypatch.setattr(helper, "_stop_group", lambda process: None, raising=False)
+    monkeypatch.setattr(helper, "_stop_group", lambda process: None)
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     return calls
 
@@ -92,14 +85,8 @@ def test_cluster_cleanup_preserves_primary_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake_launch(monkeypatch)
-    monkeypatch.setattr(helper, "_stop_group", lambda process: "cleanup diagnostic", raising=False)
+    monkeypatch.setattr(helper, "_stop_group", lambda process: "cleanup diagnostic")
 
-    def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if "stop" in args:
-            raise RuntimeError("cleanup diagnostic")
-        return subprocess.CompletedProcess(args, 0)
-
-    monkeypatch.setattr(helper.subprocess, "run", run)
     with pytest.raises(LookupError, match="primary diagnostic"), helper.local_ray_cluster():
         raise LookupError("primary diagnostic")
     assert "cleanup diagnostic" in capsys.readouterr().err
@@ -107,7 +94,7 @@ def test_cluster_cleanup_preserves_primary_error(
 
 def test_cluster_cleanup_failure_after_success_is_visible(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_launch(monkeypatch)
-    monkeypatch.setattr(helper, "_stop_group", lambda process: "cleanup diagnostic", raising=False)
+    monkeypatch.setattr(helper, "_stop_group", lambda process: "cleanup diagnostic")
     with (
         pytest.raises(pytest.fail.Exception, match="cleanup diagnostic"),
         helper.local_ray_cluster(),
