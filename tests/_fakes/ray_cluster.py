@@ -1,5 +1,6 @@
 """Own a small CLI-started Ray head for the test process and its child drivers."""
 
+import json
 import os
 import signal
 import socket
@@ -11,6 +12,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TextIO
+from urllib.request import urlopen
 
 import pytest
 
@@ -57,16 +59,39 @@ def _stderr_tail(stderr: TextIO) -> str:
     return "\n".join(stderr.read().splitlines()[-20:])
 
 
+def _state_ready(port: int, timeout: float) -> bool:
+    """Require a successful State API query, not just a listening dashboard."""
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{port}/api/v0/tasks?limit=1&timeout=1", timeout=timeout
+        ) as response:
+            body = json.loads(response.read(65537))
+        if not isinstance(body, dict) or body.get("result") is not True:
+            return False
+        data = body.get("data")
+        result = data.get("result") if isinstance(data, dict) else None
+        return isinstance(result, dict) and isinstance(result.get("result"), list)
+    except (OSError, ValueError):
+        return False
+
+
 @contextmanager
 def local_ray_cluster() -> Generator[str]:
     """Start one bounded, two-CPU loopback head and stop its group on every exit."""
     if os.environ.get("PYTEST_XDIST_WORKER"):
         pytest.skip("Ray cluster tests require sequential execution without xdist")
-    with socket.socket() as gcs, socket.socket() as client, socket.socket() as dashboard:
-        gcs.bind(("127.0.0.1", 0))
-        client.bind(("127.0.0.1", 0))
-        dashboard.bind(("127.0.0.1", 0))
+    with (
+        socket.socket() as gcs,
+        socket.socket() as client,
+        socket.socket() as dashboard,
+        socket.socket() as agent_http,
+        socket.socket() as agent_grpc,
+    ):
+        for listener in (gcs, client, dashboard, agent_http, agent_grpc):
+            listener.bind(("127.0.0.1", 0))
         dashboard_port = dashboard.getsockname()[1]
+        agent_http_port = agent_http.getsockname()[1]
+        agent_grpc_port = agent_grpc.getsockname()[1]
         port, client_port = gcs.getsockname()[1], client.getsockname()[1]
     address = f"127.0.0.1:{port}"
     tests_root = str(Path(__file__).resolve().parents[1])
@@ -99,8 +124,11 @@ def local_ray_cluster() -> Generator[str]:
             "--block",
             f"--port={port}",
             f"--ray-client-server-port={client_port}",
-            "--include-dashboard=false",
+            "--include-dashboard=true",
+            "--dashboard-host=127.0.0.1",
             f"--dashboard-port={dashboard_port}",
+            f"--dashboard-agent-listen-port={agent_http_port}",
+            f"--dashboard-agent-grpc-port={agent_grpc_port}",
             "--node-ip-address=127.0.0.1",
             "--num-cpus=2",
             "--object-store-memory=134217728",
@@ -123,13 +151,23 @@ def local_ray_cluster() -> Generator[str]:
             while True:
                 if process.poll() is not None:
                     pytest.fail(f"Ray test head start failed\n{_stderr_tail(stderr)}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    pytest.fail(f"Ray test head readiness timed out\n{_stderr_tail(stderr)}")
                 try:
-                    with socket.create_connection(("127.0.0.1", client_port), timeout=0.2):
-                        break
+                    with socket.create_connection(
+                        ("127.0.0.1", client_port), timeout=min(0.2, remaining)
+                    ):
+                        remaining = deadline - time.monotonic()
+                        if (
+                            remaining > 0
+                            and _state_ready(dashboard_port, min(1, remaining))
+                            and time.monotonic() < deadline
+                        ):
+                            break
                 except OSError:
-                    if time.monotonic() >= deadline:
-                        pytest.fail(f"Ray test head readiness timed out\n{_stderr_tail(stderr)}")
-                    time.sleep(0.05)
+                    pass
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
             yield address
         except BaseException as error:
             failure = error

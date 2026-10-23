@@ -373,7 +373,7 @@ Rules [plan]:
 | `ray/__init__.py` | Facade `swarm_arena.ray`; clear `ImportError` without the extra | M4 | `tests/test_public_api.py` |
 | `ray/_executor.py` | `RayExecutor` | M4 | `tests/ray/test_executor.py` (marker `ray`) |
 | `ray/_task.py` | Framed one-shot task; shared staged/collection/publication owner; worker-group supervisor | M4 | `tests/ray/test_task.py` (cluster cases marked `ray`) |
-| `ray/_state.py` | Task lookup by name, `confirm_dead` | M4 | `tests/ray/test_state.py` (marker `ray`) |
+| `ray/_state.py` | Bounded exact-attempt task lookup and identity-joined `worker_dead` evidence | M4 | `tests/ray/test_state_unit.py`, `tests/ray/test_state.py` (marker `ray`) |
 | `ray/_files.py` | Object-store file transport with the 256 MiB cap | M4 | `tests/ray/test_files.py` (marker `ray`) |
 | `ray/_submit.py` | `submit` through `JobSubmissionClient` | M4 | `tests/ray/test_submit.py` |
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
@@ -2729,8 +2729,33 @@ def run_job(payload: bytes) -> bytes: ...
     # Frame(ToolOutput JSON, newly-created blobs, registered FrameDiagnostic entries); incremental output
     # cap refusal returns ERROR/no blobs. Input edits are restored before command and both collect paths.
     # Partial data after publication abandonment has no file/log/report refs and starts no later uploads.
-def find_task(task_name: str) -> TaskInfo | None: ...    # ray.util.state
-def worker_dead(task_name: str) -> bool | None: ...
+# ray/_state.py
+PENDING_STATES: Final[frozenset[str]]  # pending, submitted and getting/pinning-args states
+TERMINAL_STATES: Final[frozenset[str]] # FINISHED, FAILED; no CANCELLED state
+class TaskInfo(FrozenModel):
+    task_id: str
+    attempt_number: int              # nonnegative, never inferred from row order
+    name: str
+    state: str
+    worker_id: str | None
+    node_id: str | None
+def find_task(task_name: str, *, deadline: float | None = None,
+              expected: TaskInfo | None = None) -> TaskInfo | None: ...
+def worker_dead(task_name: str, *, deadline: float | None = None,
+                expected: TaskInfo | None = None) -> bool | None: ...
+    # Blocking read-only helpers. deadline is absolute time.monotonic(); default is now + 5 s.
+    # Each SDK call uses the remaining allowance capped at 5 s; no call with < 1 s remaining
+    # (Ray's SDK timeout floor). No retries or sleeps here; late results are discarded.
+    # Exact-name, single-attempt dataclass normalization; duplicates/retries/name reuse,
+    # missing/malformed/truncated/stale/unavailable/timed-out evidence -> None (unknown).
+    # expected pins task/attempt plus any known worker/node and rejects state regression.
+    # worker_dead: nonterminal -> False; terminal + matched live worker -> False;
+    # terminal + matched dead worker + rechecked same terminal attempt -> True.
+    # Terminal with missing worker/node or worker row -> None, never proof of never-started work.
+    # list_tasks/list_workers use detail=True, limit=2, raise_on_missing_output=True.
+    # Names must be unique per dispatch; unseen reuse cannot be ruled out by an eventual snapshot.
+    # Caller supervises the entire operation through run_sync_daemon, including initialization,
+    # lock acquisition and SDK discovery, under the same allowance; no late result authorizes action.
 def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes -- and files
 def submit_runtime_env(*, working_dir: str | None, pip: Sequence[str]) -> dict[str, Any] | None: ...
     # ray/_submit.py; only nonempty working_dir/pip, never env_vars; None when both are empty

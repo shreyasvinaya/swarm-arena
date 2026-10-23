@@ -1,9 +1,12 @@
 """Connect selected worker tests to the single process-wide Ray head."""
 
+import os
 import signal
 from collections.abc import Iterator
 
 import pytest
+
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
 
 @pytest.fixture(scope="session")
