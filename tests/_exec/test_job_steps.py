@@ -579,7 +579,9 @@ async def test_caller_cancellation_owns_collector_outcome(
     from swarm_arena._exec import job_steps
     from swarm_arena.executor import LocalExecutor
 
-    entered, release = threading.Event(), threading.Event()
+    entered, finished = anyio.Event(), anyio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
     workers: list[threading.Thread] = []
     partials: list[ToolOutput] = []
     error: BaseException = _core_error(
@@ -594,8 +596,8 @@ async def test_caller_cancellation_owns_collector_outcome(
 
     def collect(*args: Any) -> ToolOutput:
         workers.append(threading.current_thread())
-        entered.set()
-        assert release.wait(30)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(60)
         raise error
 
     async def received(output: ToolOutput) -> None:
@@ -608,9 +610,9 @@ async def test_caller_cancellation_owns_collector_outcome(
 
     async def submit() -> None:
         if cancellation == "fail_after":
-            owner = anyio.fail_after(30)
+            owner = anyio.fail_after(60)
         elif cancellation == "move_on_after":
-            owner = anyio.move_on_after(30)
+            owner = anyio.move_on_after(60)
         else:
             owner = anyio.CancelScope()
         # CancelScope is itself a context manager, while fail_after yields one.
@@ -633,8 +635,10 @@ async def test_caller_cancellation_owns_collector_outcome(
         after_scope.append(True)
 
     task = asyncio.create_task(submit())
+    task.add_done_callback(lambda _: finished.set())
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(10):
+            await entered.wait()
         [scope] = scopes
         if cancellation == "native":
             task.cancel()
@@ -642,20 +646,23 @@ async def test_caller_cancellation_owns_collector_outcome(
             scope.cancel()
         else:
             scope.deadline = anyio.current_time()
-        with anyio.fail_after(5):
-            release.set()
-            if cancellation == "native":
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-                assert not scope.cancelled_caught
-            elif cancellation == "fail_after":
-                with pytest.raises(TimeoutError):
-                    await task
-                assert scope.cancelled_caught
-            else:
-                await task
-                assert scope.cancelled_caught
-                assert after_scope == [True]
+        release.set()
+        # A watchdog around `await task` would send it a second native cancel.
+        # Await only notification; inspect the job's own outcome outside the timer.
+        with anyio.fail_after(10):
+            await finished.wait()
+        if cancellation == "native":
+            with pytest.raises(asyncio.CancelledError):
+                task.result()
+            assert not scope.cancelled_caught
+        elif cancellation == "fail_after":
+            with pytest.raises(TimeoutError):
+                task.result()
+            assert scope.cancelled_caught
+        else:
+            task.result()
+            assert scope.cancelled_caught
+            assert after_scope == [True]
         assert len(partials) == 1
         assert partials[0].status is RunStatus.CANCELLED
         assert partials[0].files == []
