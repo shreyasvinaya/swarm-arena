@@ -197,9 +197,13 @@ can be retried by a later caller, after the previous attempt has finished.
 The abandoned caller cannot dispatch work after its lifetime ends. `aclose()`
 leaves the shared Ray connection open and never calls `ray.shutdown()`.
 
+### Initialization warning
+
 Ray may log `SIGTERM handler is not set because current thread is not the main
 thread.` during this initialization. The warning is retained: initialization
 stays off the event loop so it cannot block lease renewal or cancellation.
+
+### Dispatch, resources and cancellation
 
 Each job gets one task named with its job ID. When provided, `on_started`
 receives the dispatch intent and original Ray driver job ID before submission.
@@ -215,9 +219,9 @@ to `num_gpus`, `memory_gib` to integer bytes, and `custom` to named resources.
 With `secret_resource = "llm_keys"`, jobs needing node/file secrets also request
 one `llm_keys` resource. Names in `drop_env` and names already supplied by
 explicit driver environment or secret overlays do not require that resource.
-Secret values never enter task options or `runtime_env`. Driver-supplied
-secrets travel only inside the task payload; Ray may spill that payload from
-its object store to local disk. Provision and protect cluster storage accordingly.
+Secret values never enter task options or `runtime_env`. See the
+[secret transport boundary](#gateway-secret-transport) for driver-supplied
+credentials in the task payload.
 
 For an `s3://` artifact root, workers read and write artifacts by SHA-256 against
 the shared backend. For a local root, the driver sends staged blobs through
@@ -253,13 +257,26 @@ no new artifact upload. A timed-out or failed partial wait gives an empty
 `cancelled` result. As with LocalExecutor, pending caller cancellation wins over
 any callback failure, including a registered control; a successful callback
 receives the data-only partial exactly once. A schedule timeout has no partial
-callback. Hard process controls synchronously request force cancellation and
-then propagate unchanged, without awaited cleanup.
+callback. Hard process controls raised in the awaiting task synchronously request
+force cancellation and then propagate unchanged, without awaited cleanup. See
+[stop modes](limits-and-safety.md#stop-modes-and-resume) and
+[hook-containment limits](limits-and-safety.md#local-isolation-and-secrets) for
+library-mode Ctrl-C and worker-thread outcomes.
 
 Ray preserves its assigned `CUDA_VISIBLE_DEVICES` in the tool subprocess.
 Ray resources are logical scheduling quantities, so subprocess resource limits
 still apply where the operating system supports them; a logical memory request
 is not an isolation boundary.
+
+### Workspace cleanup
+
+Normal worker exits remove the temporary workspace. If preparation or collection
+is still running when the task returns, cleanup waits for worker exit through
+`atexit`. A hard exit, such as force cancellation or OOM, can bypass that cleanup
+and leave a `swarm-worker-*` directory on the worker. Remove retained directories
+only after confirming the worker and its tool processes have stopped.
+
+### Recovery
 
 Recovery uses the connected cluster's `RayContext.dashboard_url` and the
 recorded original driver's job ID. `confirm_dead` requires identity-matched
@@ -362,6 +379,8 @@ instead. Other provider credentials are not replaced: keyed jobs do not get
 them; an unkeyed job that allowlists one can receive the node value and bypass
 the gateway. Keep provider declarations accurate and review allowlists.
 
+### Gateway reservations
+
 A keyed run needs a USD reservation **above zero**, supplied by
 `Tool.estimate(request)` or `limits.default_run_reservation.usd`. Its key's
 `max_budget` equals that reservation. The engine keeps the **entire reservation
@@ -370,10 +389,12 @@ and reconciliation never refund it or create a second charge. Failures before
 the reservation is promoted to `keep_charged` retain ordinary undispatched-refund
 behavior. Once promoted, the full reservation remains charged, including
 cancellation while that promotion becomes durable, even if key creation has not
-started. Tighter, realistic
-`Tool.estimate()` values and accurate `Tool.providers()` declarations avoid
+started. Tighter, realistic `Tool.estimate()` values and accurate
+`Tool.providers()` declarations avoid
 reserving unnecessarily large amounts or keying tools that do not use an LLM.
 A soft proxy cap does not make `max_usd` a hard bound on actual provider spend.
+
+### Gateway secret transport
 
 The core keeps gateway keys out of journal records, manifests and artifacts.
 Tools must also keep credentials out of their own results and logs.
@@ -391,6 +412,8 @@ an arbitrary subprocess or the external proxy. Apply an outbound network rule
 that blocks workers from provider hosts while allowing the proxy; otherwise a
 tool with a hard-coded provider URL can go around it. The proxy needs its own
 provider egress.
+
+### Reconcile gateway spend
 
 Run completion makes a bounded reconciliation attempt. To retry later, use
 the addressed run directory and its original gateway configuration. Replace
@@ -424,7 +447,6 @@ Deletion also waits for durable observations and closure evidence. Deleted keys
 reuse committed observations without another gateway read, so rows arriving
 after deletion are not discovered. Unsupported key totals remain estimated;
 an aggregate may remain estimated or be unavailable instead of losing precision.
-A key created but never journaled is not swept or counted in reports: its bearer
-never left the driver, and it expires after `key_duration_s`. See
-[After the run: reconcile](limits-and-safety.md#after-the-run-reconcile) for
-ownership, timing and accounting limits.
+See [After the run: reconcile](limits-and-safety.md#after-the-run-reconcile) for
+ownership, timing and accounting limits, including keys created but never journaled
+and the `reconcile time allowance exhausted` reason.

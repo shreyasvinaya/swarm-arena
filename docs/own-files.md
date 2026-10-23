@@ -327,8 +327,8 @@ ok: loss=0.25, check=True, key=(-0.25,)
 The configuration example below connects a physika problem to three scripts.
 Its `.phyk` extension is illustrative; globs can select `.physk` files or any
 other regular files. No Python subclass is needed. This is a configuration
-excerpt: the LLM manager and model alias belong to later milestones, while
-the current release supplies the script components and local execution.
+excerpt: the LLM manager requires the `llm` extra and a configured model alias;
+the script components also work with a scripted manager and local execution.
 
 ```toml
 [goal]
@@ -792,7 +792,9 @@ above the supported USD range is recorded with `status="error"`, zero
 `cost_usd`, absent `usage.usd`, and the fixed diagnostic
 `usage_overflow: unsupported informational amount`. It never claims a charge.
 Each admitted row is linked immediately, so an interrupted report retains its
-already recorded call IDs on the candidate.
+already recorded call IDs on the candidate. See the
+[library signal and hook-containment limits](limits-and-safety.md#local-isolation-and-secrets)
+when interrupting report calls from Python.
 
 Collection parses and uploads at most **16 MiB** and reads at most **10,000
 nonempty rows**, counting invalid rows too. Parsing and recording stream one

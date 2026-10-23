@@ -120,15 +120,20 @@ post-deadline settlement, including durable stop-result publication. Healthy
 live settlement remains under its owner's supervision without this fixed timer.
 Report arrival has its own timeout, including after a graceful stop; expiry
 records a conservative charge rather than a storage-cleanup failure.
-Without a committed settle, the reservation stays charged in full. Cancelling construction or command preparation
-before a committed start releases the reservation at zero while ownership is
-held; a late preparation result never launches or journals work.
+Without a committed settle, the reservation stays charged in full. Cancelling
+construction or command preparation before a committed start normally releases
+the reservation at zero while ownership is held; a late preparation result never
+launches or journals work. Gateway runs have a
+[keep-charged exception](running-on-ray.md#gateway-reservations) before key creation.
 
 On resume, every reservation without a committed settlement stays charged in
 full. Runs with a committed completion are recovered; runs with a committed
-start but no committed completion become `lost`, and retrying them needs new
-budget. Reservations for dispatches without a committed start remain charged
-conservatively, without a lost marker. Thus a crash's
+`tool_start` or Ray `tool_dispatch` but no committed completion become `lost`,
+and retrying them needs new budget. Reservations with neither event remain
+charged conservatively, without a lost marker. A Ray dispatch intent can be
+committed before submission, so a missing task does not prove that it never ran.
+See [Ray recovery](running-on-ray.md#recovery) for the dashboard requirements and
+unknown death evidence. Thus a crash's
 additional accounting loss is bounded by unsettled reservations: in-flight tool
 runs and open per-holder tranches. The accounting cap cannot be enlarged by a
 crash or forced takeover. A tool's **actual external spend** still depends on
@@ -200,8 +205,9 @@ reveals later reconciliation while an already captured reader stays unchanged.
 Gateway budgets cap **USD only**, not tokens. Pin the gateway's cost map to the
 model prices used when reserving budgets; changing prices undermines estimates.
 A soft cap does not guarantee that concurrent external requests stay within the
-reservation. Keyed tool reservations stay fully charged for the run. With this
-LiteLLM range, reconciliation keeps the full reservation labelled `estimated`:
+reservation. Keyed tool reservations stay fully charged for the run, including
+[cancellation while the keep-charged mark is saved](running-on-ray.md#gateway-reservations).
+With this LiteLLM range, reconciliation keeps the full reservation labelled `estimated`:
 without a verified duration bound, waiting longer cannot prove completeness.
 Observed rows can still inform provenance without lowering the ledger charge.
 
@@ -240,7 +246,8 @@ A key's report becomes an observation only when all these conditions hold:
 1. The executor confirms the original tool is dead. A key with no start or
    dispatch event counts as unused. A reused local process-group leader is dead
    only when both recorded and current start times are known and differ.
-   A remote host or unavailable, stale or unbound Ray dashboard remains unknown.
+   A remote host or unavailable, stale or unbound Ray dashboard remains unknown;
+   see the [plain-HTTP dashboard requirement](running-on-ray.md#recovery).
 2. The gateway confirms closure at time T. Repeated reconciliations preserve the
    earliest journaled confirmation; blocking alone is not confirmation.
 3. The gateway enforces a maximum request duration no longer than
@@ -330,8 +337,8 @@ carriers, from private provenance. Copied, caller-created or subclassed carriers
 remain diagnostics. Caller cancellation takes precedence over carried controls.
 Usage overflow retains conservative charges. Exact journal/ledger equality
 applies to finalized, non-overflow accounting; fencing or interrupted publication
-can leave a reservation conservatively charged. Gateway enforcement of external
-tool spending remains later work.
+can leave a reservation conservatively charged. External tool calls can use the
+optional gateway, subject to its [soft-cap limits](#llm-gateway-hard-and-soft-caps).
 
 ## Three execution clocks and the watchdog
 
@@ -364,8 +371,10 @@ User-raised cancellation and exception groups are contained at manager, action,
 check, tool, and judge boundaries with type-only diagnostics. Judge construction,
 batch preparation, anchor selection, and configuration validation use the same
 classification before recording a failure. Healthy peers continue
-and the goal can finish. Cancellation before dispatch refunds the tool reservation
-exactly once, including command preparation and edit uploads. Cleanup has a bounded
+and the goal can finish. Cancellation before dispatch normally refunds the tool
+reservation exactly once, including command preparation and edit uploads; the
+[gateway keep-charged exception](running-on-ray.md#gateway-reservations) still applies.
+Cleanup has a bounded
 settlement wait; work that may have started retains its charge. Actual caller
 cancellation and ownership fencing still propagate. Fencing nested in an exception
 group propagates as a bare ownership-loss error, without group or leaf values;
@@ -378,7 +387,7 @@ these waits without using the executor collection allowance.
 Startup estimates, provider declarations, executor hooks, and preflight failures
 are also reported by type without hook values. A hook-raised cancellation is a
 startup failure; cancellation requested by the caller still cancels the run.
-Built-in provider probing and model-provider recovery are M3 work.
+See [Provider failures](#provider-failures) for built-in provider probing and recovery.
 
 ## Stop modes and resume
 
@@ -427,6 +436,15 @@ Python. CLI Ctrl-C prints `interrupted` and exits 130; it is an interruption,
 not a promise that graceful finalization completed. Normal returned runs,
 including no-result goals, exit 0; runtime/control failures exit 1 and usage
 errors exit 2.
+
+In library mode with a user-owned `asyncio.run`, a SIGINT delivered to a worker
+thread is handled at the next event-loop wakeup, bounded during a live run by
+the lease-renewal timer (`lease_ttl_s / 3`). The CLI owns a wakeup file descriptor
+and wakes the loop for signals delivered to any thread. A raw repeated
+`KeyboardInterrupt` inside asyncio/AnyIO bookkeeping can hang shutdown, an
+upstream limitation. For reliable repeated Ctrl-C, use the CLI or install a
+signal handler that cancels the run. The library does not take over
+process-global signal state.
 
 Resume from the committed journal with the saved configuration, or a human
 replacement:
@@ -481,6 +499,11 @@ environment allowlist. They can still access resources allowed to that user.
 Judge-private files are withheld from tool staging, not protected against
 arbitrary same-user code. Use trusted programs; containers are future work.
 See the [isolation boundary](own-files.md#isolation-boundary).
+
+For cluster execution, see the Ray guide's
+[initialization warning](running-on-ray.md#initialization-warning),
+[workspace cleanup limit](running-on-ray.md#workspace-cleanup), and
+[secret transport boundary](running-on-ray.md#gateway-secret-transport).
 
 `FunctionTool` returns JSON data only: it does not apply file edits or parent
 file overlays. Like `ScriptTool`, its `env` lists variable **names**, which must
