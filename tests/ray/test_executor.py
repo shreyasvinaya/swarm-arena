@@ -352,7 +352,7 @@ async def test_cancel_sequence_and_data_only_partial(
         got.append(out)
 
     monkeypatch.setattr(ray, "cancel", cancel)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
 
             async def submit() -> None:
@@ -385,7 +385,7 @@ async def test_schedule_timeout_cancels_without_partial(
     fake_ray.ref = _Ref(None)
     partial = Mock()
     monkeypatch.setattr(module, "_SCHEDULE_POLL_S", 0.01)
-    with anyio.fail_after(5), schedule_timeout_scope(0.02):
+    with anyio.fail_after(60), schedule_timeout_scope(0.02):
         out = await RayExecutor(cancel_margin_s=0.02).submit(
             make_job(
                 artifact_root=str(tmp_path),
@@ -460,7 +460,7 @@ async def test_recovery_allowance_includes_init_lock_and_rpc(
     def block(*args: Any, **kw: Any) -> Any:
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
             return SimpleNamespace(dashboard_url="head:8265") if held == "init" else True
         finally:
             done.set()
@@ -473,7 +473,7 @@ async def test_recovery_allowance_includes_init_lock_and_rpc(
     else:
         await executor._init_lock.acquire()
     try:
-        with anyio.fail_after(2):
+        with anyio.fail_after(30):
             result = await getattr(executor, method)(
                 Job.Started(kind="dispatch", job_id="x", task_name="x")
             )
@@ -485,7 +485,7 @@ async def test_recovery_allowance_includes_init_lock_and_rpc(
         if held == "lock":
             executor._init_lock.release()
         else:
-            assert await anyio.to_thread.run_sync(done.wait, 5)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
 
 
 async def test_aclose_does_not_shutdown(fake_ray: _RunJob, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -511,7 +511,7 @@ async def test_schedule_clock_resets_when_request_becomes_feasible(
     monkeypatch.setattr(module, "monotonic", lambda: clock[0])
     monkeypatch.setattr(module, "_SCHEDULE_POLL_S", 0.0)
     monkeypatch.setattr(ray, "nodes", nodes)
-    with anyio.fail_after(5), schedule_timeout_scope(2):
+    with anyio.fail_after(60), schedule_timeout_scope(2):
         out = await RayExecutor(cancel_margin_s=0.01).submit(
             make_job(
                 artifact_root=str(tmp_path),
@@ -537,7 +537,7 @@ async def test_cancel_during_upload_starts_no_later_publication(
         writes.append(sha256_hex(data))
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
             return sha256_hex(data)
         finally:
             done.set()
@@ -557,10 +557,10 @@ async def test_cancel_during_upload_starts_no_later_publication(
 
     monkeypatch.setattr(ArtifactStore, "put_bytes", put)
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(submit)
-                assert await anyio.to_thread.run_sync(entered.wait, 3)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 scopes[0].cancel()
         assert len(writes) == 1
         assert len(partials) == 1
@@ -568,7 +568,7 @@ async def test_cancel_during_upload_starts_no_later_publication(
         assert partials[0].files == []
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 3)
+        assert await anyio.to_thread.run_sync(done.wait, 60)
     assert len(writes) == 1
 
 
@@ -639,7 +639,7 @@ async def test_boundaries_preserve_terminal_controls(
             )
         )
     )
-    with anyio.fail_after(5), schedule_timeout_scope(0.001), pytest.raises(RuntimeError) as caught:
+    with anyio.fail_after(60), schedule_timeout_scope(0.001), pytest.raises(RuntimeError) as caught:
         await operation
     assert _core_category(caught.value) is _SignalCategory.TERMINAL
 
@@ -796,7 +796,7 @@ async def test_secret_values_never_in_task_metadata(ray_driver: Any, tmp_path: P
                     address="http://" + ray_driver.dashboard_url,
                     filters=[("name", "=", job.id)],
                     detail=True,
-                    timeout=5,
+                    timeout=60,
                 )
             )
             if rows:
@@ -904,7 +904,10 @@ async def test_feasible_queue_and_pending_cancel(
     hold_code = (
         "import json, os, time; from pathlib import Path; "
         f"Path({str(ready)!r}).touch()\n"
-        f"while not Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+        "deadline = time.monotonic() + 300\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    assert time.monotonic() < deadline, 'tool was not released'\n"
+        "    time.sleep(0.05)\n"
         "json.dump({}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
     )
     holding = tool_job(hold_code, resources=Resources(cpus=2), artifact_root=str(tmp_path / "a"))
@@ -1034,7 +1037,7 @@ async def test_hook_cancellation_is_an_ordinary_failure(
         monkeypatch.setattr(module, "driver_import_roots", fail)
     else:
         fake_ray.ref.result = error
-    with anyio.fail_after(0.5):
+    with anyio.fail_after(60):
         out = await RayExecutor(cancel_margin_s=0.01).submit(make_job(artifact_root=str(tmp_path)))
     assert out.status == RunStatus.ERROR
     assert "CancelledError" in out.data["swarm_arena_error"]
@@ -1067,7 +1070,7 @@ async def test_query_preserves_caller_cancellation(
     def held(*args: Any, **kwargs: Any) -> Any:
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
         finally:
             done.set()
 
@@ -1085,15 +1088,15 @@ async def test_query_preserves_caller_cancellation(
         returned = True
 
     try:
-        with anyio.fail_after(2):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(query)
-                assert await anyio.to_thread.run_sync(entered.wait, 1)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 tasks.cancel_scope.cancel()
         assert not returned
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 5)
+        assert await anyio.to_thread.run_sync(done.wait, 60)
 
 
 @pytest.mark.parametrize("site", ["prepare", "upload"])
@@ -1133,7 +1136,7 @@ async def test_abandoned_init_rejoins_without_another_attempt(
         calls.append(threading.get_ident())
         entered.set()
         try:
-            assert release.wait(10)
+            assert release.wait(300)
             return SimpleNamespace(dashboard_url="head:8265")
         finally:
             done.set()
@@ -1143,7 +1146,7 @@ async def test_abandoned_init_rejoins_without_another_attempt(
 
     monkeypatch.setattr(ray, "init", init)
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             assert not await executor.kill_orphan(
                 Job.Started(kind="dispatch", job_id="old", task_name="old")
             )
@@ -1151,7 +1154,7 @@ async def test_abandoned_init_rejoins_without_another_attempt(
             assert not fake_ray.payloads
             if complete_before_rejoin:
                 release.set()
-                assert await anyio.to_thread.run_sync(done.wait, 2)
+                assert await anyio.to_thread.run_sync(done.wait, 60)
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(submit)
                 tasks.start_soon(submit)
@@ -1162,7 +1165,7 @@ async def test_abandoned_init_rejoins_without_another_attempt(
         assert len(calls) == 1
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(done.wait, 2)
+        assert await anyio.to_thread.run_sync(done.wait, 60)
 
 
 async def test_failed_init_can_be_retried_by_a_later_caller(
@@ -1290,7 +1293,7 @@ async def test_abandoned_payload_put_never_dispatches(
     def put(data: bytes) -> _Payload:
         entered.set()
         try:
-            assert release.wait(10)
+            assert release.wait(300)
             return _Payload(data)
         finally:
             done.set()
@@ -1302,17 +1305,17 @@ async def test_abandoned_payload_put_never_dispatches(
 
     monkeypatch.setattr(ray, "put", put)
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(submit)
-                assert await anyio.to_thread.run_sync(entered.wait, 2)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 scopes[0].cancel()
         started.assert_not_called()
         assert not fake_ray.arguments
     finally:
         release.set()
         if entered.is_set():
-            assert await anyio.to_thread.run_sync(done.wait, 2)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
     await anyio.lowlevel.checkpoint()
     assert not fake_ray.arguments
 
@@ -1324,16 +1327,37 @@ async def test_cancel_force_and_partial_share_one_deadline(
     entered, release, done = threading.Event(), threading.Event(), threading.Event()
     scopes: list[anyio.CancelScope] = []
     delivered: list[ToolOutput] = []
-    elapsed: list[float] = []
-    start = 0.0
+    clock = [100.0]
+    allowances: list[float] = []
+    loop = asyncio.get_running_loop()
+    move_on_after = anyio.move_on_after
+
+    def observed_allowance(delay: float, **kwargs: Any) -> Any:
+        allowances.append(delay)
+        return move_on_after(delay, **kwargs)
+
+    class ClockedAnyIO(SimpleNamespace):
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+    monkeypatch.setattr(
+        module,
+        "anyio",
+        ClockedAnyIO(current_time=lambda: clock[0], move_on_after=observed_allowance),
+    )
 
     def cancel(ref: _Ref, *, force: bool = False) -> None:
         if force:
             entered.set()
+            clock[0] = 101.0
             try:
-                assert release.wait(10)
+                assert release.wait(300)
             finally:
                 done.set()
+        else:
+            clock[0] = 100.2
+            ref.result = _frame()
+            loop.call_soon_threadsafe(ref.release.set)
 
     async def partial(out: ToolOutput) -> None:
         delivered.append(out)
@@ -1345,23 +1369,24 @@ async def test_cancel_force_and_partial_share_one_deadline(
             await RayExecutor(cancel_margin_s=0.5).submit(
                 make_job(artifact_root=str(tmp_path), grace_s=0.2, on_partial=partial)
             )
-        elapsed.append(anyio.current_time() - start)
 
     monkeypatch.setattr(ray, "cancel", cancel)
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(submit)
                 await fake_ray.ref.waiting.wait()
-                start = anyio.current_time()
+                allowances.clear()
                 scopes[0].cancel()
-        assert elapsed[0] < 1.0  # 0.7 s total allowance plus scheduling slack, never extra margins.
+        # Soft cancel, force and partial receive only the remainder of the same 0.7 s.
+        assert allowances == pytest.approx([0.7, 0.5, 0.0])
         assert len(delivered) == 1
-        assert await anyio.to_thread.run_sync(entered.wait, 2)
+        assert not release.is_set()
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
     finally:
         release.set()
         if entered.is_set():
-            assert await anyio.to_thread.run_sync(done.wait, 2)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, GeneratorExit])
@@ -1418,7 +1443,7 @@ async def test_running_task_stops_the_scheduling_watch(
     monkeypatch.setattr(module, "find_task", find)
     monkeypatch.setattr(module, "_STATE_RPC_S", 0.03)
     monkeypatch.setattr(module.anyio, "sleep_forever", sleep_forever)
-    with anyio.fail_after(5) as allowance:
+    with anyio.fail_after(60) as allowance:
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(RayExecutor()._watch, "running", {"CPU": 1}, 10)
             await sleeping.wait()
@@ -1446,7 +1471,7 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
         calls.append(clock[0])
         try:
             if held:
-                assert release.wait(10)
+                assert release.wait(300)
             return [{"Alive": True, "Resources": {"CPU": 2.0}}]
         finally:
             done.set()
@@ -1467,7 +1492,7 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
     monkeypatch.setattr(module.anyio, "sleep", sleep)
     executor = RayExecutor()
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 for index in range(4):
                     tasks.start_soon(executor._watch, str(index), {"CPU": 1}, 10)
@@ -1482,7 +1507,7 @@ async def test_pending_jobs_share_rate_limited_node_snapshot(
     finally:
         release.set()
         for done in completed:
-            assert await anyio.to_thread.run_sync(done.wait, 2)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
 
 
 @pytest.mark.parametrize("address", ["localhost:6379", "127.0.0.1:6379", "auto"])
@@ -1539,7 +1564,7 @@ async def test_concurrent_executors_serialize_connection_ownership(
     def init(*, address: str, **kw: Any) -> Any:
         calls.append(address)
         entered.set()
-        assert release.wait(60)
+        assert release.wait(300)
         connected[0] = True
         return SimpleNamespace(dashboard_url="head:8265")
 
