@@ -1,25 +1,39 @@
 """Bounded stdlib transport for the private LiteLLM Proxy adapter.
 
-The pinned proxy cannot verify the strict profile. Socket timeouts bound each
-blocking I/O attempt; a single abandonable operation deadline also covers body
-reads, parsing and every pagination request. No transport worker publishes core
-state. An undelivered create result has a separate, data-only cleanup owner.
+The pinned proxy cannot verify the strict profile. One deadline bounds DNS,
+connect, TLS, headers, body reads and every pagination request. DNS uses a
+killable stdlib child; a deadline watchdog shuts down active sockets. No transport
+worker publishes core state. Undelivered creates have a data-only cleanup owner.
 """
 
 import contextlib
 import contextvars
+import hashlib
 import json
 import math
+import socket
+import ssl
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from http.client import HTTPException
-from typing import Annotated, Any, TypeVar
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from ipaddress import ip_address
+from types import TracebackType
+from typing import Annotated, Any, Literal, Self, TypeVar
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 import anyio
 from pydantic import ConfigDict, Field
@@ -44,6 +58,11 @@ _MISSING = object()
 _T = TypeVar("_T")
 _Count = Annotated[int, Field(strict=True, ge=0)]
 _Text = Annotated[str, Field(strict=True, min_length=1)]
+_RESOLVER_CODE = """
+import json, socket, sys
+rows = socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), type=socket.SOCK_STREAM)
+print(json.dumps(rows[:256]))
+"""
 
 
 class _Health(FrozenModel):
@@ -94,6 +113,7 @@ class _Blocked(FrozenModel):
     model_config = ConfigDict(extra="ignore")
 
     blocked: Annotated[bool, Field(strict=True)]
+    token: _Text
 
 
 class _Info(FrozenModel):
@@ -110,7 +130,25 @@ class _KeyInfo(FrozenModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    key: _Text
     info: _Info
+
+
+class _NotFound(FrozenModel):
+    """Recognize only the pinned key-info ProxyException, never an ingress 404."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["not_found_error"]
+    param: Literal["key"]
+
+
+class _MissingKey(FrozenModel):
+    """Validate the bounded error envelope before treating the key as absent."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    error: _NotFound
 
 
 class _Deleted(FrozenModel):
@@ -128,6 +166,14 @@ class _Cache(FrozenModel):
 
     cache_read_input_tokens: _Count | None = None
     cache_creation_input_tokens: _Count | None = None
+
+
+class _Attribution(FrozenModel):
+    """Keep only the bounded candidate identity needed by reconciliation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    candidate_id: Annotated[str, Field(strict=True, min_length=1, max_length=256)] | None = None
 
 
 class _Spend(FrozenModel):
@@ -149,6 +195,15 @@ class _Spend(FrozenModel):
         """Produce a fully validated core-owned record."""
         raw_cache = self.metadata.get("additional_usage_values")
         cache = _Cache.model_validate({} if raw_cache is None else raw_cache)
+        raw_attribution = self.metadata.get("spend_logs_metadata")
+        attribution = _Attribution.model_validate(
+            {} if raw_attribution is None else raw_attribution
+        )
+        metadata: dict[str, Any] = {}
+        if raw_cache is not None:
+            metadata["additional_usage_values"] = cache.model_dump(exclude_unset=True)
+        if attribution.candidate_id is not None:
+            metadata["spend_logs_metadata"] = {"candidate_id": attribution.candidate_id}
         read = cache.cache_read_input_tokens or 0
         write = cache.cache_creation_input_tokens or 0
         # LiteLLM's normalized prompt count includes cached input. Usage splits it.
@@ -159,7 +214,7 @@ class _Spend(FrozenModel):
             model=self.model,
             cost_usd=self.spend,
             ts=self.startTime,
-            metadata=self.metadata,
+            metadata=metadata,
             usage=Usage(
                 input_tokens=self.prompt_tokens - read - write,
                 output_tokens=self.completion_tokens,
@@ -206,6 +261,8 @@ class _Operation:
     path: str
     consumed: int = 0
     abandoned: threading.Event = field(default_factory=threading.Event)
+    lock: Any = field(default_factory=threading.Lock)
+    transport: "_Transport | None" = None
 
     def remaining(self, *, retain_response: bool = False) -> float:
         """Refuse the next I/O when the owner has left or its deadline elapsed."""
@@ -213,6 +270,196 @@ class _Operation:
         if (self.abandoned.is_set() and not retain_response) or remaining <= 0:
             raise TimeoutError
         return remaining
+
+    def abandon(self) -> None:
+        """Release ordinary sockets immediately; retained creates keep their deadline."""
+        self.abandoned.set()
+        with self.lock:
+            transport = self.transport
+        if transport is not None and not transport.retain_response:
+            transport.stop()
+
+
+class _Transport:
+    """Own interruptible network resources for one request, including headers."""
+
+    def __init__(self, operation: _Operation, retain_response: bool) -> None:
+        self.operation = operation
+        self._retain_response = retain_response
+        self._sent = False
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._sockets: list[socket.socket] = []
+        self._resolver: subprocess.Popen[bytes] | None = None
+        self._timer = threading.Timer(operation.remaining(), self.stop)
+        self._timer.daemon = True
+
+    @property
+    def retain_response(self) -> bool:
+        """Retain only a create whose request has begun sending, never queued DNS."""
+        return self._retain_response and self._sent
+
+    def begin_request(self) -> None:
+        """Order send admission against abandonment before writing any bytes."""
+        with self.operation.lock:
+            self.operation.remaining(retain_response=self.retain_response)
+            self._sent = True
+
+    def __enter__(self) -> Self:
+        with self.operation.lock:
+            self.operation.remaining()
+            self.operation.transport = self
+        self._timer.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._timer.cancel()
+        self.stop()
+        self._timer.join()
+        with self.operation.lock:
+            self.operation.transport = None
+
+    def stop(self) -> None:
+        """Wake blocked header/body/TLS I/O and kill an unfinished resolver."""
+        with self._lock:
+            self._stopped = True
+            for sock in self._sockets:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+            self._sockets.clear()
+            if self._resolver is not None:
+                with contextlib.suppress(OSError):
+                    self._resolver.kill()
+
+    def track(self, sock: socket.socket) -> socket.socket:
+        """Close a socket arriving after abandonment instead of starting more I/O."""
+        with self._lock:
+            if self._stopped:
+                sock.close()
+                raise TimeoutError
+            self._sockets.append(sock)
+        return sock
+
+    def addresses(self, host: str, port: int) -> list[Any]:
+        """Resolve without leaving an uninterruptible getaddrinfo worker behind."""
+        try:
+            address = ip_address(host)
+        except ValueError:
+            pass
+        else:
+            family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+            return [(family, socket.SOCK_STREAM, 0, "", (host, port))]
+        with self._lock:
+            if self._stopped:
+                raise TimeoutError
+            child = subprocess.Popen(
+                [sys.executable, "-I", "-c", _RESOLVER_CODE, host, str(port)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self._resolver = child
+        try:
+            try:
+                output, _ = child.communicate(
+                    timeout=self.operation.remaining(retain_response=self.retain_response)
+                )
+            except subprocess.TimeoutExpired:
+                raise TimeoutError from None
+            self.operation.remaining(retain_response=self.retain_response)
+            if child.returncode != 0:
+                raise OSError
+            return json.loads(output)
+        finally:
+            with self._lock:
+                child.kill()
+                self._resolver = None
+            child.communicate()
+
+    def connect(self, address: tuple[str, int], *args: Any) -> socket.socket:
+        """Share the remaining allowance across resolution and address attempts."""
+        host, port = address
+        for family, kind, protocol, _, destination in self.addresses(host, port):
+            sock = self.track(socket.socket(family, kind, protocol))
+            try:
+                sock.settimeout(self.operation.remaining(retain_response=self.retain_response))
+                sock.connect(tuple(destination))
+                return sock
+            except OSError:
+                sock.close()
+        raise OSError
+
+
+class _HTTPConnection(HTTPConnection):
+    """Install deadline-owned sockets in the stdlib HTTP connection."""
+
+    def __init__(self, transport: _Transport, host: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._transport = transport
+        self._create_connection = transport.connect
+
+    def send(self, data: Any) -> None:
+        if self.sock is None:
+            self.connect()
+        self._transport.begin_request()
+        super().send(data)
+
+
+class _HTTPSConnection(HTTPSConnection):
+    """Register the TLS socket before starting a potentially blocking handshake."""
+
+    _context: ssl.SSLContext
+
+    def __init__(self, transport: _Transport, host: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._transport = transport
+        self._create_connection = transport.connect
+
+    def send(self, data: Any) -> None:
+        if self.sock is None:
+            self.connect()
+        self._transport.begin_request()
+        super().send(data)
+
+    def connect(self) -> None:
+        HTTPConnection.connect(self)
+        assert self.sock is not None
+        wrapped = self._context.wrap_socket(
+            self.sock, server_hostname=self.host, do_handshake_on_connect=False
+        )
+        self.sock = self._transport.track(wrapped)
+        wrapped.settimeout(
+            self._transport.operation.remaining(retain_response=self._transport.retain_response)
+        )
+        wrapped.do_handshake()
+
+
+class _HTTPHandler(HTTPHandler):
+    """Keep urllib request handling while supplying deadline-aware connections."""
+
+    def __init__(self, transport: _Transport) -> None:
+        super().__init__()
+        self._transport = transport
+
+    def http_open(self, req: Request) -> Any:
+        return self.do_open(lambda host, **kw: _HTTPConnection(self._transport, host, **kw), req)
+
+
+class _HTTPSHandler(HTTPSHandler):
+    """Use normal certificate verification with interruptible TLS handshakes."""
+
+    def __init__(self, transport: _Transport) -> None:
+        super().__init__()
+        self._transport = transport
+
+    def https_open(self, req: Request) -> Any:
+        return self.do_open(lambda host, **kw: _HTTPSConnection(self._transport, host, **kw), req)
 
 
 class _CreateOwner:
@@ -264,10 +511,13 @@ class LiteLLMProxy:
 
     Notes
     -----
-    There are no retries or redirects. Limits are 4 MiB per response, 16 MiB per
-    operation, 200 pages and 10,000 rows. A capped/inconsistent result raises
-    GatewayError rather than returning partial spend. ``terminal_accounting``
-    remains False and unavailable settings never verify the strict profile.
+    There are no retries, redirects or environment/system proxies. Hostname
+    resolution runs in a killable stdlib subprocess; numeric IPs need no child.
+    A watchdog shuts down sockets at the operation deadline, including during
+    headers and TLS. Limits are 4 MiB per response, 16 MiB per operation, 200
+    pages and 10,000 wire rows. Capped/inconsistent results raise GatewayError.
+    ``terminal_accounting`` remains False; unavailable settings never verify
+    the strict profile.
 
     Examples
     --------
@@ -333,42 +583,60 @@ class LiteLLMProxy:
             },
             method=method,
         )
-        try:
-            response = build_opener(_NoRedirect()).open(request, timeout=timeout)
-        except HTTPError as error:
-            error.close()
-            if path == "/key/info" and error.code == 404:
-                return _MISSING
-            raise
-        with response:
-            if not 200 <= response.status < 300:
-                raise HTTPError(request.full_url, response.status, "", response.headers, None)
-            content_length = response.headers.get("Content-Length")
-            limit = min(_MAX_RESPONSE_BYTES, _MAX_OPERATION_BYTES - operation.consumed)
-            if content_length is not None and (
-                int(content_length) < 0 or int(content_length) > limit
-            ):
-                raise ValueError
-            chunks: list[bytes] = []
-            size = 0
-            while True:
-                operation.remaining(retain_response=retain_response)
-                chunk = response.read1(min(65536, limit - size + 1))
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > limit:
+        with _Transport(operation, retain_response) as transport:
+            opener = build_opener(
+                ProxyHandler({}), _NoRedirect(), _HTTPHandler(transport), _HTTPSHandler(transport)
+            )
+            missing = False
+            try:
+                response = opener.open(request, timeout=timeout)
+            except HTTPError as error:
+                if path != "/key/info" or error.code != 404:
+                    error.close()
+                    raise
+                response = error
+                missing = True
+            with response:
+                status = response.status
+                if not isinstance(status, int):
                     raise ValueError
-                chunks.append(chunk)
-            if content_length is not None and size != int(content_length):
-                raise ValueError
-            operation.consumed += size
-        return json.loads(b"".join(chunks))
+                if not missing and not 200 <= status < 300:
+                    raise HTTPError(request.full_url, status, "", response.headers, None)
+                content_length = response.headers.get("Content-Length")
+                limit = min(_MAX_RESPONSE_BYTES, _MAX_OPERATION_BYTES - operation.consumed)
+                if content_length is not None and (
+                    int(content_length) < 0 or int(content_length) > limit
+                ):
+                    raise ValueError
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    operation.remaining(retain_response=retain_response)
+                    chunk = response.read1(min(65536, limit - size + 1))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > limit:
+                        raise ValueError
+                    chunks.append(chunk)
+                if content_length is not None and size != int(content_length):
+                    raise ValueError
+                operation.consumed += size
+            payload = json.loads(b"".join(chunks))
+            if missing:
+                _MissingKey.model_validate(payload)
+                return _MISSING
+            return payload
 
     def _info(self, operation: _Operation, key: VirtualKey) -> _Info | None:
         """Read closure evidence without confusing a JSON null with a missing row."""
         raw = self._request(operation, "GET", "/key/info", query={"key": key.key_id})
-        return None if raw is _MISSING else _KeyInfo.model_validate(raw).info
+        if raw is _MISSING:
+            return None
+        reply = _KeyInfo.model_validate(raw)
+        if reply.key != key.key_id:
+            raise ValueError
+        return reply.info
 
     def _mutation(self, operation: _Operation, path: str, key: VirtualKey) -> None:
         """Confirm uncertain mutation outcomes using key-info under the same deadline."""
@@ -381,9 +649,10 @@ class LiteLLMProxy:
                 body={"key": key.key_id} if blocking else {"keys": [key.key_id]},
             )
             if blocking:
-                if not _Blocked.model_validate(raw).blocked:
+                reply = _Blocked.model_validate(raw)
+                if not reply.blocked or reply.token != key.key_id:
                     raise ValueError
-            elif key.key_id not in _Deleted.model_validate(raw).deleted_keys:
+            elif _Deleted.model_validate(raw).deleted_keys != [key.key_id]:
                 raise ValueError
         except (
             OSError,
@@ -423,7 +692,7 @@ class LiteLLMProxy:
                 detail = _exception_type_name(classified)
             raise GatewayError(f"{operation.method} {operation.path}: {detail}") from None
         finally:
-            operation.abandoned.set()
+            operation.abandon()
 
     def _block_abandoned(self, key: VirtualKey) -> None:
         """Use a detached, bounded owner with no inherited engine context."""
@@ -526,6 +795,8 @@ class LiteLLMProxy:
                     retain_response=True,
                 )
             )
+            if created.key in created.token_id:
+                raise ValueError
             key = VirtualKey(key_id=created.token_id, alias=inputs.alias)
             owner.publish(key)
             return key, created.key
@@ -565,7 +836,7 @@ class LiteLLMProxy:
 
     async def closed_at(self, key: VirtualKey) -> datetime | None:
         """
-        Timestamp confirmed blocking, archived deletion or missing-key closure.
+        Timestamp confirmed blocking, expiry, revocation, deletion or absence.
 
         Parameters
         ----------
@@ -577,6 +848,8 @@ class LiteLLMProxy:
         datetime or None
             Current UTC observation time when closed, otherwise None. It is not
             a spend-completeness guarantee or the historical closure instant.
+            Only a matching key-info echo or the bounded pinned missing-key
+            envelope establishes closure. Other 404s raise GatewayError.
 
         Examples
         --------
@@ -587,7 +860,11 @@ class LiteLLMProxy:
 
         def work(operation: _Operation) -> datetime | None:
             info = self._info(operation, key)
-            return utc_now() if info is None or info.blocked or info.status == "deleted" else None
+            return (
+                utc_now()
+                if info is None or info.blocked or info.status in {"deleted", "expired", "revoked"}
+                else None
+            )
 
         return await self._run("GET", "/key/info", work)
 
@@ -615,6 +892,10 @@ class LiteLLMProxy:
             identities remain distinct. cost_usd is authoritative; usage.usd is
             None. Missing cache counts become zero (unknown), not observed savings.
             Only timezone-aware ISO timestamps are accepted from the wire.
+            Metadata retains only spend_logs_metadata.candidate_id (at most 256
+            characters) and the two cache counters in additional_usage_values.
+            Identical request_id observations collapse within this read;
+            conflicts reject the entire read. No dedup state survives a read.
 
         Raises
         ------
@@ -647,7 +928,9 @@ class LiteLLMProxy:
                 "start_date": lower.strftime("%Y-%m-%d %H:%M:%S"),
                 "end_date": upper.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            rows: list[SpendRow] = []
+            rows: dict[str, SpendRow] = {}
+            fingerprints: dict[str, bytes] = {}
+            seen = 0
             expected: tuple[int, int] | None = None
             for number in range(1, _MAX_PAGES + 1):
                 page = _Page.model_validate(
@@ -672,17 +955,29 @@ class LiteLLMProxy:
                     or page.total_pages > _MAX_PAGES
                     or page.total_pages != (page.total + _PAGE_SIZE - 1) // _PAGE_SIZE
                     or (expected is not None and expected != counts)
-                    or len(page.data) != min(_PAGE_SIZE, max(0, page.total - len(rows)))
+                    or len(page.data) != min(_PAGE_SIZE, max(0, page.total - seen))
                 ):
                     raise ValueError
                 expected = counts
                 if any(row.api_key != key.key_id for row in page.data):
                     raise ValueError
-                rows.extend(row.normalized() for row in page.data)
-                if number >= page.total_pages:
-                    if len(rows) != page.total:
+                seen += len(page.data)
+                for raw_row in page.data:
+                    row = raw_row.normalized()
+                    # Compare validated wire observations before dropping metadata;
+                    # keep only their digest, never the upstream request payloads.
+                    fingerprint = hashlib.sha256(
+                        json.dumps(raw_row.model_dump(), sort_keys=True, allow_nan=False).encode()
+                    ).digest()
+                    previous = fingerprints.get(row.request_id)
+                    if previous is not None and previous != fingerprint:
                         raise ValueError
-                    return rows
+                    fingerprints[row.request_id] = fingerprint
+                    rows[row.request_id] = row
+                if number >= page.total_pages:
+                    if seen != page.total:
+                        raise ValueError
+                    return list(rows.values())
             raise ValueError
 
         return await self._run("GET", "/spend/logs/v2", work)
