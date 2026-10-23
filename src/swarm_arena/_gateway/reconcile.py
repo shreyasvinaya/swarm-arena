@@ -53,18 +53,31 @@ OBSERVED: Final = "observed"
 UNVERIFIED: Final = "observed (completeness unverified)"
 ESTIMATED: Final = "estimated"
 _T = TypeVar("_T")
+_ALLOWANCE_REASON: Final = "reconcile time allowance exhausted"
+
+
+class _AllowanceExpired(GatewayError):
+    """Distinguish work that never started from an external operation failure."""
 
 
 async def _external(operation: Callable[[], Awaitable[_T]], deadline: float) -> _T:
     """Bound external work only; durable recording keeps its owner's lifetime."""
+    if anyio.current_time() >= deadline:
+        raise _AllowanceExpired(_ALLOWANCE_REASON)
     outcome = _Outcome()
+    started = False
     try:
         with anyio.move_on_at(deadline) as wait:
             await anyio.lowlevel.checkpoint()
+            started = True
             result = await operation()
         if wait.cancel_called:
+            if not started:
+                raise _AllowanceExpired(_ALLOWANCE_REASON)
             raise GatewayError("gateway operation timed out")
         return result
+    except _AllowanceExpired:
+        raise
     except BaseExceptionGroup as error:
         if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
             raise
@@ -213,10 +226,10 @@ async def reconcile_keys(
     now : callable, default=utc_now
         Aware wall clock for closure waits and fixed query windows.
     _deadline : float or None, optional
-        Private shared external-work deadline. The allowance is at most the
-        smaller of request_timeout_s and the writer settlement timeout, capped
-        before inherited, closing and I/O deadlines. It never wraps healthy
-        recorder or journal storage.
+        Private overall external-work deadline, at most the writer settlement
+        timeout and capped before inherited, closing and I/O deadlines. Each
+        key receives at most request_timeout_s within that bound. It never
+        wraps healthy recorder or journal storage.
 
     _manager : KeyManager or None, optional
         Existing run key owner; maintenance constructs one when absent.
@@ -225,7 +238,8 @@ async def reconcile_keys(
     -------
     ReconcileReport
         Per-key observations or full estimated reservations; the shared payload
-        is also appended to the journal. A later call can add retained late rows.
+        is also appended to the journal. A later call can add retained late rows
+        for keys not yet deleted; deleted keys reuse committed observations.
 
     Examples
     --------
@@ -233,9 +247,11 @@ async def reconcile_keys(
     0.0
     """
     journal._check_open()
-    deadline = _gateway_deadline(journal, timeout_s=gateway.request_timeout_s)
+    if journal._run_id != run_id or any(event.run_id != run_id for event in events):
+        raise _core_error(ConfigError, "run_id")
+    overall = _gateway_deadline(journal)
     if _deadline is not None:
-        deadline = min(deadline, _deadline)
+        overall = min(overall, _deadline)
     manager = (
         _manager
         if _manager is not None
@@ -276,22 +292,80 @@ async def reconcile_keys(
                 deleted.add(key_id)
     reports: list[KeyReport] = []
     for record in records:
+        if record.key_id in deleted:
+            retained: float | None = None
+            retained_reasons: list[str] = []
+            try:
+                units, _ = _observations(record, list(state.llm_calls.values()), [])
+                retained = _report_usd(units)
+            except (GatewayError, ValueError):
+                retained_reasons.append("unsupported gateway observation")
+            reports.append(
+                KeyReport(
+                    candidate_id=record.candidate_id,
+                    key_id=record.key_id,
+                    alias=record.alias,
+                    reserved_usd=record.max_budget_usd,
+                    observed_usd=retained,
+                    label=ESTIMATED
+                    if retained is None
+                    else OBSERVED
+                    if adapter.terminal_accounting
+                    else UNVERIFIED,
+                    reasons=retained_reasons,
+                    deleted=True,
+                )
+            )
+            continue
+        deadline = min(overall, _gateway_deadline(journal, timeout_s=gateway.request_timeout_s))
         reasons: list[str] = []
+        key = _virtual(record)
+        try:
+            matches = await _external(partial(adapter.key_matches, key, run_id=run_id), deadline)
+        except _AllowanceExpired:
+            reasons.append(_ALLOWANCE_REASON)
+        except GatewayError:
+            reasons.append("gateway key identity unavailable")
+        else:
+            if matches is not True:
+                reasons.append(
+                    "gateway key identity mismatch"
+                    if matches is False
+                    else "gateway key identity unavailable"
+                )
+        if reasons:
+            reports.append(
+                KeyReport(
+                    candidate_id=record.candidate_id,
+                    key_id=record.key_id,
+                    alias=record.alias,
+                    reserved_usd=record.max_budget_usd,
+                    observed_usd=None,
+                    label=ESTIMATED,
+                    reasons=reasons,
+                    deleted=False,
+                )
+            )
+            continue
         start = starts.get(record.candidate_id)
         dead: bool | None = True
         if start is not None:
             try:
                 dead = await _external(partial(executor.confirm_dead, start), deadline)
+            except _AllowanceExpired:
+                reasons.append(_ALLOWANCE_REASON)
             except GatewayError:
                 dead = None
         if dead is not True:
             reasons.append("tool not confirmed dead")
         closure = closed[record.key_id]
-        key = _virtual(record)
         if closure is None and record.key_id not in deleted:
             try:
                 await _external(partial(adapter.block_key, key), deadline)
                 closure = await _external(partial(adapter.closed_at, key), deadline)
+            except _AllowanceExpired:
+                if _ALLOWANCE_REASON not in reasons:
+                    reasons.append(_ALLOWANCE_REASON)
             except GatewayError:
                 _key_event(journal, record, "close_failed", error="gateway closure unconfirmed")
             else:
@@ -299,7 +373,7 @@ async def reconcile_keys(
                     _key_event(journal, record, "closed", closed_at=closure.isoformat())
                 else:
                     _key_event(journal, record, "close_failed", error="gateway closure unconfirmed")
-        if closure is None:
+        if closure is None and _ALLOWANCE_REASON not in reasons:
             reasons.append("key closure not confirmed by the gateway")
         if (
             profile is None
@@ -333,26 +407,35 @@ async def reconcile_keys(
                     ),
                     deadline,
                 )
+            except _AllowanceExpired:
+                reasons.append(_ALLOWANCE_REASON)
             except GatewayError:
                 reasons.append("gateway spend read failed")
             else:
                 try:
                     units, fresh = _observations(record, list(state.llm_calls.values()), rows)
+                    observed = _report_usd(units)
                 except GatewayError as error:
                     # These messages are constructed locally, never adapter data.
                     reasons.append(str(error))
+                except ValueError:
+                    reasons.append("unsupported gateway observation")
                 else:
-                    observed = _report_usd(units)
                     for row in fresh:
                         if await _record_row(record, row, journal) is None:
                             reasons.append("gateway observation recording incomplete")
                             observed = None
                             break
-            if reasons:
+            if reasons and _ALLOWANCE_REASON not in reasons:
                 _key_event(journal, record, "read_failed", error="gateway read incomplete")
-            elif record.key_id not in deleted:
+            elif not reasons:
+                # Publication must cover both closure and observations before
+                # deleting their upstream recovery source. This is storage work.
+                await journal.commit()
                 try:
                     await _external(partial(adapter.delete_key, key), deadline)
+                except _AllowanceExpired:
+                    reasons.append(_ALLOWANCE_REASON)
                 except GatewayError:
                     _key_event(journal, record, "read_failed", error="gateway read incomplete")
                 else:
@@ -375,7 +458,6 @@ async def reconcile_keys(
             )
         )
     report = ReconcileReport(run_id=run_id, keys=reports)
-    report.spend_usd()
     journal.append(EventDraft(type=EventType.RECONCILE, payload=report.model_dump(mode="json")))
     return report
 
@@ -428,7 +510,10 @@ async def take_run(
                 for event in batch
             ]
         )
-        _check_gateway_binding(RunState.from_events(events), config)
+        state = RunState.from_events(events)
+        if events and state.run_id != run_id:
+            raise _core_error(ConfigError, "run_id")
+        _check_gateway_binding(state, config)
 
     stops = StopState() if _stops is None else _stops
     lease: Lease | None = None
@@ -468,6 +553,8 @@ async def take_run(
                 )
                 events = [event for _, batch in chain for event in batch]
             state = await _validated_io(RunState.from_events, events)
+            if events and state.run_id != run_id:
+                raise _core_error(ConfigError, "run_id")
             _check_gateway_binding(state, config)
             completed = True
         if not completed:
@@ -533,12 +620,14 @@ async def reconcile_run(
     except LeaseHeld:
         raise _core_error(
             RuntimeError,
-            f"run {run_id} has a live owner; its own reconcile at run end covers the work",
+            f"run {run_id} has a live owner; retry after its lease expires",
         ) from None
     entered = False
     hard = False
     report: ReconcileReport | None = None
     try:
+        if lease.doc.head is None:
+            return ReconcileReport(run_id=run_id, keys=[])
         store = lease._store
         async with (
             _supervise_initialization(store, lease.doc.epoch, stops, None, config, retain=True),
@@ -562,9 +651,15 @@ async def reconcile_run(
                     state=state,
                     _maintenance_lease=lease,
                 ):
-                    deadline = _gateway_deadline(writer, timeout_s=gateway.request_timeout_s)
+                    deadline = _gateway_deadline(writer)
                     try:
-                        profile = await _external(adapter.preflight, deadline)
+                        profile = await _external(
+                            adapter.preflight,
+                            min(
+                                deadline,
+                                _gateway_deadline(writer, timeout_s=gateway.request_timeout_s),
+                            ),
+                        )
                     except GatewayError:
                         profile = None
                     report = await reconcile_keys(

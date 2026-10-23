@@ -100,3 +100,33 @@ def test_key_failure_requires_nonsecret_identity(action: str) -> None:
             GatewayKeyFailure.model_validate({k: v for k, v in payload.items() if k != field})
     with pytest.raises(ValueError, match="literal_error"):
         GatewayKeyFailure.model_validate({**payload, "error": "external secret detail"})
+
+
+@pytest.mark.parametrize("fallback_exact", [False, True])
+def test_unrepresentable_total_keeps_rows_and_exact_estimate(fallback_exact: bool) -> None:
+    from swarm_arena._gateway.reports import KeyReport
+
+    costs = [1_000_000_000.0] * 10 + [0.000001]
+    keys = [
+        KeyReport(
+            candidate_id=f"c-{n}",
+            key_id=f"hash-{n}",
+            alias=f"cand-{n}",
+            reserved_usd=1 if fallback_exact else cost,
+            observed_usd=cost,
+            label="observed",
+            reasons=[],
+            deleted=True,
+        )
+        for n, cost in enumerate(costs)
+    ]
+    report = ReconcileReport(run_id="r", keys=keys)
+    assert report.spend_usd() == (11 if fallback_exact else None)
+    assert report.total_label == "estimated"
+    assert report.total_reasons == ["unsupported gateway observation"]
+    assert [key.observed_usd for key in report.keys] == costs
+    assert ReconcileReport.model_validate_json(report.model_dump_json()) == report
+    payload = report.model_dump(mode="json")
+    payload["total_usd"] = 123.0
+    with pytest.raises(ValueError, match="validation error"):
+        ReconcileReport.model_validate(payload)

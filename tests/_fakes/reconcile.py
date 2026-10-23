@@ -58,6 +58,10 @@ class CapableGateway:
         self._check("block")
         self.blocked.append(key.key_id)
 
+    async def key_matches(self, key: VirtualKey, *, run_id: str) -> bool | None:
+        self._check("identity")
+        return True
+
     async def closed_at(self, key: VirtualKey) -> datetime | None:
         self._check("closed_at")
         return self.closure

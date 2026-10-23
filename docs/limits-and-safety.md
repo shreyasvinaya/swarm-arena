@@ -217,6 +217,23 @@ is ignored); a missing or changed binding is refused before takeover and
 rechecked after acquisition. The driver also attempts reconciliation before its final commit,
 using its existing owner and gateway profile. Gateway failures are recorded
 without failing completion; storage failures and ownership loss still propagate.
+A run with no committed head returns an empty report and releases its lease
+without publishing history; it remains ineligible for resume.
+
+The run directory and run root are trusted operator data. Anyone who can write
+them can change the tools that resume executes and make resume or reconcile
+send the environment master key named by `master_key_env` to the gateway URL in
+that configuration. Keep run roots writable only by the operator. On shared
+storage, pass `--config` from an independently trusted copy; the gateway
+continuity check then refuses a changed URL. This does not authenticate a
+modified journal or recorded plan.
+
+Before reconciliation mutates a key, its journal and writer must match the
+addressed run. The adapter checks the selected hash through `/key/info` and
+compares the stored creation `metadata.run_id` and `key_alias` with the record.
+A mismatch or unavailable identity leaves the key estimated without mutation,
+using a fixed reason without external values. These checks use the pinned
+LiteLLM key-info fields; they do not make an attacker-writable run root trusted.
 
 A key's report becomes an observation only when all these conditions hold:
 
@@ -238,17 +255,30 @@ completeness. An adapter that can demonstrate these capabilities reports
 accounting, in which case it reports **observed**. Unverified observed spend
 is not proof that every charge has arrived: late log batches may add rows.
 Deletion is attempted only after a successful eligible read and durable recording.
+The committed head must cover the observations and closure before deletion,
+so a takeover after deletion can recover spend even after upstream log retention.
 
 Reports deduplicate gateway requests by key and request identity, retain earlier
 committed observations even when logs age out, and sum integer micro-dollars
-before displaying USD. Totals that cannot be represented without losing a
-micro-dollar are refused. A later reconcile can add late rows and update the
-report; readers retain their captured committed snapshot until refreshed.
+before displaying USD. A key total that cannot be represented without losing a
+micro-dollar stays estimated with `unsupported gateway observation` and is not
+deleted. An unsupported run aggregate preserves all per-key results and reports
+the exact full-reservation total as estimated with the same fixed reason. If
+even that estimate cannot be represented, the aggregate is unavailable (`null`),
+never rounded or clamped. These display limits do not prevent run completion or
+its final review export. A later reconcile can add late rows for retained keys;
+deleted keys reuse their committed observations without repeating gateway reads.
+Readers retain their captured committed snapshot until refreshed.
 Reconciliation never refunds reservations, changes a live run's budget, or
 restarts the paid-work clock. Gateway waits have a separate bounded allowance;
 healthy journal storage is not charged against that external-work timer. The
-allowance is at most `settle_timeout_s` and `request_timeout_s`, capped before
-inherited cancellation and writer closing/I/O deadlines. Run-end reads and
+overall allowance is at most `settle_timeout_s`, capped before inherited
+cancellation and writer closing/I/O deadlines. Each key has a fresh allowance
+of at most `request_timeout_s` within that overall bound. An operation whose
+allowance expired before entry reports `reconcile time allowance exhausted`,
+without claiming a gateway failure. Repeated calls skip deleted keys so later
+keys can progress. Resume's closure loop also has one bounded overall allowance;
+unclosed keys remain available for reconciliation. Run-end reads and
 reconciliation finish before the final completion allowance is armed. Failure
 events include the nonsecret key and candidate IDs for later recovery.
 
@@ -397,6 +427,11 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+Resume trusts the saved configuration, journal and recorded tools. Restrict run
+root writes to the operator and use a trusted `--config` on shared storage:
+writers can redirect the configured `master_key_env` credential to another
+gateway URL or change which tools resume runs. See the
+[run-storage trust boundary](#after-the-run-reconcile) above.
 Backend journal reads are contained and their bytes detached before chain or replay
 validation. Backend diagnostics and backend cancellation cannot impersonate core
 validation or caller cancellation.

@@ -47,6 +47,7 @@ FIELD_SETS = {
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",
     ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
+    ("reconcile", 1): "86872e6e25f773384cce91e00dba0b2a66cdaec3fa2086205813e0d336d9dab0",
     ("segment", 1): "24a9c075f402a838718212851482617251b3bab08bafa51018f9e4e6d0426f09",
     ("candidate", 1): "c9f2c8fc941f5450e39e72dae59f69f9c14481e30c88230971ff030fff6caf09",
     ("learning", 1): "c5e234505180affe880f7822eb49708b48bd501ff90903528fc4eb0b7bb478b1",
@@ -56,6 +57,23 @@ FIELD_SETS = {
     ("job_started", 1): "237fdb12287452b9309f010994d452813755353410e771cac98d04ad65f79fe9",
     ("tool_result", 1): "b0f03da03916731b82f5d6e1a2c6d7e844a1cb0e207c8b29d89bc34dea07841f",
 }
+
+
+def test_reconcile_event_payload_fields_are_pinned() -> None:
+    from swarm_arena._gateway.reports import ReconcileReport
+
+    # Event.payload is generic JSON; its envelope hash cannot pin this payload.
+    schema = ReconcileReport.model_json_schema()
+    fields = {"root": sorted(schema["properties"])}
+    fields.update(
+        {
+            name: sorted(node["properties"])
+            for name, node in schema.get("$defs", {}).items()
+            if "properties" in node
+        }
+    )
+    digest = hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+    assert digest == FIELD_SETS[("reconcile", 1)]
 
 
 @pytest.mark.parametrize(

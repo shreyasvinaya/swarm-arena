@@ -105,15 +105,26 @@ class ReconcileReport(FrozenModel):
         Producing run; replay also checks the event envelope identity.
     keys : list of KeyReport
         Per-key observations, with the same validation used during replay.
+    total_usd : float or None
+        Exact sum of observations/full estimates. If that sum is not representable,
+        use the exact full-reservation sum, or None if that is also unrepresentable.
+    total_label : str
+        Least certain per-key label; estimated when the observed sum is unsupported.
+    total_reasons : list of str
+        Fixed reason for an unsupported aggregate. Totals are derived from keys;
+        explicitly supplied inconsistent totals are refused.
 
     Examples
     --------
-    >>> ReconcileReport(run_id="r", keys=[]).model_dump(mode="json")
-    {'run_id': 'r', 'keys': []}
+    >>> ReconcileReport(run_id="r", keys=[]).total_usd
+    0.0
     """
 
     run_id: GatewayId
     keys: list[KeyReport]
+    total_usd: GatewayUsd | None = None
+    total_label: ReportLabel = "estimated"
+    total_reasons: list[Literal["unsupported gateway observation"]] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -123,22 +134,54 @@ class ReconcileReport(FrozenModel):
             return {key: item for key, item in value.items() if key != "run_elapsed_s"}
         return value
 
-    def spend_usd(self) -> float:
+    @model_validator(mode="after")
+    def _total(self) -> Self:
+        """Preserve per-key facts even when their aggregate cannot be displayed."""
+        label: ReportLabel = (
+            "estimated"
+            if any(key.label == "estimated" for key in self.keys)
+            else "observed (completeness unverified)"
+            if any(key.label == "observed (completeness unverified)" for key in self.keys)
+            else "observed"
+        )
+        reasons: list[str] = []
+        try:
+            total: float | None = _report_usd(
+                sum(
+                    _micro_units(key.reserved_usd if key.observed_usd is None else key.observed_usd)
+                    for key in self.keys
+                )
+            )
+        except ValueError:
+            label = "estimated"
+            reasons = ["unsupported gateway observation"]
+            try:
+                total = _report_usd(sum(_micro_units(key.reserved_usd) for key in self.keys))
+            except ValueError:
+                total = None
+        for name, value in (
+            ("total_usd", total),
+            ("total_label", label),
+            ("total_reasons", reasons),
+        ):
+            if name in self.model_fields_set and getattr(self, name) != value:
+                raise ValueError("gateway total conflicts with key reports")
+            object.__setattr__(self, name, value)
+        return self
+
+    def spend_usd(self) -> float | None:
         """Sum observed spend where available, otherwise full reservations.
 
         Returns
         -------
-        float
-            Display total only; never a replacement for ledger settlement.
+        float or None
+            Exact display total, using full reservations if observed aggregation
+            is unsupported. None means even the full estimate is unrepresentable.
+            Inspect total_label and total_reasons; this never changes settlement.
 
         Examples
         --------
         >>> ReconcileReport(run_id="r", keys=[]).spend_usd()
         0.0
         """
-        return _report_usd(
-            sum(
-                _micro_units(key.reserved_usd if key.observed_usd is None else key.observed_usd)
-                for key in self.keys
-            )
-        )
+        return self.total_usd

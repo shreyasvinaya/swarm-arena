@@ -33,7 +33,6 @@ from swarm_arena._errors import (
 from swarm_arena._exec.executor import Executor, Job, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
-from swarm_arena._gateway.reports import GatewayKeyFailure
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import _read_segment, read_chain
@@ -388,21 +387,7 @@ class _ResumeServices:
                                         )
                                     )
                                 if gateway is not None:
-                                    for record in gateway.records():
-                                        if record.closed_at is None:
-                                            closed = await gateway.close(record)
-                                            if closed.closed_at is None:
-                                                journal.append(
-                                                    gateway._draft(
-                                                        record,
-                                                        GatewayKeyFailure(
-                                                            action="close_failed",
-                                                            key_id=record.key_id,
-                                                            candidate_id=record.candidate_id,
-                                                            error="gateway closure unconfirmed",
-                                                        ).model_dump(mode="json"),
-                                                    )
-                                                )
+                                    await run_module._close_gateway(journal, gateway)
                                     await run_module._read_gateway(journal, gateway)
                                 shares = weighted_shares(
                                     ledger.free(),
