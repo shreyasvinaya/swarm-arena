@@ -2623,7 +2623,7 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
     try:
         assert await anyio.to_thread.run_sync(held.entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
         assert not held.exited.is_set(), "cancellation waited for the held upload"
         assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
@@ -2756,13 +2756,13 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
         if cancel:
             assert await anyio.to_thread.run_sync(held.entered.wait, 60)
             task.cancel()
-            with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
                 await observe_task(task)
             assert not held.exited.is_set(), "cancellation waited for held preparation"
             await held.finish()
         else:
             with pytest.raises(ValueError, match="draft admission failed") as caught:
-                await task
+                await observe_task(task)
             assert_secret_absent(caught.value, "secret-sentinel")
         assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         assert list(open_store(str(tmp_path / "artifacts")).list("")) == []

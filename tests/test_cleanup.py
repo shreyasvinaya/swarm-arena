@@ -105,3 +105,42 @@ async def test_observation_timeout_does_not_cancel_owned_work() -> None:
     finally:
         release.set()
         await settle_tasks(task)
+
+
+@pytest.mark.parametrize("check", ["raises_outer", "cancelled_assertion"])
+async def test_cancellation_watchdog_cannot_pass_for_a_resisting_task(check: str) -> None:
+    import anyio
+    from _fakes.cleanup import observe_task
+
+    entered, resisted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held() -> None:
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                resisted.set()
+
+    task = asyncio.create_task(held())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+            task.cancel()
+            await resisted.wait()
+        if check == "raises_outer":
+            with pytest.raises(TimeoutError):  # noqa: PT012, SIM117
+                with pytest.raises(asyncio.CancelledError), anyio.fail_after(60) as watchdog:  # noqa: PT012
+                    watchdog.deadline = float("-inf")
+                    await observe_task(task)
+        else:
+            with pytest.raises(AssertionError):  # noqa: PT012
+                with anyio.fail_after(60) as watchdog, pytest.raises(asyncio.CancelledError):  # noqa: PT012
+                    watchdog.deadline = float("-inf")
+                    await observe_task(task)
+                assert task.cancelled()
+        assert not task.done()
+        assert not release.is_set()
+    finally:
+        release.set()
+        await settle_tasks(task)

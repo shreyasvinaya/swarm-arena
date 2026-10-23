@@ -381,7 +381,7 @@ async def test_storage_error_until_expiry_fails_waiters(
             assert not waiter.done()
             lease_clock.expire(w)
             with pytest.raises(Fenced):
-                await waiter
+                await observe_task(waiter)
         assert w.fenced.is_set()
     assert flaky.replace_calls == flaky.replaces_at_first_create
 
@@ -551,7 +551,7 @@ async def test_oserror_retries_until_expiry_without_renewal(
             assert not waiter.done()
             lease_clock.expire(w)
             with pytest.raises(Fenced):
-                await waiter
+                await observe_task(waiter)
     assert flaky.create_calls == 1
     assert flaky.replace_calls == 0
 
@@ -1203,8 +1203,8 @@ async def test_writer_stop_retains_earlier_failure_provenance(
         writer._fail(error)
         with anyio.CancelScope(shield=True):
             task.cancel("later-cancel-secret")
-            with anyio.fail_after(60), pytest.raises(asyncio.CancelledError):
-                await task
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(60):
+                await observe_task(task)
             assert writer._failure is error
             assert not writer._stopped
             with pytest.raises(Fenced) as caught:

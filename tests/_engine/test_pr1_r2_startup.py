@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fakes.cleanup import settle_tasks
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.pr1_r2 import SECRET, failure
 from _fakes.run import plan
 
@@ -231,7 +231,7 @@ async def test_startup_caller_cancel_wins_over_replacement(
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await task
+            await observe_task(task)
         assert SECRET not in "".join(traceback.format_exception(caught.value))
     finally:
         if not task.done():

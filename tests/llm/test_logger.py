@@ -903,7 +903,7 @@ async def test_cancellation_abandons_adapter(tmp_path: Path) -> None:
         try:
             await held.ready()
             task.cancel()
-            with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
                 await observe_task(task)
             await drain(scope, wait=False)
         finally:

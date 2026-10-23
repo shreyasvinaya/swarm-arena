@@ -9,7 +9,7 @@ from types import ModuleType
 from typing import Any, cast
 
 import pytest
-from _fakes.cleanup import settle_tasks
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.pr1_r2 import SECRET, failure
 from _fakes.run import plan
 from _fakes.tools import cand
@@ -453,7 +453,7 @@ async def test_offline_harness_preserves_native_caller_cancel(
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await task
+            await observe_task(task)
         assert SECRET not in "".join(traceback.format_exception(caught.value))
         assert harness.manager_errors == []
     finally:

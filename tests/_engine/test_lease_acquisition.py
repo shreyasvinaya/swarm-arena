@@ -81,11 +81,11 @@ async def test_engine_acquisition_supervision(
         elif stop == "cancel":
             task.cancel()
         with (
-            anyio.fail_after(30),
             pytest.raises(
                 asyncio.CancelledError if stop == "cancel" else RuntimeError,
                 match=None if stop == "cancel" else "initialization stopped",
             ),
+            anyio.fail_after(30),
         ):
             await asyncio.shield(task)
         assert not held.held.exited.is_set(), "owner waited for its held response"

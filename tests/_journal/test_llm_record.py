@@ -1044,7 +1044,7 @@ async def test_native_cancel_before_append_leaves_placeholder(
             await held.ready()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             assert await drain(scope, wait=False) == [meta["call_id"]]
             assert run.charged(scope) == ESTIMATE
         finally:
@@ -1215,7 +1215,7 @@ async def test_cancel_during_durable_settlement_retains_admitted_actual(
                 await entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             finally:
                 release.set()
                 await settle_tasks(task)
@@ -1392,7 +1392,7 @@ async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
                     await entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             finally:
                 task.cancel()
                 await settle_tasks(task)
@@ -2098,7 +2098,7 @@ async def test_one_sided_payload_upload_cancel_does_not_append(
             await held.ready()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             await held.finish()
             await run.journal.commit()
             assert run.calls() == []
@@ -2193,7 +2193,7 @@ async def test_interrupted_reports_retain_each_admitted_link(
                 await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             await run.journal.commit()
             assert links == [call.id for call in run.calls()]
             assert len(links) == 1

@@ -198,7 +198,7 @@ async def test_cancel_mid_call_charges_reservation_in_full(tmp_path: Path, nativ
                     with anyio.fail_after(30):
                         await fake.entered.wait()
                     task.cancel()
-                    with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+                    with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
                         await observe_task(task)
                 finally:
                     task.cancel()
@@ -540,7 +540,7 @@ async def test_cancel_while_draining_still_settles(
             with anyio.fail_after(30):
                 await draining.wait()
             task.cancel()
-            with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
                 await observe_task(task)
             (call,) = run.calls()
             assert call.error is not None
@@ -801,6 +801,7 @@ async def test_real_caller_cancellation_beats_round_timer_and_action_control(
                 if owner == "task":
                     with pytest.raises(asyncio.CancelledError):
                         await observe_task(task)
+                    assert task.cancelled()
                 else:
                     await observe_task(task)
                     assert cancelled.is_set()
@@ -985,7 +986,7 @@ async def test_caller_cancellation_wins_over_terminal_drain(
             with anyio.fail_after(60):
                 await fake.entered.wait()
             task.cancel()
-            with anyio.fail_after(60), pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(60):
                 await observe_task(task)
             assert len(run.calls()) == 1
         finally:

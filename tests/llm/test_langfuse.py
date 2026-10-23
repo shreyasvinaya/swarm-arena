@@ -607,6 +607,8 @@ async def test_failing_trace_exit_preserves_control(
                     asyncio.CancelledError if kind == "caller" else type(error)
                 ) as caught:
                     await observe_task(task)
+                if kind == "caller":
+                    assert task.cancelled()
                 assert_secret_absent(caught.value, "SENTINEL_SECRET")
                 if kind != "caller":
                     assert caught.value is error

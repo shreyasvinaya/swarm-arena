@@ -306,6 +306,7 @@ async def test_editor_restores_real_tty_on_every_exit(
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await observe_task(task)
+                assert task.cancelled()
             else:
                 (directory,) = await anyio.to_thread.run_sync(
                     lambda: list(Path(config.run_root).iterdir())

@@ -12,7 +12,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
-from _fakes.cleanup import settle_tasks
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.dependencies import ray_dependency
 from _fakes.engine import with_executor, with_limits
 from _fakes.finished import FinishedRun
@@ -2329,7 +2329,7 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         assert services
         scopes[0].cancel()
         with anyio.fail_after(30):
-            await task
+            await observe_task(task)
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
@@ -2779,11 +2779,12 @@ async def test_resume_startup_models_contain_hooks_before_takeover(
                 assert _resume_bytes(store) == before
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
                 assert not release.is_set()
             else:
                 with pytest.raises(ValueError, match="model checks failed") as caught:
-                    await task
+                    await observe_task(task)
                 assert secret not in "".join(traceback.format_exception(caught.value))
     finally:
         release.set()
