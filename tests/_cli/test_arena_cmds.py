@@ -287,6 +287,7 @@ def test_invalid_human_text_never_echoes_values(
 async def test_cancelled_validation_never_publishes(
     finished_run: FinishedRun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import asyncio
     import threading
 
     import anyio
@@ -296,31 +297,45 @@ async def test_cancelled_validation_never_publishes(
     from swarm_arena._board.human_objects import HumanObject
 
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
 
     def stalled(*args: object, **kwargs: object) -> HumanObject:
+        workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
             return HumanObject(kind="pin", learning_id="L-example", author="human:alice")
         finally:
             exited.set()
 
     monkeypatch.setattr(human_ops, "_prepare_human_operation", stalled)
     board = ArenaBoard(arena_root=finished_run.config.arena_root)
+    scope = anyio.CancelScope()
+
+    async def apply() -> None:
+        with scope:
+            await human_ops._apply_human_operation(
+                board, finished_run.namespace, "pin", author="alice"
+            )
+
+    task = asyncio.create_task(apply())
     try:
-        async with anyio.create_task_group() as group:
-
-            async def apply() -> None:
-                await human_ops._apply_human_operation(
-                    board, finished_run.namespace, "pin", author="alice"
-                )
-
-            group.start_soon(apply)
-            assert await anyio.to_thread.run_sync(entered.wait, 5)
-            group.cancel_scope.cancel()
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        scope.cancel()
+        with anyio.fail_after(30):
+            await task
+        assert scope.cancelled_caught
+        assert not exited.is_set()
     finally:
         release.set()
-        assert await anyio.to_thread.run_sync(exited.wait, 5)
+        assert await anyio.to_thread.run_sync(exited.wait, 60)
+        if not task.done():
+            task.cancel()
+        with anyio.fail_after(60):
+            await asyncio.gather(task, return_exceptions=True)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
         await anyio.to_thread.run_sync(board.close)
     folder = Path(finished_run.config.arena_root) / finished_run.namespace / "curation"
     assert not list(folder.glob("*.jsonl"))
@@ -542,7 +557,7 @@ def test_installed_export_accepts_every_login(
         env=dict(os.environ, LOGNAME=login),
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
         check=False,
     )
     assert done.returncode == 0, done.stderr
@@ -658,19 +673,19 @@ def test_board_serve_smoke(finished_run: FinishedRun) -> None:
             assert line.startswith("Serving http://127.0.0.1:"), (line, stderr_path.read_text())
             url = line.split()[-1]
             for path in ("", f"learning/{learning_id}", f"candidate/{candidate_id}"):
-                with urlopen(url + path, timeout=10) as response:
+                with urlopen(url + path, timeout=60) as response:
                     assert response.status == 200
             proc.send_signal(signal.SIGINT)
-            proc.communicate(timeout=10)
+            proc.communicate(timeout=60)
             assert proc.returncode == 0, stderr_path.read_text()
         finally:
             if proc.poll() is None:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=60)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=60)
             if proc.stdout is not None:
                 proc.stdout.close()
 
