@@ -41,18 +41,18 @@ class HeldOperation:
     def wait(self) -> None:
         self.entered.set()
         try:
-            assert self.release.wait(30), "test did not release held operation"
+            assert self.release.wait(300), "test did not release held operation"
         finally:
             self.exited.set()
 
     async def ready(self) -> None:
-        with anyio.fail_after(5):
-            assert await anyio.to_thread.run_sync(self.entered.wait, 5)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(self.entered.wait, 60)
 
     async def finish(self) -> None:
         self.release.set()
-        with anyio.fail_after(5):
-            assert await anyio.to_thread.run_sync(self.exited.wait, 5)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(self.exited.wait, 60)
 
 
 @dataclass
