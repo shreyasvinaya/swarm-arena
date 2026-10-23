@@ -143,6 +143,22 @@ def test_all_snapshot(module: str) -> None:
     assert len(set(names)) == len(names)
 
 
+@pytest.mark.parametrize("module", ["swarm_arena", "swarm_arena.llm", "swarm_arena.testing"])
+def test_facade_has_no_extra_public_names(module: str) -> None:
+    if module == "swarm_arena.llm":
+        pytest.importorskip("agents")
+    facade = importlib.import_module(module)
+    children = {
+        name
+        for name, value in vars(facade).items()
+        if isinstance(value, types.ModuleType) and value.__name__.startswith(f"{module}.")
+    }
+    for names in (vars(facade), dir(facade)):
+        assert {name for name in names if not name.startswith("_")} <= set(
+            facade.__all__
+        ) | children
+
+
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_names_report_public_module(module: str) -> None:
     mod = importlib.import_module(module)

@@ -1,6 +1,6 @@
 """Optional LLM integrations, installed with ``swarm-arena[llm]``."""
 
-import importlib.metadata
+import importlib.metadata as _metadata
 
 from swarm_arena._model.ref import _LLM_EXTRA_HINT as _MSG
 
@@ -8,8 +8,8 @@ _EXTRA_DEPS = ("agents", "litellm")
 
 for _dist, _module in (("openai-agents", "agents"), ("litellm", "litellm")):
     try:
-        importlib.metadata.version(_dist)
-    except importlib.metadata.PackageNotFoundError:
+        _metadata.version(_dist)
+    except _metadata.PackageNotFoundError:
         raise ModuleNotFoundError(_MSG, name=_module) from None
 
 try:

@@ -7,7 +7,7 @@ from swarm_arena._board.arena import ArenaBoard
 from swarm_arena._board.cache import ArenaCache
 from swarm_arena._board.leaderboard import format_value
 from swarm_arena._journal.event import EventType
-from swarm_arena._journal.lease import Head, read_owner
+from swarm_arena._journal.lease import Head
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._model.base import FrozenModel
@@ -160,28 +160,6 @@ def _calls_at(run_store: Store, head: Head) -> tuple[dict[str, LLMCall], str | N
         None,
     )
     return state.llm_calls, reason
-
-
-def llm_calls_of_run(run_store: Store) -> dict[str, LLMCall]:
-    """
-    Read calls from one authority snapshot and its committed journal chain.
-
-    Parameters
-    ----------
-    run_store : Store
-        Run-scoped store. This standalone read owns no lease or run deadline.
-
-    Returns
-    -------
-    dict[str, LLMCall]
-        Calls in committed order; empty when no authority/head exists.
-
-    Examples
-    --------
-    >>> calls = llm_calls_of_run(run_store)  # doctest: +SKIP
-    """
-    owner = read_owner(run_store)
-    return {} if owner is None or owner[0].head is None else _calls_at(run_store, owner[0].head)[0]
 
 
 @dataclass(frozen=True)

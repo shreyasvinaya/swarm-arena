@@ -771,28 +771,6 @@ def test_cache_stats_per_agent(tmp_path: Path) -> None:
     assert cache_stats([_call(run, "zero", usage=Usage())])[":manager"].hit_rate == 0
 
 
-def test_llm_calls_of_run_reads_one_authority_and_ignores_orphans(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from _fakes.trace_calls import _call, _record
-
-    from swarm_arena._board import trace as module
-
-    run = FakeRun(str(tmp_path / "runs"), "r")
-    run.commit(_record(_call(run, "committed")))
-    run.orphan(_record(_call(run, "orphan")))
-    original = module.read_owner
-    reads = []
-
-    def owner(store: Any) -> Any:
-        reads.append(1)
-        return original(store)
-
-    monkeypatch.setattr(module, "read_owner", owner)
-    assert list(module.llm_calls_of_run(run.store)) == ["committed"]
-    assert reads == [1]
-
-
 @pytest.mark.parametrize("reason", [None, "planning complete", "planner failed", "run budget"])
 def test_trace_shows_planning_session_calls_for_r0(tmp_path: Path, reason: str | None) -> None:
     from _fakes.trace_calls import _call, _record
@@ -963,7 +941,6 @@ def test_llm_composite_read_performs_no_refresh_replay_or_authority_read(
         monkeypatch.setattr(board, "frontier", forbidden)
         monkeypatch.setattr(ArenaCache, "_committed_state", forbidden)
         monkeypatch.setattr(RunState, "from_events", forbidden)
-        monkeypatch.setattr("swarm_arena._board.trace.read_owner", forbidden)
         monkeypatch.setattr("swarm_arena._board.arena.read_owner", forbidden)
         assert "planner-call" in "\n".join(trace(board, "c-llm"))
         with board._read_namespace() as reader:
@@ -993,14 +970,6 @@ def test_run_projection_memo_includes_source_root(tmp_path: Path) -> None:
         for cache in caches:
             cache.close()
         board.close()
-
-
-def test_llm_calls_of_run_without_committed_head(tmp_path: Path) -> None:
-    from swarm_arena._board.trace import llm_calls_of_run
-
-    assert llm_calls_of_run(open_store(str(tmp_path / "absent"))) == {}
-    run = FakeRun(str(tmp_path / "runs"), "r")
-    assert llm_calls_of_run(run.store) == {}
 
 
 @pytest.mark.parametrize("damage", ["missing-segment", "owner", "call"])
