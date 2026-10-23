@@ -165,6 +165,25 @@ its SHA-256). So a file that the program writes but `collect()` does not list
 is lost, and so are `usage` and `failed_provider` if `collect()` does not set
 them. The `RouteTool.collect()` above keeps `data` only.
 
+### Tools that call an LLM
+
+A tool that calls an LLM must declare `providers()`, returning the provider
+names (for example `frozenset({"openai"})`); for `FunctionTool`, use
+`providers=["openai"]`. With an LLM gateway, this declaration lets the driver
+create one virtual key per tool run and inject the gateway base URLs and key.
+The subprocess must use `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` instead of
+hard-coding a provider URL. A `Command.env` allowlist discovered only inside
+`command()` cannot trigger driver key creation and, with a gateway, never
+receives the real OpenAI or Anthropic credential. Driver-visible FunctionTool
+allowlists can trigger keying, but declare providers explicitly for clarity.
+
+Supply a positive USD reservation through `estimate()` or
+`limits.default_run_reservation.usd`; the full amount stays charged even after
+spend is read back. Never include virtual keys in results or logs. The pinned
+LiteLLM profile supports soft caps and estimated spend only. See
+[The LLM gateway on the cluster](running-on-ray.md#the-llm-gateway-on-the-cluster)
+for configuration, secret transport, proxy caching/tracing and network rules.
+
 ### Optional methods and their defaults
 
 | Method | Default | Override it to |

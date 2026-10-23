@@ -298,3 +298,121 @@ These are local-cluster tests with explicit Python filesystem-access denial.
 They do not establish multi-node deployment, remote token provisioning,
 worker-image installation or real S3 acceptance. Verify those paths in your
 deployment environment.
+
+## The LLM gateway on the cluster
+
+The cluster owner runs LiteLLM Proxy with Postgres, model/provider credentials,
+and a master key. Provision `LITELLM_MASTER_KEY` in the **driver's environment**
+for key management; never put its value in `run.toml`, the plan, a Ray upload,
+or `runtime_env`. Workers need network access to the proxy URL. A loopback URL
+works only when the proxy is on the same host as the calling process; use the
+cluster-reachable proxy address for distributed workers.
+
+**The pinned LiteLLM 1.107.0rc2 profile provides soft caps and estimated spend
+only.** It cannot verify a per-key output-token ceiling, a maximum total request
+duration, or required virtual-key use, and its settings introspection is
+unavailable. `default_estimated_output_tokens` is an estimate, not an output
+limit. With `limits.max_usd`, hard caps are required by default, so explicitly
+accept soft caps to run on this version:
+
+```toml
+[llm_gateway]
+url = "http://litellm.internal:4000"
+master_key_env = "LITELLM_MASTER_KEY"
+require_hard_cap = false
+key_duration_s = 86400
+request_timeout_s = 600.0
+default_estimated_output_tokens = 4096
+
+[limits]
+max_usd = 5.0
+max_tool_runs_per_round = 2
+
+[limits.default_run_reservation]
+tokens = 100000
+usd = 0.5
+```
+
+`require_hard_cap = true` fails preflight before key creation on this pinned
+version; leaving it unset with `max_usd` has the same effect. The manifest and
+candidate trace explicitly show `cap soft`. The gateway is optional and its
+client uses the Python standard library; tool-internal calls do not require
+the `llm` extra.
+
+A tool that calls an LLM must declare `providers()` (or set
+`FunctionTool(..., providers=["openai"])`). Each tool run with declared providers,
+or a driver-visible `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` allowlist, gets one
+virtual key named `cand-<candidate id>`. Plain tools get no key. For example:
+
+```python
+from swarm_arena import FunctionTool
+
+llm_tool = FunctionTool("my_connector.tools:solve", providers=["openai"])
+plain_tool = FunctionTool("my_connector.tools:score")
+```
+
+A keyed subprocess receives `OPENAI_BASE_URL=<url>/v1`,
+`ANTHROPIC_BASE_URL=<url>`, and both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` set
+to its virtual key. It must use those base URLs. The base URLs travel in
+`Job.env`; bearer values travel in `Job.secret_values`. A keyed job drops
+node/file provider credentials before applying these overlays. A dynamic
+`Command.env` allowlist alone is invisible to driver key selection: with a
+gateway it never grants the real OpenAI or Anthropic key. Declare providers
+instead. Other provider credentials are not replaced: keyed jobs do not get
+them; an unkeyed job that allowlists one can receive the node value and bypass
+the gateway. Keep provider declarations accurate and review allowlists.
+
+A keyed run needs a USD reservation **above zero**, supplied by
+`Tool.estimate(request)` or `limits.default_run_reservation.usd`. Its key's
+`max_budget` equals that reservation. The engine keeps the **entire reservation
+charged**, including failed or cancelled key-open attempts; gateway observations
+and reconciliation never refund it or create a second charge. Failures before
+key open retain ordinary undispatched-refund behavior. Tighter, realistic
+`Tool.estimate()` values and accurate `Tool.providers()` declarations avoid
+reserving unnecessarily large amounts or keying tools that do not use an LLM.
+A soft proxy cap does not make `max_usd` a hard bound on actual provider spend.
+
+The core keeps gateway keys out of journal records, manifests and artifacts.
+Tools must also keep credentials out of their own results and logs.
+`Job.secret_values` travels inside the Ray task payload, whose object-store
+contents can spill to **worker-local disk**. Secrets that must never travel
+through that payload belong in the worker environment or `secrets.file`
+(subject to that file's own storage policy). Gateway virtual-key transport
+itself does not offer a never-on-disk guarantee. Protect worker and object-store
+storage, and never put secrets in Ray `runtime_env`.
+
+Configure LiteLLM Proxy's own `cache` and `langfuse` callback settings for
+caching and tracing **tool-internal** calls, with their credentials provisioned
+on the proxy. The driver's response cache and Langfuse setup do not configure
+an arbitrary subprocess or the external proxy. Apply an outbound network rule
+that blocks workers from provider hosts while allowing the proxy; otherwise a
+tool with a hard-coded provider URL can go around it. The proxy needs its own
+provider egress.
+
+Run completion makes a bounded reconciliation attempt. To retry later, use
+the addressed run directory and its original gateway configuration:
+
+```sh
+swarm-arena reconcile runs/<run-id>
+# Optional explicit configuration, retaining the original gateway URL:
+swarm-arena reconcile runs/<run-id> --config run.toml
+```
+
+Run directories and run roots are **trusted operator data**: anyone who can
+write them can make resume/reconcile run tools and send the master key named
+by `master_key_env` to the gateway URL in the recorded configuration. Keep run
+roots writable only by the operator; on shared storage pass `--config` from a
+trusted copy (the continuity check then refuses a changed gateway URL).
+
+Reconcile takes the run lease and refuses a live owner. It reports each key's
+reserved amount and confidence label without changing the ledger. The pinned
+adapter remains **estimated**, even after waiting or lowering
+`request_timeout_s`; it cannot prove the duration/completeness conditions and
+does not delete keys through an observed transition. Recorded calls still
+provide informational spend. Other capability-bearing adapters can report
+`observed (completeness unverified)`, or `observed` with terminal accounting,
+only after confirming tool death, key closure and the required elapsed window.
+A key created but never journaled is not swept or counted in reports: its bearer
+never left the driver, and it expires after `key_duration_s`. See
+[After the run: reconcile](limits-and-safety.md#after-the-run-reconcile) for
+recovery and accounting details.
