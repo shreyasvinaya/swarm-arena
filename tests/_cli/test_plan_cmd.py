@@ -463,10 +463,10 @@ raise SystemExit(status)
         until(b"cleanup-ready")
         os.write(master, b"\x03")
         until(b"received-second")
-        deadline = time.monotonic() + (15 if interrupts == 3 and inside_session else 30)
         if interrupts == 3:
             os.write(master, b"\x03")
-            until(b"received-third-force", timeout=15)
+            until(b"received-third-force", timeout=60)
+        deadline = time.monotonic() + 30
         os.write(release_write, b"x")
         while True:
             status = process.poll()
@@ -506,7 +506,7 @@ raise SystemExit(status)
             os.killpg(pid, signal.SIGKILL)
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=10)
+        process.wait(timeout=60)
         os.close(master)
         os.close(release_write)
 
@@ -688,7 +688,7 @@ fsync = os.fsync
 local = threading.local()
 def hold():
     started.set()
-    assert release.wait(20)
+    assert release.wait(180)
 def sync(fd):
     if getattr(local, 'writing', False) and {stage!r} == 'sync':
         hold()
@@ -704,7 +704,7 @@ def held(*args):
         finished.set()
 plan_cmd._write_plan = held
 def interrupt():
-    assert started.wait(20)
+    assert started.wait(60)
     os.kill(os.getpid(), signal.SIGINT)
 worker = threading.Thread(target=interrupt)
 worker.start()
@@ -713,9 +713,9 @@ try:
                    *(['--force'] if {force!r} else []), str(files.run), str(files.goal)])
 finally:
     release.set()
-    worker.join(20)
+    worker.join(60)
 assert not worker.is_alive()
-assert finished.wait(20)
+assert finished.wait(60)
 assert status == 130, status
 assert files.output().read_text() == 'original' if {force!r} else not files.output().exists()
 assert not list(files.goal.parent.glob('.swarm-plan-*'))

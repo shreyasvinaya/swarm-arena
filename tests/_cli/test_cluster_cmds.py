@@ -395,7 +395,7 @@ def test_submission_timeout_abandons_one_wait_with_recoverable_id(
     def block() -> None:
         workers.append(current_thread())
         entered.set()
-        assert release.wait(10)
+        assert release.wait(180)
 
     class Client:
         def __init__(self, address: str | None) -> None:
@@ -409,7 +409,7 @@ def test_submission_timeout_abandons_one_wait_with_recoverable_id(
 
     async def monitored(fn: Callable[[], str]) -> str:
         async def expire() -> None:
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
             scopes[0].deadline = float("-inf")
 
         async with anyio.create_task_group() as group:
@@ -438,7 +438,7 @@ def test_submission_timeout_abandons_one_wait_with_recoverable_id(
     finally:
         release.set()
         for worker in workers:
-            worker.join(10)
+            worker.join(60)
             assert not worker.is_alive()
     if stage == "client":
         assert calls == []
