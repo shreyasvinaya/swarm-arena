@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task
 from _fakes.engine import EngineEnv
 
 from swarm_arena import (
@@ -1338,7 +1339,7 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
             )
         with anyio.fail_after(30):
             await finished.wait()
-            await task
+            await observe_task(task)
         assert env.deps.ids.counters() == before
         assert env.events("curated") == []
         if stage != "invoke":
@@ -2816,7 +2817,7 @@ async def test_graceful_stop_judging_outlives_settlement_window(
                     await anyio.Event().wait()
             release[index].set()
         with anyio.fail_after(60):
-            result = await task
+            result = await observe_task(task)
     finally:
         for event in release:
             event.set()

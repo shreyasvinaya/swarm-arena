@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-from _fakes.cleanup import settle_tasks
+from _fakes.cleanup import observe_task, settle_tasks
 from pydantic import BaseModel
 
 from swarm_arena import Goal, Score, ScriptTool
@@ -77,7 +77,7 @@ class Broken(Manager):
                     await NATIVE_READY.wait()
                     task.cancel("caller cancellation")
                     try:
-                        await task
+                        await observe_task(task)
                     except asyncio.CancelledError as error:
                         import traceback
 

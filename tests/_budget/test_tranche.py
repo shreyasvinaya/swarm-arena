@@ -6,7 +6,7 @@ from typing import cast
 import anyio
 import anyio.lowlevel
 import pytest
-from _fakes.cleanup import settle_tasks
+from _fakes.cleanup import observe_task, settle_tasks
 
 from swarm_arena import Limits, RunConfig
 from swarm_arena._budget.amount import USD_LIMIT, Amount
@@ -664,7 +664,7 @@ async def test_cancelled_overflow_lock_wait_keeps_one_admission_latch(env: Ledge
         assert not task.done()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         before = list(env.journal.events)
         assert not tranche.can_cover(Amount())
         with pytest.raises(LimitReached) as caught:

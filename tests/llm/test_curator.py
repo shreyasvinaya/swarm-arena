@@ -308,6 +308,7 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await observe_task(task)
+                    assert task.cancelled()
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")

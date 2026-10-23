@@ -405,7 +405,7 @@ async def test_cancel_nonlocal_publication_starts_no_next_object(
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
         assert published == [b"one"]
     finally:
@@ -451,7 +451,7 @@ async def test_live_request_await_is_abandonable(
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
     finally:
         release.set()
@@ -512,6 +512,7 @@ async def test_abandoned_collector_retains_its_workspace(
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await observe_task(task)
+                assert task.cancelled()
             else:
                 output = await observe_task(task)
                 assert output.status == (
@@ -615,6 +616,7 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await observe_task(task)
+                assert task.cancelled()
             else:
                 with pytest.raises(RuntimeError, match="terminal test"):
                     await observe_task(task)
@@ -802,7 +804,7 @@ async def test_abandoned_stop_collector_cannot_latch_late_terminal(
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         callback.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await callback
+            await observe_task(callback)
         release.set()
         # Model the supervisor's reap window: collector ends after abandonment,
         # but before run hands back TIMEOUT to the owner.
@@ -851,7 +853,7 @@ async def test_abandoned_publication_retains_workspace(
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
         assert workspaces[0].is_dir(), "workspace removed while publication still owns it"
     finally:
@@ -902,7 +904,7 @@ async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
         assert runner.publication_finished
     finally:
@@ -1133,7 +1135,7 @@ async def test_cancelled_report_read_never_starts_upload(
         await held.ready()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         await held.finish()
         assert puts == [b"o", b"e"]
     finally:
@@ -1222,7 +1224,7 @@ async def test_abandoned_report_operation_retains_workspace(
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
             await observe_task(task)
         assert workspaces[0].is_dir(), "workspace removed while report operation still owns it"
     finally:

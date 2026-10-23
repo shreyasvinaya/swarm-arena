@@ -1419,8 +1419,8 @@ async def test_startup_model_hook_is_abandonable(run_config: RunConfig) -> None:
         with anyio.fail_after(60):
             assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
-            await task
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
+            await observe_task(task)
         assert not release.is_set()
     finally:
         release.set()
@@ -1615,10 +1615,11 @@ async def test_planning_session_stopped_setup_never_yields(
         with anyio.fail_after(30):
             if stop == "stop":
                 with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
-                    await task
+                    await observe_task(task)
             else:
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
         assert yielded == []
         assert session.name not in llm_record._bindings
         owner = read_owner(LocalStore(session))
@@ -1729,11 +1730,11 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
         else:
             deadline.set()
         with (
-            anyio.fail_after(30),
             pytest.raises(
                 asyncio.CancelledError if stop == "cancel" else RuntimeError,
                 match=None if stop == "cancel" else "planning session stopped",
             ),
+            anyio.fail_after(30),
         ):
             await asyncio.shield(task)
         assert setups == []
@@ -2792,6 +2793,7 @@ async def test_run_end_reconcile_preserves_control_and_storage_failures(
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await observe_task(task)
+                    assert task.cancelled()
             finally:
                 task.cancel()
                 await settle_tasks(task)
