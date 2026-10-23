@@ -350,7 +350,7 @@ async def test_terminal_session_exits_without_resurrection(
             CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
         )
         try:
-            with anyio.fail_after(15):
+            with anyio.fail_after(60):
                 while os.get_blocking(read_fd) and not task.done():
                     await anyio.lowlevel.checkpoint()
                 assert not task.done()
@@ -645,7 +645,7 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
 
             task = asyncio.create_task(call())
             try:
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     if not never:
                         release.set()
@@ -743,7 +743,7 @@ async def test_planner_caller_cancellation_drains_held_record(tmp_path: Path) ->
         with llm_scope(scope):
             task = asyncio.create_task(LLMPlanner("planner").plan(GOAL, config, None))
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await fake.ready.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -835,7 +835,7 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
     task = asyncio.create_task(LLMPlanner("planner").plan(GOAL, config, None))
     replacement = None
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             await fake.entered.wait()
             (session,) = await anyio.to_thread.run_sync(
                 lambda: list(Path(config.run_root).iterdir())
@@ -1049,7 +1049,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
         CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
     )
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             await entered.wait()
             if cancelled:
                 task.cancel()

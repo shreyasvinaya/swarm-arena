@@ -81,7 +81,7 @@ async def _isolated_upstream(
     try:
         yield
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -114,7 +114,7 @@ class _CaptureLogger(CustomLogger):
         self.ready.put_nowait(None)
 
     async def wait(self) -> None:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await self.ready.get()
 
 

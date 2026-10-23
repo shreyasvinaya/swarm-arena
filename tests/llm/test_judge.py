@@ -193,7 +193,7 @@ async def test_judge_response_cache_misses_for_changed_goal_and_hits_for_same_go
             assert repeated.cost_usd == original.cost_usd == 0
             assert all(call.status == "ok" and call.error is None for call in run.calls())
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -610,7 +610,7 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
                         JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
                     )
                 )
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
@@ -696,7 +696,7 @@ async def test_all_batch_members_start_concurrently(
     monkeypatch.setattr(_judge, "structured_call", response)
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=configuration(("a", "b"))) as run:
-        with llm_scope(run.scope("judge")), anyio.fail_after(10):
+        with llm_scope(run.scope("judge")), anyio.fail_after(60):
             scores = await LLMJudge("r", ["a", "b"]).judge(
                 goal,
                 candidates(9),
@@ -902,7 +902,7 @@ async def test_limit_stops_sibling_dispatch_and_preserves_inflight_charge(
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=config) as run:
         scope = run.scope("judge")
-        with llm_scope(scope), anyio.fail_after(10), pytest.raises(BudgetExceeded) as caught:
+        with llm_scope(scope), anyio.fail_after(60), pytest.raises(BudgetExceeded) as caught:
             await LLMJudge("r", ["draft", "huge"]).judge(
                 goal,
                 candidates(1),

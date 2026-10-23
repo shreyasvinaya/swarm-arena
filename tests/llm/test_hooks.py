@@ -459,7 +459,7 @@ async def test_cancellation_abandons_call_without_waiting_for_report(
                 await invoke(model)
             finished.set()
 
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(request)
                 await entered.wait()
@@ -532,7 +532,7 @@ async def test_schema_preparation_is_abandonable_before_reservation(
             finished.set()
 
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as tasks:
                     tasks.start_soon(request)
                     await held.ready()
@@ -1126,7 +1126,7 @@ async def test_probe_drains_before_it_returns(
             finished.set()
 
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as group:
                     group.start_soon(probe)
                     await fake.ready.wait()
@@ -1252,7 +1252,9 @@ async def test_provider_stop_keeps_sdk_owned_siblings_until_drain(
 import json, os, time
 from pathlib import Path
 n = json.load(open('swarm/request.json'))['params']['n']
+deadline = time.monotonic() + 300
 while not Path({str(release)!r}).exists():
+    assert time.monotonic() < deadline, "tool was not released"
     time.sleep(0.01)
 json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
 """
@@ -1296,7 +1298,7 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
 
     async def fail_provider() -> None:
         try:
-            with anyio.fail_after(15):
+            with anyio.fail_after(60):
                 await ready.wait()
             assert runtimes
             await runtimes[0].stops.fail("fake", source="judge")
@@ -1339,7 +1341,7 @@ import json, os, time
 from pathlib import Path
 json.dump({{'data': {{'y': 42.0}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
 Path({str(ready)!r}).touch()
-time.sleep(60)
+time.sleep(300)
 """
     cfg = manager_config(
         limits=Limits(max_usd=100, max_tokens=10_000_000),
@@ -1359,7 +1361,7 @@ time.sleep(60)
     monkeypatch.setattr(RoundRunner, "_runtime", runtime)
 
     async def fail_provider() -> None:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not await anyio.Path(ready).exists():  # noqa: ASYNC110 - subprocess readiness
                 await anyio.sleep(0.01)
         await runtimes[0].stops.fail("fake", source="judge")

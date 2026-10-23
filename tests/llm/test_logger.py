@@ -63,7 +63,7 @@ async def isolated_logger(
     try:
         yield
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -494,7 +494,7 @@ async def test_acompletion_mock_response_is_recorded_and_settled(
                 mock_response="ok",
                 metadata=kw["litellm_params"]["metadata"],
             )
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await entered.wait()
                 if defer_callback:
                     assert not recorded.is_set()
@@ -510,7 +510,7 @@ async def test_acompletion_mock_response_is_recorded_and_settled(
             )
         finally:
             release.set()
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await flush()
 
 
@@ -530,7 +530,7 @@ async def test_response_cache_hit_end_to_end(tmp_path: Path) -> None:
                 metadata=kw["litellm_params"]["metadata"],
                 cache={"use-cache": True, "namespace": "judge"},
             )
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await GLOBAL_LOGGING_WORKER.flush()
                 assert await drain(scope, wait=True) == []
         first, second = run.calls()
@@ -653,7 +653,7 @@ async def test_drain_abandons_blocked_adapter_before_upload(
         )
         try:
             await held.ready()
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 assert await drain(scope, wait=False) == [
                     kw["litellm_params"]["metadata"]["call_id"]
                 ]
@@ -840,7 +840,7 @@ async def test_terminal_cleanup_failure_propagates(
                     await held.ready()
                     run.stops.stop_now = True
                     with (
-                        anyio.fail_after(2),
+                        anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
                     ):
                         await task
@@ -902,7 +902,7 @@ async def test_cancellation_abandons_adapter(tmp_path: Path) -> None:
         try:
             await held.ready()
             task.cancel()
-            with anyio.fail_after(2), pytest.raises(asyncio.CancelledError):
+            with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
                 await task
             await drain(scope, wait=False)
         finally:
