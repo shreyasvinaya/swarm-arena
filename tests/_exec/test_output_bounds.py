@@ -11,7 +11,8 @@ from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import make_job
 
 from swarm_arena import Ref, ScriptTool
-from swarm_arena._exec import local_run, local_stage, local_workspace
+from swarm_arena._exec import job_steps as local_run
+from swarm_arena._exec import local_stage, local_workspace
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._model.canonical import sha256_hex, utc_now
 from swarm_arena._tooling import result_file
@@ -54,7 +55,7 @@ def runner_for(tmp_path: Path, limit: int) -> tuple[local_run._JobRun, Completed
         ended_at=utc_now(),
     )
     return local_run._JobRun(
-        job, staged, workspace, artifacts, LocalExecutor.Config(max_output_bytes=limit)
+        job, staged, workspace, artifacts, max_output_bytes=limit, max_log_bytes=1024
     ), run
 
 

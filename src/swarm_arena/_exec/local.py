@@ -10,9 +10,8 @@ from pydantic import ConfigDict, Field
 from swarm_arena._errors import _core_error
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Executor, Job
-from swarm_arena._exec.local_run import _NOT_AN_OUTPUT as _NOT_AN_OUTPUT
-from swarm_arena._exec.local_run import _JobRun
-from swarm_arena._exec.local_stage import _Preparation
+from swarm_arena._exec.job_steps import _NOT_AN_OUTPUT as _NOT_AN_OUTPUT
+from swarm_arena._exec.job_steps import _JobRun, _Preparation
 from swarm_arena._exec.local_workspace import _open_workspace, _remove_workspace
 from swarm_arena._exec.pool import ResourcePool
 from swarm_arena._exec.procinfo import group_has_live_member, host_id
@@ -252,9 +251,10 @@ class LocalExecutor(Executor):
         unsafe, or over ``max_output_bytes`` gives status ERROR with no files.
         Uploaded file references are named after the file's basename, as
         ``collect_output_files`` makes them. The workspace is removed unless
-        ``keep_workspaces`` is set or preparation is still running when cancelled.
+        ``keep_workspaces`` is set or preparation or collection is still running
+        when abandoned.
         In the latter case, a warning identifies the retained workspace; it is
-        never removed automatically, even after a late preparation return.
+        never removed automatically, even after a late preparation or collection return.
         Cancellation releases the slot without waiting for user construction
         or command preparation, and their late results cannot start a command
         or invoke ``on_started``/``on_partial``. A failed removal is logged as a
@@ -307,17 +307,27 @@ class LocalExecutor(Executor):
                     _open_workspace, self.config.workspace_root, job
                 )
             preparation = _Preparation(job, workspace, artifacts)
+            job_run: _JobRun | None = None
             try:
                 staged = await run_sync_daemon(preparation.run)
                 # Deliver a pending cancel before any launch or lifecycle callback.
                 await anyio.lowlevel.checkpoint()
-                job_run = _JobRun(job, staged, workspace, artifacts, self.config)
+                job_run = _JobRun(
+                    job,
+                    staged,
+                    workspace,
+                    artifacts,
+                    max_log_bytes=self.config.max_log_bytes,
+                    max_output_bytes=self.config.max_output_bytes,
+                )
                 if staged.fault is not None:
                     return await job_run.fault_output(staged.fault)
                 return await job_run.run(sup, self._rlimits(job))
             finally:
                 if not preparation.finished.is_set():
                     _LOG.warning("retaining workspace %s: preparation is still running", workspace)
+                elif job_run is not None and not job_run.collect_finished.is_set():
+                    _LOG.warning("retaining workspace %s: collection is still running", workspace)
                 elif not self.config.keep_workspaces:
                     with anyio.CancelScope(shield=True):
                         await anyio.to_thread.run_sync(_remove_workspace, workspace)

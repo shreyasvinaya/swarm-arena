@@ -177,3 +177,105 @@ else:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.s3
+async def test_nonlocal_put_file_and_fetch(s3_url: str, tmp_path: Path) -> None:
+    from swarm_arena._store.base import open_store
+
+    remote = ArtifactStore(open_store(s3_url))
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"remote bytes")
+    ref = remote.put_file(source)
+    assert (ref.sha256, ref.size) == (sha256_hex(b"remote bytes"), 12)
+    remote.fetch(ref.sha256, tmp_path / "fetched.txt")
+    assert (tmp_path / "fetched.txt").read_bytes() == b"remote bytes"
+    assert (tmp_path / "fetched.txt").stat().st_mode & 0o777 == 0o444
+
+
+@pytest.mark.s3
+async def test_nonlocal_chunks_bound_before_publication(
+    s3_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._store.base import open_store
+
+    backend = open_store(s3_url)
+    remote = ArtifactStore(backend)
+    created: list[bytes] = []
+
+    def create(key: str, data: bytes) -> str:
+        created.append(data)
+        return key
+
+    monkeypatch.setattr(backend, "create", create)
+    with pytest.raises(StorageError, match="size cap"):
+        remote._put_chunks(iter([b"ab", b"cd"]), max_bytes=3)
+    assert created == []
+    assert remote._put_chunks(iter([b"ab", b"c"]), max_bytes=3) == (sha256_hex(b"abc"), 3)
+    assert created == [b"abc"]
+
+
+def test_local_chunks_keep_streaming_path(
+    artifacts: ArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(data: bytes) -> str:
+        pytest.fail("local streaming used the byte accumulation path")
+
+    monkeypatch.setattr(artifacts, "put_bytes", fail)
+    assert artifacts._put_chunks(iter([b"ab", b"c"]), max_bytes=3) == (sha256_hex(b"abc"), 3)
+    assert artifacts.get_bytes(sha256_hex(b"abc")) == b"abc"
+
+
+@pytest.mark.s3
+async def test_nonlocal_failed_stream_does_not_publish(
+    s3_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import Iterator
+
+    from swarm_arena._store.base import open_store
+
+    remote = ArtifactStore(open_store(s3_url))
+
+    def chunks() -> Iterator[bytes]:
+        yield b"part"
+        raise ValueError("source changed")
+
+    def publish(data: bytes) -> str:
+        pytest.fail("partial contents were published")
+
+    monkeypatch.setattr(remote, "put_bytes", publish)
+    with pytest.raises(ValueError, match="source changed"):
+        remote._put_chunks(chunks(), max_bytes=8)
+
+
+@pytest.mark.s3
+async def test_nonlocal_fetch_checks_digest_cap_and_destination(
+    s3_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._store.base import open_store
+
+    backend = open_store(s3_url)
+    remote = ArtifactStore(backend)
+    digest = remote.put_bytes(b"hello")
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", 4)
+    with pytest.raises(StorageError, match="size cap"):
+        remote.fetch(digest, tmp_path / "oversized")
+    assert not (tmp_path / "oversized").exists()
+    monkeypatch.setattr("swarm_arena._store.artifacts._MAX_ARTIFACT_BYTES", 100)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"untouched")
+    (tmp_path / "link").symlink_to(outside)
+    with pytest.raises(StorageError, match="destination"):
+        remote.fetch(digest, tmp_path / "link")
+    assert outside.read_bytes() == b"untouched"
+    etag = backend.read(digest).etag
+    backend.replace(digest, SECRET.encode(), if_match=etag)
+    with pytest.raises(StorageError, match="hash") as caught:
+        remote.fetch(digest, tmp_path / "corrupt")
+    assert_secret_absent(caught.value, SECRET)
+    assert not (tmp_path / "corrupt").exists()

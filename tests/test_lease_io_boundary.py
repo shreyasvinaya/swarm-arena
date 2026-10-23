@@ -55,10 +55,10 @@ _ALLOW = {
     ): "Pre-takeover validation.",
     ("_scoring/human_review.py", "HumanReview.import_csv", "check_storage"): "Pre-takeover probes.",
     ("_tooling/script_tool.py", "_list_files", "_list_files_sync"): "In-memory manifest/view only.",
-    ("_exec/local_run.py", "_JobRun.run", "self._stopped_output"): "Local regular-file notes only.",
-    ("_exec/local_run.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
-    ("_exec/local_run.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
-    ("_exec/local_run.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
+    ("_exec/job_steps.py", "_JobRun.run", "self._stopped_output"): "Local regular-file notes only.",
+    ("_exec/job_steps.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
+    ("_exec/job_steps.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
+    ("_exec/job_steps.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
     (
         "_exec/local.py",
         "LocalExecutor.submit",
@@ -194,6 +194,7 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
         _ROOT / "_exec/local_run.py",
+        _ROOT / "_exec/job_steps.py",
         _ROOT / "_exec/local.py",
         _ROOT / "_scoring/human_review.py",
         _ROOT / "_agent/tool_run.py",
@@ -330,3 +331,16 @@ class Job:
         await run_sync_daemon(self._upload_log, data)
 """
     assert _worker_calls(source) == [("Job.finish", "self._upload_log", 6)]
+
+
+def test_guard_scans_shared_job_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_exec/job_steps.py"
+    original = Path.read_text
+    source = target.read_text() + '\nasync def unsafe_upload():\n    artifacts.put_bytes(b"x")\n'
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return source if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_exec/job_steps.py:\d+: unsafe_upload"):
+        test_lease_owned_modules_use_abandonable_workers()

@@ -242,7 +242,7 @@ Rules [plan]:
 | `_store/__init__.py` | Empty | M1a | — |
 | `_store/base.py` | `Store` ABC, `Blob`, `open_store` | M1a +M1b +M2 | `tests/_store/test_base.py` |
 | `_store/local.py` | `LocalStore`: `O_EXCL` create, lock file + atomic rename replace | M1a +M1b | `tests/_store/test_local.py` |
-| `_store/artifacts.py` | `ArtifactStore`: content-addressed put, get, fetch | M1a | `tests/_store/test_artifacts.py` |
+| `_store/artifacts.py` | `ArtifactStore`: content-addressed put, get, fetch; bounded nonlocal publication | M1a +M4 | `tests/_store/test_artifacts.py` |
 | `_store/s3.py` | `S3Store` on s3fs with conditional writes | M2 | `tests/_store/test_s3.py` (marker `s3`) |
 | `_tooling/__init__.py` | Empty | M1a | — |
 | `_tooling/tool.py` | `Tool` ABC, `Action`, shared effective tool configuration | M1a +M1b | `tests/_tooling/test_tool.py` |
@@ -262,10 +262,11 @@ Rules [plan]:
 | `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/threads.py` | `run_sync_daemon` and the daemon-call holder: run blocking user code on a daemon thread that never blocks interpreter exit | M1a | `tests/_exec/test_threads.py` |
-| `_exec/local.py` | `LocalExecutor` | M1a | `tests/_exec/test_local.py` |
-| `_exec/local_stage.py` | Staging, command preparation, effective limits and environment | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
+| `_exec/job_steps.py` | Shared staged carrier, preparation, one-shot daemon collection, bounded per-object publication and transported edit restoration | M4 | `tests/_exec/test_job_steps.py`, `tests/_exec/test_local_run.py`, `tests/_exec/test_output_bounds.py` |
+| `_exec/local.py` | `LocalExecutor` | M1a +M4 | `tests/_exec/test_local.py` |
+| `_exec/local_stage.py` | Private aliases for shared job preparation | M1a +M4 | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
 | `_exec/local_workspace.py` | Workspace creation, ownership checks and cleanup | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
-| `_exec/local_run.py` | Supervision, daemon collection, bounded output reads and uploads | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_output_bounds.py` |
+| `_exec/local_run.py` | Private aliases for shared job execution | M1a +M4 | `tests/_exec/test_local.py`, `tests/_exec/test_output_bounds.py` |
 | `_scoring/__init__.py` | Empty | M1a | — |
 | `_scoring/check.py` | `Check` ABC, `CheckContext` | M1a | `tests/_scoring/test_check.py` |
 | `_scoring/judge.py` | `Judge` ABC, `JudgeContext`, identity hashes, score stamping, finite-key rule | M1a | `tests/_scoring/test_judge.py` |
@@ -2078,6 +2079,64 @@ def process_start_time(pid: int) -> str | None: ...  # [plan] `ps -o lstart= -p 
 def group_has_live_member(pgid: int) -> bool: ...
 def kill_orphan(started: Job.Started) -> bool: ...   # only if host_id and start_time match; else False and nothing is killed
 ```
+
+Shared executor steps (private, M4; `_exec/job_steps.py`):
+
+```python
+@dataclass(frozen=True)
+class _Staged:
+    tool: Tool | None
+    request: ToolRequest | None  # live contents, never transported edit references
+    argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+    fault: str | None
+    timeout_s: float | None  # minimum non-None Job/Command timeout
+    grace_s: float           # minimum Job/Command grace
+
+@dataclass
+class _Preparation:
+    job: Job; workspace: Path; artifacts: ArtifactStore
+    finished: threading.Event  # init=False; set in run's finally
+    def run(self) -> _Staged: ...
+
+def prepare_job(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged: ...
+def resolve_argv(command: Command) -> list[str]: ...
+def live_request(request: ToolRequest, artifacts: ArtifactStore) -> ToolRequest: ...
+
+class _JobRun:
+    def __init__(self, job: Job, staged: _Staged, workspace: Path, artifacts: ArtifactStore,
+                 *, max_log_bytes: int, max_output_bytes: int) -> None: ...
+    async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput: ...
+    async def fault_output(self, reason: str) -> ToolOutput: ...
+    collect_finished: threading.Event  # workspace release only when the worker finishes
+    def _collect_owned(self, run: CompletedRun) -> ToolOutput | None: ...
+    def _collect(self, run: CompletedRun) -> ToolOutput | None: ...
+    async def _before_kill(self, provisional: CompletedRun) -> None: ...
+    def _stopped_output(self, status: RunStatus) -> ToolOutput: ...
+    async def _finish(self, output: ToolOutput,
+                      times: tuple[datetime, datetime] | None) -> ToolOutput: ...
+```
+
+Preparation runs in `run_sync_daemon` under the owner, followed by a cancellation
+checkpoint before launch. An unfinished `_Preparation` or collection worker retains
+its workspace, including after its original collection deadline expires.
+The existing `_JobRun` owns collection once: normal completion has the original
+`BEFORE_KILL_TIMEOUT_S` deadline; cancellation rejoins that same collect;
+stop collection runs before kill and is never retried. `_collect` sets and resets
+`_OUTPUT_BYTE_LIMIT` in the collecting worker. Valid stop results are partial
+iff `partial or data or files`. Direct LocalExecutor nonstandard propagation is preserved; registered terminal
+collection errors are retained through process cleanup and re-raised before publication. Worker callers reuse this state and these operations with their
+own launch/termination mechanics; no worker uses the local process-group launcher.
+
+`_finish` validates the declaration and aggregate output sizes before publication,
+then awaits each file and log separately through the abandonable storage boundary.
+A cancelled local run delivers data-only partial output without new publication.
+Local artifact chunks stream; other backends accumulate one object within the
+remaining byte cap before using the existing Store byte API. Retrieval verifies
+hashes and fetch keeps pinned, atomic destination writes on every backend.
+`live_request` is worker-only; it restores only the exact reserved edit reference
+form and reports failed restoration using path/type diagnostics without values.
 
 #### R4.13.9 Files, paths, staging — M1a
 
