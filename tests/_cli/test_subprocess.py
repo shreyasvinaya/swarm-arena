@@ -361,7 +361,7 @@ with MonkeyPatch.context() as patch:
                     nonlocal elapsed
                     ready = original_select(selector, timeout)
                     assert process.wait(timeout=60) == 130
-                    elapsed = 6.0
+                    elapsed = 31.0
                     return ready
 
                 patch.setattr(selector_type, "select", delayed_select)
@@ -369,6 +369,8 @@ with MonkeyPatch.context() as patch:
             # Allow the parent the same collection budget as other PTY tests.
             # The child-side measurement below keeps the 30-second exit bound.
             stdout, stderr = process.communicate(timeout=60)
+            if parent_delayed:
+                assert elapsed > 30
         assert process.returncode == 130, (stdout, stderr)
         assert stderr == b"interrupted\n"
         latency = float(stdout.split(b"sigint-to-exit ")[1])
