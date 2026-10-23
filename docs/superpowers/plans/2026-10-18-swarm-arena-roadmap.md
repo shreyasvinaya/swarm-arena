@@ -347,9 +347,9 @@ Rules [plan]:
 | `_cli/plan_cmd.py` | `plan`; imports `swarm_arena.llm` only inside the `--llm` and `--together` handlers | M3 | `tests/_cli/test_plan_cmd.py` |
 | `_cli/cluster_cmds.py` | `submit`, `reconcile` | M4 | `tests/_cli/test_cluster_cmds.py` |
 | `_gateway/__init__.py` | Empty | M4 | — |
-| `_gateway/adapter.py` | `GatewayAdapter` protocol, `VirtualKey`, `SpendRow`, `ProfileReport` | M4 | `tests/_gateway/test_adapter.py` |
+| `_gateway/adapter.py` | `GatewayError`, `GatewayAdapter` protocol, `VirtualKey`, validated `SpendRow`, `ProfileReport` | M4 | `tests/_gateway/test_adapter.py` |
 | `_gateway/litellm_proxy.py` | LiteLLM Proxy adapter (stdlib `urllib`), `terminal_accounting = False` | M4 | `tests/_gateway/test_litellm_proxy.py` |
-| `_gateway/profile.py` | Strict-profile preflight | M4 | `tests/_gateway/test_profile.py` |
+| `_gateway/profile.py` | Pure pinned strict-profile check; unavailable settings remain unverified | M4 | `tests/_gateway/test_profile.py` |
 | `_gateway/keys.py` | Key per tool run; the gateway values for the `Job` (base URLs for `Job.env`, the key for `Job.secret_values`, the provider key names to drop from `Job.secret_env` and to set as `Job.drop_env`); spend read-back | M4 | `tests/_gateway/test_keys.py` |
 | `_gateway/reconcile.py` | Post-run reconcile | M4 | `tests/_gateway/test_reconcile.py` |
 | `llm/__init__.py` | Facade `swarm_arena.llm`; clear `ImportError` without the extra | M3 | `tests/test_public_api.py` |
@@ -2530,12 +2530,14 @@ remain immutable.
 #### R4.13.15 Gateway — M4
 
 ```python
+class GatewayError(RuntimeError): ...  # method, route and HTTP status or error type; never values
 class ProfileReport(FrozenModel):
     verified: bool; failures: list[str]; batch_write_interval_s: float | None; request_timeout_s: float | None
 class VirtualKey(FrozenModel):
     key_id: str; alias: str                          # the secret key value is never stored or journaled
 class SpendRow(FrozenModel):
-    litellm_call_id: str; model: str; usage: Usage; cost_usd: float; ts: datetime; metadata: dict[str, Any]
+    request_id: str; litellm_call_id: str | None; model: str; usage: Usage
+    cost_usd: float; ts: datetime; metadata: dict[str, Any]
 class GatewayAdapter(Protocol):
     terminal_accounting: bool                        # LiteLLM adapter: False
     async def preflight(self) -> ProfileReport: ...
@@ -2543,10 +2545,46 @@ class GatewayAdapter(Protocol):
                          metadata: Mapping[str, Any], default_estimated_output_tokens: int) -> tuple[VirtualKey, str]: ...  # (key, secret value)
     async def block_key(self, key: VirtualKey) -> None: ...
     async def closed_at(self, key: VirtualKey) -> datetime | None: ...   # closure time T, confirmed by the API
-    async def spend_rows(self, key: VirtualKey) -> list[SpendRow]: ...
+    async def spend_rows(self, key: VirtualKey, *, start: datetime, end: datetime) -> list[SpendRow]: ...
     async def delete_key(self, key: VirtualKey) -> None: ...
 async def reconcile_run(config: RunConfig, run_id: str, adapter: GatewayAdapter, executor: Executor) -> ReconcileReport: ...
 ```
+
+All gateway models use the safe frozen base. Costs and timings are finite and
+nonnegative; metadata is finite JSON. `SpendRow.request_id` is required and
+nonblank, `litellm_call_id` is nullable and not globally unique, and `ts` is aware
+and normalized to UTC. The HTTP adapter extracts cache counts from
+`metadata.additional_usage_values`, never top-level spend fields. Spend queries
+require both aware UTC bounds for one fixed inclusive window across all pages.
+
+```python
+# _gateway/profile.py (LiteLLM Proxy 1.107.0rc2)
+BUDGET_RESERVATIONS: Final[str | None] = "disable_budget_reservation"
+FAIL_CLOSED: Final[str | None] = "fail_closed_budget_enforcement"
+MAX_REQUEST_DURATION: Final[str | None] = None
+BATCH_WRITE_INTERVAL: Final[str | None] = "proxy_batch_write_at"
+VIRTUAL_KEYS_REQUIRED: Final[str | None] = None
+PASS_THROUGH: Final[str | None] = "pass_through_endpoints"
+MAX_TOKENS_BOUND: Final[str | None] = None
+RESERVED_ROUTES_ONLY: Final[str | None] = "allowed_routes"
+def check_profile(settings: Mapping[str, Any] | None, models: Sequence[Mapping[str, Any]], *,
+                  request_timeout_s: float) -> ProfileReport: ...
+```
+
+The three absent guarantees always fail in requirement order: per-key output
+bound, total request duration, virtual-key-only access. `settings=None` retains
+those and per-model failures, then appends `gateway settings introspection
+unavailable`; both reported timings are None and unreadable switches get no
+invented state. Complete settings honor the inverted reservation switch,
+literal-True fail-closed enforcement, explicit route allowlists and explicit
+empty custom pass-through lists. Only `/chat/completions` and
+`/v1/chat/completions` plus the adapter's management/health routes are accepted;
+unknown routes, non-chat modes and known zero-cost models cannot establish
+reservation coverage. Prices and advertised output limits have independent
+model failures. Unknown batch timing is None without an additional failure.
+The pinned profile cannot verify hard caps, even with complete fixture settings;
+`default_estimated_output_tokens` remains an estimate. A capable test stub is
+separate from this LiteLLM path.
 
 #### R4.13.16 Ray internals — M4
 
