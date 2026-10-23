@@ -464,8 +464,9 @@ def test_submission_timeout_abandons_one_wait_with_recoverable_id(
 
     def scope(seconds: float) -> anyio.CancelScope:
         assert seconds == 300
+        before = anyio.current_time()
         result = real_scope(seconds)
-        assert result.deadline == pytest.approx(anyio.current_time() + 300, abs=1)
+        assert before + seconds <= result.deadline <= anyio.current_time() + seconds
         scopes.append(result)
         return result
 
@@ -535,7 +536,7 @@ class Client:
     def submit_job(self, **kwargs):
         print(kwargs["submission_id"], flush=True)
         os.kill(os.getpid(), signal.SIGINT)
-        threading.Event().wait()
+        assert not threading.Event().wait(300)
 _submit.JobSubmissionClient = Client
 raise SystemExit(main(["submit", "--yes", "run.toml", "plan.toml"]))
 """
