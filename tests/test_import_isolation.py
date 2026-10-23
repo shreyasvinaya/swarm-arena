@@ -209,3 +209,26 @@ def test_ray_facade_keeps_missing_vendor_submodule() -> None:
     assert result.returncode != 0
     assert "No module named 'ray._private'" in result.stderr
     assert "swarm-arena[" not in result.stderr
+
+
+def test_ray_facade_refuses_namespace_package_with_distribution() -> None:
+    code = (
+        FAKE_RAY_DIST
+        + """
+import importlib.machinery, sys
+class NamespaceFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'ray':
+            spec = importlib.machinery.ModuleSpec('ray', loader=None, is_package=True)
+            spec.submodule_search_locations = ['tests/ray']
+            return spec
+sys.meta_path.insert(0, NamespaceFinder())
+sys.path.insert(0, 'tests')
+import swarm_arena.ray
+"""
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO_ROOT, timeout=30
+    )
+    assert result.returncode != 0
+    assert "pip install 'swarm-arena[ray]'" in result.stderr
