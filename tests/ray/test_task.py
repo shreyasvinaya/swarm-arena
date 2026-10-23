@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -733,6 +734,7 @@ async def test_pending_cancel_beats_collector_control(
     release, finished = threading.Event(), threading.Event()
 
     def held(self: Any, run: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
         loop.call_soon_threadsafe(ready.set)
         try:
             assert release.wait(300)
@@ -749,6 +751,7 @@ async def test_pending_cancel_beats_collector_control(
     try:
         with anyio.fail_after(60):
             await ready.wait()
+        assert len(workers) == 1
         task.cancel()
         release.set()
         with anyio.fail_after(60):
@@ -1026,6 +1029,7 @@ def test_cancel_during_timeout_grace_keeps_one_collect(
     code = f"""import json, os, signal, time
 from pathlib import Path
 stopped = False
+signal.alarm(900)
 def stop(signum, frame):
     global stopped
     stopped = True
@@ -1088,17 +1092,41 @@ Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(result))
 
     monkeypatch.setattr(_task._WorkerSupervisor, "_wait", wait)
     monkeypatch.setattr(PyTool, "collect", collect)
-    out = anyio.run(run_scoped) if cancel_kind == "scope" else _task._execute(worker)
-    assert waits == ["execution", "grace"]
-    assert out.status == RunStatus.CANCELLED
-    assert out.partial
-    assert out.data == {"step": 4}
-    assert out.files == []
-    assert out.logs_ref is None
-    assert out.llm_calls_file is None
-    assert collects == [RunStatus.TIMEOUT]
-    assert store.created() == {}
-    assert all(process.poll() is not None for process in processes)
+    failure: BaseException | None = None
+    try:
+        out = anyio.run(run_scoped) if cancel_kind == "scope" else _task._execute(worker)
+        assert waits == ["execution", "grace"]
+        assert out.status == RunStatus.CANCELLED
+        assert out.partial
+        assert out.data == {"step": 4}
+        assert out.files == []
+        assert out.logs_ref is None
+        assert out.llm_calls_file is None
+        assert collects == [RunStatus.TIMEOUT]
+        assert store.created() == {}
+        assert all(process.poll() is not None for process in processes)
+    except (Exception, pytest.fail.Exception) as error:
+        failure = error
+        raise
+    finally:
+        cleanup_errors: list[Exception] = []
+        try:
+            release.touch()
+        except Exception as error:
+            cleanup_errors.append(error)
+        for process in {process.pid: process for process in processes}.values():
+            try:
+                if process.poll() is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                process.wait(timeout=60)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if failure is None:
+                raise ExceptionGroup("worker test cleanup failed", cleanup_errors)
+            for error in cleanup_errors:
+                failure.add_note(f"worker test cleanup failed: {type(error).__name__}")
 
 
 def test_interrupt_after_loop_completion_keeps_result(
