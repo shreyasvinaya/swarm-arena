@@ -563,7 +563,7 @@ async def test_timeout_collection_preserves_terminal_after_process_cleanup(
 
 
 @pytest.mark.parametrize("kind", ["terminal", "fenced", "group", "ordinary"])
-@pytest.mark.parametrize("cancellation", ["native", "scope"])
+@pytest.mark.parametrize("cancellation", ["native", "scope", "move_on_after", "fail_after"])
 async def test_cancel_during_normal_collect_delivers_partial_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, cancellation: str
 ) -> None:
@@ -609,27 +609,50 @@ async def test_cancel_during_normal_collect_delivers_partial_once(
         monkeypatch.setattr(job_steps, "command_output_from_result", collect)
     monkeypatch.setattr(_JobRun, "_deliver_partial", partial)
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
-    scope = anyio.CancelScope()
+    scopes: list[anyio.CancelScope] = []
+    after_scope: list[bool] = []
 
-    async def submit() -> ToolOutput:
-        with scope:
-            return await executor.submit(
+    async def submit() -> None:
+        if cancellation == "fail_after":
+            owner = anyio.fail_after(30)
+        elif cancellation == "move_on_after":
+            owner = anyio.move_on_after(30)
+        else:
+            owner = anyio.CancelScope()
+        # CancelScope is itself a context manager, while fail_after yields one.
+        with owner as scope:
+            scopes.append(scope)
+            await executor.submit(
                 _job(tmp_path, command=Command(argv=["true"]), on_partial=received)
             )
-        raise asyncio.CancelledError()  # expose a scope-owned cancel to this test's awaiter
+            pytest.fail("caller cancellation became a normal result")
+        after_scope.append(True)
 
     task = asyncio.create_task(submit())
     try:
         assert await anyio.to_thread.run_sync(entered.wait, 10)
+        [scope] = scopes
         if cancellation == "native":
             task.cancel()
-        else:
+        elif cancellation == "scope":
             scope.cancel()
+        else:
+            scope.deadline = anyio.current_time()
         with anyio.fail_after(5):
             await rejoining.wait()
             release.set()
-            with pytest.raises(asyncio.CancelledError):
+            if cancellation == "native":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not scope.cancelled_caught
+            elif cancellation == "fail_after":
+                with pytest.raises(TimeoutError):
+                    await task
+                assert scope.cancelled_caught
+            else:
                 await task
+                assert scope.cancelled_caught
+                assert after_scope == [True]
         assert len(partials) == 1
         assert partials[0].status is RunStatus.CANCELLED
         assert partials[0].files == []
@@ -814,3 +837,36 @@ async def test_publication_cancel_before_worker_entry_revokes_workspace_use(
                 await anyio.to_thread.run_sync(worker.join, 5)
                 assert not worker.is_alive()
     assert writes == []
+
+
+@pytest.mark.parametrize("site", ["normal", "stop"])
+async def test_pending_scope_cancel_wins_collector_handback(
+    tmp_path: Path, artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    from unittest.mock import Mock
+
+    import anyio
+
+    job = _job(tmp_path)
+    ws = tmp_path / "ws"
+    runner = _JobRun(
+        job, prepare_job(job, ws, artifacts), ws, artifacts, max_log_bytes=10, max_output_bytes=10
+    )
+    completed = _completed(ws)
+    scope = anyio.CancelScope()
+
+    async def handback() -> None:
+        scope.cancel()
+        raise _core_error(RuntimeError, "terminal test", _category=_SignalCategory.TERMINAL)
+
+    call = Mock(result=handback)
+    monkeypatch.setattr(runner, "_start_collect", lambda run: call)
+    runner._post_collect = call
+    runner._collect_deadline = anyio.current_time() + 10
+    with scope:
+        if site == "normal":
+            await runner._wait_post_collect()
+        else:
+            await runner._before_kill(completed)
+        pytest.fail("pending cancellation became a collector outcome")
+    assert scope.cancelled_caught
