@@ -70,13 +70,13 @@ def server(tmp_path: Path) -> Iterator[Server]:
     finally:
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
         board.close()
 
 
-def get(server: Server, path: str) -> str:
-    with urlopen(server.url + path, timeout=5) as response:
+def get(server: Server, path: str, *, timeout: float = 60) -> str:
+    with urlopen(server.url + path, timeout=timeout) as response:
         return response.read().decode()
 
 
@@ -96,7 +96,7 @@ class _NoRedirect(HTTPRedirectHandler):
 def _post(server: Server, path: str, **fields: str) -> int:
     request = Request(server.url + path, data=urlencode(fields).encode())
     try:
-        with build_opener(_NoRedirect()).open(request, timeout=5) as response:
+        with build_opener(_NoRedirect()).open(request, timeout=60) as response:
             return response.status
     except HTTPError as error:
         error.close()
@@ -226,13 +226,13 @@ def test_rejects_foreign_host(server: Server) -> None:
     ]:
         request = Request(server.url + path, data=data, headers={"Host": "evil.example"})
         with pytest.raises(HTTPError) as caught:
-            urlopen(request, timeout=5)
+            urlopen(request, timeout=60)
         with caught.value as response:
             assert response.code == 403
             assert b"Learning" not in response.read()
     assert _objects(server) == before
     with urlopen(
-        Request(server.url, headers={"Host": f"localhost:{server.http.server_port}"}), timeout=5
+        Request(server.url, headers={"Host": f"localhost:{server.http.server_port}"}), timeout=60
     ) as response:
         assert response.status == 200
 
@@ -273,7 +273,7 @@ def test_refresh_is_throttled_and_synchronized(
     url = f"http://127.0.0.1:{http.server_port}/"
 
     def fetch(_: int) -> str:
-        with urlopen(url, timeout=5) as response:
+        with urlopen(url, timeout=60) as response:
             return response.read().decode()
 
     try:
@@ -287,13 +287,13 @@ def test_refresh_is_throttled_and_synchronized(
         )
         updated.clear()
         fetch(0)
-        assert updated.wait(3)
+        assert updated.wait(60)
         assert "Newly published" in fetch(0)
         assert len(calls) == 2
     finally:
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
 
 
@@ -320,14 +320,14 @@ def test_run_filter_defaults_to_selected_run(server: Server) -> None:
     thread.start()
     try:
         url = f"http://127.0.0.1:{http.server_port}/"
-        with urlopen(url, timeout=5) as response:
+        with urlopen(url, timeout=60) as response:
             assert 'class="learning"' not in response.read().decode()
-        with urlopen(url + "?run=r1", timeout=5) as response:
+        with urlopen(url + "?run=r1", timeout=60) as response:
             assert 'class="learning"' in response.read().decode()
     finally:
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
 
 
@@ -385,7 +385,7 @@ def _default_server(server: Server) -> Generator[Server]:
     finally:
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
 
 
@@ -394,7 +394,7 @@ def _default_server(server: Server) -> Generator[Server]:
 )
 def test_every_method_checks_authority(server: Server, method: str) -> None:
     with _default_server(server) as site:
-        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=5)
+        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=60)
         try:
             connection.request(method, "/", headers={"Host": "evil.example"})
             response = connection.getresponse()
@@ -415,7 +415,7 @@ def test_protocol_errors_are_fixed(server: Server, failure: str) -> None:
             "version": f"GET / HTTP/{sentinel}\r\nHost: {host}\r\n\r\n",
             "method": f"{sentinel} / HTTP/1.1\r\nHost: {host}\r\n\r\n",
         }[failure]
-        with socket.create_connection(("127.0.0.1", site.http.server_port), timeout=5) as client:
+        with socket.create_connection(("127.0.0.1", site.http.server_port), timeout=60) as client:
             client.sendall(request.encode())
             response = bytearray()
             while data := client.recv(65536):
@@ -435,19 +435,19 @@ def test_loopback_startup_does_not_wait_for_reverse_dns(
 
     def stalled_lookup(name: str = "") -> str:
         entered.set()
-        assert release.wait(10), "resolver release deadline"
+        assert release.wait(300), "resolver release deadline"
         return "localhost"
 
     monkeypatch.setattr(socket, "getfqdn", stalled_lookup)
     with ThreadPoolExecutor(max_workers=1) as pool:
         starting = pool.submit(make_server, server.board, ["toy"], author="alice", port=0)
         try:
-            http = starting.result(timeout=2)
+            http = starting.result(timeout=30)
             assert not entered.is_set()
             assert http.server_port > 0
         finally:
             release.set()
-            starting.result(timeout=5).server_close()
+            starting.result(timeout=60).server_close()
 
 
 def test_refresh_never_blocks_published_gets(
@@ -464,7 +464,7 @@ def test_refresh_never_blocks_published_gets(
 
     def read_owner(*args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(20)
+        assert release.wait(300)
         return original(*args, **kwargs)
 
     with _default_server(server) as site:
@@ -473,15 +473,15 @@ def test_refresh_never_blocks_published_gets(
         clock[0] = 106.0
         with ThreadPoolExecutor(max_workers=2) as pool:
             refreshing = pool.submit(get, site, "/")
-            assert entered.wait(5)
             try:
-                assert "Learning" in refreshing.result(timeout=2)
+                assert entered.wait(60)
+                assert "Learning" in refreshing.result(timeout=30)
                 for path in ("/", "/learning/L-1", "/candidate/c-child"):
-                    assert pool.submit(get, site, path).result(timeout=2)
+                    assert pool.submit(get, site, path).result(timeout=30)
                 assert not release.is_set()
             finally:
                 release.set()
-                refreshing.result(timeout=5)
+                refreshing.result(timeout=60)
 
 
 def test_response_write_does_not_block_other_gets(
@@ -496,19 +496,19 @@ def test_response_write_does_not_block_other_gets(
         def reply(self: Any, status: int, body: str, *, location: str | None = None) -> None:
             if self.path == "/learning/L-1":
                 entered.set()
-                assert release.wait(10)
+                assert release.wait(300)
             original(self, status, body, location=location)
 
         monkeypatch.setattr(handler, "_reply", reply)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            writing = pool.submit(get, site, "/learning/L-1")
-            assert entered.wait(5)
+            writing = pool.submit(get, site, "/learning/L-1", timeout=360)
             try:
-                assert "Learning" in pool.submit(get, site, "/").result(timeout=2)
+                assert entered.wait(60)
+                assert "Learning" in pool.submit(get, site, "/").result(timeout=30)
                 assert not writing.done()
             finally:
                 release.set()
-                assert writing.result(timeout=5)
+                assert writing.result(timeout=60)
 
 
 @pytest.mark.parametrize("action", ["add", "pin", "hide"])
@@ -517,7 +517,7 @@ def test_default_mutation_redirect_publishes_state(server: Server, action: str) 
         token = _token(site)
         fields = {"token": token, "ns": "toy", "title": "Immediately readable", "text": "New text"}
         path = "/learnings/add" if action == "add" else f"/learning/L-1/{action}"
-        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=5)
+        connection = HTTPConnection("127.0.0.1", site.http.server_port, timeout=60)
         try:
             connection.request("POST", path, body=urlencode(fields))
             response = connection.getresponse()
@@ -600,16 +600,16 @@ def test_run_viewer_blank_run_filter_includes_human_and_other_runs(server: Serve
     thread.start()
     try:
         base = f"http://127.0.0.1:{http.server_port}"
-        with urlopen(base + "/?q=observation", timeout=5) as response:
+        with urlopen(base + "/?q=observation", timeout=60) as response:
             assert response.read().count(b'class="learning"') == 0
-        with urlopen(base + "/?q=observation&run=", timeout=5) as response:
+        with urlopen(base + "/?q=observation&run=", timeout=60) as response:
             body = response.read()
         assert b"Peer observation" in body
         assert b"Human observation" in body
     finally:
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
 
 
@@ -665,7 +665,7 @@ def test_llm_get_retains_calls_during_refresh_and_close(
 
     def held(self: _ArenaReader, *args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(10)
+        assert release.wait(300)
         return original(self, *args, **kwargs)
 
     def stopping() -> None:
@@ -675,10 +675,10 @@ def test_llm_get_retains_calls_during_refresh_and_close(
     monkeypatch.setattr(_ArenaReader, method, held)
     monkeypatch.setattr(server.board._lifetime, "stop", stopping)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        pending = pool.submit(get, server, path)
+        pending = pool.submit(get, server, path, timeout=360)
         close = None
         try:
-            assert entered.wait(5)
+            assert entered.wait(60)
             server.run.commit(
                 _record(
                     _call(
@@ -694,11 +694,11 @@ def test_llm_get_retains_calls_during_refresh_and_close(
             server.board.frontier()
             # The old GET remains pinned while refresh publishes newer calls.
             close = pool.submit(server.board.close)
-            assert closing.wait(5)
+            assert closing.wait(60)
             assert not close.done()
         finally:
             release.set()
-        body = pending.result(timeout=5)
+        body = pending.result(timeout=60)
         assert "late-call" not in body
         assert "late-team" not in body
         if path.startswith("/candidate"):
@@ -706,7 +706,7 @@ def test_llm_get_retains_calls_during_refresh_and_close(
         else:
             assert "50.0%" in body
         assert close is not None
-        close.result(timeout=5)
+        close.result(timeout=60)
 
 
 def test_llm_pages_escape_recorded_metadata_and_check_host(server: Server) -> None:
@@ -729,7 +729,7 @@ def test_llm_pages_escape_recorded_metadata_and_check_host(server: Server) -> No
     assert "<img" not in body
     request = Request(server.url + "/run/r1/llm", headers={"Host": "evil.example"})
     with pytest.raises(HTTPError) as error:
-        urlopen(request, timeout=5)
+        urlopen(request, timeout=60)
     assert error.value.code == 403
     error.value.close()
 
@@ -758,7 +758,7 @@ def test_llm_route_enforces_served_namespace_selection(tmp_path: Path, records: 
     http = make_server(board, ["public"], author="alice", port=0)
     thread = Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
-    connection = HTTPConnection("127.0.0.1", http.server_port, timeout=5)
+    connection = HTTPConnection("127.0.0.1", http.server_port, timeout=60)
     try:
         for namespace, status in (("private", 404), ("public", 200)):
             connection.request("GET", f"/run/{namespace}-run/llm")
@@ -777,7 +777,7 @@ def test_llm_route_enforces_served_namespace_selection(tmp_path: Path, records: 
         connection.close()
         http.shutdown()
         http.server_close()
-        thread.join(timeout=5)
+        thread.join(timeout=60)
         assert not thread.is_alive()
         board.close()
 

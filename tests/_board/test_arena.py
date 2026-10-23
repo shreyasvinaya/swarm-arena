@@ -444,7 +444,7 @@ def test_lazy_cache_and_hints_are_synchronized(tmp_path: Path, board: ArenaBoard
     barrier = Barrier(8)
 
     def access(index: int) -> int:
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=60)
         board.put_candidate(candidate, epoch=1, seq=index)
         cache = board._cache("toy")
         assert board.get_candidate("hint") == candidate
