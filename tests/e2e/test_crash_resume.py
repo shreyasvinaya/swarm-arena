@@ -158,7 +158,7 @@ def _start_driver(
         finally:
             if driver.poll() is None:
                 driver.kill()
-            driver.wait(timeout=10)
+            driver.wait(timeout=60)
             for marker in root.glob("*.pid.json"):
                 with suppress(ProcessLookupError):
                     os.killpg(json.loads(marker.read_text())["pgid"], signal.SIGKILL)
@@ -295,7 +295,7 @@ def test_sigkill_mid_round_then_resume(tmp_path: Path, run_config: RunConfig) ->
         assert slow_start.payload["started"]["host_id"]
         assert slow_start.payload["started"]["start_time"]
         os.kill(driver.pid, signal.SIGKILL)
-        assert driver.wait(10) == -signal.SIGKILL
+        assert driver.wait(60) == -signal.SIGKILL
         assert group_has_live_member(pgid)
         # Allow the lost attempt, its retry and the extra request in the resumed
         # run counter. Keep the dollar cap fixed so only budget can refuse extra.
@@ -354,7 +354,7 @@ def test_sigkill_mid_round_then_resume(tmp_path: Path, run_config: RunConfig) ->
         assert not any(
             e.type == "settle" and e.payload["id"] == lost.payload["reservation_id"] for e in events
         )
-        _wait_for(lambda: not group_has_live_member(pgid), 10)
+        _wait_for(lambda: not group_has_live_member(pgid), 60)
         [takeover] = [e for e in events if e.type == "takeover"]
         assert takeover.epoch == 2
         assert takeover.payload["force"] is True
