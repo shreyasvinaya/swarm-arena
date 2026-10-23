@@ -111,10 +111,20 @@ object_store_cap_mib = 256
 
 `RayExecutor()` validates settings without I/O. Its first operation connects to
 an existing cluster in a worker thread. `address` chooses the cluster;
-`ray://` addresses are refused. If `address` is not `"auto"`, it must match the
-connected runtime's GCS address; a mismatch fails with a value-free error.
-This check prevents Ray's process-wide existing connection from silently
-overriding an explicit address. `poll_s` controls worker subprocess polling.
+`ray://` addresses are refused. RayExecutor records the configured address string
+when it initializes the process-wide connection. Later executors reuse that
+connection with the same string; a different explicit address fails with a
+value-free error. Use one address string per process: two spellings of the same
+cluster (such as `localhost:<port>` and `127.0.0.1:<port>`) are deliberately
+treated as different. The first connection accepts either spelling without
+comparing it with Ray's normalized GCS address.
+
+If another caller already initialized Ray, an explicit address fails with
+`Ray is already initialized in this process`. `address="auto"` reuses any
+existing connection, including one initialized by another caller; this does
+not claim ownership of that connection. These checks prevent Ray from silently
+ignoring an explicit address. Initialization attempts across executors are
+serialized in worker threads. `poll_s` controls worker subprocess polling.
 `cancel_margin_s` adds time after the job's grace period for soft cancellation
 and bounds recovery operations, including connection and lock waits. Both
 intervals must be finite and positive. Initialization is single-flight per

@@ -4,6 +4,7 @@ import os
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from functools import partial
+from threading import Lock
 from time import monotonic
 from typing import Annotated, Any, Final, cast
 
@@ -18,7 +19,7 @@ from swarm_arena._exec.threads import _DaemonCall, run_sync_daemon
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _ConfigInputModel, config_or_fields
 from swarm_arena._model.tooling import RunStatus, ToolOutput
-from swarm_arena._outcomes import _Outcome, _propagate_control
+from swarm_arena._outcomes import _classify_outcome, _Outcome, _propagate_control
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._store.io import _storage_io
@@ -36,6 +37,8 @@ from swarm_arena.ray._task import TaskSettings, driver_import_roots, job_payload
 
 _SCHEDULE_POLL_S: Final = 1.0
 _STATE_RPC_S: Final = 5.0
+_connection_lock = Lock()
+_connection_address: str | None = None
 
 
 def task_options(job: Job, config: "RayExecutor.Config") -> dict[str, Any]:
@@ -249,13 +252,22 @@ class RayExecutor(Executor):
             )
 
     def _connect(self) -> tuple[str | None, str | None]:
-        context = ray.init(address=self.config.address, ignore_reinit_error=True)
-        runtime = ray.get_runtime_context()
-        if self.config.address != "auto" and runtime.gcs_address != self.config.address:
-            raise _core_error(RuntimeError, "Ray connected cluster does not match address")
-        dashboard = context.dashboard_url
-        job_id = runtime.get_job_id()
-        return dashboard, job_id
+        global _connection_address
+        # Serialize process-wide ownership even across distinct executor daemons.
+        with _connection_lock:
+            connected = ray.is_initialized()
+            if not connected:
+                _connection_address = None
+            elif self.config.address != "auto":
+                if _connection_address is None:
+                    raise _core_error(RuntimeError, "Ray is already initialized in this process")
+                if _connection_address != self.config.address:
+                    raise _core_error(RuntimeError, "Ray connected cluster does not match address")
+            context = ray.init(address=self.config.address, ignore_reinit_error=True)
+            if not connected:
+                # Keep the accepted spelling; Ray may normalize loopback addresses.
+                _connection_address = self.config.address
+            return context.dashboard_url, ray.get_runtime_context().get_job_id()
 
     async def _init(self) -> None:
         self.preflight()
@@ -398,10 +410,12 @@ class RayExecutor(Executor):
                         with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
                             await job.on_partial(output)
                     except (Exception, anyio.get_cancelled_exc_class()) as late_error:
-                        # Match LocalExecutor: classify against the original
-                        # caller snapshot, then preserve its pending cancellation.
+                        # Caller cancellation wins; callback errors are dropped,
+                        # as in LocalExecutor, through the shared outcome rule.
+                        # Raise fresh cancellation outside this handler so the
+                        # callback's exception context cannot change scope ownership.
                         with suppress(anyio.get_cancelled_exc_class()):
-                            outcome.classify(late_error)
+                            _classify_outcome(late_error, cancelled=True)
             if classified is not None:
                 return _error(classified)
             raise anyio.get_cancelled_exc_class()() from None
@@ -516,6 +530,9 @@ class RayExecutor(Executor):
             outcome = _Outcome()
             try:
                 nodes = await self._nodes_call.result()
+                snapshot: list[Mapping[str, float]] = [
+                    dict(node["Resources"]) for node in nodes if node["Alive"] is True
+                ]
             except anyio.get_cancelled_exc_class() as error:
                 # Genuine cancellation abandons only this waiter, never starts
                 # another RPC while the shared call is still running.
@@ -528,10 +545,7 @@ class RayExecutor(Executor):
                 self._nodes_snapshot = None
                 raise
             self._nodes_call = None
-            self._nodes_snapshot = None
-            self._nodes_snapshot = [
-                dict(node["Resources"]) for node in nodes if node["Alive"] is True
-            ]
+            self._nodes_snapshot = snapshot
             return self._nodes_snapshot
 
     async def _cancel(self, ref: Any, job: Job, *, deadline: float | None = None) -> ToolOutput:
