@@ -600,8 +600,9 @@ class KeyManager:
             Newly recorded observations and a value-free status: ``ok`` for a
             successful read (including empty or duplicate-only reads), ``failed``
             for a failed gateway operation, ``no_rows`` when the first-row wait
-            ends after successful empty polling, or ``incomplete`` for a timed-out
-            gateway operation or an ordinary per-row recording failure. Success does not certify
+            ends after successful empty polling (including a later poll cut by
+            that wait), or ``incomplete`` for other timed-out gateway operations
+            or an ordinary per-row recording failure. Success does not certify
             terminal accounting or final spend completeness. Controls propagate.
 
         Examples
@@ -615,18 +616,16 @@ class KeyManager:
         if not records:
             return [], "ok"
         deadline = anyio.current_time() + self._settle_timeout_s
+        first_row_deadline = deadline if wait_first and self._settle_timeout_s else math.inf
+        empty_poll_succeeded = False
         async with self._owned():
             while True:
                 observations = []
+                read_deadline = _read_deadline.get()
                 try:
                     # Only external polling has this timer; recorder storage below
                     # remains under its existing live owner/settlement supervision.
-                    with anyio.move_on_at(
-                        min(
-                            _read_deadline.get(),
-                            deadline if wait_first and self._settle_timeout_s else math.inf,
-                        )
-                    ) as poll:
+                    with anyio.move_on_at(min(read_deadline, first_row_deadline)) as poll:
                         end = datetime.now(UTC)
                         end = end.replace(microsecond=0) + timedelta(seconds=1) + _CLOCK_SKEW
                         for record in records:
@@ -645,6 +644,12 @@ class KeyManager:
                                 raise GatewayError("gateway read identity mismatch")
                             observations.extend((record, row) for row in rows)
                     if poll.cancelled_caught:
+                        if (
+                            empty_poll_succeeded
+                            and not observations
+                            and first_row_deadline < read_deadline
+                        ):
+                            return [], "no_rows"
                         _LOG.warning("gateway spend read timed out")
                         return [], "incomplete"
                 except GatewayError:
@@ -652,6 +657,7 @@ class KeyManager:
                     return [], "failed"
                 if observations or not wait_first or anyio.current_time() >= deadline:
                     break
+                empty_poll_succeeded = True
                 await anyio.sleep(min(1.0, max(0, deadline - anyio.current_time())))
                 if anyio.current_time() >= deadline:
                     break
