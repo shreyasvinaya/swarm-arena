@@ -2822,7 +2822,8 @@ def test_unreplaced_provider_key_warns(tool_type: str) -> None:
     )
     assert warnings == [
         "agent g/t0/a0: tool allowlists GEMINI_API_KEY, which the LLM gateway does not "
-        "replace; keyed tool runs do not get it"
+        "replace; keyed tool runs do not get it; unkeyed tool runs get the node value "
+        "and bypass the gateway"
     ]
 
 

@@ -951,6 +951,8 @@ class RunRunner:
                     watchers.start_soon(self._watch_clock, deps)
                     result = await self._queue(deps)
                     await self._record_stops(deps)
+                    await _read_gateway(deps.journal, deps.gateway)
+                    await self._reconcile_gateway(deps)
                     with anyio.CancelScope() as completion:
 
                         def stopping() -> None:
@@ -963,8 +965,6 @@ class RunRunner:
                         deps.stops.on_change = stopping
                         if self._stopping(deps):
                             stopping()
-                        await _read_gateway(deps.journal, deps.gateway)
-                        await self._reconcile_gateway(deps)
                         await _finish_run(deps.store, deps.journal)
                     if completion.cancel_called:
                         raise _core_error(RuntimeError, "run completion timed out")
@@ -1170,21 +1170,55 @@ async def _read_gateway(
     """Record informational spend under the existing owner, reporting safe failures."""
     if gateway is None:
         return
-    outcome = _Outcome()
+    from swarm_arena._gateway.keys import _read_deadline
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    records = gateway.records(goal_id=goal_id)
+    if goal_id is not None:
+        records = [
+            record
+            for record in records
+            if record.closed_at is None
+            or gateway._boundary_reads.get(record.key_id) != record.closed_at
+        ]
+    if not records:
+        return
+    # Reserve time before an inherited deadline to publish the diagnostic. Only
+    # HTTP is timed: healthy durable recording retains its existing supervisor.
+    margin = min(0.05, journal._settle_timeout_s / 10)
+    deadline = min(
+        anyio.current_time() + journal._settle_timeout_s,
+        anyio.current_effective_deadline() - margin,
+        journal._closing_at - margin,
+    )
+    if journal._io_scope is not None:
+        deadline = min(deadline, journal._io_scope.deadline - margin)
+    token = _read_deadline.set(deadline)
     try:
-        _, status = await gateway.read_with_status(
-            gateway.records(goal_id=goal_id), wait_first=False
-        )
-    except GatewayError as error:
-        outcome.propagate_control(error)
-        status = "failed"
-    if status != "ok":
-        journal.append(
-            EventDraft(
-                type=EventType.GATEWAY_KEY,
-                payload={"action": "read_failed", "error": f"gateway read {status}"},
+        try:
+            _, status = await gateway.read_with_status(records, wait_first=False)
+        except GatewayError as error:
+            _Outcome().propagate_control(error)
+            status = "failed"
+    finally:
+        _read_deadline.reset(token)
+    for record in records:
+        if status != "ok":
+            journal.append(
+                gateway._draft(
+                    record,
+                    GatewayKeyFailure(
+                        action="read_failed",
+                        key_id=record.key_id,
+                        candidate_id=record.candidate_id,
+                        error="gateway read incomplete"
+                        if status == "incomplete"
+                        else "gateway read failed",
+                    ).model_dump(mode="json"),
+                )
             )
-        )
+        elif record.closed_at is not None:
+            gateway._boundary_reads[record.key_id] = record.closed_at
 
 
 async def _finish_run(store: Store, journal: JournalWriter) -> RunState:

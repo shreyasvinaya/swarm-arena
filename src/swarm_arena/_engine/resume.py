@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import anyio
@@ -22,6 +23,7 @@ from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import ProviderStops, RunClock, StopState
 from swarm_arena._errors import (
+    ConfigError,
     Fenced,
     PlanError,
     StorageError,
@@ -31,6 +33,7 @@ from swarm_arena._errors import (
 from swarm_arena._exec.executor import Executor, Job, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.reports import GatewayKeyFailure
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease, OwnerDoc, read_owner
 from swarm_arena._journal.reader import _read_segment, read_chain
@@ -96,6 +99,20 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
 
 def _check(state: RunState, config: RunConfig) -> list[str]:
     """Reject intrinsic limit incompatibilities without mutating authority."""
+    if any(event.type == EventType.GATEWAY_KEY for event in state._events):
+        old_gateway, new_gateway = state.config.llm_gateway, config.llm_gateway
+        if old_gateway is None or new_gateway is None:
+            raise _core_error(ConfigError, "llm_gateway")
+
+        def binding(url: str) -> str:
+            try:
+                parsed = urlsplit(url)
+                return urlunsplit(parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1]))
+            except ValueError:
+                raise _core_error(ConfigError, "llm_gateway") from None
+
+        if binding(old_gateway.url) != binding(new_gateway.url):
+            raise _core_error(ConfigError, "llm_gateway")
     for name in ("max_tokens", "max_usd"):
         old, new = getattr(state.config.limits, name), getattr(config.limits, name)
         if new is not None and (old is None or new < old):
@@ -366,25 +383,19 @@ class _ResumeServices:
                                         )
                                     )
                                 if gateway is not None:
-                                    completed = {
-                                        e.payload["candidate"]["id"]
-                                        for e in events
-                                        if e.type == EventType.TOOL_END
-                                    }
                                     for record in gateway.records():
-                                        if (
-                                            record.closed_at is None
-                                            and record.candidate_id not in completed
-                                        ):
+                                        if record.closed_at is None:
                                             closed = await gateway.close(record)
                                             if closed.closed_at is None:
                                                 journal.append(
-                                                    EventDraft(
-                                                        type=EventType.GATEWAY_KEY,
-                                                        payload={
-                                                            "action": "close_failed",
-                                                            "error": "gateway closure unconfirmed",
-                                                        },
+                                                    gateway._draft(
+                                                        record,
+                                                        GatewayKeyFailure(
+                                                            action="close_failed",
+                                                            key_id=record.key_id,
+                                                            candidate_id=record.candidate_id,
+                                                            error="gateway closure unconfirmed",
+                                                        ).model_dump(mode="json"),
                                                     )
                                                 )
                                     await run_module._read_gateway(journal, gateway)

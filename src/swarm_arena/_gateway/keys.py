@@ -2,8 +2,10 @@
 
 import logging
 import math
+import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
+from contextvars import Context, ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -32,6 +34,7 @@ _CLEANUP_TIMEOUT_S: Final = 30.0
 _CLOCK_SKEW: Final = timedelta(minutes=15)
 _LOG = logging.getLogger(__name__)
 _T = TypeVar("_T")
+_read_deadline: ContextVar[float] = ContextVar("gateway_read_deadline", default=math.inf)
 
 
 def needs_key(providers: frozenset[str], secret_env: Sequence[str]) -> bool:
@@ -295,6 +298,7 @@ class KeyManager:
         self._run_id = run_id
         self._settle_timeout_s = settle_timeout_s
         self._records: dict[str, KeyRecord] = {}
+        self._boundary_reads: dict[str, datetime] = {}
 
     @asynccontextmanager
     async def _owned(self) -> AsyncGenerator[None]:
@@ -506,6 +510,26 @@ class KeyManager:
         await anyio.lowlevel.checkpoint_if_cancelled()
         await self._call(lambda: self._adapter.block_key(_virtual(record)), "gateway revoke")
 
+    def _revoke_later(self, record: KeyRecord) -> None:
+        """Hand one external-only block attempt to an independent bounded owner."""
+        self._check_record(record)
+        adapter, key = self._adapter, _virtual(record)
+        timeout_s = _CLEANUP_TIMEOUT_S
+
+        async def block() -> None:
+            with anyio.move_on_after(timeout_s):
+                try:
+                    await adapter.block_key(key)
+                except Exception:
+                    _LOG.warning("gateway key cleanup failed")
+
+        threading.Thread(
+            target=Context().run,
+            args=(anyio.run, block),
+            daemon=True,
+            name="swarm-arena-gateway-block",
+        ).start()
+
     async def read(self, records: Sequence[KeyRecord], *, wait_first: bool) -> list[LLMCall]:
         """Read bounded spend windows and record informational tool observations.
 
@@ -581,7 +605,10 @@ class KeyManager:
                     # Only external polling has this timer; recorder storage below
                     # remains under its existing live owner/settlement supervision.
                     with anyio.move_on_at(
-                        deadline if wait_first and self._settle_timeout_s else math.inf
+                        min(
+                            _read_deadline.get(),
+                            deadline if wait_first and self._settle_timeout_s else math.inf,
+                        )
                     ) as poll:
                         end = datetime.now(UTC)
                         end = end.replace(microsecond=0) + timedelta(seconds=1) + _CLOCK_SKEW

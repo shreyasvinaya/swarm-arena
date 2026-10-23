@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -597,16 +597,11 @@ async def _revoke_gateway_key(rt: AgentRuntime, record: KeyRecord, deadline: flo
     assert rt.gateway is not None
     deadline = _gateway_cleanup_deadline(rt, deadline)
     if deadline <= anyio.current_time():
+        rt.gateway._revoke_later(record)
         return
     with anyio.CancelScope(shield=True, deadline=deadline):
-        try:
+        with suppress(Exception):
             await rt.gateway.revoke(record)
-        except anyio.get_cancelled_exc_class():
-            # The primary caller cancellation still escapes the submit boundary.
-            pass
-        except Exception:
-            # Revocation is best effort; the original outcome retains authority.
-            pass
 
 
 async def _read_tool_gateway(
@@ -707,6 +702,7 @@ async def execute_tool_run(
     )
     allocation_request = request
     index: int | None = None
+    boundary = _Outcome()
     try:
         if not deterministic:
             index = rt.repeats.next_replicate(rt, request, requested=replicate)
@@ -771,9 +767,16 @@ async def execute_tool_run(
                     if inflight is not None:
                         inflight.discard(admission_scope)
             raise _core_signal(LimitReached("stop", "the round is stopping"))
-        except (Exception, anyio.get_cancelled_exc_class()) as error:
+        except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+            if (
+                isinstance(error, BaseExceptionGroup)
+                and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+            ):
+                raise
             if not _has_core_fenced(error):
                 await _refund_undispatched(rt, owner)
+            if isinstance(error, BaseExceptionGroup):
+                raise boundary.classify(error) from None
             raise
     finally:
         if index is not None:
@@ -847,7 +850,6 @@ async def _run(
         kind="tool",
         goal_id=rt.goal_id,
         on_admit=on_admit,
-        keep_charged=keyed,
     )
     await anyio.lowlevel.checkpoint()
     if keyed and amount.usd <= 0:
@@ -925,6 +927,9 @@ async def _run(
             secret: str | None = None
             if keyed:
                 assert rt.gateway is not None
+                res = await rt.ledger._keep_charged(
+                    res.id, on_admit=lambda admitted: setattr(owner, "admitted", admitted)
+                )
                 try:
                     gateway_record, secret = await rt.gateway.open(
                         candidate_id=id,
@@ -979,11 +984,21 @@ async def _run(
                                     rt, gateway_record, inflight, generation, warnings
                                 )
                             )
-            except (Exception, anyio.get_cancelled_exc_class()):
+            except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+                if (
+                    isinstance(error, BaseExceptionGroup)
+                    and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+                ):
+                    raise
                 if gateway_record is not None:
                     await _revoke_gateway_key(rt, gateway_record, inherited_deadline)
                 raise
-    except (Exception, anyio.get_cancelled_exc_class()) as error:
+    except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+        if (
+            isinstance(error, BaseExceptionGroup)
+            and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+        ):
+            raise
         inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
@@ -1060,11 +1075,11 @@ async def _run(
     estimated = False
     usage = output.usage
     overflow = not keyed and usage.usd is not None and usage.usd > USD_LIMIT
-    if keyed:
+    if res.keep_charged:
         # Gateway observations are the only actual-spend source. A tool's
         # unsupported usage remains informational and never trips the run fuse.
-        estimated = usage.usd is None or usage.usd > USD_LIMIT
-        actual = Amount(tokens=usage.total_tokens, usd=0 if estimated else usage.usd)
+        estimated = True
+        actual = Amount(tokens=usage.total_tokens)
     elif overflow:
         warnings.append("tool error: usage exceeds supported range")
         output = output.model_copy(update={"status": RunStatus.ERROR})
