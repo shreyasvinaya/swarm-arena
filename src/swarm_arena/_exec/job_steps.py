@@ -289,7 +289,10 @@ class _JobRun:
                     except BaseException as error:
                         # A pending caller cancellation owns the final outcome,
                         # including failures from the shielded collector rejoin.
-                        outcome.classify(error)
+                        # Keep the original scope-tagged cancellation: the shared
+                        # classifier's fresh cancellation may be chained to error.
+                        with contextlib.suppress(anyio.get_cancelled_exc_class()):
+                            outcome.classify(error)
             raise
 
     async def fault_output(self, reason: str) -> ToolOutput:
@@ -326,7 +329,13 @@ class _JobRun:
             # Classify cancellation first, then re-raise the original direct-call
             # error below instead of replacing its identity with a rebuilt Fenced.
             with contextlib.suppress(Fenced):
-                outcome.classify(error)
+                try:
+                    outcome.classify(error)
+                except anyio.get_cancelled_exc_class():
+                    # A non-cancel hand-back can race a pending owner scope.
+                    # Let that scope supply its own attributable cancellation.
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    raise
             raise
 
     def _start_collect(self, run: CompletedRun) -> _DaemonCall[ToolOutput | None]:
@@ -370,7 +379,11 @@ class _JobRun:
             except BaseException as error:
                 # Preserve direct-call identity after giving cancellation precedence.
                 with contextlib.suppress(Fenced):
-                    outcome.classify(error)
+                    try:
+                        outcome.classify(error)
+                    except anyio.get_cancelled_exc_class():
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        raise
                 raise
         if scope.cancelled_caught:
             await anyio.to_thread.run_sync(note_in_log, self._stderr, "collect timed out")
