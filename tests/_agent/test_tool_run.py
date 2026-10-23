@@ -661,7 +661,7 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
         with anyio.fail_after(15):
             async with anyio.create_task_group() as tg:
                 tg.start_soon(_run_and_store, rt, rt_env)
-                assert await anyio.to_thread.run_sync(entered.wait, 30)
+                assert await anyio.to_thread.run_sync(entered.wait, 5)
                 rt_env.cancel_inflight()
             cand = rt_env.result
             assert cand is not None
