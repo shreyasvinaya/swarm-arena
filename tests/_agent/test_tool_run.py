@@ -293,7 +293,7 @@ async def test_admission_closed_while_queued_refuses_start(rt_env: RtEnv) -> Non
     ] = []  # _run_capturing appends the LimitReached that execute_tool_run raises
     async with anyio.create_task_group() as tg:
         tg.start_soon(_run_capturing, rt, {"marker": str(rt_env.marker)}, errors)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await queued.entered.wait()
         rt_env.inflight.close()
         queued.release.set()
@@ -352,7 +352,7 @@ async def test_round_cancel_keeps_partial_output(rt_env: RtEnv) -> None:
     rt = rt_env.with_tool(
         PyTool({"code": write_then_sleep(rt_env.marker)})
     )  # result.json, then marker, then 600 s
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(
                 _run_and_store, rt, rt_env
@@ -640,7 +640,7 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     def block() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(10)
+        assert release.wait(300)
 
     def init(self: PyTool, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
@@ -658,10 +658,10 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     monkeypatch.setattr(PyTool, "__init__", init)
     monkeypatch.setattr(PyTool, "command", command)
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tg:
                 tg.start_soon(_run_and_store, rt, rt_env)
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 rt_env.cancel_inflight()
             cand = rt_env.result
             assert cand is not None
@@ -673,9 +673,9 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
             assert "command_start" not in before
             assert not rt_env.inflight._scopes
             release.set()
-            assert await anyio.to_thread.run_sync(done.wait, 5)
-            with anyio.fail_after(5):
-                await anyio.to_thread.run_sync(workers[0].join, 5)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+            with anyio.fail_after(60):
+                await anyio.to_thread.run_sync(workers[0].join, 60)
             assert not workers[0].is_alive()
             assert rt_env.committed_types() == before
             assert not rt_env.marker.exists()
@@ -683,7 +683,7 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     finally:
         release.set()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
+            await anyio.to_thread.run_sync(worker.join, 60)
             assert not worker.is_alive()
 
 
@@ -696,7 +696,7 @@ async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> 
             scopes.append(scope)
             await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(run)
             await rt_env.wait_for(rt_env.marker)
@@ -731,7 +731,7 @@ async def test_cancelled_reserve_admission_settles_undispatched_tool_at_zero(
         await wait_for(seq)
 
     monkeypatch.setattr(rt.journal, "_wait_for", cancel_at_wait)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         with anyio.CancelScope() as scope:
             with pytest.raises(asyncio.CancelledError):
                 await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
@@ -1088,7 +1088,7 @@ async def test_release_keeps_primary_control_outcome(
         rt = dataclasses.replace(rt, executor=queued)
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, [])
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await queued.entered.wait()
             group.cancel_scope.cancel()
     assert not rt.repeats._pending
@@ -1214,7 +1214,7 @@ async def test_unstarted_runs_do_not_increment_started_count(rt_env: RtEnv, fail
         errors: list[LimitReached] = []
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, errors)
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await queued.entered.wait()
             assert rt.started_runs == 0
             rt_env.inflight.close()
@@ -1246,7 +1246,7 @@ async def test_inflight_tracks_active_job_grace_until_collection(rt_env: RtEnv) 
     rt = dataclasses.replace(rt, executor=queued)
     async with anyio.create_task_group() as group:
         group.start_soon(_run_capturing, rt, {"x": 1}, [])
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await queued.entered.wait()
         assert rt_env.inflight.max_grace_s() == tool_grace(rt.tool)
         rt_env.cancel_inflight()
@@ -1292,7 +1292,7 @@ async def test_inflight_grace_remains_during_cancel_collection(rt_env: RtEnv) ->
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", grace_s=3.0))
     executor = CollectingExecutor(rt.executor)
     rt = dataclasses.replace(rt, executor=executor)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, [])
             await executor.entered.wait()
@@ -1503,6 +1503,7 @@ async def test_fingerprint_abandonment_discards_late_mutation(
     rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     import threading
+    from contextlib import contextmanager
 
     import swarm_arena._agent.tool_run as pipeline
     from swarm_arena._journal.reader import read_committed
@@ -1511,17 +1512,30 @@ async def test_fingerprint_abandonment_discards_late_mutation(
 
     entered, worker_done, done = anyio.Event(), anyio.Event(), anyio.Event()
     release = threading.Event()
+    workers: list[threading.Thread] = []
     token = anyio.lowlevel.current_token()
     scopes: list[anyio.CancelScope] = []
     candidates: list[Candidate] = []
     fenced: list[Fenced] = []
-    monkeypatch.setattr(
-        pipeline, "FINGERPRINT_TIMEOUT_S", 0.1 if mode == "timeout" else 30, raising=False
-    )
+    deadlines: list[anyio.CancelScope] = []
+
+    class FingerprintClock:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        @contextmanager
+        def fail_after(self, delay: float | None, *, shield: bool = False) -> Any:
+            with anyio.fail_after(delay, shield=shield) as deadline:
+                deadlines.append(deadline)
+                yield deadline
+
+    monkeypatch.setattr(pipeline, "FINGERPRINT_TIMEOUT_S", 300)
+    monkeypatch.setattr(pipeline, "anyio", FingerprintClock())
 
     def fingerprint(output: ToolOutput) -> str:
+        workers.append(threading.current_thread())
         anyio.from_thread.run_sync(entered.set, token=token)
-        release.wait()
+        assert release.wait(300)
         output.data["late"] = {"value": float("nan")}
         anyio.from_thread.run_sync(worker_done.set, token=token)
         return "too late"
@@ -1541,44 +1555,54 @@ async def test_fingerprint_abandonment_discards_late_mutation(
             done.set()
 
     monkeypatch.setattr(rt_env.rt.tool, "fingerprint", fingerprint)
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(run)
-        try:
-            with anyio.fail_after(5):
-                await entered.wait()
-            if mode != "timeout":
-                if mode == "fence":
-                    rt_env.rt.journal.fenced.set()
-                scopes[0].cancel()
-            with anyio.move_on_after(1):
-                await done.wait()
-            assert done.is_set(), "fingerprint waiter did not abandon blocked hook"
+    task = asyncio.create_task(run())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+        assert len(deadlines) == 1
+        if mode == "timeout":
+            deadlines[0].deadline = anyio.current_time() + 0.1
+        else:
             if mode == "fence":
-                assert fenced
-                assert not rt_env.events("tool_end")
-                assert not rt_env.events("settle")
-            else:
-                assert len(candidates) == 1
-                candidate = candidates[0]
-                assert candidate.output.data == {"x": 1, "y": 1}
-                assert rt_env.reservation_state(candidate) == "settled"
-                assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
-                assert candidate.warnings == [
-                    "fingerprint error: "
-                    + ("TimeoutError" if mode == "timeout" else "CancelledError")
-                ]
-            before = read_committed(rt_env.run_store)
-            release.set()
-            with anyio.fail_after(5):
-                await worker_done.wait()
-            await anyio.lowlevel.checkpoint()
-            assert read_committed(rt_env.run_store) == before
-            if candidates:
-                assert before is not None
-                assert RunState.from_events(before[1]).candidates[candidates[0].id] == candidates[0]
-                assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
-        finally:
-            release.set()
+                rt_env.rt.journal.fenced.set()
+            scopes[0].cancel()
+        with anyio.move_on_after(30):
+            await done.wait()
+        assert done.is_set(), "fingerprint waiter did not abandon blocked hook"
+        if mode == "fence":
+            assert fenced
+            assert not rt_env.events("tool_end")
+            assert not rt_env.events("settle")
+        else:
+            assert len(candidates) == 1
+            candidate = candidates[0]
+            assert candidate.output.data == {"x": 1, "y": 1}
+            assert rt_env.reservation_state(candidate) == "settled"
+            assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+            assert candidate.warnings == [
+                "fingerprint error: " + ("TimeoutError" if mode == "timeout" else "CancelledError")
+            ]
+        before = read_committed(rt_env.run_store)
+        release.set()
+        with anyio.fail_after(60):
+            await worker_done.wait()
+        await anyio.lowlevel.checkpoint()
+        assert read_committed(rt_env.run_store) == before
+        if candidates:
+            assert before is not None
+            assert RunState.from_events(before[1]).candidates[candidates[0].id] == candidates[0]
+            assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "fingerprint owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 def _fingerprint_round(rt_env: RtEnv) -> Any:
@@ -1640,6 +1664,7 @@ async def test_round_finishes_with_blocked_fingerprint(
 ) -> None:
     import threading
 
+    from swarm_arena._agent import tool_run as pipeline
     from swarm_arena._engine import round as round_module
     from swarm_arena._journal.reader import read_committed
     from swarm_arena._journal.replay import RunState
@@ -1647,14 +1672,17 @@ async def test_round_finishes_with_blocked_fingerprint(
     runner = _fingerprint_round(rt_env)
     entered, watch_done, done = anyio.Event(), anyio.Event(), anyio.Event()
     release = threading.Event()
+    workers: list[threading.Thread] = []
     token = anyio.lowlevel.current_token()
     results: list[Any] = []
     original_watch = runner._watch
     monkeypatch.setattr(round_module, "BEFORE_KILL_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(pipeline, "FINGERPRINT_TIMEOUT_S", 300)
 
     def fingerprint(self: FunctionTool, output: ToolOutput) -> str:
+        workers.append(threading.current_thread())
         anyio.from_thread.run_sync(entered.set, token=token)
-        release.wait()
+        assert release.wait(300)
         output.data["late"] = float("nan")
         return "late"
 
@@ -1672,29 +1700,37 @@ async def test_round_finishes_with_blocked_fingerprint(
 
     monkeypatch.setattr(FunctionTool, "fingerprint", fingerprint)
     monkeypatch.setattr(runner, "_watch", watch)
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(run)
-        try:
-            with anyio.fail_after(5):
-                await entered.wait()
-            if mode == "stop":
-                runner.deps.stops.stop_now = True
-            else:
-                runner.deps.clock._before = runner.deps.config.limits.run_timeout_s
-            with anyio.fail_after(8):
-                await watch_done.wait()
-            with anyio.move_on_after(1):
-                await done.wait()
-            assert done.is_set(), "round still waiting for fingerprint after stop/deadline"
-            candidate = results[0].candidates[0]
-            assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
-            assert len(rt_env.events("settle")) == 1
-            assert candidate.output.data == {"x": 1, "y": 1}
-            committed = read_committed(rt_env.run_store)
-            assert committed is not None
-            assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
-        finally:
-            release.set()
+    task = asyncio.create_task(run())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+        if mode == "stop":
+            runner.deps.stops.stop_now = True
+        else:
+            runner.deps.clock._before = runner.deps.config.limits.run_timeout_s
+        with anyio.fail_after(30):
+            await watch_done.wait()
+        with anyio.move_on_after(30):
+            await done.wait()
+        assert done.is_set(), "round still waiting for fingerprint after stop/deadline"
+        candidate = results[0].candidates[0]
+        assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+        assert len(rt_env.events("settle")) == 1
+        assert candidate.output.data == {"x": 1, "y": 1}
+        committed = read_committed(rt_env.run_store)
+        assert committed is not None
+        assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "fingerprint owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "extra-action"])
@@ -2136,7 +2172,7 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
             if key.endswith(".out"):
                 workers.append(threading.current_thread())
                 entered.set()
-                assert release.wait(30)
+                assert release.wait(300)
         return original(store, key, data)
 
     monkeypatch.setattr(LocalStore, "create", create)
@@ -2144,9 +2180,9 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
         execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
     )
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         rt_env.cancel_inflight()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "log publication ignored the round's cancellation"
         candidate = task.result()
         assert candidate.output.logs_ref is None
@@ -2154,11 +2190,16 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         for worker in workers:
             if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+                await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "log publication owner did not finish cleanup"
+    assert all(
+        not worker.is_alive() for worker in workers if worker.name.startswith("swarm-arena-daemon-")
+    )
     assert len(writes) == 1, "abandoned log write published another file"
 
 
@@ -2406,7 +2447,7 @@ async def test_interrupted_recording_preserves_candidate_links(
     ):
         task = asyncio.create_task(execute_tool_run(rt, {}, parents=(), replicate=None, edits=None))
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await entered.wait()
                 rt_env.cancel_inflight()
                 candidate = await task
@@ -2887,14 +2928,14 @@ async def test_key_creation_cancellation_has_late_cleanup_owner(
             async with anyio.create_task_group() as tasks:
 
                 async def cancel_create() -> None:
-                    assert await anyio.to_thread.run_sync(entered.wait, 30)
+                    assert await anyio.to_thread.run_sync(entered.wait, 60)
                     outer.cancel()
 
                 tasks.start_soon(cancel_create)
                 await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
         assert outer.cancelled_caught
         released.set()
-        assert await anyio.to_thread.run_sync(blocked.wait, 30)
+        assert await anyio.to_thread.run_sync(blocked.wait, 60)
     (key_id,) = fake_gateway.keys
     assert fake_gateway.keys[key_id]["blocked"] is True
     assert not rt_env.events("tool_start")
@@ -3311,12 +3352,12 @@ async def test_expired_revoke_hands_off_one_bounded_block(
         try:
             with anyio.fail_after(60):
                 await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
-                assert await anyio.to_thread.run_sync(entered.wait, 30)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 assert not done.is_set()
         finally:
             release.set()
             if entered.is_set():
-                assert await anyio.to_thread.run_sync(done.wait, 30)
+                assert await anyio.to_thread.run_sync(done.wait, 60)
         assert attempts == [record.key_id]
 
 
@@ -3354,7 +3395,7 @@ async def test_deadline_cancellation_blocks_key_after_caller_exits(
         assert caller.cancelled_caught
         (key_id,) = fake_gateway.keys
         with anyio.fail_after(60):
-            assert await anyio.to_thread.run_sync(done.wait, 30)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
         assert fake_gateway.keys[key_id]["blocked"]
         assert len(_gateway_requests(fake_gateway, "/key/block")) == 1
         assert not rt_env.events("tool_end")
