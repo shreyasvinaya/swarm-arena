@@ -21,8 +21,11 @@ async def run_sync_daemon(fn: Callable[..., T], *args: Any) -> T:
     daemon thread cannot keep the interpreter from exiting, unlike the worker
     threads of ``anyio.to_thread.run_sync``. When the awaiting task is
     cancelled, it stops waiting at once and the thread is dropped; the thread
-    runs on, and its outcome is discarded. If the event loop has finished by
-    the time the thread ends, the hand-back is skipped.
+    runs on, and its outcome is discarded. On the asyncio and trio backends
+    the hand-back never waits for the event loop: the thread ends as soon as
+    ``fn`` returns, even while a loop that is still open is not running. If the
+    event loop has finished by the time the thread ends, the hand-back is
+    skipped.
 
     ``fn`` runs in a copy of the caller's context
     (``contextvars.copy_context()``), as with ``anyio.to_thread.run_sync``:
@@ -64,6 +67,18 @@ async def run_sync_daemon(fn: Callable[..., T], *args: Any) -> T:
     return await _DaemonCall(fn, *args).result()
 
 
+def _post(token: anyio.lowlevel.EventLoopToken, callback: Callable[[], object]) -> None:
+    """Schedule ``callback`` on the token's loop without waiting for it to run."""
+    native = token.native_token
+    schedule = getattr(native, "call_soon_threadsafe", None)  # asyncio
+    if schedule is None:
+        schedule = getattr(native, "run_sync_soon", None)  # trio
+    if schedule is None:
+        anyio.from_thread.run_sync(callback, token=token)
+    else:
+        schedule(callback)
+
+
 class _DaemonCall(Generic[T]):
     """Retain one daemon call's outcome so cancelled waiters can rejoin it."""
 
@@ -81,7 +96,7 @@ class _DaemonCall(Generic[T]):
                 self._errors.append(exc)
             # A late result after loop shutdown is intentionally discarded.
             with contextlib.suppress(Exception):
-                anyio.from_thread.run_sync(self._done.set, token=token)
+                _post(token, self._done.set)
 
         name = f"swarm-arena-daemon-{getattr(fn, '__name__', 'work')}"
         threading.Thread(target=work, name=name, daemon=True).start()

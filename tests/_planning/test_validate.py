@@ -2774,6 +2774,159 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
             await settle_tasks(task)
 
 
+def test_draft_offer_never_waits_for_an_idle_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import asyncio
+
+    from swarm_arena._planning import validate
+    from swarm_arena._planning.validate import _draft_work
+
+    entered, go = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    real_post = validate._post
+
+    def held_post(token: Any, callback: Any) -> None:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert go.wait(180), "test did not release the offer"
+        real_post(token, callback)
+
+    monkeypatch.setattr(validate, "_post", held_post)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    async def start_and_abandon() -> None:
+        task = asyncio.ensure_future(_draft_work(prepare, artifacts))
+        assert await asyncio.to_thread(entered.wait, 60)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(start_and_abandon())
+        # The owner is gone and the loop is open but idle while the worker offers a file.
+        go.set()
+        worker = workers[0]
+        worker.join(60)
+        assert not worker.is_alive(), "the draft worker waited for an idle loop"
+        assert draft_spool_closed.wait(60)
+    finally:
+        go.set()
+        loop.run_until_complete(asyncio.sleep(0))
+        for worker in workers:
+            worker.join(60)
+        loop.close()
+
+
+async def test_draft_send_failure_reaches_a_live_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import anyio
+    from anyio.streams.memory import MemoryObjectSendStream
+
+    from swarm_arena._planning.validate import _draft_work
+
+    workers: list[threading.Thread] = []
+    failed: list[bool] = []
+    real_send = MemoryObjectSendStream.send_nowait
+
+    def fail_first_file(self: Any, item: Any) -> None:
+        if item is not None and not failed:
+            failed.append(True)
+            raise MemoryError("secret-sentinel")
+        real_send(self, item)
+
+    monkeypatch.setattr(MemoryObjectSendStream, "send_nowait", fail_first_file)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        workers.append(threading.current_thread())
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    try:
+        with (
+            anyio.fail_after(60),
+            pytest.raises(ValueError, match="draft admission failed") as caught,
+        ):
+            await _draft_work(prepare, artifacts)
+        assert failed == [True]
+        assert "MemoryError" in str(caught.value)
+        assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+    finally:
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+
+
+async def test_draft_close_failure_still_releases_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import asyncio
+
+    import anyio
+    from anyio.streams.memory import MemoryObjectSendStream
+
+    from swarm_arena._planning.validate import _draft_work
+
+    workers: list[threading.Thread] = []
+    failed: list[str] = []
+    real_send, real_close = MemoryObjectSendStream.send_nowait, MemoryObjectSendStream.close
+
+    def fail_first_file(self: Any, item: Any) -> None:
+        if item is not None and not failed:
+            failed.append("send")
+            raise MemoryError("secret-sentinel")
+        real_send(self, item)
+
+    def fail_first_close(self: Any) -> None:
+        if failed == ["send"]:
+            failed.append("close")
+            raise MemoryError("secret-sentinel")
+        real_close(self)
+
+    monkeypatch.setattr(MemoryObjectSendStream, "send_nowait", fail_first_file)
+    monkeypatch.setattr(MemoryObjectSendStream, "close", fail_first_close)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    # The close failure escapes the loop callback; collect it here, not in the runner.
+    loop = asyncio.get_running_loop()
+    runner_handler = loop.get_exception_handler()
+    reported: list[BaseException | None] = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context.get("exception")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        workers.append(threading.current_thread())
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    try:
+        with (
+            anyio.fail_after(60),
+            pytest.raises(ValueError, match="draft admission failed") as caught,
+        ):
+            await _draft_work(prepare, artifacts)
+        assert failed == ["send", "close"]
+        assert "MemoryError" in str(caught.value)
+        assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+        [close_error] = reported  # reported to the loop, not hidden
+        assert isinstance(close_error, MemoryError)
+        assert isinstance(close_error.__context__, MemoryError)
+    finally:
+        loop.set_exception_handler(runner_handler)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+
+
 def test_providers_without_gateway_warns() -> None:
     plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
     warnings = validate_plan(plan, RunConfig())

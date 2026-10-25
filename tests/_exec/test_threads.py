@@ -98,6 +98,42 @@ def test_hand_back_after_the_loop_closed_is_ignored(monkeypatch: pytest.MonkeyPa
     assert errors == []
 
 
+def test_hand_back_never_waits_for_an_idle_loop() -> None:
+    import asyncio
+
+    release = threading.Event()
+    entered = threading.Event()
+    threads: list[threading.Thread] = []
+
+    def blocked() -> int:
+        threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(180), "test did not release the held thread"
+        return 1
+
+    async def start_and_abandon() -> None:
+        call = asyncio.ensure_future(run_sync_daemon(blocked))
+        assert await asyncio.to_thread(entered.wait, 60)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(start_and_abandon())
+        # The loop stays open but no longer runs, as between two library runs.
+        release.set()
+        [thread] = threads
+        thread.join(60)
+        assert not thread.is_alive(), "the daemon thread waited for an idle loop"
+    finally:
+        release.set()
+        loop.run_until_complete(asyncio.sleep(0))
+        for thread in threads:
+            thread.join(60)
+        loop.close()
+
+
 _VALUE: contextvars.ContextVar[str] = contextvars.ContextVar("value", default="unset")
 
 
