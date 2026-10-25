@@ -2866,6 +2866,67 @@ async def test_draft_send_failure_reaches_a_live_owner(
             assert not worker.is_alive()
 
 
+async def test_draft_close_failure_still_releases_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import asyncio
+
+    import anyio
+    from anyio.streams.memory import MemoryObjectSendStream
+
+    from swarm_arena._planning.validate import _draft_work
+
+    workers: list[threading.Thread] = []
+    failed: list[str] = []
+    real_send, real_close = MemoryObjectSendStream.send_nowait, MemoryObjectSendStream.close
+
+    def fail_first_file(self: Any, item: Any) -> None:
+        if item is not None and not failed:
+            failed.append("send")
+            raise MemoryError("secret-sentinel")
+        real_send(self, item)
+
+    def fail_first_close(self: Any) -> None:
+        if failed == ["send"]:
+            failed.append("close")
+            raise MemoryError("secret-sentinel")
+        real_close(self)
+
+    monkeypatch.setattr(MemoryObjectSendStream, "send_nowait", fail_first_file)
+    monkeypatch.setattr(MemoryObjectSendStream, "close", fail_first_close)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+    # The close failure escapes the loop callback; collect it here, not in the runner.
+    loop = asyncio.get_running_loop()
+    runner_handler = loop.get_exception_handler()
+    reported: list[BaseException | None] = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context.get("exception")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        workers.append(threading.current_thread())
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    try:
+        with (
+            anyio.fail_after(60),
+            pytest.raises(ValueError, match="draft admission failed") as caught,
+        ):
+            await _draft_work(prepare, artifacts)
+        assert failed == ["send", "close"]
+        assert "MemoryError" in str(caught.value)
+        assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+        [close_error] = reported  # reported to the loop, not hidden
+        assert isinstance(close_error, MemoryError)
+        assert isinstance(close_error.__context__, MemoryError)
+    finally:
+        loop.set_exception_handler(runner_handler)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+
+
 def test_providers_without_gateway_warns() -> None:
     plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
     warnings = validate_plan(plan, RunConfig())

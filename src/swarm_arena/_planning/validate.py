@@ -1241,10 +1241,12 @@ async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: Artif
                 sender.send_nowait(item)
             except Exception as error:
                 # Keep the failure for the worker, end the owner's stream so a live
-                # owner collects the worker's outcome, and release the worker.
+                # owner collects the worker's outcome, and always release the worker.
                 delivery.append(error)
-                sender.close()
-                acknowledged.set()
+                try:
+                    sender.close()
+                finally:
+                    acknowledged.set()
 
         _post(token, deliver)
 
