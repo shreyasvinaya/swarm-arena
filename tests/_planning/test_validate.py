@@ -2823,6 +2823,49 @@ def test_draft_offer_never_waits_for_an_idle_loop(
         loop.close()
 
 
+async def test_draft_send_failure_reaches_a_live_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import anyio
+    from anyio.streams.memory import MemoryObjectSendStream
+
+    from swarm_arena._planning.validate import _draft_work
+
+    workers: list[threading.Thread] = []
+    failed: list[bool] = []
+    real_send = MemoryObjectSendStream.send_nowait
+
+    def fail_first_file(self: Any, item: Any) -> None:
+        if item is not None and not failed:
+            failed.append(True)
+            raise MemoryError("secret-sentinel")
+        real_send(self, item)
+
+    monkeypatch.setattr(MemoryObjectSendStream, "send_nowait", fail_first_file)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        workers.append(threading.current_thread())
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    try:
+        with (
+            anyio.fail_after(60),
+            pytest.raises(ValueError, match="draft admission failed") as caught,
+        ):
+            await _draft_work(prepare, artifacts)
+        assert failed == [True]
+        assert "MemoryError" in str(caught.value)
+        assert_secret_absent(caught.value, "secret-sentinel")
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
+        assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
+    finally:
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
+
+
 def test_providers_without_gateway_warns() -> None:
     plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
     warnings = validate_plan(plan, RunConfig())

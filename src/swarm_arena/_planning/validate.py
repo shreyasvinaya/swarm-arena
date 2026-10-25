@@ -1232,14 +1232,18 @@ async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: Artif
     acknowledged, abandoned = threading.Event(), threading.Event()
     sender, receiver = anyio.create_memory_object_stream[tuple[str, bytes] | None](1)
 
+    delivery: list[Exception] = []
+
     def offer(item: tuple[str, bytes] | None) -> None:
         # Never wait for the loop: an idle loop must not hold the worker and its spool.
         def deliver() -> None:
             try:
                 sender.send_nowait(item)
-            except Exception:
-                # The owner is gone; release the worker to stop and close its spool.
-                abandoned.set()
+            except Exception as error:
+                # Keep the failure for the worker, end the owner's stream so a live
+                # owner collects the worker's outcome, and release the worker.
+                delivery.append(error)
+                sender.close()
                 acknowledged.set()
 
         _post(token, deliver)
@@ -1258,6 +1262,8 @@ async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: Artif
                     offer((digest, data))
                     acknowledged.wait()
                     del data
+                    if delivery:
+                        raise delivery[0]
                     if abandoned.is_set():
                         raise _core_error(RuntimeError, "draft preparation stopped")
                 return result
